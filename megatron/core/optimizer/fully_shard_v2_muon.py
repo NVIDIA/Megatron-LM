@@ -20,6 +20,7 @@ from typing import List
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
 
@@ -85,12 +86,16 @@ class MuonGradPackage:
         if not self.has_comm:
             return []
 
-        group, this_rank, world_size = opt._comm[self.param_ids[0]]
         ops = []
+        this_rank = dist.get_rank()
         for param_idx in self.param_ids:
             root = opt._roots[param_idx]
             ranges = opt._shard_ranges[param_idx]
-            this_offset, this_size = ranges[this_rank]
+            this_offset, this_size = 0, 0
+            for rank, offset, size in ranges:
+                if rank == this_rank:
+                    this_offset, this_size = offset, size
+                    break
             ns_input_shard = None
             if this_size > 0:
                 if opt._nesterov:
@@ -109,27 +114,14 @@ class MuonGradPackage:
                 full_grads[param_idx] = full_grad
                 if this_size > 0:
                     full_grad[this_offset : this_offset + this_size].copy_(ns_input_shard)
-                for src in range(world_size):
-                    offset, size = ranges[src]
+                for src, offset, size in ranges:
                     if size == 0 or src == this_rank:
                         continue
                     ops.append(
-                        dist.P2POp(
-                            dist.irecv,
-                            full_grad[offset : offset + size],
-                            dist.get_global_rank(group, src),
-                            group=group,
-                        )
+                        dist.P2POp(dist.irecv, full_grad[offset : offset + size], src)
                     )
             elif this_size > 0:
-                ops.append(
-                    dist.P2POp(
-                        dist.isend,
-                        ns_input_shard,
-                        dist.get_global_rank(group, root),
-                        group=group,
-                    )
-                )
+                ops.append(dist.P2POp(dist.isend, ns_input_shard, root))
         return dist.batch_isend_irecv(ops) if ops else []
 
     @torch.no_grad()
@@ -141,8 +133,9 @@ class MuonGradPackage:
     def orthogonalize(self, opt, requests, full_grads):
         self.finish_gather(requests)
         orths = {}
+        this_rank = dist.get_rank()
         for param_idx in self.param_ids:
-            if opt._roots[param_idx] != opt._comm[param_idx][1]:
+            if opt._roots[param_idx] != this_rank:
                 continue
             if param_idx in full_grads:
                 full_grad = full_grads.pop(param_idx)
@@ -177,34 +170,31 @@ class MuonGradPackage:
         if not self.has_comm:
             return []
 
-        group, this_rank, world_size = opt._comm[self.param_ids[0]]
         ops = []
+        this_rank = dist.get_rank()
         for param_idx in self.param_ids:
             root = opt._roots[param_idx]
             ranges = opt._shard_ranges[param_idx]
             if root == this_rank:
                 orth = orths[param_idx].reshape(-1)
-                for dst in range(world_size):
-                    offset, size = ranges[dst]
+                for dst, offset, size in ranges:
                     if size == 0 or dst == this_rank:
                         continue
+                    ops.append(dist.P2POp(dist.isend, orth[offset : offset + size], dst))
+            else:
+                this_size = 0
+                for rank, _offset, size in ranges:
+                    if rank == this_rank:
+                        this_size = size
+                        break
+                if this_size > 0:
                     ops.append(
                         dist.P2POp(
-                            dist.isend,
-                            orth[offset : offset + size],
-                            dist.get_global_rank(group, dst),
-                            group=group,
+                            dist.irecv,
+                            opt._main_grads[param_idx].to_local().reshape(-1),
+                            root,
                         )
                     )
-            elif ranges[this_rank][1] > 0:
-                ops.append(
-                    dist.P2POp(
-                        dist.irecv,
-                        opt._main_grads[param_idx].to_local().reshape(-1),
-                        dist.get_global_rank(group, root),
-                        group=group,
-                    )
-                )
         return dist.batch_isend_irecv(ops) if ops else []
 
     @torch.no_grad()
@@ -314,12 +304,9 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         self._scale_mode = scale_mode
         self._extra_scale_factor = extra_scale_factor
 
-        # Per param: (dp_group, this rank's rank within it, that group's world size).
-        self._comm = []
-        for main_weight in self._main_weights:
-            group = main_weight.device_mesh.get_group()
-            self._comm.append((group, dist.get_rank(group), dist.get_world_size(group)))
-
+        self._shard_ranks = [
+            self._get_shard_ranks(main_weight) for main_weight in self._main_weights
+        ]
         self._shard_ranges = self._compute_shard_ranges()
         self._roots = self._assign_roots()
 
@@ -331,45 +318,80 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         ]
         self._packages = self._build_packages()
 
+    def _get_shard_ranks(self, main_weight):
+        """Return global ranks that own shards of ``main_weight`` in offset order."""
+        mesh = main_weight.device_mesh
+        shard_dims = [
+            mesh_dim
+            for mesh_dim, placement in enumerate(main_weight.placements)
+            if isinstance(placement, Shard)
+        ]
+        if not shard_dims:
+            return (dist.get_rank(),)
+
+        mesh_tensor = mesh.mesh.detach().cpu()
+        current_rank = dist.get_rank()
+        current_coord = (mesh_tensor == current_rank).nonzero(as_tuple=False)
+        if current_coord.numel() == 0:
+            raise RuntimeError(f"Rank {current_rank} is not present in Muon mesh {mesh}.")
+        current_coord = current_coord[0].tolist()
+
+        shard_order = [
+            mesh_dim
+            for mesh_dim in getattr(mesh, "_shard_order", shard_dims)
+            if mesh_dim in shard_dims
+        ]
+        if sorted(shard_order) != sorted(shard_dims):
+            shard_order = shard_dims
+
+        ranks = []
+
+        def visit(order_idx):
+            if order_idx == len(shard_order):
+                ranks.append(int(mesh_tensor[tuple(current_coord)].item()))
+                return
+            mesh_dim = shard_order[order_idx]
+            original = current_coord[mesh_dim]
+            for coord in range(mesh_tensor.shape[mesh_dim]):
+                current_coord[mesh_dim] = coord
+                visit(order_idx + 1)
+            current_coord[mesh_dim] = original
+
+        visit(0)
+        return tuple(ranks)
+
     def _compute_shard_ranges(self):
-        """Compute, per param, each DP rank's (flat_offset, size) within the full param.
+        """Compute each communication peer's ``(flat_offset, size)`` per param."""
+        local_ranges = []
+        for main_weight in self._main_weights:
+            row_numel = 1
+            for dim in main_weight.shape[1:]:
+                row_numel *= dim
+            chunk_list = getattr(main_weight._local_tensor, "__create_chunk_list__", None)
+            if chunk_list is None:
+                offset = 0
+                size = main_weight.to_local().shape[0] * row_numel
+            else:
+                chunks = chunk_list()
+                assert len(chunks) == 1, f"Expected one Muon shard chunk, got {len(chunks)}."
+                offset = chunks[0].offsets[0] * row_numel
+                size = chunks[0].sizes[0] * row_numel
+            local_ranges.append((offset, size))
 
-        Steps:
-          1. group params by dp_group (one all_gather per group);
-          2. all_gather this rank's per-param row counts -> all_ranks_rows[rank][j];
-          3. per param: size = rows * row_numel; prefix-sum the sizes into (offset, size).
+        all_rank_ranges = [None] * dist.get_world_size()
+        dist.all_gather_object(all_rank_ranges, local_ranges)
 
-        Example (world_size=4, param shape (10, 8) so row_numel=8, rows [3, 3, 2, 2]):
-            ranges = [(0, 24), (24, 24), (48, 16), (64, 16)]
-            #           rank0     rank1     rank2      rank3      (size == 0 => no shard)
-        """
-        params_by_group = OrderedDict()
-        for param_idx in range(len(self._main_weights)):
-            params_by_group.setdefault(self._comm[param_idx][0], []).append(param_idx)
-        ranges = [None] * len(self._main_weights)
-        for group, param_indices in params_by_group.items():
-            world_size = dist.get_world_size(group)
-            this_rank_rows = [self._main_weights[p].to_local().shape[0] for p in param_indices]
-            all_ranks_rows = [None] * world_size  # all_ranks_rows[rank][j] = rank's rows for param j
-            dist.all_gather_object(all_ranks_rows, this_rank_rows, group=group)
-            for j, param_idx in enumerate(param_indices):
-                main_weight = self._main_weights[param_idx]
-                row_numel = 1
-                for dim in main_weight.shape[1:]:
-                    row_numel *= dim
-                rank_ranges, offset = [], 0
-                for rank in range(world_size):
-                    size = all_ranks_rows[rank][j] * row_numel
-                    rank_ranges.append((offset, size))
-                    offset += size
-                ranges[param_idx] = rank_ranges
+        ranges = []
+        for param_idx, shard_ranks in enumerate(self._shard_ranks):
+            rank_ranges = [(rank, *all_rank_ranges[rank][param_idx]) for rank in shard_ranks]
+            ranges.append(rank_ranges)
         return ranges
 
     def _assign_roots(self):
-        """Assign each param an NS root rank, load-balancing NS work per dp_group.
+        """Assign each param an NS root rank, load-balancing NS work per shard domain.
 
         Steps:
-          1. group params by dp_group and estimate each param's NS cost;
+          1. group params by shard domain and estimate each param's NS cost;
           2. compute the average NS target load for the group;
           3. assign params heaviest-first, preferring no-comm roots until their
              ranks reach the target, then allowing remote roots for balance.
@@ -384,24 +406,24 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         """
         params_by_group = OrderedDict()
         for param_idx in range(len(self._main_weights)):
-            params_by_group.setdefault(self._comm[param_idx][0], []).append(param_idx)
-        roots = [0] * len(self._main_weights)
-        for _group, param_indices in params_by_group.items():
-            world_size = self._comm[param_indices[0]][2]
-            load = [0] * world_size
+            params_by_group.setdefault(self._shard_ranks[param_idx], []).append(param_idx)
+        roots = [dist.get_rank()] * len(self._main_weights)
+        for shard_ranks, param_indices in params_by_group.items():
+            load = {rank: 0 for rank in shard_ranks}
             work = []
             for param_idx in param_indices:
                 shape = self._main_weights[param_idx].shape
                 ns_cost = shape.numel() * min(shape) if len(shape) == 2 else 0
                 work.append((ns_cost, param_idx))
-            target_load = sum(ns_cost for ns_cost, _param_idx in work) / world_size
+            target_load = sum(ns_cost for ns_cost, _param_idx in work) / len(shard_ranks)
             for ns_cost, param_idx in sorted(work, key=lambda e: (-e[0], e[1])):
                 ranges = self._shard_ranges[param_idx]
                 param_numel = self._main_weights[param_idx].shape.numel()
                 full_holders = [
-                    rank for rank, (_offset, size) in enumerate(ranges) if size == param_numel
+                    rank for rank, _offset, size in ranges if size == param_numel
                 ]
-                holders = [rank for rank, (_offset, size) in enumerate(ranges) if size > 0]
+                holders = [rank for rank, _offset, size in ranges if size > 0]
+                size_by_rank = {rank: size for rank, _offset, size in ranges}
 
                 # Prefer no-comm full holders until they reach the average target.
                 # For split params, prefer shard holders under target before using
@@ -410,9 +432,9 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                 if not candidates:
                     candidates = [rank for rank in holders if load[rank] < target_load]
                 if not candidates:
-                    candidates = range(world_size)
+                    candidates = shard_ranks
 
-                best = min(candidates, key=lambda rank: (load[rank], -ranges[rank][1], rank))
+                best = min(candidates, key=lambda rank: (load[rank], -size_by_rank[rank], rank))
                 roots[param_idx] = best
                 load[best] += ns_cost
         return roots
@@ -425,14 +447,14 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             root = self._roots[param_idx]
             has_comm = any(
                 rank != root
-                for rank, (_offset, size) in enumerate(self._shard_ranges[param_idx])
+                for rank, _offset, size in self._shard_ranges[param_idx]
                 if size > 0
             )
             (comm_params if has_comm else comm_free_params).append(param_idx)
 
         comm_params_by_group = OrderedDict()
         for param_idx in comm_params:
-            comm_params_by_group.setdefault(self._comm[param_idx][0], []).append(param_idx)
+            comm_params_by_group.setdefault(self._shard_ranks[param_idx], []).append(param_idx)
 
         comm_packages = []
         for params_in_group in comm_params_by_group.values():
@@ -515,8 +537,11 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                 continue
             orth = owned_orths.get(param_idx)
             if orth is not None:  # this rank is the root: read its own orth segment directly
-                this_rank = self._comm[param_idx][1]
-                own_offset, own_size = self._shard_ranges[param_idx][this_rank]
+                own_offset, own_size = 0, 0
+                for rank, offset, size in self._shard_ranges[param_idx]:
+                    if rank == dist.get_rank():
+                        own_offset, own_size = offset, size
+                        break
                 orth_shard = orth.reshape(-1)[own_offset : own_offset + own_size]
             else:  # non-root holder: scatter delivered the orth shard into the grad
                 orth_shard = grad.to_local().reshape(-1)
@@ -598,6 +623,9 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
         return []
+
+    def count_zeros(self) -> float:
+        return 0.0
 
     # --- Step contract used by ChainedOptimizer. ---
     def prepare_grads(self) -> bool:

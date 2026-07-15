@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import set_state_dict as _set_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.parallel_state as mpu
 from megatron.core import dist_checkpointing
@@ -1489,8 +1489,13 @@ def _load_torch_dist_into_megatron_fsdp_v2(
         # (e.g. for GroupedMLP with many layers × experts).
         device_mesh = example_val.device_mesh if isinstance(example_val, DTensor) else None
         if device_mesh is not None:
+            placements = [Replicate()] * device_mesh.ndim
+            placements[-1] = Shard(0)
             flat = torch.distributed.tensor.empty(
-                fused_shape, dtype=example_val.dtype, device_mesh=device_mesh, placements=[Shard(0)]
+                fused_shape,
+                dtype=example_val.dtype,
+                device_mesh=device_mesh,
+                placements=placements,
             )
         else:
             flat = torch.empty(fused_shape, dtype=example_val.dtype, device=example_val.device)

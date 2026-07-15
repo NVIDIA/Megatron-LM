@@ -593,7 +593,10 @@ def make_uneven_dtensor(
             are tuples of ints (one per dimension).  Sets chunk metadata
             closures without collectives.
     """
-    assert dp_mesh.ndim == 1, "Only 1D mesh is supported for now"
+    if len(placements) != dp_mesh.ndim:
+        raise ValueError(
+            f"Expected {dp_mesh.ndim} placements for DeviceMesh, got {len(placements)}."
+        )
     if local_tensor.numel() == 0:
         local_shape = (0,) + tuple(shape[1:]) if len(shape) > 1 else (0,)
         local_tensor = local_tensor.reshape(local_shape)

@@ -64,7 +64,9 @@ def _init_dist_grads(self) -> None:
 
     self.dist_grads = []
     for p, dist_param in zip(self.params, self.dist_params):
-        grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
+        grad_data = gbuf.get_item(
+            self.param_idx[p], shard_level="inner" if is_grad_shard else "full"
+        )
         if p.requires_grad and grad_data.numel() > 0:
             self.dist_grads.append(
                 make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)

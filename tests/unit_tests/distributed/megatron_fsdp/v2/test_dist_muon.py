@@ -140,23 +140,13 @@ def _make_mesh(mesh_case, device):
     if _RANK_PAIR_MESH is not None:
         return _RANK_PAIR_MESH
 
-    rank = torch.distributed.get_rank()
-    selected_group, selected_ranks = None, None
-    for start in range(0, world_size, 2):
-        ranks = list(range(start, start + 2))
-        group = torch.distributed.new_group(ranks=ranks)
-        if rank in ranks:
-            selected_group = group
-            selected_ranks = ranks
-
-    assert selected_group is not None
-    # Ranks 2/3 use group ranks 0/1 in a group whose global ranks are 2/3. This
-    # catches P2P code that accidentally passes group ranks as global peers.
-    _RANK_PAIR_MESH = DeviceMesh.from_group(
-        [selected_group],
-        device_type=device.type,
-        mesh=selected_ranks,
-        mesh_dim_names=("dp",),
+    # All ranks must construct the same 2D mesh. The inner dimension is still a
+    # rank-pair subgroup, so ranks 2/3 have group ranks 0/1 with global ranks
+    # 2/3. That catches P2P code that mixes group rank and global rank.
+    _RANK_PAIR_MESH = DeviceMesh(
+        device.type,
+        torch.arange(world_size, dtype=torch.int).reshape(world_size // 2, 2),
+        mesh_dim_names=("dp_outer", "dp"),
     )
     return _RANK_PAIR_MESH
 

@@ -456,9 +456,31 @@ class TracePoolAllocator(BucketAllocator):
 
     # -- Phase 3: optimized runtime ------------------------------------- #
 
+    def _add_optimized_key(
+        self, key: AllocatorKey, size: int, dtype: torch.dtype, device: torch.device
+    ) -> None:
+        """Add a key first observed after the trace plan was built.
+
+        The trace usually sees every temporary key, but some paths are
+        data/control-flow dependent (for example last-microbatch-only HSDP
+        gradient sync).  Give late keys their own dedicated slot instead of
+        failing with KeyError.  This preserves stable addresses for subsequent
+        uses and for release()/resume().
+        """
+        slot_idx = len(self._slots)
+        tensor = torch.empty(size, dtype=dtype, device=device)
+        self._slots.append(
+            self._SlotInfo(tensor=tensor, size=size, dtype=dtype, device=device)
+        )
+        self._key_to_slot[key] = slot_idx
+        self._trace_meta[key] = (size, dtype, device)
+        self._key_to_view[key] = tensor[:size]
+
     def _optimized_allocate(
         self, key: AllocatorKey, size: int, dtype: torch.dtype, device: torch.device
     ) -> Bucket:
+        if key not in self._key_to_slot:
+            self._add_optimized_key(key, size, dtype, device)
         slot_idx = self._key_to_slot[key]
         slot = self._slots[slot_idx]
         assert size <= slot.size, (

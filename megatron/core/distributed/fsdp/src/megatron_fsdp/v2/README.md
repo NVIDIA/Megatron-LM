@@ -18,6 +18,7 @@ v2/
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
 ├── mixed_precision.py           # MixedPrecisionPolicy, FP8Policy, NVFP4Policy
 ├── utils.py                     # Internal utilities (mesh init, backward Function)
+├── design/hsdp_design.md        # HSDP mesh, buffer layouts, and conversions
 ├── design.md                    # Overlap, memory, and synchronization design
 ├── nvfp4_design.md              # NVFP4 primary-weights design
 ├── mcore_fsdp_checkpoint_design.md  # Checkpoint save/load and format conversion design
@@ -190,12 +191,15 @@ strategy controls which buffers and communication collectives are used.
 
 ### Parallelism
 
-- **Tensor Parallelism (TP):** Not supported. v2 currently operates on a 1D
-  DP-only DeviceMesh. Parameters that are already partitioned by TP layers
-  (e.g., `ColumnParallelLinear`, `RowParallelLinear`) are not correctly handled.
+- **Tensor Parallelism (TP):** The FSDP DeviceMesh contains DP/EDP dimensions,
+  not a TP placement. Parameters that are already partitioned by TP layers
+  (e.g., `ColumnParallelLinear`, `RowParallelLinear`) are not represented with
+  TP-aware DTensor metadata.
   See [tp_support_design.md](tp_support_design.md) for the planned design.
-- **Hybrid Sharding (HSDP):** Not supported. v2 does not yet support an outer
-  DP dimension for hybrid (inter-node + intra-node) sharding.
+- **Hybrid Sharding (HSDP):** A 2D `(dp_outer, dp/edp)` mesh supports outer
+  replication and outer optimizer-state sharding. Outer `optim` currently
+  requires inner `optim_grads_params`; NVFP4 outer optimizer sharding is not
+  supported. See [design/hsdp_design.md](design/hsdp_design.md).
 
 ### Sharding Strategies
 
@@ -312,16 +316,13 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 ## Gotchas / Pitfalls
 
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
-- **Temporary communication bucket lifecycle.** All temporary all-gather /
-  reduce-scatter buckets are allocated on the caller CUDA stream and only
-  communication collectives (all-gather, reduce-scatter) run on side streams
-  (`ag_stream`, `rs_stream`). CUDA events inserted at the boundary between
-  allocation and compute, and between compute and free, guarantee ordering
-  without ``record_stream``.  ``record_stream`` is intentionally avoided
-  because it forces the caching allocator to hold memory blocks until the
-  recorded stream finishes, preventing reuse across iterations and causing
-  significant peak memory regressions
-  ([discussion](https://dev-discuss.pytorch.org/t/1486)).
+- **Temporary communication bucket lifecycle.** Temporary all-gather /
+  reduce-scatter buckets are allocated on the caller CUDA stream. Parameter
+  all-gathers run on `ag_stream`; gradient collectives run on `rs_stream`,
+  where full-iteration graphs may also stage add/copy/zero work immediately
+  before reduction. CUDA events order preparation, communication, consumption,
+  and free. All all-gather outputs additionally record their producer stream so
+  the allocator cannot recycle a temporary buffer while communication is using it.
 
 ## Unit Tests
 

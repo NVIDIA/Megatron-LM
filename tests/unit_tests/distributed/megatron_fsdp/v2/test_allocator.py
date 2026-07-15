@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import (
     Bucket,
     TemporaryBucketAllocator,
+    TracePoolAllocator,
 )
 
 
@@ -81,6 +82,32 @@ class TestTemporaryBucketAllocator:
 
     def test_full_lifecycle(self):
         _run_allocator_tests(TemporaryBucketAllocator())
+
+
+class TestTracePoolAllocator:
+
+    def test_late_optimized_key_gets_dedicated_slot(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        allocator.allocate(key="traced", size=8, dtype=torch.float32, device=device)
+        allocator.free("traced")
+        allocator.plan()
+        assert allocator.phase == "optimized"
+
+        bucket = allocator.allocate(key="late", size=4, dtype=torch.float32, device=device)
+        assert bucket.data.numel() == 4
+        assert bucket.data.dtype == torch.float32
+        assert "late" in allocator._key_to_slot
+        allocator.free("late")
+
+        allocator.release()
+        assert allocator.phase == "released"
+        bucket = allocator.allocate(key="late", size=4, dtype=torch.float32, device=device)
+        assert allocator.phase == "optimized"
+        assert bucket.data.numel() == 4
+        assert bucket.data.dtype == torch.float32
+        allocator.free("late")
 
 
 if __name__ == "__main__":

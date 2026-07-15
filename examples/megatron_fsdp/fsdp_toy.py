@@ -126,14 +126,23 @@ class TeacherStudentData:
 # Distributed init / mesh
 # -----------------------
 
-def init_distributed() -> torch.distributed.device_mesh.DeviceMesh:
+def init_distributed(enable_hsdp: bool = False) -> torch.distributed.device_mesh.DeviceMesh:
     """Initialize process group and device mesh."""
     if not dist.is_initialized():
         dist.init_process_group("nccl")
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     torch.cuda.set_device(rank)
-    mesh = init_device_mesh("cuda", mesh_shape=(world_size,))
+    if enable_hsdp:
+        if world_size % 2 != 0:
+            raise ValueError(f"HSDP requires an even world size, got {world_size}.")
+        mesh = init_device_mesh(
+            "cuda",
+            mesh_shape=(2, world_size // 2),
+            mesh_dim_names=("dp_outer", "dp"),
+        )
+    else:
+        mesh = init_device_mesh("cuda", mesh_shape=(world_size,))
     return mesh
 
 
@@ -144,6 +153,7 @@ def build_fsdp_model(
     use_activation_checkpointing: bool = False,
     enable_cuda_graph: bool = False,
     enable_trace_pool: bool = False,
+    enable_hsdp: bool = False,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
         try:
@@ -153,27 +163,25 @@ def build_fsdp_model(
     else:
         from torch.distributed.fsdp import FSDPModule, fully_shard
 
-    mesh = init_distributed()
+    mesh = init_distributed(enable_hsdp)
     model = ToyModel(dim=dim, n_layers=n_layers).to(device="cuda", dtype=torch.bfloat16)
 
     if use_activation_checkpointing:
         model.enable_activation_checkpointing()
 
     if use_megatron_fsdp:
-        sublayer_kwargs = dict(
-            enable_cuda_graph=enable_cuda_graph,
+        root_kwargs = dict(
             enable_trace_pool=enable_trace_pool,
+            outer_dp_sharding_strategy="optim",
         )
-        kwargs = dict(
-            enable_trace_pool=enable_trace_pool,
-        )
+        sublayer_kwargs = dict(root_kwargs, enable_cuda_graph=enable_cuda_graph)
     else:
         sublayer_kwargs = {}
-        kwargs = {}
+        root_kwargs = {}
 
     for layer in model.layers:
         fully_shard(layer, mesh=mesh, **sublayer_kwargs)
-    fully_shard(model, mesh=mesh, **kwargs)
+    fully_shard(model, mesh=mesh, **root_kwargs)
 
     assert isinstance(model, ToyModel)
     assert isinstance(model, FSDPModule)
@@ -312,6 +320,10 @@ def train(
 
     for epoch in range(args.epochs):
         for _ in range(args.steps_per_epoch):
+            if hasattr(model, "set_is_last_backward"):
+                # This toy loop has one micro-batch per optimizer step.
+                model.set_is_last_backward(True)
+
             if data is not None:
                 # Deterministic teacher-student regression: loss must decrease.
                 x, target = data.sample(args.batch_size, args.seq_len, step, rank)
@@ -400,6 +412,8 @@ def parse_args() -> argparse.Namespace:
                         "to keep the Megatron-FSDP and PyTorch FSDP2 paths aligned.")
     parser.add_argument("--use-trace-pool", action="store_true", default=False,
                         help="Use TracePoolAllocator for stable buffer addresses")
+    parser.add_argument("--enable-hsdp", action="store_true",
+                        help="Enable 2xN HSDP with outer optimizer sharding")
     parser.add_argument("--release-memory-pool", action="store_true", default=False,
                         help="Call FSDPModule.release_memory_pool() after each backward "
                         "to release allocator slot tensors and CUDA graphs. "
@@ -418,6 +432,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.enable_hsdp and not args.use_megatron_fsdp:
+        raise ValueError("--enable-hsdp requires --use-megatron-fsdp")
 
     if args.record_memory_history:
         torch.cuda.memory._record_memory_history(
@@ -435,6 +451,7 @@ def main() -> None:
         use_activation_checkpointing=args.activation_checkpoint,
         enable_cuda_graph=args.cuda_graph,
         enable_trace_pool=args.use_trace_pool,
+        enable_hsdp=args.enable_hsdp,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 

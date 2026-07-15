@@ -4,7 +4,7 @@
 
 import logging
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -23,32 +23,44 @@ logger = logging.getLogger(__name__)
 
 
 def _unshard_weight_buffers(
-    dp_group,
+    outer_dp_group,
+    inner_dp_group,
     weight_buffers,
     *,
     async_op: bool,
     stream: torch.cuda.Stream,
     caller_stream: torch.cuda.Stream,
 ) -> None:
-    """Unshard one communication-compatible buffer run."""
+    """Unshard one communication-compatible buffer run by mesh dimension."""
     # Allocate on the caller stream before entering the communication stream.
-    full_buffers = [weight_buffer.fetch_buffer(as_shard=False) for weight_buffer in weight_buffers]
+    full_buffers = [
+        weight_buffer.fetch_buffer((0, 0)) for weight_buffer in weight_buffers
+    ]
     if async_op:
         stream.wait_stream(caller_stream)
 
-    cm = (
-        _coalescing_manager(dp_group, async_ops=async_op)
-        if len(weight_buffers) > 1
-        else nullcontext()
-    )
-    with torch.cuda.stream(stream):
+    def unshard_dimension(group, unshard_dim: int) -> None:
+        cm = (
+            _coalescing_manager(group, async_ops=async_op)
+            if len(weight_buffers) > 1
+            and torch.distributed.get_world_size(group) > 1
+            else nullcontext()
+        )
         with cm as coalescing_event:
             for weight_buffer in weight_buffers:
-                # The full buffer is already allocated, so only the collective
-                # is dispatched while the communication stream is current.
-                weight_buffer.unshard(bind_params=False, stream=stream)
+                weight_buffer.unshard(
+                    unshard_dim=unshard_dim,
+                    bind_params=False,
+                    stream=stream,
+                )
         if async_op and coalescing_event is not None:
             coalescing_event.wait()
+
+    with torch.cuda.stream(stream):
+        # Dim 0 is state-driven: no_shard and clean buffers fast-path, while
+        # dirty outer=optim buffers issue the outer all-gather.
+        unshard_dimension(outer_dp_group, unshard_dim=0)
+        unshard_dimension(inner_dp_group, unshard_dim=1)
 
     # Rebinding only updates tensor metadata and stays on the caller stream.
     for weight_buffer, full_buffer in zip(weight_buffers, full_buffers):
@@ -155,6 +167,9 @@ class _FSDPRootContext:
 
     enable_async_reduce_grad: bool = True
     """Whether to overlap gradient reduction with backward computation."""
+
+    is_last_microbatch: bool = False
+    """Whether the current backward pass is the last micro-batch in an optimizer step."""
 
     # ------------------------------------------------------------------
     # Activation recompute / gradient checkpointing support
@@ -430,6 +445,7 @@ class FSDPModule:
         mp_policy: MixedPrecisionPolicy,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
+        outer_dp_sharding_strategy: str = "no_shard",
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -461,6 +477,7 @@ class FSDPModule:
             ignored_params=ignored_params,
             gradient_scaling_factor=gradient_scaling_factor,
             sharding_strategy=sharding_strategy,
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -489,7 +506,9 @@ class FSDPModule:
             gbuf = p._gbuf
             item_id = p._item_id
 
-            gbuf_data = gbuf.fetch_buffer()
+            # Full (0, 0) unsharded grad: the backward writes the full gradient
+            # (params are all-gathered during bwd); reduce_grad later scatters it.
+            gbuf_data = gbuf.fetch_buffer((0, 0))
             assert gbuf_data is not None
             assert gbuf_data.numel() > 0
 
@@ -521,11 +540,19 @@ class FSDPModule:
         After materialization, full parameters are broadcast from DP rank 0
         before DTensor wrapping so every rank shards the same initialized value.
         """
-        materialization_device = f"cuda:{torch.cuda.current_device()}"
+        current_device = torch.cuda.current_device()
+        # The CUDA API returns an integer in production. Accept a torch.device override
+        # so CPU-only materialization tests can exercise this path without a GPU.
+        materialization_device = (
+            current_device
+            if isinstance(current_device, torch.device)
+            else torch.device("cuda", current_device)
+        )
         for name, m in self.named_modules():
             if m in ignored_modules:
                 continue
-            # Skip modules that don't have meta parameters
+            # Match v1 meta init: reset modules that own meta parameters. Buffer-only
+            # meta modules may intentionally keep lazy state initialized in forward.
             if all(not p.is_meta for p in m.parameters(recurse=False)):
                 continue
 
@@ -545,20 +572,20 @@ class FSDPModule:
                     raise ValueError(
                         f"Module {name} contains meta parameters but cannot reset them"
                     )
-            # Move materialized parameters to the same target device (e.g., GPU)
-            m.to(materialization_device)
+            # Move only this module's direct tensors. named_modules() visits each child
+            # separately, so it is moved only after its own materialization and reset.
+            m._apply(lambda t: t.to(materialization_device), recurse=False)
 
         if mesh is not None and mesh.size() > 1:
-            dp_group = mesh.get_group()
-            src_rank = torch.distributed.get_global_rank(dp_group, 0)
-            for name, m in self.named_modules():
-                if m in ignored_modules:
+            for param in self.parameters():
+                if param.is_meta or isinstance(param, DTensor):
                     continue
-                for param in m.parameters():
-                    if param.is_meta or isinstance(param, DTensor):
+                for mesh_dim in range(mesh.ndim):
+                    group = mesh.get_group(mesh_dim=mesh_dim)
+                    if torch.distributed.get_world_size(group) == 1:
                         continue
-                    param.data = param.data.to(materialization_device)
-                    torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
+                    src_rank = torch.distributed.get_global_rank(group, 0)
+                    torch.distributed.broadcast(param.data, src=src_rank, group=group)
 
     def _init_fsdp_state(
         self,
@@ -670,7 +697,12 @@ class FSDPModule:
         if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
             root_context.enable_cuda_graph = True
 
-    def unshard(self, async_op: bool = False, bwd_pass: bool = False):
+    def unshard(
+        self,
+        async_op: bool = False,
+        bwd_pass: bool = False,
+        prefetch: bool = True,
+    ):
         """
         Unshard parameters by all-gathering from the sharded buffer.
 
@@ -683,7 +715,7 @@ class FSDPModule:
         caller_stream, stream = _select_unshard_stream(ctx, async_op=async_op)
 
         # Unshard this module and optionally prefetch next modules in the forward/backward pass
-        if async_op:
+        if async_op and prefetch:
             prefetch_modules = ctx.get_prefetch_next_modules(self, bwd_pass=bwd_pass)
         else:
             prefetch_modules = []
@@ -696,8 +728,9 @@ class FSDPModule:
             if bwd_pass and id(module) in ctx.backward_done_modules:
                 continue  # Skip prefetch for modules whose backward is already done
 
-            # Build communication-compatible runs on the caller stream. The
-            # helper narrows the side-stream scope to collectives only.
+            # Build communication-compatible runs on the caller stream. Each run
+            # processes outer-DP before inner-DP; buffer state determines whether
+            # either dimension launches a collective.
             buffer_runs = []
             for param_names, param_group in module._named_param_groups:
                 # Optional NaN checking for debugging
@@ -710,24 +743,27 @@ class FSDPModule:
                 for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
                     if (
                         buffer_runs
-                        and buffer_runs[-1][0] is weight_buffer.dp_group
-                        and buffer_runs[-1][1] == weight_buffer.dtype
-                        and buffer_runs[-1][2] == weight_buffer.device
+                        and buffer_runs[-1][0] is weight_buffer.outer_dp_group
+                        and buffer_runs[-1][1] is weight_buffer.inner_dp_group
+                        and buffer_runs[-1][2] == weight_buffer.dtype
+                        and buffer_runs[-1][3] == weight_buffer.device
                     ):
-                        buffer_runs[-1][3].append(weight_buffer)
+                        buffer_runs[-1][4].append(weight_buffer)
                     else:
                         buffer_runs.append(
                             (
-                                weight_buffer.dp_group,
+                                weight_buffer.outer_dp_group,
+                                weight_buffer.inner_dp_group,
                                 weight_buffer.dtype,
                                 weight_buffer.device,
                                 [weight_buffer],
                             )
                         )
 
-            for dp_group, _, _, weight_buffers in buffer_runs:
+            for outer_dp_group, inner_dp_group, _, _, weight_buffers in buffer_runs:
                 _unshard_weight_buffers(
-                    dp_group,
+                    outer_dp_group,
+                    inner_dp_group,
                     weight_buffers,
                     async_op=async_op,
                     stream=stream,
@@ -845,17 +881,23 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
-            zero_targets = []
-            copy_srcs = []
-            copy_dsts = []
+            grad_replicated = param_group.sharding_strategy in ("no_shard", "optim")
+            add_to_main_grad = (
+                grad_replicated and not param_group._grad_buffer_is_fresh
+            )
+            stage_tensors: List[torch.Tensor] = []
+            stage_sources: List[torch.Tensor] = []
+            zero_tensors: List[torch.Tensor] = []
+            params_with_grad = []
 
-            for name, param in zip(param_names, param_group.params):
+            for param in param_group.params:
+                grad = param.grad
+                if grad is not None:
+                    params_with_grad.append(param)
                 grad_added = getattr(param, "grad_added_to_main_grad", False)
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
 
                 if grad_added or recorded:
-                    if param.grad is not None:
-                        del param.grad
                     # Record TE wgrad-fusion flags for CUDA graph restore.
                     # The trace backward ran eagerly, so TE set
                     # grad_added_to_main_grad on each param it wrote to.
@@ -864,49 +906,69 @@ class FSDPModule:
                     # the CG replay backward.
                     if grad_added and self._fsdp_state.enable_cuda_graph:
                         setattr(param, "_mfsdp_recorded_te_wgrad", True)
-                elif param.grad is None:
-                    main_grad = param.get_main_grad()
-                    param_main_grad = getattr(param, "main_grad", None)
-                    if (
-                        param_main_grad is None
-                        or param_main_grad.data_ptr() != main_grad.data_ptr()
-                    ):
-                        zero_targets.append(main_grad.view(-1))
+                elif grad is None:
+                    if not add_to_main_grad:
+                        zero_tensors.append(param.get_main_grad())
                 else:
-                    main_grad = param.get_main_grad()
-                    copy_srcs.append(param.grad.detach().view(-1))
-                    copy_dsts.append(main_grad.view(-1))
-                    del param.grad
+                    stage_tensors.append(param.get_main_grad())
+                    stage_sources.append(grad.detach())
 
             # Full-iteration graphs stage ordinary async gradients on the RS stream so
-            # the copies can overlap with the next module's backward compute. Other
-            # execution modes retain the existing caller-stream behavior.
+            # the add/copy/zero work overlaps with the next module's backward compute.
             stage_on_rs_stream = async_op and getattr(
                 self._fsdp_state, "enable_full_iteration_cuda_graph", False
             )
             if stage_on_rs_stream:
                 stream.wait_stream(torch.cuda.current_stream())
-                for source in copy_srcs:
-                    source.record_stream(stream)
+                for source in stage_sources:
+                    if source.is_cuda:
+                        source.record_stream(stream)
                 with torch.cuda.stream(stream):
-                    if zero_targets:
-                        torch._foreach_zero_(zero_targets)
-                    if copy_dsts:
-                        torch._foreach_copy_(copy_dsts, copy_srcs)
+                    if stage_tensors:
+                        if add_to_main_grad:
+                            torch._foreach_add_(stage_tensors, stage_sources)
+                        else:
+                            torch._foreach_copy_(stage_tensors, stage_sources)
+                    if zero_tensors:
+                        torch._foreach_zero_(zero_tensors)
             else:
-                if zero_targets:
-                    torch._foreach_zero_(zero_targets)
-                if copy_dsts:
-                    torch._foreach_copy_(copy_dsts, copy_srcs)
+                if stage_tensors:
+                    if add_to_main_grad:
+                        torch._foreach_add_(stage_tensors, stage_sources)
+                    else:
+                        torch._foreach_copy_(stage_tensors, stage_sources)
+                if zero_tensors:
+                    torch._foreach_zero_(zero_tensors)
+
+            for param in params_with_grad:
+                if param.grad is not None:
+                    del param.grad
+
+            stage_tensors.clear()
+            stage_sources.clear()
+            zero_tensors.clear()
+            grad = None
+
+            for param in param_group.params:
+                # Consume this per-backward marker here. A skipped module may not run
+                # _pre_backward_setup on the next microbatch, so leaving it set would
+                # make stale scratch storage look like a fused wgrad.
+                param.grad_added_to_main_grad = False
+
+            if grad_replicated:
+                param_group._grad_buffer_is_fresh = False
 
             if async_op:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
-                param_group.reduce_grad(stream=stream)
+                param_group.reduce_grad(
+                    is_last_microbatch=ctx.is_last_microbatch,
+                    stream=stream,
+                )
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
-                param_group.reduce_grad()
+                param_group.reduce_grad(is_last_microbatch=ctx.is_last_microbatch)
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
@@ -949,26 +1011,8 @@ class FSDPModule:
     @torch.no_grad()
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """Finish optimizer-facing gradient synchronization for this iteration."""
-        ctx = self._fsdp_root_context
-        for _, child in self.named_modules():
-            if not isinstance(child, FSDPModule):
-                continue
-            if any(
-                param_group.sharding_strategy in ("no_shard", "optim")
-                for param_group in child._fsdp_param_groups
-            ):
-                # no_shard and ZeRO-1 keep gradients replicated during backward.
-                # Sync them once at the iteration grad-sync boundary: no_shard
-                # all-reduces full grads, ZeRO-1 reduce-scatters virtual shards.
-                child.reduce_grad(async_op=False)
-            for param_group in child._fsdp_param_groups:
-                for param, dist_grad in zip(param_group.params, param_group.dist_grads):
-                    if param.requires_grad:
-                        # v1 replaces module params with optimizer-facing distributed
-                        # params after grad sync. v2 keeps compute params in the module,
-                        # so mirror the reduced grad for shared finalizers.
-                        param.main_grad = dist_grad
-        torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+        assert not force_all_reduce, "FSDP v2 does not support force_all_reduce."
+        torch.cuda.current_stream().wait_stream(self._fsdp_root_context.rs_stream)
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
@@ -1124,7 +1168,9 @@ class FSDPModule:
                     elem_size = _elem_size(buffer.dtype)
                     group_pad += max(0, global_size - numel) * elem_size
                     group_comm += global_size * elem_size
-                    dist_flag = "D" if buffer.is_distributed else "R"
+                    dist_flag = (
+                        "O" if buffer.outer_sharded else "I" if buffer.inner_sharded else "R"
+                    )
                     buffer_entries.append(
                         f"{buffer_label}[{_fmt_dtype(buffer.dtype)}:{buffer.data_size}:{dist_flag}]"
                     )
@@ -1183,14 +1229,45 @@ class FSDPModule:
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        param_data = wbuf.get_item(param_group.param_idx[param], as_shard=False)
-                        assert not torch.isnan(
-                            param_data
-                        ).any(), "NaN detected in model weight buffer"
+                        # shard_layout=(outer, inner): (0, 0) means neither dimension is sharded.
+                        param_data = wbuf.get_item(
+                            param_group.param_idx[param], shard_layout=(0, 0)
+                        )
+                        assert not torch.isnan(param_data).any(), (
+                            "NaN detected in model weight buffer"
+                        )
 
     def get_root_module(self):
         """Return the root FSDP module associated with this module."""
         return self._fsdp_root_context.get_root_module()
+
+    def set_is_last_backward(self, is_last_backward: bool = True):
+        """Set whether the next backward is the optimizer-step boundary.
+
+        This mirrors PyTorch FSDP2's microbatching API.  On the last backward,
+        delayed inner grad reductions and outer-DP grad sync are issued.
+        """
+        self._fsdp_root_context.is_last_microbatch = is_last_backward
+
+    @contextmanager
+    def no_sync(self):
+        """Defer the outer-DP / HSDP gradient reduce until the last micro-batch
+        (like MegatronFSDP v1 / PyTorch DDP ``no_sync``).
+
+        Example::
+
+            with model.no_sync():
+                loss(mb0).backward()   # accumulate, no reduce
+            loss(mb1).backward()       # last micro-batch -> reduce fires
+        """
+        if not self._fsdp_state._is_root:
+            yield
+            return
+        self.set_is_last_backward(False)
+        try:
+            yield
+        finally:
+            self.set_is_last_backward(True)
 
     def _sync_module_states_after_load(self):
         self._copy_main_weights_to_model_weights()
@@ -1203,6 +1280,7 @@ def _get_module_fsdp_param_groups(
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
     sharding_strategy: str = "optim_grads_params",
+    outer_dp_sharding_strategy: str = "no_shard",
 ) -> List[ParameterGroup]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
@@ -1235,6 +1313,7 @@ def _get_module_fsdp_param_groups(
                 mp_policy=mp_policy,
                 gradient_scaling_factor=gradient_scaling_factor,
                 sharding_strategy=sharding_strategy,
+                outer_dp_sharding_strategy=outer_dp_sharding_strategy,
             )
         )
 

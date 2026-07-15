@@ -273,8 +273,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-        edp_mesh = _init_dp_mesh(pg_collection, edp=True)
-        dp_mesh = _init_dp_mesh(pg_collection, edp=False)
+        edp_mesh = _init_dp_mesh(pg_collection, ddp_config, edp=True)
+        dp_mesh = _init_dp_mesh(pg_collection, ddp_config, edp=False)
 
         fully_shard_mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
@@ -306,6 +306,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             "enable_trace_pool": ddp_config.fsdp_double_buffer or ddp_config.fsdp_trace_pool,
             "enable_full_iteration_cuda_graph": config.cuda_graph_impl == "full_iteration",
             "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
+            "outer_dp_sharding_strategy": ddp_config.outer_dp_sharding_strategy,
             "fine_grained_hooks": config.overlap_moe_expert_parallel_comm,
             "skip_backward_callback": config.delay_wgrad_compute,
             "skip_final_backward_callback": config.overlap_moe_expert_parallel_comm,
@@ -418,7 +419,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.module._copy_main_weights_to_model_weights
         )
         self.ddp_config = ddp_config
-        self.no_sync = nullcontext
+        self.no_sync = self.module.no_sync
+        # Wire no_sync into the schedule's no_sync_func at overlap=False (training.py
+        # wires it only for overlap=True), so the last-micro-batch signal reaches FSDP.
+        if not ddp_config.overlap_grad_reduce and config.no_sync_func is None:
+            config.no_sync_func = self.no_sync
         self.start_param_sync = noop
         self.start_grad_sync = noop
 
@@ -741,7 +746,60 @@ def _reset_parameters(module):
             parent_fsdp_module_map[m].reshard()
 
 
-def _init_dp_mesh(pg_collection, edp=False):
+def _build_hsdp_dp_mesh(
+    outer_group,
+    inner_group,
+    tp_group,
+    flatten_group,
+    *,
+    inner_dim_name,
+    ep_size=1,
+):
+    ranks = _get_hsdp_tp_mesh(outer_group, inner_group, tp_group, ep_size=ep_size)
+    ranks = ranks[:, :, tp_group.rank()]
+    mesh = DeviceMesh.from_group(
+        [outer_group, inner_group],
+        device_type="cuda",
+        mesh=ranks.tolist(),
+        mesh_dim_names=("dp_outer", inner_dim_name),
+    )
+
+    name = "_".join(mesh.mesh_dim_names)
+    if hasattr(mesh, "_flatten_mapping"):
+        root = mesh._get_root_mesh()
+        layout = mesh._layout.coalesce()
+        if len(layout) > 1:
+            layout = layout.nest()
+        flat_mesh = DeviceMesh(
+            root._device_type,
+            _layout=layout,
+            _rank_map=root._rank_map,
+            mesh_dim_names=(name,),
+            _root_mesh=root,
+            _init_backend=False,
+        )
+        flat_mesh._dim_group_names = [flatten_group.group_name]
+        root._pg_registry[flatten_group.group_name] = flatten_group
+        root._flatten_mapping[name] = flat_mesh
+    else:
+        from torch.distributed.device_mesh import _mesh_resources
+
+        flat_mesh = DeviceMesh.from_group(
+            flatten_group,
+            device_type=mesh.device_type,
+            mesh=mesh.mesh.flatten().tolist(),
+            mesh_dim_names=(name,),
+        )
+        root = _mesh_resources.get_root_mesh(mesh)
+        if hasattr(_mesh_resources, "flatten_name_to_root_dims"):
+            _mesh_resources.flatten_name_to_root_dims.setdefault(root, {}).pop(name, None)
+        _mesh_resources.root_to_flatten_mapping.setdefault(root, {})[name] = flat_mesh
+        _mesh_resources.child_to_root_mapping[flat_mesh] = root
+
+    return mesh
+
+
+def _init_dp_mesh(pg_collection, ddp_config, edp=False):
     assert HAVE_DTENSOR, (
         "DTensor support is required to initialize the device mesh. "
         "Please install a compatible version of PyTorch."
@@ -749,22 +807,39 @@ def _init_dp_mesh(pg_collection, edp=False):
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    if edp:
-        mesh = DeviceMesh.from_group(
-            device_type="cuda",
-            group=pg_collection.expt_dp,
-            mesh=dist.get_process_group_ranks(pg_collection.expt_dp),
-            mesh_dim_names=("edp",),
-        )
-    else:
-        mesh = DeviceMesh.from_group(
-            device_type="cuda",
-            group=pg_collection.dp_cp,
-            mesh=dist.get_process_group_ranks(pg_collection.dp_cp),
-            mesh_dim_names=("dp",),
-        )
 
-    return mesh
+    outer_dp_size = max(1, getattr(ddp_config, "num_distributed_optimizer_instances", 1) or 1)
+    inner_group = (
+        (pg_collection.intra_expt_dp if edp else pg_collection.intra_dp_cp)
+        if outer_dp_size > 1
+        else (pg_collection.expt_dp if edp else pg_collection.dp_cp)
+    )
+    inner_dim_name = "edp" if edp else "dp"
+    tp_group = getattr(pg_collection, 'expt_tp' if edp else 'tp', None)
+    if tp_group is None:
+        tp_group = dist.new_group(ranks=[dist.get_rank()])
+    ep_group = getattr(pg_collection, 'ep', None)
+    ep_size = ep_group.size() if edp and ep_group is not None else 1
+
+    outer_group = (
+        pg_collection.inter_dist_opt
+        if outer_dp_size > 1
+        else dist.new_group(ranks=[dist.get_rank()])
+    )
+    flatten_group = getattr(pg_collection, 'expt_dp' if edp else 'dp_cp', None)
+    if flatten_group is None:
+        raise RuntimeError(
+            "[Megatron-FSDP] DeviceMesh flatten requires the full "
+            f"{'expert ' if edp else ''}data-parallel process group."
+        )
+    return _build_hsdp_dp_mesh(
+        outer_group,
+        inner_group,
+        tp_group,
+        flatten_group,
+        inner_dim_name=inner_dim_name,
+        ep_size=ep_size,
+    )
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):

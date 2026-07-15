@@ -15,11 +15,14 @@ import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor.placement_types import Replicate, Shard
 
-from ..uneven_dtensor import make_uneven_dtensor, update_uneven_dtensor_chunk_metadata
+from ..uneven_dtensor import (
+    make_uneven_dtensor,
+    update_uneven_dtensor_chunk_metadata,
+)
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
 from .mixed_precision import MixedPrecisionPolicy
-from .utils import ParamGroupIdx
+from .utils import ParamGroupIdx, _prepare_fsdp_mesh
 
 
 def _zero_tensor_storage(tensor: torch.Tensor) -> None:
@@ -55,6 +58,7 @@ class ParameterGroup:
         mp_policy: MixedPrecisionPolicy,
         mesh: Optional[DeviceMesh] = None,
         sharding_strategy: str = "optim_grads_params",
+        outer_dp_sharding_strategy: str = "no_shard",
         gradient_scaling_factor: Optional[float] = None,
         allocator: Optional[BucketAllocator] = None,
     ):
@@ -71,19 +75,34 @@ class ParameterGroup:
 
         # Setup device mesh and derived process group
         if mesh is None:
+            world_ranks = torch.arange(
+                torch.distributed.get_world_size(torch.distributed.group.WORLD)
+            ).reshape(1, -1)
             mesh = DeviceMesh(
                 self.device.type,
-                list(range(torch.distributed.get_world_size(torch.distributed.group.WORLD))),
+                world_ranks,
+                mesh_dim_names=("dp_outer", "dp"),
             )
-        assert mesh.ndim == 1, "Only 1D mesh is supported"
+        mesh = _prepare_fsdp_mesh(mesh)
         self.mesh = mesh
-        self.dp_group = mesh.get_group()
+        self.outer_dp_group = self.mesh.get_group(mesh_dim=0)
+        self.dp_group = self.mesh.get_group(mesh_dim=1)
         self._dp_rank = torch.distributed.get_rank(self.dp_group)
         self._dp_world_size = torch.distributed.get_world_size(self.dp_group)
 
         if sharding_strategy not in ("no_shard", "optim", "optim_grads", "optim_grads_params"):
             raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
+        if outer_dp_sharding_strategy not in ("no_shard", "optim"):
+            raise ValueError(
+                f"Unsupported outer DP sharding strategy: {outer_dp_sharding_strategy}"
+            )
+        if outer_dp_sharding_strategy == "optim" and sharding_strategy != "optim_grads_params":
+            raise NotImplementedError(
+                "FSDP v2 outer-DP optimizer sharding currently requires inner "
+                f"optim_grads_params, got {sharding_strategy}."
+            )
         self.sharding_strategy = sharding_strategy
+        self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.param_group_id = param_group_id
 
         # Compute chunk size factor for alignment
@@ -102,9 +121,6 @@ class ParameterGroup:
         self.transpose_weight_buffer: Optional[DataParallelBuffer] = None
         self.main_weight_buffer: Optional[DataParallelBuffer] = None
         self.main_grad_buffer: Optional[DataParallelBuffer] = None
-        self.hsdp_wbuf: Optional[DataParallelBuffer] = None
-        self.hsdp_gbuf: Optional[DataParallelBuffer] = None
-        self.hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
         # Initialize buffers and distributed parameters
         self._init_buffers()
 
@@ -120,23 +136,21 @@ class ParameterGroup:
             if buffer is not None:
                 buffer.allocator = allocator
 
-    def _create_buffer(
-        self, dtype: torch.dtype, is_distributed: bool, role: str
-    ) -> DataParallelBuffer:
+    def _create_buffer(self, dtype: torch.dtype, role: str) -> DataParallelBuffer:
         """Create a buffer and namespace its temporary bucket by role."""
         return DataParallelBuffer(
             params=self.params,
             param_idx=self.param_idx,
             dtype=dtype,
             device=self.device,
-            dp_group=self.dp_group,
+            mesh=self.mesh,
             allocator=self.allocator,
             buffer_role=role,
-            is_distributed=is_distributed,
             param_group_id=self.param_group_id,
             gradient_scaling_factor=self.gradient_scaling_factor,
             chunk_size_factor=self.chunk_size_factor,
             sharding_strategy=self.sharding_strategy,
+            outer_dp_sharding_strategy=self.outer_dp_sharding_strategy,
             mp_policy=self.mp_policy,
         )
 
@@ -151,22 +165,17 @@ class ParameterGroup:
           sharding layout; otherwise the optimizer mutates model_weight_buffer
         - main_grad_buffer: created if requires_grad
         """
-        s = self.sharding_strategy
-        shard_weights = s == "optim_grads_params"
-        shard_main_weights = s != "no_shard"
-        shard_grads = s in ("optim_grads", "optim_grads_params")
-
         # Create model weight buffers. The policy owns dtype-sensitive storage
         # choices and exposes the tensor view that should be packed.
         model_weight_dtype = self.mp_policy.model_weight_buffer_dtype(self.params[0])
-        wbuf = self._create_buffer(model_weight_dtype, shard_weights, "model_weight")
+        wbuf = self._create_buffer(model_weight_dtype, "model_weight")
         wbuf.init_data(torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device))
         for i, p in enumerate(self.params):
             wbuf.set_item(i, self.mp_policy.get_param_data(p))
         self.model_weight_buffer = wbuf
 
         if self.mp_policy.needs_transpose_weight_buffer(self.params[0]):
-            tbuf = self._create_buffer(torch.uint8, shard_weights, "transpose_weight")
+            tbuf = self._create_buffer(torch.uint8, "transpose_weight")
             tbuf.init_data(torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
                 tbuf.set_item(i, self.mp_policy.get_param_data(p, transpose=True))
@@ -182,10 +191,15 @@ class ParameterGroup:
         # differs from the optimizer dtype (fp32), so the dtype guard below
         # already prevents skipping them.
         main_params_dtype = self.mp_policy.main_params_dtype_for_param(self.params[0])
+        main_weight_shard_layout = (
+            int(self.outer_dp_sharding_strategy != "no_shard"),
+            int(self.sharding_strategy != "no_shard"),
+        )
         if main_params_dtype is not None and (
-            main_params_dtype != model_weight_dtype or shard_main_weights != shard_weights
+            main_params_dtype != model_weight_dtype
+            or main_weight_shard_layout != wbuf.storage_shard_layout
         ):
-            mbuf = self._create_buffer(main_params_dtype, shard_main_weights, "main_weight")
+            mbuf = self._create_buffer(main_params_dtype, "main_weight")
             mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
             for i, p in enumerate(self.params):
                 item = self.mp_policy.get_high_precision_value(p)
@@ -205,13 +219,13 @@ class ParameterGroup:
                 _free_storage(tensor)
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
-            if weight_buffer is not None and not weight_buffer.is_distributed:
+            if weight_buffer is not None and not weight_buffer.inner_sharded:
                 weight_buffer._bind_buffer_to_params(weight_buffer.data)
 
         # Create gradient buffer
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
-            gbuf = self._create_buffer(main_grads_dtype, shard_grads, "main_grad")
+            gbuf = self._create_buffer(main_grads_dtype, "main_grad")
             self.main_grad_buffer = gbuf
 
         # Create distributed parameter views
@@ -245,7 +259,21 @@ class ParameterGroup:
         parameters rebind their TE raw payload instead of ``param.data``.
         """
         for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
-            weight_buffer.unshard(bind_params=bind_params, stream=stream)
+            if self.outer_dp_sharding_strategy == "optim":
+                # outer=optim copies only the local optimizer shard into the
+                # replicated model buffer, so mesh dim 0 must refresh that
+                # replica before the inner-DP gather consumes it.
+                weight_buffer.unshard(
+                    unshard_dim=0,
+                    bind_params=False,
+                    stream=stream,
+                )
+            # mesh dim 1 is inner-DP.
+            weight_buffer.unshard(
+                unshard_dim=1,
+                bind_params=bind_params,
+                stream=stream,
+            )
         self.post_unshard(bwd_pass=bwd_pass)
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
@@ -273,13 +301,17 @@ class ParameterGroup:
         self.mp_policy.copy_main_weights_to_model_weights(
             self.params,
             self.param_idx,
-            self.dp_group,
+            self.mesh,
             self.model_weight_buffer,
             self.main_weight_buffer,
             self.transpose_weight_buffer,
         )
 
-    def reduce_grad(self, stream: Optional[torch.cuda.Stream] = None):
+    def reduce_grad(
+        self,
+        is_last_microbatch: bool = False,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
         """
         Reduce gradients across DP ranks.
 
@@ -288,11 +320,51 @@ class ParameterGroup:
         the replicated buffer once when the optimizer syncs.
         """
         self._ensure_buffers_on_gpu()
-        # _grad_buffer_is_fresh is True after zero_grad() or lazy buffer init,
-        # so the first reduce_grad after either event overwrites instead of
-        # accumulating — no stale data from uninitialised or zeroed buffers.
-        self.main_grad_buffer.reduce_grad(overwrite_grad=self._grad_buffer_is_fresh, stream=stream)
-        self._grad_buffer_is_fresh = False
+        if self.main_grad_buffer is None:
+            return
+
+        reduce_inner = self.sharding_strategy in (
+            "optim_grads",
+            "optim_grads_params",
+        ) or (
+            is_last_microbatch and self.sharding_strategy in ("no_shard", "optim")
+        )
+        reduce_outer = self.outer_dp_sharding_strategy in (
+            "optim_grads",
+            "optim_grads_params",
+        ) or (
+            is_last_microbatch
+            and self.outer_dp_sharding_strategy in ("no_shard", "optim")
+        )
+        if not reduce_inner and not reduce_outer:
+            return
+
+        if reduce_inner:
+            # ZeRO-2/3 reduce each microbatch into a persistent optimizer shard:
+            # overwrite that shard on the first reduce, then accumulate into it.
+            # no_shard/ZeRO-1 instead accumulate the full gradient before their
+            # final reduction, so that reduction always overwrites its output.
+            accumulate_reduced_grad = (
+                self.sharding_strategy in ("optim_grads", "optim_grads_params")
+                and not self._grad_buffer_is_fresh
+            )
+            # mesh dim 1 is inner-DP.
+            self.main_grad_buffer.reduce_grad(
+                overwrite_grad=not accumulate_reduced_grad,
+                reduce_dim=1,
+                reduce_scatter=self.sharding_strategy != "no_shard",
+                stream=stream,
+            )
+            # The buffer now contains reduced gradients rather than fresh storage.
+            self._grad_buffer_is_fresh = False
+        if reduce_outer:
+            # mesh dim 0 is outer-DP.
+            self.main_grad_buffer.reduce_grad(
+                overwrite_grad=True,
+                reduce_dim=0,
+                reduce_scatter=self.outer_dp_sharding_strategy != "no_shard",
+                stream=stream,
+            )
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -339,19 +411,39 @@ class ParameterGroup:
         self.dist_grads = []  # placeholder, populated in _init_dist_grads
         s = self.sharding_strategy
 
-        # Determine placement based on sharding strategy
-        is_param_shard = s in ("optim", "optim_grads", "optim_grads_params")
-        placements = [Shard(dim=0)] if is_param_shard else [Replicate()]
+        is_param_shard = s == "optim_grads_params"
+        is_optim_shard = s != "no_shard"
+        is_outer_optim_shard = self.outer_dp_sharding_strategy == "optim" and is_optim_shard
+        if is_outer_optim_shard:
+            setattr(self.mesh, "_shard_order", [1, 0])
+        # Mesh layout is (outer, inner). Outer optim shards optimizer views on
+        # both dimensions, with inner sharding applied before outer sharding.
+        optim_placements = [
+            Shard(dim=0) if is_outer_optim_shard else Replicate(),
+            Shard(dim=0) if is_optim_shard else Replicate(),
+        ]
 
         # Create parameter DTensor views
         for param in self.params:
-            if self.main_weight_buffer is not None:
+            item_id = self.param_idx[param]
+            if is_outer_optim_shard:
+                buffer = self.main_weight_buffer or self.model_weight_buffer
+                assert buffer is not None
+                # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
+                data = buffer.get_item(item_id, shard_layout=(1, 1))
+                if self.main_weight_buffer is not None:
+                    param_shape = param.shape
+                else:
+                    param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
+            elif self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
-                data = mbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                # shard_layout=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                data = mbuf.get_item(item_id, shard_layout=(0, 1) if is_optim_shard else (0, 0))
                 param_shape = param.shape
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
-                data = wbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                # shard_layout=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                data = wbuf.get_item(item_id, shard_layout=(0, 1) if is_param_shard else (0, 0))
                 param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             else:
                 data = param.data.detach()
@@ -359,7 +451,11 @@ class ParameterGroup:
 
             dist_param = torch.nn.Parameter(
                 make_uneven_dtensor(
-                    data, param_shape, self.mesh, placements, post_process_uneven=True
+                    data,
+                    param_shape,
+                    self.mesh,
+                    optim_placements,
+                    post_process_uneven=True,
                 ),
                 requires_grad=param.requires_grad,
             )
@@ -394,18 +490,32 @@ class ParameterGroup:
 
         # Rebuild dist_grads views — dist_params are unchanged
         s = self.sharding_strategy
-        is_grad_shard = s in ("optim", "optim_grads", "optim_grads_params")
-        placements = [Shard(dim=0)] if is_grad_shard else [Replicate()]
+        is_grad_shard = s != "no_shard"
+        is_outer_optim_shard = self.outer_dp_sharding_strategy == "optim" and is_grad_shard
+        placements = [
+            Shard(dim=0) if is_outer_optim_shard else Replicate(),
+            Shard(dim=0) if is_grad_shard else Replicate(),
+        ]
 
         self.dist_grads = []
         for p, dist_param in zip(self.params, self.dist_params):
-            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
-            if p.requires_grad and grad_data.numel() > 0:
-                self.dist_grads.append(
-                    make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
-                )
-            else:
+            item_id = self.param_idx[p]
+            # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
+            shard_layout = (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
+            grad_data = gbuf.get_item(item_id, shard_layout=shard_layout)
+            # Empty local shards are optimizer no-ops. Keeping them as None also
+            # avoids fused multi-tensor optimizer failures on neighboring shards.
+            if not p.requires_grad or grad_data.numel() == 0:
                 self.dist_grads.append(None)
+                continue
+            grad_dtensor = make_uneven_dtensor(
+                grad_data,
+                p.shape,
+                self.mesh,
+                placements,
+                copy_chunk_meta_from=dist_param,
+            )
+            self.dist_grads.append(grad_dtensor)
 
         self._grad_buffer_is_fresh = True
 
@@ -417,30 +527,49 @@ class ParameterGroup:
         DTensor objects so optimizer references remain valid.
         """
         s = self.sharding_strategy
-        is_param_shard = s in ("optim", "optim_grads", "optim_grads_params")
+        is_param_shard = s == "optim_grads_params"
+        is_optim_shard = s != "no_shard"
+        is_outer_optim_shard = self.outer_dp_sharding_strategy == "optim" and is_optim_shard
 
         for i, param in enumerate(self.params):
             dist_param = self.dist_params[i]
             if dist_param is not None:
-                if self.main_weight_buffer is not None:
+                if is_outer_optim_shard:
+                    buffer = self.main_weight_buffer or self.model_weight_buffer
+                    if buffer is None:
+                        continue
+                    # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
+                    data = buffer.get_item(self.param_idx[param], shard_layout=(1, 1))
+                elif self.main_weight_buffer is not None:
                     data = self.main_weight_buffer.get_item(
-                        self.param_idx[param], as_shard=is_param_shard
+                        self.param_idx[param],
+                        # shard_layout=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                        shard_layout=(0, 1) if is_optim_shard else (0, 0),
                     )
                 elif self.model_weight_buffer is not None:
                     data = self.model_weight_buffer.get_item(
-                        self.param_idx[param], as_shard=is_param_shard
+                        self.param_idx[param],
+                        # shard_layout=(outer, inner): (0, 1) is inner sharded; (0, 0) is full.
+                        shard_layout=(0, 1) if is_param_shard else (0, 0),
                     )
                 else:
                     continue
                 object.__setattr__(dist_param._local_tensor, 'data', data)
 
         if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
-            is_grad_shard = is_param_shard
+            is_grad_shard = is_optim_shard
             for i, param in enumerate(self.params):
                 dist_grad = self.dist_grads[i]
                 if dist_grad is not None:
+                    # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
+                    shard_layout = (
+                        (1, 1)
+                        if is_outer_optim_shard
+                        else (0, 1) if is_grad_shard else (0, 0)
+                    )
                     grad_data = self.main_grad_buffer.get_item(
-                        self.param_idx[param], as_shard=is_grad_shard
+                        self.param_idx[param],
+                        shard_layout=shard_layout,
                     )
                     object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
 

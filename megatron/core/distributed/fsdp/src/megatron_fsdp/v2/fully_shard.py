@@ -23,7 +23,7 @@ from .hooks import (
     _register_forward_pre_hook,
 )
 from .mixed_precision import MixedPrecisionPolicy
-from .utils import _init_default_fully_shard_mesh
+from .utils import _init_default_fully_shard_mesh, _prepare_fsdp_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
 _fsdp_class_cache = {}  # module-level cache
@@ -46,6 +46,7 @@ def fully_shard(
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
+    outer_dp_sharding_strategy: str = "no_shard",
     enable_cuda_graph: bool = False,
     enable_full_iteration_cuda_graph: bool = False,
     fine_grained_hooks: bool = False,
@@ -84,7 +85,7 @@ def fully_shard(
             "The input module has already been fully sharded. "
             "Please do not call fully_shard on the same module more than once."
         )
-    mesh = mesh or _init_default_fully_shard_mesh()
+    mesh = _prepare_fsdp_mesh(mesh or _init_default_fully_shard_mesh())
 
     if mp_policy is None:
         mp_policy = MixedPrecisionPolicy()
@@ -112,6 +113,7 @@ def fully_shard(
         mp_policy=mp_policy,
         gradient_scaling_factor=gradient_scaling_factor,
         sharding_strategy=sharding_strategy,
+        outer_dp_sharding_strategy=outer_dp_sharding_strategy,
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,

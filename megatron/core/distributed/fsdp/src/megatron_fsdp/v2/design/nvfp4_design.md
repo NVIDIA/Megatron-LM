@@ -331,16 +331,18 @@ prefixes:
 | Method | Domain | Returns | Description |
 |--------|--------|---------|-------------|
 | `_get_item_self_range(item_id)` | **Item-self** | `(start, end)` | Offset within the item itself (0 = start of item). What portion of this item falls in the current rank's shard. |
-| `_get_item_local_range(item_id, *, as_shard=False)` | **Local buffer** | `(start, end)` | Byte offsets within `self.data` (the local GPU buffer). Where to read/write. The `as_shard` flag forces shard-intersection computation even for non-distributed buffers. |
+| `_get_item_local_range(item_id, *, shard_level="full")` | **Local buffer** | `(start, end)` | Byte offsets within `self.data` (the local GPU buffer). Where to read/write. `shard_level` selects `"full"`, `"inner"`, or `"outer"`. |
 | `_get_item_global_range(item_id)` | **Global buffer** | `(global_offset, size)` | Position and size in the full logical (unsharded) buffer. Same on all ranks. |
 
 `_get_item_local_range` absorbs the old `_get_item_local_index` and
-`_get_item_local_shard_index`.  The `as_shard` kwarg unifies what was
+`_get_item_local_shard_index`.  The `shard_level` kwarg unifies what was
 previously the `only_shard` flag on `get_item()`:
 
 ```python
-def get_item(self, item_id, *, as_shard=False):
-    start, end = self.buffer_index._get_item_local_range(item_id, as_shard=as_shard)
+def get_item(self, item_id, *, shard_level="full"):
+    start, end = self.buffer_index._get_item_local_range(
+        item_id, shard_level=shard_level
+    )
     return self.data[start:end]
 ```
 
@@ -352,7 +354,7 @@ def get_item(self, item_id, *, as_shard=False):
 ```python
 @contextmanager
 def summon_full_params(self, async_op=False):
-    need_unshard = self.is_distributed and not self.is_unsharded()
+    need_unshard = self.inner_sharded and not self.is_unsharded()
     if need_unshard:
         self.unshard(async_op=async_op)
     try:

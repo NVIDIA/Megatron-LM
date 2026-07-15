@@ -7,11 +7,15 @@ import torch
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
     HAVE_TE_NVFP4,
     HAVE_TE_NVFP4_RECIPE,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
@@ -36,6 +40,136 @@ def ref_cache():
 
 
 class TestMegatronFSDPE2E:
+    @pytest.mark.parametrize("outer_dp_size", [1, 2])
+    def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
+        if Utils.world_size < 4 or Utils.world_size % 4 != 0:
+            pytest.skip("HSDP EP flatten coverage requires a world size divisible by 4")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            num_distributed_optimizer_instances=outer_dp_size,
+        )
+        try:
+            required_pgs = ["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
+            if outer_dp_size > 1:
+                required_pgs.extend(["intra_dp_cp", "intra_expt_dp", "inter_dist_opt"])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=required_pgs
+            )
+            ddp_config = DistributedDataParallelConfig(
+                num_distributed_optimizer_instances=outer_dp_size
+            )
+
+            for edp, full_group_attr in ((False, "dp_cp"), (True, "expt_dp")):
+                mesh = _init_dp_mesh(pg_collection, ddp_config, edp=edp)
+                flatten_name = "_".join(mesh.mesh_dim_names)
+                expected_group = getattr(pg_collection, full_group_attr)
+
+                for _ in range(2):
+                    flatten_group = mesh._flatten(flatten_name).get_group()
+                    assert flatten_group.group_name == expected_group.group_name
+        finally:
+            Utils.destroy_model_parallel()
+
+    def test_edp1_multimicrobatch_unused_grad_lifecycle(self):
+        """EDP=1 scales, accumulates, and zeros skipped-microbatch scratch grads."""
+        if Utils.world_size < 2:
+            pytest.skip("EDP=1 coverage requires at least two ranks for EP partitioning")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=Utils.world_size,
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
+            )
+            mesh = _init_dp_mesh(
+                pg_collection, DistributedDataParallelConfig(), edp=True
+            )
+            assert mesh.size(0) == mesh.size(1) == 1
+
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            model = torch.nn.Linear(16, 16, bias=False, device=device)
+            fully_shard(
+                model,
+                mesh=mesh,
+                sharding_strategy="optim_grads_params",
+                enable_unshard_prefetch=False,
+                enable_async_reduce_grad=True,
+                gradient_scaling_factor=0.25,
+            )
+
+            param_group = model._fsdp_param_groups[0]
+            grad_buffer = param_group.main_grad_buffer
+            assert grad_buffer is not None
+            assert grad_buffer.inner_dp_group.size() == 1
+            assert grad_buffer.inner_sharded
+            param_group._init_dist_grads()
+
+            param = param_group.params[0]
+            item_id = param_group.param_idx[param]
+            ctx = model._fsdp_root_context
+
+            def reduce_and_wait():
+                model.reduce_grad(async_op=True)
+                model.finish_grad_sync()
+                torch.cuda.current_stream().synchronize()
+
+            def drain_pending():
+                pending = ctx.reduce_grad_buckets[id(model)]
+                while pending:
+                    event, pending_group = pending.pop()
+                    event.synchronize()
+                    pending_group.release_grad_buffer()
+
+            try:
+                # MB1: scale a fused wgrad into the fresh optimizer shard.
+                main_grad = param.get_main_grad()
+                assert main_grad.data_ptr() != grad_buffer.data.data_ptr()
+                main_grad.fill_(8.0)
+                param.main_grad = main_grad
+                param.grad_added_to_main_grad = True
+                param._mfsdp_recorded_te_wgrad = False
+                assert param.grad is None
+                assert param_group._grad_buffer_is_fresh
+
+                reduce_and_wait()
+                optimizer_grad = param_group.dist_params[item_id].grad
+                assert optimizer_grad is not None
+                torch.testing.assert_close(
+                    optimizer_grad._local_tensor,
+                    torch.full_like(optimizer_grad._local_tensor, 2.0),
+                )
+                assert param.grad_added_to_main_grad is False
+                assert not param_group._grad_buffer_is_fresh
+                drain_pending()
+                assert not hasattr(param, "main_grad")
+
+                # MB2: a bound but unwritten recycled view contributes zero and
+                # must not overwrite the optimizer shard accumulated by MB1.
+                stale_main_grad = param.get_main_grad()
+                stale_main_grad.fill_(123.0)
+                param.main_grad = stale_main_grad
+                assert param.grad is None
+
+                reduce_and_wait()
+                assert torch.count_nonzero(stale_main_grad) == 0
+                optimizer_grad = param_group.dist_params[item_id].grad
+                assert optimizer_grad is not None
+                torch.testing.assert_close(
+                    optimizer_grad._local_tensor,
+                    torch.full_like(optimizer_grad._local_tensor, 2.0),
+                )
+            finally:
+                drain_pending()
+        finally:
+            Utils.destroy_model_parallel()
 
     @staticmethod
     def _normalize_param_name(name):
@@ -83,7 +217,7 @@ class TestMegatronFSDPE2E:
                 for param_group in module._fsdp_param_groups:
                     if (
                         param_group.model_weight_buffer is None
-                        or param_group.model_weight_buffer.is_distributed
+                        or param_group.model_weight_buffer.inner_sharded
                     ):
                         continue
                     param_group.unshard(bwd_pass=False)
@@ -94,7 +228,7 @@ class TestMegatronFSDPE2E:
                         ("model_weight_buffer", param_group.model_weight_buffer),
                         ("transpose_weight_buffer", param_group.transpose_weight_buffer),
                     ):
-                        if buffer is None or buffer.is_distributed:
+                        if buffer is None or buffer.inner_sharded:
                             continue
                         gathered = [
                             torch.empty_like(buffer.data)

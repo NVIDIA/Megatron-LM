@@ -25,7 +25,8 @@ from ..uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
 )
 from .allocator import Bucket, TemporaryBucketAllocator
-from .dp_buffer import BufferIndex, DataParallelBuffer
+from .buffer_index import BufferIndex
+from .dp_buffer import DataParallelBuffer
 from .fully_shard import FSDPModule, fully_shard
 from .mixed_precision import (
     FullyShardFP8Policy,

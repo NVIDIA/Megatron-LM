@@ -155,29 +155,38 @@ for module in [self] + prefetch:
     if all(pg.has_unsharded_weight_buffers(bwd_pass=bwd_pass) for pg in module._fsdp_param_groups):
         continue          # Required buffers are already unsharded — skip
 
-    # Caller stream: prepare GPU-resident shards, group compatible buffers,
-    # and allocate every temporary full buffer before switching streams.
+    # Caller stream: group consecutive buffers that have matching outer/inner
+    # process groups, dtype, and device.
     buffer_runs = build_buffer_runs(module, bwd_pass=bwd_pass)
-    for dp_group, weight_buffers in buffer_runs:
-        full_buffers = [buffer.fetch_buffer(as_shard=False) for buffer in weight_buffers]
+    for outer_dp_group, inner_dp_group, weight_buffers in buffer_runs:
+        full_buffers = [buffer.fetch_buffer((0, 0)) for buffer in weight_buffers]
 
         # The wait is inserted after allocation/preparation so all caller work
         # needed by this run is visible to the communication stream.
         if async_op:
             stream.wait_stream(caller_stream)
 
-        # Side-stream scope contains collectives and their Work wait only.
-        cm = (
-            _coalescing_manager(dp_group, async_ops=async_op)
-            if len(weight_buffers) > 1
-            else nullcontext()
-        )
-        with torch.cuda.stream(stream):
-            with cm as manager:
+        def unshard_dimension(group, unshard_dim):
+            cm = (
+                _coalescing_manager(group, async_ops=async_op)
+                if len(weight_buffers) > 1
+                and torch.distributed.get_world_size(group) > 1
+                else nullcontext()
+            )
+            with cm as coalescing_event:
                 for buffer in weight_buffers:
-                    buffer.unshard(bind_params=False, stream=stream)
-            if async_op and manager is not None:
-                manager.wait()
+                    buffer.unshard(
+                        unshard_dim=unshard_dim,
+                        bind_params=False,
+                        stream=stream,
+                    )
+            if async_op and coalescing_event is not None:
+                coalescing_event.wait()
+
+        with torch.cuda.stream(stream):
+            # Buffer state decides whether either dimension needs a collective.
+            unshard_dimension(outer_dp_group, unshard_dim=0)
+            unshard_dimension(inner_dp_group, unshard_dim=1)
 
         # Caller stream: rebind tensor metadata; do not run TE post-processing yet.
         for buffer, full_buffer in zip(weight_buffers, full_buffers):
@@ -212,9 +221,9 @@ for param_names, param_group in self._named_param_groups:
 caller stream, while only the all-gather collective and its `Work.wait()` execute with
 `ag_stream` current. Tensor rebinding is metadata-only and returns to the caller stream.
 The caller waits for the module event before running mixed-precision `post_unshard()` or
-installing full parameters into the module. Because allocation, final use, and free are
-ordered on the caller stream, the explicit stream events fully describe the cross-stream
-lifetime and `Tensor.record_stream()` is neither needed nor used.
+installing full parameters into the module. Explicit stream events order consumption and
+free; all all-gather outputs also record `ag_stream` so the allocator cannot recycle a
+temporary buffer while communication is still using it.
 
 **Stream ordering barrier.** When `async_op=True`, the caller stream is captured before
 any stream switch. Each communication run allocates its output buffer and completes shard
@@ -229,13 +238,16 @@ the first captured async unshard.
 `torch.cuda.nvtx` range (`"MFSDP unshard"`, `"MFSDP reshard"`, `"MFSDP reduce_grad"`)
 for profiling visibility in tools like Nsight Systems.
 
-**All-gather coalescing.** `FSDPModule.unshard()` coalesces consecutive weight-buffer
-all-gathers that use the same process group, dtype, and device. Each `ParameterGroup`
-still owns its buffers and post-processing, while the module-level loop submits
-communication-compatible all-gathers through one grouped launch. With
-`async_ops=True`, the coalescing manager owns the resulting `Work`; the async path calls
-`manager.wait()` while `ag_stream` is current before recording the communication event,
-so that event cannot run before the backend finishes writing the gathered buffers.
+**All-gather coalescing.** `FSDPModule.unshard()` groups consecutive weight buffers
+that have the same outer-DP group, inner-DP group, dtype, and device. Each run processes
+the outer dimension before the inner dimension, and each dimension uses one grouped
+launch when it contains multiple buffers and its process group has more than one rank.
+Buffer state determines whether a given `unshard()` call actually launches a collective,
+so clean outer-optim buffers and unsharded dimensions remain fast paths. Each
+`ParameterGroup` still owns its buffers and post-processing. With `async_ops=True`,
+the coalescing manager owns the resulting `Work`; the async path calls
+`coalescing_event.wait()` while `ag_stream` is current before advancing to the next
+dimension or recording the module event.
 
 Prefetched modules keep their `bwd_pass` value in `unshard_pending_post`. When their own
 pre-hook later arrives, it skips the already-launched all-gather, waits for its event, and
@@ -311,36 +323,47 @@ def reduce_grad(self, async_op: bool = False):
     for param_names, param_group in self._named_param_groups:
         if not param_group.requires_grad: continue
 
-        zero_targets = []
-        copy_srcs = []
-        copy_dsts = []
-        for name, param in zip(param_names, param_group.params):
-            main_grad = param.get_main_grad()
-            if param.grad is None:
-                if not getattr(param, 'grad_added_to_main_grad', False):
-                    zero_targets.append(main_grad.view(-1))
+        grad_replicated = param_group.sharding_strategy in ("no_shard", "optim")
+        add_to_main_grad = grad_replicated and not param_group._grad_buffer_is_fresh
+        stage_tensors = []
+        stage_sources = []
+        zero_tensors = []
+        params_with_grad = []
+        for param in param_group.params:
+            grad = param.grad
+            if grad is not None:
+                params_with_grad.append(param)
+            if getattr(param, "grad_added_to_main_grad", False):
+                continue
+            if grad is None:
+                if not add_to_main_grad:
+                    zero_tensors.append(param.get_main_grad())
             else:
-                copy_srcs.append(param.grad.detach().view(-1))
-                copy_dsts.append(main_grad.view(-1))
-                del param.grad
+                stage_tensors.append(param.get_main_grad())
+                stage_sources.append(grad.detach())
 
         stage_on_rs_stream = async_op and getattr(
             self._fsdp_state, "enable_full_iteration_cuda_graph", False
         )
         if stage_on_rs_stream:
             stream.wait_stream(torch.cuda.current_stream())
-            for source in copy_srcs:
+            for source in stage_sources:
                 source.record_stream(stream)
             with torch.cuda.stream(stream):
-                if zero_targets:
-                    torch._foreach_zero_(zero_targets)
-                if copy_dsts:
-                    torch._foreach_copy_(copy_dsts, copy_srcs)
+                if stage_tensors:
+                    op = torch._foreach_add_ if add_to_main_grad else torch._foreach_copy_
+                    op(stage_tensors, stage_sources)
+                if zero_tensors:
+                    torch._foreach_zero_(zero_tensors)
         else:
-            if zero_targets:
-                torch._foreach_zero_(zero_targets)
-            if copy_dsts:
-                torch._foreach_copy_(copy_dsts, copy_srcs)
+            if stage_tensors:
+                op = torch._foreach_add_ if add_to_main_grad else torch._foreach_copy_
+                op(stage_tensors, stage_sources)
+            if zero_tensors:
+                torch._foreach_zero_(zero_tensors)
+
+        for param in params_with_grad:
+            del param.grad
 
         # --- Step 3: Reduce-scatter on rs_stream ---
         if async_op:
@@ -372,12 +395,14 @@ The operation is inherently synchronous *within its selected stream*. The caller
 uses that stream for the collective. This avoids exposing asynchronous work handles through
 the buffer API.
 
-For full-iteration CUDA graphs, the batched zero/copy staging is also dispatched to
-`rs_stream` immediately before reduce-scatter. `rs_stream.wait_stream(current_stream())`
+For full-iteration CUDA graphs, the batched add/copy/zero staging is dispatched to
+`rs_stream` immediately before reduction. `rs_stream.wait_stream(current_stream())`
 orders the staging after backward, while `record_stream(rs_stream)` keeps detached `.grad`
-sources alive after their Python references are deleted. This removes staging kernels from
-the captured caller stream and lets them overlap with the next module's backward compute.
-Eager, per-module CUDA graph, and synchronous-reduction paths retain caller-stream staging.
+sources alive after their Python references are deleted. Replicated no-shard/optim gradients
+still add on later microbatches; sharded gradients still overwrite. This removes staging
+kernels from the captured caller stream and lets them overlap with the next module's
+backward compute. Eager, per-module CUDA graph, and synchronous-reduction paths retain
+caller-stream staging.
 
 **`grad_added_to_main_grad` and `overwrite_main_grad` flags:**
 When TransformerEngine's `gradient_accumulation_fusion` is active, the backward kernel writes
@@ -663,7 +688,7 @@ pre-hook L[2]: event[L[2]].wait() → main stream unblocks
                post_unshard(L[2]) on main stream
                _replace_module_parameter(L[2])
 
-BACKWARD PASS (enable_async_reduce_grad=True)
+BACKWARD PASS (enable_async_reduce_grad=True, full-iteration CUDA graph)
 ---------------------------------------------------------
 main stream:  |bwd L[2]-----------|bwd L[1]-----------|bwd L[0]-----------|
 ag_stream:    |AG(L[1]) prefetch    |AG(L[0]) prefetch     |                      |
@@ -690,11 +715,11 @@ def reduce_grad(self, grad_comm_dtype=None):
     sm = self.buffer_index.shard_meta
     local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
 
-    if not self.is_distributed and self.sharding_strategy == "no_shard":
-        torch.distributed.all_reduce(self.data, group=self.dp_group)
+    if not self.inner_sharded and self.sharding_strategy == "no_shard":
+        torch.distributed.all_reduce(self.data, group=self.inner_dp_group)
         return
 
-    if self.is_distributed:
+    if self.inner_sharded:
         full_grad = self.fetch_unsharded_buffer()  # temporary full grad buffer
         input_buffer = full_grad
         output_offset = sm.bucket_data_index
@@ -705,7 +730,7 @@ def reduce_grad(self, grad_comm_dtype=None):
         accumulate_output = False
     grad_shard = input_buffer[output_offset : output_offset + sm.size]
     torch.distributed.reduce_scatter_tensor(
-        output=grad_shard, input=input_buffer, group=self.dp_group
+        output=grad_shard, input=input_buffer, group=self.inner_dp_group
     )
     if accumulate_output:
         # ZeRO-2/3 accumulate into persistent shard for micro-batch grad accumulation.
@@ -849,10 +874,6 @@ fully-synchronized parameters and gradients.
    For networks with many small modules, a size-aware multi-step lookahead
    (analogous to `suggested_AG_prefetch_size` in the old `AllGatherPipeline`) would
    yield better overlap.
-
-2. **Outer-DP / HSDP.** `_FSDPRootContext` does not carry an outer-DP stream for the second
-   all-gather needed in hybrid-sharding (outer-DP × inner-FSDP) setups. This mirrors the
-   `outer_fsdp_group_param_gather_stream` in the old `AllGatherPipeline`.
 
 ---
 

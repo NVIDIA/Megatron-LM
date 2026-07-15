@@ -28,11 +28,10 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
+from torch.distributed.tensor import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
@@ -76,7 +75,7 @@ class MixedDtypeLayer(nn.Module):
 # ------------------------------------------------------------------ #
 
 
-def _build_groups(strategy):
+def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strategy="no_shard"):
     """Create two ParameterGroups (bf16 + uint8) and call init_buffers.
 
     Returns (groups, originals, dp_group, rank, world_size, device) where
@@ -84,7 +83,7 @@ def _build_groups(strategy):
     """
     rank = torch.distributed.get_rank()
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-    dp_group = torch.distributed.group.WORLD
+    dp_group = torch.distributed.group.WORLD if mesh is None else mesh.get_group(mesh_dim=1)
 
     # Fixed seed so all ranks start with identical weights
     torch.manual_seed(42)
@@ -109,12 +108,21 @@ def _build_groups(strategy):
         pg = ParameterGroup(
             params=params,
             param_group_id=ParamGroupIdx(0, gid),
-            mp_policy=MixedPrecisionPolicy(),
-            mesh=None,
+            mp_policy=mp_policy or MixedPrecisionPolicy(),
+            mesh=mesh,
             sharding_strategy=strategy,
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         )
         groups.append(pg)
     return groups, originals, dp_group, rank, torch.distributed.get_world_size(), device
+
+
+def _build_hsdp_mesh(device):
+    world_size = torch.distributed.get_world_size()
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("HSDP mesh coverage requires an even world size >= 4")
+    mesh = torch.arange(world_size, dtype=torch.int).reshape(2, world_size // 2)
+    return DeviceMesh(device.type, mesh, mesh_dim_names=("dp_outer", "dp"))
 
 
 def _flags(s):
@@ -167,12 +175,6 @@ class Ref:
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_init_buffers(strategy):
-    if strategy not in ("no_shard", "optim_grads_params"):
-        pytest.skip(
-            "This test currently covers no_shard and optim_grads_params, "
-            f"skipping {strategy}."
-        )
-
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
     has_wbuf, _, w_dist, g_dist = _flags(strategy)
 
@@ -181,7 +183,7 @@ def test_init_buffers(strategy):
         if has_wbuf:
             assert pg.model_weight_buffer is not None
             wbuf = pg.model_weight_buffer
-            assert wbuf.is_distributed == w_dist
+            assert wbuf.inner_sharded == w_dist
 
             # Per-param check: get_item should return this rank's portion of
             # the original param. A param may span shard boundaries, so the
@@ -197,7 +199,7 @@ def test_init_buffers(strategy):
         # -- main_grad_buffer --
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
-            assert pg.main_grad_buffer.is_distributed == g_dist
+            assert pg.main_grad_buffer.inner_sharded == g_dist
             assert pg.main_grad_buffer.data is None  # lazy init
 
     torch.distributed.barrier()
@@ -223,7 +225,7 @@ def test_unshard_reshard(strategy):
         wbuf = pg.model_weight_buffer
         assert wbuf is not None
 
-        shard_before = wbuf.data.clone()
+        shard_before = wbuf.data.view(torch.uint8).clone()
         unsharded = wbuf.unshard()
 
         if not w_dist:
@@ -241,7 +243,10 @@ def test_unshard_reshard(strategy):
         wbuf.reshard()
         if w_dist:
             assert wbuf._unsharded_buffer is None
-        assert torch.equal(wbuf.data, shard_before)
+        # Compare the persistent storage bit-for-bit. The buffer can contain
+        # uninitialized padding, including NaNs for which torch.equal is false
+        # even when the before/after bit patterns are identical.
+        assert torch.equal(wbuf.data.view(torch.uint8), shard_before)
 
     torch.distributed.barrier()
 
@@ -253,12 +258,6 @@ def test_unshard_reshard(strategy):
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_reduce_grad(strategy):
-    if strategy not in ("no_shard", "optim_grads_params"):
-        pytest.skip(
-            "This test currently covers no_shard and optim_grads_params, "
-            f"skipping {strategy}."
-        )
-
     groups, _, dp_group, rank, ws, device = _build_groups(strategy)
     _, _, _, g_dist = _flags(strategy)
 
@@ -275,7 +274,7 @@ def test_reduce_grad(strategy):
             gbuf.data.fill_(float(rank + 1))
             ref = torch.full_like(gbuf.data, float(rank + 1))
             Ref.all_reduce(ref, dp_group)
-            gbuf.reduce_grad()
+            gbuf.reduce_grad(reduce_scatter=False)
             assert torch.equal(gbuf.data, ref)
         else:
             # ZeRO-1/2/3: reduce-scatter a full gradient buffer and compare
@@ -297,8 +296,107 @@ def test_reduce_grad(strategy):
             gbuf.reduce_grad()
 
             # Only compare the shard region of self.data
-            sm = gbuf.buffer_index.shard_meta
-            actual = gbuf.data[sm.local_data_index : sm.local_data_index + sm.size]
+            # shard_layout=(outer, inner): (0, 1) means inner sharded only.
+            actual = gbuf.get_shard_view((0, 1))
+            assert torch.equal(actual, ref_shard)
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+@pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
+def test_hsdp_reduce_grad(strategy, outer_strategy):
+    if outer_strategy == "optim" and strategy != "optim_grads_params":
+        pytest.skip("Outer-DP optimizer sharding currently requires inner optim_grads_params.")
+
+    rank = torch.distributed.get_rank()
+    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    mesh = _build_hsdp_mesh(device)
+    groups, _, _, rank, _, device = _build_groups(
+        strategy, mesh=mesh, outer_dp_sharding_strategy=outer_strategy
+    )
+    _, _, _, g_dist = _flags(strategy)
+
+    for pg in groups:
+        pg._init_dist_grads()  # lazily allocate grad buffer and dist_grads list
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        if strategy == "no_shard":
+            gbuf.data.fill_(float(rank + 1))
+            ref = torch.full_like(gbuf.data, float(rank + 1))
+            Ref.all_reduce(ref, pg.dp_group)
+            Ref.all_reduce(ref, pg.outer_dp_group)
+            pg.reduce_grad(is_last_microbatch=True)
+            assert torch.equal(gbuf.data, ref)
+        else:
+            full_size = gbuf.buffer_index.bucket_meta.size
+            full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
+
+            ref_shard = Ref.reduce_scatter(full.clone(), pg.dp_group)
+            if outer_strategy == "optim":
+                ref_shard = Ref.reduce_scatter(ref_shard, pg.outer_dp_group)
+            else:
+                Ref.all_reduce(ref_shard, pg.outer_dp_group)
+
+            if g_dist:
+                bucket = gbuf.allocator.allocate(
+                    key=gbuf.alloc_key, size=full_size, dtype=gbuf.dtype, device=device
+                )
+                bucket.data.copy_(full)
+                gbuf.data.zero_()
+            else:
+                gbuf.data.copy_(full)
+            pg.reduce_grad(is_last_microbatch=True)
+
+            if outer_strategy == "optim":
+                # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
+                actual = gbuf.get_shard_view((1, 1))
+            else:
+                # shard_layout=(outer, inner): (0, 1) means inner sharded only.
+                actual = gbuf.get_shard_view((0, 1))
+            assert torch.equal(actual, ref_shard)
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim"])
+def test_hsdp_reduce_grad_multi_microbatch(strategy):
+    rank = torch.distributed.get_rank()
+    device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+    mesh = _build_hsdp_mesh(device)
+    groups, _, _, rank, _, _ = _build_groups(
+        strategy, mesh=mesh, outer_dp_sharding_strategy="no_shard"
+    )
+
+    num_micro_batches = 3
+    for pg in groups:
+        pg._init_dist_grads()
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        gbuf.data.zero_()
+        full_batch_grad = torch.zeros_like(gbuf.data)
+        for microbatch in range(num_micro_batches):
+            micro_grad = torch.full_like(
+                gbuf.data, float((microbatch + 1) * (rank + 1))
+            )
+            gbuf.data.add_(micro_grad)
+            full_batch_grad.add_(micro_grad)
+            pg.reduce_grad(is_last_microbatch=microbatch == num_micro_batches - 1)
+
+        if strategy == "no_shard":
+            ref = full_batch_grad
+            Ref.all_reduce(ref, pg.dp_group)
+            Ref.all_reduce(ref, pg.outer_dp_group)
+            assert torch.equal(gbuf.data, ref)
+        else:
+            ref_shard = Ref.reduce_scatter(full_batch_grad, pg.dp_group)
+            Ref.all_reduce(ref_shard, pg.outer_dp_group)
+            # shard_layout=(outer, inner): (0, 1) means inner sharded only.
+            actual = gbuf.get_shard_view((0, 1))
             assert torch.equal(actual, ref_shard)
 
     torch.distributed.barrier()

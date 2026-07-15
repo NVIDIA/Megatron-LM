@@ -1425,6 +1425,9 @@ class TestFsdpMambaConvParamGather:
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
         if Utils.world_size < 2:
             pytest.skip("Requires at least 2 GPUs (DP>=2).")
+        pytest.importorskip("mamba_ssm")
+        pytest.importorskip("causal_conv1d")
+        pytest.importorskip("einops")
 
         # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
         model_parallel_cuda_manual_seed(0)

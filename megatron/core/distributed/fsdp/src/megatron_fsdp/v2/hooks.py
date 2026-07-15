@@ -11,6 +11,8 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
+from megatron.core.tensor_parallel.random import is_checkpointing
+
 from .allocator import TracePoolAllocator
 from .cuda_graph_runner import CudaGraphRunner
 from .fsdp_module import FSDPModule, _FSDPState
@@ -22,6 +24,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_activation_recompute(module: FSDPModule) -> bool:
+    """Return whether ``module`` is running activation recompute."""
+    ctx = module._fsdp_root_context
+    if not ctx.backward_phase:
+        return False
+    if id(module) == ctx.backward_module:
+        return True
+    return torch.is_grad_enabled() and is_checkpointing()
 
 
 def _find_fsdp_target(hook_module: nn.Module) -> Optional[FSDPModule]:
@@ -68,9 +80,10 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
     ctx = target._fsdp_root_context
     assert not ctx.cuda_graph_active, "hooks must not fire during CUDA graph capture"
+    is_recompute = _is_activation_recompute(target)
 
     # ---- root: forward-phase setup (once per micro-batch) ------------------
-    if target._fsdp_state._is_root:
+    if target._fsdp_state._is_root and not is_recompute:
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
             ctx.cuda_graph_stream = torch.cuda.Stream()
             torch.cuda.set_stream(ctx.cuda_graph_stream)
@@ -79,9 +92,15 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
         ctx.backward_phase = False
 
     # ---- unshard parameters for this module -------------------------------
-    if ctx.backward_phase:
+    if is_recompute:
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
-    target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
+        target.unshard(
+            async_op=ctx.enable_unshard_prefetch,
+            bwd_pass=False,
+            prefetch=False,
+        )
+    else:
+        target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
     # ---- free stale grad data (safe to repeat, idempotent) ----------------
     for param_group in target._fsdp_param_groups:
@@ -217,11 +236,7 @@ def mfsdp_post_backward_hook(module: nn.Module):
             continue
         ctx.backward_done_modules.add(id(submodule))
         submodule.reshard()
-        if any(
-            param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-            for param_group in submodule._fsdp_param_groups
-        ):
-            submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        submodule.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         submodule.post_backward_issued = True
     ctx._advance_backward_module()
 
@@ -252,11 +267,7 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
         if module.post_backward_issued:
             continue
         module.reshard()
-        if any(
-            param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
-            for param_group in module._fsdp_param_groups
-        ):
-            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
 
     # ---- drain pending async reduce-grad events -----------------------
     stream = ctx.rs_stream

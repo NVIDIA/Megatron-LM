@@ -1,331 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import math
-from collections import namedtuple
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
+from torch.distributed.tensor import DeviceMesh
 
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
+from .buffer_index import BufferIndex
 from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
 logger = logging.getLogger(__name__)
-
-
-class BufferIndex:
-    """Describes how params are laid out in a flat buffer, including global layout
-    and per-rank shard information.
-
-    Each DataParallelBuffer owns its own independent BufferIndex instance.
-    """
-
-    ItemIndex = namedtuple("ItemIndex", ["global_data_index", "size", "item_id", "shape"])
-    BucketMeta = namedtuple("BucketMeta", ["global_data_index", "size", "items"])
-    ShardMeta = namedtuple(
-        "ShardMeta", ["global_data_index", "local_data_index", "bucket_data_index", "size"]
-    )
-
-    def __init__(
-        self,
-        param_shapes: List[torch.Size],
-        dp_rank: int,
-        dp_world_size: int,
-        is_distributed: bool,
-        param_group_id: ParamGroupIdx,
-        chunk_size_factor: int = 1,
-        sharding_strategy: str = "no_shard",
-    ):
-        self.param_group_id = param_group_id
-        self.is_distributed = is_distributed
-        self.dp_rank = dp_rank
-        self.dp_world_size = dp_world_size
-        self.chunk_size_factor = chunk_size_factor
-        self.sharding_strategy = sharding_strategy
-        self.item_index_map, self.bucket_meta = self._build_layout(
-            param_shapes, dp_world_size, chunk_size_factor, sharding_strategy
-        )
-        self.shard_meta = self._build_shard_meta(
-            self.bucket_meta, is_distributed, dp_world_size, dp_rank
-        )
-
-    # ------------------------------------------------------------------ #
-    #  Layout construction (global, rank-independent)
-    # ------------------------------------------------------------------ #
-
-    @classmethod
-    def _build_layout(
-        cls,
-        param_shapes: List[torch.Size],
-        dp_world_size: int,
-        chunk_size_factor: int,
-        sharding_strategy: str,
-    ) -> Tuple[Dict[int, "BufferIndex.ItemIndex"], "BufferIndex.BucketMeta"]:
-        """
-        Compute global buffer layout for a list of parameter shapes.
-
-        Regular parameters (numel >= chunk_size_factor) are placed first.
-        When a regular parameter has a remainder modulo chunk_size_factor,
-        its trailing grid is shared with either another regular parameter
-        or filled with "fragment" parameters.  Leftover fragments are
-        bin-packed into chunk_size_factor-sized grids so that every grid
-        is aligned and can be split evenly across DP ranks.
-
-        Returns:
-            item_index_map:  Maps item_id -> ItemIndex (global position).
-            bucket_meta:     Describes the full padded buffer.
-        """
-
-        def _pad(n: int, divisor: int) -> int:
-            return int(math.ceil(n / divisor) * divisor)
-
-        def _pad_if_needed(data_index: int) -> int:
-            if sharding_strategy != "no_shard":
-                return _pad(data_index, dp_world_size * chunk_size_factor)
-            return data_index
-
-        def add_item(item_id, shape, offset, index_map):
-            index_map[item_id] = cls.ItemIndex(
-                global_data_index=offset, size=shape.numel(), item_id=item_id, shape=shape
-            )
-
-        # Separate regular and fragment parameters.
-        regular_items: List[Tuple[int, torch.Size]] = []
-        fragment_items: List[Tuple[int, torch.Size]] = []
-        for item_id, shape in enumerate(param_shapes):
-            if shape.numel() < chunk_size_factor:
-                fragment_items.append((item_id, shape))
-            else:
-                regular_items.append((item_id, shape))
-
-        # Sort fragments largest-first for best gap-filling.
-        fragment_items.sort(key=lambda x: -x[1].numel())
-
-        item_index_map: Dict[int, cls.ItemIndex] = {}
-        data_index = 0
-
-        # ---- First pass: place regular parameters, fill gaps with fragments ----
-        while len(regular_items) > 0:
-            item_id, shape = regular_items.pop(0)
-            add_item(item_id, shape, data_index, item_index_map)
-
-            if shape.numel() % chunk_size_factor == 0:
-                data_index += shape.numel()
-                continue
-
-            gap_offset = data_index + shape.numel()
-            data_index += (shape.numel() // chunk_size_factor + 1) * chunk_size_factor
-            remain = shape.numel() % chunk_size_factor
-            space = chunk_size_factor - remain
-
-            # Try to pair another regular param whose remainder fits.
-            rhs_found_id = None
-            rhs_found_shape = None
-            for id_rhs in regular_items[:]:
-                rhs_id, rhs = id_rhs
-                if rhs.numel() % chunk_size_factor == 0:
-                    continue
-                rhs_remain = rhs.numel() % chunk_size_factor
-                if remain + rhs_remain <= chunk_size_factor:
-                    rhs_found_id, rhs_found_shape = rhs_id, rhs
-                    regular_items.remove(id_rhs)
-                    break
-
-            if rhs_found_id is not None:
-                rhs_remain = rhs_found_shape.numel() % chunk_size_factor
-                # Place the paired param so its LAST ``rhs_remain`` elements
-                # land in the same alignment grid as the current param's remainder.
-                # The bulk of the param extends backward from the grid boundary.
-                add_item(rhs_found_id, rhs_found_shape, data_index - rhs_remain, item_index_map)
-                space -= rhs_remain
-                # Advance past the aligned portion of the paired param.
-                data_index += (rhs_found_shape.numel() // chunk_size_factor) * chunk_size_factor
-
-            # Fill remaining space in this grid with fragments.
-            for id_frag in fragment_items[:]:
-                frag_id, frag = id_frag
-                if frag.numel() > space:
-                    continue
-                add_item(frag_id, frag, gap_offset, item_index_map)
-                space -= frag.numel()
-                gap_offset += frag.numel()
-                fragment_items.remove(id_frag)
-
-        # ---- helper: bin-pack leftover fragments into chunk_size_factor grids ----
-        def pack_fragments(
-            fragments: List[Tuple[int, torch.Size]], capacity: int
-        ) -> List[List[Tuple[int, torch.Size]]]:
-            """
-            Bin-pack fragments into fixed-capacity slots (grids).
-
-            Each slot has size *capacity* (== chunk_size_factor). Returns a
-            list of slots, each containing one or more (param_id, shape) pairs.
-            """
-            sorted_frags = sorted(fragments, key=lambda p: -p[1].numel())
-            slots: List[List[Tuple[int, torch.Size]]] = []
-            for pid, pshape in sorted_frags:
-                psize = pshape.numel()
-                placed = False
-                for slot in slots:
-                    used = sum(p[1].numel() for p in slot)
-                    if used + psize <= capacity:
-                        slot.append((pid, pshape))
-                        placed = True
-                        break
-                if not placed:
-                    slots.append([(pid, pshape)])
-            return slots
-
-        # ---- Second pass: bin-pack any remaining fragments into aligned grids ----
-        if fragment_items:
-            fragment_slots = pack_fragments(fragment_items, chunk_size_factor)
-            for slot in fragment_slots:
-                offset_within_grid = 0
-                for pid, pshape in slot:
-                    add_item(pid, pshape, data_index + offset_within_grid, item_index_map)
-                    offset_within_grid += pshape.numel()
-                data_index += chunk_size_factor
-
-        bucket_meta = cls.BucketMeta(
-            global_data_index=0,
-            size=_pad_if_needed(data_index),
-            items=list(item_index_map.values()),
-        )
-
-        return item_index_map, bucket_meta
-
-    # ------------------------------------------------------------------ #
-    #  Shard meta construction (per-rank)
-    # ------------------------------------------------------------------ #
-
-    @classmethod
-    def _build_shard_meta(
-        cls,
-        bucket_meta: "BufferIndex.BucketMeta",
-        is_distributed: bool,
-        dp_world_size: int,
-        dp_rank: int,
-    ) -> "BufferIndex.ShardMeta":
-        shard_size = bucket_meta.size // dp_world_size
-        bucket_data_index = shard_size * dp_rank
-        global_data_index = bucket_meta.global_data_index + bucket_data_index
-
-        if is_distributed:
-            return cls.ShardMeta(
-                global_data_index=global_data_index,
-                local_data_index=0,
-                bucket_data_index=bucket_data_index,
-                size=shard_size,
-            )
-        else:
-            return cls.ShardMeta(
-                global_data_index=global_data_index,
-                # For non-distributed buffers, each rank has the full buffer, so
-                # the local index is the same as the global index.
-                local_data_index=global_data_index,
-                bucket_data_index=bucket_data_index,
-                size=shard_size,
-            )
-
-    # ------------------------------------------------------------------ #
-    #  Compaction — scale indices proportionally for packed storage
-    # ------------------------------------------------------------------ #
-
-    def compact(self, factor: float, compact_shapes: List[torch.Size]) -> None:
-        """Scale all indices proportionally for packed storage.
-
-        Args:
-            factor: Scale factor (0.5 for NVFP4 2-values-per-byte packing).
-            compact_shapes: Per-item shapes for the packed layout (same
-                length and order as the original param_shapes).
-        """
-        new_map: Dict[int, "BufferIndex.ItemIndex"] = {}
-        for item_id, item in self.item_index_map.items():
-            new_map[item_id] = self.ItemIndex(
-                global_data_index=int(item.global_data_index * factor),
-                size=int(item.size * factor),
-                item_id=item.item_id,
-                shape=compact_shapes[item_id],
-            )
-        self.item_index_map = new_map
-
-        self.bucket_meta = self.BucketMeta(
-            global_data_index=0,
-            size=int(self.bucket_meta.size * factor),
-            items=list(new_map.values()),
-        )
-        self.shard_meta = self._build_shard_meta(
-            self.bucket_meta, self.is_distributed, self.dp_world_size, self.dp_rank
-        )
-
-    # ------------------------------------------------------------------ #
-    #  Internal index query methods — three coordinate domains:
-    #
-    #  _get_item_self_range   → (start, end) relative to the item's own
-    #                            start.  Tells what portion of this item
-    #                            falls within the current rank's shard.
-    #  _get_item_local_range  → (start, end) within self.data (the local
-    #                            GPU buffer).  Where to read/write bytes.
-    #  _get_item_global_range → (start, end) in the full logical
-    #                            (unsharded) buffer, same on all
-    #                            ranks.
-    # ------------------------------------------------------------------ #
-
-    def _get_item_global_range(self, item_id: int) -> Tuple[int, int]:
-        """Return (start, end) in the full unsharded buffer for the given item."""
-        idx = self.item_index_map[item_id]
-        return (idx.global_data_index, idx.global_data_index + idx.size)
-
-    def _get_item_self_range(self, item_id: int, *, as_shard: bool = True) -> Tuple[int, int]:
-        """Return coordinates relative to the item's own start.
-
-        When ``as_shard=True`` (default), returns the portion of the item
-        that falls within this rank's shard — the slice ``(start, end)``
-        within the item.  When ``as_shard=False``, returns ``(0, size)``
-        representing the full item.
-        """
-        idx = self.item_index_map[item_id]
-        if not as_shard:
-            return (0, idx.size)
-
-        item_start = idx.global_data_index
-        item_end = item_start + idx.size
-        shard_start = self.shard_meta.global_data_index
-        shard_end = shard_start + self.shard_meta.size
-
-        if item_start > shard_end or item_end < shard_start:
-            return (0, 0)
-
-        start = max(item_start, shard_start) - item_start
-        end = min(item_end, shard_end) - item_start
-        return (start, end)
-
-    def _get_item_local_range(self, item_id: int, *, as_shard: bool = False) -> Tuple[int, int]:
-        """Return coordinates within self.data for the item.
-
-        Parameters
-        ----------
-        as_shard : bool
-            If True, compute the shard intersection even when the buffer
-            is not distributed.  Default (False) returns the full item
-            range for non-distributed buffers.
-        """
-        if not self.is_distributed and not as_shard:
-            idx = self.item_index_map[item_id]
-            return (idx.global_data_index, idx.global_data_index + idx.size)
-
-        slice_start, slice_end = self._get_item_self_range(item_id)
-        if slice_start == slice_end:
-            return (0, 0)
-
-        idx = self.item_index_map[item_id]
-        offset = (
-            idx.global_data_index
-            - self.shard_meta.global_data_index
-            + self.shard_meta.local_data_index
-        )
-        return (offset + slice_start, offset + slice_end)
 
 
 class DataParallelBuffer:
@@ -342,44 +28,55 @@ class DataParallelBuffer:
         param_idx: Dict[torch.nn.Parameter, int],
         dtype: torch.dtype,
         device: torch.device,
-        dp_group: torch.distributed.ProcessGroup,
+        mesh: DeviceMesh,
         param_group_id: ParamGroupIdx,
         mp_policy: MixedPrecisionPolicy,
         *,
         allocator: Optional[BucketAllocator] = None,
         buffer_role: str = "model_weight",
-        is_distributed: bool = False,
         gradient_scaling_factor: Optional[float] = None,
         chunk_size_factor: int = 1,
         sharding_strategy: str = "no_shard",
+        outer_dp_sharding_strategy: str = "no_shard",
     ):
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.params = params
         self.param_idx = param_idx
         self.dtype = dtype
         self.device = device
-        self.dp_group = dp_group
+        self.outer_dp_group = mesh.get_group(mesh_dim=0)
+        self.inner_dp_group = mesh.get_group(mesh_dim=1)
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
         self.buffer_role = buffer_role
         self.alloc_key = (param_group_id, buffer_role)
         self.mp_policy = mp_policy
-        self.is_distributed = is_distributed
-        self.sharding_strategy = sharding_strategy
-        self.gradient_scaling_factor = gradient_scaling_factor
 
-        dp_rank = torch.distributed.get_rank(dp_group)
-        dp_world_size = torch.distributed.get_world_size(dp_group)
+        def get_sharding_from_strategy(strategy: str) -> bool:
+            if buffer_role in ("model_weight", "transpose_weight"):
+                return strategy == "optim_grads_params"
+            if buffer_role == "main_weight":
+                return strategy != "no_shard"
+            if buffer_role == "main_grad":
+                return strategy in ("optim_grads", "optim_grads_params")
+            raise ValueError(f"Unsupported data-parallel buffer role: {buffer_role}")
+
+        inner_sharded = get_sharding_from_strategy(sharding_strategy)
+        outer_sharded = get_sharding_from_strategy(outer_dp_sharding_strategy)
+        self.inner_sharded = inner_sharded
+        self.outer_sharded = outer_sharded
+        # shard_layout=(outer, inner): 1 means sharded and 0 means replicated.
+        self.storage_shard_layout = (int(outer_sharded), int(inner_sharded))
+        self.sharding_strategy = sharding_strategy
+        self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
+        self.gradient_scaling_factor = gradient_scaling_factor
 
         # Always build layout with logical shapes and shared chunk_size_factor
         # so that all buffers share the same proportional item-offset mapping.
         _logical_shapes = [p.shape for p in params]
         self.buffer_index = BufferIndex(
             param_shapes=_logical_shapes,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            is_distributed=is_distributed,
+            mesh=mesh,
             chunk_size_factor=chunk_size_factor,
-            sharding_strategy=sharding_strategy,
             param_group_id=param_group_id,
         )
 
@@ -391,10 +88,7 @@ class DataParallelBuffer:
             compact_shapes = mp_policy.get_param_storage_shapes(params)
             self.buffer_index.compact(0.5, compact_shapes)
 
-        if is_distributed:
-            self.data_size = self.buffer_index.shard_meta.size
-        else:
-            self.data_size = self.buffer_index.bucket_meta.size
+        self.data_size = self.buffer_index.outer_shard_metas[self.storage_shard_layout].size
 
         self.data: Optional[torch.Tensor] = None
         self._unsharded_buffer: Optional[torch.Tensor] = None
@@ -408,8 +102,8 @@ class DataParallelBuffer:
         assert data.dtype == self.dtype, f"dtype mismatch: {data.dtype} vs {self.dtype}"
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
-        if self.buffer_role in ("model_weight", "transpose_weight") and not self.is_distributed:
-            self.data._dirty = False
+        self._inner_dirty = False
+        self._outer_dirty = False
 
     # ------------------------------------------------------------------ #
     #  CPU offload
@@ -467,7 +161,10 @@ class DataParallelBuffer:
         # Collect (local_start, local_end, item_id, global_start, size) for each item
         slices = []
         for item_id in range(n_items):
-            local_start, local_end = self.buffer_index._get_item_local_range(item_id)
+            # shard_layout=(outer, inner): use this buffer's storage shard state.
+            local_start, local_end = self.buffer_index._get_item_local_range(
+                item_id, shard_layout=self.storage_shard_layout
+            )
             idx = self.buffer_index.item_index_map[item_id]
             slices.append((local_start, local_end, item_id, idx.global_data_index, idx.size))
 
@@ -544,62 +241,125 @@ class DataParallelBuffer:
             pass  # silent on success
         return valid
 
-    def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
+    @torch.no_grad()
+    def set_item(
+        self,
+        item_id: int,
+        item_data: torch.Tensor,
+        *,
+        shard_layout: Optional[Iterable[int]] = None,
+    ) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
-        if self.is_distributed:
-            slice_start, slice_end = self.buffer_index._get_item_self_range(item_id)
-            item_data = item_data.flatten()[slice_start:slice_end]
+        requested_layout = (
+            shard_layout if shard_layout is not None else self.storage_shard_layout
+        )
+        source_slice, local_slice = self.buffer_index.local_slice_for(
+            self.buffer_index._get_item_global_range(item_id),
+            requested_layout,
+            self.storage_shard_layout,
+        )
+        if source_slice is None or local_slice is None:
+            return
+        self.data[local_slice].copy_(item_data.flatten()[source_slice])
 
-        local_start, local_end = self.buffer_index._get_item_local_range(item_id)
-        shard = self.data[local_start:local_end]
-        if shard.numel() > 0:
-            shard.data.copy_(item_data.flatten())
-
-    def get_item(self, item_id: int, *, as_shard: bool = False) -> torch.Tensor:
+    def get_item(
+        self, item_id: int, *, shard_layout: Optional[Iterable[int]] = None
+    ) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
-        start, end = self.buffer_index._get_item_local_range(item_id, as_shard=as_shard)
-        return self.data[start:end]
+        requested_layout = (
+            shard_layout if shard_layout is not None else self.storage_shard_layout
+        )
+        _, local_slice = self.buffer_index.local_slice_for(
+            self.buffer_index._get_item_global_range(item_id),
+            requested_layout,
+            self.storage_shard_layout,
+        )
+        return self.data[:0] if local_slice is None else self.data[local_slice]
 
     def is_unsharded(self) -> bool:
         """Return whether this buffer currently has a full unsharded view."""
-        full_tensor = self._unsharded_buffer if self.is_distributed else self.data
-        if full_tensor is not None and not getattr(full_tensor, "_dirty", True):
-            return True
-        return False
+        if self._outer_dirty or self._inner_dirty:
+            return False
+        # shard_layout=(outer, inner): (0, 0) means neither dimension is sharded.
+        if self.storage_shard_layout != (0, 0):
+            return self._unsharded_buffer is not None
+        return self.data is not None
 
     @torch.no_grad()
     def unshard(
-        self, bind_params: bool = False, stream: Optional[torch.cuda.Stream] = None
+        self,
+        unshard_dim: Optional[int] = 1,
+        bind_params: bool = False,
+        stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
-        """All-gather the full buffer from all shards and bind parameter storage.
+        """All-gather selected dimensions and optionally bind params.
 
-        For non-distributed buffers self.data is already full, so
-        self.data is returned directly. If a replicated buffer only has this
-        rank's updated shard, the shard is all-gathered into self.data first.
+        ``unshard_dim`` uses mesh dim ids: ``None`` does not unshard,
+        ``0`` unshards outer-DP, and ``1`` unshards inner-DP.
         """
-        full_buffer = self.fetch_buffer(as_shard=False)
+        current_stream = torch.cuda.current_stream()
+        stream = stream or current_stream
+        if stream != current_stream:
+            stream.wait_stream(current_stream)
 
-        if not self.is_distributed and not getattr(full_buffer, "_dirty", False):
-            if bind_params:
-                self._bind_buffer_to_params(full_buffer)
-            return full_buffer
+        # If unshard_dim is set, that dimension becomes replicated in the target.
+        # Otherwise, every dimension keeps the current storage state.
+        target_shard_layout = (
+            0 if unshard_dim == 0 else self.storage_shard_layout[0],
+            0 if unshard_dim == 1 else self.storage_shard_layout[1],
+        )
+        dirty_flags = (self._outer_dirty, self._inner_dirty)
+        storage_is_dirty = (
+            unshard_dim is not None
+            and self.storage_shard_layout[unshard_dim] == 0
+            and dirty_flags[unshard_dim]
+        )
+        # If storage is replicated but dirty, dimension d acts as a sharded source.
+        # Otherwise, dimension d keeps the current storage state as the source.
+        source_shard_layout = (
+            1 if storage_is_dirty and unshard_dim == 0 else self.storage_shard_layout[0],
+            1 if storage_is_dirty and unshard_dim == 1 else self.storage_shard_layout[1],
+        )
+        # Only a source-sharded -> target-replicated transition needs all-gather.
+        requires_unshard = (
+            unshard_dim is not None
+            and source_shard_layout[unshard_dim] == 1
+            and target_shard_layout[unshard_dim] == 0
+        )
 
-        sm = self.buffer_index.shard_meta
-        shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-        caller_stream = torch.cuda.current_stream()
-        stream = stream or caller_stream
-        stream.wait_stream(caller_stream)
-        with torch.cuda.stream(stream):
-            torch.distributed.all_gather_into_tensor(
-                output_tensor=full_buffer, input_tensor=shard_buffer, group=self.dp_group
-            )
+        # Fast path: target is already available from clean local storage.
+        if not requires_unshard:
+            output_buffer = self.fetch_buffer(target_shard_layout)
+            if bind_params and target_shard_layout == (0, 0):
+                self._bind_buffer_to_params(output_buffer)
+            return output_buffer
 
-        if bind_params:
-            self._bind_buffer_to_params(full_buffer)
+        output_shard_layout = (
+            0 if unshard_dim == 0 else source_shard_layout[0],
+            0 if unshard_dim == 1 else source_shard_layout[1],
+        )
+        group = self.outer_dp_group if unshard_dim == 0 else self.inner_dp_group
 
-        setattr(full_buffer, "_dirty", False)  # mark the buffer as clean (unsharded)
+        input_buffer = self.fetch_buffer(source_shard_layout)
+        output_buffer = self.fetch_buffer(output_shard_layout)
+        if torch.distributed.get_world_size(group) == 1:
+            with torch.cuda.stream(stream):
+                if output_buffer.data_ptr() != input_buffer.data_ptr():
+                    output_buffer.copy_(input_buffer)
+        else:
+            with torch.cuda.stream(stream):
+                torch.distributed.all_gather_into_tensor(
+                    output_tensor=output_buffer,
+                    input_tensor=input_buffer,
+                    group=group,
+                )
 
-        return full_buffer
+        setattr(self, "_outer_dirty" if unshard_dim == 0 else "_inner_dirty", False)
+
+        # Parameter binding needs the full compute buffer.
+        if bind_params and output_shard_layout == (0, 0):
+            self._bind_buffer_to_params(output_buffer)
+        return output_buffer
 
     def _bind_buffer_to_params(self, buffer: torch.Tensor) -> None:
         """Bind the given buffer to the params according to the layout."""
@@ -615,68 +375,106 @@ class DataParallelBuffer:
             self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
 
     @torch.no_grad()
-    def reshard(self) -> None:
-        """Release the temporary unsharded buffer allocated by unshard()."""
-        if not self.is_distributed:
-            return
+    def reshard(self, shard_dim: Optional[int] = None) -> None:
+        """Release temporary buffers allocated by ``fetch_buffer`` / ``unshard``."""
+        if shard_dim is not None:
+            # If storage is already replicated on this dim, unshard() returned
+            # self.data or a self.data view, so no temporary buffer was allocated.
+            if self.storage_shard_layout[shard_dim] == 0:
+                return
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def fetch_buffer(self, *, as_shard: bool = False) -> torch.Tensor:
-        """Return the buffer, allocating the full unsharded view if needed.
+    def get_shard_view(self, shard_layout: Optional[Iterable[int]] = None) -> torch.Tensor:
+        """Return a shard view inside the persistent data buffer."""
+        assert self.data is not None, "DataParallelBuffer data not initialized"
+        requested_layout = (
+            shard_layout if shard_layout is not None else self.storage_shard_layout
+        )
+        _, local_slice = self.buffer_index.local_slice_for(
+            (0, self.buffer_index.bucket_meta.size),
+            requested_layout,
+            self.storage_shard_layout,
+        )
+        return self.data[:0] if local_slice is None else self.data[local_slice]
 
-        Parameters
-        ----------
-        as_shard : bool
-            If True, return only this rank's shard slice of the full buffer.
-            Default (False) returns the full unsharded buffer.
+    def fetch_buffer(self, shard_layout: Tuple[int, int] = (0, 0)) -> torch.Tensor:
+        """Return a buffer for ``shard_layout``, allocating temporary storage if needed.
+
+        1. If ``shard_layout`` matches this buffer's storage layout, return
+           ``self.data`` directly.
+        2. If ``self.data`` is a known parent layout of the requested shard,
+           return a view into ``self.data``. Example: storage ``(0, 1)`` can
+           return a ``(1, 1)`` view.
+        3. Otherwise allocate/reuse the full ``(0, 0)`` unsharded buffer and
+           return either that full buffer or a view from it. Example: storage
+           ``(1, 1)`` requesting ``(0, 1)`` must materialize the full buffer
+           because one outer shard cannot cover the complete inner-DP shard.
 
         Memory allocation always occurs on the caller stream for deterministic
         caching-allocator behaviour.
         """
-        if self.is_distributed:
-            if self._unsharded_buffer is None:
-                bucket = self.allocator.allocate(
-                    key=self.alloc_key,
-                    size=self.buffer_index.bucket_meta.size,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                self._unsharded_buffer = bucket.data
-            full = self._unsharded_buffer
-        else:
-            assert self.data is not None, "DataParallelBuffer data not initialized"
-            full = self.data
+        requested_shard_layout = shard_layout
 
-        if as_shard:
-            sm = self.buffer_index.shard_meta
-            return full[sm.bucket_data_index : sm.bucket_data_index + sm.size]
-        return full
+        # 1. Exact storage match: no view or temporary buffer needed.
+        if requested_shard_layout == self.storage_shard_layout:
+            assert self.data is not None, "DataParallelBuffer data not initialized"
+            return self.data
+
+        # 2. Parent storage layouts can directly expose a child shard view.
+        data_contains_requested = all(
+            storage_dim == 0 or storage_dim == requested_dim
+            for storage_dim, requested_dim in zip(self.storage_shard_layout, requested_shard_layout)
+        )
+        if data_contains_requested:
+            return self.get_shard_view(requested_shard_layout)
+
+        # 3. Otherwise materialize the full buffer and return the requested view
+        # from it. This covers HSDP storage (1, 1) -> requested (0, 1).
+        if self._unsharded_buffer is None:
+            bucket = self.allocator.allocate(
+                key=self.alloc_key,
+                size=self.buffer_index.bucket_meta.size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._unsharded_buffer = bucket.data
+        if requested_shard_layout == (0, 0):
+            return self._unsharded_buffer
+        requested_meta = self.buffer_index._get_shard_meta(requested_shard_layout)
+        return self._unsharded_buffer[
+            requested_meta.bucket_data_index : requested_meta.bucket_data_index
+            + requested_meta.size
+        ]
 
     @torch.no_grad()
     def reduce_grad(
         self,
         *,
         overwrite_grad: bool = False,
+        reduce_dim: Optional[int] = 1,
+        reduce_scatter: bool = True,
         grad_comm_dtype: Optional[torch.dtype] = None,
         stream: Optional[torch.cuda.Stream] = None,
     ):
         """Reduce gradients into the optimizer-facing local shard.
 
-        For distributed buffers, this reduce-scatters a temporary full gradient
-        and accumulates the result into the persistent local shard. For
-        replicated buffers, this reduce-scatters the full accumulation buffer
-        once into this rank's virtual shard for ZeRO-1 optimizer consumption.
-        For no-shard buffers, this all-reduces the full gradient buffer.
-        If grad_comm_dtype differs from self.dtype, communicate with a temporary
-        casted tensor and cast the reduced result back before accumulation.
+        ``reduce_dim`` uses mesh dim ids: ``None`` does not reduce,
+        ``0`` reduces outer-DP, and ``1`` reduces inner-DP.
+        ``reduce_scatter`` selects RS vs AR; ParameterGroup owns that strategy decision.
         """
-        if self.sharding_strategy in ("no_shard", "optim"):
-            overwrite_grad = True
+        if reduce_dim is None:
+            return
+
+        current_stream = torch.cuda.current_stream()
+        stream = stream or current_stream
+        if stream != current_stream:
+            stream.wait_stream(current_stream)
 
         grad_comm_dtype = grad_comm_dtype or self.mp_policy.grad_comm_dtype or self.dtype
-
-        if self.gradient_scaling_factor in (None, 1.0):
+        # Scale exactly once, when reducing fresh full grads over inner-DP.
+        # Outer-only reduce consumes an already-scaled inner-DP result.
+        if reduce_dim != 1 or self.gradient_scaling_factor in (None, 1.0):
             op = torch.distributed.ReduceOp.SUM
             prescale = False
         elif grad_comm_dtype != torch.bfloat16:
@@ -686,58 +484,86 @@ class DataParallelBuffer:
             op = torch.distributed.ReduceOp.SUM
             prescale = True
 
-        sm = self.buffer_index.shard_meta
-        local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+        # Inner reduce consumes fresh full grads: (0, 0) -> (0, 1).
+        # Outer reduce consumes the inner-reduced view: (0, 1) -> (1, 1).
+        input_shard_layout = (
+            0,
+            0 if reduce_dim == 1 else self.storage_shard_layout[1],
+        )
+        # AR keeps the same shard view; RS shards the reduced dimension.
+        output_shard_layout = (
+            1 if reduce_scatter and reduce_dim == 0 else input_shard_layout[0],
+            1 if reduce_scatter and reduce_dim == 1 else input_shard_layout[1],
+        )
+        input_buffer = self.fetch_buffer(input_shard_layout)
+        output_buffer = self.fetch_buffer(output_shard_layout)
 
-        if not self.is_distributed and self.sharding_strategy == "no_shard":
-            stream = stream or torch.cuda.current_stream()
-            stream.wait_stream(torch.cuda.current_stream())
+        # Pick the process group covering exactly the reduced dimension.
+        group = self.outer_dp_group if reduce_dim == 0 else self.inner_dp_group
+        if torch.distributed.get_world_size(group) == 1:
+            if input_buffer.is_cuda:
+                input_buffer.record_stream(stream)
             with torch.cuda.stream(stream):
-                comm_input = (
-                    self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
-                )
-                if prescale:
-                    comm_input.mul_(self.gradient_scaling_factor)
-                torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
-                if grad_comm_dtype != self.dtype:
-                    self.data.copy_(comm_input.to(self.dtype))
-                return
+                # A singleton inner-DP group bypasses both NCCL premul-sum and the
+                # BF16 prescale path above, so apply its scaling locally.
+                if reduce_dim == 1 and self.gradient_scaling_factor not in (None, 1.0):
+                    input_buffer.mul_(self.gradient_scaling_factor)
+                if output_buffer.data_ptr() != input_buffer.data_ptr():
+                    if overwrite_grad:
+                        output_buffer.copy_(input_buffer)
+                    else:
+                        output_buffer.add_(input_buffer)
+            return
 
-        if self.is_distributed:
-            # ZeRO-2/3 (optim_grads/optim_grads_params): ``self.data`` is the
-            # persistent local grad shard. The full grad buffer is temporary,
-            # assembled only for this reduce-scatter, and the RS result is
-            # accumulated into ``local_grad_shard`` for gradient accumulation.
-            input_buffer = self.fetch_buffer()
-            output_offset = sm.bucket_data_index
-        else:
-            # ZeRO-1 (optim): ``self.data`` is the replicated full grad
-            # accumulation buffer. The optimizer consumes only this rank's
-            # virtual shard, so the one delayed RS writes directly into that
-            # slice instead of accumulating into a separate shard buffer.
-            input_buffer = self.fetch_buffer()
-            output_offset = sm.local_data_index
-
-        stream = stream or torch.cuda.current_stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            comm_input = input_buffer.to(grad_comm_dtype)
-            if prescale:
+        comm_input = input_buffer
+        input_key = None
+        if grad_comm_dtype != self.dtype:
+            input_key = (self.alloc_key, "grad_reduce_input", reduce_dim)
+            input_bucket = self.allocator.allocate(
+                key=input_key,
+                size=input_buffer.numel(),
+                dtype=grad_comm_dtype,
+                device=self.device,
+            )
+            comm_input = input_bucket.data
+            with torch.cuda.stream(stream):
+                comm_input.copy_(input_buffer)
+        if comm_input.is_cuda:
+            comm_input.record_stream(stream)
+        if prescale:
+            with torch.cuda.stream(stream):
                 comm_input.mul_(self.gradient_scaling_factor)
-            reduced_grad_shard = comm_input[output_offset : output_offset + sm.size]
 
+        if not reduce_scatter:
+            with torch.cuda.stream(stream):
+                torch.distributed.all_reduce(comm_input, group=group, op=op)
+                if input_key is not None:
+                    output_buffer.copy_(comm_input.to(self.dtype))
+            if input_key is not None:
+                self.allocator.free(input_key)
+            return
+
+        input_meta = self.buffer_index._get_shard_meta(input_shard_layout)
+        output_meta = self.buffer_index._get_shard_meta(output_shard_layout)
+        output_offset = output_meta.global_data_index - input_meta.global_data_index
+        # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
+        comm_output = comm_input[output_offset : output_offset + output_buffer.numel()]
+
+        with torch.cuda.stream(stream):
             torch.distributed.reduce_scatter_tensor(
-                output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
+                output=comm_output,
+                input=comm_input,
+                group=group,
+                op=op,
             )
 
-            # If the reduced shard is already in the local grad buffer, skip copy/accumulation.
-            if local_grad_shard.data_ptr() == reduced_grad_shard.data_ptr():
-                return
-
-            if overwrite_grad:
-                local_grad_shard.copy_(reduced_grad_shard)
-            else:
-                local_grad_shard += reduced_grad_shard
+            if output_buffer.data_ptr() != comm_output.data_ptr():
+                if overwrite_grad:
+                    output_buffer.copy_(comm_output)
+                else:
+                    output_buffer += comm_output
+        if input_key is not None:
+            self.allocator.free(input_key)
 
 
 def check_all_fsdp_buffers(module) -> bool:

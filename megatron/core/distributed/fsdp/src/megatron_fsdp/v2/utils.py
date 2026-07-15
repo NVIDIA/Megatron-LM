@@ -18,7 +18,7 @@ from typing import Callable
 import torch
 import torch.nn as nn
 from torch.distributed import distributed_c10d
-from torch.distributed.tensor import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DeviceMesh
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,20 +64,43 @@ def _replace_module_parameter(module: nn.Module, name: str, new_param: nn.Parame
     setattr(parent, parts[-1], new_param)
 
 
+def _prepare_fsdp_mesh(mesh: DeviceMesh) -> DeviceMesh:
+    """Return a canonical ``(outer, inner)`` FSDP mesh.
+
+    Existing callers may pass a 1D DP mesh. Treat it as ``outer=1`` and keep
+    the original ranks on the inner-DP dimension.
+    """
+    if mesh.ndim == 2:
+        return mesh
+    if mesh.ndim != 1:
+        raise ValueError(
+            f"FSDP v2 expects a 1D DP or 2D (outer, inner) DeviceMesh, got {mesh.ndim}D."
+        )
+
+    dim_names = tuple(getattr(mesh, "mesh_dim_names", None) or ())
+    inner_dim_name = dim_names[0] if dim_names else "dp"
+    outer_dim_name = "dp_outer" if inner_dim_name != "dp_outer" else "outer"
+    return DeviceMesh(
+        mesh.device_type,
+        mesh.mesh.reshape(1, -1),
+        mesh_dim_names=(outer_dim_name, inner_dim_name),
+    )
+
+
 def _init_default_fully_shard_mesh() -> DeviceMesh:
     """Default to global CUDA mesh if possible else global CPU mesh."""
     if not distributed_c10d.is_initialized():
         distributed_c10d.init_process_group()
 
-    default_pg = distributed_c10d._get_default_group()  # still private
     if torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
-    mesh = DeviceMesh.from_group(
-        [default_pg],
-        device_type=device.type,
-        mesh=torch.distributed.get_process_group_ranks(default_pg),
-        mesh_dim_names=("dp",),
+    world_ranks = torch.arange(
+        torch.distributed.get_world_size(torch.distributed.group.WORLD)
+    ).reshape(1, -1)
+    return DeviceMesh(
+        device.type,
+        world_ranks,
+        mesh_dim_names=("dp_outer", "dp"),
     )
-    return mesh

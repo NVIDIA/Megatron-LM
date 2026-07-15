@@ -544,7 +544,7 @@ class MixedPrecisionPolicy:
         self,
         params: List[torch.Tensor],
         param_idx: dict,
-        data_parallel_group: torch.distributed.ProcessGroup,
+        mesh,
         model_weight_buffer,
         main_weight_buffer,
         transpose_weight_buffer=None,
@@ -554,30 +554,33 @@ class MixedPrecisionPolicy:
             return
 
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
+        outer_optim = main_weight_buffer.outer_dp_sharding_strategy == "optim"
+
+        inner_dp_group = mesh.get_group(mesh_dim=1)
 
         if self.is_nvfp4_param(params[0]):
+            if outer_optim:
+                raise NotImplementedError("HSDP outer optimizer sharding is not supported for NVFP4.")
             quantize_main_weights_to_nvfp4(
-                params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
+                params, param_idx, inner_dp_group, model_weight_buffer, main_weight_buffer
             )
         elif not self.is_fp8_param(params[0]):
-            if model_weight_buffer.is_distributed and not main_weight_buffer.is_distributed:
+            if model_weight_buffer.inner_sharded and not main_weight_buffer.inner_sharded:
                 raise RuntimeError(
                     "Unsupported FSDP main/model weight buffer layout: "
                     "model weights are sharded but main weights are replicated."
                 )
-            if model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
+            if outer_optim:
+                # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
+                model_weight_buffer.get_shard_view((1, 1)).copy_(
+                    main_weight_buffer.get_shard_view((1, 1))
+                )
+            elif model_weight_buffer.inner_sharded == main_weight_buffer.inner_sharded:
                 model_weight_buffer.data.copy_(main_weight_buffer.data)
             else:
-                model_shard_meta = model_weight_buffer.buffer_index.shard_meta
-                main_shard_meta = main_weight_buffer.buffer_index.shard_meta
-                model_weight_buffer.data[
-                    model_shard_meta.local_data_index : model_shard_meta.local_data_index
-                    + model_shard_meta.size
-                ].copy_(
-                    main_weight_buffer.data[
-                        main_shard_meta.local_data_index : main_shard_meta.local_data_index
-                        + main_shard_meta.size
-                    ]
+                # shard_layout=(outer, inner): (0, 1) means inner sharded only.
+                model_weight_buffer.get_shard_view((0, 1)).copy_(
+                    main_weight_buffer.get_shard_view((0, 1))
                 )
         else:
             fp8_params = []
@@ -585,9 +588,11 @@ class MixedPrecisionPolicy:
             start_offsets = []
             model_param_shards = []
             no_shard = model_weight_buffer.sharding_strategy == "no_shard"
+            # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
+            shard_layout = (1, 1) if outer_optim else (0, 1) if not no_shard else (0, 0)
             for param in params:
                 item_id = param_idx[param]
-                model_shard = model_weight_buffer.get_item(item_id, as_shard=not no_shard)
+                model_shard = model_weight_buffer.get_item(item_id, shard_layout=shard_layout)
                 if model_shard.numel() == 0:
                     fp8_params.append(param)
                     main_params.append(None)
@@ -598,32 +603,40 @@ class MixedPrecisionPolicy:
                 transpose_shard = None
                 if transpose_weight_buffer is not None:
                     transpose_shard = transpose_weight_buffer.get_item(
-                        item_id, as_shard=not no_shard
+                        item_id, shard_layout=shard_layout
                     )
-                main_weight = main_weight_buffer.get_item(item_id, as_shard=not no_shard)
+                main_weight = main_weight_buffer.get_item(item_id, shard_layout=shard_layout)
                 if no_shard:
                     start_offset = 0
                 else:
                     start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(
-                        item_id
+                        # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner.
+                        item_id, shard_layout=(1, 1) if outer_optim else (0, 1)
                     )
                 fp8_params.append(param)
                 main_params.append(main_weight)
                 start_offsets.append(start_offset)
                 model_param_shards.append((model_shard, transpose_shard))
 
+            amax_reduce_group = inner_dp_group
+            if outer_optim:
+                amax_reduce_group = mesh._flatten("_".join(mesh.mesh_dim_names)).get_group()
             quantize_main_weights_to_fp8(
-                fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
+                fp8_params,
+                main_params,
+                start_offsets,
+                amax_reduce_group,
+                model_param_shards,
             )
 
-        # ZeRO-1/2 refresh only this rank's slice; gather before next compute.
-        def mark_dirty(buffer):
-            if buffer is not None and not buffer.is_distributed:
-                buffer.data._dirty = True
-
-        if model_weight_buffer.sharding_strategy != "no_shard":
-            mark_dirty(model_weight_buffer)
-            mark_dirty(transpose_weight_buffer)
+        # Refresh updated local shards before the next compute unshard.
+        for buffer in (model_weight_buffer, transpose_weight_buffer):
+            if buffer is None:
+                continue
+            if buffer.sharding_strategy != "no_shard" and not buffer.inner_sharded:
+                buffer._inner_dirty = True
+            if outer_optim:
+                buffer._outer_dirty = True
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:
@@ -650,20 +663,27 @@ def quantize_main_weights_to_fp8(
     model_params: List[torch.Tensor],
     main_params: List[Optional[torch.Tensor]],
     start_offsets: List[Optional[int]],
-    data_parallel_group: torch.distributed.ProcessGroup,
+    amax_reduce_group: torch.distributed.ProcessGroup,
     fsdp_shard_model_params: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
 ) -> None:
-    """Quantize FP32 main-weight shards into FP8/MXFP8 model-weight shards."""
+    """Quantize FP32 main-weight shards into FP8/MXFP8 model-weight shards.
+
+    ``amax_reduce_group`` covers every rank that owns a shard of each tensor:
+    inner-DP normally, or the flattened inner x outer DP mesh group under HSDP
+    outer-DP optimizer sharding.
+    """
     if len(model_params) == 0:
         return
 
     fsdp_shard_model_params = [x[0] if x[1] is None else x for x in fsdp_shard_model_params]
     if HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
+        # The caller supplies the full amax reduction group, so TE's native path
+        # is correct for both regular FSDP and HSDP.
         args = [
             model_params,
             main_params,
             start_offsets,
-            data_parallel_group,
+            amax_reduce_group,
             fsdp_shard_model_params,
         ]
         kwargs = {}
@@ -717,7 +737,7 @@ def quantize_main_weights_to_fp8(
     packed_amax_views = [packed_amaxes[i].view(1) for i in range(len(amaxes))]
     _multi_tensor_copy_this_to_that(amaxes, packed_amax_views, dummy_overflow_buf)
     torch.distributed.all_reduce(
-        packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
+        packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=amax_reduce_group
     )
     _multi_tensor_copy_this_to_that(packed_amax_views, amaxes, dummy_overflow_buf)
 
@@ -752,7 +772,7 @@ def quantize_main_weights_to_nvfp4(
     te_start_offsets = []
 
     wbuf = model_weight_buffer
-    if not wbuf.is_distributed:
+    if not wbuf.inner_sharded:
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
 
     full_weight_buffer = wbuf.fetch_buffer()
@@ -760,7 +780,8 @@ def quantize_main_weights_to_nvfp4(
 
     for param in model_params:
         item_id = param_idx[param]
-        main_weight_shard = main_weight_buffer.get_item(item_id, as_shard=True)
+        # shard_layout=(outer, inner): (0, 1) means inner sharded only.
+        main_weight_shard = main_weight_buffer.get_item(item_id, shard_layout=(0, 1))
         if main_weight_shard.numel() == 0:
             main_weight_shard = None
 
@@ -776,8 +797,9 @@ def quantize_main_weights_to_nvfp4(
         # non-zero DP ranks silently corrupts the model weight buffer because
         # TE writes to the wrong byte position.  Always derive this offset
         # from the main_weight_buffer index, which uses full logical shapes.
+        # shard_layout=(outer, inner): (0, 1) means inner sharded only.
         shard_offset, _ = main_weight_buffer.buffer_index._get_item_self_range(
-            item_id, as_shard=True
+            item_id, shard_layout=(0, 1)
         )
         te_model_params.append(param)
         te_main_params.append(main_weight_shard)
@@ -791,7 +813,13 @@ def quantize_main_weights_to_nvfp4(
         te_model_params, te_main_params, te_start_offsets, data_parallel_group, **kwargs
     )
 
-    wbuf.data.copy_(wbuf.fetch_buffer(as_shard=True))
+    inner_shard_meta = wbuf.buffer_index.shard_meta
+    wbuf.data.copy_(
+        full_weight_buffer[
+            inner_shard_meta.bucket_data_index : inner_shard_meta.bucket_data_index
+            + inner_shard_meta.size
+        ]
+    )
 
     # Don't forget to reshard the model weight buffer after directly writing into its payload
     wbuf.reshard()
