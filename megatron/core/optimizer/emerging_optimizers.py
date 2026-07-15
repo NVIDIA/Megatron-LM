@@ -30,6 +30,8 @@ try:
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
 
+    _NS_TP_SUPPORTS_SYRK = "use_syrk" in inspect.signature(newton_schulz_tp).parameters
+
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
@@ -178,9 +180,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if use_syrk and not _NS_TP_SUPPORTS_SYRK:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "use_syrk requested but the installed emerging_optimizers does not support it; "
+                "falling back to standard GEMM.",
+            )
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -197,6 +207,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             size = [grad.size(-2), grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
+            ns_kwargs = {}
+            if use_syrk and _NS_TP_SUPPORTS_SYRK:
+                ns_kwargs["use_syrk"] = True
             orth_grad = newton_schulz_tp(
                 grad,
                 steps=num_ns_steps,
@@ -204,6 +217,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 tp_group=tp_group,
                 partition_dim=partition_dim,
                 tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
+                **ns_kwargs,
             )
             scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
             return orth_grad * scale_factor * extra_scale_factor
@@ -422,6 +436,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        use_syrk: bool = False,
         moment2_method: Literal["adamuon", "normuon"] = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -444,6 +459,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
             tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
         self.moment2_method = moment2_method
 
