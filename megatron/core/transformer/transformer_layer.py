@@ -2074,17 +2074,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_mlp_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
 
         nvtx_range_push(suffix="mlp_hyper_connection")
-        # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical
-        # stability of the mixing weights. MoE layers absorb that in their own routing
-        # dtype handling, but a dense MLP feeds this straight into a low-precision TE
-        # layer, so remember the activation dtype and restore it for dense layers below.
-        activation_dtype = hidden_states.dtype
         hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
-        if not self.is_moe_layer and hidden_states.dtype != activation_dtype:
-            hidden_states = hidden_states.to(activation_dtype)
+        # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical
+        # stability of the mixing weights, and that fp32 propagates through the residual
+        # stream. MoE layers absorb it in their own routing dtype handling, but a dense
+        # MLP feeds it straight into a low-precision TE layer whose fused layernorm weight
+        # is in params_dtype, so restore params_dtype for dense (non-MoE) layers.
+        if not self.is_moe_layer and hidden_states.dtype != self.config.params_dtype:
+            hidden_states = hidden_states.to(self.config.params_dtype)
 
         # Optional Layer norm post the cross-attention.
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
