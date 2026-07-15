@@ -137,12 +137,7 @@ class TestMuonDecoupleFP8ParamGather:
         )
 
     def _create_args(
-        self,
-        fp8_param_gather,
-        fp8_recipe,
-        overlap,
-        num_experts=0,
-        expert_model_parallel_size=1,
+        self, fp8_param_gather, fp8_recipe, overlap, num_experts=0, expert_model_parallel_size=1
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -227,12 +222,7 @@ class TestMuonDecoupleFP8ParamGather:
         return ids, labels, pos, mask, loss_mask
 
     def _build(
-        self,
-        fp8_param_gather,
-        fp8_recipe,
-        overlap,
-        num_experts=0,
-        expert_model_parallel_size=1,
+        self, fp8_param_gather, fp8_recipe, overlap, num_experts=0, expert_model_parallel_size=1
     ):
         args = self._create_args(
             fp8_param_gather,
@@ -295,9 +285,7 @@ class TestMuonDecoupleFP8ParamGather:
             outs.append(out.detach().clone())
         return losses, outs, grads, masters, params
 
-    def _check_on_vs_off(
-        self, fp8_recipe, overlap, n, num_experts=0, expert_model_parallel_size=1
-    ):
+    def _check_on_vs_off(self, fp8_recipe, overlap, n, num_experts=0, expert_model_parallel_size=1):
         """fp8_param_gather ON must match OFF bitwise for ``n`` deterministic steps on
         per-step loss / forward output / per-param main_grad / fp32 master / bf16 param."""
         with deterministic_mode():

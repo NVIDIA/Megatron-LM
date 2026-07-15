@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
@@ -887,7 +887,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for owned in params_list
             ]
             if any(owned for owned in staged):
-                staged_helper = _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
+                staged_helper = (
+                    _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
+                )
                 staged_helper(staged, group)
             if any(owned for owned in native):
                 _allgather_helper(native, group)
