@@ -58,6 +58,15 @@ class KVBlockAllocator:
             # Hash-to-block mapping for O(1) prefix lookup
             self.kv_hash_to_block_id: Dict[int, int] = {}
 
+            # Parent hash per block for prefix-chain bookkeeping: 0 = no parent
+            # (root block or unregistered). Block hashes are parent-chained, so a
+            # cached block whose hash is some other cached block's parent must not
+            # be evicted before its child (see evict_lru_blocks). Valid hashes are
+            # in [1, 2^63-1], so 0 is a safe "no parent" sentinel.
+            self.block_parent_hashes = torch.zeros(
+                (self.total_count,), dtype=torch.int64, device='cpu'
+            )
+
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
                 (self.total_count,), dtype=torch.int32, device='cpu'
@@ -253,6 +262,7 @@ class KVBlockAllocator:
 
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
+            self.block_parent_hashes.fill_(0)
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
@@ -264,18 +274,32 @@ class KVBlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
-    def register_kv_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+    def register_kv_block_hashes(
+        self,
+        block_ids: list[int],
+        block_hashes: list[int],
+        parent_hashes: Optional[list[int]] = None,
+    ) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Args:
             block_ids: List of block IDs.
             block_hashes: List of computed hash values (same length as block_ids).
+            parent_hashes: Parent hash for each block in the prefix chain (same
+                length as block_ids); 0 marks a root block with no parent. Used
+                by LRU eviction to avoid evicting a parent before its children.
+                If None, parents default to 0.
         """
         if not block_ids:
             return
         id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
+        if parent_hashes is not None:
+            assert len(parent_hashes) == len(block_ids)
+            self.block_parent_hashes[id_tensor] = torch.tensor(
+                parent_hashes, dtype=torch.int64, device=self.block_hashes.device
+            )
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
@@ -307,6 +331,7 @@ class KVBlockAllocator:
 
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1
+        self.block_parent_hashes[block_ids] = 0
         self.block_ref_counts[block_ids] = 0
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             self.block_timestamps[block_ids] = 0
@@ -340,7 +365,28 @@ class KVBlockAllocator:
     def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
         """Evict LRU cached blocks to free up space in the pool.
 
-        Evicts blocks with ref_count == 0, starting with oldest timestamps.
+        Evicts blocks with ref_count == 0, least-recently-used first, while never
+        evicting a parent before its children. Block hashes are parent-chained,
+        and ``_find_kv_match_count`` relies on the invariant that a cached child
+        block always has all of its ancestors cached too. A naive oldest-first
+        eviction breaks this: with chunked prefill, earlier chunks are allocated
+        first (older timestamps) yet are ancestors of later chunks (newer
+        timestamps), so once the request finishes and its blocks are cached, an
+        ancestor can be older than its descendant and get evicted first, leaving a
+        dangling child.
+
+        To preserve the invariant, we key each cached block by the *maximum*
+        timestamp over its subtree (itself plus all cached descendants): a cached
+        prefix is as recently used as the most-recently-used block extending it.
+        This makes every parent's key >= all of its descendants' keys, so evicting
+        an ascending-key prefix is always "descendant closed" — a parent is only
+        evicted once all of its children have been. Ties are broken by depth
+        (deeper first) so a parent never precedes a child at equal key.
+
+        Note: because a request holds a contiguous block prefix [0..k], any in-use
+        (ref_count > 0) block keeps all of its ancestors in use too. Hence a cached
+        (ref_count == 0) block can only have cached children, and considering the
+        cached set alone is sufficient to avoid dangling children.
 
         Args:
             num_blocks_needed: Number of blocks to evict.
@@ -352,13 +398,45 @@ class KVBlockAllocator:
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
         cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
 
-        if cached_block_ids.numel() < num_blocks_needed:
+        num_cached = cached_block_ids.numel()
+        if num_cached < num_blocks_needed:
             return False  # Not enough cached blocks to evict
 
-        # Sort by timestamp (ascending = oldest first)
-        cached_timestamps = self.block_timestamps[cached_block_ids]
-        sorted_indices = torch.argsort(cached_timestamps)
-        blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
+        own_ts = self.block_timestamps[cached_block_ids]
+        hashes = self.block_hashes[cached_block_ids]
+        parents = self.block_parent_hashes[cached_block_ids]
+
+        # Resolve each block's parent hash to the local index of the parent block,
+        # or -1 when the parent is not cached (root block with parent hash 0, or a
+        # parent still in use). Hashes are unique per cached block, so a single
+        # sorted lookup suffices.
+        sorted_hashes, sort_order = torch.sort(hashes)
+        pos = torch.searchsorted(sorted_hashes, parents).clamp(max=num_cached - 1)
+        found = sorted_hashes[pos] == parents
+        parent_idx = torch.where(found, sort_order[pos], torch.full_like(pos, -1))
+        has_parent = parent_idx >= 0
+        parent_safe = parent_idx.clamp(min=0)  # -1 -> 0 for masked-out gathers
+
+        # Propagate subtree-max timestamp and depth up/down the parent chain via
+        # repeated vectorized scatter/gather. Converges in <= max-chain-depth
+        # iterations (bounded by prompt_len / block_size); no per-element Python.
+        subtree_max = own_ts.clone()
+        depth = torch.zeros(num_cached, dtype=torch.int64)
+        while True:
+            new_subtree_max = subtree_max.clone()
+            new_subtree_max.scatter_reduce_(
+                0, parent_idx[has_parent], subtree_max[has_parent], reduce="amax"
+            )
+            new_depth = torch.where(has_parent, depth[parent_safe] + 1, depth)
+            if torch.equal(new_subtree_max, subtree_max) and torch.equal(new_depth, depth):
+                break
+            subtree_max, depth = new_subtree_max, new_depth
+
+        # Order by (subtree_max asc, depth desc) so children precede their parents.
+        # Two stable sorts compose into the desired lexicographic order.
+        by_depth = torch.argsort(depth, descending=True, stable=True)
+        order = by_depth[torch.argsort(subtree_max[by_depth], stable=True)]
+        blocks_to_evict = cached_block_ids[order[:num_blocks_needed]]
 
         self._deregister_blocks(blocks_to_evict)
 
