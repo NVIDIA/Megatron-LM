@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class TinyModel(nn.Module):
-    """Small model with two separately shardable units."""
+    """Small model with two separately shardable modules."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -50,7 +50,7 @@ class NestedModel(nn.Module):
 
 
 class MultiChildModel(nn.Module):
-    """Model with direct parameters and multiple child FSDP units."""
+    """Model with direct parameters and multiple child FsdpModules."""
 
     def __init__(self, dim: int, num_children: int) -> None:
         super().__init__()
@@ -169,7 +169,7 @@ def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
 
 
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
-    """An outer FSDP unit owns direct parameters but not nested child-unit parameters."""
+    """An outer FsdpModule owns direct parameters but not nested child FsdpModule parameters."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
