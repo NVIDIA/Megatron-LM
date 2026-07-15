@@ -238,22 +238,17 @@ _CUTEDSL_SSD_ENABLED = None
 
 
 def _cutedsl_ssd_enabled():
-    """Decide whether to use the CuteDSL SSD backend.
+    """Whether the CuteDSL SSD backend is usable on this system.
 
-    Controlled by env ``MEGATRON_SSD_BACKEND`` in {auto, cutedsl, triton}
-    (default ``auto``). In ``auto`` mode the CuteDSL kernel is used on Blackwell
-    (SM 10.0) when the CuteDSL runtime is importable; otherwise Triton is used.
+    CuteDSL is the default varlen-SSD backend: it is used whenever the GPU is
+    Blackwell (SM 10.0+) and the CuteDSL runtime imports; Triton is the fallback
+    for other platforms and for argument combinations the CuteDSL kernel does
+    not support. The decision is cached in ``_CUTEDSL_SSD_ENABLED`` (tests may
+    override that global directly to force a backend).
     """
     global _CUTEDSL_SSD_ENABLED
     if _CUTEDSL_SSD_ENABLED is not None:
         return _CUTEDSL_SSD_ENABLED
-
-    import os
-
-    mode = os.environ.get("MEGATRON_SSD_BACKEND", "auto").lower()
-    if mode == "triton":
-        _CUTEDSL_SSD_ENABLED = False
-        return False
 
     enabled = False
     try:
@@ -263,8 +258,6 @@ def _cutedsl_ssd_enabled():
             enabled = is_cutedsl_ssd_available()
     except Exception:
         enabled = False
-    if mode == "cutedsl":
-        enabled = True  # force, even off Blackwell (will error loudly if unusable)
     _CUTEDSL_SSD_ENABLED = enabled
     return enabled
 
@@ -290,57 +283,61 @@ def mamba_chunk_scan_combined_varlen(
     intermediate_chunk_indices=None,
     state_dtype=None,
 ):
-    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell) or Triton backend.
+    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell + divisible sequence)
+    or Triton backend.
 
-    The CuteDSL backend is a faster drop-in for the common prefill case; it
-    falls back to Triton for argument combinations it does not yet support
-    (gating ``z``, non-zero ``initial_states``, intermediate-state extraction).
-    See :func:`_mamba_chunk_scan_combined_varlen_triton` for the argument
-    contract.
+    CuteDSL is the default backend on Blackwell (SM 10.0+): a faster drop-in
+    covering the production prefill cases (divisible sequence lengths, chunked
+    prefill via ``initial_states``, prefix caching via
+    ``intermediate_chunk_indices``, empty padded sequences). Eligibility is
+    decided up front via :func:`cutedsl_unsupported_reason`; Triton is used on
+    other platforms and for the argument combinations the CuteDSL kernel does
+    not support (non-divisible sequence lengths, gating ``z``, interleaved
+    empty sequences with intermediate emission). See
+    :func:`_mamba_chunk_scan_combined_varlen_triton` for the argument contract.
     """
     if _cutedsl_ssd_enabled():
-        import os
-
+        # Kept local: this is the graceful-degradation boundary (the cutlass-
+        # dependent package must only be imported once the backend is enabled).
         from .cutedsl_mamba2_ssd import (
-            mamba_chunk_scan_combined_varlen_cutedsl,
+            cutedsl_unsupported_reason,
             mamba_chunk_scan_combined_varlen_cutedsl_thd,
         )
 
-        # The THD-native variant (X fed as a zero-copy headdim-contiguous view)
-        # avoids the largest host transpose; prefer it, then the dense
-        # CuteDSL path, then Triton. Set MEGATRON_SSD_BACKEND=cutedsl_dense to
-        # force the dense CuteDSL path.
-        kwargs = dict(
-            x=x,
-            dt=dt,
-            A=A,
-            B=B,
-            C=C,
-            chunk_size=chunk_size,
-            cu_chunk_seqlens=cu_chunk_seqlens,
-            last_chunk_indices=last_chunk_indices,
-            seq_idx=seq_idx,
-            out=out,
-            D=D,
-            z=z,
-            dt_bias=dt_bias,
-            initial_states=initial_states,
-            dt_softplus=dt_softplus,
-            dt_limit=dt_limit,
-            return_intermediate_states=return_intermediate_states,
-            intermediate_chunk_indices=intermediate_chunk_indices,
-            state_dtype=state_dtype,
+        supported = (
+            cutedsl_unsupported_reason(
+                x,
+                chunk_size,
+                cu_chunk_seqlens,
+                last_chunk_indices,
+                z=z,
+                return_intermediate_states=return_intermediate_states,
+                intermediate_chunk_indices=intermediate_chunk_indices,
+            )
+            is None
         )
-        mode = os.environ.get("MEGATRON_SSD_BACKEND", "auto").lower()
-        if mode != "cutedsl_dense":
-            try:
-                return mamba_chunk_scan_combined_varlen_cutedsl_thd(**kwargs)
-            except NotImplementedError:
-                pass
-        try:
-            return mamba_chunk_scan_combined_varlen_cutedsl(**kwargs)
-        except NotImplementedError:
-            pass  # unsupported argument combination -> Triton fallback
+        if supported:
+            return mamba_chunk_scan_combined_varlen_cutedsl_thd(
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                chunk_size=chunk_size,
+                cu_chunk_seqlens=cu_chunk_seqlens,
+                last_chunk_indices=last_chunk_indices,
+                seq_idx=seq_idx,
+                out=out,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                return_intermediate_states=return_intermediate_states,
+                intermediate_chunk_indices=intermediate_chunk_indices,
+                state_dtype=state_dtype,
+            )
 
     return _mamba_chunk_scan_combined_varlen_triton(
         x,
