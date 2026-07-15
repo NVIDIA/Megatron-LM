@@ -394,7 +394,9 @@ try:
 
     bp = Blueprint('chat_completions_api', __name__)
 
-    def apply_parsers(message_text, tools, parsers_list, tools_requested):
+    def apply_parsers(
+        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
+    ):
         """Runs CPU-intensive text parsing."""
         meta = {}
         for parser in parsers_list:
@@ -402,7 +404,9 @@ try:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
             prev_text = message_text
-            parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
+            parsed_text, new_info = PARSER_MAPPING[parser].parse(
+                message_text, tools=tools, chat_template_kwargs=chat_template_kwargs
+            )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
                     new_info.get("tool_calls", []), tools=tools
@@ -704,7 +708,11 @@ try:
 
             if parsers:
                 message_text, metadata = apply_parsers(
-                    message_text, tools, parsers, tools_requested
+                    message_text,
+                    tools,
+                    parsers,
+                    tools_requested,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
 
             normalized_tool_calls = metadata.get("tool_calls", [])
