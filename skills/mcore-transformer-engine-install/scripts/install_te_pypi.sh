@@ -222,16 +222,24 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v nvcc >/dev/null 2>&1; then
-  echo "nvcc is required for Transformer Engine native builds but was not found on PATH." >&2
-  exit 1
-fi
-
-if [[ -z "${CUDA_PATH:-}" ]]; then
-  NVCC_PATH="$(command -v nvcc)"
+if [[ -n "${CUDA_PATH:-}" ]]; then
+  NVCC_PATH="${CUDA_PATH%/}/bin/nvcc"
+  if [[ ! -x "${NVCC_PATH}" ]]; then
+    echo "CUDA_PATH=${CUDA_PATH} does not contain an executable bin/nvcc." >&2
+    exit 1
+  fi
+else
+  NVCC_PATH="$(command -v nvcc || true)"
+  if [[ -z "${NVCC_PATH}" ]]; then
+    echo "nvcc is required for Transformer Engine native builds but was not found." >&2
+    echo "Use the PyTorch NGC Container, or install a matching CUDA Toolkit and set CUDA_PATH." >&2
+    echo "For a user-local install, install only the toolkit into a writable directory; do not install a driver." >&2
+    exit 1
+  fi
   CUDA_PATH="$(cd "$(dirname "${NVCC_PATH}")/.." && pwd)"
-  export CUDA_PATH
 fi
+export CUDA_PATH
+export PATH="${CUDA_PATH}/bin:${PATH}"
 
 PYTHON_BIN="${VENV_PATH}/bin/python"
 
