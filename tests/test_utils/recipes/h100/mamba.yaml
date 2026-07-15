@@ -99,6 +99,10 @@ products:
 
   - test_case: [hybrid_nemotron_v3_pico_7b_a1b_tp1_ep8_QAD_dgx_h100_1N8G]
     products:
+      # Marked broken: the `total loss` exact/deterministic golden comparison is
+      # flaky (passes the approximate rtol=0.05 check but not bit-exact),
+      # repeatedly dequeuing PRs from the merge queue. Tracked by a dedicated
+      # flaky-test issue for this test case.
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
