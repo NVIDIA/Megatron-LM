@@ -103,6 +103,57 @@ def should_free_input(name, is_moe, config, num_local_experts):
     return free_input_nodes.get(name, False)
 
 
+def finalize_decoder_layer_output(node, hidden_states):
+    """Apply the decoder block boundary at whichever node is terminal for the layer.
+
+    The decoder block boundary (mHC output contraction + final layer norm, see
+    ``TransformerBlock.postprocess_for_layer_schedule``) must run on the last decoder
+    layer regardless of whether that layer's terminal schedule node is the MoE combine,
+    the standalone mHC-post, or the dense MLP. Embedding the boundary only in the MoE
+    closures skips it for mixed patterns whose final layer is dense (for example
+    ``moe_layer_freq=[1, 0]``), letting an uncontracted ``[s, b, n*h]`` tensor reach GPT
+    postprocessing without ``learned_output_contract`` or the final layer norm. Factoring
+    it here keeps the math independent of layer type and mHC-post placement.
+
+    When MTP is enabled the boundary also produces the pre-contraction mHC multi-stream
+    consumed by the MTP depths. That side output is detached at its producer so MTP reads
+    a leaf; ``TransformerLayerNode.backward_impl`` reconnects the accumulated gradient when
+    the scheduler runs this node's backward, exactly as ``residual`` / ``mlp_h_res`` /
+    ``mlp_hc_h_post`` are bridged. Storing it undetached would let MTP backward traverse the
+    decoder mHC graph out of schedule order, producing a second-backward error after saved
+    tensors are freed or bypassing the point where the contracted and MTP branches merge.
+
+    Args:
+        node: The terminal ``TransformerLayerNode`` for the layer.
+        hidden_states: The layer output prior to the decoder boundary.
+
+    Returns:
+        The node output: contracted + normalized ``[s, b, h]`` on the final decoder layer,
+        otherwise a viewless view of ``hidden_states``.
+    """
+    # Layer nodes exist only for concrete layers; empty decoder chunks use PostProcessNode.
+    # MTP layers finalize via submodule_mtp_postprocess_forward, not the decoder boundary.
+    if node.is_mtp or not node.is_last_layer:
+        return make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+    output, mhc_multistream = node.chunk_state.model.decoder.postprocess_for_layer_schedule(
+        hidden_states, return_mhc_multistream=True
+    )
+    # postprocess_for_layer_schedule already makes final-layernorm outputs viewless; keep
+    # this wrapper for the no-layernorm and mHC contraction-only exits.
+    output = make_viewless_tensor(
+        inp=output, requires_grad=output.requires_grad, keep_graph=True
+    )
+    # Detach the pre-contraction multi-stream at its producer so MTP reads a leaf and this
+    # node's backward_impl reconnects the accumulated gradient under scheduler control.
+    node.chunk_state.mhc_multistream = (
+        node.detach(mhc_multistream) if mhc_multistream is not None else None
+    )
+    return output
+
+
 class TransformerLayerState:
     """State shared within a transformer layer.
 
@@ -738,21 +789,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 hidden_states, forced_released_tensors=[residual]
             )
             node.layer_state.mlp_norm_manager = None
-        if not node.is_mtp and node.is_last_layer:
-            # Layer nodes exist only for concrete layers; empty decoder chunks use PostProcessNode.
-            output, mhc_multistream = node.chunk_state.model.decoder.postprocess_for_layer_schedule(
-                hidden_states, return_mhc_multistream=True
-            )
-            # The boundary helper may already make final-layernorm outputs viewless; keep this
-            # wrapper for no-layernorm or mHC contraction-only exits.
-            output = make_viewless_tensor(
-                inp=output, requires_grad=output.requires_grad, keep_graph=True
-            )
-            node.chunk_state.mhc_multistream = mhc_multistream
-        else:
-            output = make_viewless_tensor(
-                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-            )
+        output = finalize_decoder_layer_output(node, hidden_states)
 
         # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
@@ -782,18 +819,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
             node.layer_state.mlp_norm_manager = None
 
-        if not node.is_mtp and node.is_last_layer:
-            output, mhc_multistream = node.chunk_state.model.decoder.postprocess_for_layer_schedule(
-                hidden_states, return_mhc_multistream=True
-            )
-            output = make_viewless_tensor(
-                inp=output, requires_grad=output.requires_grad, keep_graph=True
-            )
-            node.chunk_state.mhc_multistream = mhc_multistream
-        else:
-            output = make_viewless_tensor(
-                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-            )
+        output = finalize_decoder_layer_output(node, hidden_states)
 
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
         node.layer_state.mlp_h_res.record_stream(torch.cuda.current_stream())
@@ -819,6 +845,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
             kwargs["mhc_recompute_manager"] = manager
         output = layer._forward_mlp(*args, **kwargs)
+        # Dense layers are terminal for their own layer, so the decoder boundary (mHC
+        # contraction + final layer norm) must be applied here for a dense final layer.
+        output = finalize_decoder_layer_output(node, output)
         if manager is not None and getattr(node, "is_last_layer_in_mhc_recompute_group", False):
             manager.discard_all_outputs()
         return output
