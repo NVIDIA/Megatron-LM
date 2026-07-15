@@ -451,7 +451,14 @@ class DBuffer:
             elif isinstance(placement, Partial):
                 # main_grad backs .grad while it rests DP-outer-Partial between
                 # microbatches, so a Partial placement must round-trip to a DTensor.
-                reduce_op = "avg" if placement.reduce_op == dist.ReduceOp.AVG else "sum"
+                if placement.reduce_op == dist.ReduceOp.AVG:
+                    reduce_op = "avg"
+                elif placement.reduce_op == dist.ReduceOp.SUM:
+                    reduce_op = "sum"
+                else:
+                    raise ValueError(
+                        f"Unsupported Partial reduce op for DTensor: {placement.reduce_op!r}."
+                    )
                 torch_placements.append(dist_tensor.Partial(reduce_op))
             else:
                 raise TypeError(f"Unsupported placement for DTensor conversion: {placement!r}.")

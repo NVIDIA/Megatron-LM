@@ -151,6 +151,9 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
+            # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
+            # is finalized to main_weight's placements after the last microbatch.
+            self._accumulation_placements = main_grad_placements
         sharded_parameters: list[nn.Parameter] = []
         unsharded_parameters: list[nn.Parameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
@@ -301,27 +304,21 @@ class FsdpParameterGroup:
                 grads, mesh=self.mesh, placements=[Partial(partial_op)] * self.mesh.ndim
             )
 
-        # DP-outer axes (Replicate in main_weight) accumulate as Partial and are
-        # all-reduced only on the last microbatch.
-        deferred_axes = [
-            axis
-            for axis, placement in enumerate(self.main_weight.placements)
-            if isinstance(placement, Replicate)
-        ]
-        if deferred_axes and self._symm_mem_pool is not None:
+        # main_grad accumulates DP-outer-Partial (Partial where main_weight is
+        # Replicate); symmetric memory does not support that deferral yet.
+        if (
+            self._accumulation_placements != self.main_weight.placements
+            and self._symm_mem_pool is not None
+        ):
             raise NotImplementedError(
                 "Symmetric-memory gradient reduction does not support deferred DP-outer axes."
             )
-        accumulation_placements = tuple(
-            Partial(partial_op) if isinstance(placement, Replicate) else placement
-            for placement in self.main_weight.placements
-        )
 
         # A finalized main_grad (placements == main_weight) means the previous step
         # is done; reset it to the DP-outer-Partial accumulation placement.
         if self.main_grad.placements == self.main_weight.placements:
-            self.main_grad.placements = accumulation_placements
-        reduced = self._reduce_grad_axis(partial_grad, accumulation_placements)
+            self.main_grad.placements = self._accumulation_placements
+        reduced = self._reduce_grad_axis(partial_grad, self._accumulation_placements)
 
         # set_to_none=True cleared the sharded grads -> overwrite main_grad and
         # install .grad; else they are views into a zeroed main_grad -> accumulate.
@@ -333,13 +330,9 @@ class FsdpParameterGroup:
                 sharded_parameter.grad = self.main_grad.get_dtensor(index)
 
         if is_last_microbatch:
-            for axis in deferred_axes:
-                dist.all_reduce(
-                    self.main_grad.local_buffer,
-                    op=dist.ReduceOp.AVG,
-                    group=self.mesh.get_group(axis),
-                )
-            self.main_grad.placements = self.main_weight.placements
+            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
+            # reduce-scatter for HFSDP) and install the sharded parameter gradients.
+            self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
             for index, sharded_parameter in enumerate(self.sharded_parameters):
                 sharded_parameter.grad = self.main_grad.get_dtensor(index)
 
