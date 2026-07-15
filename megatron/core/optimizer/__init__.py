@@ -754,6 +754,9 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
+    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
+        raise ValueError("MFSDP v2 with emerging optimizers is not currently validated.")
+
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
             f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
@@ -1025,8 +1028,6 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
-        if is_mfsdp_v2:
-            raise ValueError("MFSDP v2 currently supports only standard Adam/AdamW/SGD.")
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
@@ -1041,8 +1042,13 @@ def get_megatron_optimizer(
             raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
         if not config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 requires Megatron's DistributedOptimizer wrapper.")
-        if not config.bf16 or config.fp16 or config.loss_scale is not None:
-            raise ValueError("MFSDP v2 currently supports only unscaled BF16 training.")
+        if config.fp16:
+            raise ValueError(
+                "MFSDP v2 does not currently support FP16 training because FP16 triggers "
+                "loss unscale."
+            )
+        if config.loss_scale is not None:
+            raise ValueError("MFSDP v2 does not currently support loss scaling.")
         if config.overlap_param_gather_with_optimizer_step:
             raise ValueError("MFSDP v2 does not support optimizer-step parameter-gather overlap.")
         unsupported_optimizer_features = {

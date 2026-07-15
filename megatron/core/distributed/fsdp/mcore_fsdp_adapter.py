@@ -541,6 +541,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         for submodule in reversed(list(module.modules())):
             if submodule is module:
+                # The root is always sharded after selected child units so it is not
+                # wrapped twice when its type also appears in fsdp_unit_modules.
                 continue
             if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                 fully_shard(
@@ -566,17 +568,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
-        parallel_sizes = {
-            "tensor model parallelism": config.tensor_model_parallel_size,
-            "pipeline model parallelism": config.pipeline_model_parallel_size,
-            "context parallelism": config.context_parallel_size,
-            "expert model parallelism": config.expert_model_parallel_size,
-        }
-        unsupported_parallelism = [name for name, size in parallel_sizes.items() if size != 1]
-        if unsupported_parallelism:
+        unsupported_parallelisms = [
+            "tensor_model_parallel_size",
+            "pipeline_model_parallel_size",
+            "context_parallel_size",
+            "expert_model_parallel_size",
+        ]
+        if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
-                "MFSDP v2 currently requires TP=PP=CP=EP=1; unsupported: "
-                + ", ".join(unsupported_parallelism)
+                "MFSDP v2 does not currently support: "
+                + ", ".join(
+                    f"{parallelism}={getattr(config, parallelism)}"
+                    for parallelism in unsupported_parallelisms
+                )
             )
 
         for group_name in ("tp", "pp", "cp", "ep"):
