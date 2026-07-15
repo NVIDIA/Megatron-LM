@@ -22,8 +22,9 @@ class DistributedSetup:
 def distributed_setup() -> Iterator[DistributedSetup]:
     """Read torchrun rank state and set up this rank's local device."""
     # Some MFSDP v2 tests are sensitive to NCCL algorithm/channel choices. Clear
-    # CI launcher overrides before init_device_mesh initializes NCCL communicators
-    # so this bucket uses NCCL settings closer to production.
+    # the suite-wide NCCL defaults (set in the top-level conftest.py) before
+    # init_device_mesh initializes NCCL communicators so this bucket uses NCCL
+    # settings closer to production.
     os.environ.pop("NCCL_MAX_NCHANNELS", None)
     os.environ.pop("NCCL_NVLS_ENABLE", None)
 
