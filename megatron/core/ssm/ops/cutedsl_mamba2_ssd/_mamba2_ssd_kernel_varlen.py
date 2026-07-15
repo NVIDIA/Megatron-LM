@@ -26,6 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# pylint: disable=line-too-long,missing-class-docstring,missing-function-docstring,bad-builtin
 
 import argparse
 import os
@@ -43,9 +44,11 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not __package__:
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, os.path.join(current_dir, "../../../.."))
+    repo_root = os.path.abspath(os.path.join(current_dir, "../../../../.."))
+    sys.path.insert(0, repo_root)
+    __package__ = "megatron.core.ssm.ops.cutedsl_mamba2_ssd"
 
 from ._mamba2_ssd_reference import (
     analyze_relative_diffs,
@@ -66,12 +69,20 @@ class SSDKernel:
         N: int,
         has_d: bool,
         d_has_hdim: bool,
+        has_initial: bool = False,
+        has_intermediate: bool = False,
     ):
         self.io_dtype: Type[cutlass.Numeric] = io_dtype
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.cumsum_delta_dtype: Type[cutlass.Numeric] = cumsum_delta_dtype
         # has_d means epilog warp performs Y += X*D fusion
         self.has_d: bool = has_d
+        # has_initial means PRE_INTER seeds the SSM state from initial_states
+        # (non-zero carried state for chunked prefill / prefix caching) instead of 0.
+        self.has_initial: bool = has_initial
+        # has_intermediate means PRE_INTER emits the running SSM state to
+        # intermediate_out at flagged chunk boundaries (prefix caching).
+        self.has_intermediate: bool = has_intermediate
         # d_has_hdim = True means D is (D, EH) shape and loaded by TMA
         # d_has_hdim = False means D is (1, EH) shape and loaded directly to register
         self.d_has_hdim: bool = d_has_hdim
@@ -93,7 +104,7 @@ class SSDKernel:
         self.tile_shape_mnk_inter1 = (N, D, L)
         self.tile_shape_mnk_inter2 = (L, D, N)
 
-        self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.cta_group = tcgen05.CtaGroup.ONE
 
         # Launch config
         self.occupancy = 1
@@ -243,6 +254,10 @@ class SSDKernel:
             self.tile_shape_mnk_inter2[1:],
             self.internal_stages,
         )
+        # initial_states is loaded into the same (D, N) state tile as fstate is stored.
+        self.num_init_load_bytes = cute.size_in_bytes(
+            self.io_dtype, cute.slice_(self.p_smem_layout_store, (None, None, 0))
+        )
 
         # Y is ACC operand (from smem) of INTER2_MMA and INTRA2_MMA, after postprocessed and TMA stored by EPILOG
         # THD variant: ROW_MAJOR (headdim-contiguous) so Y is TMA-stored directly
@@ -251,12 +266,16 @@ class SSDKernel:
             self.io_dtype, utils.LayoutEnum.ROW_MAJOR, self.epi_tile, self.output_stages
         )
 
-        # Delta is linear smem layouts for pre/post processing
+        # Delta is linear smem layouts for pre/post processing. Kept in fp32 (not
+        # io dtype): delta scales the intra/inter operand matrices before their
+        # bf16 rounding, and quantizing it early is a measurable elementwise error
+        # vs the fp32-dt Triton path (cancellation in y amplifies it).
+        self.delta_dtype = cutlass.Float32
         self.delta_linear_smem_layout = cute.make_layout(
             (self.tile_shape_mnk_inter1[2], self.input_stages)
         )
         self.num_delta_load_bytes = cute.size_in_bytes(
-            self.io_dtype, cute.slice_(self.delta_linear_smem_layout, (None, 0))
+            self.delta_dtype, cute.slice_(self.delta_linear_smem_layout, (None, 0))
         )
 
         # Cumsum delta is linear smem layouts for pre/post processing
@@ -316,6 +335,9 @@ class SSDKernel:
         y: cute.Tensor,
         fstate: cute.Tensor,
         d: cute.Tensor,
+        initial_states: cute.Tensor,
+        intermediate_out: cute.Tensor,
+        emit_slot: cute.Tensor,
         seq_chunk_start: cute.Tensor,
         seq_n_chunks: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
@@ -422,6 +444,36 @@ class SSDKernel:
             cpasync.CopyBulkTensorTileS2GOp(), fstate, p_smem_layout_store, p_cta_v_layout
         )
 
+        # TMA load for initial_states (same (D, N, EH, S) layout as fstate); seeds the
+        # PRE_INTER state. Loaded into a dedicated smem buffer, read via LdMatrix.
+        tma_atom_init = None
+        tma_tensor_init = initial_states
+        if cutlass.const_expr(self.has_initial):
+            init_cta_v_layout = cute.slice_(
+                cute.make_identity_layout(initial_states.shape), (None, None, 0, 0)
+            )
+            tma_atom_init, tma_tensor_init = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                initial_states,
+                p_smem_layout_store,
+                init_cta_v_layout,
+            )
+
+        # TMA store for intermediate SSM states (prefix caching): same (D, N, EH, K)
+        # layout as fstate, indexed per emit-slot. Emitted from smem_p at flagged chunks.
+        tma_atom_inter = None
+        tma_tensor_inter = intermediate_out
+        if cutlass.const_expr(self.has_intermediate):
+            inter_cta_v_layout = cute.slice_(
+                cute.make_identity_layout(intermediate_out.shape), (None, None, 0, 0)
+            )
+            tma_atom_inter, tma_tensor_inter = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                intermediate_out,
+                p_smem_layout_store,
+                inter_cta_v_layout,
+            )
+
         # Compute grid size
         tile_sched_params, grid = self._compute_grid(y, b, fstate, max_active_clusters)
 
@@ -442,6 +494,9 @@ class SSDKernel:
             deltas_empty: cute.struct.MemRange[cutlass.Int64, self.input_stages]  # type: ignore
             d_full: cute.struct.MemRange[cutlass.Int64, self.input_stages]  # type: ignore
             d_empty: cute.struct.MemRange[cutlass.Int64, self.input_stages]  # type: ignore
+            # initial_states load barriers (one per work-item)
+            init_full: cute.struct.MemRange[cutlass.Int64, self.input_stages]  # type: ignore
+            init_empty: cute.struct.MemRange[cutlass.Int64, self.input_stages]  # type: ignore
             # Intra1 acc stage barriers
             intra1_acc_full: cute.struct.MemRange[cutlass.Int64, self.intra1_acc_stages]  # type: ignore
             intra1_acc_empty: cute.struct.MemRange[
@@ -494,7 +549,7 @@ class SSDKernel:
                 nonswizzle_buffer_align_bytes,
             ]
             smem_delta: cute.struct.Align[
-                cute.struct.MemRange[self.io_dtype, cute.cosize(self.delta_linear_smem_layout)],
+                cute.struct.MemRange[self.delta_dtype, cute.cosize(self.delta_linear_smem_layout)],
                 nonswizzle_buffer_align_bytes,
             ]
             smem_d: cute.struct.Align[
@@ -528,6 +583,11 @@ class SSDKernel:
             tma_tensor_cumsum_delta,
             tma_atom_d,
             tma_tensor_d,
+            tma_atom_init,
+            tma_tensor_init,
+            tma_atom_inter,
+            tma_tensor_inter,
+            emit_slot,
             self.cluster_layout_vmnk,
             self.x_smem_layout,
             self.xt_smem_layout,
@@ -575,6 +635,11 @@ class SSDKernel:
         tma_tensor_cumsum_delta: cute.Tensor,
         tma_atom_d: Optional[cute.CopyAtom],
         tma_tensor_d: cute.Tensor,
+        tma_atom_init: Optional[cute.CopyAtom],
+        tma_tensor_init: cute.Tensor,
+        tma_atom_inter: Optional[cute.CopyAtom],
+        tma_tensor_inter: cute.Tensor,
+        emit_slot: cute.Tensor,
         cluster_layout_vmnk: cute.Layout,
         x_smem_layout: cute.ComposedLayout,
         xt_smem_layout: cute.ComposedLayout,
@@ -610,6 +675,10 @@ class SSDKernel:
             ]
             if cutlass.const_expr(self.d_has_hdim):
                 tma_atoms.append(tma_atom_d)
+            if cutlass.const_expr(self.has_initial):
+                tma_atoms.append(tma_atom_init)
+            if cutlass.const_expr(self.has_intermediate):
+                tma_atoms.append(tma_atom_inter)
             for tma_atom in tma_atoms:
                 cpasync.prefetch_descriptor(tma_atom)
 
@@ -673,6 +742,11 @@ class SSDKernel:
         smem_d = None
         if cutlass.const_expr(self.d_has_hdim):
             smem_d = smem_storage.smem_d.get_tensor(d_linear_smem_layout)
+        # initial_states reuses the smem_p buffer (it IS chunk-0's INTER2_P): TMA-load
+        # via the smem_p_store view, read back via smem_pt (LdMatrix). No extra smem.
+        # Compute the raw mbarrier pointer at top level (referencing smem_storage inside
+        # a warp branch would capture the whole struct as a non-flattenable live-in).
+        init_mbar_ptr = smem_storage.init_full.data_ptr()
 
         # Init mbarrier for pipeline
         x_pipeline = self.make_and_init_x_pipeline(smem_storage.x_full.data_ptr())
@@ -1453,12 +1527,37 @@ class SSDKernel:
                 local_tidx, smem_pt, tiled_t2r_inter1
             )
 
+            # initial_states (chunked prefill): the state is loaded straight into the
+            # smem_p (INTER2_P) buffer via a raw mbarrier, then LdMatrix'd into the
+            # state register fragment (element-compatible with tState/tRS_rP — the
+            # reverse of the INTER2_P StMatrix store). Reuses smem_p (no extra smem).
+            tiled_s2r_init = None
+            tLR_rInit = None
+            tLR_sInit = None
+            tInits_init = None
+            tInitg_pre_slice = None
+            if cutlass.const_expr(self.has_initial):
+                tiled_s2r_init, tLR_rInit, tLR_sInit = self.smem_load_and_partition_init(
+                    local_tidx, smem_pt, tiled_t2r_inter1
+                )
+                tInits_init, tInitg_pre_slice = self.tma_partition_with_shape(
+                    tma_atom_init, tma_tensor_init, smem_p_store, self.tile_shape_mnk_inter2[1:]
+                )
+
             # Partition global/shared tensor for P (State)
             # ((ATOM_V, REST_V), INTERNAL_STAGE)
             # ((ATOM_V, REST_V), 1, 1, EH, B)
             bSG_sP, bSG_gP_pre_slice = self.tma_partition_with_shape(
                 tma_atom_p, tma_tensor_p, smem_p_store, self.tile_shape_mnk_inter2[1:]
             )
+
+            # intermediate_out (prefix caching): same smem source (smem_p_store), a
+            # separate gmem tensor indexed per emit-slot.
+            biSG_gP_pre_slice = None
+            if cutlass.const_expr(self.has_intermediate):
+                _, biSG_gP_pre_slice = self.tma_partition_with_shape(
+                    tma_atom_inter, tma_tensor_inter, smem_p_store, self.tile_shape_mnk_inter2[1:]
+                )
 
             # Pipeline B/Delta/INTER1_ACC consumer state
             b_consumer_state = pipeline.make_pipeline_state(
@@ -1490,6 +1589,8 @@ class SSDKernel:
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
                 C = cute.arch.make_warp_uniform(cutlass.Int32(seq_n_chunks[b_idx]))
+                # Global chunk base for this sequence (for prefix-caching emit lookup).
+                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start[b_idx]))
 
                 # Slice global tensor to current tile idx
                 # fstate is per-(seq, head): b_idx IS the sequence index.
@@ -1503,8 +1604,10 @@ class SSDKernel:
                 inter1_acc_consumer_state.reset_count()
                 inter2_p_producer_state.reset_count()
 
-                # State (P) init
-                tState.fill(0.0)
+                # State (P) init: zero here; the chunked-prefill seed is loaded into
+                # smem_p (and tState) inside the INTER2_P producer window below.
+                if cutlass.const_expr(not self.has_initial):
+                    tState.fill(0.0)
 
                 # Peek (try_wait) B/Delta/INTER1_B buffer full/full/empty status
                 peek_b_full_status = self.conditional_consumer_try_wait(
@@ -1517,14 +1620,41 @@ class SSDKernel:
                     inter1_b_producer_state, inter1_b_pipeline, C
                 )
 
-                # Prefill INTER2_P with 0
-                # Wait for INTER2_P buffer empty
+                # Prefill chunk-0 INTER2_P (the prior-state the inter-output uses).
+                # Wait for INTER2_P buffer empty (own smem_p for this stage).
                 inter2_p_pipeline.producer_acquire(inter2_p_producer_state)
-
-                tRS_rP.fill(0.0)
-                # Copy INTER2_P from register to smem
                 inter2_p_coord = (None, None, None, inter2_p_producer_state.index)
-                cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
+
+                if cutlass.const_expr(self.has_initial):
+                    # Chunked prefill: TMA-load initial_states straight into smem_p
+                    # (= chunk-0 INTER2_P) via a one-shot raw mbarrier, then LdMatrix
+                    # it into tState for the recurrence. Reuses smem_p (no extra smem).
+                    self.pre_inter_sync_barrier.arrive_and_wait()
+                    if local_warp_idx == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_init(init_mbar_ptr, 1)
+                            cute.arch.mbarrier_init_fence()
+                    self.pre_inter_sync_barrier.arrive_and_wait()
+                    if local_warp_idx == 0:
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                init_mbar_ptr, self.num_init_load_bytes
+                            )
+                        cute.copy(
+                            tma_atom_init,
+                            tInitg_pre_slice[(None, 0, 0, eh_idx, b_idx)],
+                            tInits_init[(None, inter2_p_producer_state.index)],
+                            tma_bar_ptr=init_mbar_ptr,
+                        )
+                    cute.arch.mbarrier_wait(init_mbar_ptr, 0)
+                    # LdMatrix smem_p (this stage) -> register state for the recurrence.
+                    cute.copy(tiled_s2r_init, tLR_sInit[inter2_p_coord], tLR_rInit)
+                    for reg_idx in cutlass.range(cute.size(tState), unroll_full=True):
+                        tState[reg_idx] = tLR_rInit[reg_idx].to(self.acc_dtype)
+                else:
+                    tRS_rP.fill(0.0)
+                    # Copy INTER2_P from register to smem
+                    cute.copy(tiled_r2s_p, tRS_rP, tRS_sP[inter2_p_coord])
 
                 # Fence for shared memory
                 cute.arch.fence_proxy("async.shared", space="cta")
@@ -1605,6 +1735,25 @@ class SSDKernel:
 
                     # Fence for shared memory
                     cute.arch.fence_proxy("async.shared", space="cta")
+
+                    # Prefix caching: emit the running state (now in smem_p = state
+                    # AFTER this chunk) to intermediate_out at flagged chunks. emit_slot
+                    # is warp/CTA-uniform, so all PRE_INTER warps take the same branch.
+                    if cutlass.const_expr(self.has_intermediate):
+                        slot = cute.arch.make_warp_uniform(
+                            cutlass.Int32(emit_slot[chunk_base + chunk_idx])
+                        )
+                        if slot >= 0:
+                            self.pre_inter_sync_barrier.arrive_and_wait()
+                            if local_warp_idx == 0:
+                                cute.copy(
+                                    tma_atom_inter,
+                                    bSG_sP[(None, inter2_p_producer_state.index)],
+                                    biSG_gP_pre_slice[(None, 0, 0, eh_idx, slot)],
+                                )
+                                cute.arch.cp_async_bulk_commit_group()
+                                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            self.pre_inter_sync_barrier.arrive_and_wait()
 
                     # Async arrive INTER1_ACC/INTER2_P buffer empty/full
                     inter1_acc_pipeline.consumer_release(inter1_acc_consumer_state)
@@ -2233,10 +2382,10 @@ class SSDKernel:
         io_dtype,
         acc_dtype,
         cta_group,
-        tile_shape_mnk_intra1,
-        tile_shape_mnk_intra2,
-        tile_shape_mnk_inter1,
-        tile_shape_mnk_inter2,
+        tile_shape_mnk_intra1,  # (L, L, N)
+        tile_shape_mnk_intra2,  # (L, D, L)
+        tile_shape_mnk_inter1,  # (N, D, L)
+        tile_shape_mnk_inter2,  # (L, D, N)
     ):
         # THD variant: flip the X operand to headdim-contiguous (MN for
         # intra2/inter1 b-operand) so X is a zero-copy THD view. B/C stay in the
@@ -2387,6 +2536,26 @@ class SSDKernel:
                 consumer_group=d_consumer_group,
                 tx_count=self.num_d_load_bytes,
                 barrier_storage=d_full_mbar_ptr,
+                defer_sync=True,
+            )
+
+    def make_and_init_init_pipeline(self, init_full_mbar_ptr):
+        if not self.has_initial:
+            return None
+        else:
+            init_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, len([self.tma_deltas_x_d_warp_id])
+            )
+            init_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, len(self.pre_inter_warp_id)
+            )
+
+            return pipeline.PipelineTmaAsync.create(
+                num_stages=self.input_stages,
+                producer_group=init_producer_group,
+                consumer_group=init_consumer_group,
+                tx_count=self.num_init_load_bytes,
+                barrier_storage=init_full_mbar_ptr,
                 defer_sync=True,
             )
 
@@ -2810,6 +2979,21 @@ class SSDKernel:
         # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
         tTR_r = cute.make_rmem_tensor(tTR_s.shape, dtype)
         return tiled_t2r, tTR_t, tTR_r
+
+    def smem_load_and_partition_init(self, local_tidx, smem_init_pt, tiled_t2r_inter1):
+        """Reverse of the INTER2_P StMatrix store: LdMatrix the initial state from
+        smem into a register fragment element-compatible with tState/tTR_rP/tRS_rP."""
+        dtype = smem_init_pt.element_type
+        copy_atom_s2r_init = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), dtype
+        )
+        tiled_s2r_init = cute.make_tiled_copy_D(copy_atom_s2r_init, tiled_t2r_inter1)
+        thr_s2r_init = tiled_s2r_init.get_slice(local_tidx)
+        tLR_sInit = thr_s2r_init.partition_S(smem_init_pt)
+        tLR_rInit = cute.make_rmem_tensor(
+            cute.slice_(tLR_sInit.shape, (None, None, None, 0)), dtype
+        )
+        return tiled_s2r_init, tLR_rInit, tLR_sInit
 
     def smem_store_and_partition_p_y(self, local_tidx, smem_pt, tiled_t2r_inter1):
         dtype = smem_pt.element_type
@@ -3236,85 +3420,152 @@ def run(
 
 if __name__ == "__main__":
 
-    def parse_comma_separated_ints(s: str) -> List[int]:
-        try:
-            return [int(x.strip()) for x in s.split(",")]
-        except ValueError:
-            raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+    import torch
 
-    parser = argparse.ArgumentParser(description="Example of MxNxKxL GEMM on Blackwell.")
+    def build_varlen_ssd_inputs(
+        seq_lens: List[int], chunk_size: int, nheads: int, headdim: int, ngroups: int, dstate: int
+    ) -> dict:
+        """Build the token-packed inputs shared by the CuteDSL and Triton wrappers."""
+        total = sum(seq_lens)
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        x = torch.randn(total, nheads, headdim, device=device, dtype=dtype)
+        dt = torch.randn(total, nheads, device=device, dtype=dtype)
+        A = -torch.exp(torch.randn(nheads, device=device, dtype=torch.float32))
+        B = torch.randn(total, ngroups, dstate, device=device, dtype=dtype)
+        C = torch.randn(total, ngroups, dstate, device=device, dtype=dtype)
+        D = torch.ones(nheads, device=device, dtype=torch.float32)
+        dt_bias = torch.randn(nheads, device=device, dtype=torch.float32)
+
+        chunk_boundaries = [0]
+        last_chunk_indices = []
+        seq_idx_per_chunk = []
+        cu_seqlens = [0]
+        for seq_len in seq_lens:
+            cu_seqlens.append(cu_seqlens[-1] + seq_len)
+        for seq_id, seq_len in enumerate(seq_lens):
+            start, end = cu_seqlens[seq_id], cu_seqlens[seq_id + 1]
+            pos = start + chunk_size
+            while pos < end:
+                chunk_boundaries.append(pos)
+                seq_idx_per_chunk.append(seq_id)
+                pos += chunk_size
+            chunk_boundaries.append(end)
+            seq_idx_per_chunk.append(seq_id)
+            last_chunk_indices.append(len(chunk_boundaries) - 2)
+
+        return {
+            "x": x,
+            "dt": dt,
+            "A": A,
+            "B": B,
+            "C": C,
+            "D": D,
+            "dt_bias": dt_bias,
+            "chunk_size": chunk_size,
+            "cu_chunk_seqlens": torch.tensor(chunk_boundaries, dtype=torch.int32, device=device),
+            "last_chunk_indices": torch.tensor(
+                last_chunk_indices, dtype=torch.int64, device=device
+            ),
+            "seq_idx": torch.tensor(seq_idx_per_chunk, dtype=torch.int32, device=device),
+        }
+
+    def cuda_time_us(fn, iterations: int, warmup_iterations: int) -> float:
+        """Return mean GPU execution time in microseconds after warmup."""
+        for _ in range(warmup_iterations):
+            fn()
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / iterations * 1e3
+
+    def run_speedup_benchmarks(warmup_iterations: int, iterations: int) -> None:
+        """Benchmark the production varlen wrapper against Triton at Nemotron dimensions."""
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for the CuteDSL speed benchmark")
+        if torch.cuda.get_device_capability()[0] < 10:
+            raise RuntimeError("The CuteDSL speed benchmark requires Blackwell (SM 10.0+)")
+
+        from ..ssd_combined import _mamba_chunk_scan_combined_varlen_triton
+        from . import ssd_cutedsl
+
+        nheads, headdim, ngroups, dstate, chunk_size = 64, 64, 8, 128, 128
+        cases = (([2048] * 8, 1.2), ([8192] * 4, 1.4))
+        failures = []
+        for seq_lens, min_speedup in cases:
+            torch.manual_seed(0)
+            common = build_varlen_ssd_inputs(seq_lens, chunk_size, nheads, headdim, ngroups, dstate)
+            num_seqs = len(seq_lens)
+            initial_states = torch.zeros(
+                num_seqs, nheads, headdim, dstate, device="cuda", dtype=torch.float32
+            )
+            chunk_starts = [0]
+            for seq_len in seq_lens:
+                chunk_starts.append(chunk_starts[-1] + seq_len // chunk_size)
+            intermediate_chunk_indices = torch.tensor(
+                [chunk_starts[i] + 1 for i in range(num_seqs)], dtype=torch.int64, device="cuda"
+            )
+            out = torch.empty_like(common["x"])
+            call = {
+                "z": None,
+                "initial_states": initial_states,
+                "dt_softplus": True,
+                "dt_limit": (0.0, float("inf")),
+                "state_dtype": torch.float32,
+                "intermediate_chunk_indices": intermediate_chunk_indices,
+                **common,
+            }
+
+            triton_us = cuda_time_us(
+                lambda: _mamba_chunk_scan_combined_varlen_triton(out=out, **call),
+                iterations,
+                warmup_iterations,
+            )
+            cutedsl_us = cuda_time_us(
+                lambda: ssd_cutedsl.mamba_chunk_scan_combined_varlen_cutedsl_thd(out=out, **call),
+                iterations,
+                warmup_iterations,
+            )
+            speedup = triton_us / cutedsl_us
+            total = sum(seq_lens)
+            print(
+                f"[nemotron dims {nheads}h/{headdim}d/{dstate}n/{ngroups}g, "
+                f"{seq_lens[0]}x{num_seqs}={total} tok] "
+                f"triton={triton_us:.1f}us  cutedsl_varlen={cutedsl_us:.1f}us "
+                f"({speedup:.2f}x; required > {min_speedup:.2f}x)"
+            )
+            if speedup <= min_speedup:
+                failures.append(f"{seq_lens[0]}x{num_seqs}: {speedup:.2f}x <= {min_speedup:.2f}x")
+
+        if failures:
+            raise AssertionError("CuteDSL speedup checks failed: " + "; ".join(failures))
+
+    parser = argparse.ArgumentParser(
+        description="Benchmark the Blackwell CuteDSL varlen Mamba2 SSD path against Triton."
+    )
 
     parser.add_argument(
-        "--gbehcdln",
-        type=parse_comma_separated_ints,
-        default=[2, 4, 2, 40, 32, 64, 128, 128],
-        # default=[2, 3, 2, 2, 8, 64, 128, 128],
-        # default=[1, 2, 1, 4, 8, 64, 128, 128],
-        help="gbehcdln dimensions (comma-separated)",
-    )
-    parser.add_argument("--io_dtype", type=cutlass.dtype, default=cutlass.BFloat16)
-    parser.add_argument("--cumsum_delta_dtype", type=cutlass.dtype, default=cutlass.Float32)
-    parser.add_argument("--acc_dtype", type=cutlass.dtype, default=cutlass.Float32)
-    parser.add_argument(
-        "--fuse_scale_d",
-        type=str,
-        choices=["none", "scalar", "vector"],
-        default="vector",
-        help="Fuse scale type: none (no Y+=X*D fusion), scalar (Y+=X*D fusion with D.shape=1xEH), or vector (Y+=X*D fusion with D.shape=DxEH)",
-    )
-    parser.add_argument(
-        "--ref_lower_precision",
+        "--benchmark-speedup",
         action="store_true",
-        default=True,
-        help="Use lower precision for reference check",
+        help="Run the CuteDSL-vs-Triton speed benchmark (this is already the default)",
     )
     parser.add_argument(
-        "--no-ref_lower_precision",
-        action="store_false",
-        dest="ref_lower_precision",
-        default=False,
-        help="Disable lower precision for reference check",
-    )
-    parser.add_argument("--tolerance", type=float, default=5e-02, help="Tolerance for validation")
-    parser.add_argument(
-        "--print_rtol_stats", action="store_true", default=True, help="Enable print rtol stats"
+        "--speedup-warmup-iterations", type=int, default=10, help="Warmup iterations per backend"
     )
     parser.add_argument(
-        "--no-print_rtol_stats",
-        action="store_false",
-        dest="print_rtol_stats",
-        default=False,
-        help="Disable print rtol stats",
-    )
-    parser.add_argument(
-        "--warmup_iterations", type=int, default=0, help="Number of warmup iterations"
-    )
-    parser.add_argument("--iterations", type=int, default=1, help="Number of iterations")
-    parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer tensor sets to ensure L2 cold cache",
+        "--speedup-iterations", type=int, default=30, help="Measured iterations per backend"
     )
 
     args = parser.parse_args()
 
-    if len(args.gbehcdln) != 8:
-        parser.error("--gbehcdln must contain exactly 8 values")
-
-    run(
-        args.gbehcdln,
-        args.io_dtype,
-        args.cumsum_delta_dtype,
-        args.acc_dtype,
-        args.fuse_scale_d,
-        args.tolerance,
-        args.print_rtol_stats,
-        args.ref_lower_precision,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-    )
+    if args.speedup_warmup_iterations < 0:
+        parser.error("--speedup-warmup-iterations must be non-negative")
+    if args.speedup_iterations <= 0:
+        parser.error("--speedup-iterations must be positive")
+    run_speedup_benchmarks(args.speedup_warmup_iterations, args.speedup_iterations)
     print("PASS")
