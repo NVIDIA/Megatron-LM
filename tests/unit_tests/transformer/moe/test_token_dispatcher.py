@@ -4,9 +4,14 @@ import dataclasses
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core import config, parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_submodules,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.spec_utils import get_submodules
@@ -94,6 +99,13 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
+            moe_ncclep_static_shape=kwargs.get("moe_ncclep_static_shape", False),
+            moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
+            use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
+            gated_linear_unit=kwargs.get("gated_linear_unit", False),
+            activation_func=kwargs.get("activation_func", F.gelu),
+            fp8=kwargs.get("fp8", None),
+            fp8_recipe=kwargs.get("fp8_recipe", "delayed"),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
@@ -101,14 +113,20 @@ class MoEModelTestContainer:
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        submodules = get_submodules(
-            get_gpt_layer_local_submodules(
+        new_config = dataclasses.replace(self.config, **kargs)
+        if new_config.use_transformer_engine_op_fuser:
+            # op-fuser needs the TE grouped-MLP experts (they accept output_buffer/grad_input_buffer
+            # for the ncclEP zero-copy path); the local spec yields SequentialMLP, which does not.
+            mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=new_config.num_moe_experts, moe_grouped_gemm=new_config.moe_grouped_gemm
+            ).submodules.mlp
+        else:
+            mlp_spec = get_gpt_layer_local_submodules(
                 num_experts=self.config.num_moe_experts,
                 moe_grouped_gemm=self.config.moe_grouped_gemm,
             ).mlp
-        )
+        submodules = get_submodules(mlp_spec)
         assert isinstance(submodules, MoESubmodules)
-        new_config = dataclasses.replace(self.config, **kargs)
         moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
@@ -159,6 +177,51 @@ class MoEModelTestContainer:
         torch.testing.assert_close(
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"
+
+    @pytest.mark.internal
+    def moe_layer_zero_copy_parity_test(self):
+        """Full MoE-layer fwd+bwd with ncclEP zero-copy OFF then ON (identical weights), asserting
+        parity. Runs the real op-fuser experts so fc2-out/fc1-dgrad are written straight into the
+        symm combine/dispatch buffers (verified via is_symm_backed) -- the pure permute/unpermute
+        harness cannot exercise this path."""
+        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+        from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
+        from transformer_engine.pytorch.ep import is_symm_backed
+
+        torch.manual_seed(42)
+        x = torch.randn((32, 8, self.config.hidden_size), dtype=self.test_dtype).cuda()
+
+        def run(layer):
+            inp = x.clone().detach().requires_grad_(True)
+            out, _ = layer(inp)  # full fwd: dispatch -> op-fuser experts -> combine
+            out.sum().backward()  # bwd: dispatch-bwd reads the symm grad buffer
+            return out.detach(), inp.grad.detach()
+
+        def reset_ep():
+            # zero_copy mode is fixed at ep_bootstrap (process-global); finalize + drop the shared
+            # symm classvars so the next layer re-bootstraps in the other mode.
+            nccl_ep_finalize()
+            _NCCLEPManager._zc_fwd_token_buf = None
+            _NCCLEPManager._zc_bwd_token_buf = None
+            _NCCLEPManager._zc_recv_topk_weights_buf = None
+
+        ref_layer = self.new_moe_layer(moe_ncclep_zero_copy=False)
+        out_ref, grad_ref = run(ref_layer)
+
+        reset_ep()
+        zc_layer = self.new_moe_layer(moe_ncclep_zero_copy=True)
+        zc_layer.load_state_dict(ref_layer.state_dict())  # identical weights
+        out_zc, grad_zc = run(zc_layer)
+
+        # the combine forward buffer must be an allocated, registered symm window (zero-copy engaged)
+        fwd_buf = _NCCLEPManager._zc_fwd_token_buf
+        assert fwd_buf is not None, "zero-copy forward symm buffer was not allocated"
+        assert is_symm_backed(fwd_buf), "zero-copy forward buffer is not symm-mem-backed"
+        reset_ep()
+
+        assert not torch.isnan(out_zc).any() and not torch.isnan(grad_zc).any()
+        torch.testing.assert_close(out_zc, out_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(grad_zc, grad_ref, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
@@ -426,6 +489,27 @@ def is_nccl_ep_available():
     return HAVE_TE_EP
 
 
+def is_nccl_ep_zero_copy_available():
+    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), which a plain
+    NCCL-EP build lacks -- gate zero-copy tests on these separately from is_nccl_ep_available()."""
+    if not is_nccl_ep_available():
+        return False
+    try:
+        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def is_op_fuser_available():
+    """The static-shape/zero-copy path runs the TE op-fuser grouped GEMM (needs TE>=2.14 ops)."""
+    try:
+        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+    except ImportError:
+        return False
+    return is_te_min_version("2.14.0")
+
+
 @pytest.mark.skipif(
     not is_deep_ep_available() and not is_hybrid_ep_available(),
     reason="Deep EP and Hybrid EP are not available",
@@ -488,6 +572,41 @@ class TestFlexDispatcher:
         container.dispatcher_dropless_test()
         # reset experimental flag to False
         config.ENABLE_EXPERIMENTAL = False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        not is_nccl_ep_zero_copy_available(), reason="NCCL EP zero-copy TE API is not available"
+    )
+    @pytest.mark.skipif(
+        not is_op_fuser_available(), reason="op-fuser (static-shape/zero-copy) needs TE>=2.14"
+    )
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    def test_forward_backward_zero_copy(self, tp_size, ep_size):
+        # zero-copy requires static_shape, which requires BOTH op-fuser and grouped_gemm; bf16 so no
+        # fp8/Blackwell dependency. The op-fuser needs tp=1 and a SwiGLU activation. Parity: the
+        # zero-copy IO path must match the staged (no-zc) path.
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="ncclep",
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            moe_ncclep_static_shape=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS; size generously.
+            moe_expert_rank_capacity_factor=8.0,
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+        )
+        container.moe_layer_zero_copy_parity_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

@@ -118,6 +118,7 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_ncclep_static_shape=kwargs.get("moe_ncclep_static_shape", False),
+            moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
@@ -183,6 +184,18 @@ def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
     return HAVE_HYBRIDEP
+
+
+def is_nccl_ep_zero_copy_available():
+    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), absent in a plain
+    NCCL-EP build."""
+    if not is_nccl_ep_available():
+        return False
+    try:
+        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def is_nccl_ep_available():
@@ -450,10 +463,15 @@ class TestNcclEpPagedStashing:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    def test_forward_backward_4_layers(self):
-        """Test paged stashing with 4 MoE layers on ncclep static shape: two passes match."""
+    @pytest.mark.parametrize("zero_copy", [False, True])
+    def test_forward_backward_4_layers(self, zero_copy):
+        """Test paged stashing with 4 MoE layers on ncclep static shape: two passes match.
+
+        zero_copy=True additionally exercises the ncclEP symm-mem zero-copy IO under paged stash."""
         if not is_nccl_ep_available():
             pytest.skip("NCCL EP is not available")
+        if zero_copy and not is_nccl_ep_zero_copy_available():
+            pytest.skip("NCCL EP zero-copy TE API is not available")
 
         config.ENABLE_EXPERIMENTAL = True
 
@@ -480,6 +498,7 @@ class TestNcclEpPagedStashing:
             moe_router_padding_for_quantization=True,
             gated_linear_unit=True,
             activation_func=F.silu,
+            moe_ncclep_zero_copy=zero_copy,
         )
 
         seq_length = 1024
