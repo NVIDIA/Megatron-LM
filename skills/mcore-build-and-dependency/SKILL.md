@@ -1,6 +1,6 @@
 ---
 name: mcore-build-and-dependency
-description: Megatron-LM installation-path routing, container-based development setup, and dependency management. Covers choosing between the supported container and bare-metal CUDA path, acquiring and launching the CI container, uv package management, and updating uv.lock.
+description: Megatron-LM installation-path routing, container-based development setup, and dependency management. Covers choosing between the PyTorch NGC Container and bare-metal CUDA path, acquiring and launching the development container, uv package management, and updating uv.lock.
 license: Apache-2.0
 when_to_use: Routing a request to install Megatron; adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
 metadata:
@@ -9,23 +9,23 @@ metadata:
 
 # Build & Dependency Guide
 
-Choose the installation environment before giving commands. The CI container is
-the supported, reproducible development path; bare-metal CUDA is a separate path
-with its own Transformer Engine installation workflow.
+Choose the installation environment before giving commands. The PyTorch NGC
+Container is the supported, reproducible development path; bare-metal CUDA is a
+separate path with its own Transformer Engine installation workflow.
 
 ## Installation Path Decision
 
 For an otherwise unspecified request such as "Install Megatron", ask this one
 question before selecting commands or an installation skill:
 
-> Are you setting up the supported NGC/CI container path, or a bare-metal CUDA
-> host without Docker?
+> Are you using the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/pytorch),
+> or a CUDA host without Docker?
 
 Do not assume a container from an ambiguous installation request. Route the
 answer as follows:
 
-- **Container, NGC, CI, Docker, or reproducible development environment:** use
-  this skill's container workflow.
+- **PyTorch NGC Container, Docker, or reproducible development environment:**
+  use this skill's container workflow.
 - **Bare metal, CUDA host, no Docker, Colab, or source install with Transformer
   Engine:** use `mcore-transformer-engine-install` for the pinned-PyPI TE
   install and CUDA smoke test.
