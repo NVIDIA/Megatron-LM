@@ -18,8 +18,11 @@ from torch.utils.cpp_extension import load_inline
 from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
     get_expert_model_parallel_rank,
     get_expert_tensor_parallel_rank,
+    get_tensor_and_context_parallel_rank,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_data
@@ -89,8 +92,45 @@ except ModuleNotFoundError:
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+_CONTEXT_PARALLEL_RNG_TRACKER_NAME = 'context-parallel-rng'
+_MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME = 'model-and-context-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+
+# Seed-space layout — each tracker occupies an exclusive, non-overlapping slot.
+# All values are relative to the user-supplied base seed.
+#
+# Step 1: declare upper bounds for each parallel dimension.
+#   Raising a bound automatically shifts the derived BASE and keeps all slots
+#   non-overlapping — no other constant needs to change.
+_TP_MAX = 1 << 10  # 1,024      TP_world_size upper bound
+_CP_MAX = 1 << 10  # 1,024      CP_world_size upper bound
+_TPCP_MAX = _TP_MAX * _CP_MAX  # 1,048,576  TP×CP upper bound (tc_rank ∈ [0, TP*CP-1])
+_EP_MAX = 1 << 13  # 8,192      EP_world_size upper bound
+_ETP_MAX = 1 << 10  # 1,024      expert_tensor_parallel upper bound (also the ETP stride)
+#
+# Step 2: derive non-overlapping BASEs as a cumulative sum.
+#   BASE[i] = BASE[i-1] + slot_size[i-1],  i.e. each slot starts immediately
+#   after the previous one ends.  Non-overlap proof:
+#     END[i-1] = BASE[i-1] + slot_size[i-1] - 1 = BASE[i] - 1 < BASE[i]
+#
+#   Tracker  slot size         BASE (cumulative)
+#   ──────── ──────────────    ─────────────────────────────────────────
+#   DP       1                 0
+#   TP       _TP_MAX           1
+#   CP       _CP_MAX           1 + _TP_MAX
+#   TPxCP    _TP_MAX*_CP_MAX   1 + _TP_MAX + _CP_MAX
+#   EP       _EP_MAX*_ETP_MAX  1 + _TP_MAX + _CP_MAX + _TPCP_MAX
+#
+# EP rank is encoded as ep_rank * _ETP_MAX + etp_rank (= ep_rank * _EP_ETP_STRIDE).
+# The stride equals _ETP_MAX, ensuring distinct (ep_rank, etp_rank) pairs never
+# collide.  PyTorch CUDA seeds are uint64; these offsets have no effect on RNG quality.
+_EP_ETP_STRIDE = _ETP_MAX
+
+_TP_RNG_SEED_OFFSET = 1
+_CP_RNG_SEED_OFFSET = _TP_RNG_SEED_OFFSET + _TP_MAX
+_TPCP_RNG_SEED_OFFSET = _CP_RNG_SEED_OFFSET + _CP_MAX
+_EP_RNG_SEED_OFFSET = _TPCP_RNG_SEED_OFFSET + _TPCP_MAX
 
 
 def _get_cuda_rng_state(
@@ -201,6 +241,35 @@ def convert_cuda_rng_state(
             raise ValueError(f"Invalid state type: {type(state)}")
 
 
+def clone_cuda_rng_state(
+    state: Union[torch.Tensor, torch.Generator]
+) -> Union[torch.Tensor, torch.Generator]:
+    """Clone a CUDA RNG state tensor or graph-safe generator."""
+    if isinstance(state, torch.Tensor):
+        return state.clone()
+    if isinstance(state, torch.Generator):
+        return state.clone_state()
+    raise ValueError(f"Invalid state type: {type(state)}")
+
+
+def get_model_parallel_rng_tracker_name():
+    """Get the model parallel rng tracker name."""
+    global _MODEL_PARALLEL_RNG_TRACKER_NAME
+    return _MODEL_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_context_parallel_rng_tracker_name():
+    """Get the context-parallel rng tracker name."""
+    global _CONTEXT_PARALLEL_RNG_TRACKER_NAME
+    return _CONTEXT_PARALLEL_RNG_TRACKER_NAME
+
+
+def get_model_and_context_parallel_rng_tracker_name():
+    """Get the tensor+context parallel rng tracker name."""
+    global _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME
+    return _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME
+
+
 def get_expert_parallel_rng_tracker_name():
     """Get the expert parallel rng tracker name"""
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
@@ -211,6 +280,70 @@ def get_data_parallel_rng_tracker_name():
     """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
     return _DATA_PARALLEL_RNG_TRACKER_NAME
+
+
+def ensure_context_parallel_rng_tracker_states(
+    states: dict[str, Union[torch.Tensor, torch.Generator]],
+    fallback_state: Optional[Union[torch.Tensor, torch.Generator]] = None,
+) -> dict[str, Union[torch.Tensor, torch.Generator]]:
+    """Backfill the CP-only RNG tracker state when it is missing."""
+    if _CONTEXT_PARALLEL_RNG_TRACKER_NAME in states:
+        return states
+
+    source_state = fallback_state
+    if source_state is None:
+        source_state = states.get(_DATA_PARALLEL_RNG_TRACKER_NAME)
+        if source_state is not None:
+            logging.getLogger(__name__).warning(
+                "No fallback_state provided to backfill '%s' RNG tracker state; "
+                "falling back to '%s' state instead.",
+                _CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+                _DATA_PARALLEL_RNG_TRACKER_NAME,
+            )
+        else:
+            logging.getLogger(__name__).warning(
+                "Could not backfill '%s' RNG tracker state: neither fallback_state nor "
+                "'%s' state is available. Skipping.",
+                _CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+                _DATA_PARALLEL_RNG_TRACKER_NAME,
+            )
+            return states
+
+    states = dict(states)
+    states[_CONTEXT_PARALLEL_RNG_TRACKER_NAME] = clone_cuda_rng_state(source_state)
+    return states
+
+
+def ensure_model_and_context_parallel_rng_tracker_states(
+    states: dict[str, Union[torch.Tensor, torch.Generator]]
+) -> dict[str, Union[torch.Tensor, torch.Generator]]:
+    """Backfill the TPxCP RNG tracker state when loading older checkpoints."""
+    if (
+        _MODEL_PARALLEL_RNG_TRACKER_NAME in states
+        and _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME not in states
+    ):
+        states = dict(states)
+        states[_MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME] = clone_cuda_rng_state(
+            states[_MODEL_PARALLEL_RNG_TRACKER_NAME]
+        )
+    return states
+
+
+def _initialize_rng_tracker_state(
+    tracker: "CudaRNGStatesTracker",
+    name: str,
+    seed: Optional[int],
+    clone_from_name: Optional[str] = None,
+) -> None:
+    """Initialize a tracker state from a seed or by cloning an existing state."""
+    if seed is not None:
+        tracker.add(name, seed)
+        return
+
+    assert clone_from_name is not None
+    states = tracker.get_states()
+    states[name] = clone_cuda_rng_state(states[clone_from_name])
+    tracker.set_states(states)
 
 
 class CudaRNGStatesTracker:
@@ -438,6 +571,8 @@ def model_parallel_cuda_manual_seed(
     tp_rank: Optional[int] = None,
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+    tc_rank: Optional[int] = None,
     force_reset_rng: bool = False,
 ):
     """Initialize model parallel cuda seed.
@@ -446,13 +581,19 @@ def model_parallel_cuda_manual_seed(
     initialized. Also, no torch.cuda.manual_seed should be called
     after this function. Basically, this is replacement for that
     function.
-    Three set of RNG states are tracked:
+    Five set of RNG states are tracked:
     default state: This is for data parallelism and is the same among a set of model parallel GPUs
     but different across different model parallel groups. This is used for example for dropout
     in the non-tensor-model-parallel regions.
     tensor-model-parallel state: This state is different among a set of model parallel GPUs,
     but the same across data parallel groups. This is used for example for dropout
     in model parallel regions.
+    context-parallel state: This state is different among a set of context parallel GPUs,
+    but the same across context-data parallel groups. This is used for example for dropout
+    in context parallel regions.
+    tensor-and-context-parallel state: This state is different among a set of tensor and context
+    parallel GPUs, but the same across the remaining data parallel groups. This is used for
+    example for dropout in regions that span both tensor and context parallelism.
     expert-parallel-seed: This state is only used for the expert layer of MoE models.
     It is different among expert-tensor and expert-model parallel GPUs, and the same
     across expert-data parallel groups.
@@ -463,25 +604,74 @@ def model_parallel_cuda_manual_seed(
         ep_rank = get_expert_model_parallel_rank()
     if etp_rank is None:
         etp_rank = get_expert_tensor_parallel_rank()
-    # 2718 is just for fun and any POSITIVE value will work.
-    offset = seed + 2718
-    tensor_model_parallel_seed = offset + tp_rank
-    # Data parallel gets the original seed.
+    if cp_rank is None:
+        cp_rank = get_context_parallel_rank()
+    if tc_rank is None:
+        tc_rank = get_tensor_and_context_parallel_rank()
+    # Guard: ensure every rank fits within the design bounds declared in the seed-space
+    # layout above.  An out-of-range rank would push the seed into a neighbouring slot
+    # and cause a duplicate-seed collision (the very bug this layout was designed to fix).
+    assert 0 <= tp_rank < _TP_MAX, (
+        f"tp_rank={tp_rank} is outside the supported range [0, {_TP_MAX}). "
+        f"Increase _TP_MAX in random.py if a larger TP degree is needed."
+    )
+    assert 0 <= cp_rank < _CP_MAX, (
+        f"cp_rank={cp_rank} is outside the supported range [0, {_CP_MAX}). "
+        f"Increase _CP_MAX in random.py if a larger CP degree is needed."
+    )
+    assert 0 <= tc_rank < _TPCP_MAX, (
+        f"tc_rank={tc_rank} is outside the supported range [0, {_TPCP_MAX}). "
+        f"Increase _TP_MAX or _CP_MAX in random.py if a larger TP×CP degree is needed."
+    )
+    assert 0 <= ep_rank < _EP_MAX, (
+        f"ep_rank={ep_rank} is outside the supported range [0, {_EP_MAX}). "
+        f"Increase _EP_MAX in random.py if a larger EP degree is needed."
+    )
+    assert 0 <= etp_rank < _ETP_MAX, (
+        f"etp_rank={etp_rank} is outside the supported range [0, {_ETP_MAX}). "
+        f"Increase _ETP_MAX in random.py if a larger ETP degree is needed."
+    )
+    # Each tracker occupies a non-overlapping slot; see the seed-space layout comment above.
     data_parallel_seed = seed
+    tensor_model_parallel_seed = seed + _TP_RNG_SEED_OFFSET + tp_rank
 
     initialize_rng_tracker(
         te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng, force_reset=force_reset_rng
     )
-    _CUDA_RNG_STATE_TRACKER.reset()
+    assert _CUDA_RNG_STATE_TRACKER is not None
+    rng_tracker = _CUDA_RNG_STATE_TRACKER
+    rng_tracker.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
-    _CUDA_RNG_STATE_TRACKER.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)
+    rng_tracker.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)
 
     # and model parallel state.
-    _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
+    rng_tracker.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
-    expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
-    _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
+    context_parallel_world_size = get_context_parallel_world_size()
+    context_parallel_seed = (
+        seed + _CP_RNG_SEED_OFFSET + cp_rank if context_parallel_world_size > 1 else None
+    )
+    _initialize_rng_tracker_state(
+        rng_tracker,
+        _CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+        context_parallel_seed,
+        clone_from_name=_DATA_PARALLEL_RNG_TRACKER_NAME,
+    )
+
+    # TPxCP forward/dropout state.
+    tensor_and_context_parallel_seed = (
+        seed + _TPCP_RNG_SEED_OFFSET + tc_rank if context_parallel_world_size > 1 else None
+    )
+    _initialize_rng_tracker_state(
+        rng_tracker,
+        _MODEL_AND_CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+        tensor_and_context_parallel_seed,
+        clone_from_name=_MODEL_PARALLEL_RNG_TRACKER_NAME,
+    )
+
+    expert_parallel_seed = seed + _EP_RNG_SEED_OFFSET + ep_rank * _EP_ETP_STRIDE + etp_rank
+    rng_tracker.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
 def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):
