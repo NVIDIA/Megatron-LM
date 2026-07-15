@@ -800,9 +800,7 @@ try:
                 "prompt_tokens": prompt_token_count,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": prompt_token_count + total_completion_tokens,
-                "prompt_tokens_details": {
-                    "cached_tokens": cached_token_count,
-                },
+                "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
 
