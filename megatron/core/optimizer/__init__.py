@@ -1051,19 +1051,16 @@ def get_megatron_optimizer(
             raise ValueError("MFSDP v2 does not currently support loss scaling.")
         if config.overlap_param_gather_with_optimizer_step:
             raise ValueError("MFSDP v2 does not support optimizer-step parameter-gather overlap.")
-        unsupported_optimizer_features = {
-            "optimizer CPU offload": config.optimizer_cpu_offload,
-            "precision-aware optimizer": config.use_precision_aware_optimizer,
-            "layer-wise distributed optimizer": config.use_layer_wise_distributed_optimizer,
-            "optimizer CUDA graphs": config.optimizer_cuda_graph,
-        }
-        enabled_optimizer_features = [
-            name for name, enabled in unsupported_optimizer_features.items() if enabled
-        ]
-        if enabled_optimizer_features:
+        if config.optimizer_cpu_offload:
+            raise ValueError("MFSDP v2 does not currently support optimizer CPU offload.")
+        if config.use_precision_aware_optimizer:
+            raise ValueError("MFSDP v2 does not currently support precision-aware optimizer.")
+        if config.use_layer_wise_distributed_optimizer:
             raise ValueError(
-                "MFSDP v2 does not currently support " + ", ".join(enabled_optimizer_features) + "."
+                "MFSDP v2 does not currently support layer-wise distributed optimizer."
             )
+        if config.optimizer_cuda_graph:
+            raise ValueError("MFSDP v2 does not currently support optimizer CUDA graphs.")
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
