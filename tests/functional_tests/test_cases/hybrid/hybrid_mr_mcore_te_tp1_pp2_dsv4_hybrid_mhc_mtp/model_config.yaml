@@ -15,6 +15,7 @@ MODEL_ARGS:
   --v-head-dim: 16
   --hybrid-layer-pattern: WEC-|H-C-/W-
   --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_dsv4_stack_spec]"
+  --disable-bias-linear: true
   --experimental-attention-variant: dsv4_hybrid
   --dsa-indexer-n-heads: 64
   --dsa-indexer-head-dim: 128
