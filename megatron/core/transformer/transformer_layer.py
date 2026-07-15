@@ -1343,15 +1343,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """Whether this layer's attention block lies inside its TE CUDA graph region.
 
         Per-layer refinement of the global ``cuda_graph_modules`` scope: attention
-        modules that cannot replay safely under TE graphs (e.g. GatedDeltaNet's
-        ``supports_te_cuda_graph = False``) are kept eager while the rest of the
-        layer's scoped region (MoE router/preprocess) is still captured.
+        modules that cannot replay safely under TE graphs are kept eager while
+        independently requested regions (for example MoE router/preprocess) can
+        still be captured. Attention implementations may separately opt out of
+        packed-THD capture while supporting the default fixed-shape path.
         """
         if self.config.cuda_graph_modules and (
             CudaGraphModule.attn not in self.config.cuda_graph_modules
         ):
             return False
-        return getattr(self.self_attention, 'supports_te_cuda_graph', True)
+        if not getattr(self.self_attention, 'supports_te_cuda_graph', True):
+            return False
+        return not self._is_thd_cuda_graph() or getattr(
+            self.self_attention, 'supports_te_cuda_graph_thd', True
+        )
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """

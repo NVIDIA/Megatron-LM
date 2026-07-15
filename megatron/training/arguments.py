@@ -2234,7 +2234,7 @@ def validate_args(args, defaults={}):
         #   - moe_router capture overlaps full-MoE recompute because route/preprocess are
         #     inside that checkpoint. It also overlaps shared_experts when they are captured;
         #     pre-MLP layernorm has explicit cudagraph-aware support and experts run eager.
-        #   - attention capture overlaps whole-GDN recompute when GDN graph opt-in is active.
+        #   - attention capture overlaps whole-GDN recompute for a non-THD GDN model.
         # See docs on partial CUDA graphs.
         if (
             args.cuda_graph_impl != "none"
@@ -2251,7 +2251,7 @@ def validate_args(args, defaults={}):
                 ),
                 captures_gdn_attention=(
                     args.experimental_attention_variant == "gated_delta_net"
-                    and os.environ.get("MEGATRON_GDN_TE_CUDA_GRAPH", "0") == "1"
+                    and args.sequence_packing_scheduler is None
                 ),
             )
             if _overlap:

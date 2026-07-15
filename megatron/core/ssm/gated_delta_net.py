@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Optional, Union
@@ -83,14 +82,11 @@ class GatedDeltaNet(MegatronModule):
     and returns output of the same size.
     """
 
-    # The FLA GDN kernels replay bitwise-identically under TE CUDA graphs in
-    # isolation (single-module fwd/dgrad/wgrad probe, 2026-07-06); the earlier
-    # "replays different values" exclusion did not reproduce on current
-    # TE/FLA. Full-layer capture is gated behind an env switch while in-situ
-    # validation matures: set MEGATRON_GDN_TE_CUDA_GRAPH=1 to capture GDN
-    # attention inside per-layer TE graphs (default keeps GDN eager and only
-    # the layer's MoE router/preprocess region is captured).
-    supports_te_cuda_graph = os.environ.get("MEGATRON_GDN_TE_CUDA_GRAPH", "0") == "1"
+    # The FLA kernels replay bitwise-identically under TE CUDA graphs for fixed-shape SBHD
+    # inputs. Packed THD execution resolves sequence metadata with host synchronization
+    # inside forward, so it must remain eager until that path has a graph-safe contract.
+    supports_te_cuda_graph = True
+    supports_te_cuda_graph_thd = False
 
     def __init__(
         self,

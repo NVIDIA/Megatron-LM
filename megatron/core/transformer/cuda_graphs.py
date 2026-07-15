@@ -8,7 +8,7 @@ import math
 import os
 import random
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
@@ -2012,8 +2012,11 @@ def _layer_is_graphable(layer, config, *, use_megatron_fsdp=False):
     # capture includes attention, so it requires a TE-graph-safe attention).
     if not config.cuda_graph_modules:
         effective_layer = _get_effective_transformer_layer(layer)
-        attention = getattr(effective_layer or layer, 'self_attention', None)
-        return getattr(attention, 'supports_te_cuda_graph', True)
+        if effective_layer is not None and not isinstance(
+            effective_layer.self_attention, IdentityOp
+        ):
+            return _layer_captures_attention(layer)
+        return True
 
     # mHC wrapper: graphability is decided by the inner layer's type/scope. Non-MoE
     # inner layers are captured as one whole-wrapper graph (mHC aggregate + inner + BDA).
@@ -2075,10 +2078,9 @@ def _layer_is_graphable(layer, config, *, use_megatron_fsdp=False):
                 and isinstance(layer.cross_attention, IdentityOp)
             )
         ):
-            # attn layer. Layers whose attention cannot replay safely under TE
-            # graphs (e.g. GatedDeltaNet) fall through: they are still graphable
-            # via the MoE scopes below, with attention kept eager per
-            # TransformerLayer._cuda_graph_captures_attention().
+            # Attention implementations can opt out for a specific input format.
+            # Such layers fall through and can still be graphable through an
+            # independently requested MoE scope below.
             return True
         if (
             CudaGraphModule.moe in config.cuda_graph_modules
@@ -2282,6 +2284,29 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
+        attention_types = Counter()
+        for layer in self.flattened_callables:
+            if not _layer_captures_attention(layer):
+                continue
+            effective_layer = _get_effective_transformer_layer(layer)
+            if effective_layer is None:
+                continue
+            attention_types[type(effective_layer.self_attention).__name__] += 1
+        if attention_types:
+            manifest = ", ".join(
+                f"{attention_type}={count}"
+                for attention_type, count in sorted(attention_types.items())
+            )
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.INFO,
+                msg=(
+                    f'Rank {torch.distributed.get_rank()}: '
+                    f'TE CUDA graph attention capture types: {manifest}.'
+                ),
+            )
 
     def capture_finished(self):
         """

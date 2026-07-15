@@ -232,65 +232,116 @@ def _force_cpu_zeros(monkeypatch):
     monkeypatch.setattr(torch, "zeros", cpu_zeros)
 
 
-class TestGdnCudaGraphOptIn:
-    def test_exact_env_opt_in_controls_direct_attention_scope(self):
-        """GDN capture is enabled only by the exact environment value 1."""
-        import importlib
+def _bare_gdn_layer(config: TransformerConfig) -> TransformerLayer:
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 
-        from megatron.core.ssm import gated_delta_net
-        from megatron.core.transformer.moe.moe_layer import MoELayer
+    attention = GatedDeltaNet.__new__(GatedDeltaNet)
+    torch.nn.Module.__init__(attention)
+    layer = _bare_transformer_layer(config)
+    layer.self_attention = attention
+    return layer
 
-        env_name = "MEGATRON_GDN_TE_CUDA_GRAPH"
-        missing = object()
-        original_value = os.environ.get(env_name, missing)
+
+class TestGdnCudaGraphScope:
+    def test_attn_scope_captures_fixed_shape_gdn(self):
         config = _base_cuda_graph_config(
             cuda_graph_impl='transformer_engine',
             cuda_graph_modules=[CudaGraphModule.attn],
             use_cpu_initialization=True,
         )
+        layer = _bare_gdn_layer(config)
 
-        try:
-            for env_value, expected in (
-                (None, False),
-                ("0", False),
-                ("false", False),
-                ("1", True),
-            ):
-                if env_value is None:
-                    os.environ.pop(env_name, None)
-                else:
-                    os.environ[env_name] = env_value
-                gdn_module = importlib.reload(gated_delta_net)
+        assert layer.self_attention.supports_te_cuda_graph
+        assert not layer.self_attention.supports_te_cuda_graph_thd
+        assert layer._cuda_graph_captures_attention()
+        assert _layer_captures_attention(layer)
+        assert _layer_is_graphable(layer, config)
 
-                attention = gdn_module.GatedDeltaNet.__new__(gdn_module.GatedDeltaNet)
-                torch.nn.Module.__init__(attention)
-                layer = _bare_transformer_layer(config)
-                layer.self_attention = attention
+    def test_packed_thd_gdn_stays_eager_for_attn_and_whole_layer_capture(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        config.sequence_packing_scheduler = 'dp_balanced'
+        layer = _bare_gdn_layer(config)
 
-                assert gdn_module.GatedDeltaNet.supports_te_cuda_graph is expected
-                assert layer._cuda_graph_captures_attention() is expected
-                assert _layer_captures_attention(layer) is expected
-                assert _layer_is_graphable(layer, config) is expected
+        assert not layer._cuda_graph_captures_attention()
+        assert not _layer_captures_attention(layer)
+        assert not _layer_is_graphable(layer, config)
 
-                if env_value == "0":
-                    # An unsupported attention stays eager without hiding an
-                    # independently requested, graphable MoE-router region.
-                    moe = MoELayer.__new__(MoELayer)
-                    torch.nn.Module.__init__(moe)
-                    layer.mlp = moe
-                    config.cuda_graph_modules = [
-                        CudaGraphModule.attn,
-                        CudaGraphModule.moe_router,
-                    ]
-                    assert not layer._cuda_graph_captures_attention()
-                    assert _layer_is_graphable(layer, config)
-                    config.cuda_graph_modules = [CudaGraphModule.attn]
-        finally:
-            if original_value is missing:
-                os.environ.pop(env_name, None)
-            else:
-                os.environ[env_name] = original_value
-            importlib.reload(gated_delta_net)
+        config.cuda_graph_modules = []
+        assert not _layer_is_graphable(layer, config)
+
+    def test_packed_thd_gdn_falls_through_to_requested_moe_scope(self):
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[
+                CudaGraphModule.attn,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            ],
+            num_moe_experts=2,
+            use_cpu_initialization=True,
+        )
+        config.sequence_packing_scheduler = 'dp_balanced'
+        layer = _bare_gdn_layer(config)
+        moe = MoELayer.__new__(MoELayer)
+        torch.nn.Module.__init__(moe)
+        layer.mlp = moe
+
+        assert not _layer_captures_attention(layer)
+        assert _layer_is_graphable(layer, config)
+
+    def test_mhc_wrapper_delegates_packed_thd_attention_capability(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        config.sequence_packing_scheduler = 'dp_balanced'
+        wrapper = _bare_mhc_wrapper(config, _bare_gdn_layer(config))
+
+        assert not wrapper._cuda_graph_captures_attention()
+        assert not _layer_captures_attention(wrapper)
+        assert not _layer_is_graphable(wrapper, config)
+
+    def test_discovery_logs_attention_capture_types(self, monkeypatch):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.attn],
+            use_cpu_initialization=True,
+        )
+        model = torch.nn.Module()
+        model.decoder = torch.nn.Module()
+        model.decoder.layers = torch.nn.ModuleList(
+            [_bare_gdn_layer(config), _bare_transformer_layer(config)]
+        )
+
+        messages = []
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.log_on_each_pipeline_stage",
+            lambda **kwargs: messages.append(kwargs["msg"]),
+        )
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.model = [model]
+        helper.config = config
+        helper.tp_group = None
+        helper.dp_cp_group = None
+        helper._uses_megatron_fsdp = False
+        helper._rotary_observation_roots = []
+        helper._discover_layers()
+
+        assert len(helper.flattened_callables) == 2
+        assert any(
+            "TE CUDA graph attention capture types: "
+            "GatedDeltaNet=1, _AttentionProbe=1." in message
+            for message in messages
+        )
 
 
 class TestRotaryCudaGraphInputs:

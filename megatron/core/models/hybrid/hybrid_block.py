@@ -152,19 +152,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
         The wrapper is the callable registered with TransformerEngine, so static
         input discovery cannot rely on top-level ``self_attention`` attributes.
-        Delegate graph safety to the effective inner TransformerLayer and honor
-        the configured attention scope. This also keeps an opt-out attention
-        implementation such as GatedDeltaNet eager.
+        Delegate the complete scope and input-format capability decision to the
+        effective inner TransformerLayer.
         """
         if not isinstance(self.inner_layer, TransformerLayer) or isinstance(
             self.inner_layer.self_attention, IdentityOp
         ):
             return False
-        if self.config.cuda_graph_modules and (
-            CudaGraphModule.attn not in self.config.cuda_graph_modules
-        ):
-            return False
-        return getattr(self.inner_layer.self_attention, 'supports_te_cuda_graph', True)
+        return self.inner_layer._cuda_graph_captures_attention()
 
     def _inner_is_partial_moe_capture(self) -> bool:
         """True when the inner layer is MoE and the configured ``cuda_graph_modules`` request

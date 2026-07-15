@@ -62,10 +62,8 @@ def test_recompute_overlap_uses_normalized_cuda_graph_enums(cuda_graph_modules, 
         pytest.param([CudaGraphModule.moe_router], [], id="router-only"),
     ],
 )
-def test_gdn_recompute_overlap_requires_attention_graph_opt_in(
-    cuda_graph_modules, expected_overlap
-):
-    """Whole-GDN recompute overlaps only scopes that capture opted-in GDN attention."""
+def test_gdn_recompute_overlap_follows_attention_scope(cuda_graph_modules, expected_overlap):
+    """Whole-GDN recompute overlaps only scopes that capture GDN attention."""
     assert (
         _get_cuda_graph_recompute_overlap(
             cuda_graph_modules, ["gdn"], captures_gdn_attention=True

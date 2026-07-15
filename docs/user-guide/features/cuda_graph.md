@@ -116,6 +116,11 @@ does not use the planned allocator. The Megatron-FSDP adapter rejects inconsiste
 --cuda-graph-modules attn moe_router moe_preprocess
 ```
 
+For the TE backend, `attn` includes every attention implementation that declares a compatible
+graph input contract. This includes standard `SelfAttention` and Gated DeltaNet for fixed-shape
+SBHD inputs. Packed-THD Gated DeltaNet remains eager because its forward path currently resolves
+sequence metadata with host synchronization.
+
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
@@ -228,17 +233,15 @@ model uses Megatron-FSDP, every `HyperConnectionHybridLayer` is deliberately kep
 parameter gather/release and pre-backward hooks currently belong to the inner layer and cannot be
 safely driven by a graph whose callable boundary is the outer wrapper.
 
-Two temporary environment controls cover behavior that does not yet have a public config field:
+One temporary environment control covers behavior that does not yet have a public config field:
 
-- `MEGATRON_GDN_TE_CUDA_GRAPH=1` opts Gated DeltaNet attention into TE graph capture. It remains
-  eager by default while graph validation matures.
 - `MEGATRON_CG_SKIP_BUFFER_ADDRESS_CHECK=1` disables the module-level replay pointer check. Only
   the exact value `1` is accepted. This is a dangerous debugging escape hatch: replay may silently
   access stale storage if an address moves. Planned fused-`main_grad` claims still perform their
   allocator-level checks.
 
-These controls are internal and may be replaced by explicit configuration fields. Do not set them
-in a production recipe without validating the resulting memory use and numerical behavior.
+This control is internal and may be replaced by an explicit configuration field. Do not set it in
+a production recipe without validating the resulting memory use and numerical behavior.
 
 ---
 
@@ -331,7 +334,7 @@ models as well:
   eager execution is required. Argument validation reports overlapping modules; in particular,
   `moe_router` capture overlaps full-`moe` recompute and any captured `shared_experts`, while
   whole-layer, `mlp`, and `moe` capture cover their respective full MLP regions.
-  Opted-in GDN attention capture also overlaps whole-``gdn`` recompute.
+  GDN attention capture also overlaps whole-`gdn` recompute.
 - Inference CUDA graphs (serving or RL rollout) currently require
   `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
   `local`; all other implementations must set `--inference-cuda-graph-scope none`,
