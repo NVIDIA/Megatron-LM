@@ -87,7 +87,7 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext | None
     _ready_grad_parameters: set[nn.Parameter]
-    _num_training_parameters: int
+    _num_trainable_parameters: int
 
     def __init__(
         self,
@@ -117,7 +117,7 @@ class FsdpModule:
         ]
         self._parameter_groups = tuple(parameter_groups)
         self._ready_grad_parameters = set()
-        self._num_training_parameters = sum(
+        self._num_trainable_parameters = sum(
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
@@ -182,10 +182,16 @@ class FsdpModule:
         module.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
         module.register_forward_hook(lambda _module, _args, _output: self.post_forward())
         module.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
-        # Gradient reduction is parameter-completion based: once every owned
-        # Parameter has accumulated its grad, this FsdpModule can reduce and
-        # reshard. Module full-backward hooks can fire before that when module
-        # inputs do not require grad.
+        if self._num_trainable_parameters == 0:
+            module.register_full_backward_hook(
+                lambda _module, _grad_input, _grad_output: self.post_backward()
+            )
+            return
+
+        # Gradient reduction for trainable parameters is parameter-completion
+        # based: once every owned Parameter has accumulated its grad, this
+        # FsdpModule can reduce and reshard. Module full-backward hooks can fire
+        # before that when module inputs do not require grad.
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
@@ -195,7 +201,7 @@ class FsdpModule:
     def _make_grad_hook(self, parameter: nn.Parameter) -> Callable[[nn.Parameter], None]:
         def grad_hook(_parameter: nn.Parameter) -> None:
             self._ready_grad_parameters.add(parameter)
-            if len(self._ready_grad_parameters) == self._num_training_parameters:
+            if len(self._ready_grad_parameters) == self._num_trainable_parameters:
                 self.post_backward()
 
         return grad_hook
