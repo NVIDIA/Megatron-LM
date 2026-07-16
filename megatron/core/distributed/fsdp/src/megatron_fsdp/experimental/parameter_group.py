@@ -261,6 +261,12 @@ class FsdpParameterGroup:
             reduced.local_buffer.div_(self.mesh.size(axis))
         return reduced
 
+    def _install_sharded_grads(self) -> None:
+        """Point each sharded parameter's grad at main_grad's current DTensor view."""
+        assert self.main_grad is not None
+        for index, sharded_parameter in enumerate(self.sharded_parameters):
+            sharded_parameter.grad = self.main_grad.get_dtensor(index)
+
     def reduce_gradients(self, is_last_microbatch: bool = True) -> None:
         """Reduce full local gradients into sharded parameter gradients.
 
@@ -304,20 +310,15 @@ class FsdpParameterGroup:
                 grads, mesh=self.mesh, placements=[Partial(partial_op)] * self.mesh.ndim
             )
 
-        # main_grad accumulates DP-outer-Partial (Partial where main_weight is
-        # Replicate); symmetric memory does not support that deferral yet.
-        if (
-            self._accumulation_placements != self.main_weight.placements
-            and self._symm_mem_pool is not None
-        ):
-            raise NotImplementedError(
-                "Symmetric-memory gradient reduction does not support deferred DP-outer axes."
-            )
-
-        # A finalized main_grad (placements == main_weight) means the previous step
-        # is done; reset it to the DP-outer-Partial accumulation placement.
-        if self.main_grad.placements == self.main_weight.placements:
+        # A non-accumulation main_grad means the previous step finalized it; this
+        # only happens on the first microbatch. Reset it to the DP-outer-Partial
+        # accumulation placement -- a metadata relabel for HSDP since the buffer is
+        # overwritten below. (HFSDP will instead need a fresh buffer here, since its
+        # finalized buffer was reduce-scattered and is smaller.)
+        if self.main_grad.placements != self._accumulation_placements:
             self.main_grad.placements = self._accumulation_placements
+            if has_grad(self.sharded_parameters):
+                self._install_sharded_grads()
         reduced = self._reduce_grad_axis(partial_grad, self._accumulation_placements)
 
         # set_to_none=True cleared the sharded grads -> overwrite main_grad and
@@ -326,15 +327,13 @@ class FsdpParameterGroup:
             self.main_grad.local_buffer.add_(reduced.local_buffer)
         else:
             self.main_grad.local_buffer.copy_(reduced.local_buffer)
-            for index, sharded_parameter in enumerate(self.sharded_parameters):
-                sharded_parameter.grad = self.main_grad.get_dtensor(index)
+            self._install_sharded_grads()
 
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
             # reduce-scatter for HFSDP) and install the sharded parameter gradients.
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
-            for index, sharded_parameter in enumerate(self.sharded_parameters):
-                sharded_parameter.grad = self.main_grad.get_dtensor(index)
+            self._install_sharded_grads()
 
         for parameter in self.unsharded_parameters:
             parameter.grad = None
