@@ -241,21 +241,24 @@ class FsdpParameterGroup:
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
-    def _reduce_grad_axis(
-        self, partial_grad: DBuffer, target_placements: tuple[Placement, ...]
+    def _reduce_partial_gradients(
+        self,
+        partial_grad: DBuffer,
+        target_placements: tuple[Placement, ...],
+        *,
+        out: "DBuffer | None" = None,
     ) -> DBuffer:
-        """Reduce ``partial_grad`` to ``target_placements`` over its one changed axis.
+        """Reduce ``partial_grad`` to ``target_placements``.
 
         HSDP and HFSDP change a single mesh axis between the all-Partial gradient
-        and its sharded resting placement, so ``changed_mesh_axis`` enforces the
-        single-axis contract.
+        and its sharded resting placement.
         """
         axis = changed_mesh_axis(partial_grad.placements, target_placements)
         if axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
         if self._symm_mem_pool is not None:
             partial_grad.rendezvous(axis)
-        reduced = partial_grad.redistribute(target_placements)
+        reduced = partial_grad.redistribute(target_placements, out=out)
         # Symmetric-memory reduce-scatter runs as SUM; rescale to recover the mean.
         if self._symm_mem_pool is not None:
             reduced.local_buffer.div_(self.mesh.size(axis))
@@ -275,7 +278,7 @@ class FsdpParameterGroup:
         accumulates through the standard zero_grad contract (``set_to_none=True``
         clears the sharded grads so main_grad is overwritten; ``set_to_none=False``
         keeps them as views into a zeroed main_grad so they accumulate). The last
-        microbatch all-reduces the DP-outer axes in place, finalizing main_grad to
+        microbatch reduces the DP-outer axes, finalizing main_grad to
         main_weight's placements so ``.grad`` -- a view into main_grad -- is the
         fully reduced gradient before ``optimizer.step()``. A finalized main_grad
         marks a completed step, so the next reduction resets it back to the
@@ -303,7 +306,7 @@ class FsdpParameterGroup:
             grads.append(parameter.grad)
 
         # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
-        # Preserve AVG semantics by reducing SUM and scaling the output in _reduce_grad_axis.
+        # Preserve AVG semantics by reducing SUM and scaling the output in _reduce_partial_gradients.
         partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         with self._symmetric_memory_context():
             partial_grad = DBuffer.distribute_tensors(
@@ -311,22 +314,26 @@ class FsdpParameterGroup:
             )
 
         # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Reset it to the DP-outer-Partial
-        # accumulation placement -- a metadata relabel for HSDP since the buffer is
-        # overwritten below. (HFSDP will instead need a fresh buffer here, since its
-        # finalized buffer was reduce-scattered and is smaller.)
+        # only happens on the first microbatch. Redistribute it back to the
+        # DP-outer-Partial accumulation placement -- a local relabel for HSDP, and
+        # a fresh reduce-scattered buffer for HFSDP in the future.
         if self.main_grad.placements != self._accumulation_placements:
-            self.main_grad.placements = self._accumulation_placements
+            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
             if has_grad(self.sharded_parameters):
                 self._install_sharded_grads()
-        reduced = self._reduce_grad_axis(partial_grad, self._accumulation_placements)
 
-        # set_to_none=True cleared the sharded grads -> overwrite main_grad and
-        # install .grad; else they are views into a zeroed main_grad -> accumulate.
+        # set_to_none=True cleared the sharded grads -> reduce straight into
+        # main_grad and install .grad; else they are views into main_grad, so
+        # reduce into a temporary and accumulate.
         if has_grad(self.sharded_parameters):
-            self.main_grad.local_buffer.add_(reduced.local_buffer)
+            reduced_grad = self._reduce_partial_gradients(
+                partial_grad, self._accumulation_placements
+            )
+            self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
         else:
-            self.main_grad.local_buffer.copy_(reduced.local_buffer)
+            self._reduce_partial_gradients(
+                partial_grad, self._accumulation_placements, out=self.main_grad
+            )
             self._install_sharded_grads()
 
         if is_last_microbatch:

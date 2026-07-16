@@ -289,8 +289,9 @@ class DBuffer:
         """Redistribute this buffer to ``new_placements``.
 
         This dispatcher supports the one-axis transitions:
-        Flat -> Replicate, Partial -> Replicate, Partial -> Flat, and
-        Replicate -> Flat. Other placement changes are intentionally unsupported.
+        Flat -> Replicate, Partial -> Replicate, Partial -> Flat,
+        Replicate -> Flat, and Replicate -> Partial. Other placement changes are
+        intentionally unsupported.
         """
         new_placements = tuple(new_placements)
         if len(new_placements) != self.mesh.ndim:
@@ -319,6 +320,8 @@ class DBuffer:
             return self.reduce_scatter(axis, new_placement, out=out)
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
             return self.scatter(axis, new_placement, out=out)
+        if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
+            return self.replicate_to_partial(axis, new_placement, out=out)
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
             f"{axis}: {old_placement!r} -> {new_placement!r}."
@@ -415,6 +418,36 @@ class DBuffer:
             return DBuffer.from_local(local_slice, self.mesh, placements, self.layout.tensor_shapes)
 
         out.local_buffer.copy_(local_slice)
+        return out
+
+    def replicate_to_partial(
+        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
+    ) -> "DBuffer":
+        """Relabel a Replicate axis as Partial (local rescale, no communication).
+
+        A Replicate value equals the AVG reduction of identical per-rank locals,
+        so Replicate -> Partial(AVG) is a pure relabel. SUM reduces those locals
+        to ``value * axis_size``, so scale by ``1 / axis_size`` to preserve it.
+        """
+        axis = mesh_axis
+        if not isinstance(new_placement, Partial):
+            raise ValueError(f"replicate_to_partial() requires a Partial target on axis {axis!r}.")
+        if not isinstance(self.placements[axis], Replicate):
+            raise ValueError(
+                f"replicate_to_partial() requires Replicate placement on axis {axis!r}."
+            )
+
+        placements = list(self.placements)
+        placements[axis] = new_placement
+        _validate_placements(placements)
+        out = self._create_or_validate_out(placements, out)
+        out.local_buffer.copy_(self.local_buffer)
+        if new_placement.reduce_op == dist.ReduceOp.SUM:
+            out.local_buffer.div_(self.mesh.size(axis))
+        elif new_placement.reduce_op != dist.ReduceOp.AVG:
+            raise NotImplementedError(
+                f"replicate_to_partial() supports SUM and AVG, got {new_placement.reduce_op!r}."
+            )
         return out
 
     def get_local_tensor(self, index: int) -> torch.Tensor:
