@@ -49,12 +49,15 @@ from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_succe
 from .utils import append_to_progress_log, is_last_rank, print_rank_0
 
 try:
+    from megatron.core.distributed.fsdp.checkpoint import (
+        is_megatron_fsdp_v2,
+        load_torch_dist_checkpoint_into_megatron_fsdp_v2,
+        preprocess_mcore_fsdp_v2_state_dict,
+        propagate_chunk_metadata_to_state_dict,
+        sync_module_states_after_load,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
-    )
-    from megatron.core.distributed.fsdp.checkpoint import (
-        _apply_mcore_postprocess,
-        _load_torch_dist_into_megatron_fsdp_v2,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
@@ -1260,17 +1263,6 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
     torch.save(dataloader_save_dict, data_state_save_path)
 
 
-def _is_megatron_fsdp_v2(model):
-    """Check if model uses Megatron FSDP v2 (use_megatron_fsdp_v2 flag)."""
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
-    first_model = model[0] if isinstance(model, (list, tuple)) else model
-    for m in first_model.modules():
-        if isinstance(m, FSDPModule):
-            return True
-
-    return False
-
-
 def generate_state_dict(
     args,
     model,
@@ -1310,8 +1302,7 @@ def generate_state_dict(
         else:  # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
             if args.use_megatron_fsdp_v2 and args.ckpt_format == "fsdp_dtensor":
-                from megatron.core.distributed.fsdp.checkpoint import _propagate_chunk_metadata_to_state_dict
-                _propagate_chunk_metadata_to_state_dict(model[i], model_sd)
+                propagate_chunk_metadata_to_state_dict(model[i], model_sd)
 
         state_dict[key] = model_sd
 
@@ -1360,8 +1351,8 @@ def generate_state_dict(
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
-    if _is_megatron_fsdp_v2(model):
-        return _apply_mcore_postprocess(raw_state_dict, args, model)
+    if is_megatron_fsdp_v2(model):
+        return preprocess_mcore_fsdp_v2_state_dict(raw_state_dict, args, model)
 
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
@@ -1556,18 +1547,6 @@ def _load_global_dist_base_checkpoint(
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
         return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
-
-    # Load torch_dist checkpoint into Megatron FSDP v2
-    if args.use_megatron_fsdp_v2:
-        checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
-        state_dict = _load_torch_dist_into_megatron_fsdp_v2(
-            args,
-            checkpoint_name,
-            model=model,
-            v2_state_dict=sharded_state_dict,
-            strict=True,
-        )
-        return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
     if sharded_state_dict is None:
         assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (
@@ -2303,16 +2282,30 @@ def load_checkpoint(
         state_dict["_model"] = model
         load_kwargs["sharded_state_dict"] = state_dict
 
-    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir,
-        args,
-        rank0=False,
-        checkpointing_context=checkpointing_context,
-        dp_cp_group=dp_cp_group,
-        expt_dp_group=expt_dp_group,
-        model=model,
-        **load_kwargs,
-    )
+    if (
+        args.use_megatron_fsdp_v2
+        and ckpt_format == "torch_dist"
+        and ckpt_type == CheckpointType.GLOBAL
+    ):
+        state_dict = load_torch_dist_checkpoint_into_megatron_fsdp_v2(
+            args,
+            checkpoint_name,
+            model=model,
+            v2_state_dict=load_kwargs["sharded_state_dict"],
+            strict=True,
+        )
+        ckpt_type = CheckpointType.FSDP_DTENSOR
+    else:
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir,
+            args,
+            rank0=False,
+            checkpointing_context=checkpointing_context,
+            dp_cp_group=dp_cp_group,
+            expt_dp_group=expt_dp_group,
+            model=model,
+            **load_kwargs,
+        )
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -2365,13 +2358,8 @@ def load_checkpoint(
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
 
-        # Megatron FSDP v2 checkpoints require an extra step to sync module states after loading.
-        if _is_megatron_fsdp_v2(module):
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
-            for m in module.modules():
-                if isinstance(m, FSDPModule):
-                    root_module = m.get_root_module()
-                    root_module._sync_module_states_after_load()
+        if args.use_megatron_fsdp_v2:
+            sync_module_states_after_load(module)
 
     # Model.
     if not skip_load_to_model_and_opt:

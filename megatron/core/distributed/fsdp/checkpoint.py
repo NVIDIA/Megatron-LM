@@ -71,6 +71,11 @@ __all__ = [
     "handle_swiglu_in_state_dict_v2",
     "handle_gdn_in_state_dict_v2",
     "handle_mamba_in_state_dict_v2",
+    "is_megatron_fsdp_v2",
+    "load_torch_dist_checkpoint_into_megatron_fsdp_v2",
+    "preprocess_mcore_fsdp_v2_state_dict",
+    "propagate_chunk_metadata_to_state_dict",
+    "sync_module_states_after_load",
 ]
 
 _MODULE_PREFIX = "module."
@@ -609,6 +614,11 @@ def _propagate_chunk_metadata_to_state_dict(model: nn.Module, state_dict: dict) 
                 )
 
 
+def propagate_chunk_metadata_to_state_dict(model: nn.Module, state_dict: dict) -> None:
+    """Copy Megatron FSDP v2 uneven-DTensor chunk metadata into a state dict."""
+    _propagate_chunk_metadata_to_state_dict(model, state_dict)
+
+
 def _apply_mcore_postprocess(raw_state_dict, args, model):
     """Apply MCore-specific state dict post-processing.
 
@@ -657,6 +667,57 @@ def _apply_mcore_postprocess(raw_state_dict, args, model):
     _verify_chunk_metadata(flattened_sd)
 
     return state_dict
+
+
+def is_megatron_fsdp_v2(model: nn.Module) -> bool:
+    """Return whether *model* contains a Megatron FSDP v2 module."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+
+    first_model = model[0] if isinstance(model, (list, tuple)) else model
+    for module in first_model.modules():
+        if isinstance(module, FSDPModule):
+            return True
+    return False
+
+
+def preprocess_mcore_fsdp_v2_state_dict(raw_state_dict, args, model):
+    """Apply MCore post-processing for a Megatron FSDP v2 fsdp_dtensor state dict."""
+    return _apply_mcore_postprocess(raw_state_dict, args, model)
+
+
+def sync_module_states_after_load(module: nn.Module) -> None:
+    """Synchronize Megatron FSDP v2 module state after ``load_state_dict``."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+
+    if not is_megatron_fsdp_v2(module):
+        return
+
+    for submodule in module.modules():
+        if isinstance(submodule, FSDPModule):
+            root_module = submodule.get_root_module()
+            root_module._sync_module_states_after_load()
+
+
+def load_torch_dist_checkpoint_into_megatron_fsdp_v2(
+    args,
+    checkpoint_name,
+    model,
+    v2_state_dict,
+    strict=True,
+):
+    """Load a torch_dist checkpoint into a Megatron FSDP v2 state-dict skeleton.
+
+    This is the checkpointing.py-facing adapter.  The generic checkpoint loader
+    determines the checkpoint path and builds the v2 sharded state-dict skeleton;
+    the MFSDP-specific online conversion stays in this module.
+    """
+    return _load_torch_dist_into_megatron_fsdp_v2(
+        args,
+        checkpoint_name,
+        model=model,
+        v2_state_dict=v2_state_dict,
+        strict=strict,
+    )
 
 
 def _numel(shape: tuple) -> int:

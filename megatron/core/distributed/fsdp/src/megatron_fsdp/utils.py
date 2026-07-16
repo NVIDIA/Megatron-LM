@@ -123,6 +123,112 @@ def find_megatron_fsdp(model):
     return None
 
 
+class _MegatronFSDPOverlapAdapter:
+    """Small adapter used by the EP-overlap pipeline schedule.
+
+    The schedule only needs a version-neutral FSDP surface: prepare before
+    layer-direct forward execution, run root pre/post-backward callbacks, and
+    expose per-layer reshard hooks.  Keep the v1/v2-specific details here so
+    pipeline scheduling code does not depend on Megatron FSDP internals.
+    """
+
+    def __init__(self, root_module, is_v2: bool):
+        self.root_module = root_module
+        self.is_v2 = is_v2
+
+    @property
+    def data_parallel_sharding_strategy(self):
+        if self.is_v2:
+            for module in self.root_module.modules():
+                if hasattr(module, '_fsdp_param_groups'):
+                    for param_group in module._fsdp_param_groups:
+                        return param_group.sharding_strategy
+            return "no_shard"
+
+        return self.root_module.ddp_config.data_parallel_sharding_strategy
+
+    def prepare_forward_schedule(self):
+        if not self.is_v2:
+            # The overlap schedule bypasses MegatronFSDP.forward(), which normally
+            # swaps distributed (optimizer-managed) parameters back to raw parameters.
+            self.root_module._replace_param_with_raw_if_needed()
+
+    def pre_backward(self):
+        if self.is_v2:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+                mfsdp_pre_backward_setup,
+            )
+
+            mfsdp_pre_backward_setup(self.root_module, skip_final_callback=True)
+        else:
+            self.root_module.pre_backward()
+
+    def post_backward(self):
+        if self.is_v2:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+                mfsdp_post_backward_final_callback,
+            )
+
+            mfsdp_post_backward_final_callback(self.root_module)
+        else:
+            self.root_module.post_backward()
+
+    def get_reshard_hooks(self):
+        if self.is_v2:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+                mfsdp_post_backward_hook,
+                mfsdp_post_forward_hook,
+            )
+
+            return mfsdp_post_forward_hook, mfsdp_post_backward_hook
+
+        return (
+            self.root_module.post_forward_release_module,
+            self.root_module.post_backward_release_module,
+        )
+
+
+def _find_megatron_fsdp_v2_root(model):
+    """Return the root Megatron FSDP v2 module, or ``None`` if absent."""
+    if model is None:
+        return None
+
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    found_fsdp_modules = []
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            found_fsdp_modules.append(module)
+            if getattr(module._fsdp_state, '_is_root', False):
+                return module
+
+    if found_fsdp_modules:
+        raise RuntimeError(
+            "Found Megatron FSDP v2 modules but none marked as root. "
+            "Ensure the root FSDP module has _fsdp_state._is_root = True. "
+            "This is normally set by fully_shard() on the outermost module. "
+            f"v2 modules found: {[m.__class__.__name__ for m in found_fsdp_modules[:5]]}"
+        )
+
+    return None
+
+
+def get_megatron_fsdp_overlap_adapter(model):
+    """Return a v1/v2-neutral adapter for EP-overlap schedules, if using M-FSDP."""
+    fsdp_v1 = find_megatron_fsdp(model)
+    if fsdp_v1 is not None:
+        return _MegatronFSDPOverlapAdapter(fsdp_v1, is_v2=False)
+
+    fsdp_v2_root = _find_megatron_fsdp_v2_root(model)
+    if fsdp_v2_root is not None:
+        return _MegatronFSDPOverlapAdapter(fsdp_v2_root, is_v2=True)
+
+    return None
+
+
 def get_mesh_names(
     device_mesh: Optional[DeviceMesh] = None, only_submesh_dims: bool = False
 ) -> list[str]:
