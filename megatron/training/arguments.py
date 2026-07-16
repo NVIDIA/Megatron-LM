@@ -1905,18 +1905,40 @@ def validate_args(args, defaults={}):
         ], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     if args.use_layer_wise_distributed_optimizer:
-        assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
-            "Layer-wise (Muon) distributed optimizer does not support FP8/FP4 parameter gather "
-            "(fp8_param_gather / fp4_param_gather). Use fp8_param_gather=False (e.g. blockwise/"
-            "MXFP8 compute with parameters persisted in bf16)."
-        )
         if not args.use_layer_wise_param_layout:
+            # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
+            # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
+            # reuse_grad_buf. fp4 is rejected unconditionally -- the LayerWise gather routes
+            # buckets by is_float8tensor, so an NVFP4 param would silently take the raw
+            # flatten path.
+            assert not getattr(args, 'fp4_param_gather', False), (
+                "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
+                "(mxfp8 or blockwise); fp4_param_gather is out of scope."
+            )
+            if args.fp8_param_gather:
+                assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
+                    "fp8 parameter gather on the decoupled compact LayerWise DDP layout requires "
+                    f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."
+                )
+                if args.fp8_recipe == 'mxfp8':
+                    assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                        "mxfp8 + --fp8-param-gather on the decoupled compact LayerWise DDP layout "
+                        "requires --reuse-grad-buf-for-mxfp8-param-ag (or use fp8_recipe='blockwise')."
+                    )
             assert args.num_distributed_optimizer_instances == 1, (
                 "the decoupled compact LayerWise DDP layout (the default; pass "
                 "--use-layer-wise-param-layout for the padded layout) requires "
                 "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
                 "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
                 "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
+        else:
+            # Padded LayerWise param layout: fp8/fp4 parameter gather is not supported here.
+            assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+                "Layer-wise (Muon) distributed optimizer with the padded param layout does not "
+                "support FP8/FP4 parameter gather. Use the default compact decoupled layout (do "
+                "not pass --use-layer-wise-param-layout) for fp8 parameter gather, or "
+                "fp8_param_gather=False."
             )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
@@ -4238,8 +4260,11 @@ def _add_distributed_args(parser):
         'decoupled layout, where LayerWise (Muon 2D) buffers use a no-padding DDP layout and locally '
         'disable DistributedOptimizer (all-reduce grads + whole-param ping-pong + allgather_params), '
         'while sibling buffers keep the byte-level DistributedOptimizer; this avoids the persistent '
-        'dp_size * max(shard_load) padding. Pass this flag to restore the padded layout (e.g. for '
-        'bit-for-bit comparison; it uses a different bf16 reduction ordering).',
+        'dp_size * max(shard_load) padding. The compact layout supports --fp8-param-gather (mxfp8 or '
+        'blockwise): the Muon buffers stay non-DistOpt and the param sync runs through the FP8-aware '
+        'allgather_params ping-pong path (stage fp32 master -> bf16, uneven all-gather, requantize '
+        'per rank); mxfp8 requires --reuse-grad-buf-for-mxfp8-param-ag. Pass this flag to restore the '
+        'padded layout (e.g. for bit-for-bit comparison; it uses a different bf16 reduction ordering).',
     )
     return parser
 
