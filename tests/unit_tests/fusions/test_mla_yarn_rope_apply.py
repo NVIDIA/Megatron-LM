@@ -54,7 +54,9 @@ class TestApplyRotaryPosEmbTHD:
         t = torch.randn(4, 2, 8)
         freqs = torch.randn(8, 1, 1, 8)
 
-        out = rope_utils_module._apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, cp_group=cp_group)
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
 
         expected_freqs = torch.cat([freqs[0:1], freqs[3:4], freqs[4:5], freqs[7:8]], dim=0)
         expected = rope_utils_module._apply_rotary_pos_emb_bshd(
@@ -69,7 +71,9 @@ class TestApplyRotaryPosEmbTHD:
         t = torch.randn(4, 2, 8)
         freqs = torch.randn(4, 1, 1, 8)
 
-        out = rope_utils_module._apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, cp_group=cp_group)
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=4
+        )
 
         expected_freqs = torch.cat([freqs[1:2], freqs[2:3]], dim=0)
         expected_slices = []
@@ -97,6 +101,7 @@ def _test_fused_apply_mla_rope_for_q(input_format):
         multi_latent_attention=True,
     )
 
+    max_seqlen = None
     if input_format == "sbhd":
         cu_seqlens = None
         seqlen = 1024
@@ -142,6 +147,7 @@ def _test_fused_apply_mla_rope_for_q(input_format):
         freqs,
         transformer_config,
         cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
         mscale=mscale,
         cp_group=FakeCPGroup(),
         mla_rotary_interleaved=True,
@@ -183,6 +189,7 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         multi_latent_attention=True,
     )
 
+    max_seqlen = None
     if input_format == "sbhd":
         cu_seqlens = None
         seqlen = 1024
@@ -241,6 +248,7 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         freqs,
         transformer_config,
         cu_seqlens=cu_seqlens,
+        max_seqlen=max_seqlen,
         mscale=mscale,
         cp_group=FakeCPGroup(),
         mla_rotary_interleaved=True,

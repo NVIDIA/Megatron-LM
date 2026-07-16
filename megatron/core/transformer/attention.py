@@ -1463,8 +1463,11 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
                 else:
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+                rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
+                rope_max_seqlen_q = rope_max_seqlen_kv = None
 
             if split_qkv:
                 if q_pos_emb is not None:
@@ -1477,6 +1480,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
+                            max_seqlen=rope_max_seqlen_q,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1495,6 +1499,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
+                        max_seqlen=rope_max_seqlen_kv,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
