@@ -2142,10 +2142,27 @@ class TransformerConfig(ModelParallelConfig):
                         f"recompute_modules."
                     )
 
+        use_mhc_recompute = (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        )
+        if (
+            use_mhc_recompute
+            and self.cuda_graph_impl == "transformer_engine"
+            and (
+                list(self.cuda_graph_modules or []) != [CudaGraphModule.attn]
+                or list(self.recompute_modules) != ["mhc"]
+            )
+        ):
+            raise ValueError(
+                "mHC recompute with Transformer Engine CUDA Graphs currently supports only "
+                "the initial attention-only split: cuda_graph_modules=[attn] and "
+                "recompute_modules=[mhc]. The eager mHC producer must remain outside the "
+                "captured consumer."
+            )
+
         if (
             self.overlap_moe_expert_parallel_comm
-            and self.recompute_granularity == "selective"
-            and "mhc" in self.recompute_modules
+            and use_mhc_recompute
             and (
                 self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
             )

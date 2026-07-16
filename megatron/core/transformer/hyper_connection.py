@@ -13,7 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointManager
+    from megatron.core.tensor_parallel.random import CheckpointManager, CudaGraphCheckpointBridge
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
@@ -485,7 +485,10 @@ class HyperConnectionModule(MegatronModule):
         return mixed.view(s, b, n * C)
 
     def forward(
-        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
+        self,
+        hidden_states: Tensor,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        output_bridge: Optional['CudaGraphCheckpointBridge'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Full mHC forward pass.
@@ -499,6 +502,9 @@ class HyperConnectionModule(MegatronModule):
             hidden_states: [s, b, n*C] - n-stream hidden states
             mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
+            output_bridge: Optional fixed-address CUDA Graph consumer input.  This
+                is valid only with ``mhc_recompute_manager`` and causes aggregate
+                recompute to materialize into the captured input surface.
 
         Returns:
             A 4-tuple. This is an intentional breaking change from the older
@@ -510,8 +516,12 @@ class HyperConnectionModule(MegatronModule):
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
         if mhc_recompute_manager is not None:
-            return self._forward_with_checkpoint(hidden_states, mhc_recompute_manager)
+            return self._forward_with_checkpoint(
+                hidden_states, mhc_recompute_manager, output_bridge=output_bridge
+            )
         else:
+            if output_bridge is not None:
+                raise ValueError("output_bridge requires an mHC recompute manager")
             return self._forward_normal(hidden_states)
 
     def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -542,7 +552,10 @@ class HyperConnectionModule(MegatronModule):
         return aggregated, h_res, h_post, hs_for_residual
 
     def _forward_with_checkpoint(
-        self, hidden_states: Tensor, manager: 'CheckpointManager'
+        self,
+        hidden_states: Tensor,
+        manager: 'CheckpointManager',
+        output_bridge: Optional['CudaGraphCheckpointBridge'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -555,6 +568,7 @@ class HyperConnectionModule(MegatronModule):
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
             manager: CheckpointManager for unified recomputation
+            output_bridge: Optional fixed-address attention CUDA Graph input.
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -572,9 +586,9 @@ class HyperConnectionModule(MegatronModule):
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
 
         # Checkpoint aggregate - auto-registers to manager
-        aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.aggregate, hs_for_aggregate, h_pre
-        )
+        aggregated = CheckpointWithoutOutput(
+            ckpt_manager=manager, output_bridge=output_bridge
+        ).checkpoint(self.aggregate, hs_for_aggregate, h_pre)
 
         return aggregated, h_res, h_post, hs_for_residual
 

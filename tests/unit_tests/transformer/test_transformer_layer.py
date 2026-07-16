@@ -811,6 +811,54 @@ class TestMHCWithCudaGraph:
             f"HyperConnectionTransformerLayer must override get_layer_static_inputs."
         )
 
+    def test_mhc_recompute_attention_graph_starts_from_one_stream_aggregate(self):
+        """The split attention graph input is the eager mHC aggregate [s, b, C]."""
+        layer, config = self._create_mhc_layer(
+            bf16=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+        )
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=2)
+        assert static_inputs["hidden_states"].shape == (32, 2, config.hidden_size)
+
+        graph_submodules = layer._get_submodules_under_cudagraphs()
+        assert layer.self_attention in graph_submodules
+        assert layer.self_attention_hyper_connection not in graph_submodules
+
+    def test_mhc_recompute_attention_graph_rejects_packed_sequence(self):
+        """The first bridge slice is SBHD-only; THD tensors need a separate contract."""
+        with pytest.raises(ValueError, match="THD/packed-sequence"):
+            self._create_mhc_layer(
+                bf16=True,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.attn],
+                recompute_granularity="selective",
+                recompute_modules=["mhc"],
+                sequence_packing_scheduler="dp_balanced",
+                max_seqlen_per_dp_cp_rank=32,
+                thd_max_packed_sequences=2,
+                pad_packed_seq_alignment="max",
+            )
+
+    def test_te_graph_static_hidden_input_tracks_runtime_microbatch_slot(self):
+        """Static-input handles use the same modulo slot selection as TE graphs."""
+        layer, _ = self._create_mhc_layer()
+        layer.cuda_graphs = [object(), object()]
+        slot_inputs = (
+            torch.empty((4, 1, 64), device="cuda"),
+            torch.empty((4, 1, 64), device="cuda"),
+        )
+        layer.set_te_cuda_graph_static_hidden_inputs(slot_inputs)
+
+        layer.current_microbatch = 3
+        assert layer.get_te_cuda_graph_static_hidden_input() is slot_inputs[1]
+        layer.clear_te_cuda_graph_static_hidden_inputs()
+        with pytest.raises(RuntimeError, match="have not been attached"):
+            layer.get_te_cuda_graph_static_hidden_input()
+
     def test_submodules_under_cudagraphs_includes_hyper_connection(self):
         """_get_submodules_under_cudagraphs must include hyper connection modules.
 

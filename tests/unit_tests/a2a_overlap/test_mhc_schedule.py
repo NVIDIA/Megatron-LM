@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.utils import NoopScheduleNode, get_comp_str
 from megatron.core.tensor_parallel.random import (
     CheckpointManager,
     CheckpointWithoutOutput,
+    CudaGraphCheckpointBridge,
     initialize_rng_tracker,
 )
 from megatron.core.transformer.module import float16_to_fp32
@@ -473,6 +474,58 @@ def test_checkpoint_manager_explicit_recompute_is_idempotent_and_restores_gradie
 
     loss.backward()
     torch.testing.assert_close(input_tensor.grad, reference_input.grad)
+
+
+def test_overlap_schedule_materializes_bridge_before_consumer_backward(_initialized_model_parallel):
+    """The future EP-overlap recompute node restores B before captured BWD.
+
+    The graph replay itself is covered by the mHC bridge test. This test binds
+    the same primitive to ``TransformerLayerSchedulePlan`` and validates node
+    ordering for the later EP-overlap phase. Dense pipeline 1F1B is covered by
+    the PP=2 functional test instead.
+    """
+
+    def run_function(value):
+        return torch.sin(value) * value
+
+    initialize_rng_tracker(force_reset=True)
+    calls = []
+    input_tensor = torch.randn(32, device="cuda", requires_grad=True)
+    bridge_tensor = torch.empty_like(input_tensor, requires_grad=True)
+    bridge_ptr = bridge_tensor.data_ptr()
+    manager = CheckpointManager()
+    checkpoint = CheckpointWithoutOutput(
+        ckpt_manager=manager, output_bridge=CudaGraphCheckpointBridge(bridge_tensor)
+    )
+    output = checkpoint.checkpoint(run_function, input_tensor)
+    expected = output.detach().clone()
+    manager.discard_all_outputs()
+
+    with torch.no_grad():
+        bridge_tensor.fill_(float("nan"))
+
+    class _ManagerRecomputeNode:
+        def forward(self):
+            calls.append("backward.mhc_recompute.forward")
+            manager.recompute_now()
+
+    class _BridgeConsumerNode(_RecordingNode):
+        def backward(self, value):
+            calls.append(f"{self.name}.backward")
+            assert bridge_tensor.data_ptr() == bridge_ptr
+            torch.testing.assert_close(bridge_tensor, expected)
+            return value
+
+    backward_layer = _RecordingLayer(calls, "backward")
+    backward_layer.mhc_recompute = _ManagerRecomputeNode()
+    backward_layer.moe_combine = _BridgeConsumerNode(calls, "backward.captured_consumer")
+
+    TransformerLayerSchedulePlan.run(None, backward_layer, b_grad=object())
+
+    _assert_called_before(
+        calls, "backward.mhc_recompute.forward", "backward.captured_consumer.backward"
+    )
+    torch.testing.assert_close(output, expected)
 
 
 def _run_schedule_and_capture(model, data):

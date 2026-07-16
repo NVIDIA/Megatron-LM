@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from .cross_entropy import vocab_parallel_cross_entropy
 from .data import broadcast_data
 from .inference_layers import (
@@ -32,6 +32,7 @@ from .mappings import (
 )
 from .random import (
     CheckpointWithoutOutput,
+    CudaGraphCheckpointBridge,
     checkpoint,
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
@@ -76,6 +77,7 @@ __all__ = [
     "get_expert_parallel_rng_tracker_name",
     "is_graph_safe_cuda_rng_tracker",
     "CheckpointWithoutOutput",
+    "CudaGraphCheckpointBridge",
     # utils.py
     "split_tensor_along_last_dim",
     "split_tensor_into_1d_equal_chunks",
