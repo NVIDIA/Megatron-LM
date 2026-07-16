@@ -1190,12 +1190,24 @@ class DynamicInferenceEngine(AbstractEngine):
                 eod = -1
             request.sampling_params.termination_id = eod
 
-        if (
-            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
-            > self.context.max_sequence_length
-        ) or (request.sampling_params.num_tokens_to_generate < 0):
+        generation_room = self.context.max_sequence_length - len(request.prompt_tokens)
+        if generation_room < 1 or request.sampling_params.num_tokens_to_generate < 0:
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+        elif request.sampling_params.num_tokens_to_generate > generation_room:
+            # A budget that merely overshoots the context room (e.g. a dataset
+            # row whose recorded prompt length drifted from the actual
+            # tokenization) is truncated rather than failed: a hard fail here
+            # propagates through the serving stack and can kill a whole RL run
+            # over one sample.
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request_id}: clamping num_tokens_to_generate "
+                    f"{request.sampling_params.num_tokens_to_generate} -> {generation_room} "
+                    f"(prompt {len(request.prompt_tokens)} tokens, "
+                    f"max_sequence_length {self.context.max_sequence_length})."
+                )
+            request.sampling_params.num_tokens_to_generate = generation_room
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
