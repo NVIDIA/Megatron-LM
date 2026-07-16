@@ -207,18 +207,22 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
         device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
     )
     torch.manual_seed(1234)
-    baseline = TinyModel().to(device)
-    model = TinyModel().to(device)
+    dim = 8
+    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
+    model = MultiChildModel(dim=dim, num_children=2).to(device)
     model.load_state_dict(baseline.state_dict())
 
-    fully_shard(model.fc1, mesh=mesh, placements=_hsdp_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_hsdp_placements())
+    # Shard the child layers, then the model, so the children share a root context
+    # and reduce through the overlap path instead of as independent roots.
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
     micro_batch_size = 2
-    x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
-    target = torch.randn(num_microbatches, micro_batch_size, 4, device=device)
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
     def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
