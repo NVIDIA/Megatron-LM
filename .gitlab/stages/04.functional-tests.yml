@@ -450,6 +450,7 @@ functional:smoke_notify:
       fi
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
+    - export PYTHONPATH=$(pwd)
     - |
       python tests/test_utils/python_scripts/notify.py \
         --pipeline-id "${CI_PIPELINE_ID}" \
@@ -459,7 +460,9 @@ functional:smoke_notify:
   rules:
     - if: $BUILD == "no"
       when: never
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")
+    # Notify for every pipeline that creates smoke children, regardless of
+    # branch name or pipeline source.
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/
       when: always
     - when: never
 
@@ -484,7 +487,6 @@ functional:x_notify:
     RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
     CONTEXT: $FUNCTIONAL_TEST_SCOPE
   script:
-    - env
     - |
       if [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
@@ -494,21 +496,30 @@ functional:x_notify:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || echo "0")
     - export TEAM_SLUG=$SLACK_ADMIN
+    - export PYTHONPATH=$(pwd)
     - |
       python tests/test_utils/python_scripts/notify.py \
         --pipeline-id "${CI_PIPELINE_ID}" \
         --check-for functional-tests \
         --pipeline-context $CONTEXT \
-        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
+        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}" \
+        --summary-output pipeline_summaries.json \
+        --failure-buckets-output failure_buckets.json \
+        --slack-output slack_notification.json
 
   artifacts:
     when: always
     paths:
       - scripts
+      - pipeline_summaries.json
+      - failure_buckets.json
+      - slack_notification.json
   rules:
-    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
+    # Notify for every functional pipeline, regardless of branch name or
+    # pipeline source.
+    - if: $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 

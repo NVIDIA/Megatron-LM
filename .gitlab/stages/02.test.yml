@@ -186,7 +186,6 @@ test:unit_tests_notify:
     - purpose/utility
     - team/megatron
   script:
-    - env
     - |
       if [[ "$CI_COMMIT_BRANCH" == *dev* ]]; then
         export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK_DEV}
@@ -195,8 +194,9 @@ test:unit_tests_notify:
       fi
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || echo "0")
     - export TEAM_SLUG=$SLACK_ADMIN
+    - export PYTHONPATH=$(pwd)
     - |
       python tests/test_utils/python_scripts/notify.py \
         --pipeline-id "${CI_PIPELINE_ID}" \
@@ -208,7 +208,9 @@ test:unit_tests_notify:
     paths:
       - scripts
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || $CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")
+    # TEMPORARY: Notify for every pipeline that creates unit-test children,
+    # regardless of branch name or pipeline source.
+    - if: $UNIT_TEST == "yes" && $UNIT_TEST_REPEAT != "0"
       when: always
     - when: never
 

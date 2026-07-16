@@ -1,0 +1,95 @@
+.linear_reconcile_rules:
+  rules:
+    # TEMPORARY: Create the reconciliation job for every functional pipeline.
+    # The command reports missing credentials/configuration explicitly instead
+    # of silently excluding the job at pipeline creation time.
+    - if: $FUNCTIONAL_TEST == "yes" && $RUN_LINEAR_STATUS == "True"
+      when: always
+    - when: never
+
+.linear_triage_job:
+  stage: triage
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+
+triage:linear_reconcile:
+  extends: [.linear_triage_job, .linear_reconcile_rules]
+  needs:
+    - job: functional:x_notify
+      artifacts: true
+  script:
+    - >-
+      nemo-ci-linear status
+      --config "${NEMO_CI_TRIAGE_CONFIG}"
+      --build-module-regex '^megatron-lm$'
+      --output linear_status_report.json
+    - >-
+      nemo-ci-linear reconcile
+      --failure-buckets failure_buckets.json
+      --linear-report linear_status_report.json
+      --pipeline-summaries pipeline_summaries.json
+      --output linear_action_plan.json
+  artifacts:
+    when: always
+    paths:
+      - linear_status_report.json
+      - linear_action_plan.json
+      - inference_metrics.json
+
+triage:linear_write:
+  extends: [.linear_triage_job]
+  needs:
+    - job: triage:linear_reconcile
+      artifacts: true
+  allow_failure: true
+  script:
+    - >-
+      nemo-ci-linear write
+      --config "${NEMO_CI_TRIAGE_CONFIG}"
+      --plan linear_action_plan.json
+      --output linear_action_plan_post.json
+  artifacts:
+    when: always
+    paths:
+      - linear_action_plan.json
+      - linear_action_plan_post.json
+      - linear_status_report.json
+  rules:
+    # TEMPORARY: Apply the Linear plan for every functional pipeline, including
+    # pipelines already failed by functional test jobs.
+    - if: >-
+        $FUNCTIONAL_TEST == "yes" &&
+        $RUN_LINEAR_STATUS == "True" &&
+        $RUN_LINEAR_WRITE == "True"
+      when: always
+    - when: never
+
+triage:slack_linear_followup:
+  extends: [.linear_triage_job]
+  needs:
+    - job: functional:x_notify
+      artifacts: true
+    - job: triage:linear_write
+      artifacts: true
+  allow_failure: true
+  script:
+    - >-
+      nemo-ci-notify
+      --pipeline-summary slack_notification.json
+      --linear-plan linear_action_plan_post.json
+      --slack-bot-token "${MCORE_SLACK_BOT_TOKEN:-${ALERTMANAGER_TOKEN}}"
+      --slack-channel-id "${MCORE_SLACK_CHANNEL_ID}"
+  rules:
+    # Post the applied Linear actions under the functional-test notification.
+    - if: >-
+        $FUNCTIONAL_TEST == "yes" &&
+        $RUN_LINEAR_STATUS == "True" &&
+        $RUN_LINEAR_WRITE == "True"
+      when: always
+    - when: never
