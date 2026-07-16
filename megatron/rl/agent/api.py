@@ -227,7 +227,12 @@ class _GranularityConfig(NamedTuple):
 
 
 class _SubmissionGate:
-    """Gate capacity is measured in units of the configured submission granularity."""
+    """Gate capacity is measured in units of the configured submission granularity.
+
+    Releases are keyed on (state, granularity) so release sites for different
+    granularities can coexist on the same code path (e.g. stage_consume's
+    reorder branch releases per group for G submission and per batch for B).
+    """
 
     def __init__(
         self,
@@ -256,8 +261,8 @@ class _SubmissionGate:
             self.held += 1
             self.acquire_calls += 1
 
-    def release_after(self, state: ReleaseState) -> None:
-        if self._release_on == state:
+    def release_after(self, state: ReleaseState, granularity: SubmissionGranularity) -> None:
+        if self._submission == granularity and self._release_on == state:
             self._sem.release()
             self.held -= 1
             self.release_calls += 1
@@ -401,7 +406,7 @@ class _RolloutPipeline:
             self.request, item.params.inference_request
         )
         inferred_at = time.monotonic()
-        self.gate.release_after("inferred")
+        self.gate.release_after("inferred", "R")
         if item.infer_dequeued_at:
             self.engine_dwell.append(inferred_at - item.infer_dequeued_at)
         self.inferred_count += 1
@@ -430,13 +435,19 @@ class _RolloutPipeline:
                 rollouts = await asyncio.gather(
                     *[item.item.params.build_rollout(item.response) for item in completed]
                 )
-                self.gate.release_after("assembled")
+                # No-op under the current map (G releases at "consumed"); kept so
+                # flipping RELEASE_STATE_BY_SUBMISSION["G"] back to "assembled"
+                # restores run-ahead-to-assembly for experiments.
+                self.gate.release_after("assembled", "G")
                 self.assembled_count += 1
                 # NOTE: this filter is currently non-functional dead code:
                 # _GranularityConfig._validate rejects filter_groups_with_same_reward
                 # at pipeline construction, so `keep` is always True. Kept for a
                 # future PR that regenerates dropped groups instead of
-                # under-delivering to the caller.
+                # under-delivering to the caller. That PR must also release the
+                # gate slot on the drop path: with G/B releasing at "consumed",
+                # a dropped group never reaches stage_consume, so its slot (and
+                # eventually its batch's) would leak permanently.
                 keep = (
                     not self.request.filter_groups_with_same_reward
                     or np.std([rollout.reward for rollout in rollouts]) > 1e-6
@@ -474,6 +485,7 @@ class _RolloutPipeline:
                     return
                 self._record_output_dwell(group)
                 yield group
+                self.gate.release_after("consumed", "G")
 
         next_batch_id = 0
         pending = self._consume_pending
@@ -493,7 +505,8 @@ class _RolloutPipeline:
                 next_batch_id += 1
                 for group in batch:
                     yield group
-                self.gate.release_after("consumed")
+                    self.gate.release_after("consumed", "G")
+                self.gate.release_after("consumed", "B")
 
 
 class GroupedRolloutGenerator(Agent, ABC):
