@@ -27,6 +27,10 @@ from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.layer_boundary_observer import (
+    observe_transformer_layer_input,
+    observe_transformer_layer_output,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -328,6 +332,7 @@ class HybridStack(MegatronModule):
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
                     )
+                    observe_transformer_layer_input(self, layer, hidden_states)
                     with inner_quant_context:
                         if isinstance(layer, TransformerLayer):
                             hidden_states, _ = layer(
@@ -352,6 +357,7 @@ class HybridStack(MegatronModule):
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+                    observe_transformer_layer_output(self, layer, hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

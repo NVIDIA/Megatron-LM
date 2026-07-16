@@ -1,13 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Activation and dgrad raw-moment logging using module hooks."""
+"""Activation, dgrad, and residual-stream raw-moment logging."""
 
 from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import torch
 import torch.nn as nn
@@ -19,6 +20,10 @@ from megatron.core.per_parameter_stats import (
     raw_moment_row_to_dict,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.layer_boundary_observer import (
+    LayerBoundary,
+    observe_transformer_layer_boundaries,
+)
 from megatron.core.transformer.moe.router import Router
 from megatron.core.utils import unwrap_model
 
@@ -48,17 +53,22 @@ class _RawMomentSite:
 
 
 class RawMomentLogger:
-    """Collect activation and dgrad raw moments from module hooks."""
+    """Collect activation, dgrad, and residual-stream raw moments."""
 
     def __init__(self):
         self._activation_hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._dgrad_hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._activation_sites: OrderedDict[str, _RawMomentSite] = OrderedDict()
         self._dgrad_sites: OrderedDict[str, _RawMomentSite] = OrderedDict()
+        self._residual_sites: OrderedDict[str, _RawMomentSite] = OrderedDict()
+        self._residual_boundary_sites: dict[tuple[int, int, LayerBoundary], _RawMomentSite] = {}
         self._latest_activation_raw_moments_by_layer: list[tuple[str, dict[str, float]]] | None = (
             None
         )
         self._latest_dgrad_raw_moments_by_layer: list[tuple[str, dict[str, float]]] | None = None
+        self._latest_residual_raw_moments_by_layer: list[
+            tuple[str, dict[str, float]]
+        ] | None = None
         self._latest_dgrad_loss_scale: float | None = None
         self._pending_dgrad_loss_scale: float | None = None
 
@@ -105,6 +115,61 @@ class RawMomentLogger:
 
             self._dgrad_hooks.append(module.register_full_backward_hook(hook))
 
+    def prepare_residual_logging(
+        self, model: Iterable[nn.Module] | nn.Module
+    ) -> None:
+        """Create stable residual sites for the decoder layers in ``model``."""
+        self._residual_sites.clear()
+        self._residual_boundary_sites.clear()
+        for stack_name, stack in _iter_residual_stacks(model):
+            for layer in getattr(stack, "layers"):
+                layer_number = getattr(layer, "layer_number", None)
+                if layer_number is None:
+                    continue
+                policy = _residual_site_policy(layer)
+                if layer_number == 1:
+                    initial_name = f"{stack_name}/input0" if stack_name else "input0"
+                    self._register_residual_site(
+                        stack,
+                        layer,
+                        "input",
+                        initial_name,
+                        policy,
+                    )
+                layer_prefix = f"{stack_name}." if stack_name else ""
+                output_name = f"{layer_prefix}layers.{layer_number - 1}/output0"
+                self._register_residual_site(
+                    stack,
+                    layer,
+                    "output",
+                    output_name,
+                    policy,
+                )
+
+    def record_residual_boundary(
+        self, stack: nn.Module, layer: nn.Module, boundary: LayerBoundary, tensor: torch.Tensor
+    ) -> None:
+        """Accumulate one observed residual-stream boundary."""
+        # Activation checkpointing reaches this path again under grad during recomputation.
+        if not torch.is_grad_enabled():
+            return
+        key = (id(stack), id(layer), boundary)
+        site = self._residual_boundary_sites.get(key)
+        if site is not None:
+            self._add_tensor(site, tensor)
+
+    def _register_residual_site(
+        self,
+        stack: nn.Module,
+        layer: nn.Module,
+        boundary: LayerBoundary,
+        site_name: str,
+        policy: _SitePolicy,
+    ) -> None:
+        key = (id(stack), id(layer), boundary)
+        site = self._residual_sites.setdefault(site_name, _RawMomentSite(site_name, policy))
+        self._residual_boundary_sites[key] = site
+
     def finalize_activation_raw_moments_by_layer(self) -> None:
         """Reduce and cache activation raw moments for later logging."""
         self._latest_activation_raw_moments_by_layer = self._finalize_sites(
@@ -118,6 +183,14 @@ class RawMomentLogger:
         self._latest_dgrad_loss_scale = self._pending_dgrad_loss_scale
         self._pending_dgrad_loss_scale = None
         self._dgrad_sites.clear()
+
+    def finalize_residual_raw_moments_by_layer(self) -> None:
+        """Reduce and cache residual-stream raw moments for later logging."""
+        self._latest_residual_raw_moments_by_layer = self._finalize_sites(
+            self._residual_sites.values()
+        )
+        self._residual_sites.clear()
+        self._residual_boundary_sites.clear()
 
     def consume_activation_raw_moments_by_layer(
         self,
@@ -138,6 +211,14 @@ class RawMomentLogger:
         if values is None:
             return None
         return values, loss_scale
+
+    def consume_residual_raw_moments_by_layer(
+        self,
+    ) -> list[tuple[str, dict[str, float]]] | None:
+        """Return and clear the latest residual-stream raw moments."""
+        values = self._latest_residual_raw_moments_by_layer
+        self._latest_residual_raw_moments_by_layer = None
+        return values
 
     def remove_activation_hooks(self) -> None:
         """Remove activation raw-moment hooks."""
@@ -233,6 +314,23 @@ def _iter_hook_modules(
             )
 
 
+def _iter_residual_stacks(
+    model: Iterable[nn.Module] | nn.Module,
+) -> Iterable[tuple[str, nn.Module]]:
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    model_chunks = model if isinstance(model, (list, tuple)) else [model]
+    for model_chunk in model_chunks:
+        unwrapped = unwrap_model(model_chunk)
+        for module_name, module in unwrapped.named_modules():
+            if not isinstance(module, (TransformerBlock, HybridStack)):
+                continue
+            if getattr(module, "is_mtp_layer", False) or "mtp" in module_name.split("."):
+                continue
+            yield module_name, module
+
+
 def _is_output_layer_logits_site(module_name: str) -> bool:
     return module_name.rsplit(".", maxsplit=1)[-1] == "output_layer"
 
@@ -286,6 +384,24 @@ def _site_policy(module_name: str, module: nn.Module, field: str) -> _SitePolicy
         if expert_group is not None:
             reduce_groups.append(expert_group)
             owner_groups.append(expert_group)
+
+    return _SitePolicy(tuple(reduce_groups), tuple(owner_groups))
+
+
+def _residual_site_policy(layer: nn.Module) -> _SitePolicy:
+    reduce_groups = []
+    owner_groups = []
+
+    dp_cp_group = _data_parallel_with_context_group()
+    if dp_cp_group is not None:
+        reduce_groups.append(dp_cp_group)
+        owner_groups.append(dp_cp_group)
+
+    tp_group = _module_tensor_parallel_group(layer)
+    if tp_group is not None:
+        owner_groups.append(tp_group)
+        if _sequence_parallel_enabled(layer):
+            reduce_groups.append(tp_group)
 
     return _SitePolicy(tuple(reduce_groups), tuple(owner_groups))
 
@@ -459,3 +575,24 @@ def consume_dgrad_raw_moments_by_layer(
 def disable_dgrad_raw_moment_logging() -> None:
     """Disable dgrad raw-moment logging."""
     _require_logger().remove_dgrad_hooks()
+
+
+@contextmanager
+def capture_residual_raw_moments(
+    model: Iterable[nn.Module] | nn.Module,
+) -> Iterator[None]:
+    """Capture decoder residual-stream raw moments within this context."""
+    logger = _get_logger()
+    logger.prepare_residual_logging(model)
+    with observe_transformer_layer_boundaries(logger.record_residual_boundary):
+        yield
+
+
+def finalize_residual_raw_moments_by_layer() -> None:
+    """Reduce and cache residual-stream raw moments."""
+    _require_logger().finalize_residual_raw_moments_by_layer()
+
+
+def consume_residual_raw_moments_by_layer() -> list[tuple[str, dict[str, float]]] | None:
+    """Return and clear the latest residual-stream raw moments."""
+    return _require_logger().consume_residual_raw_moments_by_layer()

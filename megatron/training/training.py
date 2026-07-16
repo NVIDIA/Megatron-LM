@@ -174,23 +174,27 @@ from .global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
-from .theoretical_memory_usage import report_theoretical_memory
 from .raw_moment_logging import (
+    capture_residual_raw_moments,
     consume_activation_raw_moments_by_layer,
     consume_dgrad_raw_moments_by_layer,
+    consume_residual_raw_moments_by_layer,
     disable_activation_raw_moment_logging,
     disable_dgrad_raw_moment_logging,
     enable_activation_raw_moment_logging,
     enable_dgrad_raw_moment_logging,
     finalize_activation_raw_moments_by_layer,
     finalize_dgrad_raw_moments_by_layer,
+    finalize_residual_raw_moments_by_layer,
 )
 from .statistics_logging import (
     save_activation_raw_moments_by_layer,
     save_dgrad_raw_moments_by_layer,
     save_grad_raw_moments_by_param,
     save_param_raw_moments_by_param,
+    save_residual_raw_moments_by_layer,
 )
+from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
@@ -351,7 +355,7 @@ def _warn_missing_statistics_log_dir():
     global _STATS_LOG_DIR_WARNING_SHOWN
     if not _STATS_LOG_DIR_WARNING_SHOWN:
         print_rank_0(
-            "WARNING: per-parameter statistics logging was requested, but no statistics log "
+            "WARNING: raw-moment statistics logging was requested, but no statistics log "
             "directory is available. Set --statistics-log-dir, --tensorboard-dir, or --save "
             "to write high-cardinality JSONL statistics."
         )
@@ -2365,6 +2369,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     activation_raw_moment_interval = getattr(args, 'log_activation_raw_moments_by_layer', 0)
     dgrad_raw_moment_interval = getattr(args, 'log_dgrad_raw_moments_by_layer', 0)
+    residual_raw_moment_interval = getattr(args, 'log_residual_raw_moments_by_layer', 0)
     log_activation_raw_moments_in_this_iteration = (
         activation_raw_moment_interval > 0
         and iteration is not None
@@ -2375,14 +2380,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         and iteration is not None
         and (iteration + 1) % dgrad_raw_moment_interval == 0
     )
-    log_layer_raw_moments_in_this_iteration = (
+    log_residual_raw_moments_in_this_iteration = (
+        residual_raw_moment_interval > 0
+        and iteration is not None
+        and (iteration + 1) % residual_raw_moment_interval == 0
+    )
+    suspend_cuda_graphs_for_raw_moments = (
         log_activation_raw_moments_in_this_iteration or log_dgrad_raw_moments_in_this_iteration
     )
-    if log_layer_raw_moments_in_this_iteration and getattr(
+    if (
+        suspend_cuda_graphs_for_raw_moments or log_residual_raw_moments_in_this_iteration
+    ) and getattr(
         args, 'cuda_graph_impl', 'none'
     ) == 'full_iteration':
         raise RuntimeError(
-            "Activation/dgrad raw moment logging is not supported with full-iteration CUDA graphs."
+            "Activation, dgrad, and residual raw-moment logging is not "
+            "supported with full-iteration CUDA graphs."
         )
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -2442,10 +2455,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_raw_moment_logging(model, loss_scale=loss_scale_for_dgrad_raw_moments)
         cuda_graph_context = (
             suspend_cuda_graph_replay()
-            if log_layer_raw_moments_in_this_iteration
+            if suspend_cuda_graphs_for_raw_moments
             else nullcontext()
         )
-        with cuda_graph_context:
+        residual_raw_moment_context = (
+            capture_residual_raw_moments(model)
+            if log_residual_raw_moments_in_this_iteration
+            else nullcontext()
+        )
+        with cuda_graph_context, residual_raw_moment_context:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -2475,6 +2493,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if log_dgrad_raw_moments_in_this_iteration:
             finalize_dgrad_raw_moments_by_layer()
             disable_dgrad_raw_moment_logging()
+        if log_residual_raw_moments_in_this_iteration:
+            finalize_residual_raw_moments_by_layer()
 
         # Advance the router tracer step if active.
         tracer = get_moe_router_tracer()
@@ -3996,6 +4016,7 @@ def train(
         grad_raw_moment_interval = getattr(args, 'log_grad_raw_moments_by_param', 0)
         activation_raw_moment_interval = getattr(args, 'log_activation_raw_moments_by_layer', 0)
         dgrad_raw_moment_interval = getattr(args, 'log_dgrad_raw_moments_by_layer', 0)
+        residual_raw_moment_interval = getattr(args, 'log_residual_raw_moments_by_layer', 0)
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
@@ -4069,6 +4090,21 @@ def train(
                         dgrad_raw_moments,
                         loss_scale=dgrad_loss_scale,
                     )
+        if (
+            residual_raw_moment_interval > 0
+            and iteration % residual_raw_moment_interval == 0
+        ):
+            residual_raw_moments_by_layer = consume_residual_raw_moments_by_layer()
+            statistics_log_dir = _get_statistics_log_dir(args)
+            if statistics_log_dir is None:
+                _warn_missing_statistics_log_dir()
+            elif residual_raw_moments_by_layer:
+                save_residual_raw_moments_by_layer(
+                    statistics_log_dir,
+                    iteration,
+                    args.consumed_train_samples,
+                    residual_raw_moments_by_layer,
+                )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:

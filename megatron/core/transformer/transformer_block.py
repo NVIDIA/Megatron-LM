@@ -23,6 +23,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
+from megatron.core.transformer.layer_boundary_observer import (
+    observe_transformer_layer_input,
+    observe_transformer_layer_output,
+)
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -660,6 +664,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    observe_transformer_layer_input(self, layer, hidden_states)
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -676,6 +681,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                         )
+                    observe_transformer_layer_output(self, layer, hidden_states)
 
                     if (
                         torch.is_grad_enabled()

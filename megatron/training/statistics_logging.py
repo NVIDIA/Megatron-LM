@@ -171,3 +171,21 @@ def save_dgrad_raw_moments_by_layer(
         rank=rank,
         extra_record_fields=extra_record_fields,
     )
+
+
+def save_residual_raw_moments_by_layer(
+    log_dir: str,
+    iteration: int,
+    consumed_train_samples: int,
+    residual_raw_moments_by_layer: Iterable[tuple[str, dict[str, float]]],
+    rank: int | None = None,
+) -> None:
+    """Append one residual-stream raw moments record keyed by layer boundary."""
+    save_raw_moments_by_name(
+        log_dir,
+        "residual_raw_moments_by_layer",
+        iteration,
+        consumed_train_samples,
+        residual_raw_moments_by_layer,
+        rank=rank,
+    )
