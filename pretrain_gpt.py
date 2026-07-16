@@ -10,6 +10,7 @@ _PROGRAM_START_TIME = time.time()
 import json
 
 # Suppress warnings on all ranks but rank 0.
+import contextlib
 import os
 import warnings
 
@@ -289,7 +290,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    with stimer(bdata=True):
+    # Frozen teacher (--freeze-all-layers) runs forward-only for logit saving: disable grad
+    grad_ctx = torch.no_grad() if get_args().freeze_all_layers else contextlib.nullcontext()
+    with stimer(bdata=True), grad_ctx:
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         (
             attention_mask,

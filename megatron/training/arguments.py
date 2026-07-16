@@ -1613,6 +1613,16 @@ def validate_args(args, defaults={}):
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
         )
+        # TODO: support saving logits while training (non-frozen teacher) in the future.
+        assert args.freeze_all_layers, (
+            '--logits-save-dir requires --freeze-all-layers: the teacher logit save zeroes the '
+            'language-model loss, so the model cannot train while saving logits.'
+        )
+        assert args.rampup_batch_size is None, (
+            '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
+            'mapping for checkpoint-free dump segments (--skip-train-samples) assumes a fixed '
+            'global batch size.'
+        )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -2725,6 +2735,11 @@ def _add_checkpointing_args(parser):
                        help='Override the iteration stored in the loaded checkpoint. '
                             'Also resets consumed_train_samples accordingly so the '
                             'data loader replays samples from that iteration onward.')
+    group.add_argument('--skip-train-samples', type=int, default=0,
+                       help='On a fresh --finetune load, start the data loader at this '
+                            'global sample offset (consumed_train_samples). Enables '
+                            'checkpoint-free offline-KD dump segments over disjoint '
+                            'sample windows.')
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')

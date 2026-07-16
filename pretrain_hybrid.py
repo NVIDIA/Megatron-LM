@@ -17,6 +17,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
+import contextlib
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
 
@@ -328,7 +329,9 @@ def forward_step(data_iterator, model: HybridModel):
 
     timers('batch-generator').stop()
 
-    with stimer:
+    # Frozen teacher (--freeze-all-layers) runs forward-only for logit saving: disable grad
+    grad_ctx = torch.no_grad() if get_args().freeze_all_layers else contextlib.nullcontext()
+    with stimer, grad_ctx:
         output_tensor = model(
             tokens,
             position_ids,

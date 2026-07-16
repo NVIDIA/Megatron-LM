@@ -252,6 +252,9 @@ class LogitsSaverHooks:
         Args:
             model: Model to instrument.
         """
+        # Only the last pipeline stage has output_layer / computes logits
+        if getattr(model, "output_layer", None) is None:
+            return
         fwd_handle = model.output_layer.register_forward_hook(self._forward_hook)
         self._hook_handles.append(fwd_handle)
         self._override_language_model_loss(model)
