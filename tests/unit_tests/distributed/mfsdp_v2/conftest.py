@@ -41,6 +41,16 @@ def distributed_setup() -> Iterator[DistributedSetup]:
     else:
         device = torch.device("cpu")
 
+    # Eagerly initialize the default process group with device_id so the NCCL
+    # communicator is fully established up front. NCCL symmetric-memory window
+    # registration (use_symm_mem=True) fails with a "window register / invalid
+    # argument" error when the rendezvous is the first NCCL op on the process group
+    # (https://github.com/pytorch/pytorch/issues/188567). Passing device_id forces
+    # eager communicator initialization, and a full-world init_device_mesh reuses
+    # this default group, so the eager init carries through to the mesh's collectives.
+    if device.type == "cuda" and not dist.is_initialized():
+        dist.init_process_group(backend="nccl", device_id=device)
+
     yield DistributedSetup(rank=rank, world_size=world_size, device=device)
 
     if dist.is_initialized():

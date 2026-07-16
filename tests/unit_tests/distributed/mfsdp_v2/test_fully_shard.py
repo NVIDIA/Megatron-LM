@@ -497,12 +497,29 @@ def test_overlaps_communication_and_compute(distributed_setup):
     dim = 16384
     num_children = 4
     dtype = torch.bfloat16
+
+    # Use NCCL symmetric-memory collectives so the all-gather and reduce-scatter run
+    # as SM-light NVLS multicast kernels (ncclSymk*) instead of SM-based ring kernels.
+    # Ring kernels contend with the GEMMs for SMs, so their overlap count jitters with
+    # launch timing (amplified by CI's coverage wrapper) and dips below the theoretical
+    # maximum; the multicast kernels offload data movement to NVLink/NVSwitch and keep
+    # the overlap count deterministic, which is what lets the strict thresholds below hold.
+    # (Symmetric-memory window registration needs an initialized NCCL communicator; the
+    # conftest eagerly initializes the process group with device_id so this holds.)
     model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(
+            layer,
+            mesh=mesh,
+            placements=placements,
+            mixed_precision_policy=policy,
+            use_symm_mem=True,
+        )
+    fully_shard(
+        model, mesh=mesh, placements=placements, mixed_precision_policy=policy, use_symm_mem=True
+    )
 
     x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
 
@@ -560,18 +577,20 @@ def test_overlaps_communication_and_compute(distributed_setup):
         any(_events_overlap(reduce_scatter_event, gemm_event) for gemm_event in gemm_events)
         for reduce_scatter_event in reduce_scatter_events
     )
-    # With dim large enough for the GEMMs to dominate launch jitter (see above),
-    # the prefetched collectives overlap compute deterministically, so assert the
-    # theoretical maxima (2*(num_children - 1) all-gathers across forward and
-    # backward, num_children - 1 reduce-scatters in backward) rather than a loose
-    # floor.
-    assert all_gather_overlap_count >= 2 * (num_children - 1), (
-        f"Expected all-gather to overlap compute, "
+    # With symmetric-memory (SM-light multicast) collectives the overlap count is
+    # deterministic, so assert the theoretical maximum. Each of the num_children - 1
+    # non-root children contributes a forward all-gather and a backward all-gather that
+    # overlap a GEMM (2 * (num_children - 1)), and each non-root child's reduce-scatter
+    # overlaps a backward GEMM (num_children - 1).
+    expected_all_gather_overlap = 2 * (num_children - 1)
+    expected_reduce_scatter_overlap = num_children - 1
+    assert all_gather_overlap_count >= expected_all_gather_overlap, (
+        f"Expected at least {expected_all_gather_overlap} all-gathers to overlap compute, "
         f"got {all_gather_overlap_count}/{len(all_gather_events)}."
     )
-    assert reduce_scatter_overlap_count >= num_children - 1, (
-        f"Expected reduce-scatter to overlap compute, "
-        f"got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
+    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap, (
+        f"Expected at least {expected_reduce_scatter_overlap} reduce-scatters to overlap "
+        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
     )
 
 
