@@ -6,6 +6,7 @@ import torch
 from megatron.core.inference.contexts.fused_kv_append_kernel import (
     HAVE_TRITON,
     triton_append_key_value_cache,
+    triton_append_mla_latent_cache,
 )
 from megatron.core.inference.contexts.gpu_view import ContextGPUView
 
@@ -108,3 +109,103 @@ class TestKVAppendLargeBlockIdx:
         assert torch.equal(
             actual_value, expected_value
         ), f"Value not at expected cache position (block {target_block})."
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAVE_TRITON, reason="Triton required")
+class TestMLALatentAppend:
+    """Tests for Triton MLA latent cache append kernel."""
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("n_tokens", [1, 4, 16])
+    def test_mla_latent_append_numerical_parity(self, dtype, n_tokens):
+        """Verify bitwise parity between Triton MLA append kernel and PyTorch reference."""
+        device = "cuda"
+        num_layers = 2
+        layer = 0
+        total_blocks = 16
+        block_size = 64
+        kv_reduced_dim = 512
+
+        memory_buffer_triton = torch.zeros(
+            num_layers, total_blocks, block_size, kv_reduced_dim, dtype=dtype, device=device
+        )
+        memory_buffer_ref = torch.zeros(
+            num_layers, total_blocks, block_size, kv_reduced_dim, dtype=dtype, device=device
+        )
+
+        kv_concat = torch.randn(n_tokens, 1, kv_reduced_dim, dtype=dtype, device=device)
+        block_idx = torch.tensor([0, 2, 5, 7][:n_tokens], dtype=torch.int32, device=device)
+        local_pos = torch.tensor([0, 15, 31, 63][:n_tokens], dtype=torch.int32, device=device)
+
+        # PyTorch reference
+        memory_buffer_ref[layer, block_idx[:n_tokens], local_pos[:n_tokens]] = kv_concat.squeeze(1)[
+            :n_tokens
+        ]
+
+        # Triton kernel
+        triton_append_mla_latent_cache(
+            layer_number=layer,
+            kv_concat=kv_concat,
+            memory_buffer=memory_buffer_triton,
+            padded_active_token_count=n_tokens,
+            token_to_block_idx=block_idx,
+            token_to_local_position_within_kv_block=local_pos,
+        )
+
+        assert torch.equal(memory_buffer_triton, memory_buffer_ref)
+
+    def test_mla_latent_append_cuda_graph_capture(self):
+        """Verify Triton MLA append works cleanly inside CUDA Graph capture & replay."""
+        device = "cuda"
+        num_layers = 1
+        layer = 0
+        total_blocks = 8
+        block_size = 32
+        kv_reduced_dim = 256
+        n_tokens = 2
+        dtype = torch.bfloat16
+
+        memory_buffer = torch.zeros(
+            num_layers, total_blocks, block_size, kv_reduced_dim, dtype=dtype, device=device
+        )
+        kv_concat = torch.randn(n_tokens, 1, kv_reduced_dim, dtype=dtype, device=device)
+        block_idx = torch.tensor([1, 3], dtype=torch.int32, device=device)
+        local_pos = torch.tensor([4, 12], dtype=torch.int32, device=device)
+
+        # Warmup
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                triton_append_mla_latent_cache(
+                    layer_number=layer,
+                    kv_concat=kv_concat,
+                    memory_buffer=memory_buffer,
+                    padded_active_token_count=n_tokens,
+                    token_to_block_idx=block_idx,
+                    token_to_local_position_within_kv_block=local_pos,
+                )
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture
+        g = torch.cuda.CUDAGraph()
+        memory_buffer.zero_()
+        with torch.cuda.graph(g):
+            triton_append_mla_latent_cache(
+                layer_number=layer,
+                kv_concat=kv_concat,
+                memory_buffer=memory_buffer,
+                padded_active_token_count=n_tokens,
+                token_to_block_idx=block_idx,
+                token_to_local_position_within_kv_block=local_pos,
+            )
+
+        # Replay
+        g.replay()
+        torch.cuda.synchronize()
+
+        expected = torch.zeros_like(memory_buffer)
+        expected[layer, block_idx, local_pos] = kv_concat.squeeze(1)
+
+        assert torch.equal(memory_buffer, expected)

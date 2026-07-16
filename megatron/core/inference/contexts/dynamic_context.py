@@ -55,9 +55,13 @@ from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlo
 from .routing_metadata import RoutingMetadata
 
 try:
-    from .fused_kv_append_kernel import triton_append_key_value_cache
+    from .fused_kv_append_kernel import (
+        triton_append_key_value_cache,
+        triton_append_mla_latent_cache,
+    )
 except ImportError:
     triton_append_key_value_cache = None
+    triton_append_mla_latent_cache = None
 
 try:
     import flashinfer  # type: ignore # pylint: disable=unused-import
@@ -1595,11 +1599,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         attention_layer_number = self.layer_map[layer_number - 1]
 
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
-            # currently does not support MLA latent cache
             return triton_append_key_value_cache(
                 layer_number=attention_layer_number,
                 key=key,
                 value=value,
+                memory_buffer=self.memory_buffer,
+                padded_active_token_count=self.padded_active_token_count,
+                token_to_block_idx=self.gpu_view.token_to_block_idx,
+                token_to_local_position_within_kv_block=self.gpu_view.token_to_local_position_within_kv_block,
+            )
+
+        if (
+            self.cache_mla_latent
+            and triton_append_mla_latent_cache is not None
+            and (
+                torch.cuda.is_current_stream_capturing()
+                or getattr(self, "use_triton_mla_append", False)
+            )
+        ):
+            return triton_append_mla_latent_cache(
+                layer_number=attention_layer_number,
+                kv_concat=key,
                 memory_buffer=self.memory_buffer,
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.gpu_view.token_to_block_idx,
