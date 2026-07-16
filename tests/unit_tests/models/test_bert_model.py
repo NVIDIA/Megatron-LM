@@ -98,6 +98,20 @@ class TestBertModel:
         assert isinstance(self.bert_model.lm_head, BertLMHead)
 
     @pytest.mark.internal
+    def test_output_layer_bias_false_disables_bias(self):
+        bert_model = BertModel(
+            config=self.bert_model.config,
+            num_tokentypes=0,
+            transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=self.bert_model.max_sequence_length,
+            apply_lm_head=False,
+            output_layer_bias=False,
+        )
+
+        assert bert_model.output_layer.bias is None
+
+    @pytest.mark.internal
     def test_apply_lm_head_false_bypasses_head(self):
         config: TransformerConfig = self.bert_model.config
         sequence_length = self.bert_model.max_sequence_length

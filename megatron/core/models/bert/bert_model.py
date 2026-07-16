@@ -54,6 +54,8 @@ class BertModel(LanguageModule):
             Defaults to True. Set to False for architectures whose output projection is
             applied directly to the encoder output (e.g. models with their own final norm),
             bypassing BERT's dense+GeLU+LayerNorm transform.
+        output_layer_bias (bool): Whether to include a bias in the vocabulary projection.
+            Defaults to True for backward compatibility.
     """
 
     def __init__(
@@ -76,6 +78,7 @@ class BertModel(LanguageModule):
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         apply_lm_head: bool = True,
+        output_layer_bias: bool = True,
     ):
         super(BertModel, self).__init__(config=config, pg_collection=pg_collection)
 
@@ -99,6 +102,7 @@ class BertModel(LanguageModule):
         self.return_embeddings = return_embeddings
         self.vp_stage = vp_stage
         self.apply_lm_head = apply_lm_head
+        self.output_layer_bias = output_layer_bias
 
         # megatron core pipelining currently depends on model type
         self.model_type = ModelType.encoder_or_decoder
@@ -147,7 +151,7 @@ class BertModel(LanguageModule):
                     if config.use_mup and not self.share_embeddings_and_output_weights
                     else config.init_method
                 ),
-                bias=True,
+                bias=self.output_layer_bias,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
