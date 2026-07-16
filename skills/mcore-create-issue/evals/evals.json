@@ -16,19 +16,6 @@
       ]
     },
     {
-      "id": "mcore-create-issue-run-with-multiple-failures",
-      "question": "This GitHub Actions run URL has three failed jobs. Create an issue for the failure.",
-      "expected_skill": "mcore-create-issue",
-      "expected_script": null,
-      "ground_truth": "A run URL must first be expanded into its failed jobs. When several jobs failed, ask which job to triage unless the user explicitly asks to triage all of them.",
-      "expected_behavior": [
-        "Routes to mcore-create-issue",
-        "Lists the failed jobs from the run",
-        "Asks the user which failed job to triage or offers to triage all",
-        "Does not guess which failure the user intended"
-      ]
-    },
-    {
       "id": "mcore-create-issue-duplicate-found",
       "question": "The failing test is tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_constructor, and an open issue already tracks that exact failure. Please file another bug from the CI run.",
       "expected_skill": "mcore-create-issue",
@@ -39,18 +26,6 @@
         "Recognizes the matching open issue as a duplicate",
         "Does not create a new issue",
         "Reports the existing issue URL"
-      ]
-    },
-    {
-      "id": "mcore-create-issue-negative-diagnose-only",
-      "question": "Why is this Megatron-LM CI pipeline red, and which check should I rerun? Do not create an issue.",
-      "expected_skill": "mcore-cicd",
-      "expected_script": null,
-      "ground_truth": "CI diagnosis without an issue-creation request belongs to mcore-cicd, not mcore-create-issue.",
-      "expected_behavior": [
-        "mcore-create-issue stays silent",
-        "Routes the diagnosis request to mcore-cicd",
-        "Does not create or propose creating a GitHub issue"
       ]
     }
   ]

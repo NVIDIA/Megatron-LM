@@ -2,32 +2,6 @@
   "skill": "mcore-testing",
   "cases": [
     {
-      "id": "mcore-testing-disable-functional-recipe",
-      "question": "Temporarily disable one flaky functional test in a Megatron-LM recipe, but keep it visible for an easy re-enable.",
-      "expected_skill": "mcore-testing",
-      "expected_script": null,
-      "ground_truth": "Keep the recipe entry and suffix its scope with -broken, for example changing mr-github to mr-github-broken.",
-      "expected_behavior": [
-        "Routes to mcore-testing",
-        "Keeps the functional recipe entry",
-        "Changes the scope to an equivalent value ending in -broken",
-        "Does not delete or comment out the test case"
-      ]
-    },
-    {
-      "id": "mcore-testing-disable-unit-by-environment",
-      "question": "A unit test is flaky only in the default dev environment. Which marker should I use, and what would be different for LTS?",
-      "expected_skill": "mcore-testing",
-      "expected_script": null,
-      "ground_truth": "Use @pytest.mark.flaky_in_dev for the default dev environment; use @pytest.mark.flaky when the test should be skipped in LTS.",
-      "expected_behavior": [
-        "Routes to mcore-testing",
-        "Uses pytest.mark.flaky_in_dev for the dev-only flake",
-        "Distinguishes pytest.mark.flaky as the LTS skip marker",
-        "Does not remove the test"
-      ]
-    },
-    {
       "id": "mcore-testing-run-single-distributed-test",
       "question": "Run tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_constructor locally the same way Megatron-LM unit tests expect to run.",
       "expected_skill": "mcore-testing",

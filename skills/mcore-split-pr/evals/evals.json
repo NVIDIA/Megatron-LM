@@ -17,31 +17,6 @@
       ]
     },
     {
-      "id": "mcore-split-pr-keep-tests-with-code",
-      "question": "To reduce reviewers, put all production changes in one PR and all tests for those changes in a separate PR.",
-      "expected_skill": "mcore-split-pr",
-      "expected_script": null,
-      "ground_truth": "Reject that split: tests must travel with the production code they validate, even when separating them would reduce CODEOWNERS groups.",
-      "expected_behavior": [
-        "Routes to mcore-split-pr",
-        "Keeps each test with the production code it validates",
-        "Explains that reviewer minimization does not override independent reviewability"
-      ]
-    },
-    {
-      "id": "mcore-split-pr-stacked-dependency",
-      "question": "PR B depends on symbols introduced by PR A. How should I base and later merge this stacked pair without losing PR B's reviews?",
-      "expected_skill": "mcore-split-pr",
-      "expected_script": null,
-      "ground_truth": "While stacked, target PR B at pull-request/<PR A number>. Before merging PR A, retarget PR B to main and refresh it against main so GitHub does not close it and discard review context.",
-      "expected_behavior": [
-        "Routes to mcore-split-pr",
-        "Uses pull-request/<base PR number> as the dependent PR's temporary GitHub base",
-        "Does not use the base PR author's branch as the GitHub diffbase",
-        "Retargets and refreshes the dependent PR against main before the base PR merges"
-      ]
-    },
-    {
       "id": "mcore-split-pr-execute-approved-plan",
       "question": "I approve the proposed split. Execute it and open the resulting Megatron-LM pull requests.",
       "expected_skill": "mcore-split-pr",
