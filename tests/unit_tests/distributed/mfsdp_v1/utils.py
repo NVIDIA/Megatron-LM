@@ -12,6 +12,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training.arguments import parse_args, validate_args
@@ -19,6 +20,7 @@ from megatron.training.global_vars import destroy_global_vars, set_global_variab
 from megatron.training.training import setup_model_and_optimizer
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
+from tests.unit_tests.test_utilities import Utils
 
 
 def pretrain_forward_backward(
@@ -61,6 +63,7 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
         num_attention_heads=2,
         max_position_embeddings=128,
         mamba_num_groups=4,
+        mamba_num_heads=16,
         bf16=False,
         add_bias_linear=False,
         swiglu=True,
@@ -93,9 +96,13 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     destroy_num_microbatches_calculator()
     set_global_variables(args, build_tokenizer=False)
 
+    cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
-        model_provider_func=partial(model_provider, hybrid_builder),
         model_type=ModelType.encoder_or_decoder,
+        model_provider_func=partial(model_provider, hybrid_builder),
+        cfg_container=cfg_container,
+        pg_collection=pg_collection,
     )
     return model, optimizer
 

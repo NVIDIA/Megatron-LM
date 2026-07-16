@@ -48,9 +48,7 @@ class AudioProjection(MegatronModule):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_len, hidden_size = hidden_states.shape
         if hidden_size != self.input_size:
-            raise ValueError(
-                f"Expected hidden size {self.input_size}, got {hidden_size}"
-            )
+            raise ValueError(f"Expected hidden size {self.input_size}, got {hidden_size}")
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool, device=hidden_states.device)
@@ -69,21 +67,26 @@ class AudioProjection(MegatronModule):
 
         output_mask = None
         if attention_mask is not None:
-            output_mask = attention_mask.reshape(batch_size, stacked_seq_len, self.stack_factor).any(
-                dim=-1
-            )
+            output_mask = attention_mask.reshape(
+                batch_size, stacked_seq_len, self.stack_factor
+            ).any(dim=-1)
 
         return hidden_states, output_mask
 
     def forward(
         self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Stack audio embeddings in time and project them, returning the projected states and mask.
+
+        The stacked features are permuted to ``[seq, batch, hidden]`` before projection.
+        """
         stacked_states, output_mask = self._stack_features(hidden_states, attention_mask)
         stacked_states = stacked_states.permute(1, 0, 2).contiguous()
         projected_states = self.projector(stacked_states)
         return projected_states, output_mask
 
     def forward_packed(self, packed_states: PackedAudioEmbeddings) -> PackedAudioEmbeddings:
+        """Project packed audio embeddings, preserving packing (requires stack_factor == 1)."""
         if self.stack_factor != 1:
             raise NotImplementedError(
                 "Packed audio projection currently supports stack_factor == 1 only"

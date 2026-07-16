@@ -160,14 +160,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             else:
                 hybrid_stack_spec = default_hybrid_stack_spec
 
-        assert (
-            getattr(self._model_config.transformer, "virtual_pipeline_model_parallel_size", None) is None
-            and vp_stage is None
-        ), (
-            "Virtual pipeline model parallelism is temporarily unsupported in Hybrid "
-            "models due to upstream MCore HybridModel API dependency"
-        )
-
         assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:
             padded_vocab_size = calculate_padded_vocab_size(

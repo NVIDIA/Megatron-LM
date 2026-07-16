@@ -25,6 +25,7 @@ from typing import Any, Dict
 
 
 def ceil_div(value: int, divisor: int) -> int:
+    """Returns the ceiling of ``value / divisor``; raises if ``divisor <= 0``."""
     if divisor <= 0:
         raise ValueError(f"divisor must be > 0, got {divisor}")
     return (value + divisor - 1) // divisor
@@ -55,7 +56,7 @@ class NemoAudioFeatureConfig:
     highfreq: float | None = None
     log: bool = True
     log_zero_guard_type: str = "add"
-    log_zero_guard_value: Any = 2 ** -24
+    log_zero_guard_value: Any = 2**-24
     dither: float = 1e-5
     pad_to: int = 0
     frame_splicing: int = 1
@@ -68,6 +69,7 @@ class NemoAudioFeatureConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NemoAudioFeatureConfig":
+        """Builds a config from ``data``, ignoring keys that are not dataclass fields."""
         valid = {f.name for f in fields(cls)}
         kwargs = {k: v for k, v in data.items() if k in valid}
         return cls(**kwargs)
@@ -100,11 +102,7 @@ class NemoTransformerAudioTokenEstimator:
     stack_factor: int = 1
     pre_encode: str = "conv"
 
-    def _estimate_encoder_steps(
-        self,
-        num_frames: int,
-        padded_num_frames: int | None = None,
-    ) -> int:
+    def _estimate_encoder_steps(self, num_frames: int, padded_num_frames: int | None = None) -> int:
         if num_frames < 0:
             raise ValueError(f"num_frames must be >= 0, got {num_frames}")
         if padded_num_frames is not None and padded_num_frames < num_frames:
@@ -124,14 +122,14 @@ class NemoTransformerAudioTokenEstimator:
         )
 
     def estimate(self, num_frames: int, padded_num_frames: int | None = None) -> int:
+        """Returns the expanded token count for ``num_frames`` after encoder and stacking."""
         encoder_steps = self._estimate_encoder_steps(num_frames, padded_num_frames)
         return math.ceil(encoder_steps / self.stack_factor)
 
     def estimate_from_num_frames(
-        self,
-        num_frames: int,
-        padded_num_frames: int | None = None,
+        self, num_frames: int, padded_num_frames: int | None = None
     ) -> int:
+        """Alias for :meth:`estimate` taking a frame count."""
         return self.estimate(num_frames, padded_num_frames)
 
     def __call__(self, num_frames: int, padded_num_frames: int | None = None) -> int:

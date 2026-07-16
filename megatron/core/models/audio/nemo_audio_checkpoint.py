@@ -15,13 +15,12 @@ Public API:
 """
 
 import json
-from dataclasses import asdict
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
 import os
 import tarfile
 import tempfile
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
 
 import torch
 
@@ -86,9 +85,7 @@ def _load_preprocessor_config(path: str | Path | None) -> "NemoAudioFeatureConfi
     return NemoAudioFeatureConfig()
 
 
-def nemo_audio_config_paths_from_checkpoint_dir(
-    checkpoint_dir: str | Path,
-) -> Tuple[Path, Path]:
+def nemo_audio_config_paths_from_checkpoint_dir(checkpoint_dir: str | Path) -> Tuple[Path, Path]:
     """Return checkpoint-local NeMo audio config paths for an iteration dir."""
     checkpoint_dir = Path(checkpoint_dir)
     return (
@@ -104,8 +101,7 @@ def has_nemo_audio_configs_in_checkpoint_dir(checkpoint_dir: str | Path) -> bool
 
 
 def nemo_audio_configs_from_json_paths(
-    encoder_config_path: str | Path,
-    preprocessor_config_path: str | Path | None = None,
+    encoder_config_path: str | Path, preprocessor_config_path: str | Path | None = None
 ) -> Tuple[NemoTransformerAudioConfig, "NemoAudioFeatureConfig"]:
     """Load NeMo audio encoder/preprocessor configs from JSON files."""
     encoder_cfg = NemoTransformerAudioConfig.from_dict(_load_json(encoder_config_path))
@@ -179,8 +175,7 @@ def write_nemo_audio_configs_to_checkpoint_dir(
 
 
 def write_nemo_audio_configs_from_args_to_checkpoint_dir(
-    args,
-    checkpoint_dir: str | Path,
+    args, checkpoint_dir: str | Path
 ) -> Tuple[Path, Path] | None:
     """Persist resolved NeMo audio configs for ``args`` when audio is enabled."""
     if (getattr(args, "audio_model_type", "") or "") != "nemo_transformer":
@@ -194,8 +189,7 @@ def _validate_archive(nemo_path: Path) -> None:
         raise FileNotFoundError(f"No such file: {nemo_path}")
     if not tarfile.is_tarfile(nemo_path):
         raise ValueError(
-            f"Expected a .nemo (tar) archive, got {nemo_path}. "
-            ".pt/.bin/.ckpt are not supported."
+            f"Expected a .nemo (tar) archive, got {nemo_path}. " ".pt/.bin/.ckpt are not supported."
         )
 
 
@@ -257,8 +251,7 @@ def read_nemo_config(nemo_path: str | Path) -> Dict[str, Any]:
 
 
 def extract_nemo_archive(
-    nemo_path: str | Path,
-    out_dir: str | Path | None = None,
+    nemo_path: str | Path, out_dir: str | Path | None = None
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
     """Extract a ``.nemo`` archive and return ``(model_cfg_dict, full_state_dict)``.
 
@@ -313,8 +306,7 @@ def _strip_target(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _split_audio_configs(
-    cfg: Dict[str, Any],
-    nemo_path: str | Path,
+    cfg: Dict[str, Any], nemo_path: str | Path
 ) -> Tuple[NemoTransformerAudioConfig, "NemoAudioFeatureConfig"]:
     """Validate ``_target_``s and convert the model config dict into our dataclasses."""
     if "encoder" not in cfg:
@@ -373,7 +365,7 @@ def nemo_audio_configs_from_archive(
     encoder_cfg, preproc_cfg = _split_audio_configs(cfg, nemo_path)
 
     encoder_state = {
-        k[len("encoder."):]: v
+        k[len("encoder.") :]: v
         for k, v in full_state.items()
         if k.startswith("encoder.") and isinstance(v, torch.Tensor)
     }
@@ -388,10 +380,7 @@ def nemo_audio_configs_from_archive(
 
 
 def load_nemo_transformer_audio_weights(
-    audio_module: torch.nn.Module,
-    ckpt_path: str | Path,
-    *,
-    strict: bool = False,
+    audio_module: torch.nn.Module, ckpt_path: str | Path, *, strict: bool = False
 ) -> Tuple[List[str], List[str]]:
     """Load encoder weights from a ``.nemo`` archive into ``NemoTransformerAudioModel``.
 

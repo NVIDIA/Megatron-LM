@@ -6,15 +6,18 @@
 # file can be diffed against the NeMo source. `flash_attn_func` is imported lazily so this
 # module imports without flash-attn installed.
 
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 from torch import nn
-from torch.nn import Conv1d
 from torch.nn import GELU as TorchGELU
+from torch.nn import Conv1d
 from torch.nn.functional import scaled_dot_product_attention
 from torch.utils.checkpoint import checkpoint
+
+logger = logging.getLogger(__name__)
 
 
 def _flash_attn_func(*args, **kwargs):
@@ -47,13 +50,16 @@ def _resolve_attn_impl(impl: str) -> str:
         return impl
     try:
         import transformer_engine.pytorch  # noqa: F401
+
         return "te"
     except ImportError:
         return "sdpa"
 
 
 @dataclass
-class GPTConfig():
+class GPTConfig:
+    """Configuration for a GPT-style transformer (vendored NeMo helper)."""
+
     vocab_size: int = 50257
     context_length: int = 1024
     emb_dim: int = 768
@@ -65,7 +71,9 @@ class GPTConfig():
 
 
 @dataclass
-class TransformerEncoderConfig():
+class TransformerEncoderConfig:
+    """Configuration for the audio TransformerEncoder and its blocks."""
+
     n_mels: int = 80
     d_model: int = 512
     n_heads: int = 12
@@ -95,8 +103,7 @@ def _normalize_left_context(left_context: Optional[int]) -> Optional[int]:
 
 
 def _causal_window_size(
-    causal_mask: bool,
-    left_context: Optional[int],
+    causal_mask: bool, left_context: Optional[int]
 ) -> Optional[Tuple[int, int]]:
     left_context = _normalize_left_context(left_context)
     if left_context is None:
@@ -107,18 +114,13 @@ def _causal_window_size(
 
 
 def _causal_disallow_mask(
-    query_len: int,
-    key_len: int,
-    left_context: Optional[int],
-    device,
+    query_len: int, key_len: int, left_context: Optional[int], device
 ) -> torch.Tensor:
     """Return a bool mask where True means the key is not visible to the query."""
     query_offset = key_len - query_len
-    query_positions = torch.arange(
-        query_offset,
-        query_offset + query_len,
-        device=device,
-    ).unsqueeze(1)
+    query_positions = torch.arange(query_offset, query_offset + query_len, device=device).unsqueeze(
+        1
+    )
     key_positions = torch.arange(key_len, device=device).unsqueeze(0)
     disallow = key_positions > query_positions
     left_context = _normalize_left_context(left_context)
@@ -128,31 +130,41 @@ def _causal_disallow_mask(
 
 
 class FeedForward(nn.Module):
+    """Two-layer position-wise feed-forward network with a 4x hidden expansion and GELU."""
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, 4 * dim),
-            TorchGELU(),
-            nn.Linear(4 * dim, dim),
-        )
+        self.ffn = nn.Sequential(nn.Linear(dim, 4 * dim), TorchGELU(), nn.Linear(4 * dim, dim))
 
     def forward(self, x):
+        """Apply the feed-forward network to ``x``."""
         return self.ffn(x)
 
 
 class GELU(nn.Module):
+    """Tanh-approximation GELU activation (vendored NeMo helper)."""
+
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(
-            torch.sqrt(torch.tensor(2.0 / torch.pi)) *
-            (x + 0.044715 * torch.pow(x, 3))
-        ))
+        """Apply the tanh-approximation GELU to ``x``."""
+        return (
+            0.5
+            * x
+            * (
+                1
+                + torch.tanh(
+                    torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * torch.pow(x, 3))
+                )
+            )
+        )
 
 
 class LayerNorm(nn.Module):
+    """Layer normalization with learnable scale and shift (upcasts to fp32 internally)."""
+
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
@@ -160,6 +172,7 @@ class LayerNorm(nn.Module):
         self.shift = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
+        """Normalize ``x`` over its last dimension and apply scale and shift."""
         # Cast to fp32 for numerically stable mean/var, then back to original dtype.
         # Original NeMo source used `torch.autocast('cuda', ...)`; we manually upcast so this
         # also works on CPU (e.g. unit tests).
@@ -172,18 +185,22 @@ class LayerNorm(nn.Module):
 
 
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
+    """Precompute the rotary position embedding cosine and sine tables."""
     assert head_dim % 2 == 0, "Embedding dimension must be even"
 
     # Compute the inverse frequencies
     inv_freq = 1.0 / (
-        theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim)
+        theta_base
+        ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim)
     )
 
     # Generate position indices
     positions = torch.arange(context_length, dtype=dtype)
 
     # Compute the angles
-    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # Shape: (context_length, head_dim // 2)
+    angles = positions.unsqueeze(1) * inv_freq.unsqueeze(
+        0
+    )  # Shape: (context_length, head_dim // 2)
 
     # Expand angles to match the head_dim
     angles = torch.cat([angles, angles], dim=1)  # Shape: (context_length, head_dim)
@@ -196,13 +213,14 @@ def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=
 
 
 def apply_rope(x, cos, sin):
+    """Apply rotary position embeddings to ``x`` using precomputed cos and sin tables."""
     # x: (batch_size, num_heads, seq_len, head_dim)
     batch_size, num_heads, seq_len, head_dim = x.shape
     assert head_dim % 2 == 0, "Head dimension must be even"
 
     # Split x into first half and second half
     x1 = x[..., : head_dim // 2]  # First half
-    x2 = x[..., head_dim // 2:]  # Second half
+    x2 = x[..., head_dim // 2 :]  # Second half
 
     # Adjust sin and cos shapes
     cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # Shape: (1, 1, seq_len, head_dim)
@@ -217,6 +235,8 @@ def apply_rope(x, cos, sin):
 
 
 class MultiHeadAttentionWithFA(nn.Module):
+    """Multi-head attention using the flash-attention ``flash_attn_func`` backend."""
+
     def __init__(
         self,
         dim_in,
@@ -241,6 +261,7 @@ class MultiHeadAttentionWithFA(nn.Module):
         self.out_proj = nn.Linear(self.d_out, self.d_out)
 
     def forward(self, x):
+        """Run flash-attention over ``x`` and project the result."""
         B, num_tokens, d_in = x.shape
         H = self.num_heads
 
@@ -253,12 +274,7 @@ class MultiHeadAttentionWithFA(nn.Module):
         if self.window_size is not None:
             flash_kwargs["window_size"] = self.window_size
         output = _flash_attn_func(
-            queries,
-            keys,
-            values,
-            dropout_p=dropout,
-            causal=self.causal_mask,
-            **flash_kwargs,
+            queries, keys, values, dropout_p=dropout, causal=self.causal_mask, **flash_kwargs
         )
 
         # Bxnum_tokens x Hx head_dim
@@ -335,6 +351,7 @@ class MultiHeadAttentionWithTE(nn.Module):
         self.te_attn = te_dpa_cls(**te_kwargs)
 
     def forward(self, x, lengths=None, packed_seq_params=None, **_):
+        """Run TE attention in THD layout, packing/unpacking as needed, and project."""
         if packed_seq_params is not None:
             x_packed = x.reshape(-1, x.shape[-1])
             cu_q = packed_seq_params.cu_seqlens_q
@@ -395,6 +412,8 @@ class MultiHeadAttentionWithTE(nn.Module):
 
 
 class MultiHeadAttentionWithSDPA(nn.Module):
+    """Multi-head attention using PyTorch ``scaled_dot_product_attention``."""
+
     def __init__(
         self,
         dim_in,
@@ -426,6 +445,7 @@ class MultiHeadAttentionWithSDPA(nn.Module):
             self.k_norm = nn.LayerNorm(self.head_dim)
 
     def forward(self, x, attn_mask=None, use_cache=False):
+        """Run scaled-dot-product attention over ``x`` and project the result."""
         B, num_tokens, d_in = x.shape
         H = self.num_heads
 
@@ -445,22 +465,14 @@ class MultiHeadAttentionWithSDPA(nn.Module):
         is_causal = self.causal_mask
         if self.causal_mask and self.left_context is not None:
             causal_mask = ~_causal_disallow_mask(
-                num_tokens,
-                num_tokens,
-                self.left_context,
-                x.device,
+                num_tokens, num_tokens, self.left_context, x.device
             )
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             attn_mask = causal_mask if attn_mask is None else attn_mask & causal_mask
             is_causal = False
 
         output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            attn_mask=attn_mask,
-            is_causal=is_causal,
-            dropout_p=dropout,
+            queries, keys, values, attn_mask=attn_mask, is_causal=is_causal, dropout_p=dropout
         )
 
         # B xH x num_tokens x head_dim
@@ -475,6 +487,8 @@ class MultiHeadAttentionWithSDPA(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
+    """Multi-head attention with an explicit softmax and optional KV cache."""
+
     def __init__(
         self,
         dim_in,
@@ -502,20 +516,20 @@ class MultiHeadAttention(nn.Module):
 
         self.register_buffer(
             "mask",
-            _causal_disallow_mask(
-                context_length,
-                context_length,
-                self.left_context,
-                torch.device("cpu"),
-            )
-            if self.causal_mask
-            else torch.zeros(context_length, context_length, dtype=torch.bool),
+            (
+                _causal_disallow_mask(
+                    context_length, context_length, self.left_context, torch.device("cpu")
+                )
+                if self.causal_mask
+                else torch.zeros(context_length, context_length, dtype=torch.bool)
+            ),
         )
 
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
 
     def forward(self, x, use_cache=False):
+        """Run masked multi-head attention over ``x``, optionally using the KV cache."""
         B, num_tokens, d_in = x.shape
         H = self.num_heads
 
@@ -551,16 +565,13 @@ class MultiHeadAttention(nn.Module):
             mask = self.mask[:num_tokens, :key_tokens]
         elif self.causal_mask:
             mask = _causal_disallow_mask(
-                num_tokens,
-                key_tokens,
-                self.left_context,
-                attn_scores.device,
+                num_tokens, key_tokens, self.left_context, attn_scores.device
             )
         else:
             mask = self.mask[:num_tokens, :key_tokens]
         masked = attn_scores.masked_fill(mask.bool(), -torch.inf)
 
-        attn_weights = torch.softmax(masked / d_k ** 0.5, dim=-1)
+        attn_weights = torch.softmax(masked / d_k**0.5, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
         output = torch.matmul(attn_weights, values)  # B xH x num_tokens x head_dim
@@ -574,11 +585,14 @@ class MultiHeadAttention(nn.Module):
         return output
 
     def reset_cache(self):
+        """Clear the cached keys and values."""
         self.cache_k = None
         self.cache_v = None
 
 
 class TransformerBlock(nn.Module):
+    """Single transformer encoder block: attention, feed-forward, and residual norms."""
+
     def __init__(self, cfg: TransformerEncoderConfig):
         super().__init__()
         self.cfg = cfg
@@ -625,6 +639,7 @@ class TransformerBlock(nn.Module):
         self.ffn = FeedForward(self.cfg.d_model)
 
     def forward(self, x, attn_mask=None, lengths=None, packed_seq_params=None, use_cache=False):
+        """Apply attention and feed-forward sublayers with residual connections."""
         pre_norm = self.pre_norm(x)
 
         if self.attn_impl == "te":
@@ -655,6 +670,8 @@ class TransformerBlock(nn.Module):
 
 
 class ConvSubsampling(nn.Module):
+    """Convolutional subsampling that reduces the temporal dimension by 4x."""
+
     def __init__(self, n_mels: int = 80, d_model: int = 512):
         super().__init__()
         self.conv1 = Conv1d(n_mels, d_model, kernel_size=3, padding=1)
@@ -665,6 +682,7 @@ class ConvSubsampling(nn.Module):
         self.gelu = TorchGELU()
 
     def forward(self, x, length):
+        """Subsample ``x`` by 4x and return the features and updated lengths."""
         x = self.conv1(x)
         x = self.gelu(x)
         x = self.conv2(x)
@@ -695,6 +713,7 @@ class DepthwiseConvSubsampling(nn.Module):
         self.gelu = TorchGELU()
 
     def forward(self, x, length):
+        """Subsample ``x`` by 4x via depthwise separable convs and update lengths."""
         x = self.conv1(x)
         x = self.gelu(x)
         x = self.dw_conv2(x)
@@ -718,11 +737,7 @@ class NGPTStackingSubsampling(torch.nn.Module):
     """
 
     def __init__(
-        self,
-        subsampling_factor: int,
-        feat_in: int,
-        feat_out: int,
-        use_bias: bool = False,
+        self, subsampling_factor: int, feat_in: int, feat_out: int, use_bias: bool = False
     ):
         super().__init__()
         self.subsampling_factor = subsampling_factor
@@ -740,11 +755,11 @@ class NGPTStackingSubsampling(torch.nn.Module):
         """
         x = x.transpose(1, 2)  # BxCxT -> BxTxC
         b, t, h = x.size()
-        pad_size = (self.subsampling_factor - (t % self.subsampling_factor)) % self.subsampling_factor
+        pad_size = (
+            self.subsampling_factor - (t % self.subsampling_factor)
+        ) % self.subsampling_factor
         length = torch.div(
-            length + self.subsampling_factor - 1,
-            self.subsampling_factor,
-            rounding_mode='floor',
+            length + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode='floor'
         )
 
         # Pad and fill padding frames (all-zero) with a learnable padding 'embedding'
@@ -759,6 +774,8 @@ class NGPTStackingSubsampling(torch.nn.Module):
 
 
 class TransformerEncoder(nn.Module):
+    """Audio transformer encoder: subsampling front-end followed by a transformer stack."""
+
     def __init__(
         self,
         n_mels: int = 80,
@@ -835,7 +852,7 @@ class TransformerEncoder(nn.Module):
         x, length = self.pre_encode(x, length)
         if self.nan_debug:
             self._check_nan(x, "pre_encode")
-        x = x * (self.d_model ** 0.5)
+        x = x * (self.d_model**0.5)
         if self.nan_debug:
             self._check_nan(x, "embedding_scale")
         x = self.layer_norm(x)
@@ -861,12 +878,10 @@ class TransformerEncoder(nn.Module):
                 else:
                     x = x.new_zeros(B, T_prime, self.d_model)
             else:
-                valid_mask = (
-                    torch.arange(T_prime, device=x.device).unsqueeze(0) < lengths32.unsqueeze(1)
-                )
-                cu_seqlens = torch.nn.functional.pad(
-                    lengths32.cumsum(0).to(torch.int32), (1, 0)
-                )
+                valid_mask = torch.arange(T_prime, device=x.device).unsqueeze(
+                    0
+                ) < lengths32.unsqueeze(1)
+                cu_seqlens = torch.nn.functional.pad(lengths32.cumsum(0).to(torch.int32), (1, 0))
                 psp = PackedSeqParams(
                     qkv_format="thd",
                     cu_seqlens_q=cu_seqlens,
@@ -879,9 +894,7 @@ class TransformerEncoder(nn.Module):
                 for idx, layer in enumerate(self.layers):
                     if self.recompute_layers and self.training and x_packed.requires_grad:
                         x_packed = checkpoint(
-                            lambda hidden, layer=layer: layer(
-                                hidden, packed_seq_params=psp
-                            ),
+                            lambda hidden, layer=layer: layer(hidden, packed_seq_params=psp),
                             x_packed,
                             use_reentrant=False,
                         )
@@ -919,10 +932,7 @@ class TransformerEncoder(nn.Module):
                     )
                 else:
                     x = layer(
-                        x,
-                        attn_mask=attn_mask,
-                        lengths=length,
-                        packed_seq_params=packed_seq_params,
+                        x, attn_mask=attn_mask, lengths=length, packed_seq_params=packed_seq_params
                     )
                 if self.nan_debug:
                     self._check_nan(x, f"layer_{idx}")
@@ -931,10 +941,9 @@ class TransformerEncoder(nn.Module):
                 self._check_nan(x, "final_norm")
             if return_packed:
                 lengths32 = length.to(torch.int32)
-                valid_mask = (
-                    torch.arange(x.shape[1], device=x.device).unsqueeze(0)
-                    < lengths32.unsqueeze(1)
-                )
+                valid_mask = torch.arange(x.shape[1], device=x.device).unsqueeze(
+                    0
+                ) < lengths32.unsqueeze(1)
                 x = x[valid_mask]
 
         if return_packed:
@@ -951,10 +960,9 @@ class TransformerEncoder(nn.Module):
             inf_count = torch.isinf(x).sum().item()
             valid = x[~(torch.isnan(x) | torch.isinf(x))]
             abs_max = valid.abs().max().item() if valid.numel() > 0 else float('nan')
-            print(
+            logger.error(
                 f"[NaN DEBUG] {name}: NaN={nan_count}, Inf={inf_count}, "
-                f"abs_max={abs_max:.6f}, shape={list(x.shape)}",
-                flush=True,
+                f"abs_max={abs_max:.6f}, shape={list(x.shape)}"
             )
             raise RuntimeError(f"[NaN DEBUG] NaN/Inf detected at '{name}'. Stopping training.")
 
@@ -966,9 +974,11 @@ class TransformerEncoder(nn.Module):
                 reset()
 
     def freeze(self):
+        """Disable gradients for all encoder parameters."""
         for param in self.parameters():
             param.requires_grad = False
 
     def unfreeze(self, partial=False):
+        """Enable gradients for all encoder parameters."""
         for param in self.parameters():
             param.requires_grad = True

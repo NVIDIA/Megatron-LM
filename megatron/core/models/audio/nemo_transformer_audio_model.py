@@ -40,23 +40,29 @@ class NemoTransformerAudioConfig:
 
     @property
     def output_embedding_dim(self) -> int:
+        """Return the encoder output embedding dimension (``d_model``)."""
         return self.d_model
 
     @property
     def encoder_time_stride(self) -> int:
+        """Return the time downsampling factor of the pre-encode stage."""
         if self.pre_encode in ("conv", "depth_conv"):
             return 4
         return self.subsampling_factor
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "NemoTransformerAudioConfig":
+        """Build a config from a dict, keeping only keys that match config fields."""
         valid = {f.name for f in fields(cls)}
         kwargs = {k: v for k, v in data.items() if k in valid}
         return cls(**kwargs)
 
 
 class NemoTransformerAudioModel(MegatronModule):
-    """Audio encoder matching LLaVA expectations: forward(features, mask) -> (B, T', H), bool mask."""
+    """Audio encoder matching LLaVA expectations.
+
+    ``forward(features, mask)`` returns ``(B, T', H)`` embeddings and a bool mask.
+    """
 
     def __init__(self, config: NemoTransformerAudioConfig) -> None:
         super().__init__(config=config)
@@ -86,9 +92,7 @@ class NemoTransformerAudioModel(MegatronModule):
     ) -> torch.Tensor:
         if self.config.pre_encode in ("conv", "depth_conv"):
             return torch.div(
-                torch.div(input_seq_lengths, 2, rounding_mode="floor"),
-                2,
-                rounding_mode="floor",
+                torch.div(input_seq_lengths, 2, rounding_mode="floor"), 2, rounding_mode="floor"
             )
         if self.config.pre_encode == "stacking":
             factor = int(self.config.subsampling_factor)
@@ -212,25 +216,21 @@ class NemoTransformerAudioModel(MegatronModule):
         }
 
     def forward(
-        self,
-        input_features: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode mel features into ``(B, T', H)`` embeddings and a validity mask."""
         if input_features.ndim != 3:
-            raise ValueError(f"Expected input_features (B, T, n_mels), got shape {tuple(input_features.shape)}")
+            raise ValueError(
+                f"Expected input_features (B, T, n_mels), got shape {tuple(input_features.shape)}"
+            )
 
         batch_size, max_frames, feat_dim = input_features.shape
         if feat_dim != self.config.n_mels:
-            raise ValueError(
-                f"Expected last dim n_mels={self.config.n_mels}, got {feat_dim}"
-            )
+            raise ValueError(f"Expected last dim n_mels={self.config.n_mels}, got {feat_dim}")
 
         if attention_mask is None:
             lengths = torch.full(
-                (batch_size,),
-                max_frames,
-                dtype=torch.long,
-                device=input_features.device,
+                (batch_size,), max_frames, dtype=torch.long, device=input_features.device
             )
         else:
             lengths = attention_mask.to(dtype=torch.long).sum(dim=-1)
@@ -254,25 +254,21 @@ class NemoTransformerAudioModel(MegatronModule):
         return enc_out, output_mask
 
     def forward_packed(
-        self,
-        input_features: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        self, input_features: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
     ) -> PackedAudioEmbeddings:
+        """Encode mel features into packed (padding-free) audio embeddings."""
         if input_features.ndim != 3:
-            raise ValueError(f"Expected input_features (B, T, n_mels), got shape {tuple(input_features.shape)}")
+            raise ValueError(
+                f"Expected input_features (B, T, n_mels), got shape {tuple(input_features.shape)}"
+            )
 
         batch_size, max_frames, feat_dim = input_features.shape
         if feat_dim != self.config.n_mels:
-            raise ValueError(
-                f"Expected last dim n_mels={self.config.n_mels}, got {feat_dim}"
-            )
+            raise ValueError(f"Expected last dim n_mels={self.config.n_mels}, got {feat_dim}")
 
         if attention_mask is None:
             lengths = torch.full(
-                (batch_size,),
-                max_frames,
-                dtype=torch.long,
-                device=input_features.device,
+                (batch_size,), max_frames, dtype=torch.long, device=input_features.device
             )
         else:
             lengths = attention_mask.to(dtype=torch.long).sum(dim=-1)
@@ -284,6 +280,5 @@ class NemoTransformerAudioModel(MegatronModule):
 
         enc_out, lengths_out = self.encoder(audio_bct, lengths, return_packed=True)
         return PackedAudioEmbeddings(
-            embeddings=enc_out,
-            lengths=lengths_out.to(dtype=torch.int32, device=enc_out.device),
+            embeddings=enc_out, lengths=lengths_out.to(dtype=torch.int32, device=enc_out.device)
         )
