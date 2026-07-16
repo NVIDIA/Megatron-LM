@@ -3,12 +3,13 @@
 """Unit tests for the minimal Megatron-FSDP path."""
 
 import logging
+import re
 
 import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.profiler import ProfilerActivity, profile
 
@@ -22,6 +23,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
+    collect_linked_device_events,
+    events_overlap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,11 +125,12 @@ def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
 
-def _events_overlap(first, second) -> bool:
-    return (
-        first.time_range.start < second.time_range.end
-        and second.time_range.start < first.time_range.end
-    )
+# CPU ops that a device event chains up to via cpu_parent, used to attribute the device
+# work. mfsdp's all-gather / reduce-scatter (dist.all_gather_into_tensor /
+# reduce_scatter_tensor) dispatch to c10d::_..._base_; the Linear matmuls to aten::mm.
+_ALL_GATHER_OP_PATTERN = re.compile(r"_allgather_base")
+_REDUCE_SCATTER_OP_PATTERN = re.compile(r"_reduce_scatter_base")
+_GEMM_OP_PATTERN = re.compile(r"aten::mm")
 
 
 def _nccl_events(cuda_events, *name_fragments):
@@ -480,13 +486,19 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
 
 
 def test_overlaps_communication_and_compute(distributed_setup):
-    """Forward and backward communication should overlap GEMM compute."""
+    """Forward and backward communication should overlap GEMM compute.
+
+    Uses NCCL's zero-CTA policy so the all-gather runs on the copy engine (SM-free)
+    instead of an SM-based kernel: it can never contend with the GEMMs for SMs, so the
+    overlap count is deterministic and the strict theoretical-maximum thresholds hold.
+    (The SM-based ring collectives this replaces jitter with launch timing -- amplified
+    by CI's coverage wrapper -- and dip below the maximum.)
+    """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(device.type, (world_size,))
     # A large hidden size keeps the per-layer GEMMs long enough that the
     # collectives reliably overlap them. The overlap count is otherwise
     # launch-bound: the host issues kernels with gaps (amplified by CI's
@@ -498,14 +510,22 @@ def test_overlaps_communication_and_compute(distributed_setup):
     num_children = 4
     dtype = torch.bfloat16
 
-    # Use NCCL symmetric-memory collectives so the all-gather and reduce-scatter run
-    # as SM-light NVLS multicast kernels (ncclSymk*) instead of SM-based ring kernels.
-    # Ring kernels contend with the GEMMs for SMs, so their overlap count jitters with
-    # launch timing (amplified by CI's coverage wrapper) and dips below the theoretical
-    # maximum; the multicast kernels offload data movement to NVLink/NVSwitch and keep
-    # the overlap count deterministic, which is what lets the strict thresholds below hold.
-    # (Symmetric-memory window registration needs an initialized NCCL communicator; the
-    # conftest eagerly initializes the process group with device_id so this holds.)
+    # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
+    # per-communicator property, so scoping it to this group leaves the rest of the
+    # bucket on default-CTA symmetric-memory kernels (test_symmetric_memory.py asserts
+    # ncclSymk all-gather kernel counts, which zero-CTA would turn into copy-engine
+    # memcpys). This 1-D group models the DP (FSDP) sub-mesh that mfsdp is handed in
+    # production: with EP/TP the full device mesh is multi-dimensional, but mfsdp
+    # requires an all-FSDP mesh (see experimental/module.py) and never sees the TP/EP
+    # axes, so only the DP communicator needs the zero-CTA policy. Creating the group
+    # off the conftest's device_id eager-initialized default process group uses a comm
+    # split, which avoids the cold-communicator symmetric-memory rendezvous failure
+    # (https://github.com/pytorch/pytorch/issues/188567).
+    zero_cta_options = dist.ProcessGroupNCCL.Options()
+    zero_cta_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
+    dp_group = dist.new_group(backend="nccl", pg_options=zero_cta_options)
+
+    mesh = DeviceMesh.from_group(dp_group, device.type)
     model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
@@ -538,30 +558,38 @@ def test_overlaps_communication_and_compute(distributed_setup):
         # drop the CUDA events.
         torch.cuda.synchronize(device)
 
-    cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
-    all_gather_events = _nccl_events(cuda_events, "allgather")
-    reduce_scatter_events = _nccl_events(cuda_events, "reducescatter", "reduce_scatter")
-    # GEMM device-kernel names vary across CUDA/cuBLAS versions and GPU archs
-    # (e.g. "*gemm*", "cutlass*", "cublas*", and cuBLASLt's Hopper "nvjet_sm90_*").
-    gemm_events = [
-        event
-        for event in cuda_events
-        if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas", "nvjet"))
-    ]
-    # Each of the num_children children plus the root all-gathers in forward and
-    # again in backward, and each reduce-scatters once in backward.
-    assert len(all_gather_events) == 2 * (num_children + 1), (
-        f"Expected {2 * (num_children + 1)} all-gather kernels, "
-        f"got {[event.name for event in all_gather_events]}."
+    events = prof.events()
+    # A GEMM launches under aten::mm as the matmul kernel plus a cudaMemsetAsync (device
+    # events collected by CPU op -- see collect_linked_device_events); keep the matmuls.
+    gemm_events = []
+    for op_device_events in collect_linked_device_events(events, _GEMM_OP_PATTERN).values():
+        gemm_events += [event for event in op_device_events if "memset" not in event.name.lower()]
+    # Each of the num_children child Linears runs one forward and two backward matmuls.
+    assert len(gemm_events) == 3 * num_children, (
+        f"Expected {3 * num_children} GEMMs, got {len(gemm_events)}: "
+        f"{[event.name for event in gemm_events]}"
     )
-    assert len(reduce_scatter_events) == num_children + 1, (
-        f"Expected {num_children + 1} reduce-scatter kernels, "
-        f"got {[event.name for event in reduce_scatter_events]}."
-    )
-    assert gemm_events, [event.name for event in cuda_events]
 
-    all_gather_streams = {event.device_resource_id for event in all_gather_events}
-    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
+    all_gather_events = collect_linked_device_events(events, _ALL_GATHER_OP_PATTERN)
+    reduce_scatter_events = collect_linked_device_events(events, _REDUCE_SCATTER_OP_PATTERN)
+    # The num_children child layers plus the root are each a sharded module; each does a
+    # forward and a backward all-gather and one reduce-scatter.
+    num_sharded_modules = num_children + 1
+    assert len(reduce_scatter_events) == num_sharded_modules, (
+        f"Expected {num_sharded_modules} reduce-scatters, got {len(reduce_scatter_events)}: "
+        f"{[op.name for op in reduce_scatter_events]}"
+    )
+    assert len(all_gather_events) == 2 * num_sharded_modules, (
+        f"Expected {2 * num_sharded_modules} all-gathers, got {len(all_gather_events)}: "
+        f"{[op.name for op in all_gather_events]}"
+    )
+
+    all_gather_streams = {
+        event.device_resource_id for group in all_gather_events.values() for event in group
+    }
+    reduce_scatter_streams = {
+        event.device_resource_id for group in reduce_scatter_events.values() for event in group
+    }
     gemm_streams = {event.device_resource_id for event in gemm_events}
     assert len(all_gather_streams) == 1
     assert len(reduce_scatter_streams) == 1
@@ -570,28 +598,32 @@ def test_overlaps_communication_and_compute(distributed_setup):
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
     all_gather_overlap_count = sum(
-        any(_events_overlap(all_gather_event, gemm_event) for gemm_event in gemm_events)
-        for all_gather_event in all_gather_events
+        any(events_overlap(event, gemm) for event in group for gemm in gemm_events)
+        for group in all_gather_events.values()
     )
     reduce_scatter_overlap_count = sum(
-        any(_events_overlap(reduce_scatter_event, gemm_event) for gemm_event in gemm_events)
-        for reduce_scatter_event in reduce_scatter_events
+        any(events_overlap(event, gemm) for event in group for gemm in gemm_events)
+        for group in reduce_scatter_events.values()
     )
-    # With symmetric-memory (SM-light multicast) collectives the overlap count is
-    # deterministic, so assert the theoretical maximum. Each of the num_children - 1
-    # non-root children contributes a forward all-gather and a backward all-gather that
-    # overlap a GEMM (2 * (num_children - 1)), and each non-root child's reduce-scatter
-    # overlaps a backward GEMM (num_children - 1).
+    # SM-free all-gather overlaps deterministically, so assert the theoretical maximum:
+    # a forward and a backward all-gather for each of the num_children - 1 non-root
+    # children, and one reduce-scatter per non-root child.
     expected_all_gather_overlap = 2 * (num_children - 1)
     expected_reduce_scatter_overlap = num_children - 1
     assert all_gather_overlap_count >= expected_all_gather_overlap, (
-        f"Expected at least {expected_all_gather_overlap} all-gathers to overlap compute, "
-        f"got {all_gather_overlap_count}/{len(all_gather_events)}."
+        f"Expected at least {expected_all_gather_overlap} copy-engine all-gathers to "
+        f"overlap compute, got {all_gather_overlap_count}/{len(all_gather_events)}."
     )
     assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap, (
         f"Expected at least {expected_reduce_scatter_overlap} reduce-scatters to overlap "
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
     )
+
+    # Release the dedicated communicator so it does not leak into the shared session
+    # (the mfsdp_v2 bucket keeps one process group alive across tests). On a failure
+    # above the group leaks, which is acceptable. Destroying this subgroup leaves the
+    # default process group (and the conftest teardown barrier) untouched.
+    dist.destroy_process_group(dp_group)
 
 
 def test_parameterless_parent_with_child_modules_trains(distributed_setup):
