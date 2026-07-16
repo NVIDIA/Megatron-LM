@@ -1,5 +1,6 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import gc
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -442,16 +443,18 @@ class TestMhcA2AOverlapNumerics:
         _assert_close_grads(overlap_gradients, reference_gradients)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    def test_mtp_schedule_matches_eager(self):
+    @pytest.mark.parametrize("recompute", (False, True), ids=("without-recompute", "recompute"))
+    def test_mtp_schedule_matches_eager(self, recompute):
         # With MTP (mtp_num_layers=1, default mtp_detach_heads=False) the decoder boundary
         # produces the pre-contraction mHC multi-stream consumed by the MTP depths. It must be
         # detached at its producer so MTP backward does not traverse the decoder mHC graph out
         # of schedule order; this node's backward_impl reconnects the accumulated gradient.
+        # Parameterized over recompute to exercise mHC + MTP + EP overlap + mhc recompute.
         mtp = {"mtp_num_layers": 1}
         reference_config = _make_mhc_numerical_config(
-            overlap=False, recompute=False, extra_config=mtp
+            overlap=False, recompute=recompute, extra_config=mtp
         )
-        overlap_config = _make_mhc_numerical_config(recompute=False, extra_config=mtp)
+        overlap_config = _make_mhc_numerical_config(recompute=recompute, extra_config=mtp)
         with deterministic_mode():
             data = build_input_data(seq_len=16)
             reference_model = build_gpt_model(reference_config)
@@ -466,15 +469,55 @@ class TestMhcA2AOverlapNumerics:
         torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
         _assert_close_grads(overlap_gradients, reference_gradients)
 
-    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    def test_mtp_two_inflight_plans_match_eager(self):
-        # Two in-flight schedule plans verify that the per-chunk mHC multi-stream (and hence
-        # the reconnected MTP side gradient) stays bound to the correct microbatch.
+    @pytest.mark.skipif(
+        not is_te_min_version("2.3.0"), reason="delay_wgrad_compute requires TE >= 2.3.0"
+    )
+    def test_mtp_schedule_with_delayed_wgrad_matches_eager(self):
+        # Regression test for the MTP delayed-wgrad callable selection: under mHC the MTP
+        # layer builds separate e_proj/h_proj and sets eh_proj=None, so
+        # build_mtp_layer_callables must register [e_proj, h_proj] (not eh_proj) with the
+        # attn node's delayed-wgrad list. With the unconditional eh_proj append this test
+        # crashes at TransformerLayerNode.backward_dw (None.backward_dw); with a wrong-but-
+        # non-None list it would leave the e_proj/h_proj weight gradients permanently
+        # deferred, which the grad-keys equality below catches. delay_wgrad_compute
+        # requires overlap_moe_expert_parallel_comm, so only the overlap config carries it;
+        # the eager reference computes its wgrads inline.
         mtp = {"mtp_num_layers": 1}
         reference_config = _make_mhc_numerical_config(
             overlap=False, recompute=False, extra_config=mtp
         )
-        overlap_config = _make_mhc_numerical_config(recompute=False, extra_config=mtp)
+        overlap_config = _make_mhc_numerical_config(
+            recompute=False, extra_config={**mtp, "delay_wgrad_compute": True}
+        )
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(overlap_model, data)
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        # The MTP projections must have flushed their deferred wgrads.
+        assert any("e_proj.weight" in name for name in overlap_gradients), overlap_gradients.keys()
+        assert any("h_proj.weight" in name for name in overlap_gradients), overlap_gradients.keys()
+        _assert_close_grads(overlap_gradients, reference_gradients)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("recompute", (False, True), ids=("without-recompute", "recompute"))
+    def test_mtp_two_inflight_plans_match_eager(self, recompute):
+        # Two in-flight schedule plans verify that the per-chunk mHC multi-stream (and hence
+        # the reconnected MTP side gradient) stays bound to the correct microbatch.
+        # Parameterized over recompute so the per-group recompute managers are also verified
+        # to stay independent across in-flight microbatches when MTP depths are present.
+        mtp = {"mtp_num_layers": 1}
+        reference_config = _make_mhc_numerical_config(
+            overlap=False, recompute=recompute, extra_config=mtp
+        )
+        overlap_config = _make_mhc_numerical_config(recompute=recompute, extra_config=mtp)
         with deterministic_mode():
             batches = [build_input_data(seq_len=16) for _ in range(2)]
             reference_model = build_gpt_model(reference_config)
@@ -499,3 +542,101 @@ class TestMhcA2AOverlapNumerics:
         # binding error would show up as a gross mismatch on the MTP-specific parameters
         # (verified bitwise-identical), not a ~2% nudge on the shared embedding.
         _assert_close_grads(overlap_gradients, reference_gradients, rtol=3e-2, atol=3e-2)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    def test_schedule_with_full_iteration_cuda_graph_matches_eager(self):
+        """mHC + EP overlap + ``cuda_graph_impl='full_iteration'`` (no mhc recompute).
+
+        The ``__post_init__`` guard added by this PR rejects CUDA graphs only when
+        mhc *recompute* is enabled (explicit group replay is eager-only); this test
+        proves the guard admits full-iteration CG + EP overlap without recompute,
+        and that the scheduled forward+backward step is actually capturable into a
+        ``torch.cuda.CUDAGraph`` and numerically faithful on replay — the core-level
+        equivalent of what ``FullCudaGraphWrapper`` captures in production.
+
+        MoE runs in drop_and_pad mode: the dropless alltoall dispatcher performs a
+        mandatory D2H splits sync that is illegal during stream capture. The
+        capacity factor is sized so no token can be dropped at this scale, and both
+        configs share the setting so the eager reference matches numerically.
+        """
+        # capacity_factor=4.0 -> per-expert capacity = 4.0 * 16 tokens * topk(2) / 8
+        # experts = 16 = the full token count, so no token can ever be dropped and
+        # the padded slot count (8 * 16) matches the routing-map size exactly.
+        drop_and_pad = {"moe_pad_expert_input_to_capacity": True, "moe_expert_capacity_factor": 4.0}
+        reference_config = _make_mhc_numerical_config(
+            overlap=False, recompute=False, extra_config=drop_and_pad
+        )
+        overlap_config = _make_mhc_numerical_config(
+            recompute=False, extra_config={**drop_and_pad, "cuda_graph_impl": "full_iteration"}
+        )
+        # Full-iteration capture requires a graph-safe RNG tracker (production
+        # enforces use_te_rng_tracker with CUDA graphs): TE attention forks the
+        # tracker even with dropout disabled, and the default tracker's
+        # set_state is illegal during stream capture.
+        initialize_rng_tracker(
+            use_te_rng_tracker=True, use_cudagraphable_rng=True, force_reset=True
+        )
+        try:
+            self._run_full_iteration_cuda_graph_case(reference_config, overlap_config)
+        finally:
+            initialize_rng_tracker(force_reset=True)
+
+    def _run_full_iteration_cuda_graph_case(self, reference_config, overlap_config):
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+
+            def run_step():
+                schedule_plan = overlap_model.build_schedule_plan(**data)
+                output = TransformerModelChunkSchedulePlan.run(schedule_plan, None)
+                TransformerModelChunkSchedulePlan.run(
+                    None, schedule_plan, b_grad=torch.ones_like(output)
+                )
+                return output
+
+            # Side-stream eager warmup so lazy allocations and one-time init exist
+            # before capture.
+            warmup_stream = torch.cuda.Stream()
+            warmup_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warmup_stream):
+                for _ in range(2):
+                    run_step()
+            torch.cuda.current_stream().wait_stream(warmup_stream)
+            torch.cuda.synchronize()
+
+            # Zero gradients strictly in place: the captured accumulation kernels
+            # must keep writing into the same live tensors on every replay.
+            for parameter in overlap_model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.zero_()
+
+            graph = torch.cuda.CUDAGraph()
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                static_output = run_step()
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+
+            # Capture only records the kernels; the first replay produces the
+            # real values in the static output/grad buffers.
+            graph.replay()
+            torch.cuda.synchronize()
+
+            overlap_output = static_output.detach().clone()
+            overlap_gradients = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in overlap_model.named_parameters()
+                if parameter.grad is not None
+            }
+            del graph
+            gc.collect()
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
