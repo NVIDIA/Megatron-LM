@@ -7,6 +7,7 @@ from megatron.training.statistics_logging import (
     save_dgrad_raw_moments_by_layer,
     save_grad_raw_moments_by_param,
     save_param_raw_moments_by_param,
+    save_residual_dgrad_raw_moments_by_layer,
     save_residual_raw_moments_by_layer,
 )
 
@@ -256,5 +257,45 @@ class TestSaveResidualRawMomentsByLayer:
                         "sum_4": 4.5,
                     }
                 },
+            }
+        ]
+
+
+class TestSaveResidualDgradRawMomentsByLayer:
+    def test_creates_jsonl_with_loss_scale(self, tmp_path):
+        save_residual_dgrad_raw_moments_by_layer(
+            str(tmp_path),
+            iteration=100,
+            consumed_train_samples=8192,
+            residual_dgrad_raw_moments_by_layer=[
+                (
+                    "decoder.layers.0/output0",
+                    {"count": 2, "sum_1": 1.5, "sum_2": 2.5, "sum_3": 3.5, "sum_4": 4.5},
+                )
+            ],
+            rank=3,
+            loss_scale=128.0,
+        )
+
+        filepath = (
+            tmp_path / "training_stats" / "residual_dgrad_raw_moments_by_layer" / "rank3.jsonl"
+        )
+        records = _read_records(filepath)
+        assert records == [
+            {
+                "iter": 100,
+                "consumed_train_samples": 8192,
+                "stat": "residual_dgrad_raw_moments_by_layer",
+                "values": {
+                    "decoder.layers.0/output0": {
+                        "count": 2.0,
+                        "sum_1": 1.5,
+                        "sum_2": 2.5,
+                        "sum_3": 3.5,
+                        "sum_4": 4.5,
+                    }
+                },
+                "gradient_stage": "backward_scaled",
+                "loss_scale": 128.0,
             }
         ]

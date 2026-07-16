@@ -189,3 +189,26 @@ def save_residual_raw_moments_by_layer(
         residual_raw_moments_by_layer,
         rank=rank,
     )
+
+
+def save_residual_dgrad_raw_moments_by_layer(
+    log_dir: str,
+    iteration: int,
+    consumed_train_samples: int,
+    residual_dgrad_raw_moments_by_layer: Iterable[tuple[str, dict[str, float]]],
+    rank: int | None = None,
+    loss_scale: float | None = None,
+) -> None:
+    """Append one residual-stream dgrad raw moments record keyed by layer boundary."""
+    extra_record_fields = {"gradient_stage": "backward_scaled"}
+    if loss_scale is not None:
+        extra_record_fields["loss_scale"] = float(loss_scale)
+    save_raw_moments_by_name(
+        log_dir,
+        "residual_dgrad_raw_moments_by_layer",
+        iteration,
+        consumed_train_samples,
+        residual_dgrad_raw_moments_by_layer,
+        rank=rank,
+        extra_record_fields=extra_record_fields,
+    )

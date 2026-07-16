@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.transformer.layer_boundary_observer import (
     observe_transformer_layer_boundaries,
@@ -21,6 +22,7 @@ _RAW_MOMENT_LOGGING_FLAGS = (
     'log_activation_raw_moments_by_layer',
     'log_dgrad_raw_moments_by_layer',
     'log_residual_raw_moments_by_layer',
+    'log_residual_dgrad_raw_moments_by_layer',
 )
 
 
@@ -92,6 +94,7 @@ def _raw_moment_logging_args():
         log_activation_raw_moments_by_layer=0,
         log_dgrad_raw_moments_by_layer=0,
         log_residual_raw_moments_by_layer=0,
+        log_residual_dgrad_raw_moments_by_layer=0,
         overlap_moe_expert_parallel_comm=False,
     )
 
@@ -118,9 +121,13 @@ def test_disabled_raw_moment_logging_allows_fsdp(logging_flag, disabled_interval
     _validate_raw_moment_logging_args(args)
 
 
-def test_residual_raw_moment_logging_rejects_fine_grained_ep_overlap():
+@pytest.mark.parametrize(
+    "logging_flag",
+    ("log_residual_raw_moments_by_layer", "log_residual_dgrad_raw_moments_by_layer"),
+)
+def test_residual_raw_moment_logging_rejects_fine_grained_ep_overlap(logging_flag):
     args = _raw_moment_logging_args()
-    args.log_residual_raw_moments_by_layer = 1
+    setattr(args, logging_flag, 1)
     args.overlap_moe_expert_parallel_comm = True
 
     with pytest.raises(ValueError, match='--overlap-moe-expert-parallel-comm'):
@@ -184,6 +191,104 @@ def test_residual_raw_moments_skip_no_grad_forward():
     values = _values_dict(logger.consume_residual_raw_moments_by_layer())
     assert values["decoder.layers.0/output0"]["count"] == 2.0
     assert values["decoder.layers.0/output0"]["sum_1"] == 3.0
+
+
+def test_residual_dgrad_raw_moments_capture_boundary_gradients_and_loss_scale():
+    model = _ResidualModel()
+    logger = RawMomentLogger()
+    logger.prepare_residual_logging(
+        model, capture_residuals=False, capture_dgrads=True, loss_scale=128.0
+    )
+    first_layer, second_layer = model.decoder.layers
+
+    residual_input = torch.tensor([1.0, 2.0], requires_grad=True)
+    first_output = residual_input * torch.tensor([2.0, 3.0])
+    second_output = first_output * torch.tensor([5.0, 7.0])
+    with observe_transformer_layer_boundaries(logger.record_residual_boundary):
+        observe_transformer_layer_input(model.decoder, first_layer, residual_input)
+        observe_transformer_layer_output(model.decoder, first_layer, first_output)
+        observe_transformer_layer_output(model.decoder, second_layer, second_output)
+        second_output.sum().backward()
+
+    logger.finalize_residual_dgrad_raw_moments_by_layer()
+    values, loss_scale = logger.consume_residual_dgrad_raw_moments_by_layer()
+    values = _values_dict(values)
+
+    assert loss_scale == 128.0
+    assert values["decoder/input0"] == {
+        "count": 2.0,
+        "sum_1": 31.0,
+        "sum_2": 541.0,
+        "sum_3": 10261.0,
+        "sum_4": 204481.0,
+    }
+    assert values["decoder.layers.0/output0"]["sum_1"] == 12.0
+    assert values["decoder.layers.1/output0"]["sum_1"] == 2.0
+    assert residual_input.grad.tolist() == [10.0, 21.0]
+    assert not logger._residual_dgrad_hooks
+
+
+def test_residual_dgrad_raw_moments_capture_checkpoint_recomputation_once():
+    model = _ResidualModel()
+    logger = RawMomentLogger()
+    logger.prepare_residual_logging(model, capture_residuals=False, capture_dgrads=True)
+    first_layer = model.decoder.layers[0]
+
+    def checkpointed_layer(hidden_states):
+        observe_transformer_layer_input(model.decoder, first_layer, hidden_states)
+        output = hidden_states * 2
+        observe_transformer_layer_output(model.decoder, first_layer, output)
+        return output
+
+    hidden_states = torch.tensor([1.0, 2.0], requires_grad=True)
+    with observe_transformer_layer_boundaries(logger.record_residual_boundary):
+        checkpoint(checkpointed_layer, hidden_states, use_reentrant=True).sum().backward()
+
+    logger.finalize_residual_dgrad_raw_moments_by_layer()
+    values, _ = logger.consume_residual_dgrad_raw_moments_by_layer()
+    values = _values_dict(values)
+
+    assert values["decoder/input0"]["count"] == 2.0
+    assert values["decoder/input0"]["sum_1"] == 4.0
+    assert values["decoder.layers.0/output0"]["count"] == 2.0
+    assert values["decoder.layers.0/output0"]["sum_1"] == 2.0
+
+
+def test_residual_dgrad_raw_moments_support_reused_autograd_output_tensor():
+    class ReuseOutput(torch.autograd.Function):
+        output = torch.empty(2)
+
+        @staticmethod
+        def forward(ctx, tensor):
+            ReuseOutput.output.copy_(tensor)
+            return ReuseOutput.output
+
+        @staticmethod
+        def backward(ctx, grad):
+            return grad
+
+    model = _ResidualModel()
+    logger = RawMomentLogger()
+    first_layer = model.decoder.layers[0]
+    output_tensor = None
+
+    for input_values in ([1.0, 2.0], [3.0, 4.0]):
+        logger.prepare_residual_logging(model, capture_residuals=False, capture_dgrads=True)
+        tensor = ReuseOutput.apply(torch.tensor(input_values, requires_grad=True))
+        if output_tensor is None:
+            output_tensor = tensor
+        else:
+            assert tensor is output_tensor
+
+        with observe_transformer_layer_boundaries(logger.record_residual_boundary):
+            observe_transformer_layer_output(model.decoder, first_layer, tensor)
+            tensor.sum().backward()
+
+        logger.finalize_residual_dgrad_raw_moments_by_layer()
+        values, _ = logger.consume_residual_dgrad_raw_moments_by_layer()
+        values = _values_dict(values)
+        assert values["decoder.layers.0/output0"]["count"] == 2.0
+        assert values["decoder.layers.0/output0"]["sum_1"] == 2.0
 
 
 def test_activation_raw_moments_accumulate_by_module_site():

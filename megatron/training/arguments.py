@@ -395,6 +395,7 @@ def _validate_raw_moment_logging_args(args):
             args.log_activation_raw_moments_by_layer,
             args.log_dgrad_raw_moments_by_layer,
             args.log_residual_raw_moments_by_layer,
+            args.log_residual_dgrad_raw_moments_by_layer,
         )
     )
     if raw_moment_logging_enabled and (args.use_megatron_fsdp or args.use_torch_fsdp2):
@@ -402,9 +403,15 @@ def _validate_raw_moment_logging_args(args):
             'Raw-moment statistics logging is not supported with '
             '--use-megatron-fsdp or --use-torch-fsdp2.'
         )
-    if args.log_residual_raw_moments_by_layer > 0 and args.overlap_moe_expert_parallel_comm:
+    if (
+        (
+            args.log_residual_raw_moments_by_layer > 0
+            or args.log_residual_dgrad_raw_moments_by_layer > 0
+        )
+        and args.overlap_moe_expert_parallel_comm
+    ):
         raise ValueError(
-            'Residual raw-moment statistics logging is not supported with '
+            'Residual and residual-dgrad raw-moment statistics logging is not supported with '
             '--overlap-moe-expert-parallel-comm.'
         )
 

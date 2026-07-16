@@ -272,6 +272,11 @@ class LoggerConfig:
     """Training-step interval for logging count and raw sums of powers 1-4 for the initial decoder
     residual stream and each post-layer residual stream. Values of 0 or less disable logging."""
 
+    log_residual_dgrad_raw_moments_by_layer: int = 0
+    """Training-step interval for logging count and raw sums of powers 1-4 for the backward
+    gradients of the initial decoder residual stream and each post-layer residual stream. Values
+    of 0 or less disable logging."""
+
     statistics_log_dir: str | None = None
     """Directory for high-cardinality JSONL statistics. If unset, statistics use
     tensorboard_dir when available, then the --save directory as a fallback."""
