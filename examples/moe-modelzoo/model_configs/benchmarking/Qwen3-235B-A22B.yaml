@@ -1,0 +1,138 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,graph_capture_record_stream_reuse:True
+  NCCL_NVLS_ENABLE: 0
+  TRITON_CACHE_DIR: /tmp/triton_cache_$SLURM_NODEID
+  # !Used for 1F1B overlap
+  # CUDA_DEVICE_MAX_CONNECTIONS: 32
+  # NVTE_FWD_LAYERNORM_SM_MARGIN: 20
+  # NVTE_BWD_LAYERNORM_SM_MARGIN: 20
+  # NVTE_NORM_FWD_USE_CUDNN: 1
+  # NVTE_NORM_BWD_USE_CUDNN: 1
+
+MODEL_ARGS:
+  # Distributed args
+  --distributed-timeout-minutes: 220
+  --tensor-model-parallel-size: ${TP}
+  --pipeline-model-parallel-size: ${PP}
+  --num-layers-per-virtual-pipeline-stage: ${LAYERS_PER_VP}
+  --expert-model-parallel-size: ${EP}
+  --context-parallel-size: ${CP}
+  --expert-tensor-parallel-size: 1
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --no-create-attention-mask-in-dataloader: true
+  --account-for-embedding-in-pipeline-split: true
+  --account-for-loss-in-pipeline-split: true
+
+  # Training args
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --use-flash-attn: true
+  --disable-bias-linear: true
+  --micro-batch-size: ${MBS}
+  --global-batch-size: ${GBS}
+  --train-samples: 268554688
+  --exit-duration-in-mins: 230
+  --manual-gc: true
+  --manual-gc-interval: 5
+  --cross-entropy-loss-fusion: true
+  --cross-entropy-fusion-impl: te
+  --enable-experimental: true
+
+  # Transformer Engine args
+  --transformer-impl: transformer_engine
+
+  # Data args
+  --data-cache-path: ${WORKSPACE}/data_cache
+  --tokenizer-type: HuggingFaceTokenizer 
+  --tokenizer-model: Qwen/Qwen3-235B-A22B
+  --data-path: ${DATA_PATH}
+  --split: 99,1,0
+  --no-mmap-bin-files: true
+  --num-workers: 6
+
+  # Add network size args
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --rotary-percent: 1.0
+  --rotary-base: 1000000
+  --rotary-seq-len-interpolation-factor: 1
+  --normalization: RMSNorm
+  --swiglu: true
+  --norm-epsilon: 1e-06
+  --num-layers: 94
+  --hidden-size: 4096
+  --ffn-hidden-size: 12288
+  --num-attention-heads: 64
+  --kv-channels: 128
+  --group-query-attention: true
+  --num-query-groups: 4
+  --qk-layernorm: true
+  --seq-length: ${SEQ_LEN}
+  --max-position-embeddings: ${SEQ_LEN}
+  --make-vocab-size-divisible-by: 1187
+
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+
+  # Add learning rate args
+  --lr-decay-samples: 584765624
+  --lr-warmup-samples: 1536000
+  # use lr from DeepSeek-V3
+  --lr-warmup-init: 3.9e-7
+  --lr: 3.9e-6
+  --min-lr: 3.9e-7
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+
+  # Add MoE args
+  --num-experts: 128
+  --moe-ffn-hidden-size: 1536
+  --moe-router-load-balancing-type: aux_loss
+  --moe-router-topk: 8
+  --moe-router-pre-softmax: false # Different from Qwen2-MoE
+  --moe-grouped-gemm: ${MOE_GROUPED_GEMM}
+  --moe-aux-loss-coeff: 1e-3
+  --moe-permute-fusion: true
+  --moe-router-fusion: true
+  --moe-router-dtype: fp32
+
+  # Add validation args
+  --eval-iters: 32
+  --eval-interval: 500
+
+  # Add checkpointing args
+  --finetune: true
+  --auto-detect-ckpt-format: true
+  --load: ${LOAD_PATH}
+  --no-load-rng: true
+  --no-load-optim: true
+  --save: ${OUTPUT_PATH}/checkpoints
+  --save-interval: 100
+  --dist-ckpt-strictness: log_all
+
+  # Add initialization args
+  --init-method-std: 0.02
+
+  # Add logging args
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  # --log-num-zeros-in-grad: true
+  # --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 1
+  --logging-level: 40
+  --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
+  --wandb-project: ${WANDB_PROJECT}
+  --wandb-exp-name: Qwen3-235B-A22B-TP${TP}PP${PP}EP${EP}CP${CP}VPP${VPP}-MBS${MBS}GBS${GBS}-${COMMENT}
+
+  # Add mixed precision args
+  --bf16: true

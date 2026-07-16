@@ -1,0 +1,14 @@
+**/output/
+**/logs/
+**/tensorboard/
+**/checkpoints/
+**/cache/
+**/nsys
+**/.data
+events.*
+*.pt
+*.pth
+*.txt
+nemo-scripts/results/*
+nemo-scripts/nemo_experiments/*
+*.tmp
