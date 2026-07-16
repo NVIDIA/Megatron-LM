@@ -1,12 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # syntax=docker/dockerfile:1.3-labs
 
-ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.04-py3
+ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.06-py3
 FROM ${FROM_IMAGE_NAME} AS main
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
+# NCCL 2.30.4 supports CUDA 13.x; NVIDIA publishes its CUDA 13 package as cuda13.2.
+ARG NCCL_VERSION=2.30.4-1+cuda13.2
 ENV PATH="/root/.local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
@@ -31,6 +33,9 @@ RUN bash -ex <<"EOF"
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
 
+RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
+    bash /opt/install_nccl.sh --NCCL_VER=${NCCL_VERSION}
+
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
@@ -40,9 +45,18 @@ ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
     export NVTE_CUDA_ARCHS="80;90;100"
+    # flash-mla (no_pypi_wheels group) has no PyPI wheel and is built from source by uv. Point the
+    # compilers at the CCCL/libcu++ headers (under cccl/ in this base image, not the default CUDA
+    # include path) and scope the build to the target archs. Skipped for the LTS image.
+    FLASH_MLA_GROUP=""
+    if [ "$IMAGE_TYPE" != "lts" ]; then
+        FLASH_MLA_GROUP="--group no_pypi_wheels"
+        export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
+            CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
+    fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te --link-mode copy --locked \
+    uv sync --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
