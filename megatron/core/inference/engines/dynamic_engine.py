@@ -1190,9 +1190,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 eod = -1
             request.sampling_params.termination_id = eod
 
-        # -1: a request landing exactly on max_sequence_length can neither
-        # finish nor grow (observed engine livelock at the boundary).
-        generation_room = self.context.max_sequence_length - len(request.prompt_tokens) - 1
+        # The block allocator reserves one block for the dummy row, so the
+        # usable ceiling is max_sequence_length - block_size_tokens: a request
+        # marching past it can neither finish nor allocate its next block
+        # (observed livelock pinned at exactly SL/block_size - 1 blocks).
+        generation_room = (
+            self.context.max_sequence_length
+            - self.context.block_size_tokens
+            - len(request.prompt_tokens)
+            - 1
+        )
         if generation_room < 1 or request.sampling_params.num_tokens_to_generate < 0:
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
