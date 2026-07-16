@@ -490,6 +490,17 @@ def _set_telemetry(args):
     from nemo.lens import NemoLensConfig, setup_telemetry
     from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
+    # OTel's default RandomIdGenerator draws span/trace IDs from Python's `random`, which Megatron
+    # seeds IDENTICALLY across data-parallel ranks (_set_random_seed with data_parallel_random_init
+    # off) -> every rank emits the SAME span/trace ID sequence, so a backend sees many spans sharing
+    # one span ID and parent links resolve to the wrong span (Honeycomb: "multiple spans sharing the
+    # same non-null span ID", broken checkpoint parents). Force seed-INDEPENDENT IDs from os.urandom
+    # before the provider is built. (nemo-lens builds TracerProvider without an id_generator, so it
+    # uses this default class -- patching its methods fixes both the trainer and the ckpt worker.)
+    from opentelemetry.sdk.trace import id_generator as _idg
+    _idg.RandomIdGenerator.generate_span_id = lambda self: int.from_bytes(os.urandom(8), 'big') or 1
+    _idg.RandomIdGenerator.generate_trace_id = lambda self: int.from_bytes(os.urandom(16), 'big') or 1
+
     config = NemoLensConfig.from_env(
         prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
         span_group_cls=MegatronSpanGroup,
