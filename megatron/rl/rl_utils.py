@@ -2934,7 +2934,15 @@ async def _rollout_keepalive(inference_interface, interval_s, requests_per_tick,
     from megatron.rl.inference.api import InferenceRequest, LLMChatMessage
 
     request = InferenceRequest(
-        prompt=[LLMChatMessage(role='user', content='keepalive ping')],
+        # A multi-thousand-token prompt so every tick runs a real PREFILL:
+        # prefill is what context parallelism splits across CP ranks and what
+        # drives the MoE all-to-all across EP ranks. Decode on a short prompt
+        # only exercises the TP pair on one CP rank per engine -- with TP2/CP4
+        # that is ~2 of 8 GPUs per replica, and job 5435126 was reaped through
+        # such pings ("16/32 GPUs idle for 30m") during a 90-minute agentic
+        # rollout tail. BPE does not compress the repetition, so this is ~6k
+        # prompt tokens: ~1.5k tokens of prefill work per CP4 rank per tick.
+        prompt=[LLMChatMessage(role='user', content='keepalive ' * 2048)],
         # 512 tokens/tick ~= 4-7s of decode per engine per interval: clears the
         # DCGM_FI_PROF_SM_ACTIVE <= 0.01 idle threshold (8-token pings measured
         # ~0.1% duty cycle and job 5347804 was reaped mid-save through them).
