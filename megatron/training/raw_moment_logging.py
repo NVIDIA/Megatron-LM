@@ -79,10 +79,6 @@ class RawMomentLogger:
         self._latest_residual_dgrad_raw_moments_by_layer: list[
             tuple[str, dict[str, float]]
         ] | None = None
-        self._latest_dgrad_loss_scale: float | None = None
-        self._pending_dgrad_loss_scale: float | None = None
-        self._latest_residual_dgrad_loss_scale: float | None = None
-        self._pending_residual_dgrad_loss_scale: float | None = None
 
     def register_activation_hooks(self, model: Iterable[nn.Module] | nn.Module) -> None:
         """Register forward hooks for activation raw moments."""
@@ -105,13 +101,10 @@ class RawMomentLogger:
 
             self._activation_hooks.append(module.register_forward_hook(hook, with_kwargs=True))
 
-    def register_dgrad_hooks(
-        self, model: Iterable[nn.Module] | nn.Module, loss_scale: float | None
-    ) -> None:
+    def register_dgrad_hooks(self, model: Iterable[nn.Module] | nn.Module) -> None:
         """Register backward hooks for dgrad raw moments."""
         assert not self._dgrad_hooks
         self._dgrad_sites.clear()
-        self._pending_dgrad_loss_scale = loss_scale
         for module, input_site, output_site in _iter_hook_modules(model):
             input_key = input_site.name
             self._dgrad_sites[input_key] = input_site
@@ -132,7 +125,6 @@ class RawMomentLogger:
         model: Iterable[nn.Module] | nn.Module,
         capture_residuals: bool = True,
         capture_dgrads: bool = False,
-        loss_scale: float | None = None,
     ) -> None:
         """Create stable residual and residual-dgrad sites for the decoder layers in ``model``."""
         assert not self._residual_dgrad_hooks
@@ -140,7 +132,6 @@ class RawMomentLogger:
         self._residual_dgrad_sites.clear()
         self._residual_boundary_sites.clear()
         self._residual_dgrad_boundary_sites.clear()
-        self._pending_residual_dgrad_loss_scale = loss_scale if capture_dgrads else None
         for stack_name, stack in _iter_residual_stacks(model):
             for layer in getattr(stack, "layers"):
                 layer_number = getattr(layer, "layer_number", None)
@@ -227,8 +218,6 @@ class RawMomentLogger:
     def finalize_dgrad_raw_moments_by_layer(self) -> None:
         """Reduce and cache dgrad raw moments for later logging."""
         self._latest_dgrad_raw_moments_by_layer = self._finalize_sites(self._dgrad_sites.values())
-        self._latest_dgrad_loss_scale = self._pending_dgrad_loss_scale
-        self._pending_dgrad_loss_scale = None
         self._dgrad_sites.clear()
 
     def finalize_residual_raw_moments_by_layer(self) -> None:
@@ -244,8 +233,6 @@ class RawMomentLogger:
         self._latest_residual_dgrad_raw_moments_by_layer = self._finalize_sites(
             self._residual_dgrad_sites.values()
         )
-        self._latest_residual_dgrad_loss_scale = self._pending_residual_dgrad_loss_scale
-        self._pending_residual_dgrad_loss_scale = None
         self._residual_dgrad_sites.clear()
         self._residual_dgrad_boundary_sites.clear()
         for hook, _ in self._residual_dgrad_hooks:
@@ -260,17 +247,11 @@ class RawMomentLogger:
         self._latest_activation_raw_moments_by_layer = None
         return values
 
-    def consume_dgrad_raw_moments_by_layer(
-        self,
-    ) -> tuple[list[tuple[str, dict[str, float]]], float | None] | None:
-        """Return and clear the latest dgrad raw moments and loss scale."""
+    def consume_dgrad_raw_moments_by_layer(self) -> list[tuple[str, dict[str, float]]] | None:
+        """Return and clear the latest dgrad raw moments."""
         values = self._latest_dgrad_raw_moments_by_layer
-        loss_scale = self._latest_dgrad_loss_scale
         self._latest_dgrad_raw_moments_by_layer = None
-        self._latest_dgrad_loss_scale = None
-        if values is None:
-            return None
-        return values, loss_scale
+        return values
 
     def consume_residual_raw_moments_by_layer(
         self,
@@ -282,15 +263,11 @@ class RawMomentLogger:
 
     def consume_residual_dgrad_raw_moments_by_layer(
         self,
-    ) -> tuple[list[tuple[str, dict[str, float]]], float | None] | None:
-        """Return and clear the latest residual-stream dgrad raw moments and loss scale."""
+    ) -> list[tuple[str, dict[str, float]]] | None:
+        """Return and clear the latest residual-stream dgrad raw moments."""
         values = self._latest_residual_dgrad_raw_moments_by_layer
-        loss_scale = self._latest_residual_dgrad_loss_scale
         self._latest_residual_dgrad_raw_moments_by_layer = None
-        self._latest_residual_dgrad_loss_scale = None
-        if values is None:
-            return None
-        return values, loss_scale
+        return values
 
     def remove_activation_hooks(self) -> None:
         """Remove activation raw-moment hooks."""
@@ -626,11 +603,9 @@ def disable_activation_raw_moment_logging() -> None:
     _require_logger().remove_activation_hooks()
 
 
-def enable_dgrad_raw_moment_logging(
-    model: Iterable[nn.Module] | nn.Module, loss_scale: float | None = None
-) -> None:
+def enable_dgrad_raw_moment_logging(model: Iterable[nn.Module] | nn.Module) -> None:
     """Enable dgrad raw-moment logging on ``model``."""
-    _get_logger().register_dgrad_hooks(model, loss_scale)
+    _get_logger().register_dgrad_hooks(model)
 
 
 def finalize_dgrad_raw_moments_by_layer() -> None:
@@ -638,9 +613,8 @@ def finalize_dgrad_raw_moments_by_layer() -> None:
     _require_logger().finalize_dgrad_raw_moments_by_layer()
 
 
-def consume_dgrad_raw_moments_by_layer(
-) -> tuple[list[tuple[str, dict[str, float]]], float | None] | None:
-    """Return and clear the latest dgrad raw moments and loss scale."""
+def consume_dgrad_raw_moments_by_layer() -> list[tuple[str, dict[str, float]]] | None:
+    """Return and clear the latest dgrad raw moments."""
     return _require_logger().consume_dgrad_raw_moments_by_layer()
 
 
@@ -654,15 +628,11 @@ def capture_residual_raw_moments(
     model: Iterable[nn.Module] | nn.Module,
     capture_residuals: bool = True,
     capture_dgrads: bool = False,
-    loss_scale: float | None = None,
 ) -> Iterator[None]:
     """Capture decoder residual-stream and residual-dgrad raw moments within this context."""
     logger = _get_logger()
     logger.prepare_residual_logging(
-        model,
-        capture_residuals=capture_residuals,
-        capture_dgrads=capture_dgrads,
-        loss_scale=loss_scale,
+        model, capture_residuals=capture_residuals, capture_dgrads=capture_dgrads
     )
     with observe_transformer_layer_boundaries(logger.record_residual_boundary):
         yield
@@ -683,7 +653,6 @@ def finalize_residual_dgrad_raw_moments_by_layer() -> None:
     _require_logger().finalize_residual_dgrad_raw_moments_by_layer()
 
 
-def consume_residual_dgrad_raw_moments_by_layer(
-) -> tuple[list[tuple[str, dict[str, float]]], float | None] | None:
-    """Return and clear the latest residual-stream dgrad raw moments and loss scale."""
+def consume_residual_dgrad_raw_moments_by_layer() -> list[tuple[str, dict[str, float]]] | None:
+    """Return and clear the latest residual-stream dgrad raw moments."""
     return _require_logger().consume_residual_dgrad_raw_moments_by_layer()

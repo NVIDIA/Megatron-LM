@@ -193,12 +193,10 @@ def test_residual_raw_moments_skip_no_grad_forward():
     assert values["decoder.layers.0/output0"]["sum_1"] == 3.0
 
 
-def test_residual_dgrad_raw_moments_capture_boundary_gradients_and_loss_scale():
+def test_residual_dgrad_raw_moments_capture_boundary_gradients():
     model = _ResidualModel()
     logger = RawMomentLogger()
-    logger.prepare_residual_logging(
-        model, capture_residuals=False, capture_dgrads=True, loss_scale=128.0
-    )
+    logger.prepare_residual_logging(model, capture_residuals=False, capture_dgrads=True)
     first_layer, second_layer = model.decoder.layers
 
     residual_input = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -211,10 +209,8 @@ def test_residual_dgrad_raw_moments_capture_boundary_gradients_and_loss_scale():
         second_output.sum().backward()
 
     logger.finalize_residual_dgrad_raw_moments_by_layer()
-    values, loss_scale = logger.consume_residual_dgrad_raw_moments_by_layer()
-    values = _values_dict(values)
+    values = _values_dict(logger.consume_residual_dgrad_raw_moments_by_layer())
 
-    assert loss_scale == 128.0
     assert values["decoder/input0"] == {
         "count": 2.0,
         "sum_1": 31.0,
@@ -245,8 +241,7 @@ def test_residual_dgrad_raw_moments_capture_checkpoint_recomputation_once():
         checkpoint(checkpointed_layer, hidden_states, use_reentrant=True).sum().backward()
 
     logger.finalize_residual_dgrad_raw_moments_by_layer()
-    values, _ = logger.consume_residual_dgrad_raw_moments_by_layer()
-    values = _values_dict(values)
+    values = _values_dict(logger.consume_residual_dgrad_raw_moments_by_layer())
 
     assert values["decoder/input0"]["count"] == 2.0
     assert values["decoder/input0"]["sum_1"] == 4.0
@@ -285,8 +280,7 @@ def test_residual_dgrad_raw_moments_support_reused_autograd_output_tensor():
             tensor.sum().backward()
 
         logger.finalize_residual_dgrad_raw_moments_by_layer()
-        values, _ = logger.consume_residual_dgrad_raw_moments_by_layer()
-        values = _values_dict(values)
+        values = _values_dict(logger.consume_residual_dgrad_raw_moments_by_layer())
         assert values["decoder.layers.0/output0"]["count"] == 2.0
         assert values["decoder.layers.0/output0"]["sum_1"] == 2.0
 
@@ -358,7 +352,7 @@ def test_raw_moments_skip_output_layer_logits_site():
 def test_dgrad_raw_moments_skip_output_layer_logits_site():
     model = [_OutputLayerModel()]
     logger = RawMomentLogger()
-    logger.register_dgrad_hooks(model, loss_scale=None)
+    logger.register_dgrad_hooks(model)
 
     x = torch.tensor([[1.0, 2.0]], requires_grad=True)
     model[0](x).sum().backward()
@@ -366,17 +360,15 @@ def test_dgrad_raw_moments_skip_output_layer_logits_site():
     logger.finalize_dgrad_raw_moments_by_layer()
     logger.remove_dgrad_hooks()
 
-    values, loss_scale = logger.consume_dgrad_raw_moments_by_layer()
-    values = _values_dict(values)
-    assert loss_scale is None
+    values = _values_dict(logger.consume_dgrad_raw_moments_by_layer())
     assert "output_layer/input0" in values
     assert "output_layer/output0" not in values
 
 
-def test_dgrad_raw_moments_accumulate_by_module_site_with_loss_scale():
+def test_dgrad_raw_moments_accumulate_by_module_site():
     model = [_ToyModel()]
     logger = RawMomentLogger()
-    logger.register_dgrad_hooks(model, loss_scale=128.0)
+    logger.register_dgrad_hooks(model)
 
     x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
     model[0](x).sum().backward()
@@ -384,9 +376,7 @@ def test_dgrad_raw_moments_accumulate_by_module_site_with_loss_scale():
     logger.finalize_dgrad_raw_moments_by_layer()
     logger.remove_dgrad_hooks()
 
-    values, loss_scale = logger.consume_dgrad_raw_moments_by_layer()
-    values = _values_dict(values)
-    assert loss_scale == 128.0
+    values = _values_dict(logger.consume_dgrad_raw_moments_by_layer())
     assert values["decoder.layers.0.linear/output0"] == {
         "count": 4.0,
         "sum_1": 4.0,

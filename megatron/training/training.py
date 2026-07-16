@@ -189,14 +189,7 @@ from .raw_moment_logging import (
     finalize_residual_dgrad_raw_moments_by_layer,
     finalize_residual_raw_moments_by_layer,
 )
-from .statistics_logging import (
-    save_activation_raw_moments_by_layer,
-    save_dgrad_raw_moments_by_layer,
-    save_grad_raw_moments_by_param,
-    save_param_raw_moments_by_param,
-    save_residual_dgrad_raw_moments_by_layer,
-    save_residual_raw_moments_by_layer,
-)
+from .statistics_logging import save_raw_moments_by_name
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
     append_to_progress_log,
@@ -2461,15 +2454,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         if log_activation_raw_moments_in_this_iteration:
             enable_activation_raw_moment_logging(model)
-        loss_scale_for_dgrad_raw_moments = None
-        if (
-            log_dgrad_raw_moments_in_this_iteration
-            or log_residual_dgrad_raw_moments_in_this_iteration
-        ):
-            if optimizer is not None and not optimizer.is_stub_optimizer:
-                loss_scale_for_dgrad_raw_moments = optimizer.get_loss_scale().item()
         if log_dgrad_raw_moments_in_this_iteration:
-            enable_dgrad_raw_moment_logging(model, loss_scale=loss_scale_for_dgrad_raw_moments)
+            enable_dgrad_raw_moment_logging(model)
         cuda_graph_context = (
             suspend_cuda_graph_replay()
             if suspend_cuda_graphs_for_raw_moments
@@ -2480,7 +2466,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 model,
                 capture_residuals=log_residual_raw_moments_in_this_iteration,
                 capture_dgrads=log_residual_dgrad_raw_moments_in_this_iteration,
-                loss_scale=loss_scale_for_dgrad_raw_moments,
             )
             if (
                 log_residual_raw_moments_in_this_iteration
@@ -4062,8 +4047,9 @@ def train(
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
             elif _should_write_global_training_stats(args):
-                save_param_raw_moments_by_param(
+                save_raw_moments_by_name(
                     statistics_log_dir,
+                    "param_raw_moments_by_param",
                     iteration,
                     args.consumed_train_samples,
                     param_raw_moments_by_param,
@@ -4081,8 +4067,9 @@ def train(
                 grad_raw_moments_by_param is not None
                 and _should_write_global_training_stats(args)
             ):
-                save_grad_raw_moments_by_param(
+                save_raw_moments_by_name(
                     statistics_log_dir,
+                    "grad_raw_moments_by_param",
                     iteration,
                     args.consumed_train_samples,
                     grad_raw_moments_by_param,
@@ -4096,8 +4083,9 @@ def train(
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
             elif activation_raw_moments_by_layer:
-                save_activation_raw_moments_by_layer(
+                save_raw_moments_by_name(
                     statistics_log_dir,
+                    "activation_raw_moments_by_layer",
                     iteration,
                     args.consumed_train_samples,
                     activation_raw_moments_by_layer,
@@ -4110,16 +4098,14 @@ def train(
             statistics_log_dir = _get_statistics_log_dir(args)
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
-            elif dgrad_raw_moments_by_layer is not None:
-                dgrad_raw_moments, dgrad_loss_scale = dgrad_raw_moments_by_layer
-                if dgrad_raw_moments:
-                    save_dgrad_raw_moments_by_layer(
-                        statistics_log_dir,
-                        iteration,
-                        args.consumed_train_samples,
-                        dgrad_raw_moments,
-                        loss_scale=dgrad_loss_scale,
-                    )
+            elif dgrad_raw_moments_by_layer:
+                save_raw_moments_by_name(
+                    statistics_log_dir,
+                    "dgrad_raw_moments_by_layer",
+                    iteration,
+                    args.consumed_train_samples,
+                    dgrad_raw_moments_by_layer,
+                )
         if (
             residual_raw_moment_interval > 0
             and iteration % residual_raw_moment_interval == 0
@@ -4129,8 +4115,9 @@ def train(
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
             elif residual_raw_moments_by_layer:
-                save_residual_raw_moments_by_layer(
+                save_raw_moments_by_name(
                     statistics_log_dir,
+                    "residual_raw_moments_by_layer",
                     iteration,
                     args.consumed_train_samples,
                     residual_raw_moments_by_layer,
@@ -4143,18 +4130,14 @@ def train(
             statistics_log_dir = _get_statistics_log_dir(args)
             if statistics_log_dir is None:
                 _warn_missing_statistics_log_dir()
-            elif residual_dgrad_raw_moments_by_layer is not None:
-                residual_dgrad_raw_moments, residual_dgrad_loss_scale = (
-                    residual_dgrad_raw_moments_by_layer
+            elif residual_dgrad_raw_moments_by_layer:
+                save_raw_moments_by_name(
+                    statistics_log_dir,
+                    "residual_dgrad_raw_moments_by_layer",
+                    iteration,
+                    args.consumed_train_samples,
+                    residual_dgrad_raw_moments_by_layer,
                 )
-                if residual_dgrad_raw_moments:
-                    save_residual_dgrad_raw_moments_by_layer(
-                        statistics_log_dir,
-                        iteration,
-                        args.consumed_train_samples,
-                        residual_dgrad_raw_moments,
-                        loss_scale=residual_dgrad_loss_scale,
-                    )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
