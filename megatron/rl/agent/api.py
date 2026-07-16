@@ -19,12 +19,7 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-from ..rollout_granularity import (
-    RELEASE_STATE_BY_SUBMISSION,
-    ConsumptionGranularity,
-    ReleaseState,
-    SubmissionGranularity,
-)
+from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -229,9 +224,11 @@ class _GranularityConfig(NamedTuple):
 class _SubmissionGate:
     """Gate capacity is measured in units of the configured submission granularity.
 
-    Releases are keyed on (state, granularity) so release sites for different
-    granularities can coexist on the same code path (e.g. stage_consume's
-    reorder branch releases per group for G submission and per batch for B).
+    Each granularity has a single release point: R slots free when inference
+    completes, so the gate bounds engine concurrency in rollouts. G and B
+    slots free when the trainer consumes the group/batch, so the gate
+    enforces the --rl-generation-lag run-ahead cap in groups/batches
+    respectively.
     """
 
     def __init__(
@@ -242,7 +239,6 @@ class _SubmissionGate:
     ) -> None:
         self._sem = asyncio.Semaphore(capacity)
         self._submission = submission
-        self._release_on = RELEASE_STATE_BY_SUBMISSION[submission]
         self.capacity = capacity
         # Observability counters, updated only on the configured submission
         # granularity (the only path that touches the semaphore). `held`
@@ -261,8 +257,8 @@ class _SubmissionGate:
             self.held += 1
             self.acquire_calls += 1
 
-    def release_after(self, state: ReleaseState, granularity: SubmissionGranularity) -> None:
-        if self._submission == granularity and self._release_on == state:
+    def release_for(self, granularity: SubmissionGranularity) -> None:
+        if self._submission == granularity:
             self._sem.release()
             self.held -= 1
             self.release_calls += 1
@@ -406,7 +402,7 @@ class _RolloutPipeline:
             self.request, item.params.inference_request
         )
         inferred_at = time.monotonic()
-        self.gate.release_after("inferred", "R")
+        self.gate.release_for("R")
         if item.infer_dequeued_at:
             self.engine_dwell.append(inferred_at - item.infer_dequeued_at)
         self.inferred_count += 1
@@ -435,17 +431,13 @@ class _RolloutPipeline:
                 rollouts = await asyncio.gather(
                     *[item.item.params.build_rollout(item.response) for item in completed]
                 )
-                # No-op under the current map (G releases at "consumed"); kept so
-                # flipping RELEASE_STATE_BY_SUBMISSION["G"] back to "assembled"
-                # restores run-ahead-to-assembly for experiments.
-                self.gate.release_after("assembled", "G")
                 self.assembled_count += 1
                 # NOTE: this filter is currently non-functional dead code:
                 # _GranularityConfig._validate rejects filter_groups_with_same_reward
                 # at pipeline construction, so `keep` is always True. Kept for a
                 # future PR that regenerates dropped groups instead of
                 # under-delivering to the caller. That PR must also release the
-                # gate slot on the drop path: with G/B releasing at "consumed",
+                # gate slot on the drop path: G/B slots free on consumption, and
                 # a dropped group never reaches stage_consume, so its slot (and
                 # eventually its batch's) would leak permanently.
                 keep = (
@@ -485,7 +477,7 @@ class _RolloutPipeline:
                     return
                 self._record_output_dwell(group)
                 yield group
-                self.gate.release_after("consumed", "G")
+                self.gate.release_for("G")
 
         next_batch_id = 0
         pending = self._consume_pending
@@ -505,8 +497,8 @@ class _RolloutPipeline:
                 next_batch_id += 1
                 for group in batch:
                     yield group
-                    self.gate.release_after("consumed", "G")
-                self.gate.release_after("consumed", "B")
+                    self.gate.release_for("G")
+                self.gate.release_for("B")
 
 
 class GroupedRolloutGenerator(Agent, ABC):

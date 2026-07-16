@@ -19,7 +19,6 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw
-from megatron.rl.rollout_granularity import RELEASE_STATE_BY_SUBMISSION
 
 
 class MockInferenceInterface(ReturnsRaw):
@@ -112,24 +111,19 @@ async def _flush(rounds: int = 50):
 
 
 class TestSubmissionGate:
-    def test_release_state_map(self):
-        assert RELEASE_STATE_BY_SUBMISSION == {"R": "inferred", "G": "consumed", "B": "consumed"}
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize("submission", ["R", "G", "B"])
-    async def test_release_requires_matching_state_and_granularity(self, submission):
+    async def test_release_requires_matching_granularity(self, submission):
         gate = _SubmissionGate(capacity=1, submission=submission)
         await gate.acquire_for(submission)
         assert gate.held == 1
-        release_on = RELEASE_STATE_BY_SUBMISSION[submission]
-        for state in ("inferred", "assembled", "consumed"):
-            for granularity in ("R", "G", "B"):
-                if state == release_on and granularity == submission:
-                    continue
-                gate.release_after(state, granularity)
+        for granularity in ("R", "G", "B"):
+            if granularity == submission:
+                continue
+            gate.release_for(granularity)
         assert gate.held == 1
         assert gate.release_calls == 0
-        gate.release_after(release_on, submission)
+        gate.release_for(submission)
         assert gate.held == 0
         assert gate.release_calls == 1
 
