@@ -4432,9 +4432,9 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             train_dataloader = None
             valid_dataloaders = None
             test_dataloader = None
-            do_train = (args.train_iters or 0) > 0
+            do_train = (not args.skip_train) and (args.train_iters or 0) > 0
             do_valid = (args.full_validation or args.eval_iters > 0)
-            do_test = (args.full_validation or args.eval_iters > 0)
+            do_test = (not args.skip_train) and (args.full_validation or args.eval_iters > 0)
 
         else:
             # Build datasets.

@@ -2802,7 +2802,15 @@ def evaluate_and_print_results_rl(
                         tb_writer.add_scalar(k, v, iteration)
             wandb_writer = get_wandb_writer()
             if wandb_writer:
-                wandb_writer.log(eval_metrics, step=iteration)
+                if getattr(args, 'skip_train', False):
+                    wandb_writer.log(
+                        {
+                            'eval_checkpoint_iter': iteration,
+                            **{f'eval_only/{k}': v for k, v in eval_metrics.items()},
+                        },
+                    )
+                else:
+                    wandb_writer.log(eval_metrics, step=iteration)
             logger.info(
                 "Evaluation results:"
                 + "".join([f"\n\t{k}: {v:0.4f}" for k, v in eval_metrics.items()])
