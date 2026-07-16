@@ -906,6 +906,10 @@ class TestPPForwardWithMHC:
                 use_cpu_initialization=True,
                 pipeline_dtype=torch.bfloat16,
                 bf16=True,
+                # params_dtype must match the actual .bfloat16() model params below;
+                # leaving it at the fp32 default makes the dense-mHC params_dtype
+                # cast in _forward_mlp a no-op and TE rejects the fp32 activations.
+                params_dtype=torch.bfloat16,
                 pipeline_model_parallel_size=pp_size,
                 virtual_pipeline_model_parallel_size=vp_size,
                 enable_hyper_connections=enable_mhc,
