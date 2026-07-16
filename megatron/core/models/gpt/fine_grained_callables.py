@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import weakref
 from contextlib import nullcontext
@@ -966,10 +966,17 @@ def build_mtp_layer_callables(layer):
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
     forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mtp_post_process_func]
+    # Under hyper-connections the MTP layer builds separate e_proj/h_proj and
+    # sets eh_proj to None; appending eh_proj unconditionally would place None
+    # in the delayed-wgrad callable list (crashing backward_dw) and leave the
+    # e_proj/h_proj weight gradients without a delayed-wgrad trigger.
+    mtp_projs = (
+        [layer.e_proj, layer.h_proj] if layer.config.enable_hyper_connections else [layer.eh_proj]
+    )
     if isinstance(backward_dw["attn"], list):
-        backward_dw["attn"].append(layer.eh_proj)
+        backward_dw["attn"].extend(mtp_projs)
     else:
-        backward_dw["attn"] = [backward_dw["attn"], layer.eh_proj]
+        backward_dw["attn"] = [backward_dw["attn"], *mtp_projs]
 
     return forward_funcs, backward_dw
 
