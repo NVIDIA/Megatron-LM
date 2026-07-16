@@ -423,11 +423,13 @@ class DBuffer:
     def replicate_to_partial(
         self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
     ) -> "DBuffer":
-        """Relabel a Replicate axis as Partial (local rescale, no communication).
+        """Reinterpret a Replicate axis as Partial without moving data.
 
-        A Replicate value equals the AVG reduction of identical per-rank locals,
-        so Replicate -> Partial(AVG) is a pure relabel. SUM reduces those locals
-        to ``value * axis_size``, so scale by ``1 / axis_size`` to preserve it.
+        Replicate and Partial share the same local layout, so this relabels the
+        existing local buffer rather than copying it, and issues no communication.
+        It is value-preserving for AVG -- the mean of identical per-rank locals is
+        that value. SUM would need a ``1 / axis_size`` rescale, so it is left
+        unsupported until a caller needs it.
         """
         axis = mesh_axis
         if not isinstance(new_placement, Partial):
@@ -436,19 +438,18 @@ class DBuffer:
             raise ValueError(
                 f"replicate_to_partial() requires Replicate placement on axis {axis!r}."
             )
+        if new_placement.reduce_op != dist.ReduceOp.AVG:
+            raise NotImplementedError(
+                f"replicate_to_partial() supports AVG only, got {new_placement.reduce_op!r}."
+            )
+        if out is not None:
+            raise NotImplementedError("replicate_to_partial() does not support an out buffer.")
 
         placements = list(self.placements)
         placements[axis] = new_placement
-        _validate_placements(placements)
-        out = self._create_or_validate_out(placements, out)
-        out.local_buffer.copy_(self.local_buffer)
-        if new_placement.reduce_op == dist.ReduceOp.SUM:
-            out.local_buffer.div_(self.mesh.size(axis))
-        elif new_placement.reduce_op != dist.ReduceOp.AVG:
-            raise NotImplementedError(
-                f"replicate_to_partial() supports SUM and AVG, got {new_placement.reduce_op!r}."
-            )
-        return out
+        return DBuffer.from_local(
+            self.local_buffer, self.mesh, placements, self.layout.tensor_shapes
+        )
 
     def get_local_tensor(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.

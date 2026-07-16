@@ -300,19 +300,20 @@ class FsdpParameterGroup:
                 raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
             return has_any_grad
 
-        # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Redistribute it back to the
-        # DP-outer-Partial accumulation placement -- a local relabel for HSDP, and
-        # a fresh reduce-scattered buffer for HFSDP in the future.
-        if self.main_grad.placements != self._accumulation_placements:
-            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
-            if has_grad(self.sharded_parameters):
-                self._install_sharded_grads()
-
         # zero_grad(set_to_none=True) clears sharded parameter grads, so this
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = has_grad(self.sharded_parameters)
+
+        # A non-accumulation main_grad means the previous step finalized it; this
+        # only happens on the first microbatch. Redistribute it back to the
+        # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
+        # and a fresh reduce-scattered buffer for HFSDP in the future.
+        if self.main_grad.placements != self._accumulation_placements:
+            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+            if has_sharded_grads:
+                self._install_sharded_grads()
+
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         )

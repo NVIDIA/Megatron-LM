@@ -254,6 +254,75 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
     )
 
 
+def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
+    """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
+
+    Counting NCCL events over a multi-microbatch step, the DP-inner reduce-scatter
+    fires once per microbatch per group while the DP-outer all-reduce that
+    finalizes main_grad fires only on the last microbatch, so the reduce-scatter
+    count is exactly ``num_microbatches`` times the all-reduce count. This asserts
+    on event counts only, not numerics.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
+
+    outer_size = 2
+    inner_size = world_size // outer_size
+    mesh = init_device_mesh(
+        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    torch.manual_seed(1234)
+    model = TinyModel().to(device)
+    fully_shard(model.fc1, mesh=mesh, placements=_hsdp_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_hsdp_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    num_microbatches = 3
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, 4, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train_one_step() -> None:
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+            is_last = microbatch_index == num_microbatches - 1
+            with microbatch(model, is_last=is_last):
+                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                (loss / num_microbatches).backward()
+        optimizer.step()
+
+    train_one_step()
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        train_one_step()
+        torch.cuda.synchronize(device)
+
+    cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
+    reduce_scatter_events = [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower()
+        and ("reducescatter" in event.name.lower() or "reduce_scatter" in event.name.lower())
+    ]
+    all_reduce_events = [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower() and "allreduce" in event.name.lower()
+    ]
+    # HSDP must trigger the DP-outer all-reduce that plain DP never issues.
+    assert all_reduce_events, [event.name for event in cuda_events]
+    # DP-inner reduce-scatter runs every microbatch; the DP-outer all-reduce runs
+    # only on the last, so the counts differ by exactly the microbatch factor.
+    assert len(reduce_scatter_events) == len(all_reduce_events) * num_microbatches, (
+        f"Expected reduce-scatter ({len(reduce_scatter_events)}) to be {num_microbatches}x "
+        f"the DP-outer all-reduce count ({len(all_reduce_events)})."
+    )
+
+
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     """An outer FsdpModule owns direct parameters but not nested child FsdpModule parameters."""
     world_size = distributed_setup.world_size
