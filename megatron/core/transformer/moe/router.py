@@ -844,8 +844,6 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=not self._emit_multihot,
         )
-        # squeeze(1) is a no-op when the second dim != 1; safe for both
-        # [num_tokens, topk] (dense_output=True) and [num_tokens, num_experts] (False).
         return probs.squeeze(1), routing.squeeze(1)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
