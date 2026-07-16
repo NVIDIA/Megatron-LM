@@ -2927,7 +2927,10 @@ async def _rollout_keepalive(inference_interface, interval_s, requests_per_tick,
 
     request = InferenceRequest(
         prompt=[LLMChatMessage(role='user', content='keepalive ping')],
-        generation_args=GenericGenerationArgs(max_tokens=8, temperature=1.0),
+        # 512 tokens/tick ~= 4-7s of decode per engine per interval: clears the
+        # DCGM_FI_PROF_SM_ACTIVE <= 0.01 idle threshold (8-token pings measured
+        # ~0.1% duty cycle and job 5347804 was reaped mid-save through them).
+        generation_args=GenericGenerationArgs(max_tokens=512, temperature=1.0),
     )
     consecutive_failures = 0
     while not stop_event.is_set():
