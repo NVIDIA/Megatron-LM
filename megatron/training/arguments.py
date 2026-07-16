@@ -1545,6 +1545,39 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
 
+    if args.use_layer_wise_distributed_optimizer:
+        if not args.use_layer_wise_param_layout:
+            # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
+            # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
+            # reuse_grad_buf.
+            if args.fp8_param_gather:
+                assert not getattr(args, 'fp4_param_gather', False), (
+                    "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
+                    "(mxfp8 or blockwise); fp4_param_gather is out of scope."
+                )
+                assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
+                    "fp8 parameter gather on the decoupled compact LayerWise DDP layout requires "
+                    f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."
+                )
+                if args.fp8_recipe == 'mxfp8':
+                    assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                        "mxfp8 + --fp8-param-gather on the decoupled compact LayerWise DDP layout "
+                        "requires --reuse-grad-buf-for-mxfp8-param-ag (or use fp8_recipe='blockwise')."
+                    )
+            assert args.num_distributed_optimizer_instances == 1, (
+                "--no-use-layer-wise-param-layout (decoupled compact LayerWise DDP layout) requires "
+                "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
+                "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
+                "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
+        else:
+            # Padded LayerWise param layout: fp8/fp4 parameter gather is not supported here.
+            assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+                "Layer-wise (Muon) distributed optimizer with the padded param layout does not "
+                "support FP8/FP4 parameter gather. Use --no-use-layer-wise-param-layout (the "
+                "decoupled compact layout) for fp8 parameter gather, or fp8_param_gather=False."
+            )
+
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
@@ -2903,6 +2936,24 @@ def _add_distributed_args(parser):
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
+    group.add_argument(
+        '--no-use-layer-wise-param-layout',
+        action='store_false',
+        dest='use_layer_wise_param_layout',
+        help='Opt out of the precomputed shard-aligned (padded) LayerWise param layout. '
+        'With an emerging (Muon) optimizer under --use-distributed-optimizer, this selects '
+        'the experimental compact, decoupled DDP layout: LayerWise-managed (Muon 2D matrix) '
+        'buffers use a compact no-padding DDP layout and locally disable DistributedOptimizer '
+        'semantics (all-reduce gradients + legacy whole-param ping-pong ownership + '
+        'allgather_params param sync), while sibling non-LayerWise buffers (embeddings, '
+        'biases, layernorm) keep the standard byte-level DistributedOptimizer. This removes '
+        'the persistent dp_size * max(shard_load) LayerWise padding from the long-lived '
+        'buffers. Supports --fp8-param-gather (mxfp8 or blockwise): the Muon buffers stay '
+        'non-DistOpt and the param sync runs through the FP8-aware allgather_params ping-pong '
+        'path (stage fp32 master -> bf16, uneven all-gather, requantize per rank); mxfp8 requires '
+        '--reuse-grad-buf-for-mxfp8-param-ag. Produces different bf16 reduction ordering from the '
+        'default padded layout, so will not match its loss curves bit-for-bit.',
+    )
     return parser
 
 
