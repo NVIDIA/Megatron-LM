@@ -46,23 +46,18 @@ CONTROL_TRANSITIONS = {
         idempotent_in=frozenset({CoordinatorState.PAUSED, CoordinatorState.SUSPENDED}),
     ),
     Headers.UNPAUSE: ControlTransition(
-        allowed_from=frozenset({CoordinatorState.PAUSED}),
-        new_state=CoordinatorState.RUNNING,
+        allowed_from=frozenset({CoordinatorState.PAUSED}), new_state=CoordinatorState.RUNNING
     ),
     Headers.SUSPEND: ControlTransition(
-        allowed_from=frozenset({CoordinatorState.PAUSED}),
-        new_state=CoordinatorState.SUSPENDED,
+        allowed_from=frozenset({CoordinatorState.PAUSED}), new_state=CoordinatorState.SUSPENDED
     ),
     Headers.RESUME: ControlTransition(
-        allowed_from=frozenset({CoordinatorState.SUSPENDED}),
-        new_state=CoordinatorState.PAUSED,
+        allowed_from=frozenset({CoordinatorState.SUSPENDED}), new_state=CoordinatorState.PAUSED
     ),
     Headers.STOP: ControlTransition(
         allowed_from=frozenset({CoordinatorState.PAUSED, CoordinatorState.SUSPENDED}),
         new_state=CoordinatorState.STOPPING,
     ),
     # No state change; broadcast in any state so engines stay in sync.
-    Headers.SET_GENERATION_EPOCH: ControlTransition(
-        allowed_from=_ALL_STATES, new_state=None
-    ),
+    Headers.SET_GENERATION_EPOCH: ControlTransition(allowed_from=_ALL_STATES, new_state=None),
 }

@@ -97,8 +97,7 @@ def handle_submit_request(coordinator, sender_identity, payload):
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
     engine_payload = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
-        use_bin_type=True,
+        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params], use_bin_type=True
     )
 
     request_hashes = coordinator.compute_request_hashes(prompt)
@@ -153,9 +152,7 @@ def handle_control_signal(coordinator, sender_identity, payload):
     if coordinator.state not in transition.allowed_from:
         # Silently ignore redundant signals; warn on genuinely invalid ones.
         if coordinator.state not in transition.idempotent_in:
-            logging.warning(
-                "Coordinator: ignoring %s in state %s", header.name, coordinator.state
-            )
+            logging.warning("Coordinator: ignoring %s in state %s", header.name, coordinator.state)
         return
     if transition.new_state is not None:
         coordinator.state = transition.new_state
