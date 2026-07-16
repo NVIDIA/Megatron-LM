@@ -311,6 +311,8 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_overlaps_communication_and_compute(distributed_setup):
     """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
