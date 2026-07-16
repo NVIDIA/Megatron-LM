@@ -1,1 +1,59 @@
-[]
+{
+  "skill": "mcore-run-on-slurm",
+  "cases": [
+    {
+      "id": "mcore-slurm-two-node-launch",
+      "question": "Write the essential launch setup for a two-node Megatron-LM SLURM job with eight GPUs per node.",
+      "expected_skill": "mcore-run-on-slurm",
+      "expected_script": null,
+      "ground_truth": "Use one srun task per node from a shared worktree, derive the rendezvous environment from SLURM, and launch 16 workers through uv run python -m torch.distributed.run with explicit node rank and rendezvous arguments.",
+      "expected_behavior": [
+        "Routes to mcore-run-on-slurm",
+        "Uses a shared worktree path visible to both nodes",
+        "Sets MASTER_ADDR from the first SLURM hostname and defines MASTER_PORT",
+        "Sets NNODES=2, GPUS_PER_NODE=8, and WORLD_SIZE=16",
+        "Uses one srun task per node and uv run python -m torch.distributed.run",
+        "Passes nnodes, nproc-per-node, node-rank, master-addr, and master-port"
+      ]
+    },
+    {
+      "id": "mcore-slurm-pre-blackwell-tensor-parallel",
+      "question": "My H100 SLURM job uses tensor parallel size 2 without FSDP. What should CUDA_DEVICE_MAX_CONNECTIONS be?",
+      "expected_skill": "mcore-run-on-slurm",
+      "expected_script": null,
+      "ground_truth": "For pre-Blackwell hardware with TP greater than one and non-FSDP execution, set CUDA_DEVICE_MAX_CONNECTIONS=1; the relevant code path asserts if the requirement is not met.",
+      "expected_behavior": [
+        "Routes to mcore-run-on-slurm",
+        "Recommends CUDA_DEVICE_MAX_CONNECTIONS=1",
+        "Explains that this is the pre-Blackwell TP>1 non-FSDP rule",
+        "Describes the expected failure as an assertion rather than a silent deadlock"
+      ]
+    },
+    {
+      "id": "mcore-slurm-blackwell-fsdp",
+      "question": "Should I export CUDA_DEVICE_MAX_CONNECTIONS=1 for a GB200 job using Torch-FSDP2?",
+      "expected_skill": "mcore-run-on-slurm",
+      "expected_script": null,
+      "ground_truth": "No. Blackwell does not need the setting, and Torch-FSDP2 must not use the value 1; leave it unset or use a value greater than one if another requirement applies.",
+      "expected_behavior": [
+        "Routes to mcore-run-on-slurm",
+        "Says not to set CUDA_DEVICE_MAX_CONNECTIONS=1",
+        "Notes that Blackwell does not require the setting",
+        "Notes that Torch-FSDP2 must not use the value 1"
+      ]
+    },
+    {
+      "id": "mcore-slurm-rank-failure-diagnosis",
+      "question": "Rank 0 ends in an NCCL timeout, but rank 5 logged a Python shape traceback several seconds earlier. Which failure should I investigate first?",
+      "expected_skill": "mcore-run-on-slurm",
+      "expected_script": null,
+      "ground_truth": "Inspect every rank and treat the earliest non-NCCL Python traceback as the likely root cause; later NCCL timeouts are commonly downstream symptoms.",
+      "expected_behavior": [
+        "Routes to mcore-run-on-slurm",
+        "Prioritizes the earlier rank 5 Python traceback",
+        "Treats the later NCCL timeout as a downstream symptom",
+        "Checks world-size and parallelism divisibility for a shape-related failure"
+      ]
+    }
+  ]
+}
