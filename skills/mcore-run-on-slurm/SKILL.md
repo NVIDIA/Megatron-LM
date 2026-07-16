@@ -5,6 +5,7 @@ license: Apache-2.0
 when_to_use: Submitting a SLURM job; writing or debugging an sbatch script; configuring multi-node distributed training; setting MASTER_ADDR / MASTER_PORT / WORLD_SIZE; diagnosing a SLURM job failure; 'how do I run on the cluster', 'sbatch', 'multi-node training'.
 metadata:
   author: Oliver Koenig <okoenig@nvidia.com>
+  version: "1.0.1"
 ---
 
 # Run Megatron-LM on SLURM
