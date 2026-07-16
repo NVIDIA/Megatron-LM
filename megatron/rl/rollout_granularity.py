@@ -6,20 +6,6 @@ from typing import Literal
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
-ReleaseState = Literal["inferred", "assembled", "consumed"]
-
-
-# R releases its slot when inference completes: the gate bounds engine
-# concurrency in rollouts. G and B release when the trainer consumes the
-# group/batch: the gate enforces the --rl-generation-lag run-ahead cap in
-# groups/batches respectively. G previously released at "assembled", which
-# let submission outrun consumption without bound (in-flight backlog grew
-# past the lag cap since assembled-but-unconsumed groups held no slot).
-RELEASE_STATE_BY_SUBMISSION: dict[SubmissionGranularity, ReleaseState] = {
-    "R": "inferred",
-    "G": "consumed",
-    "B": "consumed",
-}
 
 
 def get_rl_parallel_generation_tasks(args) -> int:
