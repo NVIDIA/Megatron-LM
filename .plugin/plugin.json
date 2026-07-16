@@ -1,0 +1,5 @@
+{
+  "name": "megatron-lm",
+  "description": "Megatron-LM repository skills (build and dependency, CI/CD, testing, golden values, linting, base-image bumps, Slurm runs) for Regent agents working on this repo.",
+  "version": "0.1.0"
+}
