@@ -52,7 +52,7 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
-        "TRAINING_SCRIPT_PATH=./examples/mimo/train.py"
+        "TRAINING_SCRIPT_PATH=./examples/mimo/{training_script}"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
@@ -65,13 +65,30 @@ products:
     products:
       - environment: [dev]
         scope: [flaky]
+        training_script: [train.py]
   - test_case: [mimo_vlm_pretrain_convergence_tp1_pp1_cp1_dp8_seq_packing]
     products:
       - environment: [dev]
         # Broken: iteration-time (rtol=0.05) keeps failing in CI — see issue #4654.
         scope: [mr-github-broken]
+        training_script: [train.py]
   - test_case: [mimo_vlm_pretrain_convergence_tp1_pp1_cp2_dp8]
     products:
       - environment: [dev]
         # Broken: exceeds 1h job timeout in CI
         scope: [mr-github-broken]
+        training_script: [train.py]
+  - test_case: [mimo_hetero_colocated_pp1_fanin_resume_torch_dist]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        training_script: [pretrain_mimo.py]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [mimo_hetero_colocated_pp1_fanout_resume_torch_dist]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        training_script: [pretrain_mimo.py]
+        n_repeat: [1]
+        time_limit: [1800]

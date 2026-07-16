@@ -76,6 +76,20 @@ def test_get_forward_backward_func():
     Utils.destroy_model_parallel()
 
 
+def test_plain_pp1_collection_selects_no_pipeline_schedule(monkeypatch):
+    pg_collection = ProcessGroupCollection()
+    pg_collection.pp = SimpleNamespace(size=lambda: 1)
+    monkeypatch.setattr(
+        schedule.parallel_state,
+        "get_pipeline_model_parallel_world_size",
+        lambda: pytest.fail("global MPU should not be read"),
+    )
+    assert (
+        schedule.get_forward_backward_func(schedule_pg_collection=pg_collection)
+        is schedule.forward_backward_no_pipelining
+    )
+
+
 def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)

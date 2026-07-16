@@ -10,10 +10,19 @@ from typing import List
 from examples.mimo.training.topology import ModuleGridSpec
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 
+MIMO_LAYOUT_NON_COLOCATED = "non-colocated"
+MIMO_LAYOUT_COLOCATED = "colocated"
+
 
 def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Register hetero parallelism args for the single-encoder MIMO example."""
     grid = parser.add_argument_group("hetero module grids")
+    grid.add_argument(
+        "--mimo-layout",
+        choices=(MIMO_LAYOUT_NON_COLOCATED, MIMO_LAYOUT_COLOCATED),
+        default=MIMO_LAYOUT_NON_COLOCATED,
+        help="Place encoder and language grids on disjoint ranks or colocate both on every rank.",
+    )
 
     # Single encoder grid; CP/PP stay fixed at 1.
     grid.add_argument("--encoder-tp", type=int, default=2,
@@ -52,7 +61,7 @@ def add_hetero_grid_args(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
 
 
 def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tuple[int, int]:
-    """Validate the disjoint hetero grid layout; returns ``(encoder_size, llm_size)``."""
+    """Validate the hetero grid layout; returns ``(encoder_size, llm_size)``."""
     if args.llm_cp != 1:
         raise ValueError("hetero MIMO training currently supports CP=1 only")
 
@@ -64,8 +73,11 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
         )
 
     llm_size = args.llm_tp * args.llm_cp * args.llm_pp * args.llm_dp
+    layout = args.mimo_layout
 
     if args.llm_only:
+        if layout == MIMO_LAYOUT_COLOCATED:
+            raise ValueError("colocated MIMO requires an encoder module")
         if args.llm_offset != 0:
             raise ValueError(
                 "--llm-only requires --llm-offset 0 so language ranks cover WORLD_SIZE"
@@ -79,6 +91,24 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             )
         return 0, llm_size
 
+    encoder_size = args.encoder_tp * args.encoder_dp
+    if layout == MIMO_LAYOUT_COLOCATED:
+        if args.llm_pp != 1 or args.llm_offset != 0:
+            raise ValueError("colocated MIMO requires --llm-pp 1 and --llm-offset 0")
+        if encoder_size != world_size or llm_size != world_size:
+            raise ValueError(
+                "colocated encoder and language grids must each cover WORLD_SIZE; "
+                f"encoder={encoder_size}, language={llm_size}, world={world_size}"
+            )
+        smaller_dp, larger_dp = sorted((args.encoder_dp, args.llm_dp))
+        if larger_dp % smaller_dp:
+            raise ValueError("colocated encoder and language DP sizes must divide evenly")
+        if (args.micro_batch_size * args.llm_dp) % args.encoder_dp:
+            raise ValueError("colocated encoder micro-batch size must be integral")
+        return encoder_size, llm_size
+    if layout != MIMO_LAYOUT_NON_COLOCATED:
+        raise ValueError(f"unsupported MIMO layout: {layout}")
+
     # Fan-out divisibility: the bridge splits (mbs * llm_dp) LLM lanes across
     # encoder_dp encoder lanes; the split must be exact.
     if (args.micro_batch_size * args.llm_dp) % args.encoder_dp != 0:
@@ -87,7 +117,6 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
             f"(got {args.micro_batch_size} * {args.llm_dp} % {args.encoder_dp} != 0)"
         )
 
-    encoder_size = args.encoder_tp * args.encoder_dp
     encoder_ranks = set(range(encoder_size))  # encoder span always starts at rank 0
     llm_ranks = set(range(args.llm_offset, args.llm_offset + llm_size))
     all_ranks = set(range(world_size))
@@ -104,6 +133,46 @@ def validate_hetero_grid_args(args: argparse.Namespace, world_size: int) -> tupl
         )
 
     return encoder_size, llm_size
+
+
+def validate_colocated_runtime_args(args: argparse.Namespace) -> None:
+    """Reject runtime modes not supported by the initial colocated path."""
+    if args.mimo_layout != MIMO_LAYOUT_COLOCATED:
+        return
+
+    unsupported = {
+        "activation recompute": args.recompute_granularity is not None,
+        "async checkpoint save": args.async_save,
+        "rerun (pass --rerun-mode disabled)": args.rerun_mode != "disabled",
+        "TE RNG tracker": args.te_rng_tracker,
+        "parameter-norm logging": args.log_params_norm,
+        "zero-gradient logging": args.log_num_zeros_in_grad,
+        "FP16": args.fp16,
+        "FSDP": args.use_megatron_fsdp or args.use_torch_fsdp2,
+        "DDP overlap": bool(
+            args.overlap_grad_reduce
+            or args.overlap_param_gather
+            or args.overlap_param_gather_with_optimizer_step
+        ),
+        "model upcycling": args.moe_use_upcycling,
+        "meta-device initialization": args.init_model_with_meta_device,
+        "CUDA graphs": args.cuda_graph_impl != "none",
+    }
+    enabled = [name for name, value in unsupported.items() if value]
+    if enabled:
+        raise ValueError("colocated MIMO does not support: " + ", ".join(enabled))
+    if args.llm_expt_tp not in (None, 1):
+        raise ValueError("colocated MIMO requires --llm-expt-tp 1")
+    if args.eval_micro_batch_size != args.micro_batch_size:
+        raise ValueError("colocated train and eval micro-batch sizes must match")
+
+    checkpoint_requested = bool(args.save or args.load or args.pretrained_checkpoint)
+    if checkpoint_requested and not args.data_parallel_random_init:
+        raise ValueError("colocated checkpointing requires --data-parallel-random-init")
+    if checkpoint_requested and args.ckpt_format != "torch_dist":
+        raise ValueError("colocated checkpointing requires --ckpt-format torch_dist")
+    if checkpoint_requested and (args.ckpt_fully_parallel_save or args.ckpt_fully_parallel_load):
+        raise ValueError("colocated MIMO does not support fully parallel checkpointing")
 
 
 def build_module_grid_specs(

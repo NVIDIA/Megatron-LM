@@ -9,8 +9,10 @@ import argparse
 from examples.mimo.model_providers import resolve_provider
 from examples.mimo.model_providers.nemotron_moe_vlm import add_model_provider_args
 from examples.mimo.training.args import (
+    MIMO_LAYOUT_COLOCATED,
     add_hetero_grid_args,
     build_module_grid_specs,
+    validate_colocated_runtime_args,
     validate_hetero_grid_args,
 )
 from examples.mimo.training.builder import MimoBuildConfig
@@ -52,6 +54,7 @@ def _parse_and_validate() -> argparse.Namespace:
         validate_args(args, {"dataloader_type": "external"})
     finally:
         args.world_size = physical_world_size
+    validate_colocated_runtime_args(args)
     if not args.use_distributed_optimizer:
         raise ValueError("heterogeneous MIMO training requires --use-distributed-optimizer")
 
@@ -60,6 +63,10 @@ def _parse_and_validate() -> argparse.Namespace:
             args.vocab_size, args.make_vocab_size_divisible_by, args.llm_tp, logging_enabled=False
         )
     return args
+
+
+def _loader_iterators(loaders):
+    return tuple(iter(loader) if loader is not None else None for loader in loaders)
 
 
 def main() -> None:
@@ -77,16 +84,25 @@ def main() -> None:
         specs = build_module_grid_specs(args, args.world_size, encoder_name)
         topology = create_topology(specs)
 
-        communicator = provider.build_communicator(args, topology)
-
-        loaders = build_train_valid_test_data_loaders(args, topology)
-        iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
+        communicator = (
+            None
+            if args.mimo_layout == MIMO_LAYOUT_COLOCATED
+            else provider.build_communicator(args, topology)
+        )
+        iterators = None
+        if args.mimo_layout != MIMO_LAYOUT_COLOCATED:
+            loaders = build_train_valid_test_data_loaders(args, topology)
+            iterators = _loader_iterators(loaders)
 
         model_cfg = MimoBuildConfig(_topology=topology)
         cfg = pretrain_cfg_container_from_args(args, model_cfg)
 
         def train_valid_test_data_provider(_train_val_test_num_samples):
-            return iterators
+            if iterators is not None:
+                return iterators
+            # Colocated loaders must observe consumed-sample offsets restored by checkpoint load.
+            loaders = build_train_valid_test_data_loaders(args, topology)
+            return _loader_iterators(loaders)
 
         train_valid_test_data_provider.is_distributed = True
         pretrain(

@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 from math import isqrt
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 
 from examples.mimo.training.topology import HeteroTopology
@@ -66,6 +68,7 @@ class _MockVLMDataset(Dataset):
         img_w: int,
         pixel_shuffle: bool,
         num_image_tiles: int,
+        start_index: int = 0,
     ) -> None:
         self.size = size
         self.seq_len = seq_len
@@ -80,6 +83,7 @@ class _MockVLMDataset(Dataset):
         self.img_w = img_w
         self.pixel_shuffle = pixel_shuffle
         self.num_image_tiles = num_image_tiles
+        self.start_index = start_index
 
         if self.seq_len <= self.image_seq_length:
             raise ValueError(
@@ -139,6 +143,7 @@ class _MockVLMDataset(Dataset):
         return self.size
 
     def __getitem__(self, idx: int) -> dict[str, object]:
+        idx += self.start_index
         input_ids = self._mock_tokenize(idx)
         labels = torch.full_like(input_ids, -100)
         labels[:-1] = input_ids[1:]
@@ -207,6 +212,9 @@ def _build_mock_vlm_dataloader(
     img_w: int,
     pixel_shuffle: bool,
     num_image_tiles: int,
+    start_index: int = 0,
+    collate_fn: Optional[Callable] = None,
+    isolate_rng: bool = False,
 ) -> DataLoader:
     """Create synthetic data matching the heterogeneous Nemotron RADIO VLM input schema."""
     dataset = _MockVLMDataset(
@@ -225,9 +233,15 @@ def _build_mock_vlm_dataloader(
         img_w=img_w,
         pixel_shuffle=pixel_shuffle,
         num_image_tiles=num_image_tiles,
+        start_index=start_index,
     )
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=_collate_mock_batch
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_fn or _collate_mock_batch,
+        generator=torch.Generator().manual_seed(seed) if isolate_rng else None,
     )
 
 
@@ -304,6 +318,36 @@ def build_train_valid_test_data_loaders(
             raise ValueError("RADIO mock data requires --disable-vision-class-token")
         encoder_needs_data = rank_in_encoder and is_pp_first_stage(encoder_pgc.pp)
 
+    if getattr(topology, "is_colocated", False):
+        if encoder_name is None:
+            raise ValueError("colocated MIMO mock data requires an encoder")
+        if not getattr(args, "disable_vision_class_token", False):
+            raise ValueError("RADIO mock data requires --disable-vision-class-token")
+        encoder_dp = encoder_pgc.dp.size()
+        language_dp = language_pgc.dp.size()
+        canonical_is_encoder = encoder_dp <= language_dp
+        canonical_pgc = encoder_pgc if canonical_is_encoder else language_pgc
+        canonical_dp = min(encoder_dp, language_dp)
+        start_indices = (
+            getattr(args, "consumed_train_samples", 0) // canonical_dp,
+            getattr(args, "consumed_valid_samples", 0) // canonical_dp,
+            0,
+        )
+        return _build_split_loaders(
+            args,
+            batch_size=args.micro_batch_size * language_dp // canonical_dp,
+            pg_collection=canonical_pgc,
+            module_seed_offset=(
+                _ENCODER_SEED_OFFSET if canonical_is_encoder else _LANGUAGE_SEED_OFFSET
+            ),
+            encoder_name=encoder_name,
+            collate_fn=partial(
+                _collate_colocated_batch, topology=topology, encoder_name=encoder_name
+            ),
+            start_indices=start_indices,
+            isolate_rng=True,
+        )
+
     if encoder_needs_data and language_needs_data:
         raise ValueError("the external DataLoader adapter requires non-colocated module grids")
     if encoder_needs_data:
@@ -333,6 +377,9 @@ def _build_split_loaders(
     pg_collection,
     module_seed_offset: int,
     encoder_name: Optional[str],
+    collate_fn: Optional[Callable] = None,
+    start_indices: tuple[int, int, int] = (0, 0, 0),
+    isolate_rng: bool = False,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
     base_seed = args.seed + module_seed_offset + get_pg_rank(pg_collection.dp)
@@ -342,10 +389,83 @@ def _build_split_loaders(
             batch_size=batch_size,
             dataset_size=getattr(args, "mock_dataset_size", 10_000),
             seed=base_seed + split_offset,
+            start_index=start_index,
+            collate_fn=collate_fn,
+            isolate_rng=isolate_rng,
             **common,
         )
-        for split_offset in _SPLIT_SEED_OFFSETS
+        for split_offset, start_index in zip(_SPLIT_SEED_OFFSETS, start_indices)
     )
+
+
+def _collate_colocated_batch(
+    batch: list[dict[str, object]], *, topology: HeteroTopology, encoder_name: str
+) -> dict[str, object]:
+    result = _collate_mock_batch(batch)
+    encoder_pg = topology.module_pgs[encoder_name].dp
+    language_pg = topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY].dp
+    encoder_dp, language_dp = encoder_pg.size(), language_pg.size()
+    batch_size = result["input_ids"].size(0)
+
+    if encoder_dp > language_dp:
+        scale = encoder_dp // language_dp
+        slot = _grid_dp_rank(topology.grids[encoder_name]) % scale
+        start, end = _slice_bounds(batch_size, scale, slot)
+        _slice_modality_inputs(result, encoder_name, start, end, batch_size)
+    elif language_dp > encoder_dp:
+        scale = language_dp // encoder_dp
+        slot = _grid_dp_rank(topology.grids[MIMO_LANGUAGE_MODULE_KEY]) % scale
+        start, end = _slice_bounds(batch_size, scale, slot)
+        for key in ("input_ids", "labels", "loss_mask", "position_ids"):
+            result[key] = result[key][start:end].contiguous()
+    return result
+
+
+def _grid_dp_rank(grid) -> int:
+    """Return the DP index used by the colocated bridge rank mapping."""
+    rank = dist.get_rank()
+    for dp_rank, tp_ranks in enumerate(grid.get_rank_enum(["tp"])):
+        if rank in tp_ranks:
+            return dp_rank
+    raise ValueError(f"rank {rank} is not present in the colocated module grid")
+
+
+def _slice_bounds(batch_size: int, scale: int, slot: int) -> tuple[int, int]:
+    if batch_size % scale:
+        raise ValueError("mock batch cannot be divided across colocated DP ranks")
+    size = batch_size // scale
+    return slot * size, (slot + 1) * size
+
+
+def _slice_modality_inputs(
+    batch: dict[str, object], modality_name: str, start: int, end: int, batch_size: int
+) -> None:
+    for encoder_inputs in batch["modality_inputs"][modality_name].values():
+        x = encoder_inputs["x"]
+        if x.ndim == 4:
+            images_per_sample = x.size(0) // batch_size
+            encoder_inputs["x"] = x[
+                start * images_per_sample : end * images_per_sample
+            ].contiguous()
+            continue
+
+        sizes = encoder_inputs["imgs_sizes"]
+        packed = encoder_inputs["packed_seq_params"]
+        images_per_sample = sizes.size(0) // batch_size
+        image_start, image_end = start * images_per_sample, end * images_per_sample
+        cu = packed.cu_seqlens_q
+        token_start, token_end = int(cu[image_start]), int(cu[image_end])
+        new_cu = (cu[image_start : image_end + 1] - token_start).contiguous()
+        seq_lens = new_cu[1:] - new_cu[:-1]
+        encoder_inputs["x"] = x[:, token_start:token_end].contiguous()
+        encoder_inputs["imgs_sizes"] = sizes[image_start:image_end].contiguous()
+        encoder_inputs["packed_seq_params"] = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=new_cu,
+            cu_seqlens_kv=new_cu.clone(),
+            max_seqlen_q=int(seq_lens.max()),
+            max_seqlen_kv=int(seq_lens.max()),
+        )
 
 
 def _mock_loader_kwargs(args: argparse.Namespace, encoder_name: Optional[str]) -> dict:

@@ -6,9 +6,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import random as python_random
 from collections.abc import Callable
-from typing import Any, Optional, TypeVar, Union
+from contextvars import ContextVar
+from typing import Any, Iterator, Optional, TypeVar, Union
 
+import numpy as np
 import torch
 from torch import _C
 from torch.cuda import _lazy_call, _lazy_init
@@ -91,6 +94,12 @@ except ModuleNotFoundError:
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
+_CUDA_RNG_NAMESPACE = ContextVar('cuda_rng_namespace', default=None)
+
+
+def _rng_state_name(name: str) -> str:
+    namespace = _CUDA_RNG_NAMESPACE.get()
+    return name if namespace is None else f'{namespace}::{name}'
 
 
 def _get_cuda_rng_state(
@@ -204,13 +213,66 @@ def convert_cuda_rng_state(
 def get_expert_parallel_rng_tracker_name():
     """Get the expert parallel rng tracker name"""
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
-    return _EXPERT_PARALLEL_RNG_TRACKER_NAME
+    return _rng_state_name(_EXPERT_PARALLEL_RNG_TRACKER_NAME)
 
 
 def get_data_parallel_rng_tracker_name():
     """Get the data parallel rng tracker name"""
     global _DATA_PARALLEL_RNG_TRACKER_NAME
-    return _DATA_PARALLEL_RNG_TRACKER_NAME
+    return _rng_state_name(_DATA_PARALLEL_RNG_TRACKER_NAME)
+
+
+@contextlib.contextmanager
+def cuda_rng_namespace(
+    namespace: Optional[str], fork_data_parallel_rng: bool = False
+) -> Iterator[None]:
+    """Select namespaced states in Megatron's CUDA RNG tracker.
+
+    This is a dynamic scope: deferred work such as activation recompute must re-enter it
+    explicitly. Transformer Engine, stateless inference, and CUDA-graph trackers are rejected.
+    """
+    if namespace == '':
+        raise ValueError('CUDA RNG namespace must be nonempty')
+    tracker = None
+    if namespace is not None:
+        tracker = get_cuda_rng_tracker()
+        if (
+            not isinstance(tracker, CudaRNGStatesTracker)
+            or tracker.is_inference_rng_tracker
+            or tracker.use_cudagraphable_rng
+        ):
+            raise RuntimeError(
+                'CUDA RNG namespaces require Megatron CudaRNGStatesTracker '
+                'with state tracking enabled and CUDA graphs disabled'
+            )
+    token = _CUDA_RNG_NAMESPACE.set(namespace)
+    try:
+        if namespace is not None and fork_data_parallel_rng:
+            assert tracker is not None
+            with tracker.fork(get_data_parallel_rng_tracker_name()):
+                yield
+        else:
+            yield
+    finally:
+        _CUDA_RNG_NAMESPACE.reset(token)
+
+
+@contextlib.contextmanager
+def fork_process_rng_state(seed: int) -> Iterator[None]:
+    """Temporarily seed CPU RNGs used during module construction."""
+    python_state = python_random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    try:
+        python_random.seed(seed)
+        np.random.seed(seed)
+        generator = torch.Generator(device='cpu').manual_seed(seed)
+        torch.set_rng_state(generator.get_state())
+        yield
+    finally:
+        python_random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
 
 
 class CudaRNGStatesTracker:
@@ -248,7 +310,7 @@ class CudaRNGStatesTracker:
         # Map from a string name to the cuda rng state.
         self.states_ = {}
 
-        # Seeds are just for book keeping and ensure no seed is set twice.
+        # Seeds are just for book keeping and ensure no seed is set twice within a namespace.
         self.seeds_ = set()
 
         # Name of the rng state currently being used in the generator.
@@ -272,10 +334,12 @@ class CudaRNGStatesTracker:
     def add(self, name, seed):
         """Track the rng state."""
         self._is_initialized = True
-        # Check seed is not already used.
-        if seed in self.seeds_:
+        namespace, separator, _ = name.rpartition('::')
+        seed_key = (namespace if separator else None, seed)
+        # Check seed is not already used within this namespace.
+        if seed_key in self.seeds_:
             raise Exception('seed {} already exists'.format(seed))
-        self.seeds_.add(seed)
+        self.seeds_.add(seed_key)
         # Check that state is not already defined.
         if name in self.states_:
             raise Exception('cuda rng state {} already exists'.format(name))
@@ -295,9 +359,11 @@ class CudaRNGStatesTracker:
             _set_cuda_rng_state(orig_rng_state)
 
     @contextlib.contextmanager
-    def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
+    def fork(self, name=None):
         """Fork the cuda rng state, perform operations, and exit with
         the original state."""
+        if name is None:
+            name = _rng_state_name(_MODEL_PARALLEL_RNG_TRACKER_NAME)
         # Check if we have added the state
         if name not in self.states_:
             raise Exception('cuda rng state {} is not added'.format(name))
@@ -386,7 +452,7 @@ def initialize_rng_tracker(
                 """Mirrors the interface from the training RNG tracker."""
                 pass
 
-            def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
+            def fork(self, name=None):
                 """Mirrors the interface from the training RNG tracker."""
                 return contextlib.nullcontext()
 
@@ -439,6 +505,7 @@ def model_parallel_cuda_manual_seed(
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
     force_reset_rng: bool = False,
+    rng_namespace: Optional[str] = None,
 ):
     """Initialize model parallel cuda seed.
 
@@ -468,10 +535,22 @@ def model_parallel_cuda_manual_seed(
     tensor_model_parallel_seed = offset + tp_rank
     # Data parallel gets the original seed.
     data_parallel_seed = seed
+    expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
 
     initialize_rng_tracker(
         te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng, force_reset=force_reset_rng
     )
+    if rng_namespace is not None:
+        with cuda_rng_namespace(rng_namespace):
+            _CUDA_RNG_STATE_TRACKER.add(get_data_parallel_rng_tracker_name(), data_parallel_seed)
+            _CUDA_RNG_STATE_TRACKER.add(
+                _rng_state_name(_MODEL_PARALLEL_RNG_TRACKER_NAME), tensor_model_parallel_seed
+            )
+            _CUDA_RNG_STATE_TRACKER.add(
+                get_expert_parallel_rng_tracker_name(), expert_parallel_seed
+            )
+        return
+
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
@@ -480,7 +559,6 @@ def model_parallel_cuda_manual_seed(
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
-    expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 

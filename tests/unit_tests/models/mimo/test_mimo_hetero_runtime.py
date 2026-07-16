@@ -8,7 +8,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.mimo.training.runtime import configure_module_rng, wrap_active_modules_with_ddp
+from examples.mimo.training.runtime import (
+    configure_composite_no_sync,
+    configure_module_rng,
+    configure_namespaced_module_rng,
+    wrap_active_modules_with_ddp,
+)
 from examples.mimo.training.topology import ModuleGridSpec, create_topology
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -87,6 +92,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
     groups = mocker.Mock()
     model = SimpleNamespace(language_model=mocker.Mock(), modality_submodules={})
     topology = mocker.Mock()
+    topology.is_colocated = False
     builder = MimoModelBuilder(MimoBuildConfig(_topology=topology))
     mocker.patch("examples.mimo.training.builder.get_args", return_value=args)
     mocker.patch(
@@ -125,7 +131,9 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     args = _args(init_model_with_meta_device=False)
     encoder_pg = mocker.Mock()
     model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: mocker.Mock()})
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+    topology = mocker.Mock()
+    topology.is_colocated = False
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology))
     mocker.patch("examples.mimo.training.builder.get_args", return_value=args)
     mocker.patch(
         "examples.mimo.training.builder._resolve_role", return_value=(ENCODER, False, encoder_pg)
@@ -160,6 +168,119 @@ def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):
         _resolve_role(_topology(set()))
 
 
+def test_namespaced_module_rng_uses_explicit_module_groups(mocker):
+    pg = SimpleNamespace(
+        pp=mocker.Mock(),
+        dp=mocker.Mock(),
+        tp=mocker.Mock(),
+        ep=mocker.Mock(),
+        expt_tp=mocker.Mock(),
+    )
+    ranks = {pg.pp: 2, pg.dp: 3, pg.tp: 4, pg.ep: 5, pg.expt_tp: 6}
+    mocker.patch("examples.mimo.training.runtime.get_pg_rank", side_effect=ranks.__getitem__)
+    seed = mocker.patch("examples.mimo.training.runtime.model_parallel_cuda_manual_seed")
+
+    construction_seed = configure_namespaced_module_rng(
+        _args(), pg, 100, "encoder", data_parallel_random_init=True
+    )
+
+    assert construction_seed == 1234 + 100 + 200 + 30
+    seed.assert_called_once_with(
+        construction_seed, tp_rank=4, ep_rank=5, etp_rank=6, rng_namespace="encoder"
+    )
+
+
+def test_composite_no_sync_enters_every_child():
+    events = []
+
+    class Child:
+        @staticmethod
+        def no_sync():
+            from contextlib import contextmanager
+
+            @contextmanager
+            def scope():
+                events.append("enter")
+                yield
+                events.append("exit")
+
+            return scope()
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(), language_model=Child(), modality_submodules={ENCODER: Child()}
+    )
+    configure_composite_no_sync(model)
+    with model.config.no_sync_func():
+        assert events == ["enter", "enter"]
+    assert events == ["enter", "enter", "exit", "exit"]
+
+
+def test_colocated_builder_seeds_and_wraps_both_modules(mocker):
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    language_pg, encoder_pg = mocker.Mock(), mocker.Mock()
+    grids = {}
+    for name in (ENCODER, MIMO_LANGUAGE_MODULE_KEY):
+        grid = mocker.Mock()
+        grid.is_current_rank_in_grid.return_value = True
+        grids[name] = grid
+    topology = SimpleNamespace(
+        is_colocated=True,
+        grids=grids,
+        module_pgs={ENCODER: encoder_pg, MIMO_LANGUAGE_MODULE_KEY: language_pg},
+        register_model=mocker.Mock(),
+    )
+    model = SimpleNamespace(
+        language_model=mocker.Mock(), modality_submodules={ENCODER: mocker.Mock()}
+    )
+    replacement = SimpleNamespace(
+        language_model=model.language_model, modality_submodules=model.modality_submodules
+    )
+
+    def pre_hook(models):
+        topology.register_model.assert_called_once_with(model)
+        return [replacement]
+
+    def build_model(_pg_collection):
+        assert builder._rng_namespaces == {
+            ENCODER: f"mimo.{ENCODER}",
+            MIMO_LANGUAGE_MODULE_KEY: f"mimo.{MIMO_LANGUAGE_MODULE_KEY}",
+        }
+        assert builder._rng_construction_seeds == {ENCODER: 111, MIMO_LANGUAGE_MODULE_KEY: 222}
+        return model
+
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology, pre_wrap_hooks=[pre_hook]))
+    mocker.patch(
+        "examples.mimo.training.builder.get_args",
+        return_value=_args(init_model_with_meta_device=False),
+    )
+    build = mocker.patch.object(builder, "build_model", side_effect=build_model)
+    seed = mocker.patch("examples.mimo.training.builder.configure_namespaced_module_rng")
+    seed.side_effect = [111, 222]
+    mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
+    mocker.patch("examples.mimo.training.builder.configure_composite_no_sync")
+    mocker.patch("examples.mimo.training.builder.configure_grad_sync")
+
+    assert builder.build_distributed_models(
+        language_pg, ddp_config=DistributedDataParallelConfig()
+    ) == [replacement]
+    assert seed.call_count == 2
+    namespaces = {call.args[3] for call in seed.call_args_list}
+    assert namespaces == {f"mimo.{ENCODER}", f"mimo.{MIMO_LANGUAGE_MODULE_KEY}"}
+    build.assert_called_once_with(language_pg)
+    assert builder._rng_namespaces == {}
+    assert builder._rng_construction_seeds == {}
+    assert replacement.pg_collection is language_pg
+    topology.register_model.assert_called_once_with(model)
+
+    seed.reset_mock()
+    seed.side_effect = [111, RuntimeError("seed failed")]
+    with pytest.raises(RuntimeError, match="seed failed"):
+        builder.build_distributed_models(language_pg, ddp_config=DistributedDataParallelConfig())
+    assert builder._rng_namespaces == {}
+    assert builder._rng_construction_seeds == {}
+
+
 def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
     """Outer MIMO hooks surround preparation (pre -> wrap -> configure -> post) with replacement."""
     from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
@@ -181,8 +302,10 @@ def test_builder_applies_outer_hooks_in_order_and_returns_replacement(mocker):
         return [post_replacement]
 
     groups = mocker.Mock()
+    topology = mocker.Mock()
+    topology.is_colocated = False
     config = MimoBuildConfig(
-        _topology=mocker.Mock(), pre_wrap_hooks=[pre_hook], post_wrap_hooks=[post_hook]
+        _topology=topology, pre_wrap_hooks=[pre_hook], post_wrap_hooks=[post_hook]
     )
     builder = MimoModelBuilder(config)
     mocker.patch(
@@ -222,7 +345,9 @@ def test_builder_rejects_invalid_outer_hook_cardinality(mocker, hook_stage, mode
     replacement_models = [SimpleNamespace() for _ in range(model_count)]
     hook_kwargs = {"pre_wrap_hooks": [], "post_wrap_hooks": []}
     hook_kwargs[f"{hook_stage}_wrap_hooks"] = [lambda _models: replacement_models]
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock(), **hook_kwargs))
+    topology = mocker.Mock()
+    topology.is_colocated = False
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=topology, **hook_kwargs))
     mocker.patch(
         "examples.mimo.training.builder.get_args",
         return_value=_args(init_model_with_meta_device=False),

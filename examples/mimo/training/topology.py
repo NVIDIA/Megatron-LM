@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import torch.distributed as dist
 
@@ -59,16 +59,32 @@ class ModuleGridSpec:
         return self.num_ranks
 
 
+def _grids_are_colocated(grids: dict[str, HyperCommGrid]) -> bool:
+    spans = {(grid.rank_offset, grid.size) for grid in grids.values()}
+    return len(grids) > 1 and len(spans) == 1
+
+
 @dataclass
 class HeteroTopology:
     """Process groups and rank topology for one hetero MIMO run."""
 
     grids: dict[str, HyperCommGrid]
     module_pgs: dict[str, ProcessGroupCollection]
-    schedule_pg_collection: MultiModuleProcessGroupCollection
+    schedule_pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection
+    _model: Optional[Any] = field(default=None, repr=False)
+
+    @property
+    def is_colocated(self) -> bool:
+        return _grids_are_colocated(self.grids)
+
+    def register_model(self, model: Any) -> None:
+        self._model = model
 
     def destroy(self) -> None:
         """Destroy every process group owned by this topology."""
+        if self._model is not None:
+            self._model.destroy()
+            self._model = None
         destroyed: set[int] = set()
         for pgc in self.module_pgs.values():
             for pg in (pgc.embd, pgc.pos_embd):
@@ -232,8 +248,11 @@ def build_schedule_pg_collection(
     grids: dict[str, HyperCommGrid],
     module_pgs: dict[str, ProcessGroupCollection],
     language_name: str,
-) -> MultiModuleProcessGroupCollection:
+) -> ProcessGroupCollection | MultiModuleProcessGroupCollection:
     """Build the schedule-facing collection of the modules this rank participates in."""
+    if _grids_are_colocated(grids):
+        return module_pgs[language_name]
+
     rank_modules = {}
     rank_language_name = None
     for name, grid in grids.items():

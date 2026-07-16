@@ -48,7 +48,9 @@ Shape = Union[List[int], torch.Size]
 def get_forward_backward_func(
     pp_size: Optional[int] = None,
     vp_size: Optional[int] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    schedule_pg_collection: Optional[
+        ProcessGroupCollection | MultiModuleProcessGroupCollection
+    ] = None,
 ):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -142,12 +144,21 @@ def get_forward_backward_func(
         vp_size (Optional[int]): Virtual pipeline model parallel size to use.
             If both pp_size and vp_size are None, both values fall back to parallel_state.
             Otherwise, provided values are used as-is and None is treated as an explicit input.
-        schedule_pg_collection (Optional[MultiModuleProcessGroupCollection]): When a
-            multi-module (cross-grid) collection is passed, select the bridge schedule.
+        schedule_pg_collection: A multi-module collection selects the bridge schedule; a plain
+            PP=1 collection avoids the global parallel-state fallback.
 
     """
     if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
         return forward_backward_pipelining_without_interleaving
+    pp_group = getattr(schedule_pg_collection, 'pp', None)
+    if (
+        pp_size is None
+        and vp_size is None
+        and isinstance(schedule_pg_collection, ProcessGroupCollection)
+        and pp_group is not None
+        and pp_group.size() == 1
+    ):
+        pp_size = 1
 
     if pp_size is None and vp_size is None:
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()

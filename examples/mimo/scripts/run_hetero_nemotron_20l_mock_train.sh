@@ -10,8 +10,26 @@ TRAIN_ITERS=${TRAIN_ITERS:-20}
 NUM_MICROBATCHES=${NUM_MICROBATCHES:-4}
 EVAL_INTERVAL=${EVAL_INTERVAL:-1}
 EVAL_ITERS=${EVAL_ITERS:-0}
-MICRO_BATCH_SIZE=1
-LLM_DP=2
+MIMO_LAYOUT=${MIMO_LAYOUT:-non-colocated}
+COLOCATED_DIRECTION=${COLOCATED_DIRECTION:-fan-out}
+
+if [[ "${MIMO_LAYOUT}" == "colocated" ]]; then
+  if [[ "${COLOCATED_DIRECTION}" == "fan-out" ]]; then
+    ENCODER_TP=4; ENCODER_DP=2; LLM_TP=2; LLM_DP=4; LLM_EP=4; MICRO_BATCH_SIZE=1
+  elif [[ "${COLOCATED_DIRECTION}" == "fan-in" ]]; then
+    ENCODER_TP=2; ENCODER_DP=4; LLM_TP=4; LLM_DP=2; LLM_EP=2; MICRO_BATCH_SIZE=2
+  else
+    echo "COLOCATED_DIRECTION must be fan-in or fan-out" >&2
+    exit 2
+  fi
+  LLM_OFFSET=0
+  LAYOUT_ARGS=(--mimo-layout colocated --data-parallel-random-init)
+else
+  ENCODER_TP=2; ENCODER_DP=2; LLM_TP=2; LLM_DP=2; LLM_EP=4; LLM_OFFSET=4
+  MICRO_BATCH_SIZE=1
+  LAYOUT_ARGS=()
+fi
+
 GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP))
 TORCHRUN_LOG_DIR=${TORCHRUN_LOG_DIR:-"${PWD}/logs/torchrun-$(date +%Y%m%d_%H%M%S)-$$"}
 mkdir -p "${TORCHRUN_LOG_DIR}"
@@ -73,14 +91,14 @@ uv run --extra ssm python -m torch.distributed.run \
   --seq-length 8192 \
   --max-position-embeddings 8192 \
   --bf16 \
-  --encoder-tp 2 \
-  --encoder-dp 2 \
-  --llm-offset 4 \
-  --llm-tp 2 \
+  --encoder-tp "${ENCODER_TP}" \
+  --encoder-dp "${ENCODER_DP}" \
+  --llm-offset "${LLM_OFFSET}" \
+  --llm-tp "${LLM_TP}" \
   --llm-cp 1 \
   --llm-pp 1 \
   --llm-dp "${LLM_DP}" \
-  --llm-ep 4 \
+  --llm-ep "${LLM_EP}" \
   --llm-expt-tp 1 \
   --vocab-size 131072 \
   --micro-batch-size "${MICRO_BATCH_SIZE}" \
@@ -102,4 +120,5 @@ uv run --extra ssm python -m torch.distributed.run \
   --eval-iters "${EVAL_ITERS}" \
   --log-interval 1 \
   --rerun-mode disabled \
+  "${LAYOUT_ARGS[@]}" \
   "$@"
