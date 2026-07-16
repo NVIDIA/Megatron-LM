@@ -125,6 +125,14 @@ operations (`reduce_grad_buckets` non-empty).  Violating this constraint would o
 running module's `_fsdp_root_context` while its hooks are still firing, causing undefined
 behavior.
 
+### Meta-device materialization and initialization order
+
+`_materialize_meta_module()` walks `named_modules()` in reverse order, materializing and
+resetting leaf modules before their parents. Each `_apply` is non-recursive so a tensor is
+materialized exactly once, while a parent `reset_parameters()` hook may safely inspect or
+derive state from already initialized descendants. Buffer-only lazy modules remain untouched,
+matching the v1 behavior.
+
 ---
 
 ## Feature 1: Unshard Prefetch

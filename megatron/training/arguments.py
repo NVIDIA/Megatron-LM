@@ -1230,16 +1230,12 @@ def validate_args(args, defaults={}):
                 "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
                 "GroupedTensor param buffers."
             )
-
-        # Optimizer compatibility check. Megatron-FSDP supports sgd/adam, plus the
-        # single-root distributed Muon (FullyShardV2Muon) on the v2 path only
-        # (the v2 ParameterGroup sets the dist_param back-references it needs).
-        assert args.optimizer in ('sgd', 'adam') or (
-            args.optimizer == 'muon' and getattr(args, 'use_megatron_fsdp_v2', False)
-        ), (
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer "
-            "(muon requires --use-megatron-fsdp-v2)."
-        )
+        # Optimizer compatibility check.
+        assert args.optimizer in (
+            'sgd',
+            'adam',
+            *(('muon',) if getattr(args, 'use_megatron_fsdp_v2', False) else ()),
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
             args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]

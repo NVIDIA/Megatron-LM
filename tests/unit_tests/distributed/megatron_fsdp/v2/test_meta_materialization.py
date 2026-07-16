@@ -74,6 +74,8 @@ class _MetaParent(nn.Module):
         self.buffer_id_after_reset = None
 
     def reset_parameters(self):
+        # Parent reset hooks must see already-materialized descendants.
+        assert not self.child.weight.is_meta
         self.reset_calls += 1
         with torch.no_grad():
             self.weight.fill_(3)
@@ -85,7 +87,7 @@ class _MetaParent(nn.Module):
 def test_materialize_meta_module_is_non_recursive_and_skips_buffer_only_modules(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Children reset independently while deliberately lazy buffers stay meta."""
+    """Children reset before parents while deliberately lazy buffers stay meta."""
     model = _MetaParent()
     lazy_buffer_id = id(model.buffer_only.indices)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))

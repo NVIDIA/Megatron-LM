@@ -548,7 +548,9 @@ class FSDPModule:
             if isinstance(current_device, torch.device)
             else torch.device("cuda", current_device)
         )
-        for name, m in self.named_modules():
+        # Initialize leaves before parents so a parent's reset hook may safely
+        # inspect or derive state from already-materialized descendants.
+        for name, m in reversed(list(self.named_modules())):
             if m in ignored_modules:
                 continue
             # Match v1 meta init: reset modules that own meta parameters. Buffer-only

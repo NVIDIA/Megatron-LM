@@ -633,9 +633,8 @@ class TEGroupedMLP(MegatronModule):
 
         def forward_post_hook(_module, _inputs, output):
             for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
-                hooks_with_kwargs = getattr(submodule, "_forward_hooks_with_kwargs", ())
                 for hook_id, hook in submodule._forward_hooks.items():
-                    if hook_id in hooks_with_kwargs:
+                    if hook_id in submodule._forward_hooks_with_kwargs:
                         ret = hook(submodule, (), {}, output)
                     else:
                         ret = hook(submodule, (), output)
