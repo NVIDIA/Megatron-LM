@@ -22,6 +22,7 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
@@ -2343,8 +2344,9 @@ class TECudaGraphHelper:
         max_num_seqs = getattr(self.config, 'thd_max_packed_sequences', None)
         if max_num_seqs is not None:
             max_num_seqs = int(max_num_seqs)
-            if getattr(self.config, 'pad_packed_seq_alignment', None) is not None and getattr(
-                self.config, 'pad_packed_seq_by_appending_dummy_seq', True
+            if (
+                getattr(self.config, 'pad_packed_seq_alignment', None) is not None
+                and resolve_thd_tail_padding_policy(self.config) == 'append_dummy_seq'
             ):
                 max_num_seqs -= 1
 

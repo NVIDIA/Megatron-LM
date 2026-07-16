@@ -34,6 +34,7 @@ from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -186,6 +187,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             None,
         )
 
+    thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
@@ -197,7 +199,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
     # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    padding_mask = None
+    padding_mask = batch.pop('padding_mask', None)
     if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
         tokens = batch.get('tokens', None)
         labels = batch.get('labels', None)
@@ -219,7 +221,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
-                pad_by_appending_dummy_seq=config.pad_packed_seq_by_appending_dummy_seq,
+                tail_padding_policy=thd_tail_padding_policy,
+                padding_mask=padding_mask,
             )
         )
         if 'tokens' in batch:

@@ -118,13 +118,20 @@ class ModelParallelConfig:
     tensors are padded to a multiple of N.
     """
 
-    pad_packed_seq_by_appending_dummy_seq: bool = True
-    """Represent a THD packed-sequence padding tail by appending a dummy sequence.
+    thd_tail_padding_policy: Optional[Literal["append_dummy_seq", "extend_last"]] = None
+    """Policy for representing the THD packed-sequence padding tail.
 
-    When disabled, token-like tensors are still padded according to
-    pad_packed_seq_alignment, but cu_seqlens sequence boundaries are not extended
-    for the padding tail. CUDA Graph static-input padding may still pad the
-    cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+    - append_dummy_seq: cover the post-pack padding tail with an ordinary
+      dummy sequence appended to the cu_seqlens metadata. Existing
+      valid/physical gaps between real sequences are preserved. This is the
+      default behavior.
+    - extend_last: keep valid cu_seqlens boundaries unchanged and extend the
+      final padded boundary so the tail is physical padding of the last
+      sequence. With context parallelism the extension is applied to the
+      global metadata before CP slicing. CUDA Graph static-input padding may
+      still pad the cu_seqlens tensors to thd_max_packed_sequences + 1
+      entries.
+    - None (default): treated as append_dummy_seq.
     """
 
     expert_model_parallel_size: int = 1

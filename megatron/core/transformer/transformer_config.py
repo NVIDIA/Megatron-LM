@@ -1515,9 +1515,10 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.experimental_attention_variant == "gated_delta_net":
                 if self.pad_packed_seq_alignment is not None:
-                    assert self.pad_packed_seq_by_appending_dummy_seq, (
+                    tail_policy = self.thd_tail_padding_policy or 'append_dummy_seq'
+                    assert tail_policy == 'append_dummy_seq', (
                         "gated_delta_net with pad_packed_seq_alignment requires "
-                        "pad_packed_seq_by_appending_dummy_seq."
+                        "thd_tail_padding_policy='append_dummy_seq'."
                     )
 
                 # Check required parameters
@@ -3191,6 +3192,21 @@ class TransformerConfig(ModelParallelConfig):
                 "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
+
+        # 'extend_last' THD tail padding with context parallelism requires the
+        # global metadata to be extended before CP slicing, which only the
+        # sequence-packing scheduler path performs. Restrict this combination.
+        if (
+            self.sequence_packing_scheduler is None
+            and self.pad_packed_seq_alignment is not None
+            and (self.thd_tail_padding_policy or 'append_dummy_seq') == 'extend_last'
+            and (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+        ):
+            raise ValueError(
+                "thd_tail_padding_policy='extend_last' with context parallelism is only "
+                "supported together with a sequence_packing_scheduler. Either enable a "
+                "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
             )
 
         if self.sequence_packing_scheduler is not None:
