@@ -136,6 +136,23 @@ class ToyTransformer(torch.nn.Module):
         return x
 
 
+class RootParamModel(torch.nn.Module):
+    """Toy model with parameters owned directly by the root module."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.empty(DIM_SIZE, DIM_SIZE))
+        self.bias = torch.nn.Parameter(torch.empty(DIM_SIZE))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+
 class ToyTETransformer(torch.nn.Module):
     """Toy Transformer model for testing Megatron-FSDP with Transformer Engine."""
 
@@ -730,6 +747,33 @@ class TestMegatronFsdpFullyShard:
             # Optimizer step.
             optimizer.step()
             optimizer.zero_grad()
+
+    def test_root_module_forward_uses_gathered_parameters(self):
+        """
+        Test that root-owned parameters are gathered before the root forward.
+        """
+
+        model = RootParamModel().cuda()
+        with torch.no_grad():
+            model.weight.copy_(
+                torch.arange(DIM_SIZE * DIM_SIZE, dtype=torch.float32, device="cuda").view(
+                    DIM_SIZE, DIM_SIZE
+                )
+            )
+            model.bias.copy_(torch.arange(DIM_SIZE, dtype=torch.float32, device="cuda"))
+
+        model_input = torch.arange(DIM_SIZE * DIM_SIZE, dtype=torch.float32, device="cuda").view(
+            DIM_SIZE, DIM_SIZE
+        )
+        expected_output = model(model_input)
+
+        mfsdp_model = fully_shard_model(
+            module=model, fsdp_unit_modules=[RootParamModel], zero_dp_strategy=OPTIM_GRADS_PARAMS
+        )
+
+        output = mfsdp_model(model_input)
+
+        torch.testing.assert_close(output, expected_output)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
