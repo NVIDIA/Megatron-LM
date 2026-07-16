@@ -598,6 +598,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                             layout="NT",
                             out=weight.main_grad,
                             grad=True,
+                            accumulate=not getattr(weight, "overwrite_main_grad", False),
                         )
                     else:
                         torch.matmul(grad_output.t(), total_input, out=weight.main_grad)

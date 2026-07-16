@@ -134,6 +134,15 @@ def mfsdp_post_forward_hook(module: nn.Module, *unused):
         )
     ctx = module._fsdp_root_context
     assert not ctx.cuda_graph_active, "hooks must not fire during CUDA graph capture"
+    if (
+        unused
+        and ctx.cuda_graph_runner is not None
+        and module._fsdp_state.enable_cuda_graph
+        and not getattr(module, "_fsdp_cg_installed", False)
+        and not ctx.backward_phase
+        and module.cuda_graph_compatible
+    ):
+        ctx.cuda_graph_runner.record_module_output(module, unused[-1])
     if ctx.backward_phase and id(module) == ctx.backward_module:
         return
     module.reshard()
@@ -377,14 +386,6 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
             final callback.  The caller must call
             ``mfsdp_post_backward_final_callback`` manually later.
 
-    .. note::
-
-       When CUDA graph is enabled, TE wgrad fusion writes directly into
-       ``param.main_grad`` during the trace (eager) backward.  Under graph
-       replay only the GPU kernel runs — the Python-side flags that mark
-       ``grad_added_to_main_grad`` are not part of the graph.  We eagerly
-       allocate the main gradient buffer and its full unsharded fetch-buffer
-       here so that memory addresses are fixed across graph replay iterations.
     """
     ctx = module._fsdp_root_context
     assert not ctx.cuda_graph_active, "hooks must not fire during CUDA graph capture"
@@ -408,21 +409,22 @@ def _pre_backward_setup(module: FSDPModule, skip_final_callback: bool = False):
     for param_group in module._fsdp_param_groups:
         for param in param_group.params:
             param.grad_added_to_main_grad = False
-            if param_group.sharding_strategy in ("optim_grads_params", "optim_grads"):
-                param.overwrite_main_grad = True
+            param.overwrite_main_grad = param_group.sharding_strategy in (
+                "optim_grads_params",
+                "optim_grads",
+            )
         if module._fsdp_state.enable_full_iteration_cuda_graph:
             param_group._init_dist_grads()
-        # CUDA graph + TE wgrad fusion: during graph capture the eager backward
-        # runs once and TE sets grad_added_to_main_grad=True on each param it
-        # writes to.  Under replay only the GPU kernel runs — the Python-side
-        # setattr is not part of the graph.  We must allocate the main gradient
-        # buffer and its full unsharded fetch-buffer BEFORE capture so that
-        # memory addresses are fixed across replay iterations.  Without this,
-        # TE would write to stale or uninitialised buffer addresses on replay.
+        # Keep per-module CUDA graph trace and replay on the same compatible
+        # main-grad buffer allocation. Full-iteration graphs manage optimizer
+        # gradient storage through their separate persistent-buffer path.
         if (
             not module._fsdp_state.enable_full_iteration_cuda_graph
             and module._fsdp_state.enable_cuda_graph
+            and param_group.requires_grad
+            and param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
             and param_group.main_grad_buffer is not None
+            and param_group.main_grad_buffer.dtype == param_group.params[0].dtype
         ):
             param_group._init_dist_grads()
             param_group.main_grad_buffer.fetch_buffer()

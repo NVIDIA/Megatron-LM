@@ -421,6 +421,35 @@ def verify_stats(model, loss, device):
     return (gloss / dist.get_world_size()).item(), sumsq.sqrt().item(), n
 
 
+@torch.no_grad()
+def _verify_param_stats(model, device):
+    """Compute global parameter moments after the optimizer update.
+
+    :param model: Sharded model whose local parameter views are inspected.
+    :type model: torch.nn.Module
+    :param device: CUDA device used for scalar reductions.
+    :type device: torch.device
+    :return: Global L2 norm, global sum, and number of visible parameter views.
+    :rtype: Tuple[float, float, int]
+    """
+    sumsq = torch.zeros((), device=device, dtype=torch.float64)
+    total = torch.zeros((), device=device, dtype=torch.float64)
+    n = 0
+    for param in model.parameters():
+        value = param.detach()
+        if hasattr(value, "to_local"):
+            value = value.to_local()
+        if value.numel() == 0:
+            continue
+        value = value.double()
+        sumsq += value.pow(2).sum()
+        total += value.sum()
+        n += 1
+    dist.all_reduce(sumsq, op=dist.ReduceOp.SUM)
+    dist.all_reduce(total, op=dist.ReduceOp.SUM)
+    return sumsq.sqrt().item(), total.item(), n
+
+
 # ------------------------ synthetic batch ------------------------
 def qwen25vl_vision_tokens(h, w, patch=14, merge=2):
     f = patch * merge
@@ -602,6 +631,9 @@ def main():
                     else:
                         optim.step(); optim.zero_grad(set_to_none=True)
 
+                if args.verify:
+                    pnorm, psum, n_param = _verify_param_stats(model, device)
+
                 torch.cuda.synchronize()
                 dt = time.perf_counter() - t0
                 if step >= args.warmup_steps:
@@ -622,7 +654,8 @@ def main():
                     tag = "warmup" if step < args.warmup_steps else "bench "
                     if args.verify:
                         print(f"[{args.backend}] {tag} step {step:3d} | VERIFY (timing invalid) | "
-                              f"gloss={gloss:.6f} | gnorm={gnorm:.4f} | n_grad={n}")
+                              f"gloss={gloss:.6f} | gnorm={gnorm:.4f} | n_grad={n} | "
+                              f"pnorm={pnorm:.8e} | psum={psum:.8e} | n_param={n_param}")
                     elif gl is not None:
                         print(f"[{args.backend}] {tag} step {step:3d} | {dt*1000:8.2f} ms | "
                               f"loss={gl:.4e}")

@@ -320,6 +320,58 @@ class TestFullyShardBasic:
                     torch.testing.assert_close(replica, local_grad)
 
     @pytest.mark.parametrize(
+        "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
+    )
+    @pytest.mark.parametrize(
+        ("model_dtype", "main_grad_dtype"),
+        [
+            pytest.param(torch.float32, None, id="fp32"),
+            pytest.param(torch.bfloat16, torch.float32, id="bf16-param-fp32-grad"),
+        ],
+    )
+    def test_cuda_graph_accumulates_microbatches(
+        self, sharding_strategy, model_dtype, main_grad_dtype
+    ):
+        """Accumulate one eager and one replayed M-FSDP microbatch.
+
+        :param sharding_strategy: M-FSDP gradient sharding strategy.
+        :type sharding_strategy: str
+        :param model_dtype: Compute parameter dtype.
+        :type model_dtype: torch.dtype
+        :param main_grad_dtype: Optimizer gradient dtype.
+        :type main_grad_dtype: Optional[torch.dtype]
+        """
+        model = SimpleMLP(4, bias=True).to(_device(), dtype=model_dtype)
+        fully_shard(
+            model,
+            sharding_strategy=sharding_strategy,
+            mp_policy=MixedPrecisionPolicy(
+                main_params_dtype=main_grad_dtype, main_grads_dtype=main_grad_dtype
+            ),
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            enable_cuda_graph=True,
+        )
+
+        for value in (2.0, 3.0):
+            sample = torch.full(
+                (2, 4), value, device=_device(), dtype=model_dtype, requires_grad=True
+            )
+            model(sample).sum().backward()
+        model.finish_grad_sync()
+        torch.cuda.synchronize()
+
+        for param_names, param_group in model._named_param_groups:
+            for name, dist_grad in zip(param_names, param_group.dist_grads):
+                if dist_grad is None:
+                    continue
+                local_expected = 10.0 if name.endswith("weight") else 4.0
+                expected = local_expected * _world_size()
+                torch.testing.assert_close(
+                    dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
+                )
+
+    @pytest.mark.parametrize(
         "enable_unshard_prefetch,enable_async_reduce_grad",
         [(False, False), (False, True), (True, False), (True, True)],
     )

@@ -104,7 +104,7 @@ def fully_shard(
             for m in module.modules()
             if isinstance(m, FSDPModule) and m is not module
         )
-    ) and sharding_strategy in ("optim", "optim_grads", "optim_grads_params")
+    ) and sharding_strategy in ("no_shard", "optim", "optim_grads", "optim_grads_params")
     bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(

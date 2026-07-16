@@ -150,6 +150,8 @@ A lightweight orchestrator stored on `ctx.cuda_graph_runner`:
 class CudaGraphRunner:
     def record_module(self, module, args, kwargs):
         """Record sample args during the first optimized forward."""
+    def record_module_output(self, module, output):
+        """Record eager outputs used to link producer and consumer buffers."""
     def capture_and_install(self, root_module, capture_stream=None):
         """Pop hooks → make_graphed_callables → restore hooks."""
 ```
@@ -216,6 +218,14 @@ static_input_surface = flatten(sample_args) + flatten(sample_kwargs) + tuple(mod
    must place each parameter back at the same fixed address on every
    micro-batch, or replay reads stale/garbage weights.
 
+M-FSDP swaps the registered sharded parameter for its live unsharded compute
+leaf inside the capture-time backward pre-hook.  The runtime therefore refreshes
+`module.parameters()` immediately after that hook and carries the retained
+parameter indices from warmup into capture.  This prevents the graph from
+capturing stale `dist_param` objects.  The runner also records eager module
+outputs and links matching producer-output/consumer-input storage so adjacent
+captured modules share the correct static activation and gradient surfaces.
+
 #### 4.4.3 Phases
 
 | Phase | What happens | Where |
@@ -236,10 +246,11 @@ Replay is wrapped in a `torch.autograd.Function` (`graph.py:1335-1426`):
   `static_outputs.detach()`.
 - **`backward`** (`@once_differentiable`): copy incoming grads into
   `static_grad_outputs` (skipping when the pointer already matches) → replay
-  `bwd_graph` → return `static_grad_inputs`.  Returned **parameter** grads are
-  `.detach().clone()`d (`graph.py:1420-1423`) so autograd consumers never see
-  the graph's internal static buffers; non-param input grads are returned as
-  detached views.
+  `bwd_graph` → return `static_grad_inputs`.  Compatible M-FSDP parameter leaves
+  bind directly to their `main_grad` storage during capture.  Those slots are
+  returned as detached views, while parameter grads backed by internal graph
+  storage are cloned before returning so autograd consumers never retain the
+  graph's private buffers.
 
 `functionalized` (`graph.py:1428-1480`) is the user-facing wrapper: it strips
 the `cuda_graph_stream` / `cuda_graph_event` control kwargs, **reconstructs the
@@ -357,25 +368,25 @@ make_graphed_callables(
 
 ## 8. Parameter gradients
 
-`param.grad` is the hand-off point between the graphed region and FSDP's
-ordinary gradient path.  Because `make_graphed_callables` puts
-`module.parameters()` in the graph's input surface (§4.4.2), the **captured
-backward computes each parameter's gradient value** — but everything that
-*touches `param.grad`* stays **outside** the graph:
+The captured backward binds a parameter leaf directly to its M-FSDP
+`main_grad` buffer only when shape, dtype, device, layout, stride, sharding
+policy, and TE-fusion ownership are compatible.  This makes trace and replay
+write to one stable optimizer-facing allocation and avoids an unnecessary
+`param.grad → main_grad` copy.
 
-1. **Graph (captured):** `bwd_graph.replay()` computes the gradient values into
-   the graph's static gradient buffers.
-2. **Autograd (eager, not captured):** `Graphed.backward` clones those values
-   out and returns them; PyTorch's autograd engine writes them into
-   `param.grad` through the normal `AccumulateGrad` path.
-3. **FSDP post-backward hook (eager, not captured):** `reduce_grad` copies
-   `param.grad` into `param.main_grad`, reduce-scatters, then clears
-   `param.grad`.
+1. **Capture-time pre-hook:** unshard installs the live compute parameters, then
+   the runtime refreshes the parameter input surface.
+2. **Backward capture/replay:** compatible leaves use `main_grad` as their
+   static gradient buffer; incompatible leaves continue to use graph-owned
+   storage.
+3. **Autograd hand-off:** graph-owned parameter gradients are cloned before
+   being returned.  A compatible `main_grad` result is returned as a detached
+   alias, so `param.grad` may already point at `main_grad`.
+4. **FSDP post-backward hook:** `reduce_grad` skips the copy when both pointers
+   match, clears `param.grad`, and performs the normal reduction.
 
-In short: **the graph only produces gradient values; FSDP consumes them via
-`param.grad` exactly as in the non-graph path.**  Nothing about grad
-accumulation, reduction, or resharding is captured, so no manual gradient-buffer
-plumbing is needed and the FSDP grad path stays CUDA-graph-agnostic.
+Gradient reduction and resharding remain outside the graph.  TE fused weight
+gradients keep their existing ownership path and are not rebound by the runtime.
 
 ## 9. Known issues & fixes
 
@@ -385,6 +396,7 @@ plumbing is needed and the FSDP grad path stays CUDA-graph-agnostic.
 | OOM during warmup | `warmup_outputs` held tensor refs across `gc.collect` + `empty_cache` | `param.grad = None` prevents gradient accumulation across warmup iterations | 2026-06 |
 | Non-tensor kwargs crash `.requires_grad` | `tree_flatten` passes `None` into `static_input_surface` | 6 `is not None` / `isinstance` guards in te-graph-runtime | 2026-06 |
 | Positional `hidden_states` missing in replay | `kwargs_keys` validation rejected positional args | `functionalized` checks both `user_args` and `user_kwargs` | 2026-06 |
+| Replayed gradients attached to stale sharded parameters | M-FSDP swaps parameter objects in the backward pre-hook | Refresh live parameter surfaces after the hook and bind compatible `main_grad` buffers | 2026-07 |
 
 ## 10. Files
 

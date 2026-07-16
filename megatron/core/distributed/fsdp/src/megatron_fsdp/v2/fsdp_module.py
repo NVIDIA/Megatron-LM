@@ -741,7 +741,6 @@ class FSDPModule:
                         assert not torch.isnan(
                             dist_param._local_tensor
                         ).any(), f"NaN detected in dist param for parameter {name}"
-
                 for weight_buffer in param_group.weight_buffers_for_unshard(bwd_pass=bwd_pass):
                     if (
                         buffer_runs
@@ -900,6 +899,8 @@ class FSDPModule:
                 recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
 
                 if grad_added or recorded:
+                    if param.grad is not None:
+                        del param.grad
                     # Record TE wgrad-fusion flags for CUDA graph restore.
                     # The trace backward ran eagerly, so TE set
                     # grad_added_to_main_grad on each param it wrote to.
@@ -912,8 +913,10 @@ class FSDPModule:
                     if not add_to_main_grad:
                         zero_tensors.append(param.get_main_grad())
                 else:
-                    stage_tensors.append(param.get_main_grad())
-                    stage_sources.append(grad.detach())
+                    main_grad = param.get_main_grad()
+                    if grad.data_ptr() != main_grad.data_ptr():
+                        stage_tensors.append(main_grad)
+                        stage_sources.append(grad.detach())
 
             # Full-iteration graphs stage ordinary async gradients on the RS stream so
             # the add/copy/zero work overlaps with the next module's backward compute.

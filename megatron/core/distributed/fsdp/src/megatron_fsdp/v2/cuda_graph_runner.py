@@ -35,8 +35,28 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 logger = logging.getLogger(__name__)
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> Tuple[Any, ...]:
+    """Identify a tensor storage view.
+
+    :param tensor: Tensor to identify.
+    :type tensor: torch.Tensor
+    :return: Storage address and view metadata.
+    :rtype: Tuple[Any, ...]
+    """
+    return (
+        tensor.untyped_storage().data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tensor.stride(),
+        tensor.dtype,
+        tensor.device,
+    )
+
 
 # ---------------------------------------------------------------------------
 # NVML memory helper (real GPU memory, not just torch allocator view)
@@ -91,6 +111,7 @@ def _fmt_mem_snapshot(before: Dict[str, int], after: Dict[str, int], peak_alloc:
             f"(Δ{after['nvml_used'] - before['nvml_used']:+d})"
         )
     return "  ".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Hook save / restore
@@ -157,9 +178,7 @@ def _prepare_compiled_modules_for_capture(modules):
             # directly.  This branch mainly handles ``module.compile()``.
             if not hasattr(original_forward, "_torchdynamo_orig_callable"):
                 module.forward = torch.compile(
-                    original_forward,
-                    dynamic=False,
-                    options={"triton.cudagraphs": False},
+                    original_forward, dynamic=False, options={"triton.cudagraphs": False}
                 )
     except Exception:
         _restore_compiled_modules_after_capture_failure(saved)
@@ -189,14 +208,13 @@ class CudaGraphRunner:
         # Per-module state recorded during the first optimized forward.
         self._sample_args: Dict[int, Tuple] = {}
         self._sample_kwargs: Dict[int, Dict[str, Any]] = {}
+        self._sample_outputs: Dict[int, Any] = {}
         self._modules_ordered: List[torch.nn.Module] = []
         self._compiled_module_state = []
 
     # ---- called from hooks ------------------------------------------------
 
-    def record_module(
-        self, module: torch.nn.Module, args: Tuple, kwargs: Dict[str, Any]
-    ) -> None:
+    def record_module(self, module: torch.nn.Module, args: Tuple, kwargs: Dict[str, Any]) -> None:
         """Record sample args for *module* during the first optimized forward."""
         if self._captured:
             return
@@ -207,41 +225,43 @@ class CudaGraphRunner:
         # Normalize Module.compile() before capture setup. te-graph-runtime
         # detects this compiled forward body and warms the capture-equivalent
         # hook specialization before entering torch.cuda.graph.
-        self._compiled_module_state.extend(
-            _prepare_compiled_modules_for_capture([module])
-        )
+        self._compiled_module_state.extend(_prepare_compiled_modules_for_capture([module]))
 
         sig = inspect.signature(module.forward)
         has_self = "self" in sig.parameters
-        bound = (
-            sig.bind(module, *args, **kwargs)
-            if has_self
-            else sig.bind(*args, **kwargs)
-        )
+        bound = sig.bind(module, *args, **kwargs) if has_self else sig.bind(*args, **kwargs)
         all_kwargs = {
-            n: bound.arguments[n]
-            for n in bound.arguments
-            if not (has_self and n == "self")
+            n: bound.arguments[n] for n in bound.arguments if not (has_self and n == "self")
         }
-        self._sample_args[mid] = tuple()           # all via kwargs
+        self._sample_args[mid] = tuple()  # all via kwargs
         self._sample_kwargs[mid] = all_kwargs
         self._modules_ordered.append(module)
 
-        n_tensor = sum(
-            1 for v in all_kwargs.values() if isinstance(v, torch.Tensor)
-        )
+        n_tensor = sum(1 for v in all_kwargs.values() if isinstance(v, torch.Tensor))
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info(
-                "CudaGraphRunner: recorded module %s (id=%s), "
-                "%d kwargs (%d tensor)",
+                "CudaGraphRunner: recorded module %s (id=%s), " "%d kwargs (%d tensor)",
                 getattr(module, "_fsdp_module_name", module.__class__.__name__),
                 id(module),
-                len(all_kwargs), n_tensor,
+                len(all_kwargs),
+                n_tensor,
             )
 
+    def record_module_output(self, module: torch.nn.Module, output: Any) -> None:
+        """Record an eager output for static graph linking.
+
+        :param module: Recorded FSDP module.
+        :type module: torch.nn.Module
+        :param output: Output from the eager sample forward.
+        :type output: Any
+        """
+        mid = id(module)
+        if self._captured or mid not in self._sample_args or mid in self._sample_outputs:
+            return
+        self._sample_outputs[mid] = output
+
     def capture_and_install(
-        self, root_module: torch.nn.Module,
-        capture_stream: Optional[torch.cuda.Stream] = None,
+        self, root_module: torch.nn.Module, capture_stream: Optional[torch.cuda.Stream] = None
     ) -> None:
         """Capture all graphs + install wrappers on recorded modules."""
         if self._captured or not self._modules_ordered:
@@ -250,14 +270,31 @@ class CudaGraphRunner:
 
         modules = self._modules_ordered
         n = len(modules)
+        saved_parameter_grads = tuple(
+            (param, param.grad)
+            for module in modules
+            for param_group in module._fsdp_param_groups
+            for param in param_group.params
+        )
 
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             logger.info("CudaGraphRunner: capturing %d modules", n)
 
-        # Prefer installed te-graph-runtime (https://github.com/buptzyb/te-graph-runtime),
-        # fall back to vendored copy.
+        # Use the installed runtime only when it supports M-FSDP capture.
         try:
             from te_graph_runtime import make_graphed_callables
+            from te_graph_runtime.graph import (
+                _get_compatible_main_grad_buffer as _installed_static_grad_support,
+            )
+            from te_graph_runtime.graph import (
+                _refresh_module_parameter_surface as _installed_parameter_refresh,
+            )
+
+            if not all(
+                callable(helper)
+                for helper in (_installed_static_grad_support, _installed_parameter_refresh)
+            ):
+                raise ImportError("Installed te-graph-runtime lacks M-FSDP CUDA graph support")
         except ImportError:
             from .te_graph_runtime import make_graphed_callables
 
@@ -265,34 +302,70 @@ class CudaGraphRunner:
         sample_kwargs_list: List[Dict[str, Any]] = []
         capture_hooks: List[Dict] = []
 
+        producer_outputs: Dict[Tuple[Any, ...], Tuple[int, int]] = {}
+        input_output_aliases: List[Dict[int, Tuple[int, int]]] = []
+        for producer_idx, module in enumerate(modules):
+            flat_outputs, _ = tree_flatten(self._sample_outputs.get(id(module), ()))
+            for output_idx, output in enumerate(flat_outputs):
+                if isinstance(output, torch.Tensor):
+                    producer_outputs[_tensor_storage_key(output)] = (producer_idx, output_idx)
+
+        for consumer_idx, module in enumerate(modules):
+            mid = id(module)
+            flat_args, _ = tree_flatten(self._sample_args[mid])
+            flat_kwargs, _ = tree_flatten(list(self._sample_kwargs[mid].values()))
+            aliases = {}
+            for input_idx, input_tensor in enumerate(flat_args + flat_kwargs):
+                if not isinstance(input_tensor, torch.Tensor):
+                    continue
+                producer = producer_outputs.get(_tensor_storage_key(input_tensor))
+                if producer is not None and producer[0] < consumer_idx:
+                    aliases[input_idx] = producer
+            input_output_aliases.append(aliases)
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(
+                "CudaGraphRunner: linked %d static input/output tensors",
+                sum(len(aliases) for aliases in input_output_aliases),
+            )
+
         for m in modules:
             mid = id(m)
             # Clone tensor values so warmup gets fresh leaves without
             # residual autograd state from the first forward+backward.
             args = tuple(
-                v.detach().clone().requires_grad_(v.requires_grad)
-                if isinstance(v, torch.Tensor) else v
+                (
+                    v.detach().clone().requires_grad_(v.requires_grad)
+                    if isinstance(v, torch.Tensor)
+                    else v
+                )
                 for v in self._sample_args[mid]
             )
             kw = {
-                k: v.detach().clone().requires_grad_(v.requires_grad)
-                if isinstance(v, torch.Tensor) else v
+                k: (
+                    v.detach().clone().requires_grad_(v.requires_grad)
+                    if isinstance(v, torch.Tensor)
+                    else v
+                )
                 for k, v in self._sample_kwargs[mid].items()
             }
             sample_args_list.append(args)
             sample_kwargs_list.append(kw)
 
-            capture_hooks.append({
-                "forward_pre_hooks": {0: _make_fwd_pre_hook(m)},
-                "forward_pre_hooks_with_kwargs": {0: True},
-                "forward_hooks": {0: _make_fwd_post_hook(m)},
-                "forward_hooks_with_kwargs": {0: True},
-                "backward_pre_hooks": {0: _make_bwd_pre_hook(m)},
-                "backward_hooks": {0: _make_bwd_post_hook(m)},
-            })
+            capture_hooks.append(
+                {
+                    "forward_pre_hooks": {0: _make_fwd_pre_hook(m)},
+                    "forward_pre_hooks_with_kwargs": {0: True},
+                    "forward_hooks": {0: _make_fwd_post_hook(m)},
+                    "forward_hooks_with_kwargs": {0: True},
+                    "backward_pre_hooks": {0: _make_bwd_pre_hook(m)},
+                    "backward_hooks": {0: _make_bwd_post_hook(m)},
+                }
+            )
 
         self._sample_args.clear()
         self._sample_kwargs.clear()
+        self._sample_outputs.clear()
 
         compiled_module_state = self._compiled_module_state
         if compiled_module_state and (
@@ -308,24 +381,38 @@ class CudaGraphRunner:
         # capture_time_hooks handle unshard/reshard during warmup + capture.
         saved_hooks = _pop_all_hooks(root_module)
 
+        runtime_options = {}
+        supports_input_output_aliases = (
+            "_input_output_aliases" in inspect.signature(make_graphed_callables).parameters
+        )
+        if any(input_output_aliases):
+            if not supports_input_output_aliases:
+                from .te_graph_runtime import make_graphed_callables
+
+                supports_input_output_aliases = True
+            runtime_options["_input_output_aliases"] = tuple(input_output_aliases)
+
         try:
             torch.cuda.reset_peak_memory_stats()
             _mem_before = _mem_snapshot()
 
             graphed = make_graphed_callables(
                 tuple(modules),
-                tuple(sample_args_list),
+                sample_args_list,
                 num_warmup_iters=self._num_warmup,
-                sample_kwargs=tuple(sample_kwargs_list),
+                sample_kwargs=sample_kwargs_list,
                 pool=self._graph_pool,
                 capture_time_hooks=capture_hooks,
                 capture_stream=capture_stream,
+                **runtime_options,
             )
         except Exception:
             _restore_compiled_modules_after_capture_failure(compiled_module_state)
             raise
         finally:
             _restore_all_hooks(saved_hooks)
+            for param, grad in saved_parameter_grads:
+                param.grad = grad
 
         _mem_after = _mem_snapshot()
         _peak_alloc = torch.cuda.max_memory_allocated()
@@ -358,18 +445,28 @@ class CudaGraphRunner:
 def _make_fwd_pre_hook(module):
     def hook(mod, args, kwargs):
         module.unshard()
+
     return hook
 
 
 def _make_fwd_post_hook(module):
     def hook(mod, args, kwargs, output):
         module.reshard()
+
     return hook
 
 
 def _make_bwd_pre_hook(module):
     def hook(mod, grad_output):
         module.unshard(bwd_pass=True)
+        for param_group in module._fsdp_param_groups:
+            has_fused_wgrad = any(
+                getattr(param, "_mfsdp_recorded_te_wgrad", False) for param in param_group.params
+            )
+            if has_fused_wgrad and param_group.main_grad_buffer is not None:
+                param_group._init_dist_grads()
+                param_group.main_grad_buffer.fetch_buffer()
+
     return hook
 
 
@@ -380,4 +477,5 @@ def _make_bwd_post_hook(module):
         for param_group in module._fsdp_param_groups:
             for param in param_group.params:
                 param.grad = None
+
     return hook
