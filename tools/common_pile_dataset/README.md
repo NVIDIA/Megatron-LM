@@ -165,7 +165,7 @@ default. On HPC systems where `/home` is small, set `HF_HOME` to a path with
 sufficient space:
 
 ```bash
-export HF_HOME=/lustre/path/to/.hf_cache
+export HF_HOME=/lustre/path/to/hf_home
 ```
 
 The setup script does this automatically.
