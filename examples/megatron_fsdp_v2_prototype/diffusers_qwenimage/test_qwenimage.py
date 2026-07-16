@@ -348,9 +348,7 @@ def wrap_mfsdp(model, world_size, num_gpus_per_node, dtype, sharding,
 
 def wrap_mfsdpv2(model, world_size, num_gpus_per_node, dtype, sharding,
                  enable_trace_pool=False, enable_cuda_graph=False):
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
-        fully_shard, MixedPrecisionPolicy,
-    )
+    from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
 
     use_hsdp = sharding == "hybrid" and (world_size // num_gpus_per_node) > 1
     if use_hsdp:

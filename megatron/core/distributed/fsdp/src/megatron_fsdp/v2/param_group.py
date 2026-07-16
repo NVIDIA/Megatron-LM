@@ -465,10 +465,6 @@ class ParameterGroup:
             self.dist_params.append(dist_param)
             self.dist_grads.append(None)  # placeholder, will be set in _init_dist_grads
 
-        # Update dist_param chunk metadata for checkpointing and debugging.
-        for dist_param in self.dist_params:
-            update_uneven_dtensor_chunk_metadata(dist_param)
-
     def _init_dist_grads(self) -> None:
         """Lazily allocate ``main_grad_buffer.data`` and rebuild ``dist_grads``.
 

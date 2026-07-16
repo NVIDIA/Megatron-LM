@@ -555,25 +555,24 @@ class FSDPModule:
                 continue
             # Match v1 meta init: reset modules that own meta parameters. Buffer-only
             # meta modules may intentionally keep lazy state initialized in forward.
-            if all(not p.is_meta for p in m.parameters(recurse=False)):
-                continue
+            if any(p.is_meta for p in m.parameters(recurse=False)):
+                m._apply(
+                    lambda t: torch.empty_like(t, device=materialization_device) if t.is_meta else t,
+                    recurse=False,
+                )
+                init_context = (
+                    mp_policy.model_init_context(m) if mp_policy is not None else nullcontext()
+                )
+                with init_context:
+                    if hasattr(m, "reset_parameters"):
+                        m.reset_parameters()
+                    elif hasattr(m, "_reset_parameters"):
+                        m._reset_parameters()
+                    else:
+                        raise ValueError(
+                            f"Module {name} contains meta parameters but cannot reset them"
+                        )
 
-            m._apply(
-                lambda t: torch.empty_like(t, device=materialization_device) if t.is_meta else t,
-                recurse=False,
-            )
-            init_context = (
-                mp_policy.model_init_context(m) if mp_policy is not None else nullcontext()
-            )
-            with init_context:
-                if hasattr(m, "reset_parameters"):
-                    m.reset_parameters()
-                elif hasattr(m, "_reset_parameters"):
-                    m._reset_parameters()
-                else:
-                    raise ValueError(
-                        f"Module {name} contains meta parameters but cannot reset them"
-                    )
             # Move only this module's direct tensors. named_modules() visits each child
             # separately, so it is moved only after its own materialization and reset.
             m._apply(lambda t: t.to(materialization_device), recurse=False)

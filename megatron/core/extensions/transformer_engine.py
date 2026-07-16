@@ -3379,35 +3379,20 @@ try:
         out: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         grad: bool = False,
-        accumulate: bool = False,
     ) -> List[torch.Tensor]:
-        """Run TE general GEMM with an optional caller-owned output.
-
-        :param A: Left input tensor.
-        :type A: torch.Tensor
-        :param B: Right input tensor.
-        :type B: torch.Tensor
-        :param out_dtype: Output dtype, defaults to None.
-        :type out_dtype: torch.dtype, optional
-        :param layout: Matrix layout, defaults to ``"TN"``.
-        :type layout: str, optional
-        :param out: Output tensor, defaults to None.
-        :type out: torch.Tensor, optional
-        :param bias: Bias tensor, defaults to None.
-        :type bias: torch.Tensor, optional
-        :param grad: Select gradient GEMM behavior, defaults to False.
-        :type grad: bool, optional
-        :param accumulate: Accumulate into ``out``, defaults to False.
-        :type accumulate: bool, optional
-        :return: TE GEMM outputs.
-        :rtype: List[torch.Tensor]
+        """
+        Wrapper for TE's general_gemm function.
+        It supports fp32, bf16, fp16, and fp8 GEMMs with TN, NN, and NT layouts.
+        The output dtype can be specified by `out_dtype`.
+        Note: not all combinations of these settings are supported. If not supported,
+        cublaslt will throw an error.
         """
         kwargs = dict(
             out_dtype=out_dtype,
             quantization_params=None,
             gelu=None,
             gelu_in=None,
-            accumulate=accumulate,
+            accumulate=False,
             layout=layout,
             out=out,
             bias=bias,
