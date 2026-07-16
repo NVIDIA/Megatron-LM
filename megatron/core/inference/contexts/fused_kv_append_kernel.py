@@ -185,3 +185,135 @@ def triton_append_key_value_cache(
         # Compile-time constant
         BLOCK_SIZE_H=BLOCK_SIZE_H,
     )
+
+
+@triton.jit
+def _append_mla_latent_cache_kernel(
+    # --- Pointers to Tensors ---
+    kv_concat_ptr,
+    cache_ptr,
+    block_idx_ptr,
+    local_kv_seq_idx_ptr,
+    # --- Strides for Tensor Memory Layout ---
+    stride_kv_token,
+    stride_kv_dim,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_dim,
+    # --- Other Parameters ---
+    n_tokens: tl.int32,
+    KV_REDUCED_DIM: tl.int32,
+    # --- Compile-Time Constants ---
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """
+    Triton kernel to append MLA latent vectors to 3D sliced paged MLA cache tensors.
+
+    Each program instance handles one token. The grid is 1D: (n_tokens,).
+
+    1. It identifies which token it is responsible for using `tl.program_id(0)`.
+    2. It loads the `block_idx` and `local_pos` for that token.
+    3. It loads the `kv_reduced_dim` vector for the current token.
+    4. It calculates the destination address in the 3D cache slice.
+    5. It writes (scatters) the latent vector into the cache.
+    """
+    token_idx = tl.program_id(0)
+
+    if token_idx >= n_tokens:
+        return
+
+    # --- Load destination indices for current token ---
+    block_idx = tl.load(block_idx_ptr + token_idx).to(tl.int64)
+    local_pos = tl.load(local_kv_seq_idx_ptr + token_idx).to(tl.int64)
+
+    # --- Load the MLA latent vector for the current token ---
+    offs_d = tl.arange(0, BLOCK_SIZE_D)
+    mask_d = offs_d < KV_REDUCED_DIM
+
+    kv_token_ptr = kv_concat_ptr + token_idx * stride_kv_token
+    kv_to_write = tl.load(kv_token_ptr + offs_d * stride_kv_dim, mask=mask_d, other=0.0)
+
+    # --- Calculate destination pointer in the 3D cache slice ---
+    dest_offset = block_idx * stride_cache_block + local_pos * stride_cache_pos
+
+    cache_dest_ptr = cache_ptr + dest_offset
+
+    # --- Store the latent vector into the cache ---
+    tl.store(cache_dest_ptr + offs_d * stride_cache_dim, kv_to_write, mask=mask_d)
+
+
+def triton_append_mla_latent_cache(
+    layer_number: int,
+    kv_concat: Tensor,
+    memory_buffer: Tensor,
+    padded_active_token_count: int,
+    token_to_block_idx: Tensor,
+    token_to_local_position_within_kv_block: Tensor,
+) -> None:
+    """
+    Append MLA latent vectors to cache using a standalone Triton kernel.
+
+    Args:
+        layer_number (int): Layer number (0-based attention layer index).
+        kv_concat (Tensor): MLA latent tensor of shape (batch_size, 1, kv_reduced_dim)
+            or (batch_size, kv_reduced_dim).
+        memory_buffer (Tensor): The 4D MLA latent cache tensor to write to
+            (num_layers, total_blocks, block_size, kv_reduced_dim).
+        padded_active_token_count (int): The number of active tokens to process.
+        token_to_block_idx (Tensor): Tensor mapping token index to its block index in the cache.
+        token_to_local_position_within_kv_block (Tensor): Tensor mapping token index to position
+            within block.
+    """
+    assert (
+        kv_concat.device.type == 'cuda' and memory_buffer.device.type == 'cuda'
+    ), "All tensors must be on CUDA devices."
+
+    n_tokens = padded_active_token_count
+    if n_tokens == 0:
+        return
+
+    if kv_concat.dim() == 3:
+        assert kv_concat.size(1) == 1, "Expected sequence length 1 for decode."
+        kv_concat = kv_concat.squeeze(1)
+    elif kv_concat.dim() == 4:
+        kv_concat = kv_concat.reshape(kv_concat.size(0), -1)
+
+    kv_reduced_dim = kv_concat.shape[-1]
+    mla_cache = memory_buffer[layer_number]
+
+    kv_to_cache = kv_concat[:n_tokens]
+    block_idx_active = token_to_block_idx[:n_tokens].contiguous()
+    local_kv_seq_idx_active = token_to_local_position_within_kv_block[:n_tokens].contiguous()
+
+    assert (
+        mla_cache.dim() == 3
+    ), f"Sliced MLA cache should be 3D (total_blocks, block_size, kv_reduced_dim), got {mla_cache.dim()}D"
+    assert (
+        kv_reduced_dim == mla_cache.shape[-1]
+    ), f"Reduced dimension mismatch: kv_concat has {kv_reduced_dim} but cache expects {mla_cache.shape[-1]}."
+
+    grid = (n_tokens,)
+    BLOCK_SIZE_D = triton.next_power_of_2(kv_reduced_dim)
+    cache_strides = mla_cache.stride()
+
+    stride_kv_dim = kv_to_cache.stride(1) if kv_to_cache.dim() > 1 else 1
+
+    _append_mla_latent_cache_kernel[grid](
+        # Pointers
+        kv_to_cache,
+        mla_cache,
+        block_idx_active,
+        local_kv_seq_idx_active,
+        # Strides for 2D kv_concat tensor
+        kv_to_cache.stride(0),
+        stride_kv_dim,
+        # Strides for 3D sliced cache
+        cache_strides[0],
+        cache_strides[1],
+        cache_strides[2],
+        # Other parameters
+        n_tokens=n_tokens,
+        KV_REDUCED_DIM=kv_reduced_dim,
+        # Compile-time constant
+        BLOCK_SIZE_D=BLOCK_SIZE_D,
+    )
