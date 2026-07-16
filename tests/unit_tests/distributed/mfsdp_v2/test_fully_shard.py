@@ -257,6 +257,8 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
 
+    ``fully_shard(model)`` makes the child units share a root context so their
+    reductions run through the overlap path rather than as independent roots.
     Counting NCCL events over a multi-microbatch step, the DP-inner reduce-scatter
     fires once per microbatch per group while the DP-outer all-reduce that
     finalizes main_grad fires only on the last microbatch, so the reduce-scatter
@@ -274,15 +276,17 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
         device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
     )
     torch.manual_seed(1234)
-    model = TinyModel().to(device)
-    fully_shard(model.fc1, mesh=mesh, placements=_hsdp_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_hsdp_placements())
+    dim = 8
+    model = MultiChildModel(dim=dim, num_children=2).to(device)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
     num_microbatches = 3
     micro_batch_size = 2
-    x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
-    target = torch.randn(num_microbatches, micro_batch_size, 4, device=device)
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
     def train_one_step() -> None:
