@@ -3225,7 +3225,16 @@ def load_prox_pi_state(checkpoints_path, iteration):
     if checkpoints_path is None:
         return None
     _, path = _prox_pi_checkpoint_path(checkpoints_path, iteration)
-    return torch.load(path, map_location='cpu') if os.path.exists(path) else None
+    if not os.path.exists(path):
+        return None
+    try:
+        return torch.load(path, map_location='cpu')
+    except Exception as e:
+        # A link dying mid-save leaves a torn shard; crashing here wedges the
+        # whole chain at this iteration on every restart. Reinitializing this
+        # rank's prox EWMA from the policy is a benign one-rank reset.
+        print(f'WARNING: prox_pi shard {path} unreadable ({e}); reinitializing.', flush=True)
+        return None
 
 
 # Current proximal policy; persisted by save_checkpoint_and_time on every save path.
