@@ -326,6 +326,9 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 or "global_aux_loss" in config.moe_router_load_balancing_type
             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
+            if getattr(module, 'qb_beta_accum', None) is not None:
+                module.qb_beta_accum.zero_()
+                module.qb_beta_count.zero_()
 
 
 def _update_router_expert_bias(
@@ -366,6 +369,48 @@ def _update_router_expert_bias(
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
+
+
+def _update_router_qb_beta(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Update the quantile-balancing per-expert bias once per global batch.
+
+    Averages each router's accumulated quantile (qb_beta_accum/qb_beta_count) across
+    DP, EMA-blends it with the current qb_beta, re-centers, and writes it back.
+    """
+    qb_beta_list = []
+    qb_beta_accum_list = []
+    qb_beta_count_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if getattr(module, 'qb_beta_accum', None) is not None and module.training:
+                qb_beta_list.append(module.qb_beta)
+                qb_beta_accum_list.append(module.qb_beta_accum)
+                qb_beta_count_list.append(module.qb_beta_count)
+
+    if len(qb_beta_list) == 0:
+        return
+
+    stacked_beta = torch.stack(qb_beta_list, dim=0)
+    local_avg_list = [
+        accum / count.clamp(min=1).to(accum.dtype)
+        for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
+    ]
+    stacked_local_avg = torch.stack(local_avg_list, dim=0)
+
+    torch.distributed.all_reduce(
+        stacked_local_avg, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group
+    )
+
+    ema = config.moe_router_quantile_balancing_ema
+    stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_local_avg
+    stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True)
+
+    for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
+        qb_beta.copy_(new_beta)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -541,6 +586,9 @@ def finalize_model_grads(
                 with_context_parallel=True
             )
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
+
+    if config.moe_router_load_balancing_type == "quantile_balancing":
+        _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 
