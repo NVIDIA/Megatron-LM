@@ -202,6 +202,12 @@ class DotProductAttention(MegatronModule):
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
 
+        # Apply attention logit softcapping (cap * tanh(logits / cap)) before the mask + softmax
+        # for parity with the fused TE softcap path.
+        if self.config.attn_logit_softcapping is not None:
+            cap = self.config.attn_logit_softcapping
+            attention_scores = cap * torch.tanh(attention_scores / cap)
+
         # ===========================
         # Attention probs and dropout
         # ===========================

@@ -1992,6 +1992,13 @@ class TERowParallelLinear(TELinear):
             super().backward_dw()
 
 
+# Some patched TE builds expose a `softcap` kwarg on DotProductAttention without bumping the TE
+# version number, so we probe the signature once instead of gating on is_te_min_version().
+_te_dpa_supports_softcap = (
+    "softcap" in inspect.signature(te.pytorch.DotProductAttention.__init__).parameters
+)
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -2141,6 +2148,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 "`softmax_type`."
             )
             extra_kwargs["softmax_type"] = self.config.softmax_type
+
+        if self.config.attn_logit_softcapping is not None:
+            assert _te_dpa_supports_softcap, (
+                f"Transformer-Engine v{get_te_version()} does not expose a `softcap` argument on "
+                "DotProductAttention, so `attn_logit_softcapping` cannot be used. Install a TE "
+                "build with softcap support or unset `attn_logit_softcapping`."
+            )
+            extra_kwargs["softcap"] = self.config.attn_logit_softcapping
 
         self.kept_packed_seq_params = set(
             field.name for field in dataclasses.fields(PackedSeqParams)
