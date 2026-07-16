@@ -16,13 +16,13 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.training.arguments import _validate_raw_moment_logging_args
 from megatron.training.raw_moment_logging import RawMomentLogger
 
-_RAW_MOMENT_LOGGING_FLAGS = (
-    'log_param_raw_moments_by_param',
-    'log_grad_raw_moments_by_param',
-    'log_activation_raw_moments_by_layer',
-    'log_dgrad_raw_moments_by_layer',
-    'log_residual_raw_moments_by_layer',
-    'log_residual_dgrad_raw_moments_by_layer',
+_STATS_INTERVAL_FLAGS = (
+    'log_param_stats_interval',
+    'log_wgrad_stats_interval',
+    'log_activation_stats_interval',
+    'log_dgrad_stats_interval',
+    'log_residual_stats_interval',
+    'log_residual_grad_stats_interval',
 )
 
 
@@ -89,17 +89,17 @@ def _raw_moment_logging_args():
     return SimpleNamespace(
         use_megatron_fsdp=False,
         use_torch_fsdp2=False,
-        log_param_raw_moments_by_param=0,
-        log_grad_raw_moments_by_param=0,
-        log_activation_raw_moments_by_layer=0,
-        log_dgrad_raw_moments_by_layer=0,
-        log_residual_raw_moments_by_layer=0,
-        log_residual_dgrad_raw_moments_by_layer=0,
+        log_param_stats_interval=0,
+        log_wgrad_stats_interval=0,
+        log_activation_stats_interval=0,
+        log_dgrad_stats_interval=0,
+        log_residual_stats_interval=0,
+        log_residual_grad_stats_interval=0,
         overlap_moe_expert_parallel_comm=False,
     )
 
 
-@pytest.mark.parametrize('logging_flag', _RAW_MOMENT_LOGGING_FLAGS)
+@pytest.mark.parametrize('logging_flag', _STATS_INTERVAL_FLAGS)
 @pytest.mark.parametrize('fsdp_flag', ('use_megatron_fsdp', 'use_torch_fsdp2'))
 def test_raw_moment_logging_rejects_fsdp(logging_flag, fsdp_flag):
     args = _raw_moment_logging_args()
@@ -110,7 +110,7 @@ def test_raw_moment_logging_rejects_fsdp(logging_flag, fsdp_flag):
         _validate_raw_moment_logging_args(args)
 
 
-@pytest.mark.parametrize('logging_flag', _RAW_MOMENT_LOGGING_FLAGS)
+@pytest.mark.parametrize('logging_flag', _STATS_INTERVAL_FLAGS)
 @pytest.mark.parametrize('disabled_interval', (0, -1))
 @pytest.mark.parametrize('fsdp_flag', ('use_megatron_fsdp', 'use_torch_fsdp2'))
 def test_disabled_raw_moment_logging_allows_fsdp(logging_flag, disabled_interval, fsdp_flag):
@@ -123,7 +123,7 @@ def test_disabled_raw_moment_logging_allows_fsdp(logging_flag, disabled_interval
 
 @pytest.mark.parametrize(
     "logging_flag",
-    ("log_residual_raw_moments_by_layer", "log_residual_dgrad_raw_moments_by_layer"),
+    ("log_residual_stats_interval", "log_residual_grad_stats_interval"),
 )
 def test_residual_raw_moment_logging_rejects_fine_grained_ep_overlap(logging_flag):
     args = _raw_moment_logging_args()

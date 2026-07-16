@@ -387,31 +387,31 @@ def tuple_type(x):
 
 
 def _validate_raw_moment_logging_args(args):
-    raw_moment_logging_enabled = any(
+    stats_logging_enabled = any(
         interval > 0
         for interval in (
-            args.log_param_raw_moments_by_param,
-            args.log_grad_raw_moments_by_param,
-            args.log_activation_raw_moments_by_layer,
-            args.log_dgrad_raw_moments_by_layer,
-            args.log_residual_raw_moments_by_layer,
-            args.log_residual_dgrad_raw_moments_by_layer,
+            args.log_param_stats_interval,
+            args.log_wgrad_stats_interval,
+            args.log_activation_stats_interval,
+            args.log_dgrad_stats_interval,
+            args.log_residual_stats_interval,
+            args.log_residual_grad_stats_interval,
         )
     )
-    if raw_moment_logging_enabled and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+    if stats_logging_enabled and (args.use_megatron_fsdp or args.use_torch_fsdp2):
         raise ValueError(
             'Raw-moment statistics logging is not supported with '
             '--use-megatron-fsdp or --use-torch-fsdp2.'
         )
     if (
         (
-            args.log_residual_raw_moments_by_layer > 0
-            or args.log_residual_dgrad_raw_moments_by_layer > 0
+            args.log_residual_stats_interval > 0
+            or args.log_residual_grad_stats_interval > 0
         )
         and args.overlap_moe_expert_parallel_comm
     ):
         raise ValueError(
-            'Residual and residual-dgrad raw-moment statistics logging is not supported with '
+            'Residual and residual-gradient statistics logging is not supported with '
             '--overlap-moe-expert-parallel-comm.'
         )
 

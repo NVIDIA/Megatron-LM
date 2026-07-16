@@ -250,29 +250,31 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
-    log_param_raw_moments_by_param: int = 0
+    log_param_stats_interval: int = 0
     """Training-step interval for logging count and raw sums of powers 1-4 for each parameter
     separately (keyed by parameter name) to JSONL statistics files. Values of 0 or less disable
     logging."""
 
-    log_grad_raw_moments_by_param: int = 0
+    log_wgrad_stats_interval: int = 0
     """Training-step interval for logging count and raw sums of powers 1-4 for each parameter's
     pre-clipping gradient separately (keyed by parameter name) to JSONL statistics files. Values
     of 0 or less disable logging."""
 
-    log_activation_raw_moments_by_layer: int = 0
+    log_activation_stats_interval: int = 0
     """Training-step interval for logging count and raw sums of powers 1-4 for activations keyed
-    by module site to JSONL statistics files. Values of 0 or less disable logging."""
+    by module site to JSONL statistics files. Will suspend CUDA graphs for the logged steps.
+    Values of 0 or less disable logging."""
 
-    log_dgrad_raw_moments_by_layer: int = 0
+    log_dgrad_stats_interval: int = 0
     """Training-step interval for logging count and raw sums of powers 1-4 for backward data
-    gradients keyed by module site to JSONL statistics files. Values of 0 or less disable logging."""
+    gradients keyed by module site to JSONL statistics files. Will suspend CUDA graphs for the
+    logged steps. Values of 0 or less disable logging."""
 
-    log_residual_raw_moments_by_layer: int = 0
+    log_residual_stats_interval: int = 0
     """Training-step interval for logging count and raw sums of powers 1-4 for the initial decoder
     residual stream and each post-layer residual stream. Values of 0 or less disable logging."""
 
-    log_residual_dgrad_raw_moments_by_layer: int = 0
+    log_residual_grad_stats_interval: int = 0
     """Training-step interval for logging count and raw sums of powers 1-4 for the backward
     gradients of the initial decoder residual stream and each post-layer residual stream. Values
     of 0 or less disable logging."""
