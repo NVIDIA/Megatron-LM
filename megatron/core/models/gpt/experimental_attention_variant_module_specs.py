@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gdn import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gdn import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -66,8 +66,12 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
+    # gdn2 reuses the GDN submodules and spec structure with the GatedDeltaNet2 module.
+    gdn_module = (
+        GatedDeltaNet2 if config.experimental_attention_variant == "gdn2" else GatedDeltaNet
+    )
     attention = ModuleSpec(
-        module=GatedDeltaNet,
+        module=gdn_module,
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
@@ -138,7 +142,7 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant == "gated_delta_net":
+    if config.experimental_attention_variant in ("gated_delta_net", "gdn2"):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
@@ -332,7 +336,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
+    linear_attention_variants = ["gated_delta_net", "gdn2"]
     return experimental_attention_variant in linear_attention_variants
 
 
