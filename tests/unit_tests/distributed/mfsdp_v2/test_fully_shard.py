@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class TinyModel(nn.Module):
-    """Small model with two separately shardable units."""
+    """Small model with two separately shardable modules."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -53,7 +53,7 @@ class NestedModel(nn.Module):
 
 
 class MultiChildModel(nn.Module):
-    """Model with direct parameters and multiple child FSDP units."""
+    """Model with direct parameters and multiple child FsdpModules."""
 
     def __init__(self, dim: int, num_children: int) -> None:
         super().__init__()
@@ -255,7 +255,7 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 
 
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
-    """An outer FSDP unit owns direct parameters but not nested child-unit parameters."""
+    """An outer FsdpModule owns direct parameters but not nested child FsdpModule parameters."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -397,8 +397,8 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-def test_overlaps_all_gather_and_compute(distributed_setup):
-    """A shared root context should let child all-gathers overlap GEMM compute."""
+def test_overlaps_communication_and_compute(distributed_setup):
+    """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -438,6 +438,12 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
         for event in cuda_events
         if "nccl" in event.name.lower() and "allgather" in event.name.lower()
     ]
+    reduce_scatter_events = [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower()
+        and ("reducescatter" in event.name.lower() or "reduce_scatter" in event.name.lower())
+    ]
     # GEMM device-kernel names vary across CUDA/cuBLAS versions and GPU archs
     # (e.g. "*gemm*", "cutlass*", "cublas*", and cuBLASLt's Hopper "nvjet_sm90_*").
     gemm_events = [
@@ -446,29 +452,38 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
         if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas", "nvjet"))
     ]
     assert all_gather_events, [event.name for event in cuda_events]
+    assert reduce_scatter_events, [event.name for event in cuda_events]
     assert gemm_events, [event.name for event in cuda_events]
 
     all_gather_streams = {event.device_resource_id for event in all_gather_events}
+    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
     gemm_streams = {event.device_resource_id for event in gemm_events}
     assert len(all_gather_streams) == 1
+    assert len(reduce_scatter_streams) == 1
+    assert all_gather_streams.isdisjoint(reduce_scatter_streams)
     assert all_gather_streams.isdisjoint(gemm_streams)
+    assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
-    overlap_count = sum(
+    all_gather_overlap_count = sum(
         any(_events_overlap(all_gather_event, gemm_event) for gemm_event in gemm_events)
         for all_gather_event in all_gather_events
     )
-    # This profiles a full forward/backward iteration, so backward all-gathers are
-    # included in all_gather_events. The expected overlap count is from the forward
-    # child pipeline: each child after the first can all-gather while the previous
-    # child computes, giving num_children - 1 overlaps. Backward does not overlap
-    # in this all-gather-only path because gradient reduction is not delayed:
-    # each module synchronously reduces gradients in post_backward before autograd
-    # reaches the next module's pre_backward all-gather. The next PR addresses
-    # this by delaying gradient reduction.
-    expected_overlap_count = num_children - 1
-    assert overlap_count >= expected_overlap_count, (
-        f"Expected at least {expected_overlap_count} all-gather events to overlap compute, "
-        f"got {overlap_count}/{len(all_gather_events)}."
+    reduce_scatter_overlap_count = sum(
+        any(_events_overlap(reduce_scatter_event, gemm_event) for gemm_event in gemm_events)
+        for reduce_scatter_event in reduce_scatter_events
+    )
+    # Communication overlaps compute only partially due to SM contention (the
+    # SM-based NCCL collectives share SMs with the GEMMs) and the count varies
+    # run to run, so assert only that overlap meaningfully happens rather than the
+    # theoretical maximum (2*(num_children - 1) / num_children - 1). Symmetric-memory
+    # collectives (use_symm_mem, ~SM-free) would let these thresholds be tightened.
+    assert all_gather_overlap_count >= 2, (
+        f"Expected all-gather to overlap compute, "
+        f"got {all_gather_overlap_count}/{len(all_gather_events)}."
+    )
+    assert reduce_scatter_overlap_count >= 1, (
+        f"Expected reduce-scatter to overlap compute, "
+        f"got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
     )
 
 

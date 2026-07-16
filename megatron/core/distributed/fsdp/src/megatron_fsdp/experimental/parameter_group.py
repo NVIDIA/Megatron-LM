@@ -14,7 +14,6 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
-from collections.abc import Iterable
 from contextlib import nullcontext
 
 import torch
@@ -25,7 +24,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placement, Placements, Replicate, changed_mesh_axis
+from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -241,53 +240,55 @@ class FsdpParameterGroup:
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
-    def _reduce_partial_gradients(
-        self,
-        partial_grad: DBuffer,
-        target_placements: tuple[Placement, ...],
-        *,
-        out: "DBuffer | None" = None,
-    ) -> DBuffer:
-        """Reduce ``partial_grad`` to ``target_placements``.
-
-        HSDP and HFSDP change a single mesh axis between the all-Partial gradient
-        and its sharded resting placement.
-        """
-        axis = changed_mesh_axis(partial_grad.placements, target_placements)
-        if axis is None:
-            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        if self._symm_mem_pool is not None:
-            partial_grad.rendezvous(axis)
-        reduced = partial_grad.redistribute(target_placements, out=out)
-        # Symmetric-memory reduce-scatter runs as SUM; rescale to recover the mean.
-        if self._symm_mem_pool is not None:
-            reduced.local_buffer.div_(self.mesh.size(axis))
-        return reduced
-
     def _install_sharded_grads(self) -> None:
         """Point each sharded parameter's grad at main_grad's current DTensor view."""
         assert self.main_grad is not None
         for index, sharded_parameter in enumerate(self.sharded_parameters):
             sharded_parameter.grad = self.main_grad.get_dtensor(index)
 
-    def reduce_gradients(self, is_last_microbatch: bool = True) -> None:
-        """Reduce full local gradients into sharded parameter gradients.
+    def allocate_partial_grad_buffer(self) -> DBuffer:
+        """Allocate the unreduced reduce-scatter input buffer."""
+        assert self.main_grad is not None
 
-        main_grad rests DP-outer-Partial (Partial where main_weight is Replicate)
-        between microbatches: each backward reduce-scatters DP-inner into it and
-        accumulates through the standard zero_grad contract (``set_to_none=True``
-        clears the sharded grads so main_grad is overwritten; ``set_to_none=False``
-        keeps them as views into a zeroed main_grad so they accumulate). The last
-        microbatch reduces the DP-outer axes, finalizing main_grad to
-        main_weight's placements so ``.grad`` -- a view into main_grad -- is the
-        fully reduced gradient before ``optimizer.step()``. A finalized main_grad
-        marks a completed step, so the next reduction resets it back to the
-        accumulation placement. With every axis Flat (plain DP) main_grad is
-        already finalized and this is the previous every-backward behavior.
+        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
+        # Preserve AVG semantics by reducing SUM and scaling the output below.
+        partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
+        grads: list[torch.Tensor] = []
+        for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
+            if parameter.grad is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
+            grads.append(parameter.grad)
+        with self._symmetric_memory_context():
+            return DBuffer(
+                mesh=self.mesh,
+                placements=[Partial(partial_op)] * self.mesh.ndim,
+                tensor_shapes=tuple(grad.shape for grad in grads),
+                dtype=grads[0].dtype,
+                device=grads[0].device,
+            )
+
+    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
+        """Pack full local gradients into an existing reduce-scatter input buffer."""
+        # A future fused-wgrad path can write directly into these buffer views.
+        for index, parameter in enumerate(self.unsharded_parameters):
+            partial_grad.get_local_tensor(index).copy_(parameter.grad)
+            parameter.grad = None
+
+    def reduce_partial_gradients(
+        self, partial_grad: DBuffer, is_last_microbatch: bool = True
+    ) -> None:
+        """Reduce a packed partial gradient buffer into sharded parameter gradients.
+
+        For HSDP main_grad rests DP-outer-Partial (Partial where main_weight is
+        Replicate) between microbatches, accumulating each backward through the
+        standard zero_grad contract; the last microbatch reduces the DP-outer axes,
+        finalizing main_grad to main_weight's placements so ``.grad`` is the fully
+        reduced gradient before ``optimizer.step()``. With every axis Flat (plain
+        DP) main_grad already rests finalized.
         """
         assert self.main_grad is not None
 
-        def has_grad(parameters: Iterable[nn.Parameter]) -> bool:
+        def has_grad(parameters: tuple[nn.Parameter, ...]) -> bool:
             has_any_grad = False
             has_any_missing_grad = False
             for parameter in parameters:
@@ -299,20 +300,6 @@ class FsdpParameterGroup:
                 raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
             return has_any_grad
 
-        grads: list[torch.Tensor] = []
-        for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
-            if parameter.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
-            grads.append(parameter.grad)
-
-        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
-        # Preserve AVG semantics by reducing SUM and scaling the output in _reduce_partial_gradients.
-        partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
-        with self._symmetric_memory_context():
-            partial_grad = DBuffer.distribute_tensors(
-                grads, mesh=self.mesh, placements=[Partial(partial_op)] * self.mesh.ndim
-            )
-
         # A non-accumulation main_grad means the previous step finalized it; this
         # only happens on the first microbatch. Redistribute it back to the
         # DP-outer-Partial accumulation placement -- a local relabel for HSDP, and
@@ -322,18 +309,33 @@ class FsdpParameterGroup:
             if has_grad(self.sharded_parameters):
                 self._install_sharded_grads()
 
-        # set_to_none=True cleared the sharded grads -> reduce straight into
-        # main_grad and install .grad; else they are views into main_grad, so
-        # reduce into a temporary and accumulate.
-        if has_grad(self.sharded_parameters):
-            reduced_grad = self._reduce_partial_gradients(
-                partial_grad, self._accumulation_placements
-            )
-            self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
+        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
+        # leaves sharded grads installed, so this backward accumulates into main_grad.
+        has_sharded_grads = has_grad(self.sharded_parameters)
+        can_reduce_into_main_grad = (
+            not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
+        )
+        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
+        if reduce_axis is None:
+            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
+        partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
+        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        if self._symm_mem_pool is not None:
+            partial_grad.rendezvous(reduce_axis)
+        if can_reduce_into_main_grad:
+            partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
+            if grad_divisor != 1:
+                self.main_grad.local_buffer.div_(grad_divisor)
         else:
-            self._reduce_partial_gradients(
-                partial_grad, self._accumulation_placements, out=self.main_grad
-            )
+            reduced_grad = partial_grad.redistribute(self.main_grad.placements)
+            if grad_divisor != 1:
+                reduced_grad.local_buffer.div_(grad_divisor)
+            if has_sharded_grads:
+                self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+            else:
+                self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+        if not has_sharded_grads:
             self._install_sharded_grads()
 
         if is_last_microbatch:
@@ -341,9 +343,6 @@ class FsdpParameterGroup:
             # reduce-scatter for HFSDP) and install the sharded parameter gradients.
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
             self._install_sharded_grads()
-
-        for parameter in self.unsharded_parameters:
-            parameter.grad = None
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
