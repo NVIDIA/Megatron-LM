@@ -79,12 +79,17 @@ EOF
 # checkout right after the TE-building uv sync. A non-empty libnccl_ep.a with an EMPTY
 # build/include/.../hybrid_ep.cuh line means the .a is present while the staged header is
 # missing ("stale .a, unstaged headers"); if the build/include header is present the
-# hypothesis is wrong and the runtime failure is a path/persistence issue.
-RUN --mount=type=cache,target=/root/.cache/uv bash -ex <<"EOF"
-    echo "=== nccl_ep artifact state in the uv checkout ==="
-    find /root/.cache/uv/git-v0/checkouts -name 'libnccl_ep.a'                                  # the .a the gate keys on
-    find /root/.cache/uv/git-v0/checkouts -path '*/build/include/nccl_ep/device/hybrid_ep.cuh'  # the header the JIT needs
-    find /root/.cache/uv/git-v0/checkouts -path '*/contrib/nccl_ep/device/hybrid_ep.cuh'        # the source header (always present)
+# hypothesis is wrong and the runtime failure is a path/persistence issue. The probes are
+# rooted at the whole uv cache and are strictly non-fatal (no set -e, each find guarded to
+# exit 0) so this step can never change build behavior, whatever it finds.
+RUN --mount=type=cache,target=/root/.cache/uv bash -x <<"EOF"
+    echo "=== nccl_ep artifact state in the uv cache ==="
+    ls -la /root/.cache/uv 2>&1 || true                                                         # where uv actually put its cache
+    find /root/.cache/uv -name 'libnccl_ep.a' 2>/dev/null || true                               # the .a the gate keys on
+    find /root/.cache/uv -path '*/build/include/nccl_ep/device/hybrid_ep.cuh' 2>/dev/null || true  # the header the JIT needs
+    find /root/.cache/uv -path '*/contrib/nccl_ep/device/hybrid_ep.cuh' 2>/dev/null || true     # the source header (always present)
+    echo "=== end nccl_ep probe ==="
+    exit 0
 EOF
 
 # Install DeepEP
