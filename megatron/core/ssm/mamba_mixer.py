@@ -27,6 +27,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.determinism import pin_external_mamba_autotuners, use_deterministic_mode
 from megatron.core.ssm.ops.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
@@ -235,6 +236,11 @@ class MambaMixer(MegatronModule):
                 "mamba_training_ssm_states_dtype is set, but the installed mamba_ssm does "
                 "not accept the `state_dtype` argument. Upgrade mamba_ssm or unset the option."
             )
+        if self.use_mem_eff_path and use_deterministic_mode():
+            # The mem-eff path runs fused kernels from the external mamba_ssm
+            # package whose timing-based triton autotune breaks run-to-run
+            # bit-exactness. Pin those autotuners to a fixed config.
+            pin_external_mamba_autotuners()
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
