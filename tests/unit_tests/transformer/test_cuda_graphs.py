@@ -9,7 +9,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.fine_grained_callables import _BackwardDWWrapper
+from megatron.core.models.common.utils import _BackwardDWWrapper
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
