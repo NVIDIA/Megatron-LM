@@ -44,7 +44,10 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.argument_utils import (
+    ArgumentGroupFactory,
+    _normalize_dsv4_hybrid_csa_compress_ratios,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
@@ -2284,36 +2287,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
-        # When the dsv4_hybrid variant is active (set above or explicitly) and the user did not
-        # provide --csa-compress-ratios, derive it from the pattern symbols (C->4, H->128,
-        # W/D/others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
-        # per-layer ratios match the symbols. C/H/W layers also take their ratio via the spec.
-        _variant = kw_args.get('experimental_attention_variant',
-                               getattr(args, 'experimental_attention_variant', None))
-        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is None:
-            _ratio_map = {Symbols.CSA: 4, Symbols.HCA: 128}
-            # One ratio entry per ACTUAL layer: main layers, then every MTP layer of every MTP
-            # depth (a depth can contain multiple hybrid layers, e.g. "/MD-E"). This makes the
-            # array long enough for the deepseek attn index (num_layers + layer_number - 1) for
-            # any MTP attention position, not just depth-first. C->4, H->128, others->0.
-            _sections = _pat.split(Symbols.MTP_SEPARATOR)
-            _ratios = [_ratio_map.get(c, 0) for c in _sections[0].replace(Symbols.PIPE, '')]
-            for _mtp_sec in _sections[1:]:
-                _ratios += [_ratio_map.get(c, 0) for c in _mtp_sec.replace(Symbols.PIPE, '')]
-            kw_args['csa_compress_ratios'] = _ratios
-            args.csa_compress_ratios = _ratios
-        # Exact length check (the pattern is known here, so the precise per-layer count is too):
-        # one ratio per main layer + one per MTP layer of every MTP depth. This catches a
-        # mis-sized user-provided --csa-compress-ratios with a clear error. (transformer_config
-        # keeps a >= backstop because it does not have the pattern to recompute this exactly.)
-        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is not None:
-            _secs = _pat.split(Symbols.MTP_SEPARATOR)
-            _exact_len = sum(len(s.replace(Symbols.PIPE, '')) for s in _secs)
-            assert len(args.csa_compress_ratios) == _exact_len, (
-                f"csa_compress_ratios length ({len(args.csa_compress_ratios)}) must equal the "
-                f"number of layers in the hybrid pattern (main + every MTP-depth layer) "
-                f"= {_exact_len} for pattern '{_pat}'."
-            )
+        # Normalize compact and legacy-padded ratios through the shared migration helper.
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -4896,7 +4871,9 @@ def _add_experimental_attention_variant_args(parser):
         'Each value is the compression ratio for the corresponding '
         'transformer layer (valid values: 0, 4, 128; 0 = sliding-window-only, the "W" '
         'hybrid layer symbol). '
-        'The list length must equal num_layers.',
+        'For HybridModel with --hybrid-layer-pattern, the preferred compact form has one '
+        'entry per W/C/H attention symbol; legacy zero-padded one-entry-per-hybrid-layer '
+        'lists are also accepted.',
     )
     group.add_argument(
         '--no-dsa-kernel-fusion',

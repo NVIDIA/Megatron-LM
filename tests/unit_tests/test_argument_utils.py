@@ -13,6 +13,7 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    _normalize_dsv4_hybrid_csa_compress_ratios,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.config import PretrainConfigContainer
@@ -676,6 +677,41 @@ class TestMegatronNetworkArgumentGeneration:
         args = parser.parse_args([])
         for field_name in callback_fields:
             assert not hasattr(args, field_name)
+
+
+class TestDsv4HybridCsaCompressRatioNormalization:
+    """Test the shared DSv4 hybrid compression-ratio normalization contract."""
+
+    @pytest.mark.parametrize(
+        ("provided", "expected_config_ratios"),
+        [
+            (None, [0, 0, 0, 4, 128, 0]),
+            ([0, 4, 128], [0, 0, 0, 4, 128, 0]),
+            ([0, 0, 0, 4, 128, 0], [0, 0, 0, 4, 128, 0]),
+        ],
+    )
+    def test_normalizes_default_compact_and_padded_ratios(self, provided, expected_config_ratios):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+        kw_args = {}
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, "-W|EC/H-")
+
+        assert args.csa_compress_ratios == [0, 4, 128]
+        assert kw_args['csa_compress_ratios'] == expected_config_ratios
+
+    @pytest.mark.parametrize(
+        ("provided", "message"),
+        [
+            ([0, 8, 128], "ratio 8.*symbol 'C'.*expected 4"),
+            ([1, 0, 0, 4, 128, 0], "non-attention hybrid symbol '-'.*non-zero ratio 1"),
+            ([0, 4], r"length \(2\).*W/C/H attention symbols \(3\)"),
+        ],
+    )
+    def test_rejects_invalid_ratios(self, provided, message):
+        args = Namespace(experimental_attention_variant='dsv4_hybrid', csa_compress_ratios=provided)
+
+        with pytest.raises(AssertionError, match=message):
+            _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
 
 
 # ---------------------------------------------------------------------------
