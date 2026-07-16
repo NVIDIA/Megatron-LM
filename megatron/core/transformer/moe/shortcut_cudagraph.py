@@ -112,6 +112,9 @@ class AsyncDispatchToPersistentGradBuffers(torch.autograd.Function):
         route_probs_grad_buffer,
         route_grad_ready_event,
     ):
+        # Dispatch reads detached persistent buffers, so it otherwise has no autograd edge
+        # to the route/input graph. This dummy dependency holds that graph's backward until
+        # dispatch backward has published the route gradients and recorded the ready event.
         ctx.dispatch_stream = dispatch_stream
         ctx.route_input_grad_buffer = route_input_grad_buffer
         ctx.route_probs_grad_buffer = route_probs_grad_buffer

@@ -281,6 +281,7 @@ class _OutputProjSharedExperts(GraphableMegatronModule):
             # The output projection and its backward then use graph-local storage, allowing the
             # shared graph mempool to reuse the route-output allocation after this graph starts.
             compute_state = (compute_state[0].clone(), *compute_state[1:])
+
         if self._is_mamba:
             compute_result = self.compute_layer.output_proj(*compute_state)
         else:
@@ -423,10 +424,10 @@ class ShortcutMoEBlock:
 
     def launch_dispatch(self, persistent_slot: int, backward_dependency: torch.Tensor):
         """Launch dispatch from persistent inputs after the route/input graph is queued."""
-        target = self.route_input_compute
-        if not target._enable_cudagraph:
+        if not self.route_input_compute._enable_cudagraph:
             raise RuntimeError("Persistent dispatch inputs require shortcut CUDA-graph mode")
-        slot = target.get_persistent_slot(persistent_slot)
+
+        slot = self.route_input_compute.get_persistent_slot(persistent_slot)
         route_input = slot.route_input_buffer.tensor
         route_probs = slot.route_probs_buffer.tensor
         self.moe_layer._restore_token_dispatcher_attrs_for_dispatch(

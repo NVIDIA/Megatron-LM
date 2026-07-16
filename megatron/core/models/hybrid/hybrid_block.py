@@ -27,7 +27,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
@@ -59,6 +59,14 @@ class _HybridExecutionStep:
 
     layer_index: int
     shortcut_block: Optional[ShortcutMoEBlock] = None
+
+
+def _install_standalone_cudagraph_manager(layer, config):
+    """Restore the regular graph manager for a layer not consumed by a shortcut pair."""
+    if getattr(layer, '_shortcut_graph_output_proj', False) and not hasattr(
+        layer, 'cudagraph_manager'
+    ):
+        layer.cudagraph_manager = CudaGraphManager(config)
 
 
 class HybridStack(MegatronModule):
@@ -252,6 +260,10 @@ class HybridStack(MegatronModule):
                     and self.layer_type_list[i + 1] == LayerSymbols.MOE
                 )
                 if not next_is_moe:
+                    # Mamba/attention constructors defer their regular graph manager whenever
+                    # shortcut mode is globally enabled. Restore it when this particular layer
+                    # is not the immediate predecessor of an MoE shortcut pair.
+                    _install_standalone_cudagraph_manager(self.layers[i], self.config)
                     execution_plan.append(_HybridExecutionStep(layer_index=i))
                     i += 1
                     continue

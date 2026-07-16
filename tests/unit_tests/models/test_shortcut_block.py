@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.models.hybrid import hybrid_block as hybrid_block_module
 from megatron.core.models.hybrid import shortcut_block as shortcut_block_module
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutExecutionMode,
@@ -21,6 +22,19 @@ from megatron.core.transformer.moe.shortcut_cudagraph import (
 )
 from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def test_standalone_shortcut_candidate_restores_regular_cudagraph_manager(monkeypatch):
+    config = object()
+    manager = object()
+    layer = SimpleNamespace(_shortcut_graph_output_proj=True)
+    monkeypatch.setattr(
+        hybrid_block_module, "CudaGraphManager", lambda received: manager
+    )
+
+    hybrid_block_module._install_standalone_cudagraph_manager(layer, config)
+
+    assert layer.cudagraph_manager is manager
 
 
 @pytest.fixture
