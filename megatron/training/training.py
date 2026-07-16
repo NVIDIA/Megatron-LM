@@ -207,6 +207,8 @@ except ImportError:
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
+    from megatron.post_training.utils import maybe_enable_modelopt
+
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
@@ -1701,16 +1703,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import has_modelopt_state
-
-        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
-        # set a flag to use our model provider if so.
-        if args.load is not None and has_modelopt_state(args.load):
-            print_rank_0(f'ModelOpt checkpoint detected')
-            args.modelopt_enabled = True
-        elif getattr(args, "export_kd_teacher_load", None):
-            # For distillation ckpts without ModelOpt state
-            args.modelopt_enabled = True
+        maybe_enable_modelopt(args)
 
     # Build model.
     def build_model():
@@ -2017,6 +2010,9 @@ def setup_model_and_optimizer(
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+
     def _build_model_wrapper(wrap_with_ddp: bool):
         if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
             from megatron.training.utils import start_memory_history_recording
@@ -2176,6 +2172,14 @@ def setup_model_and_optimizer(
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+
+    # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
+    # Import locally to prevent circular import: megatron.post_training.checkpointing
+    # imports `get_args` from megatron.training at module scope.
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
+
+        load_kd_teacher_checkpoint(model)
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
@@ -2956,10 +2960,6 @@ def save_checkpoint_and_time(
     timers('interval-time').stop()
     energy_monitor.pause()
 
-    # Extra barrier is added to make sure all ranks report the max time.
-    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=True)
-
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
@@ -2969,6 +2969,10 @@ def save_checkpoint_and_time(
         if hasattr(model_chunk, 'free_overlap_buffers'):
             model_chunk.free_overlap_buffers()
     torch.cuda.empty_cache()
+
+    # timer.log() reports the min & max time. We do not need a barrier here.
+    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+    timers(timer_key, log_level=0).start(barrier=False)
 
     # Resolve checkpoint groups from this rank's module PGC; None for stock runs
     # falls back to the mpu groups inside save_checkpoint (byte-identical).
@@ -3008,7 +3012,8 @@ def save_checkpoint_and_time(
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
-    timers(timer_key).stop(barrier=True)
+    # Since timer.log() reports the min & max time, we do not need a barrier here.
+    timers(timer_key).stop(barrier=False)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
 
     if should_report_memory:
