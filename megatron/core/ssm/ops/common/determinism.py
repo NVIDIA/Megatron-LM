@@ -6,20 +6,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-import warnings
 
 import torch
-from packaging import version
-
-try:
-    import triton
-
-    TRITON_VERSION = version.parse(triton.__version__)
-except ImportError:
-    TRITON_VERSION = version.parse("0.0.0")
-
-TRITON_HAS_CACHE_RESULTS = TRITON_VERSION >= version.parse("3.4.0")
-_autotune_warning_issued = False
 
 _deterministic_override = None
 
@@ -81,26 +69,72 @@ def _filter_configs_by_block_sizes(configs):
 def autotune_configs(configs):
     """Select autotune configs for deterministic mode.
 
-    Uses cached autotuning (TRITON_CACHE_AUTOTUNING=1) if Triton >= 3.4.0,
-    otherwise auto-selects the cheapest config by block size * stages.
+    Config selection must be value-deterministic (a pure function of the
+    config list), never timing-derived. Cached autotuning
+    (``TRITON_CACHE_AUTOTUNING=1``) is NOT sufficient: the first benchmark is
+    still timing-based, so the cached winner can differ per process, per GPU,
+    and per (ephemeral, container-local) Triton cache directory. Two
+    otherwise-identical runs then execute different tile shapes, which changes
+    the floating-point reduction order. Deterministic mode therefore always
+    pins to the env-selected or cheapest config.
     """
     if not configs or not use_deterministic_mode():
         return configs
-    if TRITON_HAS_CACHE_RESULTS and os.environ.get("TRITON_CACHE_AUTOTUNING") == "1":
-        return configs
-    global _autotune_warning_issued
-    if not _autotune_warning_issued:
-        _autotune_warning_issued = True
-        msg = (
-            "Deterministic mode: set TRITON_CACHE_AUTOTUNING=1 for cached autotuning."
-            if TRITON_HAS_CACHE_RESULTS
-            else "Deterministic mode: upgrade to Triton >= 3.4.0 for cached autotuning."
-        )
-        warnings.warn(msg)
     filtered = _filter_configs_by_block_sizes(configs)
     if filtered:
         return filtered
     return [min(configs, key=_estimate_config_cost)]
+
+
+_external_autotune_pinned = False
+
+
+def pin_external_mamba_autotuners():
+    """Pin timing-based Triton autotuners in the external ``mamba_ssm`` package.
+
+    The Mamba memory-efficient training path (``use_mamba_mem_eff_path``, the
+    default) calls ``mamba_split_conv1d_scan_combined`` from the external
+    ``mamba_ssm`` package. Those kernels carry their own ``@triton.autotune``
+    decorators that benchmark candidate configs at first call, so the winning
+    config — and therefore the floating-point reduction order — can differ
+    across processes and GPUs from clock jitter alone. Under deterministic
+    mode, prune each such autotuner to a single value-deterministically chosen
+    config (same rule as ``autotune_configs``). Scoped to ``mamba_ssm``
+    functions so other Triton autotuners keep their tuned performance.
+
+    Idempotent; a no-op when triton is unavailable.
+    """
+    global _external_autotune_pinned
+    if _external_autotune_pinned:
+        return
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return
+
+    original_run = Autotuner.run
+
+    def _kernel_module(autotuner):
+        fn = getattr(autotuner, "base_fn", None) or getattr(autotuner, "fn", None)
+        # Unwrap JITFunction and nested decorators to the underlying python fn.
+        seen = 0
+        while fn is not None and not hasattr(fn, "__module__") and hasattr(fn, "fn") and seen < 8:
+            fn = fn.fn
+            seen += 1
+        return getattr(fn, "__module__", "") or ""
+
+    def deterministic_run(self, *args, **kwargs):
+        if (
+            len(getattr(self, "configs", ())) > 1
+            and use_deterministic_mode()
+            and _kernel_module(self).startswith("mamba_ssm")
+        ):
+            filtered = _filter_configs_by_block_sizes(self.configs)
+            self.configs = filtered or [min(self.configs, key=_estimate_config_cost)]
+        return original_run(self, *args, **kwargs)
+
+    Autotuner.run = deterministic_run
+    _external_autotune_pinned = True
 
 
 def alloc_tile_workspace(base_shape, tile_dim, dtype, device, deterministic, *, zero_init=True):
