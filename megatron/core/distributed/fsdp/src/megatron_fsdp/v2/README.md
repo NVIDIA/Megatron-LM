@@ -290,27 +290,32 @@ without any Megatron-LM dependency once the package is released.
 
 ## Toy Example
 
-See `examples/megatron_fsdp/fsdp_toy.py` for a standalone example showing:
+See
+`examples/megatron_fsdp_v2_prototype/fsdp_toy/fsdp_toy.py` for a standalone
+example showing:
 
 - Basic model wrapping with `fully_shard()`
-- CUDA graph capture (`--cuda-graph` / `--no-cuda-graph`)
+- CUDA graph capture (`--cuda-graph`, disabled by default)
 - Training loop with gradient accumulation
 - Activation checkpointing (`--activation-checkpoint`)
 - Distributed checkpointing with `torch.distributed.checkpoint`
 
 ```bash
-torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+torchrun --nproc_per_node=2 \
+    examples/megatron_fsdp_v2_prototype/fsdp_toy/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4
 
 # With activation checkpointing and Megatron-FSDP
-torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+torchrun --nproc_per_node=2 \
+    examples/megatron_fsdp_v2_prototype/fsdp_toy/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4 \
     --use-megatron-fsdp --activation-checkpoint
 
-# Disable CUDA graph capture
-torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+# Enable CUDA graph capture and trace-pool allocation
+torchrun --nproc_per_node=2 \
+    examples/megatron_fsdp_v2_prototype/fsdp_toy/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4 \
-    --use-megatron-fsdp --no-cuda-graph
+    --use-megatron-fsdp --cuda-graph --use-trace-pool
 ```
 
 ## Gotchas / Pitfalls

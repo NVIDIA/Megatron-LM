@@ -1,8 +1,14 @@
-# FSDP1 vs Megatron-FSDP — QwenImage Benchmark
+# Diffusers QwenImage: FSDP1 vs Megatron-FSDP
 
 Minimal repro comparing PyTorch FSDP1 against Megatron-FSDP on
 `QwenImageTransformer2DModel`.  All code is self-contained in `test_qwenimage.py`;
 only stock packages are required below.
+
+Run the commands below from the example directory:
+
+```bash
+cd examples/megatron_fsdp_v2_prototype/diffusers_qwenimage
+```
 
 ## Environment Setup (run once)
 
