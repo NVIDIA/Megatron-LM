@@ -3002,6 +3002,11 @@ def _rollout_keepalive_burn(interval_s, stop_event):
             return
         a = b = None
         failures = 0
+        # CONTINUOUS low-duty burn, not periodic bursts: job 5439275 was reaped
+        # (31/32 idle 30m) with the previous 3s-per-60s burst version running and
+        # zero failures logged -- a 5% duty cycle concentrated in one burst evades
+        # the reaper's sampling. ~60ms of matmul every 500ms (~12% duty) is visible
+        # to any sampler cadence while adding negligible contention.
         while not stop_event.is_set():
             try:
                 with torch.cuda.stream(stream):
@@ -3009,8 +3014,8 @@ def _rollout_keepalive_burn(interval_s, stop_event):
                         a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
                         b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
                     t0 = _time.monotonic()
-                    while _time.monotonic() - t0 < 3.0 and not stop_event.is_set():
-                        for _ in range(8):
+                    while _time.monotonic() - t0 < 0.06:
+                        for _ in range(16):
                             torch.matmul(a, b)
                         stream.synchronize()
                 failures = 0
@@ -3022,7 +3027,7 @@ def _rollout_keepalive_burn(interval_s, stop_event):
                 if failures >= 10:
                     logger.warning("Keepalive burn disabled after 10 consecutive failures.")
                     return
-            if stop_event.wait(interval_s):
+            if stop_event.wait(0.5):
                 return
     except Exception:
         logger.warning("Keepalive burn thread exiting.", exc_info=True)
