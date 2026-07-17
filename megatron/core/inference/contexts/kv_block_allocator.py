@@ -427,9 +427,17 @@ class KVBlockAllocator:
         # Propagate subtree-max timestamp and depth up/down the parent chain via
         # repeated vectorized scatter/gather. Converges in <= max-chain-depth
         # iterations (bounded by prompt_len / block_size); no per-element Python.
+        #
+        # The iteration count is capped at num_cached. A valid parent graph is a
+        # forest, so depth can never exceed num_cached and the loop fixes well
+        # before the cap. The cap is a safety bound: were a hash collision to
+        # create a parent cycle, the depth recurrence would otherwise never
+        # converge and spin forever. With the cap we stop at a bounded (if
+        # arbitrary) ordering instead of hanging; correctness still degrades
+        # gracefully to "some valid block set is evicted".
         subtree_max = own_ts.clone()
         depth = torch.zeros(num_cached, dtype=torch.int64)
-        while True:
+        for _ in range(num_cached):
             new_subtree_max = subtree_max.clone()
             new_subtree_max.scatter_reduce_(
                 0, parent_idx[has_parent], subtree_max[has_parent], reduce="amax"

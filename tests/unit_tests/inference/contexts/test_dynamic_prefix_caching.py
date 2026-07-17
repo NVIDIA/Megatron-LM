@@ -431,7 +431,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_add_request_full_cache_partial_hit_pins_matched_blocks(self):
-        """Regression: on a partial prefix hit against a FULL cache, the matched
+        """On a partial prefix hit against a FULL cache, the matched
         blocks must be pinned before allocation so LRU eviction cannot reclaim
         one of them for the new (non-matched) block.
 
@@ -440,7 +440,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         the pool. An incoming prompt H0 -> H1 -> H2 matches [S0, S1] and needs one
         new block. If S0/S1 are not pinned first, descendant-first LRU evicts the
         older leaf S1 and immediately reuses it, yielding block_table [S0, S1, S1]
-        and a dangling H2 -> missing H1 chain. Correct behaviour evicts SX and
+        and a dangling H2 -> missing H1 chain. Correct behavior evicts SX and
         yields [S0, S1, SX] with a contiguous H0 -> H1 -> H2 chain.
         """
         ctx = self._ctx()

@@ -339,6 +339,38 @@ def test_evict_lru_insufficient_cached_blocks_returns_false():
     assert a.kv_hash_to_block_id == {10: 0, 20: 1}
 
 
+def test_evict_lru_terminates_on_cyclic_parent_graph():
+    """Safety bound: a hash collision could make the parent graph cyclic, which
+    would otherwise make the subtree-max / depth recurrence spin forever. The
+    num_cached iteration cap must let eviction terminate and still evict the
+    requested number of blocks (a hang would time this test out)."""
+    a = _lru_allocator()
+    # 2-cycle: block 0's parent hash is 20 (block 1) and block 1's parent hash is
+    # 10 (block 0). register_kv_block_hashes never produces this — we seed it
+    # directly to model the pathological collision case.
+    _seed_cached_chain(
+        a, block_ids=[0, 1], hashes=[10, 20], parents=[20, 10], timestamps=[1, 2]
+    )
+    assert int(a.get_evictable_block_count()) == 2
+
+    # Terminates (no hang) and evicts exactly one of the two cached blocks.
+    assert a.evict_lru_blocks(1) is True
+    assert int(a.get_evictable_block_count()) == 1
+    assert len(a.kv_hash_to_block_id) == 1
+
+    # A longer 3-cycle also terminates and can be fully evicted.
+    b = _lru_allocator()
+    _seed_cached_chain(
+        b,
+        block_ids=[0, 1, 2],
+        hashes=[10, 20, 30],
+        parents=[30, 10, 20],
+        timestamps=[1, 2, 3],
+    )
+    assert b.evict_lru_blocks(3) is True
+    assert b.kv_hash_to_block_id == {}
+
+
 def test_is_memory_available_excludes_reserved_evictable():
     """reserved_evictable removes soon-to-be-pinned cached blocks from the
     evictable capacity, so availability matches what allocation can satisfy
