@@ -117,6 +117,28 @@ class TestFullyShardedDataParallel:
         )
         return fsdp_model
 
+    def test_fsdp_v2_rejects_average_in_collective(self):
+        """Test that FSDP v2 fails clearly instead of silently mis-scaling gradients."""
+        fsdp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            use_megatron_fsdp_v2=True,
+            average_in_collective=True,
+        )
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="--ddp-average-in-collective is not supported with Megatron FSDP v2",
+        ):
+            FullyShardedDataParallel(
+                config=transformer_config,
+                ddp_config=fsdp_config,
+                module=TestModel(input_dim=13, output_dim=17),
+                fsdp_unit_modules=[torch.nn.Linear],
+            )
+
     def test_fsdp_mp_policy_with_default_args(self):
         """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
         if not is_torch_min_version("2.4.0"):

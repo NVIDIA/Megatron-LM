@@ -252,6 +252,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        if ddp_config.use_megatron_fsdp_v2 and ddp_config.average_in_collective:
+            raise NotImplementedError(
+                "--ddp-average-in-collective is not supported with Megatron FSDP v2."
+            )
+
         # The legacy fallback intentionally imports a different fully_shard implementation.
         # pylint: disable=possibly-used-before-assignment
         if ddp_config.use_megatron_fsdp:
