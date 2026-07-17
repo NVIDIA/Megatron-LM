@@ -314,6 +314,45 @@ def test_evict_lru_branching_prefix_tree():
     _assert_prefix_invariant(a)
 
 
+def test_evict_lru_cached_child_with_pinned_parent_treated_as_root():
+    """Multi-turn / agentic case: a shared prefix block S0 stays pinned by an
+    active request (ref_count > 0) while a descendant S1 from a finished turn is
+    cached (ref_count == 0). S0 is not in the candidate set, so S1's parent
+    resolves to -1 (S1 is treated as a forest root) and is safely evicted by
+    normal LRU. The pinned parent must never be touched, even when it is the
+    oldest block of all."""
+    a = _lru_allocator()
+    # Chain S0 -> S1, plus an unrelated cached root SX.
+    a.register_kv_block_hashes(
+        block_ids=[0, 1, 2], block_hashes=[10, 20, 30], parent_hashes=[0, 10, 0]
+    )
+    ids = torch.tensor([0, 1, 2], dtype=torch.int64)
+    # S0 pinned (active request), S1 and SX cached/evictable. S0 is the OLDEST
+    # (ts=0) — a pin-blind oldest-first eviction would wrongly take it and orphan
+    # nothing here, but in general orphan its children.
+    a.block_ref_counts[ids] = torch.tensor([1, 0, 0], dtype=torch.int32)
+    a.block_timestamps[ids] = torch.tensor([0, 1, 9], dtype=torch.int64)
+    a.total_avail -= 3
+
+    # Only S1 and SX are candidates; the pinned S0 is excluded.
+    assert int(a.get_evictable_block_count()) == 2
+
+    # Evict one: S1 (ts=1) is the oldest candidate and a leaf; evicted first.
+    assert a.evict_lru_blocks(1) is True
+    assert a.kv_hash_to_block_id == {10: 0, 30: 2}  # S0 (pinned) + SX survive
+    assert a.block_ref_counts[0].item() == 1  # parent still pinned
+    assert a.block_hashes[0].item() == 10  # parent hash intact
+    assert a.block_hashes[1].item() == -1  # child deregistered
+    _assert_prefix_invariant(a)
+
+    # Evict again: only SX remains as a candidate; S0 stays pinned throughout.
+    assert a.evict_lru_blocks(1) is True
+    assert a.kv_hash_to_block_id == {10: 0}
+    assert a.block_ref_counts[0].item() == 1
+    # The pinned parent can never be evicted, so a third eviction fails.
+    assert a.evict_lru_blocks(1) is False
+
+
 def test_evict_lru_insufficient_cached_blocks_returns_false():
     """When fewer cached blocks exist than requested, eviction fails without
     touching the cache."""
