@@ -122,8 +122,7 @@ def test_disabled_raw_moment_logging_allows_fsdp(logging_flag, disabled_interval
 
 
 @pytest.mark.parametrize(
-    "logging_flag",
-    ("log_residual_stats_interval", "log_residual_grad_stats_interval"),
+    "logging_flag", ("log_residual_stats_interval", "log_residual_grad_stats_interval")
 )
 def test_residual_raw_moment_logging_rejects_fine_grained_ep_overlap(logging_flag):
     args = _raw_moment_logging_args()
@@ -152,11 +151,7 @@ def test_residual_raw_moments_capture_distinct_layer_boundaries():
     logger.finalize_residual_raw_moments_by_layer()
 
     values = _values_dict(logger.consume_residual_raw_moments_by_layer())
-    assert set(values) == {
-        "decoder/input0",
-        "decoder.layers.0/output0",
-        "decoder.layers.1/output0",
-    }
+    assert set(values) == {"decoder/input0", "decoder.layers.0/output0", "decoder.layers.1/output0"}
     assert values["decoder/input0"] == {
         "count": 2.0,
         "sum_1": 3.0,
@@ -182,9 +177,7 @@ def test_residual_raw_moments_skip_no_grad_forward():
 
     with observe_transformer_layer_boundaries(logger.record_residual_boundary):
         with torch.no_grad():
-            observe_transformer_layer_output(
-                model.decoder, first_layer, torch.tensor([10.0, 20.0])
-            )
+            observe_transformer_layer_output(model.decoder, first_layer, torch.tensor([10.0, 20.0]))
         observe_transformer_layer_output(model.decoder, first_layer, torch.tensor([1.0, 2.0]))
 
     logger.finalize_residual_raw_moments_by_layer()
