@@ -67,7 +67,7 @@ from megatron.training.distillation.utils import (
     v2_batched_tar_filename,
     v2_pack_indices,
 )
-from megatron.training.utils import print_rank_0
+from megatron.training.utils import print_rank_last
 
 logger = logging.getLogger(__name__)
 
@@ -677,7 +677,7 @@ class LogitsSaverHooks:
         bundle_end = max(e for _, e in writes)
         tar_filename = v2_batched_tar_filename(self.dp_rank, bundle_start, bundle_end)
         tar_path = os.path.join(self.save_dir, tar_filename)
-        print_rank_0(f"Handing off {len(writes)} logit iterations for async flush")
+        print_rank_last(f"Handing off {len(writes)} logit iterations for async flush")
         return (tar_path, writes, self._meta_bytes, msc_enabled)
 
     @staticmethod
@@ -727,7 +727,7 @@ class LogitsSaverHooks:
 
         storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
         for old_path, quarantined in quarantine_contained_tars(tar_path):
-            print_rank_0(f"Quarantined superseded cached-logits shard {old_path} -> {quarantined}")
+            print_rank_last(f"Quarantined superseded cached-logits shard {old_path} -> {quarantined}")
 
         write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
         compressor = zstandard.ZstdCompressor(level=3)

@@ -75,6 +75,7 @@ Usage example
 
 import concurrent.futures
 import logging
+import sys
 import warnings
 from collections import deque
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -111,7 +112,7 @@ from megatron.training.distillation.utils import (
     v2_iter_logprobs_tar_entries,
     v2_sorted_batched_tars,
 )
-from megatron.training.utils import print_rank_0
+from megatron.training.utils import print_rank_last
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,8 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
     Shard discovery refreshes the directory listing after known shards are
     exhausted so a concurrent writer can publish more data; remote refreshes
-    are rank-0 broadcast to avoid object-store list storms.
+    use a per-PP-stage rank-0 broadcast (TP×DP×CP group) to avoid object-store
+    list storms without deadlocking under PP>1.
 
     Yields ``(iteration, values_list, indices_list)``, one entry per load
     microbatch step, with CP sequence slicing already applied.
@@ -268,19 +270,19 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         self._decode_lookahead = max(1, decode_lookahead)
 
         if self._decode_threads > 1:
-            print_rank_0(
+            print_rank_last(
                 f"Teacher logits decode: using {self._decode_threads} decode threads "
                 f"(lookahead={self._decode_lookahead}) in the logits loader worker"
             )
         if self._remote_logprobs and self._msc_prefetch_depth > 0:
-            print_rank_0(
+            print_rank_last(
                 f"Teacher logits remote tar prefetch: {self._msc_prefetch_depth} "
                 "shard(s) ahead"
             )
 
         p = self._plan
         if (p.mbs_save, p.dp_save, p.gbs_save) != (p.mbs_load, p.dp_load, p.gbs_load):
-            print_rank_0(
+            print_rank_last(
                 "Cached-logits resharding: "
                 f"save=(mbs={p.mbs_save}, dp={p.dp_save}, gbs={p.gbs_save}) -> "
                 f"load=(mbs={p.mbs_load}, dp={p.dp_load}, gbs={p.gbs_load})"
@@ -722,13 +724,13 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
             self._compute_dp_remapping(logprobs_dir, dp_rank, dp_size)
         )
         if len(self._source_dp_ranks) > 1:
-            print_rank_0(
+            print_rank_last(
                 f"DP downscaling (v1): dp_rank {dp_rank} loads from saved dp_ranks "
                 f"{self._source_dp_ranks} (saved_dp_size {dp_size_saved}, "
                 f"current_dp_size {dp_size})"
             )
         elif self._dp_ratio > 1:
-            print_rank_0(
+            print_rank_last(
                 f"DP upscaling (v1): dp_rank {dp_rank} -> mapped_dp_rank "
                 f"{self._source_dp_ranks[0]} (sub_rank {self._sub_rank}, "
                 f"saved_dp_size {dp_size_saved}, current_dp_size {dp_size})"
@@ -965,8 +967,8 @@ def make_teacher_tar_dataset(
 ) -> TeacherTarDataset:
     """Build the right :class:`TeacherTarDataset` for the on-disk format.
 
-    Peeks any existing tar's ``_meta.json`` (on rank 0, broadcast to the
-    rest of the world) to read ``saver.format_version``; instantiates
+    Peeks any existing tar's ``_meta.json`` (rank-0 on the TP×DP×CP group,
+    then broadcast) to read ``saver.format_version``; instantiates
     :class:`TeacherTarDataset` for v2 tars and :class:`LegacyTeacherTarDataset`
     for v1.  Callers should always go through this factory rather than
     constructing the classes directly.
@@ -1130,7 +1132,7 @@ class CachedLogitsKDLoss:
     def _init_dataloader(self, start_iteration: int) -> None:
         """Create the DataLoader starting from *start_iteration*."""
         # Keep the iterable dataset in the training process so ordered shard
-        # streaming, dynamic discovery, and rank-0 collectives stay simple.
+        # streaming and dynamic discovery stay simple (no dataloader workers).
         # ``make_teacher_tar_dataset`` peeks ``_meta.json`` to pick the
         # v2 (monolith + resharding) or v1 (legacy list-of-microbatches) reader.
         dataset = make_teacher_tar_dataset(
@@ -1144,8 +1146,8 @@ class CachedLogitsKDLoss:
             msc_prefetch_depth=self._msc_prefetch_depth,
             ignore_hash=self._ignore_hash,
         )
-        # Remote shard discovery uses rank-0 collectives, so the iterable
-        # dataset stays in the main training process.
+        # Remote shard discovery uses a per-PP-stage collective, so keep the
+        # iterable in the main training process (all last-PP ranks participate).
         loader = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=None,
@@ -1333,8 +1335,13 @@ class LossFuncCallable:
             # Requires extra TP reduction
             dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
         except StopIteration as e:
-            logger.warning(f"Cached-logits dataloader exhausted on rank {safe_get_rank()} — stopping. {e}")
-            raise SystemExit(0) from None
+            # Last-PP ranks all hit this; keep the failure loud but avoid a
+            # full traceback storm across TP×DP×CP.
+            sys.tracebacklimit = 0
+            raise RuntimeError(
+                "Cached-logits dataloader exhausted: teacher shards ended "
+                f"before training finished. {e}"
+            ) from None
         except Exception as e:
             if not self.ignore_errors:
                 raise
