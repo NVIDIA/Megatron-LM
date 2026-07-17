@@ -108,8 +108,10 @@ class DistributedDataParallelConfig:
 
     mfsdp_cuda_graph_modules: list = field(default_factory=list)
     """If set and ``use_megatron_fsdp_v2`` is set, enable CUDA graph capture
-    on specific FSDP module types.  Valid values: ``'mamba'`` (MambaLayer),
-    ``'transformer'`` (TransformerLayer).  Example: ``['mamba', 'transformer']``.
+    on specific FSDP module types. Valid values: ``'mamba'`` (MambaLayer),
+    ``'transformer'`` (TransformerLayer), ``'attn'`` (Attention), ``'mlp'`` (dense MLP),
+    ``'moe'`` (TEGroupedMLP or SequentialMLP), and ``'moe_router'`` (MoE Router).
+    Example: ``['attn', 'mlp']``.
     Only leaf FSDP modules (without FSDP children) are eligible."""
     use_custom_fsdp: bool = False
     """

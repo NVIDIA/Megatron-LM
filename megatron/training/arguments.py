@@ -4180,12 +4180,14 @@ def _add_distributed_args(parser):
         '--mfsdp-cuda-graph',
         nargs='+',
         default=[],
-        choices=['mamba', 'transformer', 'moe_router', 'attn'],
+        choices=['mamba', 'transformer', 'attn', 'mlp', 'moe', 'moe_router'],
         dest='mfsdp_cuda_graph_modules',
         help='Enable CUDA graph capture on specific FSDP module types '
         'when using Megatron FSDP v2 (--use-megatron-fsdp-v2). '
-        'Choices: mamba (MambaLayer), transformer (TransformerLayer). '
-        'Can be combined, e.g. --mfsdp-cuda-graph mamba transformer. '
+        'Choices: mamba (MambaLayer), transformer (TransformerLayer), '
+        'attn (Attention), mlp (dense MLP), moe (MoE experts), and moe_router (MoE Router). '
+        'Can be combined when the selected FSDP modules are not nested, '
+        'e.g. --mfsdp-cuda-graph attn mlp. '
         'Only non-nested (leaf) FSDP modules are eligible.',
     )
     group.add_argument(

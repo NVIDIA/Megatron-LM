@@ -31,6 +31,8 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import Router as MoERouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -331,6 +333,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         if fsdp_unit_modules is not None:
             cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
+            moe_submodules = {
+                submodule
+                for moe_layer in module.modules()
+                if isinstance(moe_layer, MoELayer)
+                for submodule in moe_layer.modules()
+            }
             # Iterate modules post order to ensure that child modules are fully sharded
             # before their parents, which is required for correct param group divide.
             for name, m in reversed(list(module.named_modules())):
@@ -343,8 +351,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
                 if any(
                     [
+                        isinstance(m, TransformerLayer) and "transformer" in cuda_graph_on,
                         isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
                         isinstance(m, Attention) and "attn" in cuda_graph_on,
+                        isinstance(m, MLP)
+                        and m not in moe_submodules
+                        and "mlp" in cuda_graph_on,
+                        isinstance(m, (TEGroupedMLP, SequentialMLP))
+                        and "moe" in cuda_graph_on,
                         isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
                     ]
                 ):

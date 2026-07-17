@@ -25,6 +25,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
@@ -138,6 +140,42 @@ class TestFullyShardedDataParallel:
                 module=TestModel(input_dim=13, output_dim=17),
                 fsdp_unit_modules=[torch.nn.Linear],
             )
+
+    @pytest.mark.parametrize(
+        ("selector", "module_type"),
+        [
+            ("transformer", TransformerLayer),
+            ("mlp", MLP),
+            ("moe", TEGroupedMLP),
+            ("moe", SequentialMLP),
+        ],
+    )
+    def test_fsdp_v2_enables_selected_module_cuda_graph(self, selector, module_type):
+        """Test that module selectors enable CUDA graph capture on their FSDP units."""
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+        fsdp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            use_megatron_fsdp_v2=True,
+            data_parallel_sharding_strategy="optim_grads_params",
+            mfsdp_cuda_graph_modules=[selector],
+        )
+
+        selected_module = module_type.__new__(module_type)
+        torch.nn.Module.__init__(selected_module)
+        selected_module.weight = torch.nn.Parameter(torch.ones(1, device="cuda"))
+        model = torch.nn.Module()
+        model.selected_module = selected_module
+
+        fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=fsdp_config,
+            module=model,
+            fsdp_unit_modules=[module_type],
+        )
+
+        assert fsdp_model.module.selected_module._fsdp_state.enable_cuda_graph
 
     def test_fsdp_mp_policy_with_default_args(self):
         """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
