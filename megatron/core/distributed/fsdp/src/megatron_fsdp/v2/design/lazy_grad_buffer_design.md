@@ -41,8 +41,8 @@ and model export.
 | Method | Location | Role |
 |--------|----------|------|
 | `_init_dist_grads()` | `param_group.py` | Lazy-allocate `main_grad_buffer.data` and rebuild `dist_grads` DTensors on first use |
-| `_maybe_free_grad_data()` | `param_group.py` | Free `main_grad_buffer.data` when all params are zero-graded |
-| `zero_grad()` | `param_group.py` | Called by `optim.zero_grad()` → triggers `_maybe_free_grad_data()` |
+| `_release_grad_storage_if_unused()` | `param_group.py` | Free `main_grad_buffer.data` when it has no live gradients |
+| `zero_grad()` | `param_group.py` | Called by `optim.zero_grad()` → triggers `_release_grad_storage_if_unused()` |
 | `_rebuild_dist_views()` | `param_group.py` | Rebuild `_local_tensor` views after buffer changes device |
 | `_ensure_buffers_on_gpu()` | `param_group.py` | Auto-reload any buffer from CPU back to GPU |
 
@@ -56,7 +56,7 @@ def _init_dist_grads(self) -> None:
     if gbuf.data is not None:
         return  # already initialised
 
-    gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
+    gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 
     s = self.sharding_strategy
     is_grad_shard = s in ("optim", "optim_grads", "optim_grads_params")
@@ -74,20 +74,25 @@ def _init_dist_grads(self) -> None:
         else:
             self.dist_grads.append(None)
 
-    self._grad_buffer_is_fresh = True
 ```
 
 Key properties:
 - **Idempotent**: if `gbuf.data` is already allocated, returns immediately
 - **Called from multiple safe points**: backward pre-hook, `reduce_grad()`, post-backward callback
-- **Uses `torch.zeros`** (not `torch.empty`): the first reduce-scatter accumulates
-  (`overwrite_grad=False`) into the buffer, so it must start from zero — see §5
+- **Uses `torch.empty`**: the constructor/`zero_grad()` state makes the first
+  reduce-scatter overwrite uninitialized storage; only later microbatches
+  accumulate into valid gradients — see §5
 
-### 2.3 `_maybe_free_grad_data()` — Memory Refresh
+### 2.3 `_release_grad_storage_if_unused()` — Memory Refresh
 
 ```python
-def _maybe_free_grad_data(self) -> None:
+def _release_grad_storage_if_unused(self) -> None:
     if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
+        return
+    if (
+        self._full_grad_buffer_has_accumulated_grad
+        or self._reduced_grad_buffer_has_accumulated_grad
+    ):
         return
     if any(getattr(p, "grad", None) is not None for p in self.dist_params):
         return
@@ -95,7 +100,9 @@ def _maybe_free_grad_data(self) -> None:
     self.dist_grads = [None for _ in self.params]
 ```
 
-Guarded: only frees when no `dist_param` still holds a `.grad` reference.
+Guarded: only frees when neither the full staging buffer nor the collective
+output contains an accumulated gradient and no `dist_param` still holds a
+`.grad` reference.
 
 ### 2.4 Call Sites
 
@@ -107,8 +114,9 @@ Guarded: only frees when no `dist_param` still holds a `.grad` reference.
 │                                                              │
 │  zero_grad()                          ← optim.zero_grad()    │
 │    → dist_param.grad = None                                  │
-│    → _maybe_free_grad_data()         ← frees buffer          │
-│    → _grad_buffer_is_fresh = True                            │
+│    → _full_grad_buffer_has_accumulated_grad = False          │
+│    → _reduced_grad_buffer_has_accumulated_grad = False       │
+│    → _release_grad_storage_if_unused() ← frees buffer        │
 │                                                              │
 │  backward_pre_hook                                            │
 │    → _init_dist_grads()              ← re-allocates buffer   │
@@ -187,9 +195,24 @@ saves memory permanently.
 
 ### Multiple `reduce_grad()` calls (gradient accumulation)
 
-After the first call, `_init_dist_grads()` is a no-op. Subsequent calls just
-do the reduce as before. `overwrite_grad=False` ensures proper accumulation
-across micro-batches.
+After the first call, `_init_dist_grads()` is a no-op. Two flags track the
+independent accumulation locations:
+
+- `_full_grad_buffer_has_accumulated_grad` controls whether staging adds to or
+  overwrites the full `(0, 0)` gradient buffer.
+- `_reduced_grad_buffer_has_accumulated_grad` controls whether a new collective
+  result adds to or overwrites the local reduced output.
+
+A reduce-scatter consumes the full input and clears the first flag. An
+all-reduce operates in place, so the full-buffer flag remains set. Any completed
+collective sets the reduced-output flag.
+
+| Inner strategy | After a non-final microbatch | After the final microbatch |
+| --- | --- | --- |
+| `no_shard` | full=`True`, reduced=`False` | full=`True`, reduced=`True` |
+| `optim` | full=`True`, reduced=`False` | full=`False`, reduced=`True` |
+| `optim_grads` | full=`False`, reduced=`True` | full=`False`, reduced=`True` |
+| `optim_grads_params` | full=`False`, reduced=`True` | full=`False`, reduced=`True` |
 
 ### Full-iteration CUDA graph
 
@@ -199,7 +222,7 @@ captures forward/backward but runs the optimizer outside the graph, so the local
 gradient shard and `decoupled_grad` object must keep stable identities.
 
 - `_pre_backward_setup()` allocates dist grads before capture.
-- `_maybe_free_grad_data()` keeps optimizer-facing gradient storage alive.
+- `_release_grad_storage_if_unused()` keeps optimizer-facing gradient storage alive.
 - `zero_grad()` keeps optimizer-facing objects and clears local storage in place.
 - Optimizer zero-grad keeps marked `grad`/`decoupled_grad` DTensors and zeroes
   their local storage.
@@ -207,12 +230,12 @@ gradient shard and `decoupled_grad` object must keep stable identities.
   reshard inside capture, so the CUDA graph private pool owns their stable replay
   addresses and reuses non-overlapping lifetimes.
 
-The flag defaults to `False`, so eager and per-module CUDA graph paths retain
+Both flags default to `False`, so eager and per-module CUDA graph paths retain
 their normal lazy allocation/free behavior.
 
 ### Activation recomputation
 
-During recomputation, the forward pre-hook fires again. `_maybe_free_grad_data()`
+During recomputation, the forward pre-hook fires again. `_release_grad_storage_if_unused()`
 is a no-op (data already None or grads are live). The backward pre-hook re-allocates
 via `_init_dist_grads()` before backward compute starts — no change in behavior.
 
@@ -224,47 +247,31 @@ skip. If called after, the buffer exists on GPU and is offloaded normally.
 
 ---
 
-## 5. The `torch.empty` Bug — A Bitter Lesson
+## 5. Safe `torch.empty` Allocation
 
-### 5.1 What Went Wrong
+### 5.1 First-Write Semantics
 
-The initial implementation used `torch.empty()` instead of `torch.zeros()`:
+The gradient buffer uses `torch.empty()` to avoid an unnecessary zero-fill:
 
 ```python
-# BROKEN — uninitialised GPU memory
 gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
 ```
 
-`torch.empty()` returns a tensor backed by **uninitialised GPU memory** —
-arbitrary bit patterns left by prior allocations. `reduce_grad()` then
-accumulates into this garbage:
+`torch.empty()` returns uninitialized memory, so the first reduced gradient
+must overwrite the local shard. Later microbatches may accumulate:
 
 ```python
 # DataParallelBuffer.reduce_grad()
-if overwrite_grad:
+if accumulate_reduced_grad:
+    local_grad_shard += reduced_grad_shard
+else:
     local_grad_shard.copy_(reduced_grad_shard)
-elif accumulate_output:
-    local_grad_shard += reduced_grad_shard   # ← ADDS to garbage → NaN
 ```
 
-### 5.2 Why It Hung
-
-1. Micro-batch 1: `+= garbage → NaN`
-2. Micro-batches 2–8: `+= NaN → NaN` (NaN propagates)
-3. `optimizer.step()` produces NaN weights
-4. `_copy_main_params_to_model_params()` copies NaN to model
-5. **Hang**: subsequent CUDA operations on NaN tensors stall the GPU or
-   trigger NCCL edge-case hangs
-
-### 5.3 The Fix
-
-```python
-# CORRECT — zero-initialised
-gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
-```
-
-`torch.zeros` ensures the first accumulate has a clean slate. Paired with
-`_grad_buffer_is_fresh` → `overwrite_grad` for defense-in-depth.
+`_reduced_grad_buffer_has_accumulated_grad=False` selects overwrite for the
+first collective output. `reduce_grad()` then sets it to `True`, selecting
+accumulation for later microbatches. `zero_grad()` resets both accumulation
+flags to `False`.
 
 ---
 
@@ -272,7 +279,7 @@ gbuf.init_data(torch.zeros(gbuf.data_size, dtype=gbuf.dtype, device=self.device)
 
 - `_ensure_buffers_on_gpu()` auto-reloads CPU-offloaded buffers before use
 - `_rebuild_dist_views()` re-slices `_local_tensor` views after device move
-- `_maybe_free_grad_data()` frees GPU allocation regardless of CPU copy state
+- `_release_grad_storage_if_unused()` frees GPU allocation regardless of CPU copy state
 
 Combined: the gradient buffer is **fully elastic** — on GPU only when needed,
 on CPU (or nowhere) the rest of the time.
@@ -284,7 +291,7 @@ on CPU (or nowhere) the rest of the time.
 | Call site | Impact |
 |-----------|--------|
 | `reduce_grad()` | Lazy init fires — adds one `torch.zeros` + DTensor rebuild on first call |
-| `zero_grad()` | Already guarded — no-op if data is None; frees buffer via `_maybe_free_grad_data` |
+| `zero_grad()` | Already guarded — no-op if data is None; frees buffer via `_release_grad_storage_if_unused` |
 | `_rebuild_dist_views()` | Already guarded — no-op for grads if buffer is None |
 | `_copy_main_weights_to_model_weights()` | No impact (uses model_weight + main_weight only) |
 | `_compute_per_param_norms()` | Reads `dist_grads` — skips if None |
@@ -297,7 +304,7 @@ on CPU (or nowhere) the rest of the time.
 
 | File | Relevant Changes |
 |------|-----------------|
-| `param_group.py` | `_init_dist_grads()`, `_maybe_free_grad_data()`, `_rebuild_dist_views()`, `_ensure_buffers_on_gpu()`, lazy `_init_buffers()` |
+| `param_group.py` | `_init_dist_grads()`, `_release_grad_storage_if_unused()`, `_rebuild_dist_views()`, `_ensure_buffers_on_gpu()`, lazy `_init_buffers()` |
 | `dp_buffer.py` | `_is_on_cpu()`, `_ensure_data_on_gpu()`, `_move_data_to()` |
 | `allocator.py` | `release()`, `_auto_resume()`, `resume()` — pool lifecycle |
 | `fsdp_module.py` | `zero_grad()` override, `_get_fsdp_modules()`, `offload_to_cpu()`, `reload_to_gpu()` |

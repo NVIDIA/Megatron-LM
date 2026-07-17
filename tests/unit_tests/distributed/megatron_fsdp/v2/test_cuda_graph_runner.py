@@ -78,6 +78,8 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         requires_grad=True,
         sharding_strategy="optim_grads_params",
         enable_full_iteration_cuda_graph=False,
+        main_grad_buffer=SimpleNamespace(inner_sharded=True),
+        _full_grad_buffer_has_accumulated_grad=False,
         params=(param,),
         dist_params=(dist_param,),
         dist_grads=(None,),

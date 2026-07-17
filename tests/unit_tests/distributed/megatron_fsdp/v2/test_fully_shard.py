@@ -333,9 +333,6 @@ class TestFullyShardBasic:
         :param main_grad_dtype: Optimizer gradient dtype.
         :type main_grad_dtype: Optional[torch.dtype]
         """
-        if sharding_strategy == "optim":
-            pytest.skip("FIXME: optim strategy has a bug")
-
         model = SimpleMLP(4, bias=True).to(_device(), dtype=model_dtype)
         fully_shard(
             model,
@@ -354,6 +351,19 @@ class TestFullyShardBasic:
             if i == len(values) - 1:
                 model.set_is_last_backward(True)
             model(sample).sum().backward()
+            for _, param_group in model._named_param_groups:
+                expect_full_grad = sharding_strategy == "no_shard" or (
+                    sharding_strategy == "optim" and i < len(values) - 1
+                )
+                assert param_group._full_grad_buffer_has_accumulated_grad == expect_full_grad
+                expect_reduced_grad = sharding_strategy in (
+                    "optim_grads",
+                    "optim_grads_params",
+                ) or i == len(values) - 1
+                assert (
+                    param_group._reduced_grad_buffer_has_accumulated_grad
+                    == expect_reduced_grad
+                )
         model.finish_grad_sync()
 
         for param_names, param_group in model._named_param_groups:
@@ -365,6 +375,49 @@ class TestFullyShardBasic:
                 torch.testing.assert_close(
                     dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
                 )
+
+        model.zero_grad()
+        for _, param_group in model._named_param_groups:
+            assert not param_group._full_grad_buffer_has_accumulated_grad
+            assert not param_group._reduced_grad_buffer_has_accumulated_grad
+
+    def test_cuda_graph_accumulates_with_empty_optim_shard(self):
+        """Preserve ZeRO-1 accumulation on ranks that own only padding."""
+        if _world_size() < 2:
+            pytest.skip("Empty optimizer-shard coverage requires at least two ranks")
+
+        model = SimpleMLP(1, bias=False).to(_device())
+        fully_shard(
+            model,
+            sharding_strategy="optim",
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+            enable_cuda_graph=True,
+        )
+
+        values = [2.0, 3.0]
+        for i, value in enumerate(values):
+            sample = torch.full((2, 1), value, device=_device(), requires_grad=True)
+            if i == len(values) - 1:
+                model.set_is_last_backward(True)
+            model(sample).sum().backward()
+        model.finish_grad_sync()
+
+        expected = 10.0 * _world_size()
+        for _, param_group in model._named_param_groups:
+            assert not param_group._full_grad_buffer_has_accumulated_grad
+            assert param_group._reduced_grad_buffer_has_accumulated_grad
+            for dist_grad in param_group.dist_grads:
+                if dist_grad is not None:
+                    torch.testing.assert_close(
+                        dist_grad.to_local(), torch.full_like(dist_grad.to_local(), expected)
+                    )
+
+        model.zero_grad()
+        for _, param_group in model._named_param_groups:
+            assert not param_group._full_grad_buffer_has_accumulated_grad
+            assert not param_group._reduced_grad_buffer_has_accumulated_grad
+            assert param_group.main_grad_buffer.data is None
 
     @pytest.mark.parametrize(
         "enable_unshard_prefetch,enable_async_reduce_grad",

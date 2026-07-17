@@ -451,7 +451,7 @@ class DataParallelBuffer:
     def reduce_grad(
         self,
         *,
-        overwrite_grad: bool = False,
+        accumulate_reduced_grad: bool = False,
         reduce_dim: Optional[int] = 1,
         reduce_scatter: bool = True,
         grad_comm_dtype: Optional[torch.dtype] = None,
@@ -462,6 +462,8 @@ class DataParallelBuffer:
         ``reduce_dim`` uses mesh dim ids: ``None`` does not reduce,
         ``0`` reduces outer-DP, and ``1`` reduces inner-DP.
         ``reduce_scatter`` selects RS vs AR; ParameterGroup owns that strategy decision.
+        ``accumulate_reduced_grad`` adds the collective result to an existing
+        local output gradient instead of replacing it.
         """
         if reduce_dim is None:
             return
@@ -509,10 +511,10 @@ class DataParallelBuffer:
                 if reduce_dim == 1 and self.gradient_scaling_factor not in (None, 1.0):
                     input_buffer.mul_(self.gradient_scaling_factor)
                 if output_buffer.data_ptr() != input_buffer.data_ptr():
-                    if overwrite_grad:
-                        output_buffer.copy_(input_buffer)
-                    else:
+                    if accumulate_reduced_grad:
                         output_buffer.add_(input_buffer)
+                    else:
+                        output_buffer.copy_(input_buffer)
             return
 
         comm_input = input_buffer
@@ -558,10 +560,10 @@ class DataParallelBuffer:
             )
 
             if output_buffer.data_ptr() != comm_output.data_ptr():
-                if overwrite_grad:
-                    output_buffer.copy_(comm_output)
-                else:
+                if accumulate_reduced_grad:
                     output_buffer += comm_output
+                else:
+                    output_buffer.copy_(comm_output)
         if input_key is not None:
             self.allocator.free(input_key)
 

@@ -137,7 +137,8 @@ class TestMegatronFSDPE2E:
                 param.grad_added_to_main_grad = True
                 param._mfsdp_recorded_te_wgrad = False
                 assert param.grad is None
-                assert param_group._grad_buffer_is_fresh
+                assert not param_group._full_grad_buffer_has_accumulated_grad
+                assert not param_group._reduced_grad_buffer_has_accumulated_grad
 
                 reduce_and_wait()
                 optimizer_grad = param_group.dist_params[item_id].grad
@@ -147,7 +148,8 @@ class TestMegatronFSDPE2E:
                     torch.full_like(optimizer_grad._local_tensor, 2.0),
                 )
                 assert param.grad_added_to_main_grad is False
-                assert not param_group._grad_buffer_is_fresh
+                assert not param_group._full_grad_buffer_has_accumulated_grad
+                assert param_group._reduced_grad_buffer_has_accumulated_grad
                 drain_pending()
                 assert not hasattr(param, "main_grad")
 
@@ -160,6 +162,8 @@ class TestMegatronFSDPE2E:
 
                 reduce_and_wait()
                 assert torch.count_nonzero(stale_main_grad) == 0
+                assert not param_group._full_grad_buffer_has_accumulated_grad
+                assert param_group._reduced_grad_buffer_has_accumulated_grad
                 optimizer_grad = param_group.dist_params[item_id].grad
                 assert optimizer_grad is not None
                 torch.testing.assert_close(

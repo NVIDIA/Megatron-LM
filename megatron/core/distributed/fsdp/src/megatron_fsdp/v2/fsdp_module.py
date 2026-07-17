@@ -875,10 +875,7 @@ class FSDPModule:
             # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
             # accompanies the eager backward is captured away.  We record the per-param
             # flag during the trace micro-batch and restore it here.
-            grad_replicated = param_group.sharding_strategy in ("no_shard", "optim")
-            add_to_main_grad = (
-                grad_replicated and not param_group._grad_buffer_is_fresh
-            )
+            accumulate_full_grad = param_group._full_grad_buffer_has_accumulated_grad
             stage_tensors: List[torch.Tensor] = []
             stage_sources: List[torch.Tensor] = []
             zero_tensors: List[torch.Tensor] = []
@@ -903,7 +900,7 @@ class FSDPModule:
                     if grad_added and self._fsdp_state.enable_cuda_graph:
                         setattr(param, "_mfsdp_recorded_te_wgrad", True)
                 elif grad is None:
-                    if not add_to_main_grad:
+                    if not accumulate_full_grad:
                         zero_tensors.append(param.get_main_grad())
                 else:
                     main_grad = param.get_main_grad()
@@ -923,7 +920,7 @@ class FSDPModule:
                         source.record_stream(stream)
                 with torch.cuda.stream(stream):
                     if stage_tensors:
-                        if add_to_main_grad:
+                        if accumulate_full_grad:
                             torch._foreach_add_(stage_tensors, stage_sources)
                         else:
                             torch._foreach_copy_(stage_tensors, stage_sources)
@@ -931,7 +928,7 @@ class FSDPModule:
                         torch._foreach_zero_(zero_tensors)
             else:
                 if stage_tensors:
-                    if add_to_main_grad:
+                    if accumulate_full_grad:
                         torch._foreach_add_(stage_tensors, stage_sources)
                     else:
                         torch._foreach_copy_(stage_tensors, stage_sources)
@@ -952,9 +949,6 @@ class FSDPModule:
                 # _pre_backward_setup on the next microbatch, so leaving it set would
                 # make stale scratch storage look like a fused wgrad.
                 param.grad_added_to_main_grad = False
-
-            if grad_replicated:
-                param_group._grad_buffer_is_fresh = False
 
             if async_op:
                 # ---- Overlapped path ----

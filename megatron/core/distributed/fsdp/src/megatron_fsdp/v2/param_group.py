@@ -115,6 +115,8 @@ class ParameterGroup:
         self.gradient_scaling_factor = gradient_scaling_factor
         self.allocator = allocator if allocator is not None else TemporaryBucketAllocator()
         self.enable_full_iteration_cuda_graph = False
+        self._full_grad_buffer_has_accumulated_grad = False
+        self._reduced_grad_buffer_has_accumulated_grad = False
 
         # Buffer references (initialized in _init_buffers)
         self.model_weight_buffer: Optional[DataParallelBuffer] = None
@@ -323,6 +325,13 @@ class ParameterGroup:
         if self.main_grad_buffer is None:
             return
 
+        # FSDPModule has staged this microbatch into the full (0, 0) gradient
+        # buffer before calling here. For replicated gradient storage, that
+        # buffer accumulates microbatches until the step-boundary collective.
+        # For sharded gradient storage, it is fresh reduce-scatter input and is
+        # consumed below on every microbatch.
+        self._full_grad_buffer_has_accumulated_grad = True
+
         reduce_inner = self.sharding_strategy in (
             "optim_grads",
             "optim_grads_params",
@@ -336,35 +345,29 @@ class ParameterGroup:
             is_last_microbatch
             and self.outer_dp_sharding_strategy in ("no_shard", "optim")
         )
-        if not reduce_inner and not reduce_outer:
-            return
-
         if reduce_inner:
-            # ZeRO-2/3 reduce each microbatch into a persistent optimizer shard:
-            # overwrite that shard on the first reduce, then accumulate into it.
-            # no_shard/ZeRO-1 instead accumulate the full gradient before their
-            # final reduction, so that reduction always overwrites its output.
-            accumulate_reduced_grad = (
-                self.sharding_strategy in ("optim_grads", "optim_grads_params")
-                and not self._grad_buffer_is_fresh
-            )
+            reduce_scatter = self.sharding_strategy != "no_shard"
             # mesh dim 1 is inner-DP.
             self.main_grad_buffer.reduce_grad(
-                overwrite_grad=not accumulate_reduced_grad,
+                accumulate_reduced_grad=self._reduced_grad_buffer_has_accumulated_grad,
                 reduce_dim=1,
-                reduce_scatter=self.sharding_strategy != "no_shard",
+                reduce_scatter=reduce_scatter,
                 stream=stream,
             )
-            # The buffer now contains reduced gradients rather than fresh storage.
-            self._grad_buffer_is_fresh = False
+            self._reduced_grad_buffer_has_accumulated_grad = True
+            if reduce_scatter:
+                # The full buffer was only collective input. Its contents are
+                # no longer a valid unreduced accumulation after reduce-scatter.
+                self._full_grad_buffer_has_accumulated_grad = False
         if reduce_outer:
             # mesh dim 0 is outer-DP.
             self.main_grad_buffer.reduce_grad(
-                overwrite_grad=True,
+                accumulate_reduced_grad=False,
                 reduce_dim=0,
                 reduce_scatter=self.outer_dp_sharding_strategy != "no_shard",
                 stream=stream,
             )
+            self._reduced_grad_buffer_has_accumulated_grad = True
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
@@ -377,8 +380,8 @@ class ParameterGroup:
                     del param.main_grad
             self.main_grad_buffer.reshard()
 
-    def _maybe_free_grad_data(self) -> None:
-        """Drop ``main_grad_buffer.data`` if all params are zero-graded.
+    def _release_grad_storage_if_unused(self) -> None:
+        """Drop ``main_grad_buffer.data`` if it has no live gradients.
 
         After ``zero_grad()`` (or before the first backward), all
         ``dist_param.grad`` are ``None``, so the gradient buffer holds no
@@ -388,6 +391,14 @@ class ParameterGroup:
         if self.enable_full_iteration_cuda_graph:
             return
         if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
+            return
+        # Gradient storage may contain either unreduced microbatch accumulation
+        # or a collective output even when this rank owns no optimizer-facing
+        # parameter shard. Keep both alive until zero_grad() clears their state.
+        if (
+            self._full_grad_buffer_has_accumulated_grad
+            or self._reduced_grad_buffer_has_accumulated_grad
+        ):
             return
         if any(
             [getattr(p, "grad", None) is not None for p in self.dist_params]
@@ -480,8 +491,9 @@ class ParameterGroup:
         The buffer layout (``BufferIndex``, offsets, shard) was created in
         ``_init_buffers``; only the backing tensor is deferred.  Called from
         ``reduce_grad()`` on first use.  Uses ``torch.empty`` to avoid the
-        zero-init cost; ``_grad_buffer_is_fresh`` is ``True`` after allocation
-        so the first reduce-scatter *overwrites* (``local_grad_shard.copy_``)
+        zero-init cost. ``_reduced_grad_buffer_has_accumulated_grad`` is
+        ``False`` after allocation, so the first reduce-scatter *overwrites*
+        (``local_grad_shard.copy_``)
         rather than accumulating — the uninitialized data is never read.
         Subsequent calls are no-ops.
         """
@@ -521,8 +533,6 @@ class ParameterGroup:
                 copy_chunk_meta_from=dist_param,
             )
             self.dist_grads.append(grad_dtensor)
-
-        self._grad_buffer_is_fresh = True
 
     def _rebuild_dist_views(self) -> None:
         """In-place update ``dist_params._local_tensor`` / ``dist_grad._local_tensor``.
@@ -598,6 +608,8 @@ class ParameterGroup:
 
     def zero_grad(self, set_to_none: bool = True):
         """Zero the main gradient buffer and mark grads as zeroed."""
+        self._full_grad_buffer_has_accumulated_grad = False
+        self._reduced_grad_buffer_has_accumulated_grad = False
         if self.enable_full_iteration_cuda_graph:
             if self.main_grad_buffer is not None:
                 if self.main_grad_buffer.data is not None:
@@ -611,7 +623,6 @@ class ParameterGroup:
                 if decoupled_grad is not None:
                     _zero_tensor_storage(decoupled_grad)
                     setattr(dist_param, "_mfsdp_keep_grad_for_cuda_graph", True)
-            self._grad_buffer_is_fresh = True
             return
 
         if set_to_none:
@@ -620,8 +631,7 @@ class ParameterGroup:
                     dist_param.grad = None
                 if hasattr(dist_param, "decoupled_grad"):
                     dist_param.decoupled_grad = None
-            self._maybe_free_grad_data()
+            self._release_grad_storage_if_unused()
         else:
             if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
                 self.main_grad_buffer.data.zero_()
-        self._grad_buffer_is_fresh = True

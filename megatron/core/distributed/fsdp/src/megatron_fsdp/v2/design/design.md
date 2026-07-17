@@ -331,8 +331,7 @@ def reduce_grad(self, async_op: bool = False):
     for param_names, param_group in self._named_param_groups:
         if not param_group.requires_grad: continue
 
-        grad_replicated = param_group.sharding_strategy in ("no_shard", "optim")
-        add_to_main_grad = grad_replicated and not param_group._grad_buffer_is_fresh
+        accumulate_full_grad = param_group._full_grad_buffer_has_accumulated_grad
         stage_tensors = []
         stage_sources = []
         zero_tensors = []
@@ -344,7 +343,7 @@ def reduce_grad(self, async_op: bool = False):
             if getattr(param, "grad_added_to_main_grad", False):
                 continue
             if grad is None:
-                if not add_to_main_grad:
+                if not accumulate_full_grad:
                     zero_tensors.append(param.get_main_grad())
             else:
                 stage_tensors.append(param.get_main_grad())
@@ -359,13 +358,13 @@ def reduce_grad(self, async_op: bool = False):
                 source.record_stream(stream)
             with torch.cuda.stream(stream):
                 if stage_tensors:
-                    op = torch._foreach_add_ if add_to_main_grad else torch._foreach_copy_
+                    op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
                     op(stage_tensors, stage_sources)
                 if zero_tensors:
                     torch._foreach_zero_(zero_tensors)
         else:
             if stage_tensors:
-                op = torch._foreach_add_ if add_to_main_grad else torch._foreach_copy_
+                op = torch._foreach_add_ if accumulate_full_grad else torch._foreach_copy_
                 op(stage_tensors, stage_sources)
             if zero_tensors:
                 torch._foreach_zero_(zero_tensors)
@@ -719,30 +718,23 @@ final_callback:
 No `async_op` parameter is needed. The method is purely synchronous within the calling stream:
 
 ```python
-def reduce_grad(self, grad_comm_dtype=None):
-    sm = self.buffer_index.shard_meta
-    local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+def reduce_grad(self, *, accumulate_reduced_grad=False, reduce_scatter=True):
+    input_buffer = self.fetch_buffer(input_shard_layout)
+    output_buffer = self.fetch_buffer(output_shard_layout)
 
-    if not self.inner_sharded and self.sharding_strategy == "no_shard":
-        torch.distributed.all_reduce(self.data, group=self.inner_dp_group)
+    if not reduce_scatter:
+        torch.distributed.all_reduce(input_buffer, group=group)
         return
 
-    if self.inner_sharded:
-        full_grad = self.fetch_unsharded_buffer()  # temporary full grad buffer
-        input_buffer = full_grad
-        output_offset = sm.bucket_data_index
-        accumulate_output = True
-    else:
-        input_buffer = self.data  # ZeRO-1 replicated accumulation buffer
-        output_offset = sm.local_data_index
-        accumulate_output = False
-    grad_shard = input_buffer[output_offset : output_offset + sm.size]
+    reduced_grad = input_buffer[output_offset : output_offset + output_buffer.numel()]
     torch.distributed.reduce_scatter_tensor(
-        output=grad_shard, input=input_buffer, group=self.inner_dp_group
+        output=reduced_grad, input=input_buffer, group=group
     )
-    if accumulate_output:
-        # ZeRO-2/3 accumulate into persistent shard for micro-batch grad accumulation.
-        local_grad_shard += grad_shard
+    if output_buffer.data_ptr() != reduced_grad.data_ptr():
+        if accumulate_reduced_grad:
+            output_buffer += reduced_grad
+        else:
+            output_buffer.copy_(reduced_grad)
 ```
 
 The caller (`FSDPModule.reduce_grad`) provides the stream context; `DataParallelBuffer`

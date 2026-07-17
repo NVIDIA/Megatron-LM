@@ -322,6 +322,8 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
         gbuf = pg.main_grad_buffer
         if gbuf is None:
             continue
+        assert not pg._full_grad_buffer_has_accumulated_grad
+        assert not pg._reduced_grad_buffer_has_accumulated_grad
 
         if strategy == "no_shard":
             gbuf.data.fill_(float(rank + 1))
@@ -358,6 +360,9 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
                 actual = gbuf.get_shard_view((0, 1))
             assert torch.equal(actual, ref_shard)
 
+        assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
+        assert pg._reduced_grad_buffer_has_accumulated_grad
+
     torch.distributed.barrier()
 
 
@@ -385,7 +390,16 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
             )
             gbuf.data.add_(micro_grad)
             full_batch_grad.add_(micro_grad)
-            pg.reduce_grad(is_last_microbatch=microbatch == num_micro_batches - 1)
+            is_last_microbatch = microbatch == num_micro_batches - 1
+            pg.reduce_grad(is_last_microbatch=is_last_microbatch)
+            if is_last_microbatch:
+                assert pg._full_grad_buffer_has_accumulated_grad == (
+                    strategy == "no_shard"
+                )
+                assert pg._reduced_grad_buffer_has_accumulated_grad
+            else:
+                assert pg._full_grad_buffer_has_accumulated_grad
+                assert not pg._reduced_grad_buffer_has_accumulated_grad
 
         if strategy == "no_shard":
             ref = full_batch_grad
@@ -398,5 +412,9 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
             # shard_layout=(outer, inner): (0, 1) means inner sharded only.
             actual = gbuf.get_shard_view((0, 1))
             assert torch.equal(actual, ref_shard)
+
+        pg.zero_grad()
+        assert not pg._full_grad_buffer_has_accumulated_grad
+        assert not pg._reduced_grad_buffer_has_accumulated_grad
 
     torch.distributed.barrier()
