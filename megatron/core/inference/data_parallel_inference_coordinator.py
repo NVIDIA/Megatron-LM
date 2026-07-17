@@ -535,7 +535,17 @@ class DataParallelInferenceCoordinator:
 
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
-                assert sender_identity in self.identities_of_data_parallel_ranks
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    # A de-registered engine's final replies can still be in flight
+                    # on the ZMQ socket ("Coordinator: removed engine" then a stray
+                    # reply). Asserting here killed whole 16-node jobs roughly once
+                    # per chain-day; the stray reply's requests are re-dispatched or
+                    # padded by the client-side retry path, so drop it instead.
+                    logging.warning(
+                        f"Coordinator: dropping ENGINE_REPLY from unknown/removed "
+                        f"engine {sender_identity!r}"
+                    )
+                    continue
                 finished_requests = deserialized_payload[1]
 
                 for finished_request in finished_requests:
