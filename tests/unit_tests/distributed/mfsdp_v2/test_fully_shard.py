@@ -403,6 +403,30 @@ def test_overlaps_communication_and_compute(distributed_setup):
     )
 
 
+def test_parameterless_parent_with_child_modules_trains(distributed_setup):
+    """A parent with no unowned parameters should still root trainable child FsdpModules."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(5678)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False)).to(device)
+
+    fully_shard(model[0], mesh=mesh, placements=_flat_placements())
+    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    assert model.parameter_groups == ()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    x = torch.randn(3, 4, device=device)
+
+    optimizer.zero_grad(set_to_none=True)
+    loss = model(x).sum()
+    loss.backward()
+    optimizer.step()
+
+
 def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     """A non-trainable parameter group should not allocate persistent main gradients."""
     world_size = distributed_setup.world_size
@@ -502,24 +526,30 @@ def test_microbatch_scopes_child_contexts(distributed_setup):
 
 
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
-    """CPU-initialized parameters should be sharded with their real values."""
+    """A CPU model should support sharding a child before moving the full model to CUDA."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Linear(4, 4, bias=False)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
     with torch.no_grad():
-        model.weight.fill_(3.0)
-    expected_weight = model.weight.detach().to(device)
+        model[0].weight.fill_(2.0)
+        model[1].weight.fill_(3.0)
+    x = torch.ones(1, 4)
+    expected_output = model(x).to(device)
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    # Shard the second layer's parameters onto the mesh device; the unwrapped
+    # first layer's parameters remain on CPU until model.to(device) below.
+    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
 
-    (group,) = model.parameter_groups
-    full_weight = group.model_weight.allgather(0).get_local_tensor(0)
-    assert full_weight.device.type == device.type
-    torch.testing.assert_close(full_weight, expected_weight)
+    assert model[0].weight.device.type == "cpu"
+    assert isinstance(model[1].weight, DTensor)
+    assert model[1].weight.device == device
+
+    model.to(device)
+
+    output = model(x.to(device))
+    torch.testing.assert_close(output, expected_output)
 
 
 def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
