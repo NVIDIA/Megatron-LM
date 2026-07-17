@@ -7,9 +7,10 @@ import torch
 
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -417,6 +418,50 @@ def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
     return HAVE_HYBRIDEP
+
+
+def test_hybridep_pad_variable_tokens_metadata(monkeypatch):
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_hybridep_pad_variable_tokens=True,
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    local_num_tokens = 17
+    max_num_tokens_across_ep = 70
+    padded_num_tokens = (
+        max_num_tokens_across_ep
+        + -max_num_tokens_across_ep % HYBRIDEP_TOKEN_ALIGNMENT
+    )
+    routing_map = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.bool)
+    probs = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.float32)
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is manager.group
+        tensor.fill_(max_num_tokens_across_ep)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager._original_num_tokens == local_num_tokens
+    assert manager._padded_num_tokens == padded_num_tokens
+    assert manager.routing_map.shape == (padded_num_tokens, manager.num_experts)
+    assert manager.token_probs.shape == (padded_num_tokens, manager.num_experts)
+    torch.testing.assert_close(manager.routing_map[:local_num_tokens], routing_map)
+    torch.testing.assert_close(manager.token_probs[:local_num_tokens], probs)
+    assert not manager.routing_map[local_num_tokens:].any()
+    assert not manager.token_probs[local_num_tokens:].any()
 
 
 @pytest.mark.skipif(
