@@ -285,12 +285,15 @@ def triton_append_mla_latent_cache(
     block_idx_active = token_to_block_idx[:n_tokens].contiguous()
     local_kv_seq_idx_active = token_to_local_position_within_kv_block[:n_tokens].contiguous()
 
-    assert (
-        mla_cache.dim() == 3
-    ), f"Sliced MLA cache should be 3D (total_blocks, block_size, kv_reduced_dim), got {mla_cache.dim()}D"
-    assert (
-        kv_reduced_dim == mla_cache.shape[-1]
-    ), f"Reduced dimension mismatch: kv_concat has {kv_reduced_dim} but cache expects {mla_cache.shape[-1]}."
+    assert mla_cache.dim() == 3, (
+        "Sliced MLA cache should be 3D "
+        "(total_blocks, block_size, kv_reduced_dim), "
+        f"got {mla_cache.dim()}D"
+    )
+    assert kv_reduced_dim == mla_cache.shape[-1], (
+        f"Reduced dimension mismatch: kv_concat has {kv_reduced_dim} "
+        f"but cache expects {mla_cache.shape[-1]}."
+    )
 
     grid = (n_tokens,)
     BLOCK_SIZE_D = triton.next_power_of_2(kv_reduced_dim)
