@@ -304,6 +304,33 @@ def test_reduce_grad(strategy):
 
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+def test_zero_grad_set_to_none_false_reuses_dist_grads(strategy):
+    groups, _, _, _, _, _ = _build_groups(strategy)
+
+    for pg in groups:
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        gbuf.init_data(torch.ones(gbuf.data_size, dtype=gbuf.dtype, device=pg.device))
+        original_data = gbuf.data
+        original_data_ptr = original_data.data_ptr()
+        original_dist_grads = [object() for _ in pg.params]
+        pg.dist_grads = list(original_dist_grads)
+
+        pg.zero_grad(set_to_none=False)
+
+        assert gbuf.data is original_data
+        assert gbuf.data.data_ptr() == original_data_ptr
+        assert torch.count_nonzero(gbuf.data).item() == 0
+        assert all(dist_param.grad is None for dist_param in pg.dist_params)
+        for before, after in zip(original_dist_grads, pg.dist_grads):
+            assert after is before
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
 def test_hsdp_reduce_grad(strategy, outer_strategy):
     if outer_strategy == "optim" and strategy != "optim_grads_params":

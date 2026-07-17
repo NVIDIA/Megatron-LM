@@ -1034,7 +1034,7 @@ class FSDPModule:
 
     def _zero_grad_buffer(self):
         """Zero the gradient buffer for all parameter groups."""
-        self.zero_grad()
+        self.zero_grad(set_to_none=False)
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
