@@ -126,6 +126,16 @@ def _events_overlap(first, second) -> bool:
     )
 
 
+def _nccl_events(cuda_events, *name_fragments):
+    """CUDA NCCL events whose name contains any of ``name_fragments`` (case-insensitive)."""
+    return [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower()
+        and any(fragment in event.name.lower() for fragment in name_fragments)
+    ]
+
+
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
     """Minimal per-module FSDP training should match single-rank SGD."""
@@ -281,7 +291,8 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     )
     torch.manual_seed(1234)
     dim = 8
-    model = MultiChildModel(dim=dim, num_children=2).to(device)
+    num_children = 2
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device)
     for layer in model.layers:
         fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
     fully_shard(model, mesh=mesh, placements=_hsdp_placements())
@@ -310,19 +321,11 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
         torch.cuda.synchronize(device)
 
     cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
-    reduce_scatter_events = [
-        event
-        for event in cuda_events
-        if "nccl" in event.name.lower()
-        and ("reducescatter" in event.name.lower() or "reduce_scatter" in event.name.lower())
-    ]
-    all_reduce_events = [
-        event
-        for event in cuda_events
-        if "nccl" in event.name.lower() and "allreduce" in event.name.lower()
-    ]
-    # HSDP must trigger the DP-outer all-reduce that plain DP never issues.
-    assert all_reduce_events, [event.name for event in cuda_events]
+    reduce_scatter_events = _nccl_events(cuda_events, "reducescatter", "reduce_scatter")
+    all_reduce_events = _nccl_events(cuda_events, "allreduce")
+    # One DP-outer all-reduce per parameter group -- each child layer plus the
+    # root unit's bias -- fired only on the last microbatch. Plain DP fires none.
+    assert len(all_reduce_events) == num_children + 1, [event.name for event in cuda_events]
     # DP-inner reduce-scatter runs every microbatch; the DP-outer all-reduce runs
     # only on the last, so the counts differ by exactly the microbatch factor.
     assert len(reduce_scatter_events) == len(all_reduce_events) * num_microbatches, (
@@ -510,17 +513,8 @@ def test_overlaps_communication_and_compute(distributed_setup):
         torch.cuda.synchronize(device)
 
     cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
-    all_gather_events = [
-        event
-        for event in cuda_events
-        if "nccl" in event.name.lower() and "allgather" in event.name.lower()
-    ]
-    reduce_scatter_events = [
-        event
-        for event in cuda_events
-        if "nccl" in event.name.lower()
-        and ("reducescatter" in event.name.lower() or "reduce_scatter" in event.name.lower())
-    ]
+    all_gather_events = _nccl_events(cuda_events, "allgather")
+    reduce_scatter_events = _nccl_events(cuda_events, "reducescatter", "reduce_scatter")
     # GEMM device-kernel names vary across CUDA/cuBLAS versions and GPU archs
     # (e.g. "*gemm*", "cutlass*", "cublas*", and cuBLASLt's Hopper "nvjet_sm90_*").
     gemm_events = [

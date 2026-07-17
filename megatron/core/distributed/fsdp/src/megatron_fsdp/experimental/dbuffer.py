@@ -321,7 +321,22 @@ class DBuffer:
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
             return self.scatter(axis, new_placement, out=out)
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
-            return self.replicate_to_partial(axis, new_placement, out=out)
+            # Replicate and Partial share the same local layout, so relabel the
+            # buffer without communication. Value-preserving for AVG only -- the
+            # mean of identical per-rank locals is that value; SUM would need a
+            # 1/axis_size rescale, which no caller needs.
+            if new_placement.reduce_op != dist.ReduceOp.AVG:
+                raise NotImplementedError(
+                    "Replicate -> Partial redistribute supports AVG only, got "
+                    f"{new_placement.reduce_op!r}."
+                )
+            if out is not None:
+                raise NotImplementedError(
+                    "Replicate -> Partial redistribute does not support an out buffer."
+                )
+            return DBuffer.from_local(
+                self.local_buffer, self.mesh, new_placements, self.layout.tensor_shapes
+            )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
             f"{axis}: {old_placement!r} -> {new_placement!r}."
@@ -419,37 +434,6 @@ class DBuffer:
 
         out.local_buffer.copy_(local_slice)
         return out
-
-    def replicate_to_partial(
-        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
-    ) -> "DBuffer":
-        """Reinterpret a Replicate axis as Partial without moving data.
-
-        Replicate and Partial share the same local layout, so this relabels the
-        existing local buffer rather than copying it, and issues no communication.
-        It is value-preserving for AVG -- the mean of identical per-rank locals is
-        that value. SUM would need a ``1 / axis_size`` rescale, so it is left
-        unsupported until a caller needs it.
-        """
-        axis = mesh_axis
-        if not isinstance(new_placement, Partial):
-            raise ValueError(f"replicate_to_partial() requires a Partial target on axis {axis!r}.")
-        if not isinstance(self.placements[axis], Replicate):
-            raise ValueError(
-                f"replicate_to_partial() requires Replicate placement on axis {axis!r}."
-            )
-        if new_placement.reduce_op != dist.ReduceOp.AVG:
-            raise NotImplementedError(
-                f"replicate_to_partial() supports AVG only, got {new_placement.reduce_op!r}."
-            )
-        if out is not None:
-            raise NotImplementedError("replicate_to_partial() does not support an out buffer.")
-
-        placements = list(self.placements)
-        placements[axis] = new_placement
-        return DBuffer.from_local(
-            self.local_buffer, self.mesh, placements, self.layout.tensor_shapes
-        )
 
     def get_local_tensor(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
