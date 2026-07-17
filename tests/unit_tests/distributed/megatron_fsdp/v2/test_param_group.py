@@ -357,7 +357,7 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
             ref = torch.full_like(gbuf.data, float(rank + 1))
             Ref.all_reduce(ref, pg.dp_group)
             Ref.all_reduce(ref, pg.outer_dp_group)
-            pg.reduce_grad(is_last_microbatch=True)
+            pg.reduce_grad(is_last_backward=True)
             assert torch.equal(gbuf.data, ref)
         else:
             full_size = gbuf.buffer_index.bucket_meta.size
@@ -377,7 +377,7 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
                 gbuf.data.zero_()
             else:
                 gbuf.data.copy_(full)
-            pg.reduce_grad(is_last_microbatch=True)
+            pg.reduce_grad(is_last_backward=True)
 
             if outer_strategy == "optim":
                 # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
@@ -417,9 +417,9 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
             )
             gbuf.data.add_(micro_grad)
             full_batch_grad.add_(micro_grad)
-            is_last_microbatch = microbatch == num_micro_batches - 1
-            pg.reduce_grad(is_last_microbatch=is_last_microbatch)
-            if is_last_microbatch:
+            is_last_backward = microbatch == num_micro_batches - 1
+            pg.reduce_grad(is_last_backward=is_last_backward)
+            if is_last_backward:
                 assert pg._full_grad_buffer_has_accumulated_grad == (
                     strategy == "no_shard"
                 )

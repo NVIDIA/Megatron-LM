@@ -519,7 +519,7 @@ When `overlap_moe_expert_parallel_comm=True`, the following constraints apply:
 #### 7.1.5 Gradient sync suppression — `no_sync()`
 
 - **V1 impl**: `MegatronFSDP.no_sync()` (context manager, sets
-  `is_last_microbatch = False` on enter, `True` on exit).
+  `is_last_backward = False` on enter, `True` on exit).
 - **When**: wraps the inner micro-batches (all except first forward-only
   and last backward-only).
 - **Effect**: prevents gradient reduce-scatter for non-final micro-batches.

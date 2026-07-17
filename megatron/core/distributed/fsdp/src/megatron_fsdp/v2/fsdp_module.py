@@ -168,8 +168,15 @@ class _FSDPRootContext:
     enable_async_reduce_grad: bool = True
     """Whether to overlap gradient reduction with backward computation."""
 
-    is_last_microbatch: bool = False
-    """Whether the current backward pass is the last micro-batch in an optimizer step."""
+    is_last_backward: bool = False
+    """Whether the current backward pass is the optimizer-step boundary."""
+
+    model_weight_refresh_pending: bool = False
+    """Whether the next normal forward must install optimizer-updated weights.
+
+    The final backward callback arms this only at an optimizer-step boundary.
+    An explicit post-optimizer copy or the next non-recompute forward consumes it.
+    """
 
     # ------------------------------------------------------------------
     # Activation recompute / gradient checkpointing support
@@ -954,13 +961,13 @@ class FSDPModule:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
                 param_group.reduce_grad(
-                    is_last_microbatch=ctx.is_last_microbatch,
+                    is_last_backward=ctx.is_last_backward,
                     stream=stream,
                 )
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
-                param_group.reduce_grad(is_last_microbatch=ctx.is_last_microbatch)
+                param_group.reduce_grad(is_last_backward=ctx.is_last_backward)
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
@@ -1043,6 +1050,9 @@ class FSDPModule:
                 continue
             for param_group in child._fsdp_param_groups:
                 param_group.copy_main_weights_to_model_weights()
+        # Explicit optimizer integrations and the lazy pre-forward path share
+        # this method. Whichever installs the weights first consumes the work.
+        self._fsdp_root_context.model_weight_refresh_pending = False
 
     def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
         """
@@ -1239,7 +1249,7 @@ class FSDPModule:
         This mirrors PyTorch FSDP2's microbatching API.  On the last backward,
         delayed inner grad reductions and outer-DP grad sync are issued.
         """
-        self._fsdp_root_context.is_last_microbatch = is_last_backward
+        self._fsdp_root_context.is_last_backward = is_last_backward
 
     @contextmanager
     def no_sync(self):

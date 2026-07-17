@@ -552,6 +552,15 @@ The rowwise/model buffer is refreshed on forward unshard. For MXFP8, the
 transpose buffer is refreshed on backward unshard, where
 `weight_buffers_for_unshard(..., bwd_pass=True)` selects it.
 
+The final backward callback arms `ctx.model_weight_refresh_pending` only when
+`is_last_backward` is true. An optimizer integration that explicitly calls
+`_copy_main_weights_to_model_weights()` consumes this flag immediately. For a
+plain PyTorch optimizer, the next non-recompute root pre-forward hook consumes
+the flag and installs the optimized weights before launching any parameter
+unshard or prefetch. This keeps weight installation out of `zero_grad()`, skips
+intermediate gradient-accumulation micro-batches, and prevents activation
+checkpoint recompute from consuming the pending optimizer boundary.
+
 ---
 
 ## Feature 3: Activation Recomputation (Gradient Checkpointing)

@@ -311,7 +311,7 @@ class ParameterGroup:
 
     def reduce_grad(
         self,
-        is_last_microbatch: bool = False,
+        is_last_backward: bool = False,
         stream: Optional[torch.cuda.Stream] = None,
     ):
         """
@@ -336,13 +336,13 @@ class ParameterGroup:
             "optim_grads",
             "optim_grads_params",
         ) or (
-            is_last_microbatch and self.sharding_strategy in ("no_shard", "optim")
+            is_last_backward and self.sharding_strategy in ("no_shard", "optim")
         )
         reduce_outer = self.outer_dp_sharding_strategy in (
             "optim_grads",
             "optim_grads_params",
         ) or (
-            is_last_microbatch
+            is_last_backward
             and self.outer_dp_sharding_strategy in ("no_shard", "optim")
         )
         if reduce_inner:

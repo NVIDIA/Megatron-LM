@@ -88,6 +88,11 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
     # ---- root: forward-phase setup (once per micro-batch) ------------------
     if target._fsdp_state._is_root and not is_recompute:
+        # The last-backward contract guarantees that an optimizer decision has
+        # happened before this next normal forward. Install updated main-weight
+        # shards before any parameter unshard/prefetch can consume model weights.
+        if ctx.model_weight_refresh_pending:
+            target._copy_main_weights_to_model_weights()
         if ctx.enable_cuda_graph and ctx.cuda_graph_stream is None:
             ctx.cuda_graph_stream = torch.cuda.Stream()
             torch.cuda.set_stream(ctx.cuda_graph_stream)
@@ -281,6 +286,12 @@ def mfsdp_post_backward_final_callback(root_module: nn.Module):
             event.wait()
             param_group.release_grad_buffer()
     torch.cuda.current_stream().wait_stream(stream)
+
+    # ``is_last_backward`` is the optimizer-step boundary. The optimizer may
+    # install model weights explicitly; otherwise the next normal pre-forward
+    # hook does it lazily. Activation recompute is excluded by that hook.
+    if ctx.is_last_backward:
+        ctx.model_weight_refresh_pending = True
 
     # ---- reset root / context state for the next micro-batch ----------
     root_module._fsdp_state._post_backward_callback_queued = False
