@@ -113,7 +113,10 @@ def _make_gtp_remat_grouped_linear(
         **kwargs,
     )
     layer.gtp_remat_size = gtp_remat_group.size()
-    wrap_module_params_gtp(layer, layer.weight_names, gtp_remat_group, is_grouped=True)
+    # GroupedLinear exposes per-expert weight0..weight{num_gemms-1} (it no longer declares
+    # weight_names); build the names here to match attach_gtp_to_presharded_module.
+    weight_names = [f"weight{idx}" for idx in range(num_gemms)]
+    wrap_module_params_gtp(layer, weight_names, gtp_remat_group, is_grouped=True)
     return layer
 
 

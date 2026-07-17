@@ -451,6 +451,11 @@ def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_id
     Separate from _gtp_slice_one_param so attrs land on the post-quantize param (when
     quantize fires between slice and attach).
     """
+    # DistributedWeight requires implementers stay torch.Tensor subclasses; enforce at construction.
+    assert isinstance(gtp_shard, torch.Tensor), (
+        "GTP param must remain a torch.Tensor subclass (DistributedWeight requirement); got "
+        f"{type(gtp_shard).__name__}."
+    )
     if is_grouped:
         gtp_shard.expert_idx = expert_idx
         gtp_shard.is_routed_expert = True
@@ -509,7 +514,19 @@ def _gtp_reclass_native_fp8_shard(param):
 
 def attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=False):
     """Turn each pre-sharded weight into a GTP param (FP8/BF16) and attach GTP wiring."""
-    weight_names = getattr(module, "weight_names", ["weight"])
+    # GTP shards per-expert weight0..weight{num_gemms-1}; a coalesced single weight has no sibling
+    # shards to attach, so reject it here (once, at setup) instead of silently attaching nothing.
+    if is_grouped:
+        assert not getattr(
+            module, "single_grouped_weight", False
+        ), f"GTP grouped module {type(module).__name__} requires single_grouped_weight=False."
+    # Use the module's weight_names if it declares them; otherwise create them (grouped modules
+    # expose per-expert weight0..weight{num_gemms-1}, non-grouped a single "weight").
+    weight_names = getattr(module, "weight_names", None)
+    if not weight_names:
+        weight_names = (
+            [f"weight{idx}" for idx in range(module.num_gemms)] if is_grouped else ["weight"]
+        )
     new_weights = []
     for idx, name in enumerate(weight_names):
         param = getattr(module, name, None)
