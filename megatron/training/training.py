@@ -3217,15 +3217,23 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
+        moe_layer_freq = args.moe_layer_freq
+        mtp_num_layers = args.mtp_num_layers
         if is_hybrid_model(args):
-            from operator import itemgetter
-
             from megatron.core.ssm.mamba_hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                parse_hybrid_pattern,
             )
 
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+            parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            main_pattern = (parsed_hybrid_pattern.main_pattern or "").replace(Symbols.PIPE, "")
+            layers = len(main_pattern) + parsed_hybrid_pattern.mtp_num_depths
+            moe_layer_freq = [int(layer_type == Symbols.MOE) for layer_type in main_pattern]
+            moe_layer_freq.extend(
+                parsed_hybrid_pattern.mtp_pattern.count(Symbols.MOE)
+                for _ in range(parsed_hybrid_pattern.mtp_num_depths)
+            )
+            mtp_num_layers = None
         else:
             layers = args.num_layers
 
@@ -3238,8 +3246,8 @@ def training_log(
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
-            moe_layer_freq=args.moe_layer_freq,
-            mtp_num_layers=args.mtp_num_layers,
+            moe_layer_freq=moe_layer_freq,
+            mtp_num_layers=mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )

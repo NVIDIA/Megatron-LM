@@ -44,7 +44,10 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.argument_utils import (
+    ArgumentGroupFactory,
+    _normalize_dsv4_hybrid_csa_compress_ratios,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
@@ -1208,6 +1211,17 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
+        if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
+            # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
+            # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
+            # grouped backing storage remapped instead; quantized grouped tensors also need
+            # grouped scale/amax handling. DDP has a separate GroupedTensor-aware path.
+            raise ValueError(
+                "Megatron-FSDP does not currently support moe_single_grouped_weight or "
+                "moe_single_grouped_bias. Disable single grouped MoE parameters or use the "
+                "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
+                "GroupedTensor param buffers."
+            )
         # Optimizer compatibility check.
         assert args.optimizer in (
             'sgd',
@@ -1854,18 +1868,40 @@ def validate_args(args, defaults={}):
         ], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     if args.use_layer_wise_distributed_optimizer:
-        assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
-            "Layer-wise (Muon) distributed optimizer does not support FP8/FP4 parameter gather "
-            "(fp8_param_gather / fp4_param_gather). Use fp8_param_gather=False (e.g. blockwise/"
-            "MXFP8 compute with parameters persisted in bf16)."
-        )
         if not args.use_layer_wise_param_layout:
+            # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
+            # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
+            # reuse_grad_buf. fp4 is rejected unconditionally -- the LayerWise gather routes
+            # buckets by is_float8tensor, so an NVFP4 param would silently take the raw
+            # flatten path.
+            assert not getattr(args, 'fp4_param_gather', False), (
+                "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
+                "(mxfp8 or blockwise); fp4_param_gather is out of scope."
+            )
+            if args.fp8_param_gather:
+                assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
+                    "fp8 parameter gather on the decoupled compact LayerWise DDP layout requires "
+                    f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."
+                )
+                if args.fp8_recipe == 'mxfp8':
+                    assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                        "mxfp8 + --fp8-param-gather on the decoupled compact LayerWise DDP layout "
+                        "requires --reuse-grad-buf-for-mxfp8-param-ag (or use fp8_recipe='blockwise')."
+                    )
             assert args.num_distributed_optimizer_instances == 1, (
                 "the decoupled compact LayerWise DDP layout (the default; pass "
                 "--use-layer-wise-param-layout for the padded layout) requires "
                 "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
                 "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
                 "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
+        else:
+            # Padded LayerWise param layout: fp8/fp4 parameter gather is not supported here.
+            assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+                "Layer-wise (Muon) distributed optimizer with the padded param layout does not "
+                "support FP8/FP4 parameter gather. Use the default compact decoupled layout (do "
+                "not pass --use-layer-wise-param-layout) for fp8 parameter gather, or "
+                "fp8_param_gather=False."
             )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
@@ -2209,37 +2245,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
-        # When the dsv4_hybrid variant is active (set above or explicitly) and the user did not
-        # provide --csa-compress-ratios, derive it from the pattern symbols (C->4, H->128,
-        # W/D/others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
-        # per-layer ratios match the symbols. C/H/W layers also take their ratio via the spec.
-        _variant = kw_args.get(
-            'experimental_attention_variant', getattr(args, 'experimental_attention_variant', None)
-        )
-        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is None:
-            _ratio_map = {Symbols.CSA: 4, Symbols.HCA: 128}
-            # One ratio entry per ACTUAL layer: main layers, then every MTP layer of every MTP
-            # depth (a depth can contain multiple hybrid layers, e.g. "/MD-E"). This makes the
-            # array long enough for the deepseek attn index (num_layers + layer_number - 1) for
-            # any MTP attention position, not just depth-first. C->4, H->128, others->0.
-            _sections = _pat.split(Symbols.MTP_SEPARATOR)
-            _ratios = [_ratio_map.get(c, 0) for c in _sections[0].replace(Symbols.PIPE, '')]
-            for _mtp_sec in _sections[1:]:
-                _ratios += [_ratio_map.get(c, 0) for c in _mtp_sec.replace(Symbols.PIPE, '')]
-            kw_args['csa_compress_ratios'] = _ratios
-            args.csa_compress_ratios = _ratios
-        # Exact length check (the pattern is known here, so the precise per-layer count is too):
-        # one ratio per main layer + one per MTP layer of every MTP depth. This catches a
-        # mis-sized user-provided --csa-compress-ratios with a clear error. (transformer_config
-        # keeps a >= backstop because it does not have the pattern to recompute this exactly.)
-        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is not None:
-            _secs = _pat.split(Symbols.MTP_SEPARATOR)
-            _exact_len = sum(len(s.replace(Symbols.PIPE, '')) for s in _secs)
-            assert len(args.csa_compress_ratios) == _exact_len, (
-                f"csa_compress_ratios length ({len(args.csa_compress_ratios)}) must equal the "
-                f"number of layers in the hybrid pattern (main + every MTP-depth layer) "
-                f"= {_exact_len} for pattern '{_pat}'."
-            )
+        # Normalize compact and legacy-padded ratios through the shared migration helper.
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -4232,8 +4239,11 @@ def _add_distributed_args(parser):
         'decoupled layout, where LayerWise (Muon 2D) buffers use a no-padding DDP layout and locally '
         'disable DistributedOptimizer (all-reduce grads + whole-param ping-pong + allgather_params), '
         'while sibling buffers keep the byte-level DistributedOptimizer; this avoids the persistent '
-        'dp_size * max(shard_load) padding. Pass this flag to restore the padded layout (e.g. for '
-        'bit-for-bit comparison; it uses a different bf16 reduction ordering).',
+        'dp_size * max(shard_load) padding. The compact layout supports --fp8-param-gather (mxfp8 or '
+        'blockwise): the Muon buffers stay non-DistOpt and the param sync runs through the FP8-aware '
+        'allgather_params ping-pong path (stage fp32 master -> bf16, uneven all-gather, requantize '
+        'per rank); mxfp8 requires --reuse-grad-buf-for-mxfp8-param-ag. Pass this flag to restore the '
+        'padded layout (e.g. for bit-for-bit comparison; it uses a different bf16 reduction ordering).',
     )
     return parser
 
@@ -4872,7 +4882,9 @@ def _add_experimental_attention_variant_args(parser):
         'Each value is the compression ratio for the corresponding '
         'transformer layer (valid values: 0, 4, 128; 0 = sliding-window-only, the "W" '
         'hybrid layer symbol). '
-        'The list length must equal num_layers.',
+        'For HybridModel with --hybrid-layer-pattern, the preferred compact form has one '
+        'entry per W/C/H attention symbol; legacy zero-padded one-entry-per-hybrid-layer '
+        'lists are also accepted.',
     )
     group.add_argument(
         '--no-dsa-kernel-fusion',
