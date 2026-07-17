@@ -104,8 +104,8 @@ def triton_append_key_value_cache(
 
     Args:
         layer_number (int): Layer number (1-based).
-        key (Tensor): Key tensor of shape (batch_size, 1, num_heads, h_dim).
-        value (Tensor): Value tensor of shape (batch_size, 1, num_heads, h_dim).
+        key (Tensor): Key tensor of shape (num_tokens, 1, num_heads, h_dim).
+        value (Tensor): Value tensor of shape (num_tokens, 1, num_heads, h_dim).
         memory_buffer (Tensor): The 6D KV cache tensor to write to.
         padded_active_token_count (int): The number of active tokens to process.
         token_to_block_idx (Tensor): Tensor mapping token index to its block index in
@@ -255,8 +255,8 @@ def triton_append_mla_latent_cache(
 
     Args:
         layer_number (int): Layer number (0-based attention layer index).
-        kv_concat (Tensor): MLA latent tensor of shape (batch_size, 1, kv_reduced_dim)
-            or (batch_size, kv_reduced_dim).
+        kv_concat (Tensor): MLA latent tensor of shape (num_tokens, 1, kv_reduced_dim),
+            (num_tokens, kv_reduced_dim), or 4D which will be reshaped to 2D.
         memory_buffer (Tensor): The 4D MLA latent cache tensor to write to
             (num_layers, total_blocks, block_size, kv_reduced_dim).
         padded_active_token_count (int): The number of active tokens to process.
