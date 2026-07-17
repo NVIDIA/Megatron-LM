@@ -353,15 +353,14 @@ def test_overlaps_communication_and_compute(distributed_setup):
         # drop the CUDA events.
         torch.cuda.synchronize(device)
 
-    # Keep only real device kernels. NCCL also emits a per-collective op-range
-    # annotation (e.g. "nccl:_reduce_scatter_base") that the profiler tags as a
-    # CUDA event; excluding the "nccl:"-prefixed annotations avoids double-counting
-    # the reduce-scatters (whose name contains "reduce_scatter"). Real kernels are
-    # named like "ncclDevKernel_ReduceScatter_..." / "ncclDevKernel_AllGather_...".
+    # Keep only real device kernels. NCCL also emits per-collective GPU user
+    # annotations (e.g. "nccl:_reduce_scatter_base") that the profiler reports as
+    # CUDA events. Filtering by activity type avoids counting those annotations as
+    # kernels without relying on their current naming convention.
     cuda_events = [
         event
         for event in prof.events()
-        if event.device_type.name == "CUDA" and not event.name.startswith("nccl:")
+        if event.device_type.name == "CUDA" and event.activity_type == "kernel"
     ]
     all_gather_events = [
         event
