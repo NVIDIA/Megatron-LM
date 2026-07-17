@@ -59,7 +59,11 @@ class EnergyMonitor:
     def _get_energy(self) -> int:
         """Get current energy consumption from NVML."""
         try:
-            return nvmlDeviceGetTotalEnergyConsumption(self._handle)
+            # Passing None to nvmlDeviceGetTotalEnergyConsumption can cause a core
+            # dump, so short circuit if self._handle is None.
+            if self._handle is not None:
+                return nvmlDeviceGetTotalEnergyConsumption(self._handle)
+            return self._last_energy
         except NVMLError:
             return self._last_energy  # return *something* if it errors
 

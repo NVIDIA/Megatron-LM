@@ -2,33 +2,14 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
-from .base import CopyService
+from .base import CopyService, RecvOp, SendOp, match_local_ops_by_task_id
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SendOp:
-    """Simple container describing a single send operation."""
-
-    task_id: int | None
-    tensor: torch.Tensor
-    dest_rank: int
-
-
-@dataclass
-class RecvOp:
-    """Simple container describing a single receive operation."""
-
-    task_id: int | None
-    tensor: torch.Tensor
-    src_rank: int
 
 
 class GlooCopyService(CopyService):
@@ -38,41 +19,29 @@ class GlooCopyService(CopyService):
     """
 
     def __init__(self, group=None):
+        super().__init__(group=group)
         if group is not None:
             self.gloo_pg = group
-            self.rank = group.rank()
-            self.world_size = group.size()
         else:
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
             self.gloo_pg = dist.new_group(backend="gloo")
         self.send_ops: List[SendOp] = []
+        # Each recv op is paired with its GPU destination tensor; the SendOp/RecvOp
+        # itself carries a pinned-CPU staging buffer for Gloo's CPU PG.
         self.recv_ops: List[Tuple[RecvOp, torch.Tensor]] = []
+        # Dedicated stream for GPU-side work (local same-rank copies and the
+        # final CPU->GPU writebacks) so they overlap with the GPU->CPU staging
+        # copies issued on the default stream during ``run()``.
         self._copy_stream = torch.cuda.Stream()
         if self.rank == 0:
             logger.info(
                 f"GlooCopyService initialized on rank {self.rank} with {self.world_size} ranks"
             )
 
-    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
-        self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
-
-    def submit_send_with_id(self, task_id: int, src_tensor: torch.Tensor, dest_rank: int):
-        """Submit a send operation with a unique task identifier."""
+    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
 
-    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int):
-        """Submit a receive operation."""
+    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int, task_id: Optional[int] = None):
         # Allocate a pinned CPU buffer for faster CPU↔GPU transfer.
-        cpu_buffer = torch.empty(
-            dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
-        )
-        self.recv_ops.append(
-            (RecvOp(task_id=None, tensor=cpu_buffer, src_rank=src_rank), dest_tensor)
-        )
-
-    def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
-        """Submit a receive operation with a unique task identifier."""
         cpu_buffer = torch.empty(
             dest_tensor.shape, dtype=dest_tensor.dtype, device="cpu", pin_memory=True
         )
@@ -88,43 +57,23 @@ class GlooCopyService(CopyService):
                 f"{len(self.send_ops)} sends + {len(self.recv_ops)} recvs = {total_ops} ops"
             )
 
-        p2p_ops: List[dist.P2POp] = []
-
-        # Short-circuit self transfers into local device copies.
         local_sends = [op for op in self.send_ops if op.dest_rank == self.rank]
         remote_sends = [op for op in self.send_ops if op.dest_rank != self.rank]
         local_recvs = [(recv, dst) for (recv, dst) in self.recv_ops if recv.src_rank == self.rank]
         remote_recvs = [(recv, dst) for (recv, dst) in self.recv_ops if recv.src_rank != self.rank]
 
+        # Local copies run on a dedicated stream so they overlap with the
+        # GPU->CPU staging copies issued on the default stream below.
         if local_sends or local_recvs:
-            local_sends_by_id = {op.task_id: op for op in local_sends}
-            if None in local_sends_by_id:
-                raise RuntimeError(
-                    "GlooCopyService: local send missing task_id; "
-                    "use submit_send_with_id/submit_recv_with_id for local copies"
-                )
-            local_recvs_by_id = {recv.task_id: (recv, dst) for (recv, dst) in local_recvs}
-            if None in local_recvs_by_id:
-                raise RuntimeError(
-                    "GlooCopyService: local recv missing task_id; "
-                    "use submit_send_with_id/submit_recv_with_id for local copies"
-                )
-            if len(local_sends_by_id) != len(local_sends) or len(local_recvs_by_id) != len(
-                local_recvs
-            ):
-                raise RuntimeError(
-                    f"GlooCopyService: unmatched local ops on rank {self.rank}: "
-                    f"{len(local_sends)} local sends vs {len(local_recvs)} local recvs"
-                )
-            for task_id, (recv_op, dst_tensor) in local_recvs_by_id.items():
-                send_op = local_sends_by_id.get(task_id)
-                if send_op is None:
-                    raise RuntimeError(
-                        f"GlooCopyService: missing local send for task_id={task_id} "
-                        f"on rank {self.rank}"
-                    )
-                with torch.no_grad():
+            local_recv_objs = [recv for recv, _ in local_recvs]
+            dst_by_task_id = {recv.task_id: dst for recv, dst in local_recvs}
+            pairs = match_local_ops_by_task_id(
+                local_sends, local_recv_objs, "GlooCopyService", self.rank
+            )
+            with torch.no_grad(), torch.cuda.stream(self._copy_stream):
+                for send_op, recv_op in pairs:
                     src_tensor = send_op.tensor
+                    dst_tensor = dst_by_task_id[recv_op.task_id]
                     if dst_tensor.device != src_tensor.device:
                         dst_tensor.copy_(src_tensor.to(dst_tensor.device))
                     else:
@@ -142,13 +91,15 @@ class GlooCopyService(CopyService):
             )
             cpu_tensor.copy_(op.tensor.detach(), non_blocking=True)
             cpu_send_bufs.append(cpu_tensor)
-        # Single sync after all GPU→CPU copies are issued.
+        # Wait only on default-stream staging copies; _copy_stream keeps running.
         if cpu_send_bufs:
-            torch.cuda.synchronize()
+            torch.cuda.current_stream().synchronize()
 
         for op in remote_sends:
+            # Drop the GPU reference now that staging is complete.
             op.tensor = None
 
+        p2p_ops: List[dist.P2POp] = []
         for cpu_tensor, op in zip(cpu_send_bufs, remote_sends):
             p2p_ops.append(
                 dist.P2POp(dist.isend, cpu_tensor, group=self.gloo_pg, group_peer=op.dest_rank)
@@ -164,18 +115,17 @@ class GlooCopyService(CopyService):
                 req.wait()
 
         # Copy received CPU buffers back into the original destination tensors.
-        # Use non_blocking with pinned memory for overlap.
-        for recv, dst_tensor in remote_recvs:
-            if dst_tensor.is_cuda:
-                dst_tensor.copy_(recv.tensor, non_blocking=True)
-            else:
-                dst_tensor.copy_(recv.tensor)
+        # Use non_blocking with pinned memory for overlap.  Routed through
+        # _copy_stream so subsequent default-stream work isn't blocked.
+        with torch.cuda.stream(self._copy_stream):
+            for recv, dst_tensor in remote_recvs:
+                if dst_tensor.is_cuda:
+                    dst_tensor.copy_(recv.tensor, non_blocking=True)
+                else:
+                    dst_tensor.copy_(recv.tensor)
 
-        if self._copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self._copy_stream)
-
-        # Ensure all async CPU→GPU copies are complete.
-        torch.cuda.synchronize()
+        # Ensure all async CPU→GPU copies are complete and local copies have landed.
+        torch.cuda.current_stream().wait_stream(self._copy_stream)
 
         if self.rank == 0:
             logger.info("GlooCopyService: batched communication completed")

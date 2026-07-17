@@ -39,10 +39,13 @@ class SymmetricMemoryBuffer:
     """
 
     def __init__(self, size_in_mb, process_group):
-        if not HAVE_TORCH_SYMM_MEM or not HAVE_TRITON:
-            # This should be hit if the user is running an older
-            # version of torch, or if they do not have triton
-            # installed.
+        self.init_failure_reason: Optional[str] = None
+        if not HAVE_TORCH_SYMM_MEM:
+            self.init_failure_reason = "torch.distributed._symmetric_memory not importable"
+            self.symm_buffer = None
+            self.symm_mem_hdl = None
+        elif not HAVE_TRITON:
+            self.init_failure_reason = "triton not installed"
             self.symm_buffer = None
             self.symm_mem_hdl = None
         else:
@@ -52,8 +55,7 @@ class SymmetricMemoryBuffer:
                 self.symm_buffer = symm_mem.empty(numel, dtype=torch.uint8, device='cuda')
                 self.symm_mem_hdl = symm_mem.rendezvous(self.symm_buffer, process_group)
             except RuntimeError as e:
-                # If symmetric memory initialization fails, set buffer and handle to None
-                # This should happen if the process group is not contained within NVlink
+                self.init_failure_reason = f"{type(e).__name__}: {e}"
                 self.symm_buffer = None
                 self.symm_mem_hdl = None
 
@@ -138,7 +140,7 @@ class SymmetricMemoryManager:
     """
 
     _buffers: dict[str, SymmetricMemoryBuffer] = {}
-    _default_size_mb: int = 256
+    _default_size_mb: int = 512
 
     @classmethod
     def get_buffer(

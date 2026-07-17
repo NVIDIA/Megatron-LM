@@ -114,12 +114,18 @@ class ProcessGroupCollection:
     # _DATA_PARALLEL_GROUP_WITH_CP
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Separate dp_cp communicator for param all-gather (AG/RS overlap)
+    dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
     # TODO (Hepteract): remove this once distributed checkpoint is refactored
     # _EXPERT_DATA_PARALLEL_GROUP
     expt_dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_DATA_PARALLEL_GROUP_AG
+    expt_dp_ag: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     intra_dp_cp: torch.distributed.ProcessGroup = field(init=False)
@@ -146,11 +152,13 @@ class ProcessGroupCollection:
         for field_info in fields(self):
             if hasattr(self, field_info.name):
                 pg = getattr(self, field_info.name)
-                if pg is not None:
-                    active_pgs.append(f"{field_info.name}({pg.size()})")
-                else:
-                    # Field exists but is None
+                if pg is None:
                     active_pgs.append(f"{field_info.name}(None)")
+                elif isinstance(pg, list):
+                    sizes = [g.size() for g in pg]
+                    active_pgs.append(f"{field_info.name}({sizes})")
+                else:
+                    active_pgs.append(f"{field_info.name}({pg.size()})")
         return (
             f"ProcessGroupCollection({', '.join(active_pgs)})"
             if active_pgs
@@ -210,6 +218,7 @@ class ProcessGroupCollection:
             ),
             'dp': parallel_state.get_data_parallel_group,
             'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
+            'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
@@ -232,6 +241,7 @@ class ProcessGroupCollection:
             'expt_dp': partial(
                 parallel_state.get_expert_data_parallel_group, check_initialized=False
             ),
+            'expt_dp_ag': lambda: None,
             'tp_dp_cp': partial(
                 parallel_state.get_tensor_and_data_parallel_group,
                 check_initialized=False,

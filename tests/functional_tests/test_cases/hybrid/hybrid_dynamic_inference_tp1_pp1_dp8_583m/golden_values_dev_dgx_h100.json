@@ -34,8 +34,8 @@
    1261,
    15353
   ],
-  "latency": 1.906998872756958,
-  "ttft": 0.08748054504394531,
+  "latency": 2.3884456157684326,
+  "ttft": 0.10706686973571777,
   "cuda_graph_request_count_map": null,
   "step_count": 30,
   "top_n_logprobs": null,
@@ -281,6 +281,6 @@
    -2.262563943862915
   ]
  },
- "mem-max-allocated-bytes": 48828583424,
+ "mem-max-allocated-bytes": 53317222912,
  "lifetime_prefill_token_count": 88
 }

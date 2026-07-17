@@ -12,7 +12,6 @@ without CUDA graphs) and compared:
   2. context.using_cuda_graph_this_step() returned True at expected steps.
 """
 
-import os
 import random
 import types
 
@@ -37,14 +36,14 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 BLOCK_SIZE = 256
 VOCAB_SIZE = 10000
@@ -121,9 +120,9 @@ class TestPrefixCachingCudaGraphs:
                 add_bias_linear=True,
                 is_hybrid_model=True,
             )
-            model = MambaModel(
+            model = HybridModel(
                 config=config,
-                mamba_stack_spec=mamba_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec,
                 vocab_size=VOCAB_SIZE,
                 max_sequence_length=MAX_SEQ_LEN,
                 parallel_output=True,
@@ -147,7 +146,7 @@ class TestPrefixCachingCudaGraphs:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(self, model, mamba_config, num_cuda_graphs):
         """Build an engine with prefix caching and optional CUDA graphs."""
@@ -164,8 +163,12 @@ class TestPrefixCachingCudaGraphs:
             use_cuda_graphs_for_non_decode_steps=True,
         )
         if mamba_config is not None:
+            # max_requests is not capped here, so it auto-derives from the KV buffer
+            # size. The Mamba cache budget must cover the per-step extraction scratch
+            # (which scales with max_requests) on top of the durable cache.
+            # max_requests is left uncapped to preserve this test's CUDA-graph buckets.
             inference_config_kwargs.update(
-                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=0.05
+                mamba_inference_state_config=mamba_config, prefix_caching_mamba_gb=2.0
             )
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
@@ -319,6 +322,11 @@ class TestHybridChunkedPrefillIntermediateState:
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel()
+        random.seed(123)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
 
     @classmethod
     def teardown_class(cls):
@@ -343,9 +351,9 @@ class TestHybridChunkedPrefillIntermediateState:
             add_bias_linear=True,
             is_hybrid_model=True,
         )
-        model = MambaModel(
+        model = HybridModel(
             config=config,
-            mamba_stack_spec=mamba_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
@@ -367,7 +375,7 @@ class TestHybridChunkedPrefillIntermediateState:
         for module in model.modules():
             if isinstance(module, CudaGraphManager):
                 module.cudagraph_runners.clear()
-                module.inference_cudagraphs_lookup_table.clear()
+                module.custom_cudagraphs_lookup_table.clear()
 
     def _build_engine(
         self,
@@ -394,9 +402,12 @@ class TestHybridChunkedPrefillIntermediateState:
             max_requests=128,
         )
         if enable_prefix_caching:
+            # The Mamba cache budget must cover both the durable cache and the
+            # per-step extraction scratch (which scales with max_requests), so it
+            # needs enough headroom to fit the scratch and still leave durable slots.
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-                prefix_caching_mamba_gb=0.05,
+                prefix_caching_mamba_gb=0.2,
             )
         if max_tokens is not None:
             inference_config_kwargs["max_tokens"] = max_tokens
@@ -443,16 +454,7 @@ class TestHybridChunkedPrefillIntermediateState:
         if not sequence_packing_available:
             pytest.skip(reason)
 
-        # Clear NVTE env vars set by conftest set_env fixture.
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
-
-        random.seed(123)
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
-        )
+        clear_nvte_env_vars()  # conftest's set_env fixture re-sets these per test
 
         model = self._create_hybrid_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
@@ -534,3 +536,50 @@ class TestHybridChunkedPrefillIntermediateState:
                 f"req {req_id}: baseline {baseline_outputs[req_id]} != "
                 f"test {test_outputs[req_id]}"
             )
+
+    @torch.inference_mode()
+    def test_prefill_shorter_than_conv_window(self):
+        """A prefill captured into a CUDA graph whose token bucket is smaller than the
+        Mamba conv window (d_conv) generates correctly.
+
+        Conv-state extraction gathers d_conv positions per slot, and unused slots use
+        abs_position == d_conv (gather indices up to d_conv-1). The CUDA-graph bucket
+        list always includes a size-1 (tp_size) graph, so a prompt shorter than d_conv
+        is captured at a bucket whose token layout is shorter than the gather window.
+        CUDA graphs (num_cuda_graphs) are required to exercise this capture path.
+        """
+        sequence_packing_available, reason = _check_mamba_sequence_packing_support()
+        if not sequence_packing_available:
+            pytest.skip(reason)
+
+        clear_nvte_env_vars()  # conftest's set_env fixture re-sets these per test
+
+        model = self._create_hybrid_model(num_cuda_graphs=2)
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        device = torch.cuda.current_device()
+
+        d_conv = mamba_config.conv_states_shape[-1]
+        if d_conv < 2:
+            pytest.skip(f"d_conv={d_conv} too small to exercise a sub-window prefill")
+
+        # Prompt shorter than the conv window: its prefill chunk snaps to a CUDA-graph
+        # bucket < d_conv, so the captured graph's token layout is < d_conv.
+        engine = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            num_cuda_graphs=2,
+        )
+        short_prompt = torch.arange(0, d_conv - 1, dtype=torch.int64, device=device)
+
+        engine._add_request(self._make_request(0, short_prompt, enable_pc=True))
+        outputs = {}
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                outputs[merged.request_id] = list(merged.generated_tokens)
+
+        # Generation completes and produces the requested number of tokens.
+        assert len(outputs[0]) == NUM_TOKENS_TO_GENERATE

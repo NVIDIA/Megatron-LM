@@ -20,6 +20,10 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -79,6 +83,7 @@ class InferenceLinear(TELinear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -94,6 +99,7 @@ class InferenceLinear(TELinear):
             is_expert=is_expert,
             symmetric_ar_type=symmetric_ar_type,
             tp_group=tp_group,
+            name=name,
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
@@ -125,6 +131,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -140,6 +147,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            name=name,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -252,6 +260,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -267,6 +276,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            name=name,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -348,6 +358,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -361,6 +372,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            name=name,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -473,3 +485,75 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         else:
             x = self._matmul_reduce_scatter(x)
             return x, None
+
+
+def inference_all_gather_from_tensor_model_parallel_region(
+    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
+) -> torch.Tensor:
+    """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
+
+    Replaces `gather_from_tensor_model_parallel_region` in inference paths
+    where autograd is not needed and NVLS symmetric-memory is available.
+
+    The NVLS path performs a flat all-gather into symmetric memory (concatenating
+    along dim-0), then rearranges the result to the last dimension — the same
+    semantics as `_gather_along_last_dim` but using hardware multicast when
+    possible.
+    """
+    tp_size = dist.get_world_size(tp_group)
+    if tp_size == 1:
+        return x
+
+    triton_nvls_kernels_allowed = not getattr(
+        config, 'inference_disable_triton_nvls_kernels', False
+    )
+
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+        ag_buffer_dims = list(x.size())
+        ag_buffer_dims[0] *= tp_size
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(ag_buffer_dims, dtype=x.dtype)
+
+        if are_tensors_nvls_eligible(x) and symm_mem_buffer["handle"] is not None:
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            tensor_list = symm_mem_buffer["tensor"].chunk(tp_size, dim=0)
+            return torch.cat(tensor_list, dim=-1).contiguous()
+
+    return gather_from_tensor_model_parallel_region(x, group=tp_group)
+
+
+def inference_reduce_scatter_to_sequence_parallel_region(
+    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
+) -> torch.Tensor:
+    """NVLS-optimized reduce-scatter along the first dimension, with NCCL fallback.
+
+    Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
+    where autograd is not needed and NVLS symmetric-memory is available.
+    """
+    # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
+    # to use this function for its non-fused NVLS reduce-scatter path.
+    tp_size = dist.get_world_size(tp_group)
+    if tp_size == 1:
+        return x
+
+    triton_nvls_kernels_allowed = not getattr(
+        config, 'inference_disable_triton_nvls_kernels', False
+    )
+
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
+
+        if (
+            x.dtype == torch.bfloat16
+            and are_tensors_nvls_eligible(x)
+            and symm_mem_buffer["handle"] is not None
+        ):
+            symm_mem_buffer["tensor"].copy_(x)
+            output_dims = list(x.size())
+            output_dims[0] = x.size(0) // tp_size
+            output = torch.empty(output_dims, dtype=x.dtype, device=x.device)
+            multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
+            return output
+
+    return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)

@@ -41,6 +41,12 @@ class AsyncZMQCommunicator:
             hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
                 If None, defaults to socket.gethostname().
         """
+        # Normalize None to the default (world) group. get_rank/get_world_size
+        # already treat None this way, but get_process_group_ranks below does
+        # not accept None, so resolve it once here for all three calls.
+        if process_group is None:
+            process_group = dist.group.WORLD
+
         self.rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
         self.is_leader = self.rank == 0
@@ -130,6 +136,45 @@ class AsyncZMQCommunicator:
                     return result[0] if n == 1 else result
                 except zmq.Again:
                     await asyncio.sleep(0.001)
+
+    def sync_all_reduce_max(self, *local_vals: int) -> int | tuple[int, ...]:
+        """Synchronous (non-asyncio) variant of all_reduce_max.
+
+        Uses blocking ZMQ sends/recvs so it can be called from synchronous
+        call sites that need a CPU-only MAX reduction across the process
+        group. Intended for tiny payloads (e.g. a few integers) that would
+        otherwise force a NCCL AllReduce kernel on the compute stream.
+
+        Note: when called from inside a running asyncio event loop, the
+        blocking recv will pause other coroutines on this rank until all
+        peers respond. This is acceptable here because every rank reaches
+        the call simultaneously and the message size is trivial.
+
+        Returns a single int when called with one argument, otherwise a tuple.
+        """
+        n = len(local_vals)
+        if n == 0:
+            raise ValueError("sync_all_reduce_max requires at least one value")
+
+        if self.world_size <= 1:
+            return local_vals[0] if n == 1 else local_vals
+
+        fmt = f'!{n}i'
+        payload = struct.pack(fmt, *local_vals)
+
+        if self.is_leader:
+            rows = [local_vals]
+            while len(rows) < self.world_size:
+                msg = self.gather_sock.recv()
+                rows.append(struct.unpack(fmt, msg))
+            maxes = tuple(max(row[i] for row in rows) for i in range(n))
+            self.bcast_sock.send(struct.pack(fmt, *maxes))
+            return maxes[0] if n == 1 else maxes
+        else:
+            self.gather_sock.send(payload)
+            msg = self.bcast_sock.recv()
+            result = struct.unpack(fmt, msg)
+            return result[0] if n == 1 else result
 
     def close(self):
         """

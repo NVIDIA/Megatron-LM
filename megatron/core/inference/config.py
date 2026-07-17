@@ -2,7 +2,7 @@
 
 from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -24,7 +24,7 @@ class MambaInferenceStateConfig:
     layer_type_list: List[str]
     """
     A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
-    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
@@ -50,7 +50,7 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -100,8 +100,8 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     FIRST_PREFIX_BLOCK = "first_prefix_block"
     """Route to the rank that has the first block hash cached. O(ranks) check."""
 
-    ROUND_ROBIN = "round_robin"
-    """Route requests to ranks in round-robin order, ignoring prefix affinity."""
+    LOAD_BALANCED = "load_balanced"
+    """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
 class KVCacheManagementMode(str, Enum):
@@ -115,6 +115,32 @@ class KVCacheManagementMode(str, Enum):
 
     RECOMPUTE = "recompute"
     """Deallocate large tensors and recompute them from scratch during allocation."""
+
+
+class CudaGraphSizingDistribution(str, Enum):
+    """How CUDA graph token-count sizes are spaced when generating the captured graphs.
+
+    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
+    `log2(max_tokens)` total graphs.
+
+    LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
+    sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
+    Higher graph density at the top end.
+    """
+
+    EXPONENTIAL = "exponential"
+    LINEAR = "linear"
+
+
+class AsyncScheduleMode(str, Enum):
+    """Async scheduling mode for dynamic inference."""
+
+    LEGACY = "legacy"
+    """Resolve requests before preparing the next forward pass."""
+
+    SERIAL = "serial"
+    """Prepare and forward speculatively before resolving the sampled requests."""
 
 
 @dataclass
@@ -188,18 +214,48 @@ class InferenceConfig:
     # =================================
     num_cuda_graphs: Optional[int] = None
     """
-    Maximum number of cuda graphs to capture, where the cuda graph batch sizes range from 1 to
-    `max_requests`. Due to rounding, the actual number of cuda graphs may not equal this argument.
+    Maximum number of cuda graphs to capture.
+    Graph token counts are spaced from 1 up to a per-graph-type budget:
+      - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
+      - Prefill/mixed graphs are bounded by `cuda_graph_max_tokens` by default,
+        or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
+    Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
 
     cuda_graph_mixed_prefill_count: Optional[int] = 16
-    """ 
+    """
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
+    """
+
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
+        CudaGraphSizingDistribution.EXPONENTIAL
+    )
+    """
+    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
+    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
+    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
+    a bigger step size at the top end).
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
     """
     Whether to use CUDA graphs for non-decode steps.
+    """
+
+    cuda_graph_all_prefills: bool = False
+    """
+    Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
+    When False (default), prefill/mixed graphs are bounded by `cuda_graph_max_tokens`.
+    When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
+    """
+
+    cuda_graph_max_tokens: int = 512
+    """
+    Token ceiling for the largest captured prefill/mixed CUDA graph.
+    This is a raw token count (not scaled by speculative decoding). The effective ceiling is
+    clamped to `[max_requests * (num_speculative_tokens + 1), max_tokens]` so it never falls
+    below the decode bound nor exceeds the token budget. Ignored when `cuda_graph_all_prefills`
+    is set, which extends capture to the full `max_tokens`.
     """
 
     static_kv_memory_pointers: bool = False
@@ -252,7 +308,7 @@ class InferenceConfig:
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
@@ -270,7 +326,13 @@ class InferenceConfig:
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
     on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
-    block boundaries are cached and reused across requests with matching prefixes."""
+    block boundaries are cached and reused across requests with matching prefixes.
+
+    This budget covers both buffers allocated by MambaSlotAllocator: the durable cache
+    (ssm_states/conv_states, max_slots slots reused across requests) and the per-step
+    extraction scratch (intermediate_ssm_out/intermediate_conv_out, sized to the
+    worst-case 3 * max_requests slots). The scratch is reserved from this budget first,
+    so a larger max_requests leaves fewer durable slots."""
 
     # =================================
     # Logging config
@@ -297,10 +359,19 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference."""
+
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    """Mode used to schedule dynamic batching inference work."""
+
+    logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
+    """Whether returned log-probs are modified by the sampling parameters or not."""
+
+    request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
-    consisting of the string label, the target dtype, and whether to store the data on GPU.
+    consisting of the string label and the target dtype.
     """
 
     use_synchronous_zmq_collectives: bool = False
@@ -309,14 +380,56 @@ class InferenceConfig:
     performance variability for MoEs.
     """
 
+    disable_ep_consensus: bool = False
+    """If True, the engine skips the EP-group consensus all-reduce in
+    `run_engine_with_coordinator` and decides whether to step based on local
+    state alone. The rank still calls `controller.dummy_forward()` whenever
+    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
+    sync — without this, a peer running a real forward would deadlock waiting
+    on this rank's all-to-all participation. Trades off the consensus
+    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
+    """
+
+    ep_consensus_interval: int = 20
+    """How many steps to skip between EP-consensus all-reduces when the engine
+    has pending work. Consensus is always run immediately when there is no
+    global work (to detect new arrivals quickly); this interval only applies
+    to the busy case, where skipping avoids per-step all-reduce overhead.
+    In the worst case, pausing is delayed by this many steps (~10–20 ms per
+    step at typical decode throughput).
+    """
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
+        self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+        if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
+                "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        # The speculative log-probs path does not yet apply processed-logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
+                "(num_speculative_tokens > 0)."
+            )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "sampling_backend='flashinfer' requires the flashinfer package; "
+                    "install it or set sampling_backend='torch'."
+                ) from e

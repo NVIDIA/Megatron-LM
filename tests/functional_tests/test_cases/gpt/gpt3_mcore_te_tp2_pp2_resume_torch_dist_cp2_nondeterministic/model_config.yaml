@@ -53,4 +53,5 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --async-save: true
   --use-persistent-ckpt-worker: true
+  --verify-integrity: true
 TEST_TYPE: ckpt-resume

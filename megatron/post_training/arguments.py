@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 
 def add_modelopt_args(parser):
@@ -10,8 +10,9 @@ def add_modelopt_args(parser):
         "--export-model-type",
         type=str,
         default="GPTModel",
-        choices=["GPTModel", "MambaModel"],
-        help="Model type to use in model_provider.",
+        choices=["GPTModel", "HybridModel", "MambaModel"],
+        help='Model type to use in model_provider. Use "HybridModel" for hybrid models '
+        '(formerly MambaModel). "MambaModel" is accepted for backward compatibility but deprecated.',
     )
     group.add_argument(
         "--export-legacy-megatron",
@@ -91,6 +92,26 @@ def add_modelopt_args(parser):
     )
     group.add_argument(
         "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
+    )
+
+    # MTP / base train-target selection for QAD and MTP QAT.
+    group.add_argument(
+        '--qad-train-target',
+        type=str,
+        default=None,
+        choices=['base', 'mtp', 'both'],
+        help='Which side of an MTP model to train during QAD / MTP QAT. '
+        '"mtp": train MTP heads only, freeze the base (post-QAD two-phase recipe); '
+        '"base": train the base only, freeze the MTP heads; '
+        '"both": co-train the base and MTP heads together. '
+        'Routers on the frozen side also have their expert_bias update skipped.',
+    )
+    group.add_argument(
+        '--freeze-base-for-mtp',
+        action='store_true',
+        default=False,
+        help='Deprecated alias for --qad-train-target mtp: freeze all base model '
+        'parameters and only train MTP heads.',
     )
 
     # Special model architecture option

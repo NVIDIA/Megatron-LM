@@ -17,7 +17,6 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.legacy.model import BertModel
 from megatron.training.training import setup_model_and_optimizer
 from pretrain_bert import model_provider, get_batch, loss_func, forward_step
 
@@ -374,8 +373,8 @@ class BertEmbedder:
         assert args.output_bert_embeddings
 
         self.models, optimizer, opt_param_scheduler = \
-            setup_model_and_optimizer(model_provider,
-                                      ModelType.encoder_or_decoder)
+            setup_model_and_optimizer(ModelType.encoder_or_decoder,
+                                      model_provider)
         self.batch_size = batch_size
         self.max_bert_seq_length = max_bert_seq_length
 

@@ -69,7 +69,7 @@ MODEL_OPTIONS="\
     \
     --fp8-recipe tensorwise \
     --hybrid-layer-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
-    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+    --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
     --mamba-state-dim 256 \
     --per-split-data-args-path ${BLEND_PATH} \
     --tiktoken-pattern v2 \

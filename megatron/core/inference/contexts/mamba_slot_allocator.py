@@ -47,59 +47,78 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
 
-        device = torch.cuda.current_device()
+        gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.total_count
 
-        # Block <-> slot mappings
-        self.block_to_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
-        self.slot_to_block = torch.full((max_slots,), -1, dtype=torch.int32, device=device)
+        # Block <-> slot mappings (CPU for bookkeeping).
+        self.block_to_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device='cpu')
+        self.slot_to_block = torch.full((max_slots,), -1, dtype=torch.int32, device='cpu')
 
-        # Free slot pool (stack)
-        self.free_slots = torch.arange(max_slots, dtype=torch.int32, device=device)
+        # Free slot pool (stack, CPU).
+        self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors
+        # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
+        # one slot per cached block boundary, reused across requests. Sized to
+        # `max_slots`; the budget accounting in DynamicInferenceContext refers to
+        # these as the "durable" buffers.
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
-            device=device,
+            device=gpu_device,
         )
         self.ssm_states = torch.zeros(
-            (num_mamba_layers, max_slots) + ssm_states_shape, dtype=ssm_states_dtype, device=device
+            (num_mamba_layers, max_slots) + ssm_states_shape,
+            dtype=ssm_states_dtype,
+            device=gpu_device,
         )
 
         # Hash-to-block mapping: only blocks with cached Mamba state
         self.hash_to_block_id: Dict[int, int] = {}
 
-        # Per-request intermediate state storage (GPU tensors, fixed-size per request)
-        # 0 = no offset, -1 = no block
+        # Per-request intermediate state storage.
+        # offsets_cpu and counts_cpu: CPU source of truth.  GPU copies are
+        # populated by transfer_bookkeeping_to_gpu() since Triton kernels read them.
+        # block_ids and eos_cache_block_id: CPU only (consumed by CPU code).
         k = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
-        self._intermediate_offsets_gpu = torch.zeros(
-            (context.max_requests, k), dtype=torch.int32, device=device
+        self._intermediate_offsets_cpu = torch.zeros(
+            (context.max_requests, k), dtype=torch.int32, device='cpu'
         )
-        self._intermediate_block_ids_gpu = torch.full(
-            (context.max_requests, k), -1, dtype=torch.int32, device=device
+        self._intermediate_counts_cpu = torch.zeros(
+            context.max_requests, dtype=torch.int32, device='cpu'
+        )
+        self._intermediate_offsets_gpu = torch.zeros(
+            (context.max_requests, k), dtype=torch.int32, device=gpu_device
         )
         self._intermediate_counts_gpu = torch.zeros(
-            context.max_requests, dtype=torch.int32, device=device
+            context.max_requests, dtype=torch.int32, device=gpu_device
         )
-        self._eos_cache_block_id_gpu = torch.full(
-            (context.max_requests,), -1, dtype=torch.int32, device=device
+        # CPU-only: consumed by _collect_commit_data() which needs .tolist() anyway.
+        self._intermediate_block_ids_cpu = torch.full(
+            (context.max_requests, k), -1, dtype=torch.int32, device='cpu'
+        )
+        self._eos_cache_block_id_cpu = torch.full(
+            (context.max_requests,), -1, dtype=torch.int32, device='cpu'
         )
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated output buffers for CUDA graph compatible extraction
+        # Pre-allocated "scratch" output buffers for CUDA graph compatible
+        # extraction (GPU): per-step staging that the kernel writes intermediate
+        # states into before commit copies them to the durable cache above. Sized
+        # to the per-step worst case (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST *
+        # max_requests); the budget accounting in DynamicInferenceContext refers to
+        # these as the "scratch" buffers.
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
-            device=device,
+            device=gpu_device,
         )
         self.intermediate_conv_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
             dtype=conv_states_dtype,
-            device=device,
+            device=gpu_device,
         )
 
     # =========================================================================
@@ -320,9 +339,11 @@ class MambaSlotAllocator:
             return
         device = self.conv_states.device
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
-        req_tensor = torch.tensor(request_indices, dtype=torch.int64, device=device)
-        # Batch lookup mamba state indices (1 GPU sync)
-        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[req_tensor].tolist()
+        # Lookup mamba indices from CPU bookkeeping, then move to GPU for state copy.
+        req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
+        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[
+            req_tensor_cpu
+        ].tolist()
         mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]
@@ -389,66 +410,79 @@ class MambaSlotAllocator:
             overall_required_blocks: Total blocks needed for this request.
         """
         ctx = self.context
+        bs = ctx.block_size_tokens
         prompt_len = len(req.prompt_tokens)
-        num_kv_matched = num_matched_blocks
-        kv_div_abs = num_kv_matched * ctx.block_size_tokens
-        last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
-        seq_len = prefill_chunk_length - skip_tokens  # effective prefill length
 
-        # Compute relative offsets (relative to prefill start after skip)
-        kv_div_rel = kv_div_abs - skip_tokens
-        last_aligned_rel = last_aligned_abs - skip_tokens
-        penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
-        penultimate_rel = penultimate_abs - skip_tokens
+        # Absolute token position (from the prompt start) where THIS chunk's
+        # computed tokens begin. The first chunk computes from `skip_tokens` (the
+        # prefix that was skipped); continuation chunks compute from
+        # `finished_chunk_token_count` (with skip_tokens == 0). Framing the
+        # boundary offsets against this chunk start -- rather than assuming the
+        # first chunk -- lets us extract Mamba state at block boundaries that fall
+        # in ANY chunk. In particular the last complete block of a multi-chunk
+        # prompt lives in a continuation chunk; it was previously unreachable, so
+        # non-block-aligned prompts never cached a usable resume boundary and
+        # later turns could not skip prefill.
+        chunk_start = req.finished_chunk_token_count + skip_tokens
+        seq_len = prefill_chunk_length - skip_tokens  # tokens computed this chunk
+        is_last_chunk = req.finished_chunk_token_count + prefill_chunk_length >= prompt_len
+
+        # Candidate absolute block boundaries at which to cache Mamba state.
+        kv_div_abs = num_matched_blocks * bs
+        last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
+        penultimate_abs = (overall_required_blocks - 1) * bs
 
         # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
         mamba_chunk_size = 128
 
-        # Build offset list: include if > 0, < seq_len, and % mamba_chunk_size == 0
+        # Keep only boundaries that land inside this chunk's computed tokens and on
+        # a mamba-chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
-        for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
+        for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
+            offset = abs_pos - chunk_start
             if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
                 offsets_set.add(offset)
 
         offsets = sorted(offsets_set)
         count = len(offsets)
 
-        # Vectorized block ID lookup: GPU gather avoids per-block .item() syncs
+        # CPU bookkeeping writes (no GPU kernel launches).
         if count > 0:
-            device = self._intermediate_offsets_gpu.device
-            abs_tokens = torch.tensor(
-                [skip_tokens + o for o in offsets], dtype=torch.int64, device=device
-            )
-            block_indices = abs_tokens // ctx.block_size_tokens - 1
-            bids = ctx.request_to_kv_block_ids[current_id][block_indices]
+            abs_tokens_cpu = torch.tensor([chunk_start + o for o in offsets], dtype=torch.int64)
+            block_indices_cpu = abs_tokens_cpu // bs - 1
+            bids_cpu = ctx.request_to_kv_block_ids[current_id][block_indices_cpu]
 
-            self._intermediate_offsets_gpu[current_id, :count] = torch.tensor(
-                offsets, dtype=torch.int32, device=device
+            self._intermediate_offsets_cpu[current_id, :count] = torch.tensor(
+                offsets, dtype=torch.int32
             )
-            self._intermediate_block_ids_gpu[current_id, :count] = bids.to(torch.int32)
+            self._intermediate_block_ids_cpu[current_id, :count] = bids_cpu.to(torch.int32)
             self._has_intermediates = True
-        self._intermediate_counts_gpu[current_id] = count
+        self._intermediate_counts_cpu[current_id] = count
 
-        # Block-aligned EOS: prompt_len is exactly block-aligned
-        if last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // ctx.block_size_tokens - 1
+        # Block-aligned EOS: when the prompt length is exactly block-aligned, the
+        # request's live final state IS the last block boundary's state and can be
+        # cached directly. Only valid on the final chunk (otherwise the live state
+        # is mid-prompt). Non-block-aligned prompts cache their last complete block
+        # via the intermediate-extraction path above instead.
+        if is_last_chunk and last_aligned_abs == prompt_len and prompt_len > 0:
+            last_block_idx = prompt_len // bs - 1
             if last_block_idx >= 0:
-                self._eos_cache_block_id_gpu[current_id] = ctx.request_to_kv_block_ids[current_id][
+                self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
                     last_block_idx
                 ]
                 self._has_intermediates = True
             else:
-                self._eos_cache_block_id_gpu[current_id] = -1
+                self._eos_cache_block_id_cpu[current_id] = -1
         else:
-            self._eos_cache_block_id_gpu[current_id] = -1
+            self._eos_cache_block_id_cpu[current_id] = -1
 
-    def get_intermediate_gpu_data(self):
-        """Get intermediate offsets and counts as GPU tensor slices for current prefill batch.
+    def get_intermediate_cpu_data(self):
+        """Get intermediate offsets and counts as CPU tensor slices for current prefill batch.
 
         Returns:
-            Tuple of (offsets_gpu, counts_gpu) where:
-                offsets_gpu: [prefill_count, 3] int32 GPU tensor
-                counts_gpu: [prefill_count] int32 GPU tensor
+            Tuple of (offsets_cpu, counts_cpu) where:
+                offsets_cpu: [prefill_count, 3] int32 CPU tensor
+                counts_cpu: [prefill_count] int32 CPU tensor
             Returns (None, None) if no prefill requests or no intermediates.
         """
         if not self._has_intermediates:
@@ -463,9 +497,24 @@ class MambaSlotAllocator:
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = active_start + decode_count
 
-        offsets = self._intermediate_offsets_gpu[prefill_start : prefill_start + prefill_count]
-        counts = self._intermediate_counts_gpu[prefill_start : prefill_start + prefill_count]
+        offsets = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
+        counts = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
         return offsets, counts
+
+    def transfer_intermediate_to_gpu(self, prefill_start: int, prefill_count: int):
+        """Copy intermediate offsets/counts slice from CPU to GPU for Mamba kernels.
+
+        Returns the GPU tensor views for the forward-pass kernels to consume.
+        """
+        if prefill_count == 0:
+            return None, None
+        offsets_cpu = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
+        counts_cpu = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
+        offsets_gpu = self._intermediate_offsets_gpu[prefill_start : prefill_start + prefill_count]
+        counts_gpu = self._intermediate_counts_gpu[prefill_start : prefill_start + prefill_count]
+        offsets_gpu.copy_(offsets_cpu, non_blocking=True)
+        counts_gpu.copy_(counts_cpu, non_blocking=True)
+        return offsets_gpu, counts_gpu
 
     # =========================================================================
     # Intermediate state commit
@@ -517,14 +566,14 @@ class MambaSlotAllocator:
         decode_count = ctx.batch_dimensions.decode_req_count
         prefill_start = active_start + decode_count
 
-        # Batch-transfer block IDs and EOS block IDs from GPU (2 GPU syncs)
+        # Block IDs and EOS block IDs live on CPU (no GPU sync needed).
         intermediate_count = metadata.intermediate_count
         per_request_counts = metadata.per_request_intermediate_counts
 
-        all_block_ids_cpu = self._intermediate_block_ids_gpu[
+        all_block_ids_cpu = self._intermediate_block_ids_cpu[
             prefill_start : prefill_start + prefill_count
         ].tolist()
-        eos_bids_cpu = self._eos_cache_block_id_gpu[
+        eos_bids_cpu = self._eos_cache_block_id_cpu[
             prefill_start : prefill_start + prefill_count
         ].tolist()
 
@@ -586,10 +635,10 @@ class MambaSlotAllocator:
             decode_count = ctx.batch_dimensions.decode_req_count
             prefill_start = active_start + decode_count
             end = prefill_start + prefill_count
-            self._intermediate_counts_gpu[prefill_start:end].fill_(0)
-            self._intermediate_offsets_gpu[prefill_start:end].fill_(0)
-            self._intermediate_block_ids_gpu[prefill_start:end].fill_(-1)
-            self._eos_cache_block_id_gpu[prefill_start:end].fill_(-1)
+            self._intermediate_counts_cpu[prefill_start:end].fill_(0)
+            self._intermediate_offsets_cpu[prefill_start:end].fill_(0)
+            self._intermediate_block_ids_cpu[prefill_start:end].fill_(-1)
+            self._eos_cache_block_id_cpu[prefill_start:end].fill_(-1)
         self._has_intermediates = False
 
     # =========================================================================
@@ -600,15 +649,13 @@ class MambaSlotAllocator:
         """Reset all state (mappings, free pool, cache, intermediate tracking)."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
-        self.free_slots = torch.arange(
-            self.max_slots, dtype=torch.int32, device=torch.cuda.current_device()
-        )
+        self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
         self.intermediate_ssm_out.zero_()
         self.intermediate_conv_out.zero_()
-        self._intermediate_offsets_gpu.fill_(0)
-        self._intermediate_block_ids_gpu.fill_(-1)
-        self._intermediate_counts_gpu.fill_(0)
-        self._eos_cache_block_id_gpu.fill_(-1)
+        self._intermediate_offsets_cpu.fill_(0)
+        self._intermediate_counts_cpu.fill_(0)
+        self._intermediate_block_ids_cpu.fill_(-1)
+        self._eos_cache_block_id_cpu.fill_(-1)
         self._has_intermediates = False
