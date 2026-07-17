@@ -156,6 +156,9 @@ class InferenceSetupConfig:
     """Extend prefill/mixed CUDA graph capture up to `max_tokens`. By default, all graphs are
     limited by the decode limit of `max_requests * (num_speculative_tokens + 1)`."""
 
+    inference_cuda_graph_max_tokens: int = 512
+    """Token ceiling for the largest captured prefill/mixed CUDA graph (default: 512)."""
+
     # ---------------- Chunked prefill / speculation ----------------
 
     enable_chunked_prefill: bool = False
@@ -176,11 +179,14 @@ class InferenceSetupConfig:
     space is needed."""
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
-        "longest_prefix", "first_prefix_block", "round_robin"
-    ] = "first_prefix_block"
-    """Coordinator routing policy for prefix caching. "first_prefix_block" (default) routes based on
-    the first block hash only. "longest_prefix" routes to the rank with the longest matching prefix.
-    "round_robin" ignores prefix affinity and cycles through ranks."""
+        "longest_prefix", "first_prefix_block", "load_balanced"
+    ] = "load_balanced"
+    """Coordinator routing policy for prefix caching. "load_balanced" (default) routes to the rank
+    with the fewest in-flight requests, ignoring prefix affinity. "first_prefix_block" routes based
+    on the first block hash only. "longest_prefix" routes to the rank with the longest matching
+    prefix. "first_prefix_block" and "longest_prefix" both combine prefix affinity with load
+    balancing and fall back to load-balanced routing when prefix caching is disabled or no prefix
+    match exists."""
 
     inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
     """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
@@ -337,6 +343,7 @@ class InferenceSetupConfig:
             ),
             use_cuda_graphs_for_non_decode_steps=not self.decode_only_cuda_graphs,
             cuda_graph_all_prefills=self.inference_cuda_graph_all_prefills,
+            cuda_graph_max_tokens=self.inference_cuda_graph_max_tokens,
             static_kv_memory_pointers=static_kv_memory_pointers,
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,
