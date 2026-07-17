@@ -214,8 +214,8 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     exhausted so a concurrent writer can publish more data; remote refreshes
     are rank-0 broadcast to avoid object-store list storms.
 
-    Yields ``(values_list, indices_list)``, one entry per load microbatch
-    step, with CP sequence slicing already applied.
+    Yields ``(iteration, values_list, indices_list)``, one entry per load
+    microbatch step, with CP sequence slicing already applied.
     """
 
     def __init__(
@@ -599,7 +599,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 values_list, indices_list = self._slice_cp_sequences(
                     values_list, indices_list
                 )
-                yield values_list, indices_list
+                yield i_load, values_list, indices_list
                 i_load += 1
 
         # One prefetcher shared across all needed d_save streams: each
@@ -905,17 +905,20 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
                 )
             all_values.append(vals)
             all_indices.append(inds)
-        return self._interleave_microbatches(all_values, all_indices)
+        merged_values, merged_indices = self._interleave_microbatches(all_values, all_indices)
+        return ref_iteration, merged_values, merged_indices
 
     def _iter_single_source_group(self, pool, url):
-        for _, values_list, indices_list in self._iter_decoded_entries(pool, url):
-            yield self._slice_microbatches(values_list, indices_list)
+        for iteration, values_list, indices_list in self._iter_decoded_entries(pool, url):
+            values_list, indices_list = self._slice_microbatches(values_list, indices_list)
+            yield iteration, values_list, indices_list
 
     def _iter_downscaled_group(self, pool, urls):
         decoded_iters = [self._iter_decoded_entries(pool, url) for url in urls]
         for decoded_group in zip(*decoded_iters):
-            values_list, indices_list = self._interleave_decoded_group(decoded_group)
-            yield self._slice_cp_sequences(values_list, indices_list)
+            iteration, values_list, indices_list = self._interleave_decoded_group(decoded_group)
+            values_list, indices_list = self._slice_cp_sequences(values_list, indices_list)
+            yield iteration, values_list, indices_list
 
     def _iter_group(self, pool, group):
         if len(self._source_dp_ranks) > 1:
@@ -1115,6 +1118,9 @@ class CachedLogitsKDLoss:
 
         # ---- iteration / microbatch tracking ----
         self._current_iteration: Optional[int] = None
+        # Iteration label of the shard most recently pulled from the DataLoader,
+        # used to verify teacher/student alignment.
+        self._loaded_iteration: Optional[int] = None
         self._microbatch_counter: int = 0
 
         # ---- current iteration's teacher data (pinned CPU tensors) ----
@@ -1150,15 +1156,16 @@ class CachedLogitsKDLoss:
         self._dataloader_iter = iter(loader)
 
     def _advance_iteration(self) -> None:
-        """Fetch the next iteration's data from the DataLoader."""
+        """Fetch the next shard from the DataLoader and record its iteration label."""
         assert self._dataloader_iter is not None
         try:
-            values_list, indices_list = next(self._dataloader_iter)
+            loaded_iteration, values_list, indices_list = next(self._dataloader_iter)
         except StopIteration as e:
             raise StopIteration(
                 f"No more teacher log-prob data available in "
                 f"{self.logprobs_dir}.  The DataLoader has been exhausted."
             ) from e
+        self._loaded_iteration = int(loaded_iteration)
         self._current_values = values_list
         self._current_indices = indices_list
         self._microbatch_counter = 0
@@ -1194,6 +1201,23 @@ class CachedLogitsKDLoss:
         # ---- detect iteration change → pull next prefetched item ----
         if self._current_iteration != iteration:
             self._advance_iteration()
+            # ---- verify teacher/student alignment and skip shards if needed ----
+            while self._loaded_iteration is not None and self._loaded_iteration < iteration:
+                logger.warning(
+                    "Teacher logit shard for iteration %s is behind training "
+                    "iteration %s (overlapping/duplicate shard in %s); skipping "
+                    "to resync alignment.",
+                    self._loaded_iteration, iteration, self.logprobs_dir,
+                )
+                self._advance_iteration()
+            if self._loaded_iteration != iteration:
+                raise RuntimeError(
+                    f"Teacher logit data misaligned: training iteration "
+                    f"{iteration} but the next available cached shard is "
+                    f"iteration {self._loaded_iteration} (gap / missing teacher "
+                    f"data in '{self.logprobs_dir}'). Refusing to train on "
+                    f"misaligned distillation targets."
+                )
             self._current_iteration = iteration
 
         # ---- resolve microbatch index ----
