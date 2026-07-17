@@ -4001,6 +4001,13 @@ def train(
         if should_exit:
             break
 
+    # Early-exit paths (exit-duration / exit-interval / signal handler) sys.exit()
+    # below before the normal-path logging, so record the train-loop finish time here.
+    if should_exit:
+        one_logger and one_logger.log_metrics(
+            {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
+
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
@@ -4048,6 +4055,9 @@ def train(
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
                     if getattr(buf, 'nccl_mem_pool', None) is not None:
                         nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+        one_logger and one_logger.log_metrics(
+            {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
