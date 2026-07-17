@@ -2875,14 +2875,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+        (matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 
         request_tokens_can_be_added = (
             self.active_token_count + effective_prefill_chunk_length <= self.max_tokens
         )
-        kv_cache_available = self.kv_block_allocator.is_memory_available(num_blocks_from_pool)
+        # Matched blocks are currently evictable (ref_count == 0) but add_request
+        # will pin them before allocating, so they cannot serve as free capacity
+        # for the new blocks this request needs. Exclude them from the evictable
+        # count so availability matches what allocation can actually satisfy.
+        kv_cache_available = self.kv_block_allocator.is_memory_available(
+            num_blocks_from_pool, reserved_evictable=len(matched_block_ids)
+        )
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def _find_kv_match_count(
@@ -2983,18 +2989,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
 
-        new_block_ids = None
-        if num_blocks_from_pool > 0:
-            new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
-            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
-                raise BlockOverflowError(req.request_id)
-
-        # Increment ref counts and update timestamps for matched (shared) blocks
+        # Pin matched (shared) blocks BEFORE allocation. allocate_memory_blocks()
+        # may trigger LRU eviction, and a matched block still at ref_count == 0
+        # would be an eviction candidate — descendant-first LRU could evict a
+        # matched leaf and immediately reuse its ID for a new block, leaving the
+        # block table with a duplicate ID and a dangling parent. Incrementing ref
+        # counts first removes matched blocks from the evictable set (see
+        # evict_lru_blocks / get_evictable_block_count), so eviction falls back to
+        # genuinely unused cached blocks.
+        matched_tensor = None
         if num_matched_blocks > 0:
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
             self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
+
+        new_block_ids = None
+        if num_blocks_from_pool > 0:
+            new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
+            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
+                # Roll back the pin so a failed add does not leak ref counts on
+                # the matched blocks (which would make them permanently unevictable).
+                if matched_tensor is not None:
+                    self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
+                raise BlockOverflowError(req.request_id)
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again

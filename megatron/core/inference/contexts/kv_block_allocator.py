@@ -137,13 +137,20 @@ class KVBlockAllocator:
         """Compute number of paused blocks available."""
         return self.paused_count - self.get_paused_used()
 
-    def is_memory_available(self, num_blocks: int) -> bool:
+    def is_memory_available(self, num_blocks: int, reserved_evictable: int = 0) -> bool:
         """Check if memory blocks are available.
 
         Includes both free pool blocks and evictable cached blocks (ref_count == 0).
 
         Args:
             num_blocks (int): Number of blocks to check.
+            reserved_evictable (int): Number of currently-evictable cached blocks
+                that must NOT be counted toward availability because the caller
+                will pin them before allocating (e.g. prefix-matched blocks that
+                get their ref counts bumped in add_request). These blocks are
+                ref_count == 0 now, so they are included in the evictable count,
+                but they will be protected from eviction, so they cannot supply
+                the requested ``num_blocks``.
 
         Return:
             (bool) Is memory available?
@@ -155,8 +162,8 @@ class KVBlockAllocator:
             return False
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
             return False  # RZ: no cached blocks to evict
-        # Also count evictable cached blocks
-        evictable_count = self.get_evictable_block_count()
+        # Also count evictable cached blocks, excluding those the caller will pin.
+        evictable_count = int(self.get_evictable_block_count()) - reserved_evictable
         return (self.total_avail + evictable_count) >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:

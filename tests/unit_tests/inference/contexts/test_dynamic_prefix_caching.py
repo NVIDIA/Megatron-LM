@@ -430,6 +430,73 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
             assert alloc3.block_ref_counts[bid.item()].item() == 1
 
     @pytest.mark.internal
+    def test_add_request_full_cache_partial_hit_pins_matched_blocks(self):
+        """Regression: on a partial prefix hit against a FULL cache, the matched
+        blocks must be pinned before allocation so LRU eviction cannot reclaim
+        one of them for the new (non-matched) block.
+
+        Scenario (mirrors the descendant-first LRU edge case): a cached chain
+        H0/S0 -> H1/S1 (older) plus an unrelated cached root HX/SX (newer) fill
+        the pool. An incoming prompt H0 -> H1 -> H2 matches [S0, S1] and needs one
+        new block. If S0/S1 are not pinned first, descendant-first LRU evicts the
+        older leaf S1 and immediately reuses it, yielding block_table [S0, S1, S1]
+        and a dangling H2 -> missing H1 chain. Correct behaviour evicts SX and
+        yields [S0, S1, SX] with a contiguous H0 -> H1 -> H2 chain.
+        """
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+
+        # Cached chain H0/S0 -> H1/S1, seeded with an OLD timestamp.
+        ctx.prefix_cache_lru_clock = 1
+        req_chain = self._req(ctx, self._prompt(bs * 2))
+        ctx.add_request(req_chain)
+        s0, s1 = self._block_ids(ctx, 0, 2)
+        h0, h1 = req_chain.precomputed_block_hashes[0], req_chain.precomputed_block_hashes[1]
+
+        # Unrelated cached root HX/SX, seeded with a NEWER timestamp, so a naive
+        # oldest-first / descendant-first eviction would prefer the chain leaf.
+        ctx.prefix_cache_lru_clock = 10
+        ctx.add_request(self._req(ctx, self._prompt(bs, offset=9000), request_id=2))
+        (sx,) = self._block_ids(ctx, 1, 1)
+
+        # All three slots are distinct and now cached (ref_count drops to 0).
+        assert len({s0, s1, sx}) == 3
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0, 1]))
+        ctx.total_request_count = 0
+        assert alloc.block_ref_counts[s0].item() == 0
+        assert alloc.block_ref_counts[s1].item() == 0
+        assert alloc.block_ref_counts[sx].item() == 0
+
+        # Force a full pool: the new block for H2 can only come from eviction.
+        alloc.total_avail = 0
+
+        # Incoming prompt H0 -> H1 -> H2: first two blocks match the cached chain,
+        # the third (H2) is new and must trigger a single eviction.
+        ctx.prefix_cache_lru_clock = 20
+        req_new = self._req(ctx, self._prompt(bs * 3), request_id=3)
+        ctx.add_request(req_new)
+        h2 = req_new.precomputed_block_hashes[2]
+
+        block_table = self._block_ids(ctx, 0, 3)
+
+        # Matched blocks are preserved and SX (the unrelated root) is evicted/reused.
+        assert block_table == [s0, s1, sx]
+        # All three block IDs are distinct — no duplicate from a reclaimed match.
+        assert len(set(block_table)) == 3
+        # Matched blocks stay pinned for the new request.
+        assert alloc.block_ref_counts[s0].item() == 1
+        assert alloc.block_ref_counts[s1].item() == 1
+        assert alloc.block_ref_counts[sx].item() == 1
+        # Contiguous H0 -> H1 -> H2 hash chain over [S0, S1, SX].
+        assert alloc.block_hashes[s0].item() == h0
+        assert alloc.block_hashes[s1].item() == h1
+        assert alloc.block_hashes[sx].item() == h2
+        assert alloc.block_parent_hashes[s1].item() == h0
+        assert alloc.block_parent_hashes[sx].item() == h1
+        assert alloc.kv_hash_to_block_id[h1] == s1
+
+    @pytest.mark.internal
     def test_ref_count_refzero(self):
         bs = 32
 

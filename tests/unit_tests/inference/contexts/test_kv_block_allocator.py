@@ -339,6 +339,31 @@ def test_evict_lru_insufficient_cached_blocks_returns_false():
     assert a.kv_hash_to_block_id == {10: 0, 20: 1}
 
 
+def test_is_memory_available_excludes_reserved_evictable():
+    """reserved_evictable removes soon-to-be-pinned cached blocks from the
+    evictable capacity, so availability matches what allocation can satisfy
+    once those blocks (e.g. prefix matches) are pinned."""
+    a = _lru_allocator(total_count=6, paused_count=1)
+    # Drain the free pool: every block is allocated (ref_count == 1), none free.
+    a.allocate_memory_blocks(a.total_avail)
+    assert a.total_avail == 0
+    # Mark two blocks as cached/evictable, mirroring an LRU release: ref_count
+    # drops to 0 and the hash is retained, but the block stays out of the free
+    # pool (total_avail unchanged).
+    a.register_kv_block_hashes(block_ids=[0, 1], block_hashes=[10, 20], parent_hashes=[0, 10])
+    a.block_ref_counts[torch.tensor([0, 1])] = 0
+    assert a.total_avail == 0
+    assert int(a.get_evictable_block_count()) == 2
+
+    # Both evictable blocks count toward availability by default.
+    assert a.is_memory_available(2) is True
+    # Reserving one (it will be pinned) leaves only one usable for the request.
+    assert a.is_memory_available(2, reserved_evictable=1) is False
+    assert a.is_memory_available(1, reserved_evictable=1) is True
+    # Reserving all evictable blocks leaves nothing to satisfy a new block.
+    assert a.is_memory_available(1, reserved_evictable=2) is False
+
+
 def test_evict_lru_preserves_invariant_under_random_chains():
     """Property test: across many randomized multi-chain layouts and eviction
     counts, the retained cache always satisfies the parent-chain invariant."""
