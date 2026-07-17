@@ -25,7 +25,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl_mlite.compat import load_verl_engine_api
+from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -35,6 +35,8 @@ except Exception:  # pragma: no cover - older VERL without Metric
     _VerlMetric = None
 
 from .config import MegatronLiteEngineConfig
+
+_patch_bucketed_weight_sender()
 
 BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
     load_verl_engine_api()
@@ -379,7 +381,11 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
-        if self.engine_config.model_name == "qwen3_5":
+        if self.engine_config.resync_format is not None:
+            export_kwargs["target"] = self.engine_config.resync_format
+            if self.engine_config.resync_config:
+                export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+        elif self.engine_config.model_name == "qwen3_5":
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
@@ -686,12 +692,23 @@ class MegatronLiteEngine(BaseEngine):
         if loss_function is not None or forward_only:
             runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
+        replay_specs = [
+            runtime_batch.routed_experts is not None
+            for runtime_batch, _loss_context in runtime_batches
+        ]
+        replay_enabled = self.engine_config.router_replay_mode == "R3"
+        if replay_enabled and not all(replay_specs):
+            raise ValueError(
+                "router_replay_mode='R3' requires routed_experts on every "
+                "actor micro-batch in a step."
+            )
         result = self.runtime.forward_backward(
             self.handle,
             iter(runtime_batches),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
+            router_replay={"action": "replay"} if replay_enabled else None,
         )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
@@ -725,11 +742,18 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
+        routed_experts = micro_batch.get("routed_experts", None)
+        if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
+            raise ValueError(
+                "R3 routed_experts must use VERL's jagged no-padding layout; "
+                f"got shape {tuple(routed_experts.shape)}."
+            )
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
             loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
+            routed_experts=routed_experts,
         )
 
     def _make_runtime_loss_context(
@@ -756,8 +780,35 @@ class MegatronLiteEngine(BaseEngine):
             return None
 
         loss_mask = micro_batch["loss_mask"]
+        input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
-            return loss_mask
+            # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
+            # nested tensor (shape ``[bsz, response_len]``), while ``input_ids`` is
+            # the full ``[prompt; response]`` packed sequence. Returning it as-is
+            # left the packed loss_mask (sum of response lengths) shorter than the
+            # ``input_ids`` seq_lens, so ``_nested_from_packed_tensor`` narrowed a
+            # full-length slice out of a response-only buffer and crashed the
+            # actor-update step. Expand it here to the full sequence the same way
+            # the native Megatron path does (``_build_mtp_loss_mask_nested``):
+            # left-pad each row with prompt zeros and keep the whole valid response
+            # span (response_mask may carry internal zeros for tool outputs).
+            resp_offsets = loss_mask.offsets().tolist()
+            resp_values = loss_mask.values()
+            rows = []
+            for i, total in enumerate(input_lengths):
+                start, end = resp_offsets[i], resp_offsets[i + 1]
+                response_piece = resp_values[start:end]
+                prompt_len = total - (end - start)
+                if prompt_len < 0:
+                    raise ValueError(
+                        f"response loss mask has {end - start} tokens but packed input "
+                        f"sequence has {total} tokens"
+                    )
+                prompt_pad = torch.zeros(
+                    prompt_len, dtype=response_piece.dtype, device=response_piece.device
+                )
+                rows.append(torch.cat([prompt_pad, response_piece], dim=0))
+            return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
         rows = []
         for seq_ids, row_mask in zip(input_ids.unbind(0), loss_mask, strict=True):

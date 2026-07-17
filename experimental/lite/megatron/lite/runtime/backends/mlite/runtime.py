@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 from collections.abc import Callable, Iterator
 from dataclasses import fields as dc_fields
@@ -362,6 +363,14 @@ class MegatronLiteRuntime(RuntimeBase):
             for chunk in model_chunks:
                 yield from chunk.named_parameters()
 
+    def release_export_scratch(self, handle: ModelHandle) -> None:
+        """Release retained full-parameter scratch before colocated rollout wake."""
+        model_chunks = handle._extras.get("model_chunks", [handle._model])
+        for chunk in model_chunks:
+            release = getattr(chunk, "release_export_scratch", None)
+            if callable(release):
+                release()
+
     # ── Memory ──
 
     def to(
@@ -381,19 +390,36 @@ class MegatronLiteRuntime(RuntimeBase):
             offload_optimizer,
         )
 
+        # A model+gradient transfer is the training context boundary.  On its
+        # CPU side the colocated rollout is about to map its sleeping weights;
+        # on its CUDA side training is taking the device back.  Keep the whole
+        # release/restore contract here rather than teaching VERL about backend
+        # scratch buffers or optimizer residency.
+        training_transfer = model and grad
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
-            if optimizer and handle._optimizer is not None:
+            if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
                     offload_state()
                 else:
                     offload_optimizer(handle._optimizer)
+            if training_transfer:
+                self.release_export_scratch(handle)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    # R3/full-recompute may leave CUDA tensors reachable only
+                    # through dead Python cycles until the next periodic GC.
+                    # vLLM remaps its sleeping weights immediately after this
+                    # boundary, so collect those cycles before asking the CUDA
+                    # allocator to return their now-unused blocks.
+                    gc.collect()
+                    torch.cuda.empty_cache()
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
-            if optimizer and handle._optimizer is not None:
+            if (optimizer or training_transfer) and handle._optimizer is not None:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):
                     load_state()
@@ -418,8 +444,10 @@ class MegatronLiteRuntime(RuntimeBase):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        router_replay: Any = None,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
+        from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
 
         forward_step = handle._extras["forward_step"]
         if num_microbatches < 1:
@@ -432,6 +460,11 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             data_iter = iter([data])
 
+        replay_driver = RouterReplayDriver.maybe_create(handle, router_replay)
+        if replay_driver is not None:
+            replay_driver.begin()
+            forward_step = replay_driver.wrap(forward_step)
+
         ps = handle._parallel_state
         if ps.pp_size > 1:
             from types import SimpleNamespace
@@ -442,23 +475,31 @@ class MegatronLiteRuntime(RuntimeBase):
             first_item = next(data_iter)
             first_batch, _loss_context = split_loss_context(first_item)
             data_iter = chain([first_item], data_iter)
-            tensor_shape = _infer_pipeline_tensor_shape(
-                first_batch, handle._extras.get("model_cfg"), ps
-            )
+            model_cfg = handle._extras.get("model_cfg")
+            # Nominal inter-stage shape for the fixed-shape VPP path. The 1F1B and
+            # forward-only schedules ignore this and use Megatron dynamic shape
+            # exchange (the sender transmits its real per-micro-batch size), so THD
+            # variable-length packing no longer needs a locally-derived shape.
+            tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
+
             model_chunks = handle._extras.get("model_chunks", [handle._model])
             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
             pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
-            outputs = forward_backward_pipelining(
-                pipeline_forward_step,
-                pipeline_chunks,
-                data_iter,
-                SimpleNamespace(num_microbatches=num_microbatches),
-                ps,
-                tensor_shape=tensor_shape,
-                pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=pipeline_loss_fn,
-                forward_only=forward_only,
-            )
+            try:
+                outputs = forward_backward_pipelining(
+                    pipeline_forward_step,
+                    pipeline_chunks,
+                    data_iter,
+                    SimpleNamespace(num_microbatches=num_microbatches),
+                    ps,
+                    tensor_shape=tensor_shape,
+                    pre_forward_hook=handle._extras.get("pre_forward_hook"),
+                    loss_fn=pipeline_loss_fn,
+                    forward_only=forward_only,
+                )
+            finally:
+                if replay_driver is not None:
+                    replay_driver.end()
             out = _last_loss_output(outputs)
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
@@ -474,17 +515,21 @@ class MegatronLiteRuntime(RuntimeBase):
                 dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
             out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
-            out = run_microbatch_loop(
-                handle._model,
-                data_iter,
-                num_microbatches,
-                forward_step,
-                optimizer=handle._optimizer if not forward_only else None,
-                dist_opt=not forward_only,
-                pre_forward_hook=handle._extras.get("pre_forward_hook"),
-                loss_fn=loss_fn,
-                forward_only=forward_only,
-            )
+            try:
+                out = run_microbatch_loop(
+                    handle._model,
+                    data_iter,
+                    num_microbatches,
+                    forward_step,
+                    optimizer=handle._optimizer if not forward_only else None,
+                    dist_opt=not forward_only,
+                    pre_forward_hook=handle._extras.get("pre_forward_hook"),
+                    loss_fn=loss_fn,
+                    forward_only=forward_only,
+                )
+            finally:
+                if replay_driver is not None:
+                    replay_driver.end()
 
         if not forward_only:
             finalize_grads = handle._extras.get("finalize_grads")

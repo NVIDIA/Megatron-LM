@@ -465,7 +465,9 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_n
     elif hasattr(protocol, "export_hf_weights"):
         from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
 
-        weights = dict(protocol.export_hf_weights(chunks, cfg, ps, rank0_only=True))
+        weights = dict(
+            protocol.export_hf_weights(chunks, cfg, ps, rank0_only=True, cpu=True)
+        )
         if dist.get_rank() == 0 and weights:
             save_safetensors(weights, out_dir)
     else:

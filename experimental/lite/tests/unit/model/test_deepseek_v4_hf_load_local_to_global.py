@@ -76,3 +76,49 @@ def test_ds4_load_hf_resolves_local_pp_layer_to_global(tmp_path):
     torch.testing.assert_close(
         model.layers["1"].input_layernorm.weight.detach(), torch.full((dim,), 5.0)
     )
+
+
+def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
+    from megatron.lite.model.deepseek_v4.lite import checkpoint as ckpt
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    class Gate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("expert_bias", torch.tensor([0.25, -0.5]))
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.gate = Gate()
+
+    class StageOne(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_indices = [1]
+            self.layers = nn.ModuleDict({"0": Layer()})
+
+    remote = torch.tensor([3, 1, 4], dtype=torch.int64)
+
+    def fake_broadcast_object_list(header, *, src, **_kwargs):
+        if src == 0:
+            header[0] = [("layers.0.ffn.gate.tid2eid", tuple(remote.shape), remote.dtype)]
+
+    def fake_broadcast(tensor, *, src, **_kwargs):
+        if src == 0:
+            tensor.copy_(remote)
+
+    monkeypatch.setattr(hf_weights, "export_hf_weights", lambda *_args, **_kwargs: iter(()))
+    monkeypatch.setattr(ckpt.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(ckpt.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ckpt.dist, "broadcast_object_list", fake_broadcast_object_list)
+    monkeypatch.setattr(ckpt.dist, "broadcast", fake_broadcast)
+
+    ps = SimpleNamespace(pp_size=2, pp_rank=1, pp_global_ranks=[0, 1], pp_group=object())
+    cfg = SimpleNamespace(num_hash_layers=1, vocab_size=8)
+
+    exported = dict(ckpt._export_unquantized_weights(StageOne(), cfg, ps))
+
+    assert torch.equal(exported["layers.0.ffn.gate.tid2eid"], remote)
+    assert torch.equal(exported["layers.1.ffn.gate.bias"], torch.tensor([0.25, -0.5]))

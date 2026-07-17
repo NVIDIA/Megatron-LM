@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 
 import torch
 import torch.distributed as dist
@@ -42,6 +43,13 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible, log_rank0
+from megatron.lite.runtime.contracts.weights import ResyncFormat
+
+
+_QUANTIZED_RESYNC_TARGETS = {
+    ResyncFormat.BLOCK_FP8.value,
+    ResyncFormat.MXFP4.value,
+}
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -144,6 +152,20 @@ def _global_expert_idx_from_local(local_idx: int, config: DeepseekV4Config, ps: 
     return ps.ep_rank * num_local + local_idx
 
 
+def _router_buffer_matches_layer_kind(name: str, config: DeepseekV4Config) -> bool:
+    """Keep only the router buffer serialized by the corresponding HF layer."""
+    match = _BLOCK_KEY_RE.match(name)
+    if match is None:
+        return False
+    block, index_text, _ = match.groups()
+    is_hash_layer = block == "layers" and int(index_text) < config.num_hash_layers
+    if name.endswith(".mlp.gate.tid2eid"):
+        return is_hash_layer
+    if name.endswith(".mlp.gate.expert_bias"):
+        return not is_hash_layer
+    return False
+
+
 def _hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[str]:
     """Map a bare DS4 native key (global layer idx, global expert id) to HF name(s).
 
@@ -221,7 +243,10 @@ def _scale_to_float(scale: torch.Tensor) -> torch.Tensor:
     if scale.dtype.is_floating_point:
         return scale.float()
     if scale.dtype == torch.uint8:
-        return torch.pow(torch.tensor(2.0, dtype=torch.float32), scale.float() - 127.0)
+        return torch.pow(
+            torch.tensor(2.0, dtype=torch.float32, device=scale.device),
+            scale.float() - 127.0,
+        )
     return scale.float()
 
 
@@ -278,6 +303,8 @@ def _copy_param(
     scale: torch.Tensor | None = None,
 ) -> None:
     if scale is not None:
+        tensor = tensor.to(device=param.device)
+        scale = scale.to(device=param.device)
         tensor = _dequantize_scaled_tensor(tensor, scale, param.shape)
     elif param.dtype.is_floating_point and not tensor.dtype.is_floating_point:
         raise RuntimeError(
@@ -287,15 +314,63 @@ def _copy_param(
     param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
 
-def _read_hf_tensor(
-    reader: SafeTensorReader, hf_name: str, target_shape: torch.Size | tuple[int, ...]
-) -> torch.Tensor:
-    scale_name = _scale_name_for_hf_name(hf_name)
-    tensor = reader.get_tensor(hf_name)
-    scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
-    if scale is not None:
-        return _dequantize_scaled_tensor(tensor, scale, torch.Size(target_shape))
-    return tensor
+def _copy_hf_tensors(
+    reader: SafeTensorReader,
+    target: nn.Parameter | torch.Tensor,
+    hf_names: list[str],
+) -> None:
+    if len(hf_names) == 1:
+        destinations = [target]
+    elif len(hf_names) == 2:
+        first = target.shape[0] // 2
+        destinations = [target[:first], target[first:]]
+    else:
+        raise ValueError(f"Expected one or two HF tensors, got {hf_names}")
+
+    for destination, hf_name in zip(destinations, hf_names, strict=True):
+        scale_name = _scale_name_for_hf_name(hf_name)
+        scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
+        _copy_param(destination, reader.get_tensor(hf_name), scale=scale)
+
+
+def _replica_group_for_state_key(name: str, ps: ParallelState):
+    if EXPERT_CLASSIFIER(name):
+        return getattr(ps, "ep_dp_group", None)
+    return getattr(ps, "dp_cp_group", None)
+
+
+def _replica_source_group_rank(name: str, ps: ParallelState) -> int:
+    if not EXPERT_CLASSIFIER(name):
+        return 0
+    expert_dp_size = int(getattr(ps, "expert_dp_size", 1))
+    if expert_dp_size < 1:
+        raise ValueError(f"Invalid expert_dp_size={expert_dp_size}")
+    return int(getattr(ps, "ep_rank", 0)) % expert_dp_size
+
+
+def _copy_replicated_hf_tensors(
+    reader: SafeTensorReader,
+    target: nn.Parameter | torch.Tensor,
+    hf_names: list[str],
+    *,
+    group,
+    source_group_rank: int = 0,
+) -> bool:
+    """Read once per replica group, then broadcast the full local parameter."""
+    if group is None or not dist.is_initialized() or dist.get_world_size(group) <= 1:
+        _copy_hf_tensors(reader, target, hf_names)
+        return True
+
+    group_ranks = dist.get_process_group_ranks(group)
+    if not 0 <= source_group_rank < len(group_ranks):
+        raise ValueError(
+            f"source_group_rank={source_group_rank} is outside group size {len(group_ranks)}"
+        )
+    is_reader = dist.get_rank(group) == source_group_rank
+    if is_reader:
+        _copy_hf_tensors(reader, target, hf_names)
+    dist.broadcast(target.data, src=group_ranks[source_group_rank], group=group)
+    return is_reader
 
 
 def load_hf_weights(
@@ -316,7 +391,6 @@ def load_hf_weights(
     if (ps.tp_size, ps.etp_size) != (1, 1):
         raise NotImplementedError("DeepSeek V4 direct HF load currently supports only TP=ETP=1.")
 
-    reader = SafeTensorReader(path)
     base_model = unwrap_model(model)
     state = base_model.state_dict()
     # local pipeline position -> global layer index (identity at PP=1)
@@ -326,33 +400,38 @@ def load_hf_weights(
         else {}
     )
     loaded = 0
+    local_reads = 0
     missing: list[str] = []
-    for name, target in state.items():
-        if _is_native_metadata_key(name):
-            continue
-        global_name = to_global_layer_name(name, layer_map)
-        hf_names = _hf_names_for_state_key(_to_global_expert_name(global_name, config, ps), config)
-        if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
-            missing.append(name)
-            continue
-        if len(hf_names) == 2:
-            first = target.shape[0] // 2
-            tensor = torch.cat(
-                [
-                    _read_hf_tensor(reader, hf_names[0], (first, *target.shape[1:])),
-                    _read_hf_tensor(
-                        reader, hf_names[1], (target.shape[0] - first, *target.shape[1:])
-                    ),
-                ],
-                dim=0,
+    load_started = time.monotonic()
+    with SafeTensorReader(path) as reader:
+        for name, target in state.items():
+            if _is_native_metadata_key(name):
+                continue
+            global_name = to_global_layer_name(name, layer_map)
+            hf_names = _hf_names_for_state_key(
+                _to_global_expert_name(global_name, config, ps), config
             )
-            target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
-        else:
-            scale_name = _scale_name_for_hf_name(hf_names[0])
-            scale = reader.get_tensor(scale_name) if _has(reader, scale_name) else None
-            _copy_param(target, reader.get_tensor(hf_names[0]), scale=scale)
-        loaded += 1
+            if not hf_names or not all(_has(reader, hf_name) for hf_name in hf_names):
+                missing.append(name)
+                continue
+            local_reads += int(
+                _copy_replicated_hf_tensors(
+                    reader,
+                    target,
+                    hf_names,
+                    group=_replica_group_for_state_key(name, ps),
+                    source_group_rank=_replica_source_group_rank(name, ps),
+                )
+            )
+            loaded += 1
 
+    if local_reads:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(
+            "[megatron.lite] DeepSeek V4 checkpoint reader complete "
+            f"rank={rank} local_tensors={local_reads} elapsed_seconds={time.monotonic() - load_started:.3f}",
+            flush=True,
+        )
     log_rank0(f"DeepSeek V4 native loaded {loaded} tensors from {path}")
     for name in missing:
         log_rank0(f"WARNING: DeepSeek V4 checkpoint tensor missing: {name}")
@@ -460,8 +539,8 @@ class DeepseekV4WeightSpec:
         return f"{prefix}.weight{local_idx}"
 
 
-def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
-    """Export DS4 weights as HF (name, tensor) pairs via the SHARED exporter.
+def _export_unquantized_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
+    """Export gathered DS4 BF16 weights and persistent router buffers.
 
     Identical structure to kimi/glm5: delegate to the shared ``_export`` (which
     does the TP/ETP/EP/PP gather, including the PP ``all_gather_object`` reached
@@ -473,13 +552,13 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
 
     spec = DeepseekV4WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
+    cpu = bool(kwargs.get("cpu", False))
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank0_only and rank != 0:
-        return
     chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
+    local_buffers: list[tuple[str, torch.Tensor]] = []
     for chunk in chunks:
         base_chunk = unwrap_model(chunk)
         layer_map = (
@@ -490,18 +569,99 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
         for name, buffer in base_chunk.named_buffers():
             # Persistent router buffers carried into HF: hash-layer ``tid2eid``
             # and the (made-persistent for non-hash layers) ``expert_bias``.
-            if not (name.endswith(".mlp.gate.tid2eid") or name.endswith(".mlp.gate.expert_bias")):
-                continue
             global_name = to_global_layer_name(name, layer_map)
-            for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
-                yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
+            if not _router_buffer_matches_layer_kind(global_name, config):
+                continue
+            for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach()):
+                local_buffers.append((hf_name, hf_tensor.contiguous()))
+
+    emit = not (rank0_only and rank != 0)
+    if ps.pp_size <= 1:
+        if emit:
+            for hf_name, tensor in local_buffers:
+                tensor = tensor.cpu() if cpu else tensor
+                yield hf_name, _cast_export_tensor(tensor, export_dtype)
+        return
+
+    # Router state is stored as buffers, so the parameter-only shared exporter
+    # above cannot carry it across PP stages.  Every actor rank feeds one rollout
+    # worker; yielding only this rank's local buffers leaves each online vLLM
+    # replica with router state for just one pipeline stage.  Stream every PP
+    # stage's buffers over the same PP group used for parameters so each rank
+    # emits a complete model without materializing the full checkpoint.
+    bcast_device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    for src_pp in range(ps.pp_size):
+        src_global = ps.pp_global_ranks[src_pp]
+        is_source = src_pp == ps.pp_rank
+        if is_source:
+            stage_buffers = [
+                (name, tensor.to(bcast_device).contiguous()) for name, tensor in local_buffers
+            ]
+            header = [
+                [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in stage_buffers]
+            ]
+        else:
+            stage_buffers = []
+            header = [None]
+        dist.broadcast_object_list(
+            header, src=src_global, group=ps.pp_group, device=bcast_device
+        )
+        for idx, (hf_name, shape, dtype) in enumerate(header[0]):
+            tensor = (
+                stage_buffers[idx][1]
+                if is_source
+                else torch.empty(shape, dtype=dtype, device=bcast_device)
+            )
+            dist.broadcast(tensor, src=src_global, group=ps.pp_group)
+            if emit:
+                output = tensor.cpu() if cpu else tensor
+                yield hf_name, _cast_export_tensor(output, export_dtype)
+
+
+def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
+    """Export DS4 weights as HF or serialized vLLM-checkpoint pairs.
+
+    The default remains the ordinary HF/BF16 stream. ``block_fp8`` and
+    ``mxfp4`` are model-owned adapters over that gathered stream; the runtime
+    and veRL engine do not classify individual DS4 tensors. ``mxfp4`` describes
+    the routed-expert representation; dense quantized weights remain block FP8.
+    """
+    target = kwargs.pop("target", "hf")
+    resync_config = kwargs.pop("resync_config", None)
+    if target not in {"hf", ResyncFormat.BF16.value, *_QUANTIZED_RESYNC_TARGETS}:
+        raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
+    weights = _export_unquantized_weights(model, config, ps, **kwargs)
+    if target in _QUANTIZED_RESYNC_TARGETS:
+        from megatron.lite.model.deepseek_v4.lite.resync import export_resync_weights
+
+        if target == ResyncFormat.MXFP4.value:
+            resync_config = dict(resync_config or {})
+            configured_dtype = resync_config.get("expert_dtype")
+            if configured_dtype not in {None, "fp4"}:
+                raise ValueError(
+                    "DeepSeek-V4 target='mxfp4' requires expert_dtype='fp4', "
+                    f"got {configured_dtype!r}"
+                )
+            resync_config["expert_dtype"] = "fp4"
+        yield from export_resync_weights(weights, config, resync_config=resync_config)
+    else:
+        if resync_config:
+            raise ValueError(
+                "DeepSeek-V4 resync_config requires a quantized export target"
+            )
+        yield from weights
 
 
 def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
 
     rank = dist.get_rank() if dist.is_initialized() else 0
-    out = dict(export_hf_weights(model, config, ps, rank0_only=True, **kwargs))
+    kwargs.pop("cpu", None)
+    out = dict(export_hf_weights(model, config, ps, rank0_only=True, cpu=True, **kwargs))
     if rank == 0 and out:
         save_safetensors(out, path)
     if dist.is_initialized():
