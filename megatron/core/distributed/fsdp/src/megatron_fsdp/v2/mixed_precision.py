@@ -550,11 +550,22 @@ class MixedPrecisionPolicy:
         transpose_weight_buffer=None,
     ) -> None:
         """Install optimized main weights into model compute weights."""
-        if main_weight_buffer is None:
-            return
+        assert model_weight_buffer is not None, "FSDP parameters require a model-weight buffer"
+        optimizer_weight_buffer = main_weight_buffer or model_weight_buffer
+        outer_optim = optimizer_weight_buffer.outer_dp_sharding_strategy == "optim"
 
-        assert model_weight_buffer is not None, "main weights require a model-weight buffer"
-        outer_optim = main_weight_buffer.outer_dp_sharding_strategy == "optim"
+        # With no distinct main-weight buffer, the optimizer updated shard views
+        # of model_weight_buffer directly. There is no data to copy, but replicated
+        # storage still has to be marked dirty so the next unshard refreshes it.
+        if main_weight_buffer is None:
+            for buffer in (model_weight_buffer, transpose_weight_buffer):
+                if buffer is None:
+                    continue
+                if buffer.sharding_strategy != "no_shard" and not buffer.inner_sharded:
+                    buffer._inner_dirty = True
+                if outer_optim:
+                    buffer._outer_dirty = True
+            return
 
         inner_dp_group = mesh.get_group(mesh_dim=1)
 

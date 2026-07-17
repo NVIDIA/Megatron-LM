@@ -339,6 +339,10 @@ def train(
             if args.use_megatron_fsdp and args.release_memory_pool:
                 model.release_memory_pool()
             optimizer.step()
+            if args.use_megatron_fsdp:
+                # Refresh replicated compute-weight storage after an optimizer
+                # updates sharded parameter views (required by optim/HSDP).
+                model._copy_main_weights_to_model_weights()
             optimizer.zero_grad()
             model.zero_grad()
 

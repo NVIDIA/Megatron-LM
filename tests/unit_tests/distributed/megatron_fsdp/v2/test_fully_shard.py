@@ -663,6 +663,34 @@ class TestFullyShardBasic:
         finally:
             model.reshard()
 
+    def test_outer_optim_direct_model_weight_marks_replica_dirty(self):
+        """BF16 optimizers update model-buffer shards and require an outer refresh."""
+        model = SimpleMLP(16).to(device=_device(), dtype=torch.bfloat16)
+        fully_shard(
+            model,
+            mesh=_build_hsdp_mesh(),
+            sharding_strategy="optim_grads_params",
+            outer_dp_sharding_strategy="optim",
+            enable_unshard_prefetch=False,
+            enable_async_reduce_grad=False,
+        )
+
+        param_group = model._fsdp_param_groups[0]
+        model_buffer = param_group.model_weight_buffer
+        assert param_group.main_weight_buffer is None
+        assert model_buffer.storage_shard_layout == (0, 1)
+        assert not model_buffer._outer_dirty
+
+        # This hook is called after the optimizer step. With no separate main
+        # buffer there is nothing to copy, but the optimizer updated a (1, 1)
+        # shard view inside replicated (0, 1) model storage.
+        model._copy_main_weights_to_model_weights()
+        assert model_buffer._outer_dirty
+
+        model.unshard(async_op=False)
+        assert not model_buffer._outer_dirty
+        model.reshard()
+
     def test_skipped_prefetch_waits_before_reshard(self, monkeypatch):
         """A skipped prefetched module must join its AG before freeing buffers."""
         torch.manual_seed(42)
