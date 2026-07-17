@@ -37,7 +37,6 @@ _Z_STREAM_SLOT = 4
 
 _LAYOUT_BLOCK_S = 64
 
-
 # ---------------------------------------------------------------------------
 # Forward kernels
 # ---------------------------------------------------------------------------
@@ -86,7 +85,7 @@ def _softplus_with_torch_threshold(x):
 
 @triton.autotune(
     configs=_conv_autotune_configs(),
-    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS", "HAS_LEFT_HALO"],
+    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS", "HAS_LEFT_BOUNDARY"],
 )
 @triton.jit
 def _conv_silu_project_kernel(
@@ -95,7 +94,7 @@ def _conv_silu_project_kernel(
     bias_ptr,
     out_ptr,
     silu_save_ptr,
-    left_halo_ptr,
+    left_boundary_ptr,
     seq_len,
     num_in_heads,
     in_channel_offset,
@@ -115,16 +114,16 @@ def _conv_silu_project_kernel(
     silu_save_b_stride,
     silu_save_c_stride,
     silu_save_s_stride,
-    left_halo_s_stride,
-    left_halo_b_stride,
-    left_halo_c_stride,
+    left_boundary_s_stride,
+    left_boundary_b_stride,
+    left_boundary_c_stride,
     eps,
     HEAD_DIM: tl.constexpr,
     K_W: tl.constexpr,
     REPEAT: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    HAS_LEFT_HALO: tl.constexpr,
+    HAS_LEFT_BOUNDARY: tl.constexpr,
     APPLY_L2: tl.constexpr,
     SAVE_SILU: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -178,18 +177,18 @@ def _conv_silu_project_kernel(
             + chan[None, :] * qkvzba_c_stride
         )
         x_val = tl.load(x_ptr, mask=x_mask[:, None], other=0.0).to(tl.float32)
-        if HAS_LEFT_HALO:
-            halo_s = x_s + (K_W - 1)
-            halo_mask = (x_s < 0) & (halo_s >= 0)
-            safe_halo_s = tl.maximum(halo_s, 0)
-            halo_ptr = (
-                left_halo_ptr
-                + safe_halo_s[:, None] * left_halo_s_stride
-                + batch_id * left_halo_b_stride
-                + chan[None, :] * left_halo_c_stride
+        if HAS_LEFT_BOUNDARY:
+            boundary_s = x_s + (K_W - 1)
+            boundary_mask = (x_s < 0) & (boundary_s >= 0)
+            safe_boundary_s = tl.maximum(boundary_s, 0)
+            boundary_ptr = (
+                left_boundary_ptr
+                + safe_boundary_s[:, None] * left_boundary_s_stride
+                + batch_id * left_boundary_b_stride
+                + chan[None, :] * left_boundary_c_stride
             )
-            halo_val = tl.load(halo_ptr, mask=halo_mask[:, None], other=0.0).to(tl.float32)
-            x_val = tl.where(x_mask[:, None], x_val, halo_val)
+            boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(tl.float32)
+            x_val = tl.where(x_mask[:, None], x_val, boundary_val)
         w_tap = tl.load(weight_ptr + chan * weight_c_stride + i * weight_w_stride).to(tl.float32)
         acc += w_tap[None, :] * x_val
 
@@ -270,7 +269,7 @@ def _thd_seq_bounds(cu_seqlens_ptr, token_offsets, total_tokens, num_packed_seqs
 
 @triton.autotune(
     configs=_conv_autotune_configs(),
-    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS", "HAS_LEFT_HALO"],
+    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS", "HAS_LEFT_BOUNDARY"],
 )
 @triton.jit
 def _conv_silu_project_thd_kernel(
@@ -279,7 +278,7 @@ def _conv_silu_project_thd_kernel(
     bias_ptr,
     out_ptr,
     silu_save_ptr,
-    left_halo_ptr,
+    left_boundary_ptr,
     cu_seqlens_ptr,
     seq_len,
     global_token_offset,
@@ -303,16 +302,16 @@ def _conv_silu_project_thd_kernel(
     silu_save_b_stride,
     silu_save_c_stride,
     silu_save_s_stride,
-    left_halo_s_stride,
-    left_halo_b_stride,
-    left_halo_c_stride,
+    left_boundary_s_stride,
+    left_boundary_b_stride,
+    left_boundary_c_stride,
     eps,
     HEAD_DIM: tl.constexpr,
     K_W: tl.constexpr,
     REPEAT: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    HAS_LEFT_HALO: tl.constexpr,
+    HAS_LEFT_BOUNDARY: tl.constexpr,
     APPLY_L2: tl.constexpr,
     SAVE_SILU: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -363,24 +362,24 @@ def _conv_silu_project_thd_kernel(
             + chan[None, :] * qkvzba_c_stride
         )
         x_val = tl.load(x_ptr, mask=x_mask[:, None], other=0.0).to(tl.float32)
-        if HAS_LEFT_HALO:
-            halo_s = x_s + (K_W - 1)
-            halo_mask = (
+        if HAS_LEFT_BOUNDARY:
+            boundary_s = x_s + (K_W - 1)
+            boundary_mask = (
                 s_mask
                 & (x_s < 0)
-                & (halo_s >= 0)
+                & (boundary_s >= 0)
                 & (global_x_s >= seq_start)
                 & (global_x_s < seq_end)
             )
-            safe_halo_s = tl.maximum(halo_s, 0)
-            halo_ptr = (
-                left_halo_ptr
-                + safe_halo_s[:, None] * left_halo_s_stride
-                + batch_id * left_halo_b_stride
-                + chan[None, :] * left_halo_c_stride
+            safe_boundary_s = tl.maximum(boundary_s, 0)
+            boundary_ptr = (
+                left_boundary_ptr
+                + safe_boundary_s[:, None] * left_boundary_s_stride
+                + batch_id * left_boundary_b_stride
+                + chan[None, :] * left_boundary_c_stride
             )
-            halo_val = tl.load(halo_ptr, mask=halo_mask[:, None], other=0.0).to(tl.float32)
-            x_val = tl.where(x_mask[:, None], x_val, halo_val)
+            boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(tl.float32)
+            x_val = tl.where(x_mask[:, None], x_val, boundary_val)
         w_tap = tl.load(weight_ptr + chan * weight_c_stride + i * weight_w_stride).to(tl.float32)
         acc += w_tap[None, :] * x_val
 
@@ -767,7 +766,7 @@ def _z_layout_to_qkvzba_kernel(
 @triton.jit
 def _load_virtual_conv_input(
     qkvzba_ptr,
-    left_halo_ptr,
+    left_boundary_ptr,
     src,
     chan,
     chan_mask,
@@ -775,13 +774,13 @@ def _load_virtual_conv_input(
     qkvzba_s_stride,
     qkvzba_b_stride,
     qkvzba_c_stride,
-    left_halo_s_stride,
-    left_halo_b_stride,
-    left_halo_c_stride,
+    left_boundary_s_stride,
+    left_boundary_b_stride,
+    left_boundary_c_stride,
     seq_len,
     valid_src,
-    HAS_LEFT_HALO: tl.constexpr,
-    HALO: tl.constexpr,
+    HAS_LEFT_BOUNDARY: tl.constexpr,
+    BOUNDARY: tl.constexpr,
 ):
     local_mask = valid_src & (src >= 0) & (src < seq_len)
     safe_src = tl.minimum(tl.maximum(src, 0), seq_len - 1)
@@ -794,39 +793,38 @@ def _load_virtual_conv_input(
     local_val = tl.load(
         local_ptr, mask=local_mask[:, None] & chan_mask[None, :], other=0.0
     ).to(tl.float32)
-    if HAS_LEFT_HALO:
-        halo_s = src + HALO
-        halo_mask = valid_src & (src < 0) & (halo_s >= 0)
-        safe_halo_s = tl.maximum(halo_s, 0)
-        halo_ptr = (
-            left_halo_ptr
-            + safe_halo_s[:, None] * left_halo_s_stride
-            + batch_id * left_halo_b_stride
-            + chan[None, :] * left_halo_c_stride
+    if HAS_LEFT_BOUNDARY:
+        boundary_s = src + BOUNDARY
+        boundary_mask = valid_src & (src < 0) & (boundary_s >= 0)
+        safe_boundary_s = tl.maximum(boundary_s, 0)
+        boundary_ptr = (
+            left_boundary_ptr
+            + safe_boundary_s[:, None] * left_boundary_s_stride
+            + batch_id * left_boundary_b_stride
+            + chan[None, :] * left_boundary_c_stride
         )
-        halo_val = tl.load(
-            halo_ptr, mask=halo_mask[:, None] & chan_mask[None, :], other=0.0
+        boundary_val = tl.load(
+            boundary_ptr, mask=boundary_mask[:, None] & chan_mask[None, :], other=0.0
         ).to(tl.float32)
-        return tl.where(local_mask[:, None], local_val, halo_val)
+        return tl.where(local_mask[:, None], local_val, boundary_val)
     return local_val
 
 
 @triton.jit
-def _conv_silu_virtual_halo_backward_kernel(
+def _conv_silu_boundary_backward_kernel(
     qkvzba_ptr,
     weight_ptr,
     d_silu_ptr,
     d_qkvzba_ptr,
-    d_weight_ptr,
-    left_halo_ptr,
-    d_left_halo_ptr,
+    d_weight_correction_ptr,
+    left_boundary_ptr,
+    d_left_boundary_ptr,
     cu_seqlens_ptr,
     seq_len,
     source_len,
     num_packed_seqs,
     global_token_offset,
     global_seq_len,
-    valid_left_halo,
     conv_dim,
     qkvzba_s_stride,
     qkvzba_b_stride,
@@ -839,37 +837,54 @@ def _conv_silu_virtual_halo_backward_kernel(
     d_qkvzba_s_stride,
     d_qkvzba_b_stride,
     d_qkvzba_c_stride,
-    left_halo_s_stride,
-    left_halo_b_stride,
-    left_halo_c_stride,
-    d_left_halo_s_stride,
-    d_left_halo_b_stride,
-    d_left_halo_c_stride,
-    HALO: tl.constexpr,
+    left_boundary_s_stride,
+    left_boundary_b_stride,
+    left_boundary_c_stride,
+    d_left_boundary_s_stride,
+    d_left_boundary_b_stride,
+    d_left_boundary_c_stride,
+    BOUNDARY: tl.constexpr,
     K_W: tl.constexpr,
-    HAS_LEFT_HALO: tl.constexpr,
     IS_PACKED: tl.constexpr,
-    BLOCK_S: tl.constexpr,
+    APPLY_MAIN_CORRECTION: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Backward for the CP virtual-halo causal conv + SiLU scope."""
+    """Compute CP left-boundary grad and optional packed boundary correction."""
 
     pid_b = tl.program_id(0)
     pid_c = tl.program_id(1)
-    pid_src = tl.program_id(2)
 
-    src_offs = pid_src * BLOCK_S + tl.arange(0, BLOCK_S)
-    src = src_offs - HALO
+    src_offs = tl.arange(0, BLOCK_H)
     source_mask = src_offs < source_len
+    src = src_offs - BOUNDARY
+    boundary_s = src + BOUNDARY
+    is_boundary_source = src < 0
+    is_local_source = src >= 0
+    global_src = global_token_offset + src
+    if IS_PACKED:
+        local_seq_start, local_seq_end = _thd_seq_bounds(
+            cu_seqlens_ptr, global_token_offset, global_seq_len, num_packed_seqs
+        )
+        valid_boundary_source = (
+            is_boundary_source & (global_src >= local_seq_start) & (global_src < local_seq_end)
+        )
+    else:
+        valid_boundary_source = is_boundary_source
+    valid_local_source = APPLY_MAIN_CORRECTION & is_local_source & (src < seq_len)
+    source_valid = source_mask & (valid_boundary_source | valid_local_source)
+
     chan = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
     chan_mask = chan < conv_dim
-
-    global_src = global_token_offset + src
-    d_src = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+    d_src = tl.zeros((BLOCK_H, BLOCK_C), dtype=tl.float32)
 
     for i in tl.static_range(K_W):
         t = src + (K_W - 1) - i
-        t_mask = source_mask & (t >= 0) & (t < seq_len)
+        t_mask = source_valid & (t >= 0) & (t < seq_len)
+        if APPLY_MAIN_CORRECTION:
+            # Local-source corrections are only needed for outputs whose conv
+            # window could have consumed the virtual left boundary.
+            t_mask = t_mask & (is_boundary_source | (t < BOUNDARY))
         global_t = global_token_offset + t
         if IS_PACKED:
             seq_start, seq_end = _thd_seq_bounds(
@@ -877,10 +892,11 @@ def _conv_silu_virtual_halo_backward_kernel(
             )
             same_sequence = (global_src >= seq_start) & (global_src < seq_end)
         else:
-            same_sequence = source_mask
+            same_sequence = t_mask
         source_contributes = t_mask & same_sequence
 
-        acc = tl.zeros((BLOCK_S, BLOCK_C), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_H, BLOCK_C), dtype=tl.float32)
+        base_acc = tl.zeros((BLOCK_H, BLOCK_C), dtype=tl.float32)
         for j in tl.static_range(K_W):
             tap_src = t - (K_W - 1) + j
             global_tap_src = global_token_offset + tap_src
@@ -895,7 +911,7 @@ def _conv_silu_virtual_halo_backward_kernel(
                 tap_valid = t_mask & (tap_src < seq_len)
             x_tap = _load_virtual_conv_input(
                 qkvzba_ptr,
-                left_halo_ptr,
+                left_boundary_ptr,
                 tap_src,
                 chan,
                 chan_mask,
@@ -903,13 +919,13 @@ def _conv_silu_virtual_halo_backward_kernel(
                 qkvzba_s_stride,
                 qkvzba_b_stride,
                 qkvzba_c_stride,
-                left_halo_s_stride,
-                left_halo_b_stride,
-                left_halo_c_stride,
+                left_boundary_s_stride,
+                left_boundary_b_stride,
+                left_boundary_c_stride,
                 seq_len,
                 tap_valid,
-                HAS_LEFT_HALO,
-                HALO,
+                True,
+                BOUNDARY,
             )
             w_tap = tl.load(
                 weight_ptr + chan * weight_c_stride + j * weight_w_stride,
@@ -917,9 +933,25 @@ def _conv_silu_virtual_halo_backward_kernel(
                 other=0.0,
             ).to(tl.float32)
             acc += x_tap * w_tap[None, :]
+            if APPLY_MAIN_CORRECTION:
+                local_tap_mask = tap_valid & (tap_src >= 0)
+                safe_tap_src = tl.minimum(tl.maximum(tap_src, 0), seq_len - 1)
+                x_base_ptrs = (
+                    qkvzba_ptr
+                    + safe_tap_src[:, None] * qkvzba_s_stride
+                    + pid_b * qkvzba_b_stride
+                    + chan[None, :] * qkvzba_c_stride
+                )
+                x_base = tl.load(
+                    x_base_ptrs, mask=local_tap_mask[:, None] & chan_mask[None, :], other=0.0
+                ).to(tl.float32)
+                base_acc += x_base * w_tap[None, :]
 
         sig = tl.sigmoid(acc)
         silu_grad = sig * (1.0 + acc * (1.0 - sig))
+        if APPLY_MAIN_CORRECTION:
+            base_sig = tl.sigmoid(base_acc)
+            base_silu_grad = base_sig * (1.0 + base_acc * (1.0 - base_sig))
         d_silu_ptrs = (
             d_silu_ptr
             + pid_b * d_silu_b_stride
@@ -930,66 +962,67 @@ def _conv_silu_virtual_halo_backward_kernel(
             d_silu_ptrs, mask=source_contributes[:, None] & chan_mask[None, :], other=0.0
         ).to(tl.float32)
         d_acc = d_silu * silu_grad
+        if APPLY_MAIN_CORRECTION:
+            d_base_acc = d_silu * base_silu_grad
+            d_acc = tl.where(is_boundary_source[:, None], d_acc, d_acc - d_base_acc)
         w_i = tl.load(
             weight_ptr + chan * weight_c_stride + i * weight_w_stride,
             mask=chan_mask,
             other=0.0,
         ).to(tl.float32)
         d_src += d_acc * w_i[None, :]
+        if APPLY_MAIN_CORRECTION:
+            x_src = _load_virtual_conv_input(
+                qkvzba_ptr,
+                left_boundary_ptr,
+                src,
+                chan,
+                chan_mask,
+                pid_b,
+                qkvzba_s_stride,
+                qkvzba_b_stride,
+                qkvzba_c_stride,
+                left_boundary_s_stride,
+                left_boundary_b_stride,
+                left_boundary_c_stride,
+                seq_len,
+                source_contributes,
+                True,
+                BOUNDARY,
+            )
+            d_w = tl.sum(d_acc * x_src, axis=0)
+            tl.atomic_add(
+                d_weight_correction_ptr + chan * weight_c_stride + i * weight_w_stride,
+                d_w,
+                mask=chan_mask,
+            )
 
-        x_src = _load_virtual_conv_input(
-            qkvzba_ptr,
-            left_halo_ptr,
-            src,
-            chan,
-            chan_mask,
-            pid_b,
-            qkvzba_s_stride,
-            qkvzba_b_stride,
-            qkvzba_c_stride,
-            left_halo_s_stride,
-            left_halo_b_stride,
-            left_halo_c_stride,
-            seq_len,
-            source_contributes,
-            HAS_LEFT_HALO,
-            HALO,
-        )
-        d_w = tl.sum(d_acc * x_src, axis=0)
-        tl.atomic_add(
-            d_weight_ptr + chan * weight_c_stride + i * weight_w_stride,
-            d_w,
-            mask=chan_mask,
-        )
-
-    local_store_mask = source_mask & (src >= 0) & (src < seq_len)
-    d_qkvzba_ptrs = (
-        d_qkvzba_ptr
-        + tl.minimum(tl.maximum(src, 0), seq_len - 1)[:, None] * d_qkvzba_s_stride
-        + pid_b * d_qkvzba_b_stride
-        + chan[None, :] * d_qkvzba_c_stride
+    d_boundary_ptrs = (
+        d_left_boundary_ptr
+        + boundary_s[:, None] * d_left_boundary_s_stride
+        + pid_b * d_left_boundary_b_stride
+        + chan[None, :] * d_left_boundary_c_stride
     )
     tl.store(
-        d_qkvzba_ptrs,
-        d_src.to(d_qkvzba_ptr.dtype.element_ty),
-        mask=local_store_mask[:, None] & chan_mask[None, :],
+        d_boundary_ptrs,
+        d_src.to(d_left_boundary_ptr.dtype.element_ty),
+        mask=source_mask[:, None] & is_boundary_source[:, None] & chan_mask[None, :],
     )
-    if HAS_LEFT_HALO:
-        halo_s = src + HALO
-        halo_store_mask = source_mask & (src < 0) & (halo_s >= 0)
-        valid_halo_mask = halo_s >= (HALO - valid_left_halo)
-        safe_halo_s = tl.maximum(halo_s, 0)
-        d_halo_ptrs = (
-            d_left_halo_ptr
-            + safe_halo_s[:, None] * d_left_halo_s_stride
-            + pid_b * d_left_halo_b_stride
-            + chan[None, :] * d_left_halo_c_stride
+    if APPLY_MAIN_CORRECTION:
+        d_qkvzba_ptrs = (
+            d_qkvzba_ptr
+            + src[:, None] * d_qkvzba_s_stride
+            + pid_b * d_qkvzba_b_stride
+            + chan[None, :] * d_qkvzba_c_stride
         )
-        d_halo = tl.where(valid_halo_mask[:, None], d_src, 0.0)
+        local_store_mask = source_mask & is_local_source & (src < seq_len)
+        d_qkvzba_current = tl.load(
+            d_qkvzba_ptrs, mask=local_store_mask[:, None] & chan_mask[None, :], other=0.0
+        )
         tl.store(
-            d_halo_ptrs,
-            d_halo.to(d_left_halo_ptr.dtype.element_ty),
-            mask=halo_store_mask[:, None] & chan_mask[None, :],
+            d_qkvzba_ptrs,
+            d_qkvzba_current + d_src.to(d_qkvzba_ptr.dtype.element_ty),
+            mask=local_store_mask[:, None] & chan_mask[None, :],
         )
 
 
@@ -1282,55 +1315,52 @@ def _triton_z_layout_to_qkvzba(
         )
 
 
-def _triton_conv_silu_virtual_halo_backward(
+def _triton_conv_silu_boundary_backward(
     qkvzba: Tensor,
     conv1d_weight: Tensor,
     d_silu_conv: Tensor,
     d_qkvzba: Tensor,
-    left_halo: Tensor,
+    left_boundary: Tensor,
     *,
     cu_seqlens: Optional[Tensor],
     global_token_offset: int,
     global_seq_len: int,
-    valid_left_halo: int,
-) -> Tuple[Tensor, Tensor]:
-    """Compute CP conv+SiLU gradients without materializing an augmented sequence."""
+    apply_main_correction: bool,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Compute chunkwise-CP boundary grad and optional packed main correction."""
 
     seq_len, batch, _ = qkvzba.shape
     conv_dim = conv1d_weight.shape[0]
     k_w = conv1d_weight.shape[-1]
-    halo = k_w - 1
+    boundary = k_w - 1
     weight_2d = conv1d_weight.view(conv1d_weight.shape[0], k_w)
-    d_weight_fp32 = torch.zeros_like(weight_2d, dtype=torch.float32)
-    d_left_halo = torch.empty_like(left_halo)
-    device = qkvzba.device
-    source_len = seq_len + halo
+    d_left_boundary = torch.empty_like(left_boundary)
+    d_weight_correction = (
+        torch.zeros_like(weight_2d, dtype=torch.float32) if apply_main_correction else qkvzba
+    )
     num_packed_seqs = 0 if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    is_packed = cu_seqlens is not None
     if cu_seqlens is None:
         cu_seqlens = qkvzba
 
-    BLOCK_S = 64
+    source_len = 2 * boundary if apply_main_correction else boundary
+    BLOCK_H = 1 << (source_len - 1).bit_length()
     BLOCK_C = 128
-    grid = (
-        batch,
-        triton.cdiv(conv_dim, BLOCK_C),
-        triton.cdiv(source_len, BLOCK_S),
-    )
-    _conv_silu_virtual_halo_backward_kernel[grid](
+    grid = (batch, triton.cdiv(conv_dim, BLOCK_C))
+    _conv_silu_boundary_backward_kernel[grid](
         qkvzba,
         weight_2d,
         d_silu_conv,
         d_qkvzba,
-        d_weight_fp32,
-        left_halo,
-        d_left_halo,
+        d_weight_correction,
+        left_boundary,
+        d_left_boundary,
         cu_seqlens,
         seq_len,
         source_len,
         num_packed_seqs,
         global_token_offset,
         global_seq_len,
-        valid_left_halo,
         conv_dim,
         qkvzba.stride(0),
         qkvzba.stride(1),
@@ -1343,22 +1373,22 @@ def _triton_conv_silu_virtual_halo_backward(
         d_qkvzba.stride(0),
         d_qkvzba.stride(1),
         d_qkvzba.stride(2),
-        left_halo.stride(0),
-        left_halo.stride(1),
-        left_halo.stride(2),
-        d_left_halo.stride(0),
-        d_left_halo.stride(1),
-        d_left_halo.stride(2),
-        HALO=halo,
+        left_boundary.stride(0),
+        left_boundary.stride(1),
+        left_boundary.stride(2),
+        d_left_boundary.stride(0),
+        d_left_boundary.stride(1),
+        d_left_boundary.stride(2),
+        BOUNDARY=boundary,
         K_W=k_w,
-        HAS_LEFT_HALO=True,
-        IS_PACKED=cu_seqlens is not qkvzba,
-        BLOCK_S=BLOCK_S,
+        IS_PACKED=is_packed,
+        APPLY_MAIN_CORRECTION=apply_main_correction,
+        BLOCK_H=BLOCK_H,
         BLOCK_C=BLOCK_C,
         num_warps=4,
         num_stages=2,
     )
-    return d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype), d_left_halo
+    return d_left_boundary, d_weight_correction if apply_main_correction else None
 
 
 def _triton_g_beta_backward(
@@ -1446,6 +1476,30 @@ def _wait_for_streams(dst_stream: "torch.cuda.Stream", *src_streams: "torch.cuda
         dst_stream.wait_stream(stream)
 
 
+@triton.jit
+def _chunkwise_cp_seq_idx_kernel(
+    cu_seqlens_ptr,
+    seq_idx_ptr,
+    local_start,
+    local_seq_len,
+    BLOCK_T: tl.constexpr,
+):
+    """Fill local chunkwise-CP packed sequence ids without searchsorted."""
+
+    pid_seq = tl.program_id(0)
+    pid_block = tl.program_id(1)
+    local_offsets = pid_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    global_offsets = local_start + local_offsets
+    seq_start = tl.load(cu_seqlens_ptr + pid_seq)
+    seq_end = tl.load(cu_seqlens_ptr + pid_seq + 1)
+    mask = (
+        (local_offsets < local_seq_len)
+        & (global_offsets >= seq_start)
+        & (global_offsets < seq_end)
+    )
+    tl.store(seq_idx_ptr + local_offsets, pid_seq, mask=mask)
+
+
 def _resolve_packed_seq_idx(
     cu_seqlens: Optional[Tensor], seq_idx: Optional[Tensor], total_tokens: int
 ) -> Optional[Tensor]:
@@ -1478,29 +1532,19 @@ def _resolve_chunkwise_cp_packed_seq_idx(cu_seqlens: Tensor, local_seq_len: int,
     """Build local packed sequence ids for a contiguous chunkwise-CP rank interval."""
 
     local_start = cp_rank * local_seq_len
-    global_positions = torch.arange(
+    seq_idx = torch.empty((1, local_seq_len), device=cu_seqlens.device, dtype=torch.int32)
+    block_t = 512
+    grid = (cu_seqlens.shape[0] - 1, triton.cdiv(local_seq_len, block_t))
+    _chunkwise_cp_seq_idx_kernel[grid](
+        cu_seqlens,
+        seq_idx,
         local_start,
-        local_start + local_seq_len,
-        device=cu_seqlens.device,
-        dtype=torch.long,
+        local_seq_len,
+        BLOCK_T=block_t,
+        num_warps=8,
+        num_stages=2,
     )
-    seq_idx = torch.bucketize(global_positions, cu_seqlens[1:].to(torch.long), right=True)
-    return seq_idx.to(torch.int32).unsqueeze(0).contiguous()
-
-
-def _valid_packed_left_halo_width(
-    cu_seqlens: Tensor, *, local_seq_len: int, halo: int, cp_rank: int
-) -> int:
-    """Return how many left-halo tokens belong to this rank's first packed sequence."""
-
-    if halo == 0 or cp_rank == 0:
-        return 0
-    local_start = cp_rank * local_seq_len
-    cu_list = [int(x) for x in cu_seqlens.tolist()]
-    for seq_start, seq_end in zip(cu_list[:-1], cu_list[1:]):
-        if seq_start < local_start < seq_end:
-            return min(halo, local_start - seq_start)
-    return 0
+    return seq_idx
 
 
 def _cp_neighbor_global_ranks(cp_group) -> Tuple[int, int, Optional[int], Optional[int]]:
@@ -1528,67 +1572,102 @@ def _wait_distributed_ops(ops) -> None:
         op.wait()
 
 
-def _start_left_halo_exchange(
-    qkvzba: Tensor, *, conv_dim: int, halo: int, cp_group
+def _split_batched_recv_send_works(works, op_roles) -> Tuple[Tuple, Tuple]:
+    """Split batched recv/send work handles when the backend exposes them separately.
+
+    Some NCCL/PyTorch combinations return one grouped ``Work`` for the whole
+    ``batch_isend_irecv`` launch, while others return one ``Work`` per P2P op.
+    If the backend returns a single grouped handle, waiting for it at the recv
+    dependency point also completes the send.
+    """
+
+    works = tuple(works)
+    op_roles = tuple(op_roles)
+    if len(works) == 1:
+        if "recv" in op_roles:
+            return works, ()
+        return (), works
+    if len(works) == len(op_roles):
+        recv_ops = tuple(work for work, role in zip(works, op_roles) if role == "recv")
+        send_ops = tuple(work for work, role in zip(works, op_roles) if role == "send")
+        return recv_ops, send_ops
+    raise RuntimeError(
+        "Expected batch_isend_irecv to return one grouped work handle or one "
+        "work handle per P2P op for chunkwise CP boundary exchange; "
+        f"got {len(works)} work handles for {len(op_roles)} ops."
+    )
+
+
+def _start_left_boundary_exchange(
+    qkvzba: Tensor, *, conv_dim: int, boundary: int, cp_group
 ) -> Tuple[Optional[Tensor], Tuple, Tuple, Optional[Tensor]]:
-    """Start chunkwise-CP left-halo exchange without waiting for completion."""
+    """Start chunkwise-CP left-boundary exchange without waiting for completion."""
 
     _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
-    left_halo = None
+    left_boundary = None
+    send_buf = None
     recv_ops = []
     send_ops = []
-    send_buf = None
+    p2p_ops = []
+    op_roles = []
     if prev_rank is not None:
-        left_halo = qkvzba.new_empty((halo, qkvzba.shape[1], conv_dim))
-        recv_ops.append(
-            torch.distributed.irecv(tensor=left_halo, src=prev_rank, group=cp_group)
+        left_boundary = qkvzba.new_empty((boundary, qkvzba.shape[1], conv_dim))
+        p2p_ops.append(
+            torch.distributed.P2POp(torch.distributed.irecv, left_boundary, prev_rank, cp_group)
         )
+        op_roles.append("recv")
     if next_rank is not None:
-        send_buf = qkvzba[-halo:, :, :conv_dim].contiguous()
-        send_ops.append(
-            torch.distributed.isend(tensor=send_buf, dst=next_rank, group=cp_group)
+        send_buf = qkvzba[-boundary:, :, :conv_dim].contiguous()
+        p2p_ops.append(
+            torch.distributed.P2POp(torch.distributed.isend, send_buf, next_rank, cp_group)
         )
-    return left_halo, tuple(recv_ops), tuple(send_ops), send_buf
+        op_roles.append("send")
+    if p2p_ops:
+        recv_ops, send_ops = _split_batched_recv_send_works(
+            torch.distributed.batch_isend_irecv(p2p_ops), op_roles
+        )
+
+    return left_boundary, tuple(recv_ops), tuple(send_ops), send_buf
 
 
-def _start_right_halo_grad_recv(
-    qkvzba: Tensor, *, conv_dim: int, halo: int, cp_group
-) -> Tuple[Optional[Tensor], Tuple]:
-    """Post the recv for the next CP rank's left-halo gradients."""
+def _start_boundary_grad_exchange(
+    qkvzba: Tensor, d_left_boundary: Optional[Tensor], *, conv_dim: int, boundary: int, cp_group
+) -> Tuple[Optional[Tensor], Tuple, Tuple, Optional[Tensor]]:
+    """Start chunkwise-CP boundary-gradient exchange without waiting for completion."""
 
-    _, _, _, next_rank = _cp_neighbor_global_ranks(cp_group)
-    d_right_halo = None
+    _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    d_right_boundary = None
+    send_buf = None
     recv_ops = []
-    if next_rank is not None:
-        d_right_halo = qkvzba.new_empty((halo, qkvzba.shape[1], conv_dim))
-        recv_ops.append(
-            torch.distributed.irecv(tensor=d_right_halo, src=next_rank, group=cp_group)
-        )
-    return d_right_halo, tuple(recv_ops)
-
-
-def _start_left_halo_grad_send(
-    d_left_halo: Optional[Tensor], *, cp_group
-) -> Tuple[Tuple, Optional[Tensor]]:
-    """Send left-halo gradients back to the previous CP rank."""
-
-    _, _, prev_rank, _ = _cp_neighbor_global_ranks(cp_group)
     send_ops = []
-    send_buf = None
-    if prev_rank is not None:
-        if d_left_halo is None:
-            raise RuntimeError("Chunkwise CP backward requires a left-halo gradient to send.")
-        send_buf = d_left_halo.contiguous()
-        send_ops.append(
-            torch.distributed.isend(tensor=send_buf, dst=prev_rank, group=cp_group)
+    p2p_ops = []
+    op_roles = []
+    if next_rank is not None:
+        d_right_boundary = qkvzba.new_empty((boundary, qkvzba.shape[1], conv_dim))
+        p2p_ops.append(
+            torch.distributed.P2POp(torch.distributed.irecv, d_right_boundary, next_rank, cp_group)
         )
-    return tuple(send_ops), send_buf
+        op_roles.append("recv")
+    if prev_rank is not None:
+        if d_left_boundary is None:
+            raise RuntimeError("Chunkwise CP backward requires a left-boundary gradient to send.")
+        send_buf = d_left_boundary.contiguous()
+        p2p_ops.append(
+            torch.distributed.P2POp(torch.distributed.isend, send_buf, prev_rank, cp_group)
+        )
+        op_roles.append("send")
+    if p2p_ops:
+        recv_ops, send_ops = _split_batched_recv_send_works(
+            torch.distributed.batch_isend_irecv(p2p_ops), op_roles
+        )
+
+    return d_right_boundary, tuple(recv_ops), tuple(send_ops), send_buf
 
 
 def _build_augmented_packed_cu_seqlens(
-    cu_seqlens: Tensor, *, local_seq_len: int, halo: int, cp_size: int, cp_rank: int
+    cu_seqlens: Tensor, *, local_seq_len: int, boundary: int, cp_size: int, cp_rank: int
 ) -> Tuple[Tensor, int]:
-    """Build augmented local packed boundaries and return the valid left-halo width."""
+    """Build augmented local packed boundaries and return the valid left-boundary width."""
 
     cu_list = [int(x) for x in cu_seqlens.tolist()]
     total_tokens = cu_list[-1]
@@ -1601,7 +1680,7 @@ def _build_augmented_packed_cu_seqlens(
         )
 
     boundaries = []
-    valid_left_halo = 0
+    valid_left_boundary = 0
     for seq_start, seq_end in zip(cu_list[:-1], cu_list[1:]):
         if seq_end <= seq_start:
             continue
@@ -1613,21 +1692,21 @@ def _build_augmented_packed_cu_seqlens(
         local_overlap_start = overlap_start - local_start
         local_overlap_end = overlap_end - local_start
         # Chunkwise CP partitions the flattened packed token buffer into contiguous rank
-        # intervals. Only tokens from the same packed sequence are valid left-halo tokens.
-        segment_valid_halo = min(halo, overlap_start - seq_start)
-        segment_start = halo + local_overlap_start - segment_valid_halo
-        segment_end = halo + local_overlap_end
+        # intervals. Only tokens from the same packed sequence are valid left-boundary tokens.
+        segment_valid_boundary = min(boundary, overlap_start - seq_start)
+        segment_start = boundary + local_overlap_start - segment_valid_boundary
+        segment_end = boundary + local_overlap_end
 
         if not boundaries:
             if segment_start > 0:
                 boundaries.append(0)
             boundaries.append(segment_start)
-            valid_left_halo = segment_valid_halo
+            valid_left_boundary = segment_valid_boundary
         elif boundaries[-1] != segment_start:
             boundaries.append(segment_start)
         boundaries.append(segment_end)
 
-    augmented_len = halo + local_seq_len
+    augmented_len = boundary + local_seq_len
     if not boundaries:
         boundaries = [0, augmented_len]
     elif boundaries[0] != 0:
@@ -1636,7 +1715,7 @@ def _build_augmented_packed_cu_seqlens(
         boundaries.append(augmented_len)
 
     augmented_cu = torch.tensor(boundaries, device=cu_seqlens.device, dtype=torch.int32)
-    return augmented_cu, valid_left_halo
+    return augmented_cu, valid_left_boundary
 
 
 def _triton_pre_gated_delta_rule_forward(
@@ -1650,26 +1729,31 @@ def _triton_pre_gated_delta_rule_forward(
     key_head_dim: int,
     value_head_dim: int,
     cu_seqlens: Optional[Tensor] = None,
-    left_halo: Optional[Tensor] = None,
-    left_halo_recv_ops: Optional[Tuple] = None,
-    left_halo_send_ops: Optional[Tuple] = None,
-    global_token_offset: int = 0,
-    global_seq_len: Optional[int] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    cp_group=None,
+    cp_size: int = 1,
+) -> Tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Optional[Tensor],
+    int,
+    int,
+]:
     """Triton-backed forward for the pre-gated-delta-rule front-end.
 
-    Returns ``(query, key, value, gate, beta, g, silu_qk_save)``. The last
-    element is the bf16-rounded ``silu(conv(x))`` for the QK channel range
-    laid out channel-last for the QK l2norm/repeat backward scope.
+    Returns ``(query, key, value, gate, beta, g, silu_qk_save, left_boundary,
+    global_token_offset, global_seq_len)``. ``silu_qk_save`` is the bf16-rounded
+    ``silu(conv(x))`` for the QK channel range laid out channel-last for the QK
+    l2norm/repeat backward scope. ``left_boundary`` is returned so the autograd
+    wrapper can save it for backward.
     """
 
     seq_len, batch, total_channels = qkvzba.shape
     is_packed_thd = cu_seqlens is not None
-    has_left_halo = left_halo is not None
-    if left_halo is None:
-        left_halo = qkvzba
-    if global_seq_len is None:
-        global_seq_len = seq_len
     if is_packed_thd:
         assert batch == 1, (
             "Packed THD fused_pre_gated_delta_rule expects batch dimension 1; " f"got {batch=}."
@@ -1680,8 +1764,31 @@ def _triton_pre_gated_delta_rule_forward(
 
     qk_channels = num_key_heads * key_head_dim
     v_channels = num_value_heads * value_head_dim
+    conv_dim = 2 * qk_channels + v_channels
     repeat_factor = num_value_heads // num_key_heads
     k_w = conv1d_weight.shape[-1]
+    boundary = k_w - 1
+    cp_active = cp_group is not None and cp_size > 1 and boundary > 0
+    cp_rank = cp_group.rank() if cp_active else 0
+    left_boundary = None
+    left_boundary_recv_ops = None
+    left_boundary_send_ops = None
+    _left_boundary_send_buf = None
+    global_token_offset = 0
+    global_seq_len = seq_len
+    if cp_active:
+        (
+            left_boundary,
+            left_boundary_recv_ops,
+            left_boundary_send_ops,
+            _left_boundary_send_buf,
+        ) = _start_left_boundary_exchange(qkvzba, conv_dim=conv_dim, boundary=boundary, cp_group=cp_group)
+        if is_packed_thd:
+            global_token_offset = cp_rank * seq_len
+            global_seq_len = seq_len * cp_size
+    has_left_boundary = left_boundary is not None
+    if left_boundary is None:
+        left_boundary = qkvzba
     assert _is_power_of_two(key_head_dim), (
         "Triton kernel currently expects key_head_dim to be a power of two; "
         f"got {key_head_dim=}."
@@ -1741,13 +1848,24 @@ def _triton_pre_gated_delta_rule_forward(
     silu_save_c_stride = silu_qk_save.stride(1)
     silu_save_s_stride = silu_qk_save.stride(2)
 
+    overlap_boundary_exchange = bool(left_boundary_recv_ops or left_boundary_send_ops)
+
     # Stream setup. Each side stream handles one of the four sub-computations
-    # (QK conv+l2norm, V conv, Z copy, g/beta).
+    # (QK conv+l2norm, V conv, Z copy, g/beta). When chunkwise CP boundary exchange
+    # is active, QK/V consume the received boundary and stay on the caller stream.
+    # Z and g/beta do not depend on the boundary, so they can still overlap with
+    # the boundary exchange on side streams.
     main_stream = torch.cuda.current_stream(device=device)
-    qk_stream = _get_side_stream(device, slot=_QK_STREAM_SLOT)
-    v_stream = _get_side_stream(device, slot=_V_STREAM_SLOT)
-    g_beta_stream = _get_side_stream(device, slot=_G_BETA_STREAM_SLOT)
-    z_stream = _get_side_stream(device, slot=_Z_STREAM_SLOT)
+    if overlap_boundary_exchange:
+        qk_stream = main_stream
+        v_stream = main_stream
+        g_beta_stream = _get_side_stream(device, slot=_G_BETA_STREAM_SLOT)
+        z_stream = _get_side_stream(device, slot=_Z_STREAM_SLOT)
+    else:
+        qk_stream = _get_side_stream(device, slot=_QK_STREAM_SLOT)
+        v_stream = _get_side_stream(device, slot=_V_STREAM_SLOT)
+        g_beta_stream = _get_side_stream(device, slot=_G_BETA_STREAM_SLOT)
+        z_stream = _get_side_stream(device, slot=_Z_STREAM_SLOT)
     for stream in (qk_stream, v_stream, g_beta_stream, z_stream):
         stream.wait_stream(main_stream)
 
@@ -1806,13 +1924,12 @@ def _triton_pre_gated_delta_rule_forward(
                 beta.stride(2),
             )
 
-    overlap_halo_exchange = bool(left_halo_recv_ops or left_halo_send_ops)
-    if overlap_halo_exchange:
-        # Z and g/beta do not consume the CP left halo, so issue them while
-        # the halo recv is in flight. QK/V wait below right before they need it.
+    if overlap_boundary_exchange:
+        # Z and g/beta do not consume the CP left boundary, so issue them while
+        # the boundary recv is in flight. QK/V wait below right before they need it.
         _launch_z_copy()
         _launch_g_beta()
-    _wait_distributed_ops(left_halo_recv_ops)
+    _wait_distributed_ops(left_boundary_recv_ops)
 
     # --- QK conv + silu + l2norm + repeat ---
     qk_grid = lambda meta: (batch * 2 * num_key_heads, triton.cdiv(seq_len, meta["BLOCK_S"]))
@@ -1824,7 +1941,7 @@ def _triton_pre_gated_delta_rule_forward(
                 bias_tensor,
                 qk_out,
                 silu_qk_save,
-                left_halo,
+                left_boundary,
                 cu_seqlens,
                 seq_len,
                 global_token_offset,
@@ -1848,16 +1965,16 @@ def _triton_pre_gated_delta_rule_forward(
                 silu_save_b_stride,
                 silu_save_c_stride,
                 silu_save_s_stride,
-                left_halo.stride(0),
-                left_halo.stride(1),
-                left_halo.stride(2),
+                left_boundary.stride(0),
+                left_boundary.stride(1),
+                left_boundary.stride(2),
                 _L2NORM_EPS,
                 HEAD_DIM=key_head_dim,
                 K_W=k_w,
                 REPEAT=repeat_factor,
                 NUM_GROUPS=2,
                 HAS_BIAS=False,
-                HAS_LEFT_HALO=has_left_halo,
+                HAS_LEFT_BOUNDARY=has_left_boundary,
                 SAVE_SILU=True,
                 APPLY_L2=True,
             )
@@ -1868,7 +1985,7 @@ def _triton_pre_gated_delta_rule_forward(
                 bias_tensor,
                 qk_out,
                 silu_qk_save,
-                left_halo,
+                left_boundary,
                 seq_len,
                 num_key_heads,
                 0,  # QK starts at channel 0; group 1 starts at +qk_channels.
@@ -1888,16 +2005,16 @@ def _triton_pre_gated_delta_rule_forward(
                 silu_save_b_stride,
                 silu_save_c_stride,
                 silu_save_s_stride,
-                left_halo.stride(0),
-                left_halo.stride(1),
-                left_halo.stride(2),
+                left_boundary.stride(0),
+                left_boundary.stride(1),
+                left_boundary.stride(2),
                 _L2NORM_EPS,
                 HEAD_DIM=key_head_dim,
                 K_W=k_w,
                 REPEAT=repeat_factor,
                 NUM_GROUPS=2,
                 HAS_BIAS=False,
-                HAS_LEFT_HALO=has_left_halo,
+                HAS_LEFT_BOUNDARY=has_left_boundary,
                 SAVE_SILU=True,
                 APPLY_L2=True,
             )
@@ -1912,7 +2029,7 @@ def _triton_pre_gated_delta_rule_forward(
                 bias_tensor,
                 value,
                 qkvzba,  # silu_save unused (SAVE_SILU=False)
-                left_halo,
+                left_boundary,
                 cu_seqlens,
                 seq_len,
                 global_token_offset,
@@ -1936,16 +2053,16 @@ def _triton_pre_gated_delta_rule_forward(
                 0,  # silu_save strides unused
                 0,
                 0,
-                left_halo.stride(0),
-                left_halo.stride(1),
-                left_halo.stride(2),
+                left_boundary.stride(0),
+                left_boundary.stride(1),
+                left_boundary.stride(2),
                 _L2NORM_EPS,
                 HEAD_DIM=value_head_dim,
                 K_W=k_w,
                 REPEAT=1,
                 NUM_GROUPS=1,
                 HAS_BIAS=False,
-                HAS_LEFT_HALO=has_left_halo,
+                HAS_LEFT_BOUNDARY=has_left_boundary,
                 SAVE_SILU=False,
                 APPLY_L2=False,
             )
@@ -1956,7 +2073,7 @@ def _triton_pre_gated_delta_rule_forward(
                 bias_tensor,
                 value,
                 qkvzba,  # silu_save unused (SAVE_SILU=False)
-                left_halo,
+                left_boundary,
                 seq_len,
                 num_value_heads,
                 v_channel_offset,
@@ -1976,21 +2093,21 @@ def _triton_pre_gated_delta_rule_forward(
                 0,  # silu_save strides unused
                 0,
                 0,
-                left_halo.stride(0),
-                left_halo.stride(1),
-                left_halo.stride(2),
+                left_boundary.stride(0),
+                left_boundary.stride(1),
+                left_boundary.stride(2),
                 _L2NORM_EPS,
                 HEAD_DIM=value_head_dim,
                 K_W=k_w,
                 REPEAT=1,
                 NUM_GROUPS=1,
                 HAS_BIAS=False,
-                HAS_LEFT_HALO=has_left_halo,
+                HAS_LEFT_BOUNDARY=has_left_boundary,
                 SAVE_SILU=False,
                 APPLY_L2=False,
             )
 
-    if not overlap_halo_exchange:
+    if not overlap_boundary_exchange:
         # --- Z copy ---
         _launch_z_copy()
 
@@ -1999,12 +2116,23 @@ def _triton_pre_gated_delta_rule_forward(
 
     # Re-join the side streams so the caller's stream observes the writes.
     _wait_for_streams(main_stream, qk_stream, v_stream, z_stream, g_beta_stream)
-    # The halo send uses an owned contiguous buffer that no downstream kernel
-    # reads, so defer this wait to overlap the send with QK/V compute.
-    _wait_distributed_ops(left_halo_send_ops)
-    _ = _left_halo_send_buf
+    # The boundary send uses an owned contiguous buffer that no downstream
+    # kernel reads, so defer this wait to overlap the send with QK/V compute.
+    _wait_distributed_ops(left_boundary_send_ops)
+    _ = _left_boundary_send_buf
 
-    return query, key, value, gate, beta, g, silu_qk_save
+    return (
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        g,
+        silu_qk_save,
+        left_boundary if has_left_boundary else None,
+        global_token_offset,
+        global_seq_len,
+    )
 
 
 def _triton_pre_gated_delta_rule_backward(
@@ -2025,11 +2153,10 @@ def _triton_pre_gated_delta_rule_backward(
     key_head_dim: int,
     value_head_dim: int,
     seq_idx: Optional[Tensor] = None,
-    left_halo: Optional[Tensor] = None,
+    left_boundary: Optional[Tensor] = None,
     cu_seqlens: Optional[Tensor] = None,
     global_token_offset: int = 0,
     global_seq_len: Optional[int] = None,
-    valid_left_halo: Optional[int] = None,
     cp_group=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
     """Triton-backed backward for the pre-gated-delta-rule front-end.
@@ -2037,12 +2164,14 @@ def _triton_pre_gated_delta_rule_backward(
     Mirror of :func:`_triton_pre_gated_delta_rule_forward`. Takes upstream
     gradients (``dq``/``dk``/``dv``/``dgate``/``dbeta``/``dg``) plus the
     saved forward intermediates and returns input/parameter gradients
-    ``(d_qkvzba, d_weight, d_A_log, d_dt_bias)``.
+    ``(d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_boundary)``. The
+    last element is ``None`` unless chunkwise CP supplied a left boundary.
 
-    Non-CP uses the hand-tuned C++ ``causal_conv1d_bwd_function`` for
-    conv+SiLU gradients. Chunkwise CP uses a Triton virtual-halo conv
-    backward so it can match the forward's fixed-width halo and packed
-    sequence-boundary semantics without materializing an augmented input.
+    The hand-tuned C++ ``causal_conv1d_bwd_function`` computes the main
+    conv+SiLU input and weight gradients. Chunkwise CP passes the left boundary as
+    causal-conv initial states for the main backward and uses a tiny Triton
+    kernel only for the left-boundary gradient that must be sent to the previous
+    CP rank.
     """
 
     seq_len, batch, _ = qkvzba.shape
@@ -2060,17 +2189,9 @@ def _triton_pre_gated_delta_rule_backward(
     # layout), so we can skip a 256 MB ``.contiguous()`` copy.
     qkvzba_conv = qkvzba[:, :, :conv_dim].permute(1, 2, 0)
     weight_2d = conv1d_weight.view(conv1d_weight.shape[0], k_w)
-    initial_states = None if left_halo is None else left_halo.permute(1, 2, 0)
+    initial_states = None if left_boundary is None else left_boundary.permute(1, 2, 0)
     if global_seq_len is None:
         global_seq_len = seq_len
-    if valid_left_halo is None:
-        valid_left_halo = k_w - 1
-    d_right_halo = None
-    right_halo_recv_ops = None
-    if cp_group is not None and k_w > 1:
-        d_right_halo, right_halo_recv_ops = _start_right_halo_grad_recv(
-            qkvzba, conv_dim=conv_dim, halo=k_w - 1, cp_group=cp_group
-        )
 
     # ``silu_qk_save`` is the (b, 2*qk_channels, s) bf16 buffer the
     # forward wrote ``silu(conv(x))`` into for QK. Reuse it directly as
@@ -2113,99 +2234,127 @@ def _triton_pre_gated_delta_rule_backward(
         stream=v_stream,
     )
 
-    # g + beta backward fully stores d_qkvzba's alpha + beta slices, plus
-    # per-head d_A_log / d_dt_bias. Conv and z slices are filled by the
-    # causal-conv and z kernels, so d_qkvzba does not need a pre-zero.
     d_qkvzba = torch.empty_like(qkvzba)
-    _, d_A_log_fp32, d_dt_bias_fp32 = _triton_g_beta_backward(
-        qkvzba,
-        A_log,
-        dt_bias,
-        dg,
-        dbeta,
-        num_value_heads=num_value_heads,
-        key_head_dim=key_head_dim,
-        value_head_dim=value_head_dim,
-        num_key_heads=num_key_heads,
-        d_qkvzba_out=d_qkvzba,
-        stream=g_beta_stream,
-    )
+    overlap_boundary_grad_exchange = cp_group is not None and k_w > 1
 
-    # Z slice gradient: stream dgate into d_qkvzba's z slice.
-    _triton_z_layout_to_qkvzba(
-        dgate,
-        d_qkvzba,
-        z_channel_offset=z_offset,
-        num_value_heads=num_value_heads,
-        value_head_dim=value_head_dim,
-        stream=z_stream,
-    )
+    def _launch_g_beta_and_z_backward() -> Tuple[Tensor, Tensor]:
+        # g + beta backward fully stores d_qkvzba's alpha + beta slices, plus
+        # per-head d_A_log / d_dt_bias. Conv and z slices are filled by the
+        # causal-conv and z kernels, so d_qkvzba does not need a pre-zero.
+        _, d_A_log_fp32, d_dt_bias_fp32 = _triton_g_beta_backward(
+            qkvzba,
+            A_log,
+            dt_bias,
+            dg,
+            dbeta,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            num_key_heads=num_key_heads,
+            d_qkvzba_out=d_qkvzba,
+            stream=g_beta_stream,
+        )
+
+        # Z slice gradient: stream dgate into d_qkvzba's z slice.
+        _triton_z_layout_to_qkvzba(
+            dgate,
+            d_qkvzba,
+            z_channel_offset=z_offset,
+            num_value_heads=num_value_heads,
+            value_head_dim=value_head_dim,
+            stream=z_stream,
+        )
+        return d_A_log_fp32, d_dt_bias_fp32
+
+    if not overlap_boundary_grad_exchange:
+        d_A_log_fp32, d_dt_bias_fp32 = _launch_g_beta_and_z_backward()
 
     # Join only streams that wrote into d_silu_conv before conv backward.
-    # g/beta and z write disjoint outputs and can continue overlapping with conv bwd.
+    # g/beta and z write disjoint outputs: non-CP launches them above to overlap
+    # with conv backward, while chunkwise CP delays them below to overlap with
+    # boundary-gradient P2P.
     default_stream = torch.cuda.current_stream(device)
     _wait_for_streams(default_stream, qk_stream, v_stream)
 
     # Pre-allocate d_x_conv as a strided view INTO d_qkvzba's conv slice.
     # d_qkvzba memory layout is (s, b, total_channels) contiguous, so
     # element [s, b, c] sits at offset s*b_stride + b*c_stride + c.
-    # Re-interpreting that storage as (b, conv_dim, s) lets the non-CP
-    # causal_conv1d_bwd_function write d_x directly into the right cells.
+    # Re-interpreting that storage as (b, conv_dim, s) lets causal_conv1d
+    # backward write d_x directly into the right cells.
     seq_stride = qkvzba.stride(0)
     batch_stride = qkvzba.stride(1)
     d_x_conv_view = d_qkvzba.as_strided((batch, conv_dim, seq_len), (batch_stride, 1, seq_stride))
 
-    if left_halo is None:
-        # Hand-tuned C++ conv backward. Internally folds the silu' factor and
-        # computes both d_x and d_w in fp32; writes d_x directly into the
-        # view above.
-        assert causal_conv1d_bwd_function is not None
-        _, d_weight_fp32, _, _ = causal_conv1d_bwd_function(
-            qkvzba_conv,
-            weight_2d,
-            None,  # no bias
-            d_silu_conv,
-            seq_idx,
-            initial_states,
-            None,  # dfinal_states
-            d_x_conv_view,  # dx pre-allocated into d_qkvzba's conv slice
-            False,  # return_dinitial_states
-            True,  # activation (silu)
-        )
-        d_weight = d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype)
-        d_left_halo = None
+    apply_boundary_correction = left_boundary is not None and seq_idx is not None
+    causal_initial_states = None if apply_boundary_correction else initial_states
+
+    # Hand-tuned C++ conv backward. Internally folds the silu' factor and
+    # computes both d_x and d_w in fp32; writes d_x directly into the view above.
+    assert causal_conv1d_bwd_function is not None
+    _, d_weight_fp32, _, _ = causal_conv1d_bwd_function(
+        qkvzba_conv,
+        weight_2d,
+        None,  # no bias
+        d_silu_conv,
+        seq_idx,
+        causal_initial_states,
+        None,  # dfinal_states
+        d_x_conv_view,  # dx pre-allocated into d_qkvzba's conv slice
+        False,  # return_dinitial_states
+        True,  # activation (silu)
+    )
+    d_weight = d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype)
+    if left_boundary is None:
+        d_left_boundary = None
     else:
-        d_weight, d_left_halo = _triton_conv_silu_virtual_halo_backward(
+        d_left_boundary, d_weight_correction = _triton_conv_silu_boundary_backward(
             qkvzba,
             conv1d_weight,
             d_silu_conv,
             d_qkvzba,
-            left_halo,
+            left_boundary,
             cu_seqlens=cu_seqlens,
             global_token_offset=global_token_offset,
             global_seq_len=global_seq_len,
-            valid_left_halo=valid_left_halo,
+            apply_main_correction=apply_boundary_correction,
         )
-    left_halo_send_ops = None
-    _left_halo_send_buf = None
-    if cp_group is not None and k_w > 1:
-        # Send the left-halo gradient as soon as conv backward has produced it.
+        if d_weight_correction is not None:
+            d_weight = (
+                d_weight.float() + d_weight_correction.view(*conv1d_weight.shape)
+            ).to(conv1d_weight.dtype)
+    d_right_boundary = None
+    right_boundary_recv_ops = None
+    left_boundary_send_ops = None
+    _left_boundary_send_buf = None
+    if overlap_boundary_grad_exchange:
+        # Exchange boundary gradients as soon as conv backward has produced the
+        # local left-boundary gradient.
         # The remaining g/beta and z work writes disjoint d_qkvzba slices and
         # can continue overlapping with this P2P exchange.
-        left_halo_send_ops, _left_halo_send_buf = _start_left_halo_grad_send(
-            d_left_halo, cp_group=cp_group
+        (
+            d_right_boundary,
+            right_boundary_recv_ops,
+            left_boundary_send_ops,
+            _left_boundary_send_buf,
+        ) = _start_boundary_grad_exchange(
+            qkvzba,
+            d_left_boundary,
+            conv_dim=conv_dim,
+            boundary=k_w - 1,
+            cp_group=cp_group,
         )
-        _wait_distributed_ops(right_halo_recv_ops)
-        if d_right_halo is not None:
-            d_qkvzba[-(k_w - 1) :, :, :conv_dim].add_(d_right_halo)
+        d_A_log_fp32, d_dt_bias_fp32 = _launch_g_beta_and_z_backward()
+        _wait_distributed_ops(right_boundary_recv_ops)
+        if d_right_boundary is not None:
+            d_qkvzba[-(k_w - 1) :, :, :conv_dim].add_(d_right_boundary)
     default_stream.wait_stream(g_beta_stream)
     d_A_log = d_A_log_fp32.to(A_log.dtype)
     d_dt_bias = d_dt_bias_fp32.to(dt_bias.dtype)
     default_stream.wait_stream(z_stream)
-    _wait_distributed_ops(left_halo_send_ops)
-    _ = _left_halo_send_buf
+    _wait_distributed_ops(left_boundary_send_ops)
+    _ = _left_boundary_send_buf
 
-    return d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_halo
+    return d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_boundary
 
 
 class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
@@ -2240,61 +2389,40 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.num_value_heads = num_value_heads
         ctx.key_head_dim = key_head_dim
         ctx.value_head_dim = value_head_dim
-        qk_channels = num_key_heads * key_head_dim
-        v_channels = num_value_heads * value_head_dim
-        conv_dim = 2 * qk_channels + v_channels
-        halo = conv1d_weight.shape[-1] - 1
-        cp_active = cp_group is not None and cp_size > 1 and halo > 0
+        boundary = conv1d_weight.shape[-1] - 1
+        cp_active = cp_group is not None and cp_size > 1 and boundary > 0
         ctx.cp_active = cp_active
         ctx.cp_group = cp_group
-        ctx.cp_size = cp_size
-        ctx.conv_dim = conv_dim
-        ctx.halo = halo
-        ctx.valid_left_halo = halo
         ctx.has_cu_seqlens = False
-        ctx.has_left_halo = False
+        ctx.has_left_boundary = False
         ctx.global_token_offset = 0
         ctx.global_seq_len = qkvzba.shape[0]
         cp_rank = cp_group.rank() if cp_active else 0
 
-        cu_seqlens_for_forward = cu_seqlens
-        left_halo = None
-        left_halo_recv_ops = None
-        left_halo_send_ops = None
-        _left_halo_send_buf = None
-        global_token_offset = 0
-        global_seq_len = None
         seq_idx_for_backward = seq_idx
-        if cp_active:
-            (
-                left_halo,
-                left_halo_recv_ops,
-                left_halo_send_ops,
-                _left_halo_send_buf,
-            ) = _start_left_halo_exchange(
-                qkvzba, conv_dim=conv_dim, halo=halo, cp_group=cp_group
+        seq_idx_ready_event = None
+        if cp_active and cu_seqlens is not None:
+            ctx.has_cu_seqlens = True
+            seq_idx_for_backward = _resolve_chunkwise_cp_packed_seq_idx(
+                cu_seqlens, qkvzba.shape[0], cp_rank
             )
-            if cu_seqlens is not None:
-                global_token_offset = cp_rank * qkvzba.shape[0]
-                global_seq_len = qkvzba.shape[0] * cp_size
-                ctx.has_cu_seqlens = True
-                ctx.global_token_offset = global_token_offset
-                ctx.global_seq_len = global_seq_len
-                valid_left_halo = _valid_packed_left_halo_width(
-                    cu_seqlens,
-                    local_seq_len=qkvzba.shape[0],
-                    halo=halo,
-                    cp_rank=cp_rank,
-                )
-                ctx.valid_left_halo = valid_left_halo
-                seq_idx_for_backward = _resolve_chunkwise_cp_packed_seq_idx(
-                    cu_seqlens, qkvzba.shape[0], cp_rank
-                )
-        ctx.has_left_halo = left_halo is not None
-        qkvzba_for_forward = qkvzba
+            seq_idx_ready_event = torch.cuda.Event()
+            seq_idx_ready_event.record(torch.cuda.current_stream(qkvzba.device))
+        ctx.seq_idx_ready_event = seq_idx_ready_event
 
-        query, key, value, gate, beta, g, silu_qk_save = _triton_pre_gated_delta_rule_forward(
-            qkvzba_for_forward,
+        (
+            query,
+            key,
+            value,
+            gate,
+            beta,
+            g,
+            silu_qk_save,
+            left_boundary,
+            global_token_offset,
+            global_seq_len,
+        ) = _triton_pre_gated_delta_rule_forward(
+            qkvzba,
             conv1d_weight,
             A_log,
             dt_bias,
@@ -2302,22 +2430,21 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             num_value_heads=num_value_heads,
             key_head_dim=key_head_dim,
             value_head_dim=value_head_dim,
-            cu_seqlens=cu_seqlens_for_forward,
-            left_halo=left_halo,
-            left_halo_recv_ops=left_halo_recv_ops,
-            left_halo_send_ops=left_halo_send_ops,
-            global_token_offset=global_token_offset,
-            global_seq_len=global_seq_len,
+            cu_seqlens=cu_seqlens,
+            cp_group=cp_group,
+            cp_size=cp_size,
         )
-        _ = _left_halo_send_buf
+        ctx.has_left_boundary = left_boundary is not None
+        ctx.global_token_offset = global_token_offset
+        ctx.global_seq_len = global_seq_len
         ctx.has_seq_idx = seq_idx_for_backward is not None
-        saved_tensors = [qkvzba_for_forward, conv1d_weight, A_log, dt_bias, silu_qk_save]
+        saved_tensors = [qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save]
         if ctx.has_seq_idx:
             saved_tensors.append(seq_idx_for_backward)
         if ctx.has_cu_seqlens:
             saved_tensors.append(cu_seqlens)
-        if ctx.has_left_halo:
-            saved_tensors.append(left_halo)
+        if ctx.has_left_boundary:
+            saved_tensors.append(left_boundary)
         ctx.save_for_backward(*saved_tensors)
         return query, key, value, gate, beta, g
 
@@ -2339,6 +2466,10 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         if ctx.has_seq_idx:
             seq_idx = ctx.saved_tensors[saved_idx]
             saved_idx += 1
+            if ctx.seq_idx_ready_event is not None:
+                torch.cuda.current_stream(qkvzba_for_backward.device).wait_event(
+                    ctx.seq_idx_ready_event
+                )
         else:
             seq_idx = None
         if ctx.has_cu_seqlens:
@@ -2346,12 +2477,12 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             saved_idx += 1
         else:
             cu_seqlens = None
-        if ctx.has_left_halo:
-            left_halo = ctx.saved_tensors[saved_idx]
+        if ctx.has_left_boundary:
+            left_boundary = ctx.saved_tensors[saved_idx]
             saved_idx += 1
         else:
-            left_halo = None
-        d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_halo = _triton_pre_gated_delta_rule_backward(
+            left_boundary = None
+        d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_boundary = _triton_pre_gated_delta_rule_backward(
             qkvzba_for_backward,
             conv1d_weight,
             silu_qk_save,
@@ -2368,11 +2499,10 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             key_head_dim=ctx.key_head_dim,
             value_head_dim=ctx.value_head_dim,
             seq_idx=seq_idx,
-            left_halo=left_halo,
+            left_boundary=left_boundary,
             cu_seqlens=cu_seqlens,
             global_token_offset=ctx.global_token_offset,
             global_seq_len=ctx.global_seq_len,
-            valid_left_halo=ctx.valid_left_halo,
             cp_group=ctx.cp_group if ctx.cp_active else None,
         )
         # Match forward inputs: (qkvzba, conv1d_weight, A_log, dt_bias,
@@ -2428,11 +2558,11 @@ def fused_streamed_pre_gated_delta_rule(
         cu_seqlens: Optional packed THD cumulative sequence lengths. When CP
             is inactive, ``cu_seqlens[-1]`` must equal local ``seq_len``. When
             chunkwise CP is active, pass global packed boundaries so the fused
-            path can mask virtual halo taps at packed sequence boundaries.
+            path can mask virtual boundary taps at packed sequence boundaries.
         seq_idx: Optional precomputed token-to-sequence map with shape
             ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
         cp_group: Optional chunkwise-CP process group. When it has size > 1,
-            the fused path prepends a previous-rank conv halo internally.
+            the fused path prepends a previous-rank conv boundary internally.
 
     Returns:
         ``(query, key, value, gate, beta, g)`` matching the unfused
@@ -2466,11 +2596,11 @@ def fused_streamed_pre_gated_delta_rule(
                 "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
                 f"for fused_pre_gated_delta_rule; got batch={qkvzba.shape[1]}."
             )
-        halo = conv1d_weight.shape[-1] - 1
-        if halo > 0 and qkvzba.shape[0] < halo:
+        boundary = conv1d_weight.shape[-1] - 1
+        if boundary > 0 and qkvzba.shape[0] < boundary:
             raise ValueError(
                 "fused_pre_gated_delta_rule chunkwise CP requires local chunk length "
-                f"({qkvzba.shape[0]}) >= conv_kernel_dim - 1 ({halo})."
+                f"({qkvzba.shape[0]}) >= conv_kernel_dim - 1 ({boundary})."
             )
         if seq_idx is not None:
             raise ValueError(
@@ -2497,20 +2627,11 @@ def fused_streamed_pre_gated_delta_rule(
             "Packed fused_pre_gated_delta_rule requires at least one packed sequence; "
             f"got {cu_seqlens.shape=}."
         )
-        assert cu_seqlens[0].item() == 0, (
-            "Packed fused_pre_gated_delta_rule requires cu_seqlens[0] == 0, "
-            f"got {cu_seqlens[0].item()}."
-        )
-        assert torch.all(cu_seqlens[1:] >= cu_seqlens[:-1]).item(), (
-            "Packed fused_pre_gated_delta_rule requires monotonically non-decreasing "
-            f"cu_seqlens, got {cu_seqlens}."
-        )
-        expected_tokens = qkvzba.shape[0] * cp_size
-        assert cu_seqlens[-1].item() == expected_tokens, (
-            "Packed fused_pre_gated_delta_rule requires cu_seqlens[-1] to match "
-            f"{'global' if cp_size > 1 else 'local'} seq_len, "
-            f"got {cu_seqlens[-1].item()} vs {expected_tokens}."
-        )
+        # Caller contract: packed boundaries start at zero, are monotonically
+        # non-decreasing, and end at the local token count for CP1 or the global
+        # token count for chunkwise CP. Checking those values here requires GPU
+        # reductions and D2H synchronizations, so the fused hot path trusts the
+        # packed-sequence scheduler to provide valid cu_seqlens.
         cu_seqlens = cu_seqlens.contiguous()
         if cp_size == 1:
             seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkvzba.shape[0])
