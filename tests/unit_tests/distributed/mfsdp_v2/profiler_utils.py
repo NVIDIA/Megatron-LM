@@ -4,6 +4,7 @@
 
 import re
 
+from torch.autograd import DeviceType
 from torch.autograd.profiler_util import FunctionEvent
 
 
@@ -33,7 +34,7 @@ def collect_linked_device_events(
     # is the "no device correlation" sentinel and is skipped.
     op_by_correlation: dict[int, FunctionEvent] = {}
     for event in events:
-        if event.device_type.name != "CPU" or not event.linked_correlation_id:
+        if event.device_type != DeviceType.CPU or not event.linked_correlation_id:
             continue
         node = event
         while node is not None:
@@ -44,7 +45,7 @@ def collect_linked_device_events(
 
     device_events_by_op: dict[FunctionEvent, list[FunctionEvent]] = {}
     for event in events:
-        if event.device_type.name != "CUDA":
+        if event.device_type != DeviceType.CUDA:
             continue
         op = op_by_correlation.get(event.linked_correlation_id)
         if op is not None:
