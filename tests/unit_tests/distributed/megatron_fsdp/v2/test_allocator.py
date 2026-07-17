@@ -86,6 +86,21 @@ class TestTemporaryBucketAllocator:
 
 class TestTracePoolAllocator:
 
+    def test_optimized_allocate_rejects_live_slot_collision(self):
+        allocator = TracePoolAllocator()
+        device = torch.device("cpu")
+
+        allocator.allocate(key="first", size=8, dtype=torch.float32, device=device)
+        allocator.free("first")
+        allocator.allocate(key="second", size=8, dtype=torch.float32, device=device)
+        allocator.free("second")
+        allocator.plan()
+
+        assert allocator._key_to_slot["first"] == allocator._key_to_slot["second"]
+        allocator.allocate(key="first", size=8, dtype=torch.float32, device=device)
+        with pytest.raises(RuntimeError, match="slot collision"):
+            allocator.allocate(key="second", size=8, dtype=torch.float32, device=device)
+
     def test_late_optimized_key_gets_dedicated_slot(self):
         allocator = TracePoolAllocator()
         device = torch.device("cpu")

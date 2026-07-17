@@ -483,6 +483,12 @@ class TracePoolAllocator(BucketAllocator):
             self._add_optimized_key(key, size, dtype, device)
         slot_idx = self._key_to_slot[key]
         slot = self._slots[slot_idx]
+        if slot.in_use and key not in self._active_keys:
+            raise RuntimeError(
+                f"TracePoolAllocator slot collision: slot {slot_idx} is already in use "
+                f"while allocating key {key!r}. The optimized allocation lifetimes "
+                "differ from the traced lifetimes."
+            )
         assert size <= slot.size, (
             f"requested {size} > slot capacity {slot.size} (key={key!r})"
         )
