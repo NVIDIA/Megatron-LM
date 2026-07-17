@@ -20,7 +20,18 @@ import tarfile
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 import torch
@@ -33,6 +44,7 @@ try:
 except ImportError:
     HAVE_ZSTANDARD = False
 
+from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.training import get_args
 from megatron.training.utils import get_blend_and_blend_per_split
@@ -175,20 +187,32 @@ def storage_glob(pattern: str) -> List[str]:
     return glob.glob(pattern)
 
 
+def _broadcast_without_pp(factory: Callable[[], Any]) -> Any:
+    """Run *factory* on the TP×DP×CP group src rank and broadcast the result.
+
+    Object-store traffic is expensive / rate-limited (e.g. Swiftstack), so only
+    one rank per pipeline stage should list or open remote objects.  Uses the
+    TP×DP×CP group (every rank on this stage) rather than WORLD, because the
+    KD loader only runs on the last PP stage and a world-group broadcast would
+    deadlock under PP>1.  All ranks on the calling stage must enter this
+    collective.  On a single process, just calls *factory* locally.
+    """
+    if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+        return factory()
+    group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+    src = dist.get_process_group_ranks(group)[0]
+    payload = [factory() if dist.get_rank() == src else None]
+    dist.broadcast_object_list(payload, src=src, group=group)
+    return payload[0]
+
+
 def _storage_glob_rank0(pattern: str, cached: bool = False) -> List[str]:
-    """Run ``storage_glob`` on rank 0 and broadcast the result."""
+    """Run ``storage_glob`` once per pipeline stage and broadcast the result."""
     if cached:
         if (paths := _STORAGE_GLOB_CACHE.get(pattern)) is not None:
             return paths
 
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        payload = [storage_glob(pattern) if dist.get_rank() == 0 else None]
-        dist.broadcast_object_list(payload, src=0)
-        paths = payload[0]
-    else:
-        paths = storage_glob(pattern)
-
-    paths = list(paths or [])
+    paths = list(_broadcast_without_pp(lambda: storage_glob(pattern)) or [])
     _STORAGE_GLOB_CACHE[pattern] = paths
     return paths
 
@@ -654,24 +678,15 @@ def peek_logprobs_metadata(tar_path: str) -> Optional[Dict[str, Any]]:
 def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
     """Read ``_meta.json`` from any available tar in *logprobs_dir*.
 
-    Rank-0 does the I/O and broadcasts the parsed dict to the rest of the
-    world to keep object-store list/get calls down to one.  Returns
-    ``None`` if no tars are present yet.  Used by the loader factory to
-    discover the on-disk format version before instantiating a dataset.
+    Listing goes through :func:`storage_glob_with_caching` (rank-0 object-store
+    list + cache).  The metadata peek itself is also rank-0 on the TP×DP×CP
+    group and broadcast to the rest of the stage, so only one rank opens the
+    tar.  Returns ``None`` if no tars are present yet.
     """
-    distributed = (
-        dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-    )
     tars = storage_glob_with_caching(logprobs_dir, "*.tar")
-    if distributed and dist.get_rank() != 0:
-        meta: Optional[Dict[str, Any]] = None
-    else:
-        meta = peek_logprobs_metadata(tars[0]) if tars else None
-    if distributed:
-        payload: List[Optional[Dict[str, Any]]] = [meta]
-        dist.broadcast_object_list(payload, src=0)
-        return payload[0]
-    return meta
+    return _broadcast_without_pp(
+        lambda: peek_logprobs_metadata(tars[0]) if tars else None
+    )
 
 
 def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
