@@ -150,6 +150,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
+        env_index: int = 0,
     ) -> GroupRolloutParams:
 
         prompt, golden = await self.get_prompt(validation=request.validation)
@@ -161,6 +162,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return GroupRolloutParams(
             inference_request=inference_request,
             build_rollout=functools.partial(self._rollout_from_response, request, golden=golden),
+            agent=self,
         )
 
     async def _evaluation(
