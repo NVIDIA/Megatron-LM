@@ -1826,14 +1826,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
             )
 
-        if (
-            self.cache_mla_latent
-            and triton_append_mla_latent_cache is not None
-            and (
-                torch.cuda.is_current_stream_capturing()
-                or getattr(self, "use_triton_mla_append", False)
-            )
-        ):
+        if self.cache_mla_latent and triton_append_mla_latent_cache is not None:
             return triton_append_mla_latent_cache(
                 layer_number=attention_layer_number,
                 kv_concat=key,
