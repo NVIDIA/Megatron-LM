@@ -2974,29 +2974,102 @@ async def _rollout_keepalive(inference_interface, interval_s, requests_per_tick,
                 return
 
 
+def _rollout_keepalive_burn(interval_s, stop_event):
+    """Per-rank GPU burn thread: a few seconds of matmul per interval.
+
+    The generation-request keepalive above is routed through the inference
+    interface, but the dynamic engine is COOPERATIVE -- it only steps when the
+    rollout wave loop drives it. When every in-flight rollout is off in
+    environment land (agentic episodes running containers for 30-90 min), all
+    ranks sit in the same asyncio select loop, queued keepalive requests are
+    never processed, and the whole job reads as idle: grid job 5435098 was
+    reaped at "64/64 GPUs idle for 30m, 100% waste" with that keepalive armed
+    and zero logged failures. This thread does not depend on the engine at
+    all: every rank keeps its own SMs measurably busy. ~3s of burn per 60s
+    tick is a ~5% duty cycle against the reaper's SM_ACTIVE <= 0.01 test.
+    Must never raise: keepalive is cosmetic and must not affect training.
+    """
+    import time as _time
+
+    try:
+        device = torch.cuda.current_device()
+        stream = torch.cuda.Stream(device=device)
+        # Engine init captures CUDA graphs (inference_dynamic_batching_num_cuda_graphs
+        # buckets); out-of-band GPU work during capture can invalidate it. Captures
+        # happen at engine build, well inside the first 5 minutes -- and the reaper
+        # window is 30 -- so sit out the start rather than probe capture state.
+        if stop_event.wait(300.0):
+            return
+        a = b = None
+        failures = 0
+        while not stop_event.is_set():
+            try:
+                with torch.cuda.stream(stream):
+                    if a is None:
+                        a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+                        b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+                    t0 = _time.monotonic()
+                    while _time.monotonic() - t0 < 3.0 and not stop_event.is_set():
+                        for _ in range(8):
+                            torch.matmul(a, b)
+                        stream.synchronize()
+                failures = 0
+            except Exception:
+                failures += 1
+                a = b = None  # drop tensors in case the failure was an OOM
+                if failures == 1:
+                    logger.warning("Keepalive burn failed; retrying quietly.", exc_info=True)
+                if failures >= 10:
+                    logger.warning("Keepalive burn disabled after 10 consecutive failures.")
+                    return
+            if stop_event.wait(interval_s):
+                return
+    except Exception:
+        logger.warning("Keepalive burn thread exiting.", exc_info=True)
+
+
 def _maybe_start_rollout_keepalive(args, loop, inference_interface):
-    """Start the keepalive task on rank 0 if --rl-rollout-keepalive-interval > 0."""
+    """Start keepalives if --rl-rollout-keepalive-interval > 0.
+
+    Two mechanisms with one lifetime: a per-rank burn thread on EVERY rank
+    (reliable reaper defense, engine-independent), plus the engine-routed
+    dummy generations on rank 0 (exercises the real decode path whenever the
+    engine is actually serving).
+    """
     import asyncio
+    import threading
 
     interval_s = getattr(args, 'rl_rollout_keepalive_interval', 0.0) or 0.0
-    if interval_s <= 0 or torch.distributed.get_rank() != 0:
+    if interval_s <= 0:
         return None, None
+    burn_stop = threading.Event()
+    burn_thread = threading.Thread(
+        target=_rollout_keepalive_burn, args=(interval_s, burn_stop), daemon=True
+    )
+    burn_thread.start()
+    if torch.distributed.get_rank() != 0:
+        return (None, burn_stop, burn_thread), None
     requests_per_tick = max(1, getattr(args, 'data_parallel_size', 1) or 1)
     stop_event = asyncio.Event()
     task = loop.create_task(
         _rollout_keepalive(inference_interface, interval_s, requests_per_tick, stop_event)
     )
     logger.info(
-        f"Rollout keepalive enabled: {requests_per_tick} dummy generation(s) "
-        f"every {interval_s:.0f}s while in inference mode."
+        f"Rollout keepalive enabled: per-rank burn thread + {requests_per_tick} dummy "
+        f"generation(s) every {interval_s:.0f}s while in inference mode."
     )
-    return stop_event, task
+    return (stop_event, burn_stop, burn_thread), task
 
 
 def _stop_rollout_keepalive(loop, stop_event, task):
     """Stop the keepalive task, letting an in-flight tiny generation drain first."""
     import asyncio
 
+    if stop_event is not None:
+        _, burn_stop, burn_thread = stop_event
+        stop_event = stop_event[0]
+        burn_stop.set()
+        burn_thread.join(timeout=10)
     if task is None:
         return
     stop_event.set()
