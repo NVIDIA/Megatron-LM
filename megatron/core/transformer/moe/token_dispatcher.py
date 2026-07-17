@@ -1497,10 +1497,12 @@ class _DeepepV2Manager(_DeepepManager):
         self.router_dtype = config.moe_router_dtype
         self.capacity_factor = config.moe_expert_capacity_factor
         self.permute_fusion = config.moe_permute_fusion
-        if config.moe_deepep_num_sms is None:
-            self.num_sms = 0
-        else:
-            self.num_sms = config.moe_deepep_num_sms
+        # Preserve DeepEP v2's default while honoring the unified flex dispatcher setting.
+        self.num_sms = (
+            config.moe_flex_dispatcher_num_sms
+            if config.moe_flex_dispatcher_num_sms is not None
+            else 0
+        )
 
         self.token_indices: Optional[torch.Tensor] = None
         self.token_probs: Optional[torch.Tensor] = None
