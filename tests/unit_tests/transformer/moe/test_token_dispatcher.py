@@ -439,8 +439,7 @@ def test_hybridep_pad_variable_tokens_metadata(monkeypatch):
     local_num_tokens = 17
     max_num_tokens_across_ep = 70
     padded_num_tokens = (
-        max_num_tokens_across_ep
-        + -max_num_tokens_across_ep % HYBRIDEP_TOKEN_ALIGNMENT
+        max_num_tokens_across_ep + -max_num_tokens_across_ep % HYBRIDEP_TOKEN_ALIGNMENT
     )
     routing_map = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.bool)
     probs = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.float32)
