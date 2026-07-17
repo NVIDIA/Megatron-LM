@@ -200,6 +200,13 @@ class FsdpParameterGroup:
         if self.main_weight is self.model_weight:
             return
 
+        if self.main_weight.placements == self.model_weight.placements:
+            self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
+            return
+
+        # main_weight is typically the higher-precision optimizer dtype, while
+        # model_weight is the lower-precision compute dtype. Cast before redistributing
+        # so cross-rank communication moves the smaller compute-dtype payload.
         self.main_weight.cast(self.model_weight.dtype).redistribute(
             self.model_weight.placements, out=self.model_weight
         )
