@@ -485,15 +485,15 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-def test_overlaps_communication_and_compute(distributed_setup):
-    """Forward and backward communication should overlap GEMM compute.
-
-    Uses NCCL's zero-CTA policy so the all-gather runs on the copy engine (SM-free)
-    instead of an SM-based kernel: it can never contend with the GEMMs for SMs, so the
-    overlap count is deterministic and the strict theoretical-maximum thresholds hold.
-    (The SM-based ring collectives this replaces jitter with launch timing -- amplified
-    by CI's coverage wrapper -- and dip below the maximum.)
-    """
+@pytest.mark.parametrize(
+    "use_symm_mem",
+    [
+        pytest.param(False, marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev], id="default"),
+        pytest.param(True, id="symmetric_memory"),
+    ],
+)
+def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
+    """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -510,20 +510,23 @@ def test_overlaps_communication_and_compute(distributed_setup):
     num_children = 4
     dtype = torch.bfloat16
 
-    # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
-    # per-communicator property, so scoping it to this group leaves the rest of the
-    # bucket on default-CTA symmetric-memory kernels (test_symmetric_memory.py asserts
-    # ncclSymk all-gather kernel counts, which zero-CTA would turn into copy-engine
-    # memcpys). This 1-D group models the DP (FSDP) sub-mesh that mfsdp is handed in
-    # production: with EP/TP the full device mesh is multi-dimensional, but mfsdp
-    # requires an all-FSDP mesh (see experimental/module.py) and never sees the TP/EP
-    # axes, so only the DP communicator needs the zero-CTA policy. Creating the group
-    # off the conftest's device_id eager-initialized default process group uses a comm
-    # split, which avoids the cold-communicator symmetric-memory rendezvous failure
-    # (https://github.com/pytorch/pytorch/issues/188567).
-    zero_cta_options = dist.ProcessGroupNCCL.Options()
-    zero_cta_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
-    dp_group = dist.new_group(backend="nccl", pg_options=zero_cta_options)
+    if use_symm_mem:
+        # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
+        # per-communicator property, so scoping it to this group leaves the rest of the
+        # bucket on default-CTA symmetric-memory kernels (test_symmetric_memory.py asserts
+        # ncclSymk all-gather kernel counts, which zero-CTA would turn into copy-engine
+        # memcpys). This 1-D group models the DP (FSDP) sub-mesh that mfsdp is handed in
+        # production: with EP/TP the full device mesh is multi-dimensional, but mfsdp
+        # requires an all-FSDP mesh (see experimental/module.py) and never sees the TP/EP
+        # axes, so only the DP communicator needs the zero-CTA policy. Creating the group
+        # off the conftest's device_id eager-initialized default process group uses a comm
+        # split, which avoids the cold-communicator symmetric-memory rendezvous failure
+        # (https://github.com/pytorch/pytorch/issues/188567).
+        zero_cta_options = dist.ProcessGroupNCCL.Options()
+        zero_cta_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
+        dp_group = dist.new_group(backend="nccl", pg_options=zero_cta_options)
+    else:
+        dp_group = dist.new_group(backend="nccl")
 
     mesh = DeviceMesh.from_group(dp_group, device.type)
     model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
@@ -535,10 +538,14 @@ def test_overlaps_communication_and_compute(distributed_setup):
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=policy,
-            use_symm_mem=True,
+            use_symm_mem=use_symm_mem,
         )
     fully_shard(
-        model, mesh=mesh, placements=placements, mixed_precision_policy=policy, use_symm_mem=True
+        model,
+        mesh=mesh,
+        placements=placements,
+        mixed_precision_policy=policy,
+        use_symm_mem=use_symm_mem,
     )
 
     x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
@@ -559,8 +566,9 @@ def test_overlaps_communication_and_compute(distributed_setup):
         torch.cuda.synchronize(device)
 
     events = prof.events()
-    # A GEMM launches under aten::mm as the matmul kernel plus a cudaMemsetAsync (device
-    # events collected by CPU op -- see collect_linked_device_events); keep the matmuls.
+    # A GEMM launches under aten::mm as the matmul kernel plus a cudaMemsetAsync
+    # (device events collected by CPU op -- see collect_linked_device_events);
+    # keep the matmuls.
     gemm_events = []
     for op_device_events in collect_linked_device_events(events, _GEMM_OP_PATTERN).values():
         gemm_events += [event for event in op_device_events if "memset" not in event.name.lower()]
@@ -605,13 +613,15 @@ def test_overlaps_communication_and_compute(distributed_setup):
         any(events_overlap(event, gemm) for event in group for gemm in gemm_events)
         for group in reduce_scatter_events.values()
     )
-    # SM-free all-gather overlaps deterministically, so assert the theoretical maximum:
-    # a forward and a backward all-gather for each of the num_children - 1 non-root
-    # children, and one reduce-scatter per non-root child.
-    expected_all_gather_overlap = 2 * (num_children - 1)
-    expected_reduce_scatter_overlap = num_children - 1
+    # The symmetric-memory case uses NCCL's zero-CTA policy so the all-gather runs on the
+    # copy engine (SM-free) instead of an SM-based kernel: it can never contend with the
+    # GEMMs for SMs, so the overlap count is deterministic and the strict theoretical
+    # maximum thresholds hold. The default case preserves the original non-symmetric path
+    # with looser thresholds since SM-based NCCL kernels can jitter with launch timing.
+    expected_all_gather_overlap = 2 * (num_children - 1) if use_symm_mem else 2
+    expected_reduce_scatter_overlap = num_children - 1 if use_symm_mem else 1
     assert all_gather_overlap_count >= expected_all_gather_overlap, (
-        f"Expected at least {expected_all_gather_overlap} copy-engine all-gathers to "
+        f"Expected at least {expected_all_gather_overlap} all-gathers to "
         f"overlap compute, got {all_gather_overlap_count}/{len(all_gather_events)}."
     )
     assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap, (
@@ -622,7 +632,7 @@ def test_overlaps_communication_and_compute(distributed_setup):
     # Release the dedicated communicator so it does not leak into the shared session
     # (the mfsdp_v2 bucket keeps one process group alive across tests). On a failure
     # above the group leaks, which is acceptable. Destroying this subgroup leaves the
-    # default process group (and the conftest teardown barrier) untouched.
+    # default process group and conftest teardown barrier.
     dist.destroy_process_group(dp_group)
 
 
