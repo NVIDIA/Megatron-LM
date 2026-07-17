@@ -152,7 +152,11 @@ class FsdpModule:
             return
 
         root_module = cast(nn.Module, self)
-        context = FsdpContext(device=self._parameter_groups[0].main_weight.device, root_module=self)
+        first_parameter = next(root_module.parameters(), None)
+        if first_parameter is None:
+            raise RuntimeError("FSDP root module requires at least one parameter in its subtree.")
+
+        context = FsdpContext(device=first_parameter.device, root_module=self)
         # named_modules() yields FsdpModules in registration order, which is the static
         # forward execution order used to prefetch the next FsdpModule's all-gather.
         for submodule_name, submodule in root_module.named_modules():
@@ -396,8 +400,6 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
             visit(child_module, child_fqn)
 
     visit(root_module, "")
-    if not parameters:
-        raise ValueError("fully_shard requires at least one unowned parameter.")
     return parameters
 
 
