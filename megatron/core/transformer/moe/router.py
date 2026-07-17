@@ -495,7 +495,9 @@ class TopKRouter(Router):
             aux_loss,
             "seq_load_balancing_loss",
             self.tp_cp_group,
-            valid_token_count=local_num_tokens,
+            # local_num_tokens is per-sequence (bsz folded into the expert dim above);
+            # * bsz recovers the micro-batch total, else per-token-loss scaling keeps a 1/MBS.
+            valid_token_count=local_num_tokens * bsz,
         )
         return probs
 
