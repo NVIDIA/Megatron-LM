@@ -595,7 +595,10 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = 
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
-        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+        hybrid_stack_spec = import_module(args.spec)
+        if callable(hybrid_stack_spec):
+            hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
+        kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
