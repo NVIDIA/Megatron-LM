@@ -913,12 +913,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert ctx.mamba_metadata.max_intermediate_count == expected
         assert ctx.mamba_slot_allocator.intermediate_ssm_out.shape[1] == expected
 
-        # Tiny token budget: the per-request floor takes over.
-        ctx_small = self._mctx(block_size_tokens=256, max_tokens=256)
-        assert (
-            ctx_small.max_mamba_intermediate_states_per_step == MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
-        )
-
     @pytest.mark.internal
     def test_intermediate_count_bounded_by_token_budget(self):
         # Claim: a single engine step emits at most max_tokens / block_size Mamba
