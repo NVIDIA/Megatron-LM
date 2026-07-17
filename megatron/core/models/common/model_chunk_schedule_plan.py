@@ -176,12 +176,15 @@ class TransformerLayerSchedulePlan:
             "is_last_layer_in_mhc_recompute_group", False
         ):
             group_index = extra_args["mhc_recompute_group_index"]
+            # The group counter restarts per module (decoder / mtp), so fold the
+            # module tag into the NVTX label to keep profiles unambiguous.
+            module_tag = extra_args.get("mhc_recompute_module_tag", "decoder")
             self.mhc_recompute = ScheduleNode(
                 mhc_recompute_manager.recompute_now,
                 comp_stream,
                 event,
                 name="mhc_recompute",
-                forward_nvtx_name=f"mhc/recompute/group_{group_index}/B",
+                forward_nvtx_name=f"mhc/recompute/{module_tag}/group_{group_index}/B",
             )
         else:
             self.mhc_recompute = None
@@ -415,9 +418,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # build layer schedule plan for each layer.
         # The methods to obtain layers are different for MTP so we need the other build plan for
         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
-        self._build_layer_schedule_plan(model.decoder, get_comp_stream, get_comm_stream)
         self._build_layer_schedule_plan(
-            getattr(model, "mtp", None), get_comp_stream, get_comm_stream
+            model.decoder, get_comp_stream, get_comm_stream, module_tag="decoder"
+        )
+        self._build_layer_schedule_plan(
+            getattr(model, "mtp", None), get_comp_stream, get_comm_stream, module_tag="mtp"
         )
 
         # build post process
@@ -426,7 +431,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
-    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
+    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream, module_tag):
         if module is None:
             return
 
@@ -458,6 +463,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 "mhc_recompute_manager": mhc_recompute_manager,
                 "is_last_layer_in_mhc_recompute_group": is_group_end,
                 "mhc_recompute_group_index": group_index,
+                "mhc_recompute_module_tag": module_tag,
             }
             layer_plan = TransformerLayerSchedulePlan(
                 module.layers[layer_idx],

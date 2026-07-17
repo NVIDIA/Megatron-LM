@@ -463,21 +463,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # See set_input_tensor().
             hidden_states = self.input_tensor
 
-        # Viewless tensor.
-        # - We only need to create a viewless tensor in the case of micro batch
-        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
-        #   above creates a view tensor, and '.contiguous()' is a pass-through.
-        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
-        #   the need to make it viewless.
-        #
-        #   However, we don't explicitly check mbs == 1 here because
-        #   make_viewless_tensor() has negligible overhead when its input
-        #   is already viewless.
-        #
-        # - For the 'else' case above, calling make_viewless_tensor() here is
-        #   likely redundant, since p2p_communication.py (likely originator)
-        #   already creates viewless tensors. That said, make_viewless_tensor()
-        #   is called here to be future-proof and corner-case-proof.
+        # Make the input viewless. This is usually redundant — embedding outputs and
+        # p2p_communication.py both produce viewless tensors — but make_viewless_tensor()
+        # is a negligible-overhead no-op on already-viewless inputs, so it is kept here
+        # defensively for mbs == 1 view-tensor and other corner cases.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         # Expand hidden states for hyper connections at the start of the block.

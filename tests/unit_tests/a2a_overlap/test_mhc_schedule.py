@@ -200,7 +200,7 @@ def test_model_chunk_builds_independent_two_layer_recompute_groups(monkeypatch):
     )
     module = SimpleNamespace(config=config, layers=[object() for _ in range(5)], training=True)
 
-    plan._build_layer_schedule_plan(module, get_comp_stream, lambda: None)
+    plan._build_layer_schedule_plan(module, get_comp_stream, lambda: None, module_tag="decoder")
 
     managers = [extra_args["mhc_recompute_manager"] for extra_args in captured_extra_args]
     assert managers[0] is managers[1]
