@@ -163,12 +163,21 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
     if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
+    # new_group requires a default process group. Initialize it here so this test works
+    # in isolation. Do not eagerly initialize it with device_id in the shared fixture:
+    # that can hang teardown after communicator splits; see
+    # https://github.com/pytorch/pytorch/issues/190396.
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
     # Dedicated communicator with NCCL's zero-CTA policy, scoped to this test so the rest
-    # of the bucket keeps default-CTA symmetric-memory kernels. Created off the conftest's
-    # device_id eager-initialized default group via a comm split.
+    # of the bucket keeps default-CTA symmetric-memory kernels.
     zero_cta_options = dist.ProcessGroupNCCL.Options()
     zero_cta_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
     dp_group = dist.new_group(backend="nccl", pg_options=zero_cta_options)
+    # NCCL window registration can fail when symmetric-memory rendezvous is the first
+    # operation on a communicator, so initialize this communicator explicitly.
+    dist.barrier(group=dp_group, device_ids=[device.index])
     mesh = DeviceMesh.from_group(dp_group, device.type)
 
     num_training_steps = 5

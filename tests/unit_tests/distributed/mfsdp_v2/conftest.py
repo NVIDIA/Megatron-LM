@@ -41,14 +41,6 @@ def distributed_setup() -> Iterator[DistributedSetup]:
     else:
         device = torch.device("cpu")
 
-    # Eagerly initialize the default process group with device_id so the NCCL
-    # communicator is established before symmetric-memory rendezvous. NCCL window
-    # registration can fail when rendezvous is the first NCCL op on a process group.
-    # A full-world init_device_mesh reuses this default group, and subgroups created
-    # from it avoid the cold-communicator registration failure.
-    if device.type == "cuda" and not dist.is_initialized():
-        dist.init_process_group(backend="nccl", device_id=device)
-
     yield DistributedSetup(rank=rank, world_size=world_size, device=device)
 
     if dist.is_initialized():
