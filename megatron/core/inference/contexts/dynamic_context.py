@@ -2882,12 +2882,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_tokens_can_be_added = (
             self.active_token_count + effective_prefill_chunk_length <= self.max_tokens
         )
-        # Matched blocks are currently evictable (ref_count == 0) but add_request
-        # will pin them before allocating, so they cannot serve as free capacity
-        # for the new blocks this request needs. Exclude them from the evictable
-        # count so availability matches what allocation can actually satisfy.
+        # add_request pins the matched blocks before allocating. Only matches that
+        # are currently evictable (ref_count == 0) count against the evictable
+        # pool; matches already pinned by another in-flight request are not in
+        # get_evictable_block_count() and pinning them frees nothing. Reserve only
+        # the ref_count == 0 matches so availability is not under-reported.
+        reserved_evictable = 0
+        if matched_block_ids:
+            matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
+            reserved_evictable = int(
+                (self.kv_block_allocator.block_ref_counts[matched_tensor] == 0).sum()
+            )
         kv_cache_available = self.kv_block_allocator.is_memory_available(
-            num_blocks_from_pool, reserved_evictable=len(matched_block_ids)
+            num_blocks_from_pool, reserved_evictable=reserved_evictable
         )
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 

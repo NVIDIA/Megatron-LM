@@ -435,6 +435,13 @@ class KVBlockAllocator:
         # converge and spin forever. With the cap we stop at a bounded (if
         # arbitrary) ordering instead of hanging; correctness still degrades
         # gracefully to "some valid block set is evicted".
+        #
+        # TODO(perf): this relaxation is O(max_depth) iterations, each O(num_cached)
+        # work — so O(num_cached * max_depth) per eviction. For very long single
+        # chains (e.g. a 1M-token prompt at block_size 256 is ~4k blocks -> ~4k
+        # iterations) this can get expensive under memory pressure. If it shows up
+        # in profiling, switch to pointer-jumping / path-doubling to converge in
+        # O(log max_depth) iterations instead.
         subtree_max = own_ts.clone()
         depth = torch.zeros(num_cached, dtype=torch.int64)
         for _ in range(num_cached):

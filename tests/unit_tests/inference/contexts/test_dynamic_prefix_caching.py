@@ -497,6 +497,46 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.kv_hash_to_block_id[h1] == s1
 
     @pytest.mark.internal
+    def test_check_availability_excludes_already_pinned_matches(self):
+        """check_availability reserves only matched blocks that are currently
+        evictable (ref_count == 0). A matched prefix already pinned by an
+        in-flight request frees no capacity when re-pinned, so reserving it would
+        under-report availability and needlessly defer shared-prefix requests."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.kv_block_allocator
+
+        # Request A stays active, pinning the shared prefix H0/S0 -> H1/S1.
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
+        s0, s1 = self._block_ids(ctx, 0, 2)
+        assert alloc.block_ref_counts[s0].item() == 1
+        assert alloc.block_ref_counts[s1].item() == 1
+
+        # One unrelated block is cached and evictable (ref_count == 0).
+        ctx.add_request(self._req(ctx, self._prompt(bs, offset=9000), request_id=2))
+        (sx,) = self._block_ids(ctx, 1, 1)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        assert alloc.block_ref_counts[sx].item() == 0
+        assert int(alloc.get_evictable_block_count()) == 1
+
+        # Free pool exhausted: the one new block B needs (H2) can only come from
+        # evicting SX. The already-pinned matches S0/S1 must not be reserved.
+        alloc.total_avail = 0
+
+        # Request B shares H0/H1 with A and needs one new block for H2.
+        req_b = self._req(ctx, self._prompt(bs * 3), request_id=3)
+        matched, num_from_pool, *_ = ctx._compute_prefix_match(
+            req_b, req_b.remaining_prompt_length
+        )
+        assert matched == [s0, s1]
+        assert num_from_pool == 1
+
+        _, _, kv_cache_available = ctx.check_availability(req_b)
+        # SX (the sole evictable block) can satisfy H2; reserving the pinned
+        # matches would wrongly report the request as un-addable.
+        assert kv_cache_available is True
+
+    @pytest.mark.internal
     def test_ref_count_refzero(self):
         bs = 32
 
