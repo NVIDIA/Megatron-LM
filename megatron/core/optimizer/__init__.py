@@ -68,6 +68,7 @@ from .emerging_optimizers import (
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
 )
+from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
@@ -665,15 +666,18 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
-                *optimizer_args,
-                model_chunks=model_chunks,
-                per_model_buffers=per_model_buffers,
-                data_parallel_group=data_parallel_group,
-                data_parallel_group_gloo=data_parallel_group_gloo,
-                data_parallel_group_idx=data_parallel_group_idx,
-                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-            )
+            if isinstance(model_chunks[0], FullyShardedDataParallelV2):
+                optimizer = FullyShardedOptimizer(*optimizer_args, model_chunks=model_chunks)
+            else:
+                optimizer = DistributedOptimizer(
+                    *optimizer_args,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                )
             # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
             # weight gradients are all-reduced across optimizer instances, so each instance has
             # the duplicated weight gradients, need to reduce gradient stats inside each instance.
@@ -1038,29 +1042,8 @@ def get_megatron_optimizer(
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
     if is_mfsdp_v2:
-        if len(model_chunks) != 1:
-            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
         if not config.use_distributed_optimizer:
-            raise ValueError("MFSDP v2 requires Megatron's DistributedOptimizer wrapper.")
-        if config.fp16:
-            raise ValueError(
-                "MFSDP v2 does not currently support FP16 training because FP16 triggers "
-                "loss unscale."
-            )
-        if config.loss_scale is not None:
-            raise ValueError("MFSDP v2 does not currently support loss scaling.")
-        if config.overlap_param_gather_with_optimizer_step:
-            raise ValueError("MFSDP v2 does not support optimizer-step parameter-gather overlap.")
-        if config.optimizer_cpu_offload:
-            raise ValueError("MFSDP v2 does not currently support optimizer CPU offload.")
-        if config.use_precision_aware_optimizer:
-            raise ValueError("MFSDP v2 does not currently support precision-aware optimizer.")
-        if config.use_layer_wise_distributed_optimizer:
-            raise ValueError(
-                "MFSDP v2 does not currently support layer-wise distributed optimizer."
-            )
-        if config.optimizer_cuda_graph:
-            raise ValueError("MFSDP v2 does not currently support optimizer CUDA graphs.")
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=True.")
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -1121,7 +1104,7 @@ def get_megatron_optimizer(
                     param_group for param_group in param_groups if param_group['params']
                 ]
                 # MFSDP v2 owns its sharded parameter and gradient storage, so
-                # DistributedOptimizer returns before initializing per_model_buffers.
+                # FullyShardedOptimizer does not need DDP param-and-grad buffers.
                 buffers = None
             else:
                 param_groups, buffers = _get_param_groups_and_buffers(

@@ -12,6 +12,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -134,7 +135,13 @@ class TestMcoreAdapter:
         reference_optimizer = get_megatron_optimizer(
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
+        with pytest.raises(ValueError, match="precision-aware optimizer"):
+            FullyShardedOptimizer.validate_config(
+                replace(optimizer_config, use_precision_aware_optimizer=True), [model]
+            )
         optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
+        assert isinstance(optimizer, FullyShardedOptimizer)
+        optimizer.reload_model_params()
 
         steps = [
             [

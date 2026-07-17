@@ -47,7 +47,6 @@ from ..dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
-from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
     group_params_for_buffers,
@@ -761,10 +760,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
-    def _uses_mfsdp_v2(self) -> bool:
-        """Whether MFSDP v2 owns this optimizer's parameter and gradient shards."""
-        return isinstance(self.model_chunks[0], FullyShardedDataParallelV2)
-
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
@@ -791,10 +786,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        if self._uses_mfsdp_v2():
-            # TODO: Add MFSDP v2 optimizer checkpointing support. See #5534.
-            raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
-
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
@@ -878,10 +869,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
-        if self._uses_mfsdp_v2():
-            # TODO: Add MFSDP v2 optimizer checkpointing support. See #5534.
-            raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
-
         if self.ddp_config.use_megatron_fsdp:
             # When using Megatron-FSDP, directly load the optimizer state
             # into the wrapped optimizer.
@@ -1456,9 +1443,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
-        if self._uses_mfsdp_v2():
-            # TODO: Add MFSDP v2 optimizer checkpointing support. See #5534.
-            raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
         if sharding_type is not None:
             log_single_rank(
                 logger,
@@ -2527,16 +2511,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             set_to_none (bool): if true, set grads to None.
         """
-        if self._uses_mfsdp_v2():
-            if not self.is_stub_optimizer:
-                self.optimizer.zero_grad(set_to_none=set_to_none)
-            # MFSDP v2 filters empty local DTensor shards out of optimizer param groups as
-            # a TE FusedAdam workaround: https://github.com/NVIDIA/TransformerEngine/issues/3207.
-            # A rank with no local optimizer params can still have stale module grads to clear.
-            for model_chunk in self.model_chunks:
-                model_chunk.zero_grad(set_to_none=set_to_none)
-            return
-
         if self.ddp_config.use_megatron_fsdp:
             for model_chunk in self.model_chunks:
                 # Zero gradients managed by Megatron-FSDP.
@@ -2744,11 +2718,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         if self.ddp_config.use_megatron_fsdp:
-            if self._uses_mfsdp_v2():
-                # MFSDP v2 currently syncs compute weights from optimized main weights
-                # inside its forward pre-hook. That sync should eventually move here,
-                # after the optimizer step, to avoid repeating it before every microbatch.
-                return
             # Update Megatron-FSDP's compute weights with optimized main weights.
             # If using quantized parameters, this will also perform quantization.
             for model_chunk in self.model_chunks:
