@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
@@ -338,8 +338,8 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
     else:
         provided = list(args.csa_compress_ratios)
         if len(provided) == compact_len:
-            args.csa_compress_ratios, kw_args['csa_compress_ratios'] = (
-                padded_to_compact_and_full(provided)
+            args.csa_compress_ratios, kw_args['csa_compress_ratios'] = padded_to_compact_and_full(
+                provided
             )
         elif len(provided) == full_len:
             compact = []
@@ -596,7 +596,10 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = 
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         hybrid_stack_spec = import_module(args.spec)
-        if callable(hybrid_stack_spec):
+        # ModuleSpec implements __call__ to build the described module, so a
+        # generic callable check would instantiate static specs here before a
+        # ProcessGroupCollection exists. Only resolve callable spec factories.
+        if callable(hybrid_stack_spec) and not isinstance(hybrid_stack_spec, ModuleSpec):
             hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 

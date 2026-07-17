@@ -10,10 +10,12 @@ import pytest
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
     _normalize_dsv4_hybrid_csa_compress_ratios,
+    hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.config import PretrainConfigContainer
@@ -712,6 +714,60 @@ class TestDsv4HybridCsaCompressRatioNormalization:
 
         with pytest.raises(AssertionError, match=message):
             _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
+
+
+class TestHybridConfigFromArgs:
+    """Test static and config-aware hybrid stack spec resolution."""
+
+    @staticmethod
+    def _args():
+        return Namespace(
+            spec=["test_module", "test_spec"],
+            fp16_lm_cross_entropy=False,
+            hybrid_layer_pattern="M",
+            position_embedding_type="none",
+            rotary_percent=1.0,
+            rotary_base=10000,
+            make_vocab_size_divisible_by=128,
+            rotary_seq_len_interpolation_factor=None,
+            max_position_embeddings=1024,
+            untie_embeddings_and_output_weights=False,
+            padded_vocab_size=128,
+        )
+
+    @staticmethod
+    def _transformer_config():
+        config = MagicMock()
+        config.transformer_impl = "transformer_engine"
+        config.inference_fuse_tp_communication = False
+        return config
+
+    @patch(
+        "megatron.training.argument_utils.HybridModelConfig", side_effect=lambda **kwargs: kwargs
+    )
+    @patch("megatron.training.argument_utils.import_module")
+    def test_preserves_static_module_spec(self, mock_import_module, _mock_model_config):
+        static_spec = ModuleSpec(module=object)
+        mock_import_module.return_value = static_spec
+
+        config = hybrid_config_from_args(self._args(), config=self._transformer_config())
+
+        assert config["hybrid_stack_spec"] is static_spec
+
+    @patch(
+        "megatron.training.argument_utils.HybridModelConfig", side_effect=lambda **kwargs: kwargs
+    )
+    @patch("megatron.training.argument_utils.import_module")
+    def test_resolves_config_aware_spec_factory(self, mock_import_module, _mock_model_config):
+        static_spec = ModuleSpec(module=object)
+        spec_factory = MagicMock(return_value=static_spec)
+        mock_import_module.return_value = spec_factory
+        transformer_config = self._transformer_config()
+
+        config = hybrid_config_from_args(self._args(), config=transformer_config)
+
+        spec_factory.assert_called_once_with(transformer_config)
+        assert config["hybrid_stack_spec"] is static_spec
 
 
 # ---------------------------------------------------------------------------
