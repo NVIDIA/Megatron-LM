@@ -2448,9 +2448,7 @@ class CompressedSparseAttention(MegatronModule):
         # Final indices address these source rows directly. This avoids a
         # second per-sequence packed KV layout and lets torch.cat own backward.
         kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major), dim=0)
-        use_indexer_loss = (
-            training_with_grad and indexer_loss_coeff > 0 and compressed_topk is not None
-        )
+        use_indexer_loss = training_with_grad and compressed_topk is not None
         compressed_width = (
             compressed_topk.shape[-1]
             if compressed_topk is not None
