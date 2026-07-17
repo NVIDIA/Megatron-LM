@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -60,7 +59,10 @@ def cleanup():
     yield
     if torch.distributed.is_initialized():
         try:
-            torch.distributed.barrier()
+            if torch.cuda.is_available():
+                torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            else:
+                torch.distributed.barrier()
         except Exception:
             return
         torch.distributed.destroy_process_group()
