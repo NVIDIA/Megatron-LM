@@ -916,8 +916,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # Tiny token budget: the per-request floor takes over.
         ctx_small = self._mctx(block_size_tokens=256, max_tokens=256)
         assert (
-            ctx_small.max_mamba_intermediate_states_per_step
-            == MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+            ctx_small.max_mamba_intermediate_states_per_step == MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         )
 
     @pytest.mark.internal

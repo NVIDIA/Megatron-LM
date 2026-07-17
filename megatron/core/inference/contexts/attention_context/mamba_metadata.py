@@ -401,8 +401,7 @@ class MambaMetadata:
         # buffers, even for high-prefill-count graph buckets where
         # padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST would.
         max_count = min(
-            padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
-            self.max_intermediate_count,
+            padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, self.max_intermediate_count
         )
         if cu_seqlens_gpu is None:
             cu_seqlens_gpu = self._cu_seqlens_buffer
