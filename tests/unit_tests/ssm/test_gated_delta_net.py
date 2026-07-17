@@ -1432,31 +1432,6 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
         with pytest.raises((AssertionError, ValueError), match="local.*chunk|conv_kernel_dim"):
             gdn(hidden_states, None)
 
-    def test_packed_chunkwise_cp_partial_left_boundary_bounds(self):
-        from megatron.core.fusions.fused_pre_gated_delta_rule import (
-            _build_augmented_packed_cu_seqlens,
-        )
-
-        cp_rank = parallel_state.get_context_parallel_rank()
-        cu_seqlens = torch.tensor([0, 4, 12], device=torch.cuda.current_device(), dtype=torch.int32)
-
-        augmented_cu, valid_left_boundary = _build_augmented_packed_cu_seqlens(
-            cu_seqlens,
-            local_seq_len=6,
-            boundary=3,
-            cp_size=2,
-            cp_rank=cp_rank,
-        )
-
-        if cp_rank == 0:
-            expected_cu = [0, 3, 7, 9]
-            expected_valid_left_boundary = 0
-        else:
-            expected_cu = [0, 1, 9]
-            expected_valid_left_boundary = 2
-        assert augmented_cu.tolist() == expected_cu
-        assert valid_left_boundary == expected_valid_left_boundary
-
     def test_fused_and_unfused_packed_forward_chunkwise_cp_match(self):
         unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
         fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)

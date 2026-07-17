@@ -816,7 +816,7 @@ def _conv_silu_boundary_backward_kernel(
     weight_ptr,
     d_silu_ptr,
     d_qkvzba_ptr,
-    d_weight_correction_ptr,
+    d_weight_accum_ptr,
     left_boundary_ptr,
     d_left_boundary_ptr,
     cu_seqlens_ptr,
@@ -831,6 +831,8 @@ def _conv_silu_boundary_backward_kernel(
     qkvzba_c_stride,
     weight_c_stride,
     weight_w_stride,
+    d_weight_accum_c_stride,
+    d_weight_accum_w_stride,
     d_silu_b_stride,
     d_silu_c_stride,
     d_silu_s_stride,
@@ -992,7 +994,9 @@ def _conv_silu_boundary_backward_kernel(
             )
             d_w = tl.sum(d_acc * x_src, axis=0)
             tl.atomic_add(
-                d_weight_correction_ptr + chan * weight_c_stride + i * weight_w_stride,
+                d_weight_accum_ptr
+                + chan * d_weight_accum_c_stride
+                + i * d_weight_accum_w_stride,
                 d_w,
                 mask=chan_mask,
             )
@@ -1161,6 +1165,104 @@ def _g_beta_backward_kernel(
     tl.atomic_add(d_dt_bias_ptr + h_offs, d_dt_bias_partial, mask=h_mask)
 
 
+@triton.jit
+def _finalize_pre_gdr_backward_kernel(
+    d_weight_accum_ptr,
+    d_weight_ptr,
+    d_A_log_fp32_ptr,
+    d_A_log_ptr,
+    d_dt_bias_fp32_ptr,
+    d_dt_bias_ptr,
+    d_qkvzba_ptr,
+    d_right_boundary_ptr,
+    d_weight_numel,
+    d_param_numel,
+    right_boundary_numel,
+    seq_len,
+    weight_width,
+    boundary,
+    batch,
+    conv_dim,
+    d_weight_accum_c_stride,
+    d_weight_accum_w_stride,
+    d_weight_c_stride,
+    d_weight_w_stride,
+    d_A_log_fp32_stride,
+    d_A_log_stride,
+    d_dt_bias_fp32_stride,
+    d_dt_bias_stride,
+    d_qkvzba_s_stride,
+    d_qkvzba_b_stride,
+    d_qkvzba_c_stride,
+    d_right_boundary_s_stride,
+    d_right_boundary_b_stride,
+    d_right_boundary_c_stride,
+    CAST_WEIGHT: tl.constexpr,
+    CAST_A_LOG: tl.constexpr,
+    CAST_DT_BIAS: tl.constexpr,
+    HAS_RIGHT_BOUNDARY: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Finalize small fused pre-GDR backward casts and optional boundary add."""
+
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+
+    if CAST_WEIGHT:
+        weight_mask = offs < d_weight_numel
+        tap = offs % weight_width
+        chan = offs // weight_width
+        d_weight_val = tl.load(
+            d_weight_accum_ptr
+            + chan * d_weight_accum_c_stride
+            + tap * d_weight_accum_w_stride,
+            mask=weight_mask,
+            other=0.0,
+        )
+        tl.store(
+            d_weight_ptr + chan * d_weight_c_stride + tap * d_weight_w_stride,
+            d_weight_val,
+            mask=weight_mask,
+        )
+
+    if HAS_RIGHT_BOUNDARY:
+        boundary_mask = offs < right_boundary_numel
+        chan = offs % conv_dim
+        batch_id = (offs // conv_dim) % batch
+        boundary_s = offs // (batch * conv_dim)
+        qkvzba_s = seq_len - boundary + boundary_s
+        d_qkvzba_ptrs = (
+            d_qkvzba_ptr
+            + qkvzba_s * d_qkvzba_s_stride
+            + batch_id * d_qkvzba_b_stride
+            + chan * d_qkvzba_c_stride
+        )
+        d_right_boundary_ptrs = (
+            d_right_boundary_ptr
+            + boundary_s * d_right_boundary_s_stride
+            + batch_id * d_right_boundary_b_stride
+            + chan * d_right_boundary_c_stride
+        )
+        d_qkvzba_val = tl.load(d_qkvzba_ptrs, mask=boundary_mask, other=0.0).to(tl.float32)
+        d_right_boundary_val = tl.load(
+            d_right_boundary_ptrs, mask=boundary_mask, other=0.0
+        ).to(tl.float32)
+        tl.store(d_qkvzba_ptrs, d_qkvzba_val + d_right_boundary_val, mask=boundary_mask)
+
+    if CAST_A_LOG:
+        param_mask = offs < d_param_numel
+        d_A_log_val = tl.load(
+            d_A_log_fp32_ptr + offs * d_A_log_fp32_stride, mask=param_mask, other=0.0
+        )
+        tl.store(d_A_log_ptr + offs * d_A_log_stride, d_A_log_val, mask=param_mask)
+
+    if CAST_DT_BIAS:
+        param_mask = offs < d_param_numel
+        d_dt_bias_val = tl.load(
+            d_dt_bias_fp32_ptr + offs * d_dt_bias_fp32_stride, mask=param_mask, other=0.0
+        )
+        tl.store(d_dt_bias_ptr + offs * d_dt_bias_stride, d_dt_bias_val, mask=param_mask)
+
+
 # ---------------------------------------------------------------------------
 # Python entry points
 # ---------------------------------------------------------------------------
@@ -1318,6 +1420,7 @@ def _triton_z_layout_to_qkvzba(
 def _triton_conv_silu_boundary_backward(
     qkvzba: Tensor,
     conv1d_weight: Tensor,
+    d_weight_accum: Tensor,
     d_silu_conv: Tensor,
     d_qkvzba: Tensor,
     left_boundary: Tensor,
@@ -1326,7 +1429,7 @@ def _triton_conv_silu_boundary_backward(
     global_token_offset: int,
     global_seq_len: int,
     apply_main_correction: bool,
-) -> Tuple[Tensor, Optional[Tensor]]:
+) -> Tensor:
     """Compute chunkwise-CP boundary grad and optional packed main correction."""
 
     seq_len, batch, _ = qkvzba.shape
@@ -1335,9 +1438,11 @@ def _triton_conv_silu_boundary_backward(
     boundary = k_w - 1
     weight_2d = conv1d_weight.view(conv1d_weight.shape[0], k_w)
     d_left_boundary = torch.empty_like(left_boundary)
-    d_weight_correction = (
-        torch.zeros_like(weight_2d, dtype=torch.float32) if apply_main_correction else qkvzba
-    )
+    # Packed boundary correction is accumulated directly into causal-conv's
+    # returned d_weight buffer, avoiding a separate zero + add correction tensor.
+    d_weight_accum_arg = d_weight_accum if apply_main_correction else qkvzba
+    d_weight_accum_c_stride = d_weight_accum.stride(0) if apply_main_correction else 0
+    d_weight_accum_w_stride = d_weight_accum.stride(1) if apply_main_correction else 0
     num_packed_seqs = 0 if cu_seqlens is None else cu_seqlens.shape[0] - 1
     is_packed = cu_seqlens is not None
     if cu_seqlens is None:
@@ -1352,7 +1457,7 @@ def _triton_conv_silu_boundary_backward(
         weight_2d,
         d_silu_conv,
         d_qkvzba,
-        d_weight_correction,
+        d_weight_accum_arg,
         left_boundary,
         d_left_boundary,
         cu_seqlens,
@@ -1367,6 +1472,8 @@ def _triton_conv_silu_boundary_backward(
         qkvzba.stride(2),
         weight_2d.stride(0),
         weight_2d.stride(1),
+        d_weight_accum_c_stride,
+        d_weight_accum_w_stride,
         d_silu_conv.stride(0),
         d_silu_conv.stride(1),
         d_silu_conv.stride(2),
@@ -1388,7 +1495,7 @@ def _triton_conv_silu_boundary_backward(
         num_warps=4,
         num_stages=2,
     )
-    return d_left_boundary, d_weight_correction if apply_main_correction else None
+    return d_left_boundary
 
 
 def _triton_g_beta_backward(
@@ -1460,6 +1567,86 @@ def _triton_g_beta_backward(
             d_beta_out.stride(2),
         )
     return d_qkvzba_out, d_A_log, d_dt_bias
+
+
+def _triton_finalize_pre_gdr_backward(
+    d_weight_accum: Tensor,
+    conv1d_weight: Tensor,
+    d_A_log_fp32: Tensor,
+    A_log: Tensor,
+    d_dt_bias_fp32: Tensor,
+    dt_bias: Tensor,
+    d_qkvzba: Tensor,
+    d_right_boundary: Optional[Tensor],
+    *,
+    conv_dim: int,
+    boundary: int,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Finalize small fused pre-GDR backward casts and optional CP boundary add."""
+
+    cast_weight = d_weight_accum.dtype != conv1d_weight.dtype
+    cast_A_log = d_A_log_fp32.dtype != A_log.dtype
+    cast_dt_bias = d_dt_bias_fp32.dtype != dt_bias.dtype
+    has_right_boundary = d_right_boundary is not None
+
+    if cast_weight:
+        d_weight = torch.empty_like(conv1d_weight)
+    else:
+        d_weight = d_weight_accum.view(*conv1d_weight.shape)
+    d_A_log = torch.empty_like(A_log) if cast_A_log else d_A_log_fp32
+    d_dt_bias = torch.empty_like(dt_bias) if cast_dt_bias else d_dt_bias_fp32
+
+    d_weight_numel = d_weight_accum.numel() if cast_weight else 0
+    d_param_numel = d_A_log_fp32.numel() if (cast_A_log or cast_dt_bias) else 0
+    right_boundary_numel = d_right_boundary.numel() if has_right_boundary else 0
+    total_numel = max(d_weight_numel, d_param_numel, right_boundary_numel)
+    if total_numel == 0:
+        return d_weight, d_A_log, d_dt_bias
+
+    dummy = d_qkvzba
+    d_right_boundary_arg = d_right_boundary if has_right_boundary else dummy
+    BLOCK = 256
+    grid = (triton.cdiv(total_numel, BLOCK),)
+    _finalize_pre_gdr_backward_kernel[grid](
+        d_weight_accum,
+        d_weight,
+        d_A_log_fp32,
+        d_A_log,
+        d_dt_bias_fp32,
+        d_dt_bias,
+        d_qkvzba,
+        d_right_boundary_arg,
+        d_weight_numel,
+        d_param_numel,
+        right_boundary_numel,
+        d_qkvzba.shape[0],
+        conv1d_weight.shape[-1],
+        boundary,
+        d_qkvzba.shape[1],
+        conv_dim,
+        d_weight_accum.stride(0),
+        d_weight_accum.stride(1),
+        d_weight.stride(0),
+        d_weight.stride(2),
+        d_A_log_fp32.stride(0),
+        d_A_log.stride(0),
+        d_dt_bias_fp32.stride(0),
+        d_dt_bias.stride(0),
+        d_qkvzba.stride(0),
+        d_qkvzba.stride(1),
+        d_qkvzba.stride(2),
+        d_right_boundary_arg.stride(0),
+        d_right_boundary_arg.stride(1),
+        d_right_boundary_arg.stride(2),
+        CAST_WEIGHT=cast_weight,
+        CAST_A_LOG=cast_A_log,
+        CAST_DT_BIAS=cast_dt_bias,
+        HAS_RIGHT_BOUNDARY=has_right_boundary,
+        BLOCK=BLOCK,
+        num_warps=4,
+        num_stages=2,
+    )
+    return d_weight, d_A_log, d_dt_bias
 
 
 def _launch_context(device: torch.device, stream: Optional["torch.cuda.Stream"]):
@@ -1662,60 +1849,6 @@ def _start_boundary_grad_exchange(
         )
 
     return d_right_boundary, tuple(recv_ops), tuple(send_ops), send_buf
-
-
-def _build_augmented_packed_cu_seqlens(
-    cu_seqlens: Tensor, *, local_seq_len: int, boundary: int, cp_size: int, cp_rank: int
-) -> Tuple[Tensor, int]:
-    """Build augmented local packed boundaries and return the valid left-boundary width."""
-
-    cu_list = [int(x) for x in cu_seqlens.tolist()]
-    total_tokens = cu_list[-1]
-    local_start = cp_rank * local_seq_len
-    local_end = local_start + local_seq_len
-    if local_end > total_tokens:
-        raise ValueError(
-            "fused_pre_gated_delta_rule chunkwise CP local range exceeds packed tokens: "
-            f"{local_end=} > {total_tokens=}."
-        )
-
-    boundaries = []
-    valid_left_boundary = 0
-    for seq_start, seq_end in zip(cu_list[:-1], cu_list[1:]):
-        if seq_end <= seq_start:
-            continue
-        overlap_start = max(seq_start, local_start)
-        overlap_end = min(seq_end, local_end)
-        if overlap_start >= overlap_end:
-            continue
-
-        local_overlap_start = overlap_start - local_start
-        local_overlap_end = overlap_end - local_start
-        # Chunkwise CP partitions the flattened packed token buffer into contiguous rank
-        # intervals. Only tokens from the same packed sequence are valid left-boundary tokens.
-        segment_valid_boundary = min(boundary, overlap_start - seq_start)
-        segment_start = boundary + local_overlap_start - segment_valid_boundary
-        segment_end = boundary + local_overlap_end
-
-        if not boundaries:
-            if segment_start > 0:
-                boundaries.append(0)
-            boundaries.append(segment_start)
-            valid_left_boundary = segment_valid_boundary
-        elif boundaries[-1] != segment_start:
-            boundaries.append(segment_start)
-        boundaries.append(segment_end)
-
-    augmented_len = boundary + local_seq_len
-    if not boundaries:
-        boundaries = [0, augmented_len]
-    elif boundaries[0] != 0:
-        boundaries.insert(0, 0)
-    if boundaries[-1] != augmented_len:
-        boundaries.append(augmented_len)
-
-    augmented_cu = torch.tensor(boundaries, device=cu_seqlens.device, dtype=torch.int32)
-    return augmented_cu, valid_left_boundary
 
 
 def _triton_pre_gated_delta_rule_forward(
@@ -2290,8 +2423,13 @@ def _triton_pre_gated_delta_rule_backward(
 
     # Hand-tuned C++ conv backward. Internally folds the silu' factor and
     # computes both d_x and d_w in fp32; writes d_x directly into the view above.
+    # The public causal-conv1d wrapper casts d_weight back to weight.dtype before
+    # returning, leaving one small vectorized dtype-conversion kernel here. We use
+    # the public API for stability; to remove that launch, this call would need to
+    # switch to causal-conv1d's private _causal_conv1d_bwd_cpp entry with a
+    # caller-owned fp32 d_weight accumulator.
     assert causal_conv1d_bwd_function is not None
-    _, d_weight_fp32, _, _ = causal_conv1d_bwd_function(
+    _, d_weight_accum, _, _ = causal_conv1d_bwd_function(
         qkvzba_conv,
         weight_2d,
         None,  # no bias
@@ -2303,13 +2441,14 @@ def _triton_pre_gated_delta_rule_backward(
         False,  # return_dinitial_states
         True,  # activation (silu)
     )
-    d_weight = d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype)
+    d_weight_accum = d_weight_accum.view(conv1d_weight.shape[0], conv1d_weight.shape[-1])
     if left_boundary is None:
         d_left_boundary = None
     else:
-        d_left_boundary, d_weight_correction = _triton_conv_silu_boundary_backward(
+        d_left_boundary = _triton_conv_silu_boundary_backward(
             qkvzba,
             conv1d_weight,
+            d_weight_accum,
             d_silu_conv,
             d_qkvzba,
             left_boundary,
@@ -2318,10 +2457,6 @@ def _triton_pre_gated_delta_rule_backward(
             global_seq_len=global_seq_len,
             apply_main_correction=apply_boundary_correction,
         )
-        if d_weight_correction is not None:
-            d_weight = (
-                d_weight.float() + d_weight_correction.view(*conv1d_weight.shape)
-            ).to(conv1d_weight.dtype)
     d_right_boundary = None
     right_boundary_recv_ops = None
     left_boundary_send_ops = None
@@ -2345,11 +2480,19 @@ def _triton_pre_gated_delta_rule_backward(
         )
         d_A_log_fp32, d_dt_bias_fp32 = _launch_g_beta_and_z_backward()
         _wait_distributed_ops(right_boundary_recv_ops)
-        if d_right_boundary is not None:
-            d_qkvzba[-(k_w - 1) :, :, :conv_dim].add_(d_right_boundary)
     default_stream.wait_stream(g_beta_stream)
-    d_A_log = d_A_log_fp32.to(A_log.dtype)
-    d_dt_bias = d_dt_bias_fp32.to(dt_bias.dtype)
+    d_weight, d_A_log, d_dt_bias = _triton_finalize_pre_gdr_backward(
+        d_weight_accum,
+        conv1d_weight,
+        d_A_log_fp32,
+        A_log,
+        d_dt_bias_fp32,
+        dt_bias,
+        d_qkvzba,
+        d_right_boundary,
+        conv_dim=conv_dim,
+        boundary=k_w - 1,
+    )
     default_stream.wait_stream(z_stream)
     _wait_distributed_ops(left_boundary_send_ops)
     _ = _left_boundary_send_buf
