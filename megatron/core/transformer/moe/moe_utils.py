@@ -11,6 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
@@ -773,8 +774,10 @@ def topk_routing_with_score_function(
                 group_topk=group_topk,
             )
         else:
-            # Sorting top-k turned off during inference
-            return torch.topk(scores, k=topk, dim=1, sorted=torch.is_grad_enabled())
+            # Skip the sort only when an inference engine is driving the model. RL
+            # logprob recompute runs under torch.no_grad() (not an inference engine),
+            # so it must match the grad-enabled training forward and keep sorting on.
+            return torch.topk(scores, k=topk, dim=1, sorted=not InferenceMode.is_active())
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         # Default behavior if no replay is active

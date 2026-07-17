@@ -286,8 +286,8 @@ def verify_model_weights_swap(
 class RolloutStats:
     rewards: list[list[float]] # inner list is for a group
     env_ids: list[str] # same length as len(rewards)
-    turn_lens: list[list[int]] # token lengths of turns, grouped.
-    traj_lens: list[list[int]] # all turns comprise one trajectory.
+    turn_lens: list[list[int]] # tokens newly added by each turn, grouped.
+    traj_lens: list[list[int]] # the final sequence is the full trajectory.
     num_turns: None | list[list[int]] # num_turns per traj
     advantages: None | list[list[float]]
     min_piold_to_inf_prob: None | float
@@ -1514,7 +1514,7 @@ def dump_staleness_data(
                 "group_reward_mean": group_reward_mean,
                 "group_reward_std": group_reward_std,
                 "group_degenerate": group_degenerate,
-                "traj_len": int(sum(len(t) for t in rollout.trajectory)),
+                "traj_len": int(len(rollout.trajectory[-1])) if rollout.trajectory else 0,
                 "num_turns": len(rollout.trajectory),
                 "num_evictions": int(sum(rollout.num_evictions)),
                 "turns": turns,
@@ -1575,7 +1575,7 @@ def compute_group_stats(
                 for turn_traj in rollout.trajectory:
                     detokenized_traj = tokenizer.detokenize(turn_traj)
                     lang_rl_log(
-                        f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} tokens] {detokenized_traj}"
+                        f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(turn_traj)} tokens] {detokenized_traj}"
                     )
                     # Multi-turn agents can terminate a turn on a tool-call boundary,
                     # which is neither tokenizer.eod (11) nor a hit-seq_len truncation.
@@ -1589,18 +1589,21 @@ def compute_group_stats(
                     )
             else:
                 lang_rl_log(
-                    f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} chars] {rollout.trajectory}"
+                    f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} turns] {rollout.trajectory}"
                 )
             group_num_turns.append(len(rollout.trajectory))
             group_rewards.append(rollout.reward)
-            roll_turn_lens = [len(t) for t in rollout.trajectory]
-            group_turn_lengths.extend(roll_turn_lens)
-            group_traj_lengths.append(sum(roll_turn_lens))
+            # Each turn's sequence is cumulative (prompt + all turns so far); refer to the deltas.
+            cum_turn_lens = [len(t) for t in rollout.trajectory]
+            group_turn_lengths.extend(
+                cur - prev for prev, cur in zip([0] + cum_turn_lens[:-1], cum_turn_lens)
+            )
+            group_traj_lengths.append(cum_turn_lens[-1] if cum_turn_lens else 0)
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
             # Token-weighted first/avg/last epoch from the per-turn RLE boundaries.
-            policy_summary = rollout_epoch_summary(rollout.policy_epoch, roll_turn_lens)
-            kv_summary = rollout_epoch_summary(rollout.kv_cache_epoch, roll_turn_lens)
+            policy_summary = rollout_epoch_summary(rollout.policy_epoch, cum_turn_lens)
+            kv_summary = rollout_epoch_summary(rollout.kv_cache_epoch, cum_turn_lens)
             if policy_summary is None or kv_summary is None:
                 # Zero-token placeholder rollout (failed gym episode). There are no
                 # tokens to weight, so summarize with the first recorded epoch
@@ -1850,15 +1853,18 @@ def prep_wandb_metrics(
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
+        # Each turn in a trajectory is a cumulative sequence (prompt + all turns so far).
         metrics['rollouts'] = wandb_writer.Table(
             columns=['Trajectories', 'Tokens', 'Rewards'],
             rows=[
                 [
-                    tokenizer.detokenize(turn) if isinstance(r, TokenRollout) else turn,
+                    tokenizer.detokenize(r.trajectory[-1])
+                    if isinstance(r, TokenRollout)
+                    else r.trajectory[-1],
                     r.trajectory,
                     r.reward,
                 ]
-                for r in example_group for turn in r.trajectory
+                for r in example_group if r.trajectory
             ],
         )
     return metrics
