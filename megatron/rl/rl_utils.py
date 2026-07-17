@@ -3055,11 +3055,20 @@ def _maybe_start_rollout_keepalive(args, loop, inference_interface):
     interval_s = getattr(args, 'rl_rollout_keepalive_interval', 0.0) or 0.0
     if interval_s <= 0:
         return None, None
-    burn_stop = threading.Event()
-    burn_thread = threading.Thread(
-        target=_rollout_keepalive_burn, args=(interval_s, burn_stop), daemon=True
-    )
-    burn_thread.start()
+    # In-process burns are OFF by default: the engine captures CUDA graphs
+    # LAZILY (new batch-size buckets, hours into a run), and any concurrent
+    # burn activity in the same CUDA context poisons the capture -- job
+    # 5439048 died on "operation not permitted when stream is capturing" 45
+    # min in. The reaper defense lives in a SEPARATE PROCESS per GPU (own
+    # context, invisible to captures, GIL-free): tools/burn_daemon.py,
+    # spawned by install_nemogym_and_barrier.sh.
+    burn_stop = burn_thread = None
+    if os.environ.get('MRL_INPROCESS_BURN', '0') == '1':
+        burn_stop = threading.Event()
+        burn_thread = threading.Thread(
+            target=_rollout_keepalive_burn, args=(interval_s, burn_stop), daemon=True
+        )
+        burn_thread.start()
     if torch.distributed.get_rank() != 0:
         return (None, burn_stop, burn_thread), None
     requests_per_tick = max(1, getattr(args, 'data_parallel_size', 1) or 1)
@@ -3081,8 +3090,9 @@ def _stop_rollout_keepalive(loop, stop_event, task):
     if stop_event is not None:
         _, burn_stop, burn_thread = stop_event
         stop_event = stop_event[0]
-        burn_stop.set()
-        burn_thread.join(timeout=10)
+        if burn_stop is not None:
+            burn_stop.set()
+            burn_thread.join(timeout=10)
     if task is None:
         return
     stop_event.set()
