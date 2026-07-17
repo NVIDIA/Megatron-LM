@@ -76,6 +76,14 @@ def _g_beta_autotune_configs():
     ]
 
 
+@triton.jit
+def _softplus_with_torch_threshold(x):
+    """Match torch.nn.functional.softplus default threshold without exp overflow."""
+
+    exp_input = tl.minimum(x, 20.0)
+    return tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(exp_input)))
+
+
 @triton.autotune(
     configs=_conv_autotune_configs(),
     key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS"],
@@ -474,10 +482,7 @@ def _compute_g_and_beta_kernel(
     dt_bias = tl.load(dt_bias_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
 
     pre = alpha + dt_bias[None, :]
-    # softplus(x) = log(1 + exp(x)); torch's softplus thresholds at x>20 but we
-    # rely on fp32 evaluation here, which stays well within range for typical
-    # GDN inputs (the unfused path computes the same expression).
-    softplus_val = tl.log(1.0 + tl.exp(pre))
+    softplus_val = _softplus_with_torch_threshold(pre)
     g = -tl.exp(A_log)[None, :] * softplus_val
     beta_sig = tl.sigmoid(beta)
 
@@ -750,7 +755,7 @@ def _g_beta_backward_kernel(
 
     Forward:
         pre = alpha + dt_bias                       # fp32
-        softplus_pre = log(1 + exp(pre))
+        softplus_pre = softplus(pre)                # torch default threshold
         g       = -exp(A_log) * softplus_pre
         beta_sig = sigmoid(beta_raw)
 
@@ -794,8 +799,8 @@ def _g_beta_backward_kernel(
     dt_bias = tl.load(dt_bias_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
 
     pre = alpha + dt_bias[None, :]
-    sigmoid_pre = tl.sigmoid(pre)
-    softplus_pre = tl.log(1.0 + tl.exp(pre))
+    sigmoid_pre = tl.where(pre > 20.0, 1.0, tl.sigmoid(pre))
+    softplus_pre = _softplus_with_torch_threshold(pre)
     exp_A = tl.exp(A_log)[None, :]
     g = -exp_A * softplus_pre
     beta_sig = tl.sigmoid(beta_raw)
@@ -1112,6 +1117,156 @@ def _resolve_packed_seq_idx(
         f"got {seq_idx.shape=} and {total_tokens=}."
     )
     return seq_idx.contiguous()
+
+
+def _cp_neighbor_global_ranks(cp_group) -> Tuple[int, int, Optional[int], Optional[int]]:
+    """Return ``(cp_size, cp_rank, prev_global_rank, next_global_rank)``."""
+
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
+    prev_rank = (
+        torch.distributed.get_global_rank(cp_group, cp_rank - 1) if cp_rank > 0 else None
+    )
+    next_rank = (
+        torch.distributed.get_global_rank(cp_group, cp_rank + 1)
+        if cp_rank < cp_size - 1
+        else None
+    )
+    return cp_size, cp_rank, prev_rank, next_rank
+
+
+def _exchange_left_halo(qkvzba: Tensor, *, conv_dim: int, halo: int, cp_group) -> Tensor:
+    """Receive the previous CP rank's right conv tail for chunkwise CP."""
+
+    _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    left_halo = qkvzba.new_zeros((halo, qkvzba.shape[1], conv_dim))
+    ops = []
+    if prev_rank is not None:
+        ops.append(torch.distributed.irecv(tensor=left_halo, src=prev_rank))
+    if next_rank is not None:
+        right_tail = qkvzba[-halo:, :, :conv_dim].contiguous()
+        ops.append(torch.distributed.isend(tensor=right_tail, dst=next_rank))
+    for op in ops:
+        op.wait()
+    return left_halo
+
+
+def _exchange_right_halo_grad(d_left_halo: Tensor, *, cp_group) -> Tensor:
+    """Send left-halo gradients back and receive gradients for this rank's right tail."""
+
+    _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    d_right_halo = torch.zeros_like(d_left_halo)
+    send_buf = None
+    ops = []
+    if next_rank is not None:
+        ops.append(torch.distributed.irecv(tensor=d_right_halo, src=next_rank))
+    if prev_rank is not None:
+        send_buf = d_left_halo.contiguous()
+        ops.append(torch.distributed.isend(tensor=send_buf, dst=prev_rank))
+    for op in ops:
+        op.wait()
+    return d_right_halo
+
+
+def _build_chunkwise_cp_augmented_qkvzba(
+    qkvzba: Tensor, *, conv_dim: int, halo: int, cp_group
+) -> Tensor:
+    """Prepend the received conv-channel halo and zero-fill non-conv channels."""
+
+    left_halo = _exchange_left_halo(qkvzba, conv_dim=conv_dim, halo=halo, cp_group=cp_group)
+    halo_full = qkvzba.new_zeros((halo, qkvzba.shape[1], qkvzba.shape[2]))
+    halo_full[:, :, :conv_dim].copy_(left_halo)
+    return torch.cat((halo_full, qkvzba), dim=0)
+
+
+def _build_augmented_packed_cu_seqlens(
+    cu_seqlens: Tensor, *, local_seq_len: int, halo: int, cp_size: int, cp_rank: int
+) -> Tuple[Tensor, int]:
+    """Build augmented local packed boundaries and return the valid left-halo width."""
+
+    cu_list = [int(x) for x in cu_seqlens.tolist()]
+    total_tokens = cu_list[-1]
+    local_start = cp_rank * local_seq_len
+    local_end = local_start + local_seq_len
+    if local_end > total_tokens:
+        raise ValueError(
+            "fused_pre_gated_delta_rule chunkwise CP local range exceeds packed tokens: "
+            f"{local_end=} > {total_tokens=}."
+        )
+
+    boundaries = []
+    valid_left_halo = 0
+    for seq_start, seq_end in zip(cu_list[:-1], cu_list[1:]):
+        if seq_end <= seq_start:
+            continue
+        overlap_start = max(seq_start, local_start)
+        overlap_end = min(seq_end, local_end)
+        if overlap_start >= overlap_end:
+            continue
+
+        local_overlap_start = overlap_start - local_start
+        local_overlap_end = overlap_end - local_start
+        # Chunkwise CP partitions the flattened packed token buffer into contiguous rank
+        # intervals. Only tokens from the same packed sequence are valid left-halo tokens.
+        segment_valid_halo = min(halo, overlap_start - seq_start)
+        segment_start = halo + local_overlap_start - segment_valid_halo
+        segment_end = halo + local_overlap_end
+
+        if not boundaries:
+            if segment_start > 0:
+                boundaries.append(0)
+            boundaries.append(segment_start)
+            valid_left_halo = segment_valid_halo
+        elif boundaries[-1] != segment_start:
+            boundaries.append(segment_start)
+        boundaries.append(segment_end)
+
+    augmented_len = halo + local_seq_len
+    if not boundaries:
+        boundaries = [0, augmented_len]
+    elif boundaries[0] != 0:
+        boundaries.insert(0, 0)
+    if boundaries[-1] != augmented_len:
+        boundaries.append(augmented_len)
+
+    augmented_cu = torch.tensor(boundaries, device=cu_seqlens.device, dtype=torch.int32)
+    return augmented_cu, valid_left_halo
+
+
+def _build_chunkwise_cp_augmented_packed_qkvzba(
+    qkvzba: Tensor,
+    cu_seqlens: Tensor,
+    *,
+    conv_dim: int,
+    halo: int,
+    cp_group,
+    cp_size: int,
+    cp_rank: int,
+) -> Tuple[Tensor, Tensor]:
+    """Prepend a boundary-aware conv halo for packed chunkwise CP."""
+
+    augmented_cu, valid_left_halo = _build_augmented_packed_cu_seqlens(
+        cu_seqlens,
+        local_seq_len=qkvzba.shape[0],
+        halo=halo,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+    left_halo = _exchange_left_halo(qkvzba, conv_dim=conv_dim, halo=halo, cp_group=cp_group)
+    halo_full = qkvzba.new_zeros((halo, qkvzba.shape[1], qkvzba.shape[2]))
+    if valid_left_halo > 0:
+        valid_slice = slice(halo - valid_left_halo, halo)
+        halo_full[valid_slice, :, :conv_dim].copy_(left_halo[valid_slice])
+    return torch.cat((halo_full, qkvzba), dim=0), augmented_cu
+
+
+def _prepend_zero_sequence_grad(grad: Tensor, halo: int) -> Tensor:
+    """Prepend zero gradients for augmented halo outputs."""
+
+    if halo == 0:
+        return grad
+    zeros = grad.new_zeros((grad.shape[0], halo, *grad.shape[2:]))
+    return torch.cat((zeros, grad), dim=1)
 
 
 def _triton_pre_gated_delta_rule_forward(
@@ -1605,6 +1760,8 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         dt_bias,
         cu_seqlens,
         seq_idx,
+        cp_group,
+        cp_size,
         num_key_heads,
         num_value_heads,
         key_head_dim,
@@ -1616,8 +1773,44 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         ctx.num_value_heads = num_value_heads
         ctx.key_head_dim = key_head_dim
         ctx.value_head_dim = value_head_dim
+        qk_channels = num_key_heads * key_head_dim
+        v_channels = num_value_heads * value_head_dim
+        conv_dim = 2 * qk_channels + v_channels
+        halo = conv1d_weight.shape[-1] - 1
+        cp_active = cp_group is not None and cp_size > 1 and halo > 0
+        ctx.cp_active = cp_active
+        ctx.cp_group = cp_group
+        ctx.cp_size = cp_size
+        ctx.conv_dim = conv_dim
+        ctx.halo = halo
+        cp_rank = cp_group.rank() if cp_active else 0
+
+        cu_seqlens_for_forward = cu_seqlens
+        seq_idx_for_backward = seq_idx
+        if cp_active and cu_seqlens is not None:
+            qkvzba_for_forward, cu_seqlens_for_forward = (
+                _build_chunkwise_cp_augmented_packed_qkvzba(
+                    qkvzba,
+                    cu_seqlens,
+                    conv_dim=conv_dim,
+                    halo=halo,
+                    cp_group=cp_group,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                )
+            )
+            seq_idx_for_backward = _resolve_packed_seq_idx(
+                cu_seqlens_for_forward, None, qkvzba_for_forward.shape[0]
+            )
+        elif cp_active:
+            qkvzba_for_forward = _build_chunkwise_cp_augmented_qkvzba(
+                qkvzba, conv_dim=conv_dim, halo=halo, cp_group=cp_group
+            )
+        else:
+            qkvzba_for_forward = qkvzba
+
         query, key, value, gate, beta, g, silu_qk_save = _triton_pre_gated_delta_rule_forward(
-            qkvzba,
+            qkvzba_for_forward,
             conv1d_weight,
             A_log,
             dt_bias,
@@ -1625,13 +1818,27 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             num_value_heads=num_value_heads,
             key_head_dim=key_head_dim,
             value_head_dim=value_head_dim,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens_for_forward,
         )
-        ctx.has_seq_idx = seq_idx is not None
+        if cp_active:
+            query = query[:, halo:]
+            key = key[:, halo:]
+            value = value[:, halo:]
+            gate = gate[:, halo:]
+            beta = beta[:, halo:]
+            g = g[:, halo:]
+        ctx.has_seq_idx = seq_idx_for_backward is not None
         if ctx.has_seq_idx:
-            ctx.save_for_backward(qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save, seq_idx)
+            ctx.save_for_backward(
+                qkvzba_for_forward,
+                conv1d_weight,
+                A_log,
+                dt_bias,
+                silu_qk_save,
+                seq_idx_for_backward,
+            )
         else:
-            ctx.save_for_backward(qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save)
+            ctx.save_for_backward(qkvzba_for_forward, conv1d_weight, A_log, dt_bias, silu_qk_save)
         return query, key, value, gate, beta, g
 
     @staticmethod
@@ -1639,12 +1846,21 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         """Run the fused pre-GDR backward path from saved forward tensors."""
 
         if ctx.has_seq_idx:
-            qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save, seq_idx = ctx.saved_tensors
+            qkvzba_for_backward, conv1d_weight, A_log, dt_bias, silu_qk_save, seq_idx = (
+                ctx.saved_tensors
+            )
         else:
-            qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save = ctx.saved_tensors
+            qkvzba_for_backward, conv1d_weight, A_log, dt_bias, silu_qk_save = ctx.saved_tensors
             seq_idx = None
+        if ctx.cp_active:
+            dq = _prepend_zero_sequence_grad(dq, ctx.halo)
+            dk = _prepend_zero_sequence_grad(dk, ctx.halo)
+            dv = _prepend_zero_sequence_grad(dv, ctx.halo)
+            dgate = _prepend_zero_sequence_grad(dgate, ctx.halo)
+            dbeta = _prepend_zero_sequence_grad(dbeta, ctx.halo)
+            dg = _prepend_zero_sequence_grad(dg, ctx.halo)
         d_qkvzba, d_weight, d_A_log, d_dt_bias = _triton_pre_gated_delta_rule_backward(
-            qkvzba,
+            qkvzba_for_backward,
             conv1d_weight,
             silu_qk_save,
             dq,
@@ -1661,11 +1877,31 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             value_head_dim=ctx.value_head_dim,
             seq_idx=seq_idx,
         )
+        if ctx.cp_active:
+            d_left_halo = d_qkvzba[: ctx.halo, :, : ctx.conv_dim].contiguous()
+            d_qkvzba_local = d_qkvzba[ctx.halo :].contiguous()
+            d_right_halo = _exchange_right_halo_grad(d_left_halo, cp_group=ctx.cp_group)
+            if ctx.cp_group.rank() < ctx.cp_size - 1:
+                d_qkvzba_local[-ctx.halo :, :, : ctx.conv_dim].add_(d_right_halo)
+            d_qkvzba = d_qkvzba_local
         # Match forward inputs: (qkvzba, conv1d_weight, A_log, dt_bias,
-        # cu_seqlens, seq_idx, num_key_heads, num_value_heads,
+        # cu_seqlens, seq_idx, cp_group, cp_size, num_key_heads, num_value_heads,
         # key_head_dim, value_head_dim).
         # Non-tensor args get None.
-        return (d_qkvzba, d_weight, d_A_log, d_dt_bias, None, None, None, None, None, None)
+        return (
+            d_qkvzba,
+            d_weight,
+            d_A_log,
+            d_dt_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def fused_streamed_pre_gated_delta_rule(
@@ -1682,6 +1918,7 @@ def fused_streamed_pre_gated_delta_rule(
     use_qk_l2norm: bool = True,
     cu_seqlens: Optional[Tensor] = None,
     seq_idx: Optional[Tensor] = None,
+    cp_group=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Streamed fused pre-gated-delta-rule entry point.
 
@@ -1697,10 +1934,14 @@ def fused_streamed_pre_gated_delta_rule(
             multiple of ``num_key_heads``.
         use_qk_l2norm: Must be ``True``; the fused backward closes over the
             l2norm path.
-        cu_seqlens: Optional packed THD cumulative sequence lengths. When set,
-            ``qkvzba`` must have ``batch == 1`` and ``cu_seqlens[-1] == seq_len``.
+        cu_seqlens: Optional packed THD cumulative sequence lengths. When CP
+            is inactive, ``cu_seqlens[-1]`` must equal local ``seq_len``. When
+            chunkwise CP is active, pass global packed boundaries; the fused
+            path derives augmented local boundaries internally.
         seq_idx: Optional precomputed token-to-sequence map with shape
             ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
+        cp_group: Optional chunkwise-CP process group. When it has size > 1,
+            the fused path prepends a previous-rank conv halo internally.
 
     Returns:
         ``(query, key, value, gate, beta, g)`` matching the unfused
@@ -1727,6 +1968,24 @@ def fused_streamed_pre_gated_delta_rule(
     assert (
         num_value_heads % num_key_heads == 0
     ), f"{num_value_heads=} must be a multiple of {num_key_heads=}."
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size > 1:
+        if qkvzba.shape[1] != 1:
+            raise ValueError(
+                "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
+                f"for fused_pre_gated_delta_rule; got batch={qkvzba.shape[1]}."
+            )
+        halo = conv1d_weight.shape[-1] - 1
+        if halo > 0 and qkvzba.shape[0] < halo:
+            raise ValueError(
+                "fused_pre_gated_delta_rule chunkwise CP requires local chunk length "
+                f"({qkvzba.shape[0]}) >= conv_kernel_dim - 1 ({halo})."
+            )
+        if seq_idx is not None:
+            raise ValueError(
+                "fused_pre_gated_delta_rule derives packed seq_idx internally when "
+                "chunkwise CP is active."
+            )
     if cu_seqlens is not None:
         assert cu_seqlens.is_cuda, (
             "Packed fused_pre_gated_delta_rule requires CUDA cu_seqlens; "
@@ -1755,12 +2014,15 @@ def fused_streamed_pre_gated_delta_rule(
             "Packed fused_pre_gated_delta_rule requires monotonically non-decreasing "
             f"cu_seqlens, got {cu_seqlens}."
         )
-        assert cu_seqlens[-1].item() == qkvzba.shape[0], (
+        expected_tokens = qkvzba.shape[0] * cp_size
+        assert cu_seqlens[-1].item() == expected_tokens, (
             "Packed fused_pre_gated_delta_rule requires cu_seqlens[-1] to match "
-            f"seq_len, got {cu_seqlens[-1].item()} vs {qkvzba.shape[0]}."
+            f"{'global' if cp_size > 1 else 'local'} seq_len, "
+            f"got {cu_seqlens[-1].item()} vs {expected_tokens}."
         )
         cu_seqlens = cu_seqlens.contiguous()
-        seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkvzba.shape[0])
+        if cp_size == 1:
+            seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkvzba.shape[0])
     else:
         assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
 
@@ -1771,6 +2033,8 @@ def fused_streamed_pre_gated_delta_rule(
         dt_bias,
         cu_seqlens,
         seq_idx,
+        cp_group,
+        cp_size,
         num_key_heads,
         num_value_heads,
         key_head_dim,

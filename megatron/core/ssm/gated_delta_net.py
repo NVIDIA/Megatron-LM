@@ -535,18 +535,34 @@ class GatedDeltaNet(MegatronModule):
         )
 
         if self.gdn_pre_gated_delta_rule_fusion:
-            assert cp_size_chunkwise == 1, (
-                "gdn_pre_gated_delta_rule_fusion is not supported with chunkwise CP. "
-                "Disable gdn_pre_gated_delta_rule_fusion or use linear_cp_mode='headwise'."
-            )
+            if cp_size_chunkwise > 1 and batch > 1:
+                raise ValueError(
+                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
+                    "because the FLA gated delta rule backend requires a single batch dimension "
+                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
+                )
+            if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
+                raise ValueError(
+                    "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
+                    "chunk-local causal-conv inputs can change later chunk numerics."
+                )
             nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
             seq_idx = (
                 packed_seq_params.seq_idx
                 if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                and cp_size_chunkwise == 1
+                else None
+            )
+            fused_cu_seqlens_q = (
+                cu_seqlens_q
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
                 else None
             )
             query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
-                qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+                qkvzba,
+                cu_seqlens_q=fused_cu_seqlens_q,
+                seq_idx=seq_idx,
+                cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
             )
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
@@ -764,7 +780,9 @@ class GatedDeltaNet(MegatronModule):
 
         return query, key, value, gate, beta, g
 
-    def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+    def _fused_streamed_pre_gated_delta_rule(
+        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None
+    ):
         """Call the streamed fused pre-GDR wrapper."""
 
         try:
@@ -790,6 +808,7 @@ class GatedDeltaNet(MegatronModule):
             use_qk_l2norm=self.use_qk_l2norm,
             cu_seqlens=cu_seqlens_q,
             seq_idx=seq_idx,
+            cp_group=cp_group,
         )
 
     def _a2a_cp_to_hp(

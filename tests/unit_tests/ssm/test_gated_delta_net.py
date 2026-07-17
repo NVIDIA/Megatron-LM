@@ -580,19 +580,24 @@ class TestFusedPreGatedDeltaRule:
         *,
         deterministic_mode: bool = True,
         conv_kernel_dim: int = 2,
+        hidden_size: int = 256,
+        key_head_dim: int = 64,
+        value_head_dim: int = 64,
+        num_key_heads: int = 4,
+        num_value_heads: int = 8,
     ):
         transformer_config = TransformerConfig(
-            hidden_size=256,
+            hidden_size=hidden_size,
             linear_conv_kernel_dim=conv_kernel_dim,
-            linear_key_head_dim=64,
-            linear_value_head_dim=64,
-            linear_num_key_heads=4,
-            linear_num_value_heads=8,
+            linear_key_head_dim=key_head_dim,
+            linear_value_head_dim=value_head_dim,
+            linear_num_key_heads=num_key_heads,
+            linear_num_value_heads=num_value_heads,
             num_layers=1,
             normalization="RMSNorm",
             use_cpu_initialization=True,
             layernorm_zero_centered_gamma=True,
-            num_attention_heads=8,
+            num_attention_heads=num_value_heads,
             activation_func=F.silu,
             bf16=True,
             tensor_model_parallel_size=1,
@@ -747,6 +752,69 @@ class TestFusedPreGatedDeltaRule:
         torch.testing.assert_close(fused_output, unfused_output, atol=2e-3, rtol=2e-3)
         assert fused_bias == unfused_bias
 
+    def test_fused_and_unfused_backward_thd_padding_match(self):
+        unfused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+
+        real_seq_len = 9
+        padded_seq_len = 16
+        hidden_states = torch.randn(
+            (padded_seq_len, 1, unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        hidden_states_unfused = hidden_states.detach().clone().requires_grad_(True)
+        hidden_states_fused = hidden_states.detach().clone().requires_grad_(True)
+        cu_seqlens = torch.tensor(
+            [0, 5, real_seq_len, padded_seq_len],
+            device=torch.cuda.current_device(),
+            dtype=torch.int32,
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=padded_seq_len - real_seq_len,
+            max_seqlen_kv=padded_seq_len - real_seq_len,
+            total_tokens=hidden_states.shape[0],
+        )
+        assert packed_seq_params.seq_idx is not None
+
+        unfused_gdn.zero_grad(set_to_none=True)
+        fused_gdn.zero_grad(set_to_none=True)
+        unfused_output, _ = unfused_gdn(
+            hidden_states_unfused, None, packed_seq_params=packed_seq_params
+        )
+        fused_output, _ = fused_gdn(hidden_states_fused, None, packed_seq_params=packed_seq_params)
+        grad_output = torch.randn_like(unfused_output.float())
+        grad_output[real_seq_len:] = 0.0
+
+        unfused_loss = (unfused_output.float() * grad_output).sum()
+        fused_loss = (fused_output.float() * grad_output).sum()
+        unfused_loss.backward()
+        fused_loss.backward()
+
+        torch.testing.assert_close(
+            hidden_states_fused.grad, hidden_states_unfused.grad, atol=3e-2, rtol=3e-2
+        )
+        for param_name in ("in_proj.weight", "conv1d.weight", "A_log", "dt_bias"):
+            fused_param = dict(fused_gdn.named_parameters())[param_name]
+            unfused_param = dict(unfused_gdn.named_parameters())[param_name]
+            torch.testing.assert_close(
+                fused_param.grad,
+                unfused_param.grad,
+                atol=3e-2,
+                rtol=3e-2,
+                msg=lambda msg, name=param_name: f"{name} grad mismatch: {msg}",
+            )
+
     def test_fused_and_unfused_pre_gated_delta_rule_match(self):
         batch = 2
         seq_len = 32
@@ -851,6 +919,62 @@ class TestFusedPreGatedDeltaRule:
             fused_outputs, unfused_outputs, atol=2e-3, rtol=2e-3
         )
 
+    def test_fused_packed_g_softplus_matches_torch_for_large_alpha(self):
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        device = torch.cuda.current_device()
+        batch = 1
+        cu_seqlens = torch.tensor([0, 3, 8], device=device, dtype=torch.int32)
+        seq_len = cu_seqlens[-1].item()
+        num_value_heads = fused_gdn.num_v_heads_local_tp
+        beta_channel_offset = 2 * fused_gdn.qk_dim_local_tp + 2 * fused_gdn.v_dim_local_tp
+        alpha_channel_offset = beta_channel_offset + num_value_heads
+
+        qkvzba = torch.zeros(
+            (seq_len, batch, fused_gdn.in_proj_dim),
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        with torch.no_grad():
+            qkvzba[
+                :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
+            ] = 100.0
+            fused_gdn.A_log.zero_()
+            fused_gdn.dt_bias.zero_()
+        fused_gdn.zero_grad(set_to_none=True)
+
+        *_, g = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba, cu_seqlens_q=cu_seqlens)
+
+        alpha = qkvzba[
+            :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
+        ].transpose(0, 1)
+        expected_g = -torch.exp(fused_gdn.A_log.float()).view(1, 1, -1) * F.softplus(
+            alpha.float() + fused_gdn.dt_bias.float().view(1, 1, -1)
+        )
+        assert torch.isfinite(g).all()
+        torch.testing.assert_close(g.float(), expected_g, atol=0.0, rtol=0.0)
+
+        g.float().sum().backward()
+        expected_alpha_grad = -torch.ones_like(alpha.float())
+        expected_A_log_grad = expected_g.sum(dim=(0, 1))
+        expected_dt_bias_grad = -torch.full_like(fused_gdn.dt_bias.float(), seq_len * batch)
+        alpha_grad = qkvzba.grad[
+            :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
+        ].transpose(0, 1)
+
+        assert torch.isfinite(alpha_grad).all()
+        assert torch.isfinite(fused_gdn.A_log.grad).all()
+        assert torch.isfinite(fused_gdn.dt_bias.grad).all()
+        torch.testing.assert_close(alpha_grad.float(), expected_alpha_grad, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            fused_gdn.A_log.grad.float(), expected_A_log_grad, atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            fused_gdn.dt_bias.grad.float(), expected_dt_bias_grad, atol=0.0, rtol=0.0
+        )
+
     def test_fused_and_unfused_packed_pre_gated_delta_rule_backward_match(self):
         reference_gdn = self._build_gdn(
             gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
@@ -863,6 +987,73 @@ class TestFusedPreGatedDeltaRule:
         batch = 1
         cu_seqlens = torch.tensor(
             [0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        seq_len = cu_seqlens[-1].item()
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        qkvzba_unfused = qkvzba.detach().clone().requires_grad_(True)
+        qkvzba_fused = qkvzba.detach().clone().requires_grad_(True)
+
+        reference_gdn.zero_grad(set_to_none=True)
+        fused_gdn.zero_grad(set_to_none=True)
+
+        unfused_outputs = self._packed_pre_gated_delta_rule_reference(
+            reference_gdn, qkvzba_unfused, cu_seqlens
+        )
+        fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
+            qkvzba_fused, cu_seqlens_q=cu_seqlens
+        )
+        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+
+        unfused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
+        )
+        fused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(fused_outputs, grad_outputs)
+        )
+        unfused_loss.backward()
+        fused_loss.backward()
+
+        torch.testing.assert_close(qkvzba_fused.grad, qkvzba_unfused.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            fused_gdn.conv1d.weight.grad, reference_gdn.conv1d.weight.grad, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            fused_gdn.A_log.grad, reference_gdn.A_log.grad, atol=3e-2, rtol=3e-2
+        )
+        torch.testing.assert_close(
+            fused_gdn.dt_bias.grad, reference_gdn.dt_bias.grad, atol=3e-2, rtol=3e-2
+        )
+
+    def test_fused_and_unfused_packed_pre_gated_delta_rule_backward_repeat4_match(self):
+        reference_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False,
+            deterministic_mode=True,
+            conv_kernel_dim=4,
+            hidden_size=256,
+            key_head_dim=32,
+            value_head_dim=32,
+            num_key_heads=2,
+            num_value_heads=8,
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True,
+            deterministic_mode=False,
+            conv_kernel_dim=4,
+            hidden_size=256,
+            key_head_dim=32,
+            value_head_dim=32,
+            num_key_heads=2,
+            num_value_heads=8,
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 1
+        cu_seqlens = torch.tensor(
+            [0, 3, 8, 16], device=torch.cuda.current_device(), dtype=torch.int32
         )
         seq_len = cu_seqlens[-1].item()
         qkvzba = torch.randn(
@@ -1034,6 +1225,330 @@ class TestFusedPreGatedDeltaRule:
         torch.testing.assert_close(
             leaked_v_grad, torch.zeros_like(leaked_v_grad), atol=0.0, rtol=0.0
         )
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(not HAVE_FUSED_PRE_GDR, reason="causal-conv1d fused backward is not installed.")
+@pytest.mark.internal
+class TestFusedPreGatedDeltaRuleChunkwiseCP:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        self.pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def _build_gdn(self, *, gdn_pre_gated_delta_rule_fusion: bool, conv_kernel_dim: int = 4):
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            linear_conv_kernel_dim=conv_kernel_dim,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            bf16=True,
+            tensor_model_parallel_size=1,
+            context_parallel_size=2,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            linear_cp_mode="chunkwise",
+            transformer_impl="transformer_engine",
+            deterministic_mode=False,
+            gdn_pre_gated_delta_rule_fusion=gdn_pre_gated_delta_rule_fusion,
+        )
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=transformer_config
+        ).submodules
+        gdn = GatedDeltaNet(
+            transformer_config,
+            submodules=gdn_submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=self.pg_collection,
+        )
+        return gdn.cuda().bfloat16()
+
+    def _make_hidden_states(self, gdn, *, seq_len_global: int):
+        cp_size = parallel_state.get_context_parallel_world_size()
+        assert seq_len_global % cp_size == 0
+        seq_len_local = seq_len_global // cp_size
+        cp_rank = parallel_state.get_context_parallel_rank()
+        hidden_states = torch.randn(
+            (seq_len_local, 1, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        return hidden_states + cp_rank
+
+    @staticmethod
+    def _make_packed_seq_params(cu_seqlens):
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cu = torch.tensor(cu_seqlens, device=torch.cuda.current_device(), dtype=torch.int32)
+        return PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=max(cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)),
+            max_seqlen_kv=max(
+                cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)
+            ),
+            total_tokens=cu_seqlens[-1] // cp_size,
+        )
+
+    @staticmethod
+    def _run_forward(gdn, hidden_states, packed_seq_params=None):
+        with torch.no_grad():
+            output, bias = gdn(hidden_states, None, packed_seq_params=packed_seq_params)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return output, bias
+
+    @staticmethod
+    def _run_backward(gdn, hidden_states, grad_output, packed_seq_params=None):
+        gdn.zero_grad(set_to_none=True)
+        hidden_states = hidden_states.detach().clone().requires_grad_(True)
+        output, _ = gdn(hidden_states, None, packed_seq_params=packed_seq_params)
+        loss = (output.float() * grad_output).sum()
+        loss.backward()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        param_grads = {
+            name: param.grad.detach().clone()
+            for name, param in gdn.named_parameters()
+            if param.grad is not None
+        }
+        return output.detach(), hidden_states.grad.detach().clone(), param_grads
+
+    def test_fused_and_unfused_forward_chunkwise_cp_match(self):
+        unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
+        fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+        hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=64)
+
+        unfused_output, unfused_bias = self._run_forward(unfused_gdn, hidden_states)
+        fused_output, fused_bias = self._run_forward(fused_gdn, hidden_states)
+
+        rank = torch.distributed.get_rank()
+        torch.testing.assert_close(
+            fused_output,
+            unfused_output,
+            atol=3e-3,
+            rtol=3e-3,
+            msg=lambda msg: f"chunkwise CP fused forward mismatch ({rank=}): {msg}",
+        )
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_backward_chunkwise_cp_match(self):
+        unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
+        fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+        hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=64)
+        grad_output = torch.randn(
+            hidden_states.shape,
+            device=torch.cuda.current_device(),
+            dtype=torch.float32,
+        )
+
+        unfused_output, unfused_dinput, unfused_grads = self._run_backward(
+            unfused_gdn, hidden_states, grad_output
+        )
+        fused_output, fused_dinput, fused_grads = self._run_backward(
+            fused_gdn, hidden_states, grad_output
+        )
+
+        rank = torch.distributed.get_rank()
+        torch.testing.assert_close(
+            fused_output,
+            unfused_output,
+            atol=3e-3,
+            rtol=3e-3,
+            msg=lambda msg: f"chunkwise CP fused backward output mismatch ({rank=}): {msg}",
+        )
+        torch.testing.assert_close(
+            fused_dinput,
+            unfused_dinput,
+            atol=5e-2,
+            rtol=5e-2,
+            msg=lambda msg: f"chunkwise CP fused input grad mismatch ({rank=}): {msg}",
+        )
+        assert fused_grads.keys() == unfused_grads.keys()
+        for name in unfused_grads:
+            torch.testing.assert_close(
+                fused_grads[name],
+                unfused_grads[name],
+                atol=5e-2,
+                rtol=5e-2,
+                msg=lambda msg, param_name=name: (
+                    f"chunkwise CP fused grad mismatch for {param_name!r} ({rank=}): {msg}"
+                ),
+            )
+
+    def test_fused_chunkwise_cp_rejects_short_local_chunks(self):
+        gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True, conv_kernel_dim=4)
+        hidden_states = self._make_hidden_states(gdn, seq_len_global=4)
+
+        with pytest.raises((AssertionError, ValueError), match="local.*chunk|conv_kernel_dim"):
+            gdn(hidden_states, None)
+
+    def test_packed_chunkwise_cp_partial_left_halo_bounds(self):
+        from megatron.core.fusions.fused_pre_gated_delta_rule import (
+            _build_augmented_packed_cu_seqlens,
+        )
+
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cu_seqlens = torch.tensor([0, 4, 12], device=torch.cuda.current_device(), dtype=torch.int32)
+
+        augmented_cu, valid_left_halo = _build_augmented_packed_cu_seqlens(
+            cu_seqlens,
+            local_seq_len=6,
+            halo=3,
+            cp_size=2,
+            cp_rank=cp_rank,
+        )
+
+        if cp_rank == 0:
+            expected_cu = [0, 3, 7, 9]
+            expected_valid_left_halo = 0
+        else:
+            expected_cu = [0, 1, 9]
+            expected_valid_left_halo = 2
+        assert augmented_cu.tolist() == expected_cu
+        assert valid_left_halo == expected_valid_left_halo
+
+    def test_fused_and_unfused_packed_forward_chunkwise_cp_match(self):
+        unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
+        fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+        packed_seq_params = self._make_packed_seq_params([0, 96, 128])
+        hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=128)
+
+        unfused_output, unfused_bias = self._run_forward(
+            unfused_gdn, hidden_states, packed_seq_params=packed_seq_params
+        )
+        fused_output, fused_bias = self._run_forward(
+            fused_gdn, hidden_states, packed_seq_params=packed_seq_params
+        )
+
+        rank = torch.distributed.get_rank()
+        torch.testing.assert_close(
+            fused_output,
+            unfused_output,
+            atol=3e-3,
+            rtol=3e-3,
+            msg=lambda msg: f"packed chunkwise CP fused forward mismatch ({rank=}): {msg}",
+        )
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_packed_backward_chunkwise_cp_match(self):
+        unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
+        fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+        packed_seq_params = self._make_packed_seq_params([0, 96, 128])
+        hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=128)
+        grad_output = torch.randn(
+            hidden_states.shape,
+            device=torch.cuda.current_device(),
+            dtype=torch.float32,
+        )
+
+        unfused_output, unfused_dinput, unfused_grads = self._run_backward(
+            unfused_gdn, hidden_states, grad_output, packed_seq_params=packed_seq_params
+        )
+        fused_output, fused_dinput, fused_grads = self._run_backward(
+            fused_gdn, hidden_states, grad_output, packed_seq_params=packed_seq_params
+        )
+
+        rank = torch.distributed.get_rank()
+        torch.testing.assert_close(
+            fused_output,
+            unfused_output,
+            atol=3e-3,
+            rtol=3e-3,
+            msg=lambda msg: f"packed chunkwise CP fused backward output mismatch ({rank=}): {msg}",
+        )
+        torch.testing.assert_close(
+            fused_dinput,
+            unfused_dinput,
+            atol=5e-2,
+            rtol=5e-2,
+            msg=lambda msg: f"packed chunkwise CP fused input grad mismatch ({rank=}): {msg}",
+        )
+        assert fused_grads.keys() == unfused_grads.keys()
+        for name in unfused_grads:
+            torch.testing.assert_close(
+                fused_grads[name],
+                unfused_grads[name],
+                atol=5e-2,
+                rtol=5e-2,
+                msg=lambda msg, param_name=name: (
+                    f"packed chunkwise CP fused grad mismatch for {param_name!r} ({rank=}): {msg}"
+                ),
+            )
+
+    def test_fused_and_unfused_packed_partial_halo_chunkwise_cp_match(self):
+        unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
+        fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+        packed_seq_params = self._make_packed_seq_params([0, 4, 12])
+        hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=12)
+        grad_output = torch.randn(
+            hidden_states.shape,
+            device=torch.cuda.current_device(),
+            dtype=torch.float32,
+        )
+
+        unfused_output, unfused_dinput, unfused_grads = self._run_backward(
+            unfused_gdn, hidden_states, grad_output, packed_seq_params=packed_seq_params
+        )
+        fused_output, fused_dinput, fused_grads = self._run_backward(
+            fused_gdn, hidden_states, grad_output, packed_seq_params=packed_seq_params
+        )
+
+        rank = torch.distributed.get_rank()
+        torch.testing.assert_close(
+            fused_output,
+            unfused_output,
+            atol=3e-3,
+            rtol=3e-3,
+            msg=lambda msg: f"partial-halo packed CP fused output mismatch ({rank=}): {msg}",
+        )
+        torch.testing.assert_close(
+            fused_dinput,
+            unfused_dinput,
+            atol=5e-2,
+            rtol=5e-2,
+            msg=lambda msg: f"partial-halo packed CP fused input grad mismatch ({rank=}): {msg}",
+        )
+        assert fused_grads.keys() == unfused_grads.keys()
+        for name in unfused_grads:
+            torch.testing.assert_close(
+                fused_grads[name],
+                unfused_grads[name],
+                atol=5e-2,
+                rtol=5e-2,
+                msg=lambda msg, param_name=name: (
+                    f"partial-halo packed CP fused grad mismatch for {param_name!r} "
+                    f"({rank=}): {msg}"
+                ),
+            )
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
