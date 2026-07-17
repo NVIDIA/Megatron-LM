@@ -254,11 +254,7 @@ def test_evict_lru_never_orphans_a_child():
     a = _lru_allocator()
     # Chain b0 -> b1 -> b2. Parent b1 (ts=1) is older than child b2 (ts=5).
     _seed_cached_chain(
-        a,
-        block_ids=[0, 1, 2],
-        hashes=[10, 20, 30],
-        parents=[0, 10, 20],
-        timestamps=[1, 1, 5],
+        a, block_ids=[0, 1, 2], hashes=[10, 20, 30], parents=[0, 10, 20], timestamps=[1, 1, 5]
     )
 
     assert a.evict_lru_blocks(1) is True
@@ -274,11 +270,7 @@ def test_evict_lru_cascades_up_the_chain():
     deepest descendant, always keeping the retained set descendant-closed."""
     a = _lru_allocator()
     _seed_cached_chain(
-        a,
-        block_ids=[0, 1, 2],
-        hashes=[10, 20, 30],
-        parents=[0, 10, 20],
-        timestamps=[1, 1, 5],
+        a, block_ids=[0, 1, 2], hashes=[10, 20, 30], parents=[0, 10, 20], timestamps=[1, 1, 5]
     )
 
     assert a.evict_lru_blocks(2) is True
@@ -294,11 +286,7 @@ def test_evict_lru_normal_lru_order_when_leaf_is_oldest():
     a = _lru_allocator()
     # Ancestors refreshed (ts=9); descendant stale (ts=3) and is the leaf.
     _seed_cached_chain(
-        a,
-        block_ids=[0, 1, 2],
-        hashes=[10, 20, 30],
-        parents=[0, 10, 20],
-        timestamps=[9, 9, 3],
+        a, block_ids=[0, 1, 2], hashes=[10, 20, 30], parents=[0, 10, 20], timestamps=[9, 9, 3]
     )
 
     assert a.evict_lru_blocks(1) is True
@@ -312,11 +300,7 @@ def test_evict_lru_branching_prefix_tree():
     a = _lru_allocator()
     # b0 is the parent of both b1 and b2 (e.g. prompts "P+X" and "P+Y").
     _seed_cached_chain(
-        a,
-        block_ids=[0, 1, 2],
-        hashes=[10, 20, 30],
-        parents=[0, 10, 10],
-        timestamps=[1, 2, 8],
+        a, block_ids=[0, 1, 2], hashes=[10, 20, 30], parents=[0, 10, 10], timestamps=[1, 2, 8]
     )
 
     # Evicting one block takes a leaf (b1, the older child), never the parent.
@@ -348,9 +332,7 @@ def test_evict_lru_terminates_on_cyclic_parent_graph():
     # 2-cycle: block 0's parent hash is 20 (block 1) and block 1's parent hash is
     # 10 (block 0). register_kv_block_hashes never produces this — we seed it
     # directly to model the pathological collision case.
-    _seed_cached_chain(
-        a, block_ids=[0, 1], hashes=[10, 20], parents=[20, 10], timestamps=[1, 2]
-    )
+    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[20, 10], timestamps=[1, 2])
     assert int(a.get_evictable_block_count()) == 2
 
     # Terminates (no hang) and evicts exactly one of the two cached blocks.
@@ -361,11 +343,7 @@ def test_evict_lru_terminates_on_cyclic_parent_graph():
     # A longer 3-cycle also terminates and can be fully evicted.
     b = _lru_allocator()
     _seed_cached_chain(
-        b,
-        block_ids=[0, 1, 2],
-        hashes=[10, 20, 30],
-        parents=[30, 10, 20],
-        timestamps=[1, 2, 3],
+        b, block_ids=[0, 1, 2], hashes=[10, 20, 30], parents=[30, 10, 20], timestamps=[1, 2, 3]
     )
     assert b.evict_lru_blocks(3) is True
     assert b.kv_hash_to_block_id == {}
