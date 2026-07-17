@@ -525,9 +525,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
 
         # Request B shares H0/H1 with A and needs one new block for H2.
         req_b = self._req(ctx, self._prompt(bs * 3), request_id=3)
-        matched, num_from_pool, *_ = ctx._compute_prefix_match(
-            req_b, req_b.remaining_prompt_length
-        )
+        matched, num_from_pool, *_ = ctx._compute_prefix_match(req_b, req_b.remaining_prompt_length)
         assert matched == [s0, s1]
         assert num_from_pool == 1
 
