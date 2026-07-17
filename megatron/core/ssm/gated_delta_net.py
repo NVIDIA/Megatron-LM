@@ -8,14 +8,13 @@
 """Backward-compatibility shim.
 
 The Gated Delta Net implementation moved to the ``megatron.core.ssm.gdn`` package.
-Import from ``megatron.core.ssm.gdn`` (or ``megatron.core.ssm.gdn.gdn_common`` for
-the helpers) instead; this module re-exports the public names for existing users.
+Import from ``megatron.core.ssm.gdn`` instead;
+this module re-exports the public names for existing users.
 """
 
 # pylint: disable=unused-import
 
-from megatron.core.ssm.gdn.gated_delta_net import GatedDeltaNet
-from megatron.core.ssm.gdn.gdn_common import (
+from megatron.core.ssm.gdn.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
     _build_head_perm_for_split_sections,
@@ -25,6 +24,7 @@ from megatron.core.ssm.gdn.gdn_common import (
     tensor_a2a_hp2cp,
     torch_chunk_gated_delta_rule,
 )
+from megatron.core.ssm.gdn.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.utils import _split_tensor_factory
 
 __all__ = [

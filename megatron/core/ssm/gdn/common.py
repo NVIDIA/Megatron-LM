@@ -8,7 +8,7 @@
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -75,10 +75,17 @@ class _GDNBase(MegatronModule):
     skeleton, the gated output norm + projection, and sharded checkpointing.
 
     Concrete variants implement `_setup_variant` (in_proj sizing, split tables, gate
-    parameters, and kernel selection), `_reset_dt_bias`, and `_compute_gates`.
+    parameter dims, and kernel selection) and `_reset_dt_bias`.
 
     The layer takes input with size [s, b, h] and returns output of the same size.
     """
+
+    dt_bias_dim: int
+    a_log_dim: int
+    dt_bias: nn.Parameter
+    A_log: nn.Parameter
+
+    gated_delta_rule: Callable[..., tuple[torch.Tensor, torch.Tensor | None]]
 
     def __init__(
         self,
@@ -113,7 +120,8 @@ class _GDNBase(MegatronModule):
         """
         if not HAVE_FLA:
             raise ImportError(
-                "FLA is not installed. Please install it with `pip install flash-linear-attention`."
+                "FLA is not installed. Please install it with "
+                "`pip install flash-linear-attention[cuda]`."
             )
 
         super().__init__(config)
@@ -151,9 +159,18 @@ class _GDNBase(MegatronModule):
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
-        # Variant-specific setup: in_proj sizing, split tables, gate parameters
-        # (dt_bias, A_log), and the gated-delta-rule kernel callable.
-        self._setup_variant()
+        attrs_to_check = (
+            "dt_bias_dim",
+            "a_log_dim",
+            "in_proj_dim",
+            "in_proj_split_names",
+            "in_proj_split_sections",
+            "feat_dim_split",
+            "gated_delta_rule",
+        )
+        self._setup_variant_attrs()
+        for attr in attrs_to_check:
+            assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -180,8 +197,6 @@ class _GDNBase(MegatronModule):
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
 
-        # weight shape: [conv_dim, 1, d_conv]
-        # bias shape: [conv_dim]
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim_local_tp,
             out_channels=self.conv_dim_local_tp,
@@ -197,6 +212,22 @@ class _GDNBase(MegatronModule):
         if conv_bias:
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
             setattr(self.conv1d.bias, "partition_dim", 0)
+
+        self.dt_bias = nn.Parameter(
+            torch.empty(
+                self.dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+            )
+        )
+        setattr(self.dt_bias, "tensor_model_parallel", True)
+        setattr(self.dt_bias, "partition_dim", 0)
+
+        self.A_log = nn.Parameter(
+            torch.empty(
+                self.a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+            )
+        )
+        setattr(self.A_log, "tensor_model_parallel", True)
+        setattr(self.A_log, "partition_dim", 0)
 
         # Output layernorm before projection
         self.out_norm = build_module(
@@ -230,64 +261,33 @@ class _GDNBase(MegatronModule):
     ####################
     # Variant hooks
     ####################
-    def _setup_variant(self):
+    def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
 
-        Must set: ``in_proj_dim``, ``in_proj_split_names``, ``in_proj_split_sections``,
-        ``feat_dim_split``, the ``dt_bias``/``A_log`` parameters (via
-        ``_create_gate_params``), and ``gated_delta_rule`` (the kernel callable).
+        Must set:
+        - ``in_proj_dim``
+        - ``in_proj_split_names``
+        - ``in_proj_split_sections``
+        - ``feat_dim_split``
+        - ``dt_bias_dim`` / ``a_log_dim`` (sizes of the gate parameters, which the
+          base class creates after the conv1d module to preserve the original
+          parameter registration order)
+        - ``gated_delta_rule`` (the kernel callable).
         """
         raise NotImplementedError
-
-    def _reset_dt_bias(self):
-        """Initialize ``dt_bias``. Called from ``reset_parameters`` under the RNG tracker."""
-        raise NotImplementedError
-
-    def _compute_gates(self, gate_feats, A_log_local_cp, dt_bias_local_cp, batch, seq_len):
-        """Compute the log-decay ``g`` and the variant-specific kernel inputs.
-
-        Args:
-            gate_feats: The variant-specific in_proj output sections (everything after
-                the qkv and output-gate sections, in ``feat_dim_split`` order).
-            A_log_local_cp: CP-local slice of ``A_log``.
-            dt_bias_local_cp: CP-local slice of ``dt_bias``.
-            batch: Batch size.
-            seq_len: Sequence length.
-
-        Returns:
-            (tuple[Tensor, dict[str, Tensor]]): The log-decay ``g`` and a dict of the
-            remaining variant-specific kernel inputs keyed by kernel argument name.
-        """
-        raise NotImplementedError
-
-    def _create_gate_params(self, *, dt_bias_dim: int, a_log_dim: int):
-        """Create the ``dt_bias`` and ``A_log`` parameters with TP sharding attributes."""
-        self.dt_bias = nn.Parameter(
-            torch.empty(
-                dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
-            )
-        )
-        setattr(self.dt_bias, "tensor_model_parallel", True)
-        setattr(self.dt_bias, "partition_dim", 0)
-
-        self.A_log = nn.Parameter(
-            torch.empty(
-                a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
-            )
-        )
-        setattr(self.A_log, "tensor_model_parallel", True)
-        setattr(self.A_log, "partition_dim", 0)
 
     def reset_parameters(self):
         """Reset the parameters."""
         if self.config.perform_initialization:
             with get_cuda_rng_tracker().fork():
-                # conv1d.weight
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
-                # dt_bias
-                self._reset_dt_bias()
-                # A_log
+                torch.ones(
+                    self.dt_bias_dim,
+                    dtype=self.config.params_dtype,
+                    device=torch.cuda.current_device(),
+                    out=self.dt_bias.data,
+                )
                 A = torch.empty(
                     self.A_log.shape[0],
                     dtype=self.config.params_dtype,
@@ -470,16 +470,26 @@ class _GDNBase(MegatronModule):
             self.dt_bias, dim=0, cp_group=self.pg_collection.cp
         )
 
+        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, gate_feats, A_log_local_cp, dt_bias_local_cp, batch, seq_len
+        query, key, value, gate, gate_feats = self._prepare_input_for_gated_delta_rule(
+            qkv, gate, gate_feats, batch, seq_len
         )
-        gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+
+        nvtx_range_push(suffix="g_and_beta")
+        beta, alpha = gate_feats
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        beta = beta.sigmoid()
+        nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
@@ -545,20 +555,14 @@ class _GDNBase(MegatronModule):
         return y
 
     @jit_fuser
-    def _prepare_input_for_gated_delta_rule(
-        self, qkv, gate, gate_feats, A_log_local_cp, dt_bias_local_cp, batch, seq_len
-    ) -> dict[str, torch.Tensor]:
+    def _prepare_input_for_gated_delta_rule(self, qkv, gate, gate_feats, batch, seq_len):
         """
-        Prepare all gated delta rule kernel inputs.
+        Prepare the query, key, value, gate, and variant gate-feature tensors for the
+        gated delta rule kernels.
 
-        Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
-        contiguous operations. ``gate_feats`` holds the variant-specific in_proj
-        sections, which ``_compute_gates`` turns into the decay and gating tensors.
-
-        Returns:
-            (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
-            ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
-            gate (z) tensor under the ``gate`` key, which is not a kernel input.
+        Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
+        ``gate_feats`` holds the variant-specific in_proj sections, which are returned
+        contiguous for the decay/gating computation in ``forward``.
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
@@ -579,26 +583,20 @@ class _GDNBase(MegatronModule):
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
-        repeat_factor = self.num_value_heads // self.num_key_heads
-
-        g, variant_kernel_inputs = self._compute_gates(
-            gate_feats, A_log_local_cp, dt_bias_local_cp, batch, seq_len
-        )
-
         # Expand query and key if needed (grouped query attention)
-        if repeat_factor > 1:
+        if self.num_value_heads // self.num_key_heads > 1:
+            repeat_factor = self.num_value_heads // self.num_key_heads
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
 
-        kernel_inputs = {
-            "q": query.contiguous(),
-            "k": key.contiguous(),
-            "v": value.contiguous(),
-            "g": g.contiguous(),
-            "gate": gate.contiguous(),
-            **variant_kernel_inputs,
-        }
-        return kernel_inputs
+        # Make all tensors contiguous
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        gate = gate.contiguous()
+        gate_feats = tuple(t.contiguous() for t in gate_feats)
+
+        return query, key, value, gate, gate_feats
 
     def _resolve_cu_seqlens(
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
@@ -964,7 +962,7 @@ def torch_chunk_gated_delta_rule(
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
-):
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     # pylint: disable=line-too-long
     '''
     Torch-native implementation of chunked gated delta rule for deterministic mode.

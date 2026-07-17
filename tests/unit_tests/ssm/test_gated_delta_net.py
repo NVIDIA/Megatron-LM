@@ -19,7 +19,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdn import GatedDeltaNet
-from megatron.core.ssm.gdn.gdn_common import (
+from megatron.core.ssm.gdn.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     tensor_a2a_cp2hp,
@@ -311,31 +311,24 @@ class TestGatedDeltaNet:
             torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
             torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
         )  # beta, alpha
-        A_log_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
-        dt_bias_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
-        expected_keys = {"q", "k", "v", "g", "beta"}
 
         # Disable dynamo so coverage.py can trace through the method bodies,
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
-            kernel_inputs = gdn._prepare_input_for_gated_delta_rule(
-                qkv, gate, gate_feats, A_log_mock, dt_bias_mock, batch, seq_len
+            query, key, value, gate_out, gate_feats_out = gdn._prepare_input_for_gated_delta_rule(
+                qkv, gate, gate_feats, batch, seq_len
             )
-            gate_out = kernel_inputs.pop("gate")
 
-        assert set(kernel_inputs.keys()) == expected_keys
-        query, key, value, g = (kernel_inputs[name] for name in ("q", "k", "v", "g"))
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-        # The log-decay must be in fp32
-        assert g.dtype == torch.float32
-        for t in (query, key, value, gate_out, g):
+        for t in (query, key, value, gate_out, *gate_feats_out):
             assert t.is_contiguous()
 
-        # Per-head decay and write strength beta
-        assert g.shape == (batch, seq_len, num_v_heads_local)
-        assert kernel_inputs["beta"].shape == (batch, seq_len, num_v_heads_local)
+        # The variant gate features (beta, alpha) pass through with shapes intact
+        beta_out, alpha_out = gate_feats_out
+        assert beta_out.shape == (batch, seq_len, num_v_heads_local)
+        assert alpha_out.shape == (batch, seq_len, num_v_heads_local)
 
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
