@@ -21,8 +21,7 @@ v2/
 ├── design/hsdp_design.md        # HSDP mesh, buffer layouts, and conversions
 ├── design.md                    # Overlap, memory, and synchronization design
 ├── nvfp4_design.md              # NVFP4 primary-weights design
-├── mcore_fsdp_checkpoint_design.md  # Checkpoint save/load and format conversion design
-└── tp_support_design.md         # Tensor Parallelism support plan (future)
+└── mcore_fsdp_checkpoint_design.md  # Checkpoint save/load and format conversion design
 ```
 
 For the broader `megatron_fsdp` package layout, see the parent directory.
@@ -195,7 +194,6 @@ strategy controls which buffers and communication collectives are used.
   not a TP placement. Parameters that are already partitioned by TP layers
   (e.g., `ColumnParallelLinear`, `RowParallelLinear`) are not represented with
   TP-aware DTensor metadata.
-  See [tp_support_design.md](tp_support_design.md) for the planned design.
 - **Hybrid Sharding (HSDP):** A 2D `(dp_outer, dp/edp)` mesh supports outer
   replication and outer optimizer-state sharding. Outer `optim` currently
   requires inner `optim_grads_params`; NVFP4 outer optimizer sharding is not
