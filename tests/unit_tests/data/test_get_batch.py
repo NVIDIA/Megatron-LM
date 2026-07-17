@@ -561,7 +561,12 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -1160,7 +1165,12 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     total_tokens = micro_batch_size * seq_length
 
