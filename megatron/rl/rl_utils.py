@@ -3000,34 +3000,42 @@ def _rollout_keepalive_burn(interval_s, stop_event):
         # window is 30 -- so sit out the start rather than probe capture state.
         if stop_event.wait(300.0):
             return
-        a = b = None
+        # GIL-independent burn via CUDA-graph replay. Evolution, all verified by
+        # reaper AdminComments: 3s-per-60s bursts -> reaped 31/32 idle (5439275);
+        # 60ms-per-500ms eager matmuls -> reaped 56/64 idle (5439663/5439706): the
+        # burn registered on only ~8 GPUs because ranks whose main thread spins
+        # the engine step loop starve this thread of the GIL, so most ranks never
+        # launched their kernels. A captured graph packs ~200ms of matmul into ONE
+        # replay call: even a thread scheduled every ~300ms sustains ~45% duty.
+        # thread_local capture mode so neither the engine's concurrent CUDA work
+        # nor this capture can invalidate each other.
+        a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+        b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
+        c = torch.empty(4096, 4096, dtype=torch.bfloat16, device=device)
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                torch.matmul(a, b, out=c)
+            stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream, capture_error_mode="thread_local"):
+            for _ in range(1500):
+                torch.matmul(a, b, out=c)
+        stream.synchronize()
         failures = 0
-        # CONTINUOUS low-duty burn, not periodic bursts: job 5439275 was reaped
-        # (31/32 idle 30m) with the previous 3s-per-60s burst version running and
-        # zero failures logged -- a 5% duty cycle concentrated in one burst evades
-        # the reaper's sampling. ~60ms of matmul every 500ms (~12% duty) is visible
-        # to any sampler cadence while adding negligible contention.
         while not stop_event.is_set():
             try:
                 with torch.cuda.stream(stream):
-                    if a is None:
-                        a = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
-                        b = torch.randn(4096, 4096, dtype=torch.bfloat16, device=device)
-                    t0 = _time.monotonic()
-                    while _time.monotonic() - t0 < 0.06:
-                        for _ in range(16):
-                            torch.matmul(a, b)
-                        stream.synchronize()
+                    graph.replay()
+                    stream.synchronize()
                 failures = 0
             except Exception:
                 failures += 1
-                a = b = None  # drop tensors in case the failure was an OOM
                 if failures == 1:
                     logger.warning("Keepalive burn failed; retrying quietly.", exc_info=True)
                 if failures >= 10:
                     logger.warning("Keepalive burn disabled after 10 consecutive failures.")
                     return
-            if stop_event.wait(0.5):
+            if stop_event.wait(0.25):
                 return
     except Exception:
         logger.warning("Keepalive burn thread exiting.", exc_info=True)
