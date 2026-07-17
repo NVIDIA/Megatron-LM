@@ -132,6 +132,7 @@ def _nccl_events(cuda_events, *name_fragments):
         event
         for event in cuda_events
         if "nccl" in event.name.lower()
+        and event.activity_type == "kernel"
         and any(fragment in event.name.lower() for fragment in name_fragments)
     ]
 
