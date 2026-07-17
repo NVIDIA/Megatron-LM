@@ -183,7 +183,7 @@ class _FSDPRootContext:
     ``backward_phase`` is set to ``False`` when this becomes ``True``."""
 
     enable_cuda_graph: bool = False
-    """Set by enable_cuda_graph() — tells hooks to manage the side stream."""
+    """Whether hooks should manage the side stream for CUDA graph capture."""
 
     cuda_graph_stream: Optional[torch.cuda.Stream] = None
     """Side stream for CUDA graph capture/replay.  Created lazily on the
@@ -269,21 +269,6 @@ class FSDPModule:
         if ctx.bucket_allocator.phase != "optimized":
             return False
         return True
-
-    def enable_cuda_graph(self) -> None:
-        """Enable CUDA graph capture for this FSDP module.
-
-        Must be called while the module is resharded (before the first
-        forward pass).  Sets the ``enable_cuda_graph`` flag on both the
-        per-module FSDP state and the shared root context.  The side
-        stream is created lazily on the first root forward pre-hook.
-
-        Usage::
-
-            fully_shard(layer, mesh=mesh)
-            layer.enable_cuda_graph()   # call before first forward
-        """
-        self._fsdp_state.enable_cuda_graph = True
 
     def release_memory_pool(self) -> None:
         """Release all persistent communication-buffer memory and any CUDA graphs.
@@ -702,7 +687,7 @@ class FSDPModule:
                     f"has FSDP children: {child_names}. "
                     f"Only leaf FSDP modules (no FSDP children) can use CUDA graph capture."
                 )
-            self.enable_cuda_graph()
+            self._fsdp_state.enable_cuda_graph = True
 
         if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
             root_context.enable_cuda_graph = True
