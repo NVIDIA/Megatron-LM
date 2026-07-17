@@ -735,11 +735,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_mamba_cache_budget_too_small_raises(self):
-        # The CUDA-graph extraction scratch (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST *
-        # max_requests slots) is reserved from prefix_caching_mamba_gb before the
-        # durable cache is sized. A budget too small to fit the scratch plus at
-        # least one durable slot is a hard configuration error, not a silent
-        # over-allocation (which previously could OOM at startup).
+        # The CUDA-graph extraction scratch (sized to the per-step token-budget
+        # cap, max_mamba_intermediate_states_per_step) is reserved from
+        # prefix_caching_mamba_gb before the durable cache is sized. A budget too
+        # small to fit the scratch plus at least one durable slot is a hard
+        # configuration error, not a silent over-allocation (which previously
+        # could OOM at startup).
         with pytest.raises(ValueError, match="prefix cache budget"):
             self._mctx(prefix_caching_mamba_gb=1e-5)
 
@@ -888,6 +889,68 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
                 ctx5.mamba_slot_allocator.conv_states[layer, slot5],
                 torch.full_like(ctx5.mamba_slot_allocator.conv_states[layer, slot5], layer + 1.0),
             )
+
+    @pytest.mark.internal
+    def test_max_intermediate_states_per_step_formula(self):
+        # The extraction buffers are sized by the per-step token budget:
+        # ceil(max_tokens / block_size) + 1, floored at
+        # MAX_INTERMEDIATE_OFFSETS_PER_REQUEST -- independent of max_requests.
+        import math
+
+        from megatron.core.inference.contexts.mamba_slot_allocator import (
+            MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+        )
+
+        # Token budget dominates the floor.
+        ctx = self._mctx(block_size_tokens=256, max_tokens=2048)
+        expected = max(
+            MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+            math.ceil(ctx.max_tokens / ctx.block_size_tokens) + 1,
+        )
+        assert ctx.max_mamba_intermediate_states_per_step == expected
+        # The single value is shared everywhere it's consumed.
+        assert ctx.mamba_slot_allocator.max_intermediate_count == expected
+        assert ctx.mamba_metadata.max_intermediate_count == expected
+        assert ctx.mamba_slot_allocator.intermediate_ssm_out.shape[1] == expected
+
+        # Tiny token budget: the per-request floor takes over.
+        ctx_small = self._mctx(block_size_tokens=256, max_tokens=256)
+        assert (
+            ctx_small.max_mamba_intermediate_states_per_step
+            == MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+        )
+
+    @pytest.mark.internal
+    def test_intermediate_count_bounded_by_token_budget(self):
+        # Claim: a single engine step emits at most max_tokens / block_size Mamba
+        # intermediate states, regardless of how many prefill requests it packs.
+        # Fill the token budget with fresh multi-block prefills and confirm the
+        # extracted count never exceeds the scratch buffer.
+        bs = 256
+        ctx = self._mctx(block_size_tokens=bs, max_tokens=2048, max_sequence_length=4096)
+        budget = ctx.max_mamba_intermediate_states_per_step
+
+        # Non-block-aligned 2.5-block prefills (each crosses a block boundary on a
+        # mamba-chunk multiple -> one intermediate offset). Distinct content so
+        # they never prefix-match one another.
+        per_req = bs * 2 + bs // 2  # 640 tokens
+        n = ctx.max_tokens // per_req
+        assert n >= 2
+        for i in range(n):
+            ctx.add_request(
+                self._req(ctx, self._prompt(per_req, offset=i * 100000), request_id=i + 1)
+            )
+
+        # Drive the step's metadata computation (populates intermediate_count).
+        ctx.initialize_attention_state()
+        ctx.transfer_bookkeeping_to_gpu()
+
+        md = ctx.mamba_metadata
+        # Extraction actually fired (guards against a silent no-op test)...
+        assert md.intermediate_count > 0
+        # ...and the packed step never exceeds the token-budget bound.
+        assert md.intermediate_count <= budget
+        assert md.intermediate_count == sum(md.per_request_intermediate_counts)
 
 
 class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):

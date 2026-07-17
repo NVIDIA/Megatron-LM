@@ -14,7 +14,12 @@ class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
     def __init__(
-        self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128, d_conv: int = 0
+        self,
+        max_requests: int,
+        max_tokens: int,
+        max_intermediate_count: int,
+        mamba_chunk_size: int = 128,
+        d_conv: int = 0,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -22,6 +27,11 @@ class MambaMetadata:
         Args:
             max_requests (int): The maximum number of concurrent requests.
             max_tokens (int): The maximum number of tokens.
+            max_intermediate_count (int): Per-step upper bound on Mamba
+                intermediate-state extractions; sizes the intermediate metadata
+                buffers. Computed once by DynamicInferenceContext (as
+                max_mamba_intermediate_states_per_step) and shared with
+                MambaSlotAllocator.
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
@@ -91,9 +101,9 @@ class MambaMetadata:
         )
         self.mamba_state_free_slot_count = self.max_requests
 
-        # Intermediate state extraction buffers (CUDA graph compatible)
-        # Each prefill request can produce up to 3 intermediate offsets
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests
+        # Intermediate state extraction buffers (CUDA graph compatible). Sized by
+        # the per-step token-budget cap shared from DynamicInferenceContext.
+        self.max_intermediate_count = max_intermediate_count
         self._intermediate_chunk_indices_buffer = torch.zeros(
             self.max_intermediate_count, dtype=torch.int64, device=self.device
         )
@@ -387,7 +397,13 @@ class MambaMetadata:
                 shared ``ContextGPUView.mamba_cu_seqlens`` view.
         """
         chunk_size = self.mamba_chunk_size
-        max_count = padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+        # Cap at the token-budget bound so the per-step views never exceed the
+        # buffers, even for high-prefill-count graph buckets where
+        # padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST would.
+        max_count = min(
+            padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+            self.max_intermediate_count,
+        )
         if cu_seqlens_gpu is None:
             cu_seqlens_gpu = self._cu_seqlens_buffer
 
@@ -438,6 +454,13 @@ class MambaMetadata:
                 valid_abs_positions = abs_positions_2d[valid_mask]
 
                 real_count = valid_chunk_indices.numel()
+                # The token-budget bound guarantees this; fail loudly rather than
+                # silently overrun the scratch buffers if the candidate-offset
+                # logic in MambaSlotAllocator.compute_and_store_offsets changes.
+                assert real_count <= self.max_intermediate_count, (
+                    f"Mamba intermediate count {real_count} exceeds buffer size "
+                    f"{self.max_intermediate_count}"
+                )
                 self._intermediate_chunk_indices_buffer[:real_count] = valid_chunk_indices
                 self._intermediate_abs_positions_buffer[:real_count] = valid_abs_positions.to(
                     torch.int32

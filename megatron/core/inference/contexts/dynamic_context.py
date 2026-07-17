@@ -598,6 +598,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
+        # Per-step upper bound on Mamba intermediate-state extractions, computed
+        # once here and shared with MambaMetadata and MambaSlotAllocator so the
+        # extraction scratch/metadata buffers and the budget accounting all agree.
+        # A step produces at most one block boundary per block_size_tokens of its
+        # token budget; the floor keeps buffers usable for tiny max_tokens and the
+        # +1 is a small safety margin.
+        self.max_mamba_intermediate_states_per_step = max(
+            MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
+            math.ceil(self.max_tokens / self.block_size_tokens) + 1,
+        )
+
         assert self.max_tokens >= self.max_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
             f"max_requests ({self.max_requests}), "
@@ -802,7 +813,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # budget first, then the rest sizes the "durable" cache
                 # (ssm_states/conv_states). mamba_bytes_per_req is the shared
                 # per-slot footprint of both.
-                scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+                scratch_slots = self.max_mamba_intermediate_states_per_step
                 scratch_bytes = scratch_slots * mamba_bytes_per_req
                 durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
                 durable_slots = max(durable_slots, 0)
@@ -861,6 +872,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
+                max_intermediate_count=self.max_mamba_intermediate_states_per_step,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
@@ -1696,26 +1708,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         #                       `max_slots` slots (computed below).
         #   - "scratch" buffers: self.intermediate_ssm_out / self.intermediate_conv_out,
         #                       fixed CUDA-graph-safe staging for intermediate-state
-        #                       extraction, sized to the per-step worst case of
-        #                       `scratch_slots` = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
-        #                       * max_requests slots.
+        #                       extraction, sized to the per-step token-budget cap
+        #                       `scratch_slots` = max_mamba_intermediate_states_per_step.
         # The scratch is not part of the durable cache but consumes the same
         # per-slot bytes, so reserve it from the budget up front before sizing the
         # durable cache; otherwise total usage silently exceeds mamba_gb (and can
         # OOM) when scratch_slots > max_slots.
-        scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+        scratch_slots = self.max_mamba_intermediate_states_per_step
         scratch_bytes = scratch_slots * per_slot_bytes
         max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
         if max_slots < 1:
             raise ValueError(
                 f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
                 f"is too small. The CUDA-graph extraction scratch reserves "
-                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots = "
-                f"{MAX_INTERMEDIATE_OFFSETS_PER_REQUEST} offsets x {self.max_requests} "
-                f"requests x {per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
+                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots x "
+                f"{per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
                 f"fewer than one durable cache slot. Increase prefix_caching_mamba_gb "
                 f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
-                f"reduce max_requests."
+                f"reduce max_tokens."
             )
 
         self.mamba_slot_allocator = MambaSlotAllocator(

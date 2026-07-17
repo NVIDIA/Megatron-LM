@@ -106,10 +106,10 @@ class MambaSlotAllocator:
         # Pre-allocated "scratch" output buffers for CUDA graph compatible
         # extraction (GPU): per-step staging that the kernel writes intermediate
         # states into before commit copies them to the durable cache above. Sized
-        # to the per-step worst case (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST *
-        # max_requests); the budget accounting in DynamicInferenceContext refers to
-        # these as the "scratch" buffers.
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
+        # by the per-step token budget computed once on the context; the budget
+        # accounting in DynamicInferenceContext refers to these as the "scratch"
+        # buffers.
+        self.max_intermediate_count = context.max_mamba_intermediate_states_per_step
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
