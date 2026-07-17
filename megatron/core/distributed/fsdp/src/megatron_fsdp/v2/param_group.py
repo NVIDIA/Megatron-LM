@@ -17,7 +17,7 @@ from torch.distributed.tensor.placement_types import Replicate, Shard
 
 from ..uneven_dtensor import (
     make_uneven_dtensor,
-    update_uneven_dtensor_chunk_metadata,
+    copy_chunk_metadata,
 )
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .dp_buffer import DataParallelBuffer
@@ -449,19 +449,28 @@ class ParameterGroup:
                 data = param.data.detach()
                 param_shape = param.shape
 
+            dist_data = make_uneven_dtensor(
+                data,
+                param_shape,
+                self.mesh,
+                optim_placements,
+                post_process_uneven=True,
+            )
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(
-                    data,
-                    param_shape,
-                    self.mesh,
-                    optim_placements,
-                    post_process_uneven=True,
-                ),
+                dist_data,
                 requires_grad=param.requires_grad,
             )
+            # ``torch.nn.Parameter(DTensor)`` wraps the DTensor and creates a
+            # fresh local tensor object, so Python-side uneven-DTensor metadata
+            # attached by ``post_process_uneven=True`` is not preserved
+            # automatically. Grad DTensor initialization later copies chunk
+            # metadata from ``dist_param``; keep that invariant explicit here.
+            copy_chunk_metadata(dist_data, dist_param)
+
             # Mark as FSDP parameter for special handling
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
+            assert hasattr(dist_param._local_tensor, "__create_chunk_list__"), "DTensor must have chunk metadata for FSDP"
             self.dist_params.append(dist_param)
             self.dist_grads.append(None)  # placeholder, will be set in _init_dist_grads
 
