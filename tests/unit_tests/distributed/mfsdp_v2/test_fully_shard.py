@@ -311,8 +311,6 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_overlaps_communication_and_compute(distributed_setup):
     """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
@@ -321,7 +319,14 @@ def test_overlaps_communication_and_compute(distributed_setup):
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
-    dim = 8192
+    # A large hidden size keeps the per-layer GEMMs long enough that the
+    # collectives reliably overlap them. The overlap count is otherwise
+    # launch-bound: the host issues kernels with gaps (amplified by CI's
+    # `coverage run` wrapper), so with short GEMMs a collective can land in a
+    # gap between GEMMs instead of running alongside one, making the count jitter
+    # run to run. At dim=16384 the GEMMs dominate that launch jitter and the
+    # overlap becomes deterministic. (dim=8192 was flaky under coverage.)
+    dim = 16384
     num_children = 4
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
@@ -348,7 +353,15 @@ def test_overlaps_communication_and_compute(distributed_setup):
         # drop the CUDA events.
         torch.cuda.synchronize(device)
 
-    cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
+    # Keep only real device kernels. NCCL also emits per-collective GPU user
+    # annotations (e.g. "nccl:_reduce_scatter_base") that the profiler reports as
+    # CUDA events. Filtering by activity type avoids counting those annotations as
+    # kernels without relying on their current naming convention.
+    cuda_events = [
+        event
+        for event in prof.events()
+        if event.device_type.name == "CUDA" and event.activity_type == "kernel"
+    ]
     all_gather_events = [
         event
         for event in cuda_events
@@ -367,8 +380,16 @@ def test_overlaps_communication_and_compute(distributed_setup):
         for event in cuda_events
         if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas", "nvjet"))
     ]
-    assert all_gather_events, [event.name for event in cuda_events]
-    assert reduce_scatter_events, [event.name for event in cuda_events]
+    # Each of the num_children children plus the root all-gathers in forward and
+    # again in backward, and each reduce-scatters once in backward.
+    assert len(all_gather_events) == 2 * (num_children + 1), (
+        f"Expected {2 * (num_children + 1)} all-gather kernels, "
+        f"got {[event.name for event in all_gather_events]}."
+    )
+    assert len(reduce_scatter_events) == num_children + 1, (
+        f"Expected {num_children + 1} reduce-scatter kernels, "
+        f"got {[event.name for event in reduce_scatter_events]}."
+    )
     assert gemm_events, [event.name for event in cuda_events]
 
     all_gather_streams = {event.device_resource_id for event in all_gather_events}
@@ -388,16 +409,16 @@ def test_overlaps_communication_and_compute(distributed_setup):
         any(_events_overlap(reduce_scatter_event, gemm_event) for gemm_event in gemm_events)
         for reduce_scatter_event in reduce_scatter_events
     )
-    # Communication overlaps compute only partially due to SM contention (the
-    # SM-based NCCL collectives share SMs with the GEMMs) and the count varies
-    # run to run, so assert only that overlap meaningfully happens rather than the
-    # theoretical maximum (2*(num_children - 1) / num_children - 1). Symmetric-memory
-    # collectives (use_symm_mem, ~SM-free) would let these thresholds be tightened.
-    assert all_gather_overlap_count >= 2, (
+    # With dim large enough for the GEMMs to dominate launch jitter (see above),
+    # the prefetched collectives overlap compute deterministically, so assert the
+    # theoretical maxima (2*(num_children - 1) all-gathers across forward and
+    # backward, num_children - 1 reduce-scatters in backward) rather than a loose
+    # floor.
+    assert all_gather_overlap_count >= 2 * (num_children - 1), (
         f"Expected all-gather to overlap compute, "
         f"got {all_gather_overlap_count}/{len(all_gather_events)}."
     )
-    assert reduce_scatter_overlap_count >= 1, (
+    assert reduce_scatter_overlap_count >= num_children - 1, (
         f"Expected reduce-scatter to overlap compute, "
         f"got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
     )
