@@ -18,13 +18,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 # Each sharded Linear's collective must be large enough that NCCL selects its
 # symmetric-memory (ncclSymk*) kernels over ring. Sub-KB collectives fall back to
 # ring on some platforms (e.g. CI with NCCL_NVLS_ENABLE=0), which would make the
-# symmetric-kernel assertions below fail; 1024-wide units (a few-MiB bf16 weight)
+# symmetric-kernel assertions below fail; 1024-wide layers (a few-MiB bf16 weight)
 # reliably engage the symmetric kernels.
 _HIDDEN = 1024
 
 
 class TinyModel(nn.Module):
-    """Two separately shardable units, sized so NCCL selects symmetric-memory kernels."""
+    """Two separately shardable Linear modules, sized so NCCL selects symmetric-memory kernels."""
 
     def __init__(self) -> None:
         super().__init__()
