@@ -16,8 +16,6 @@ possible slot count, but per-program execution is data-conditional on the
 runtime ``real_count``, so padded slots cost almost nothing.
 """
 
-from typing import Optional
-
 import torch
 from torch import Tensor
 
@@ -88,9 +86,9 @@ def scatter_intermediate_ssm(
     """
     assert states.is_cuda and chunk_indices.is_cuda and real_count_gpu.is_cuda and out.is_cuda
     assert states.dim() >= 2, f"expected states to be at least 2D, got {states.shape}"
-    assert out.shape[1:] == states.shape[1:], (
-        f"per-slot shape mismatch: out {tuple(out.shape[1:])} vs states {tuple(states.shape[1:])}"
-    )
+    assert (
+        out.shape[1:] == states.shape[1:]
+    ), f"per-slot shape mismatch: out {tuple(out.shape[1:])} vs states {tuple(states.shape[1:])}"
     assert chunk_indices.dtype == torch.int64, chunk_indices.dtype
     assert real_count_gpu.dtype == torch.int32 and real_count_gpu.numel() == 1
 
@@ -197,9 +195,9 @@ def scatter_intermediate_conv(
     assert src.shape[0] == 1, f"batch must be 1 for inference, got {src.shape[0]}"
     assert abs_positions.dtype == torch.int32, abs_positions.dtype
     assert real_count_gpu.dtype == torch.int32 and real_count_gpu.numel() == 1
-    assert out.dim() == 3 and out.shape[2] == d_conv, (
-        f"out shape {tuple(out.shape)} does not match (max_count, conv_dim, {d_conv})"
-    )
+    assert (
+        out.dim() == 3 and out.shape[2] == d_conv
+    ), f"out shape {tuple(out.shape)} does not match (max_count, conv_dim, {d_conv})"
 
     _, conv_dim, _ = out.shape
     n_slots = int(abs_positions.numel())

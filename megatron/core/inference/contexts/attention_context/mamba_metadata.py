@@ -104,9 +104,7 @@ class MambaMetadata:
         # kernels (intermediate_extraction.py). Fixed-address, rewritten each step
         # so captured CUDA graphs stay valid while the kernels skip padded slots
         # (pid_slot >= real_count).
-        self._intermediate_real_count_buffer = torch.zeros(
-            1, dtype=torch.int32, device=self.device
-        )
+        self._intermediate_real_count_buffer = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         # Coalesced production path: pinned CPU views + shared GPU views bound
         # by DynamicInferenceContext so that the per-step Mamba metadata fields
