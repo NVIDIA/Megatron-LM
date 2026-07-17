@@ -234,7 +234,8 @@ def test_depth_is_completed_batches_and_refills_after_pop(fake_cuda, depth):
     loader.close()
 
 
-def test_pending_encode_can_be_claimed_while_cpu_read_ahead_blocks(fake_cuda):
+def test_pending_encode_can_be_claimed_while_cpu_read_ahead_blocks(fake_cuda, caplog):
+    caplog.set_level("INFO", logger=f"{encoder_prefetch.__name__}.debug")
     read_ahead_started = threading.Event()
     release_read_ahead = threading.Event()
 
@@ -251,20 +252,25 @@ def test_pending_encode_can_be_claimed_while_cpu_read_ahead_blocks(fake_cuda):
         feature_producer=lambda inputs: torch.tensor(inputs["radio"]["x"].item()),
         depth=1,
         stream=fake_cuda.producer,
+        debug=True,
     )
     loader.start()
     assert read_ahead_started.wait(timeout=1)
 
     try:
         assert len(loader._ready) == 0
+        completion_event = loader._pending[1]
         batch = next(loader)
         assert batch[PREFETCHED_FEATURES_KEY][ENCODER].item() == 0
-        assert fake_cuda.current.waited_events[-1] is fake_cuda.events[-1]
+        assert fake_cuda.current.waited_events[-1] is completion_event
         assert loader._pending is None
         assert loader._in_flight
     finally:
         release_read_ahead.set()
         loader.close()
+
+    assert "consumer-wait batch=0 encoder_wait_ms=1.250" in caplog.text
+    assert "claimed_pending=1" in caplog.text
 
 
 def test_cpu_read_ahead_overlaps_encode_without_enqueuing_another_batch(fake_cuda):

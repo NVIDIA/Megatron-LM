@@ -122,14 +122,26 @@ def _log_producer_debug(
 
 
 def _log_consumer_debug(
-    batch_id: int, ready_at_request: int, depth: int, wait_start: float
+    batch_id: int, ready_at_request: int, depth: int, claimed_pending: bool, wait_start: float
 ) -> None:
     _debug_logger.info(
-        "encoder-prefetch-debug consumer batch=%d ready_at_request=%d/%d pop_wait_ms=%.3f",
+        "encoder-prefetch-debug consumer batch=%d ready_at_request=%d/%d "
+        "claimed_pending=%d pop_wait_ms=%.3f",
         batch_id,
         ready_at_request,
         depth,
+        claimed_pending,
         (time.perf_counter() - wait_start) * 1000,
+    )
+
+
+def _log_encoder_wait_debug(
+    batch_id: int, start_event: torch.cuda.Event, end_event: torch.cuda.Event
+) -> None:
+    _debug_logger.info(
+        "encoder-prefetch-debug consumer-wait batch=%d encoder_wait_ms=%.3f",
+        batch_id,
+        start_event.elapsed_time(end_event),
     )
 
 
@@ -190,6 +202,7 @@ class EncoderPrefetchLoader:
         self._ready: deque[dict[str, object]] = deque()
         self._pending: tuple[dict[str, object], torch.cuda.Event] | None = None
         self._in_flight = False
+        self._encoder_wait_timings: deque[tuple[int, torch.cuda.Event, torch.cuda.Event]] = deque()
         self._projection_timings: deque[tuple[int, torch.cuda.Event, torch.cuda.Event]] = deque()
         self._produced_batches = 0
         self._consumed_batches = 0
@@ -298,6 +311,7 @@ class EncoderPrefetchLoader:
             if self._debug:
                 assert encode_start is not None
                 _log_producer_debug(batch_id, data_fetch_ms, encode_start, completion_event)
+                self._drain_encoder_wait_timings()
                 self._drain_projection_timings()
             if terminate:
                 return
@@ -360,12 +374,35 @@ class EncoderPrefetchLoader:
 
         current_stream = torch.cuda.current_stream()
         if completion_event is not None:
+            wait_start_event = torch.cuda.Event(enable_timing=True) if self._debug else None
+            wait_end_event = torch.cuda.Event(enable_timing=True) if self._debug else None
+            if wait_start_event is not None:
+                wait_start_event.record(current_stream)
             current_stream.wait_event(completion_event)
+            if wait_end_event is not None:
+                wait_end_event.record(current_stream)
+                self._queue_encoder_wait_timing(batch_id, wait_start_event, wait_end_event)
         _record_batch_stream(item, current_stream)
         if self._debug:
             item[PROJECTION_TIMER_KEY] = _ProjectionTimer(self, batch_id)
-            _log_consumer_debug(batch_id, ready_at_request, self._depth, wait_start)
+            _log_consumer_debug(
+                batch_id, ready_at_request, self._depth, completion_event is not None, wait_start
+            )
         return item
+
+    def _queue_encoder_wait_timing(
+        self, batch_id: int, start_event: torch.cuda.Event, end_event: torch.cuda.Event
+    ) -> None:
+        with self._condition:
+            self._encoder_wait_timings.append((batch_id, start_event, end_event))
+
+    def _drain_encoder_wait_timings(self) -> None:
+        ready = []
+        with self._condition:
+            while self._encoder_wait_timings and self._encoder_wait_timings[0][2].query():
+                ready.append(self._encoder_wait_timings.popleft())
+        for batch_id, start_event, end_event in ready:
+            _log_encoder_wait_debug(batch_id, start_event, end_event)
 
     def _queue_projection_timing(
         self, batch_id: int, start_event: torch.cuda.Event, end_event: torch.cuda.Event
@@ -399,4 +436,5 @@ class EncoderPrefetchLoader:
                     self._worker_join_timeout_s,
                 )
         if self._debug:
+            self._drain_encoder_wait_timings()
             self._drain_projection_timings()
