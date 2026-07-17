@@ -155,7 +155,7 @@ class InferenceRequest:
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
-    tpot: Optional[List[int]] = None
+    tpot: List[float] = field(default_factory=list)
 
     def __post_init__(self):
         if self.sampling_params is None and self.inference_parameters is not None:
@@ -373,10 +373,14 @@ class DynamicInferenceRequest(InferenceRequest):
     routing_indices: Optional[np.ndarray] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    # Consecutive steps this request has been deferred by CG-aware admission gating.
+    # Reset to 0 on successful admission. Used only for starvation logging.
+    cg_wait_iters: int = 0
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
+    num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
@@ -737,6 +741,7 @@ class DynamicInferenceRequestRecord:
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
+            num_cached_tokens=self.requests[0].num_cached_tokens,
         )
 
         return request

@@ -14,7 +14,7 @@
 
 import logging
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Type
 
 try:
     import einops
@@ -40,8 +40,9 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
@@ -90,6 +91,22 @@ class FullyShardedDataParallel(_BaseDataParallel):
         },
     }
 
+    @staticmethod
+    def _fine_grained_recurse_module_types(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> Tuple[Type[nn.Module], ...]:
+        """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            # Lazy import to avoid circular chain.
+            from megatron.core.transformer.moe.experts import TEGroupedMLP
+            from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+            return (TEGroupedMLP, SharedExpertMLP)
+        return ()
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -116,17 +133,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         )
         self.mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
-            # Grandfathered Argument: grad_reduce_in_fp32
-            main_grads_dtype=(
-                torch.float32
-                if ddp_config.grad_reduce_in_fp32
-                else ddp_config.megatron_fsdp_main_grads_dtype
-            ),
-            grad_comm_dtype=(
-                torch.float32
-                if ddp_config.grad_reduce_in_fp32
-                else ddp_config.megatron_fsdp_grad_comm_dtype
-            ),
+            main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
+            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
         )
         log_single_rank(
             logger,
@@ -151,12 +159,37 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
+                self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
 
         self._annotate_tensor_parallelism(module)
 
+        if config.overlap_moe_expert_parallel_comm:
+            assert not ddp_config.fsdp_double_buffer, (
+                "1F1B overlap with FSDP does not support double buffer. "
+                "Please set fsdp_double_buffer=False in the ddp config."
+            )
+            assert config.cuda_graph_impl in ("none", "full_iteration"), (
+                "1F1B overlap with FSDP does not support per-layer CUDA graphs "
+                f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
+                "Use cuda_graph_impl='full_iteration' or disable CUDA graphs "
+                "(cuda_graph_impl='none')."
+            )
+
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            assert self.fsdp_unit_modules and all(
+                module in supported_fsdp_unit_modules for module in self.fsdp_unit_modules
+            ), (
+                "EP overlap with FSDP currently requires fsdp_unit_modules "
+                "to contain only supported MCore modules "
+                f"{supported_fsdp_unit_modules}, "
+                f"got {self.fsdp_unit_modules}."
+            )
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -169,8 +202,24 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                # EP overlap schedule calls sub-modules directly instead of
+                # TransformerLayer.forward(), so fine-grained hooks are needed
+                # to manage _training_state and all-gather each sub-module's
+                # parameters individually.  This applies to all sharding
+                # strategies (not only optim_grads_params) because the hooks
+                # also maintain per-module training-state bookkeeping that the
+                # gradient-reduction pipeline relies on.
                 enable_fine_grained_param_gather_hook=(
-                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
+                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
+                    or config.overlap_moe_expert_parallel_comm
+                    or self.ddp_config.megatron_fsdp_enable_fine_grained_param_gather
+                ),
+                enable_fine_grained_param_gather_backward_hook=(
+                    config.overlap_moe_expert_parallel_comm
+                    and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                ),
+                fine_grained_recurse_module_types=self._fine_grained_recurse_module_types(
+                    config, ddp_config
                 ),
             ),
         )

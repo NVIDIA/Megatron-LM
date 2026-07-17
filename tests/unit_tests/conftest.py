@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -13,6 +12,22 @@ from megatron.core.utils import is_te_min_version
 from tests.test_utils.python_scripts.download_unit_tests_dataset import download_and_extract_asset
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+def pytest_configure(config):
+    """Set NCCL defaults for the unit-test suite.
+
+    These previously lived as ``export``s in ``tests/unit_tests/run_ci_test.sh``.
+    They reduce NCCL memory usage / SM contention and were originally added to
+    fix NCCL hangs observed for FSDP v1 (among other MCore algorithms). Setting
+    them here — at session start, before any test initializes NCCL communicators
+    — keeps that default while moving the test-bucket configuration out of the
+    CI launch script and into pytest. Individual buckets that want
+    production-like NCCL settings (e.g. MFSDP v2) can pop these in their own
+    conftest before initializing their process group.
+    """
+    os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
+    os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
 
 def pytest_addoption(parser):
@@ -44,7 +59,10 @@ def cleanup():
     yield
     if torch.distributed.is_initialized():
         try:
-            torch.distributed.barrier(timeout=timedelta(seconds=300))
+            if torch.cuda.is_available():
+                torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+            else:
+                torch.distributed.barrier()
         except Exception:
             return
         torch.distributed.destroy_process_group()

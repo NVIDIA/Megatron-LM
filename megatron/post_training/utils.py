@@ -9,8 +9,25 @@ import torch
 from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
 
-from megatron.core import parallel_state
-from megatron.training.utils import unwrap_model
+
+def maybe_enable_modelopt(args):
+    """Set `args.modelopt_enabled` if a ModelOpt checkpoint or distillation teacher is
+    configured. Idempotent and safe to call multiple times (e.g. once early in
+    `pretrain_gpt.py` before building the model config, and again as a fallback in
+    `training.py` for callers that don't go through that entrypoint).
+    """
+    if getattr(args, "modelopt_enabled", False):
+        return
+
+    from megatron.post_training.checkpointing import has_modelopt_state
+    from megatron.training import print_rank_0
+
+    if args.load is not None and has_modelopt_state(args.load):
+        print_rank_0("ModelOpt checkpoint detected")
+        args.modelopt_enabled = True
+    if getattr(args, "export_kd_teacher_load", None):
+        # For distillation ckpts without ModelOpt state
+        args.modelopt_enabled = True
 
 
 def modelopt_version_higher_than(target_version: str):
@@ -100,8 +117,8 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
 
 def print_distributed_quant_summary(model, msg=""):
     from megatron.core import parallel_state
+    from megatron.core.utils import unwrap_model
     from megatron.training import print_rank_0
-    from megatron.training.utils import unwrap_model
 
     unwrapped_model = unwrap_model(model)
     if isinstance(unwrapped_model, list):

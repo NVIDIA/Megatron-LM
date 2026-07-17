@@ -1,0 +1,38 @@
+# Model-specific args for the hybrid mamba 2B checkpoint.
+# Sourced from tests/functional_tests/test_cases/hybrid/hybrid_static_inference_tp1_pp1_2B_logitsmatch/model_config.yaml
+--load ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/checkpoint
+--tokenizer-model ${CHECKPOINT_LOAD_PATH}/model/mamba_hybrid_2b/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+--tokenizer-type TikTokenizer
+--tiktoken-pattern v2
+--use-mcore-models
+--model-provider hybrid
+--expert-model-parallel-size 1
+--untie-embeddings-and-output-weights
+--disable-bias-linear
+--init-method-std 0.014
+--position-embedding-type none
+--hidden-size 2048
+--ffn-hidden-size 11264
+--num-attention-heads 16
+--kv-channels 128
+--hybrid-layer-pattern M-M-M-M*-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-
+--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec
+--normalization RMSNorm
+--swiglu
+--attention-dropout 0.0
+--hidden-dropout 0.0
+--seq-length 4096
+--max-position-embeddings 4096
+--ckpt-format torch_dist
+--ckpt-fully-parallel-load
+--ckpt-assume-constant-structure
+--dist-ckpt-strictness log_unexpected
+--bf16
+--attention-backend flash
+--no-create-attention-mask-in-dataloader
+--use-checkpoint-args
+--no-use-tokenizer-model-from-checkpoint-args
+--no-load-optim
+--inference-ckpt-non-strict
+--transformer-impl transformer_engine
+--distributed-backend nccl
