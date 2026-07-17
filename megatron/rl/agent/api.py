@@ -102,14 +102,23 @@ class RolloutGroup(AgentBaseModel):
 GroupedRollouts = list[RolloutGroup]
 
 
+class EpisodeResult(NamedTuple):
+    """All per-turn responses of one (possibly multi-turn) episode plus the final conversation."""
+
+    responses: list[InferenceResponse]
+    conversation: list[LLMChatMessage]
+
+
 class GroupRolloutParams(NamedTuple):
     """Returned by agent.prepare_group_rollout.
 
     One instance is created per group call and reused for all rollouts in that group.
+    Every rollout is an episode: run_episode generates it (one or more turns), while
+    build_rollout turns the completed episode into a Rollout.
     """
 
-    inference_request: InferenceRequest
-    build_rollout: Callable[[InferenceResponse], Awaitable[Rollout]]
+    run_episode: Callable[[], Awaitable[EpisodeResult]]
+    build_rollout: Callable[[EpisodeResult], Awaitable[Rollout]]
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -284,7 +293,7 @@ class _InferredItem(NamedTuple):
     """One rollout post-inference, flowing from infer to assemble."""
 
     item: _InferWorkItem
-    response: InferenceResponse
+    episode: EpisodeResult
     inferred_at: float = 0.0
 
 
@@ -397,16 +406,14 @@ class _RolloutPipeline:
 
     @trace_async_exceptions(verbose=True)
     async def _infer_one(self, item: _InferWorkItem) -> None:
-        response = await self.agent.get_rollout_response(
-            self.request, item.params.inference_request
-        )
+        episode = await item.params.run_episode()
         inferred_at = time.monotonic()
         self.gate.release_after("inferred")
         if item.infer_dequeued_at:
             self.engine_dwell.append(inferred_at - item.infer_dequeued_at)
         self.inferred_count += 1
         await self.assemble_queue.put(
-            _InferredItem(item=item, response=response, inferred_at=inferred_at)
+            _InferredItem(item=item, episode=episode, inferred_at=inferred_at)
         )
 
     async def stage_assemble(self) -> None:
@@ -428,7 +435,7 @@ class _RolloutPipeline:
                 completed = pending.pop(inferred.item.group_id)
                 completed.sort(key=lambda item: item.item.rollout_idx)
                 rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.response) for item in completed]
+                    *[item.item.params.build_rollout(item.episode) for item in completed]
                 )
                 self.gate.release_after("assembled")
                 self.assembled_count += 1
@@ -511,12 +518,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         self,
         request: GroupedRolloutRequest,
     ) -> GroupRolloutParams:
-        """Return the params for one group's rollouts.
-
-        Called once per group by _RolloutPipeline.stage_prepare. The returned
-        build_rollout closure is invoked once per inference response in
-        _RolloutPipeline.stage_assemble.
-        """
+        """Return the params for one group's rollouts."""
         ...
 
     async def get_grouped_rollouts(
