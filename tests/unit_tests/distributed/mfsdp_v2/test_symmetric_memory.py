@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.autograd import DeviceType
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.profiler import ProfilerActivity, profile
 
@@ -43,7 +44,7 @@ def _flat_placements() -> Placements:
 
 
 def _kernels(prof: torch.profiler.profile) -> list[str]:
-    return [event.name for event in prof.events() if event.device_type.name == "CUDA"]
+    return [event.name for event in prof.events() if event.device_type == DeviceType.CUDA]
 
 
 def _is_symmetric_kernel(kernel: str) -> bool:
