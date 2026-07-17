@@ -1814,6 +1814,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         attention_layer_number = self.layer_map[layer_number - 1]
 
+        token_to_local_pos = self.gpu_view.token_to_local_position_within_kv_block
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
             return triton_append_key_value_cache(
                 layer_number=attention_layer_number,
@@ -1822,7 +1823,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 memory_buffer=self.memory_buffer,
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.gpu_view.token_to_block_idx,
-                token_to_local_position_within_kv_block=self.gpu_view.token_to_local_position_within_kv_block,
+                token_to_local_position_within_kv_block=token_to_local_pos,
                 dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
             )
 
@@ -1833,7 +1834,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 memory_buffer=self.memory_buffer,
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.gpu_view.token_to_block_idx,
-                token_to_local_position_within_kv_block=self.gpu_view.token_to_local_position_within_kv_block,
+                token_to_local_position_within_kv_block=token_to_local_pos,
             )
 
         block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
