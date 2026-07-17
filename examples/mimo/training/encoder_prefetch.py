@@ -188,6 +188,7 @@ class EncoderPrefetchLoader:
             _debug_logger.setLevel(logging.INFO)
         self._condition = threading.Condition()
         self._ready: deque[dict[str, object]] = deque()
+        self._pending: tuple[dict[str, object], torch.cuda.Event] | None = None
         self._in_flight = False
         self._projection_timings: deque[tuple[int, torch.cuda.Event, torch.cuda.Event]] = deque()
         self._produced_batches = 0
@@ -245,6 +246,11 @@ class EncoderPrefetchLoader:
                 item, completion_event, encode_start = self._enqueue_batch(batch)
 
                 with self._condition:
+                    if not self._stop:
+                        self._pending = (item, completion_event)
+                        self._condition.notify_all()
+
+                with self._condition:
                     should_read_ahead = not self._stop
                 if should_read_ahead:
                     # Stage one CPU batch while this GPU encode runs; enqueue it later.
@@ -270,6 +276,7 @@ class EncoderPrefetchLoader:
                     if not self._stop:
                         self._producer_error = error
                     self._in_flight = False
+                    self._pending = None
                     self._condition.notify_all()
                 return
 
@@ -277,7 +284,9 @@ class EncoderPrefetchLoader:
                 self._in_flight = False
                 if self._stop:
                     return
-                self._ready.append(item)
+                if self._pending is not None:
+                    self._ready.append(self._pending[0])
+                    self._pending = None
                 batch_id = self._produced_batches
                 self._produced_batches += 1
                 if source_exhausted:
@@ -304,7 +313,7 @@ class EncoderPrefetchLoader:
 
         with torch.cuda.device(self._device), torch.cuda.stream(self._stream):
             # Encoder ranks intentionally retain only fields consumed by their forward step.
-            output_batch = {"input_ids": move_batch_to_cuda(batch["input_ids"])}
+            output_batch = {"input_ids": batch["input_ids"]}
             encoder_inputs = move_batch_to_cuda(modality_inputs[self._encoder_name])
             encode_start = torch.cuda.Event(enable_timing=True) if self._debug else None
             if encode_start is not None:
@@ -327,12 +336,20 @@ class EncoderPrefetchLoader:
                 lambda: self._stop
                 or self._producer_error is not None
                 or self._ready
-                or (self._source_exhausted and not self._ready)
+                or self._pending is not None
+                or (self._source_exhausted and not self._ready and self._pending is None)
             )
             if self._stop:
                 raise StopIteration
+            completion_event = None
             if self._ready:
                 item = self._ready.popleft()
+                batch_id = self._consumed_batches
+                self._consumed_batches += 1
+                self._condition.notify_all()
+            elif self._pending is not None:
+                item, completion_event = self._pending
+                self._pending = None
                 batch_id = self._consumed_batches
                 self._consumed_batches += 1
                 self._condition.notify_all()
@@ -341,7 +358,10 @@ class EncoderPrefetchLoader:
             else:
                 raise StopIteration
 
-        _record_batch_stream(item, torch.cuda.current_stream())
+        current_stream = torch.cuda.current_stream()
+        if completion_event is not None:
+            current_stream.wait_event(completion_event)
+        _record_batch_stream(item, current_stream)
         if self._debug:
             item[PROJECTION_TIMER_KEY] = _ProjectionTimer(self, batch_id)
             _log_consumer_debug(batch_id, ready_at_request, self._depth, wait_start)
@@ -368,6 +388,7 @@ class EncoderPrefetchLoader:
             self._closed = True
             self._stop = True
             self._ready.clear()
+            self._pending = None
             self._condition.notify_all()
             worker = self._worker
         if worker is not None:

@@ -222,16 +222,49 @@ def test_depth_is_completed_batches_and_refills_after_pop(fake_cuda, depth):
         stream=fake_cuda.producer,
     )
     loader.start()
-    _wait_until(lambda: len(produced) == depth)
+    _wait_until(lambda: len(loader._ready) == depth)
 
     first = next(loader)
-    _wait_until(lambda: len(produced) == depth + 1)
+    _wait_until(lambda: len(loader._ready) == depth)
 
     assert first[PREFETCHED_FEATURES_KEY][ENCODER].item() == 0
     assert PROJECTION_TIMER_KEY not in first
     assert len(fake_cuda.producer.waited_events) == 1
     assert fake_cuda.current.waited_events == []
     loader.close()
+
+
+def test_pending_encode_can_be_claimed_while_cpu_read_ahead_blocks(fake_cuda):
+    read_ahead_started = threading.Event()
+    release_read_ahead = threading.Event()
+
+    class _BlockingSource(_Source):
+        def __next__(self):
+            if self.position == 1:
+                read_ahead_started.set()
+                release_read_ahead.wait(timeout=2)
+            return super().__next__()
+
+    loader = EncoderPrefetchLoader(
+        source=_BlockingSource(2),
+        encoder_name=ENCODER,
+        feature_producer=lambda inputs: torch.tensor(inputs["radio"]["x"].item()),
+        depth=1,
+        stream=fake_cuda.producer,
+    )
+    loader.start()
+    assert read_ahead_started.wait(timeout=1)
+
+    try:
+        assert len(loader._ready) == 0
+        batch = next(loader)
+        assert batch[PREFETCHED_FEATURES_KEY][ENCODER].item() == 0
+        assert fake_cuda.current.waited_events[-1] is fake_cuda.events[-1]
+        assert loader._pending is None
+        assert loader._in_flight
+    finally:
+        release_read_ahead.set()
+        loader.close()
 
 
 def test_cpu_read_ahead_overlaps_encode_without_enqueuing_another_batch(fake_cuda):
@@ -267,6 +300,34 @@ def test_cpu_read_ahead_overlaps_encode_without_enqueuing_another_batch(fake_cud
     with pytest.raises(StopIteration):
         next(loader)
     loader.close()
+
+
+def test_prefetch_keeps_input_ids_on_cpu_path(fake_cuda, monkeypatch):
+    input_ids = torch.tensor([[511, 1]])
+    encoder_inputs = {"radio": {"x": torch.tensor(0)}}
+    moved = []
+
+    def record_move(value):
+        moved.append(value)
+        return value
+
+    monkeypatch.setattr(encoder_prefetch, "move_batch_to_cuda", record_move)
+    loader = EncoderPrefetchLoader(
+        source=[{"input_ids": input_ids, "modality_inputs": {ENCODER: encoder_inputs}}],
+        encoder_name=ENCODER,
+        feature_producer=lambda _inputs: torch.tensor(0),
+        depth=1,
+        stream=fake_cuda.producer,
+    )
+    loader.start()
+    _wait_until(lambda: len(loader._ready) == 1)
+
+    batch = next(loader)
+    loader.close()
+
+    assert batch["input_ids"] is input_ids
+    assert len(moved) == 1
+    assert moved[0] is encoder_inputs
 
 
 def test_debug_logs_prefetch_timing_and_queue_state(fake_cuda, caplog):
@@ -393,6 +454,51 @@ def test_forward_step_projects_prefetched_features_inside_debug_timer(monkeypatc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_real_cuda_pending_handoff_waits_for_encode():
+    torch.cuda.set_device(0)
+    read_ahead_started = threading.Event()
+    release_read_ahead = threading.Event()
+    backbone = nn.Linear(4, 4, bias=False, device="cuda")
+
+    class _BlockingSource:
+        def __init__(self):
+            self.position = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.position == 1:
+                read_ahead_started.set()
+                release_read_ahead.wait(timeout=2)
+                raise StopIteration
+            self.position += 1
+            return {
+                "input_ids": torch.tensor([[511]]),
+                "modality_inputs": {ENCODER: {"radio": {"x": torch.ones(32, 4)}}},
+            }
+
+    def produce(inputs):
+        with torch.no_grad():
+            return backbone(inputs["radio"]["x"])
+
+    loader = EncoderPrefetchLoader(
+        source=_BlockingSource(), encoder_name=ENCODER, feature_producer=produce, depth=1
+    )
+    loader.start()
+    assert read_ahead_started.wait(timeout=1)
+
+    try:
+        assert len(loader._ready) == 0
+        batch = next(loader)
+        expected = backbone(torch.ones(32, 4, device="cuda"))
+        torch.testing.assert_close(batch[PREFETCHED_FEATURES_KEY][ENCODER], expected)
+    finally:
+        release_read_ahead.set()
+        loader.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_real_cuda_handoff_and_projection_gradients():
     torch.cuda.set_device(0)
     backbone = nn.Linear(4, 4, bias=False, device="cuda")
@@ -417,6 +523,7 @@ def test_real_cuda_handoff_and_projection_gradients():
     losses = []
     for sequence in range(8):
         batch = next(loader)
+        assert not batch["input_ids"].is_cuda
         features = batch[PREFETCHED_FEATURES_KEY][ENCODER]
         reference = backbone(torch.full((32, 4), float(sequence), device="cuda"))
         torch.testing.assert_close(features, reference)
