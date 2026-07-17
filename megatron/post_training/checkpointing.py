@@ -28,14 +28,25 @@ logger = logging.getLogger(__name__)
 
 
 def has_modelopt_state(checkpoint_path: str) -> bool:
-    """Check if modelopt_state folder exists inside the checkpoint.
+    """Check if modelopt_state folder exists inside the checkpoint and contains nontrivial state.
+
+    NOTE: Ignores distillation (KD) state, which is deprecated and unused.
+
     Args:
         checkpoint_path: Path to the checkpoint directory
 
     Returns:
-        True if modelopt_state exists, False otherwise
+        True if modelopt_state exists and contains nontrivial state, False otherwise
     """
     args = get_args()
+
+    def _has_nontrivial_modelopt_state(modelopt_state: dict) -> bool:
+        """Check whether modelopt_state contains state beyond the (deprecated, unused) KD mode."""
+        modes = modelopt_state.get("modelopt_state_dict", [])
+        if len(modes) == 1 and modes[0][0] == "kd_loss":
+            # Ignore KD state.
+            modes = modes[:-1]
+        return len(modes) > 0
 
     try:
         if args.ckpt_format == "torch":
@@ -43,17 +54,20 @@ def has_modelopt_state(checkpoint_path: str) -> bool:
             state_dict, _, _ = _load_base_checkpoint(checkpoint_path, rank0=False)
             if state_dict is None:
                 return False
-            if "modelopt_state" not in state_dict:
+            modelopt_state = state_dict.get("modelopt_state")
+            if modelopt_state is None:
                 return False
-            return True
+            return _has_nontrivial_modelopt_state(modelopt_state)
         else:
             # Sharded
             load_dir = get_sharded_load_dir(checkpoint_path)
             if load_dir is None:
                 return False
-            if not (load_dir / "modelopt_state").is_dir():
+            modelopt_checkpoint_name = load_dir / "modelopt_state"
+            if not modelopt_checkpoint_name.is_dir():
                 return False
-            return True
+            modelopt_state = dist_checkpointing.load_common_state_dict(str(modelopt_checkpoint_name))
+            return _has_nontrivial_modelopt_state(modelopt_state)
     except Exception as e:
         print_rank_0(f"Failed to inspect checkpoint in {checkpoint_path}: {e}")
         return False
