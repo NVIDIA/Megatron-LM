@@ -2145,20 +2145,10 @@ class TransformerConfig(ModelParallelConfig):
         use_mhc_recompute = (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
         )
-        if (
-            use_mhc_recompute
-            and self.cuda_graph_impl == "transformer_engine"
-            and (
-                list(self.cuda_graph_modules or []) != [CudaGraphModule.attn]
-                or list(self.recompute_modules) != ["mhc"]
-            )
-        ):
-            raise ValueError(
-                "mHC recompute with Transformer Engine CUDA Graphs currently supports only "
-                "the initial attention-only split: cuda_graph_modules=[attn] and "
-                "recompute_modules=[mhc]. The eager mHC producer must remain outside the "
-                "captured consumer."
-            )
+        # NOTE: the mHC-recompute/CUDA-graph capability gate lives further down in
+        # __post_init__, after cuda_graph_modules normalization and the deprecated
+        # enable_cuda_graph/external_cuda_graph migration, so that string module
+        # forms and legacy flags reach the same gate.
 
         if (
             self.overlap_moe_expert_parallel_comm
@@ -2855,6 +2845,46 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        # mHC selective recompute couples with CUDA graphs only through the guarded
+        # attention-only Transformer Engine split. This gate must stay below the
+        # cuda_graph_modules normalization and the deprecated flag migration above:
+        # earlier placement would compare unnormalized string module forms and let
+        # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
+        if (
+            self.recompute_granularity == "selective"
+            and "mhc" in self.recompute_modules
+            and self.cuda_graph_impl != "none"
+        ):
+            if self.cuda_graph_impl in ("local", "full_iteration"):
+                # Intentionally fail-closed even for inference-only local-graph
+                # configs that carry leftover training recompute args: mHC
+                # recompute is inert outside training, but silently accepting
+                # the combination would mask misconfigured training runs.
+                raise ValueError(
+                    f"mHC recompute is not supported with cuda_graph_impl="
+                    f"'{self.cuda_graph_impl}': eager mHC recompute and its per-microbatch "
+                    "checkpoint registration need host execution between captured "
+                    "segments, which only the Transformer Engine partial implementation "
+                    "provides. Use cuda_graph_impl='transformer_engine' with "
+                    "cuda_graph_modules=['attn'], or disable CUDA graphs."
+                )
+            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+                self.recompute_modules
+            ) != ["mhc"]:
+                raise ValueError(
+                    "mHC recompute with Transformer Engine CUDA Graphs currently supports "
+                    "only the initial attention-only split: cuda_graph_modules=[attn] and "
+                    "recompute_modules=[mhc]. The eager mHC producer must remain outside "
+                    "the captured consumer."
+                )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    "mHC recompute with attention-only TE CUDA Graphs has not been "
+                    "validated with interleaved pipeline (VPP) schedules: graph-slot "
+                    "lifetimes are only proven for non-interleaved 1F1B. Disable "
+                    "virtual pipeline or CUDA graphs."
+                )
 
         if self.cuda_graph_impl != "none":
 

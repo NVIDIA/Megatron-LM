@@ -11,6 +11,8 @@ Tests the following functionality:
 5. TransformerConfig 'mhc' in recompute_modules option
 """
 
+import types
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -19,6 +21,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointManager,
     CheckpointWithoutOutput,
     CudaGraphCheckpointBridge,
+    get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.enums import CudaGraphModule
@@ -572,6 +575,232 @@ class TestTransformerConfigRecomputeMhc:
                 cuda_graph_impl="transformer_engine",
                 cuda_graph_modules=cuda_graph_modules,
             )
+
+    @staticmethod
+    def _mhc_recompute_config_kwargs(**extra):
+        base = dict(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            recompute_modules=["mhc"],
+            recompute_granularity="selective",
+        )
+        base.update(extra)
+        return base
+
+    @pytest.mark.parametrize("modules", ["attn", ["attn"]])
+    def test_config_accepts_string_module_forms_for_attention_split(self, modules):
+        """The gate must compare cuda_graph_modules after string->enum normalization."""
+        config = TransformerConfig(
+            **self._mhc_recompute_config_kwargs(
+                cuda_graph_impl="transformer_engine", cuda_graph_modules=modules
+            )
+        )
+        assert config.cuda_graph_modules == [CudaGraphModule.attn]
+
+    def test_config_rejects_deprecated_external_cuda_graph_with_mhc_recompute(self):
+        """The legacy flag migrates to the TE impl and must reach the same gate."""
+        with pytest.raises(ValueError, match="initial attention-only split"):
+            TransformerConfig(**self._mhc_recompute_config_kwargs(external_cuda_graph=True))
+
+    def test_config_rejects_deprecated_enable_cuda_graph_with_mhc_recompute(self):
+        """The legacy flag migrates to the local impl, which has no split support."""
+        with pytest.raises(ValueError, match="cuda_graph_impl='local'"):
+            TransformerConfig(**self._mhc_recompute_config_kwargs(enable_cuda_graph=True))
+
+    def test_config_rejects_local_impl_with_mhc_recompute(self):
+        with pytest.raises(ValueError, match="cuda_graph_impl='local'"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    cuda_graph_impl="local", cuda_graph_modules=[CudaGraphModule.attn]
+                )
+            )
+
+    def test_config_rejects_full_iteration_impl_with_mhc_recompute(self):
+        with pytest.raises(ValueError, match="cuda_graph_impl='full_iteration'"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    cuda_graph_impl="full_iteration", cuda_graph_modules=[]
+                )
+            )
+
+    def test_config_rejects_interleaved_pipeline_with_attention_split(self):
+        with pytest.raises(ValueError, match="interleaved pipeline"):
+            TransformerConfig(
+                **self._mhc_recompute_config_kwargs(
+                    num_layers=4,
+                    cuda_graph_impl="transformer_engine",
+                    cuda_graph_modules=[CudaGraphModule.attn],
+                    pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.bfloat16,
+                )
+            )
+
+    def test_config_allows_vpp_with_mhc_recompute_without_cuda_graphs(self):
+        """The VPP rejection is scoped to CUDA graphs; eager recompute + VPP stays legal."""
+        config = TransformerConfig(
+            **self._mhc_recompute_config_kwargs(
+                num_layers=4,
+                pipeline_model_parallel_size=2,
+                virtual_pipeline_model_parallel_size=2,
+                pipeline_dtype=torch.bfloat16,
+            )
+        )
+        assert config.virtual_pipeline_model_parallel_size == 2
+
+    def test_config_accepts_te_attention_graphs_without_mhc_recompute(self):
+        """The gate is scoped to mHC recompute; plain TE attention graphs stay legal."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+        )
+        assert config.cuda_graph_modules == [CudaGraphModule.attn]
+
+    def test_hybrid_mhc_layer_rejects_attention_split_at_construction(self):
+        """HybridStack mHC layers capture the mHC producer and must fail closed."""
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+
+        config = TransformerConfig(
+            **self._mhc_recompute_config_kwargs(
+                cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.attn]
+            )
+        )
+        with pytest.raises(ValueError, match="HybridStack"):
+            HyperConnectionHybridLayer(config, types.SimpleNamespace(layer_number=1))
+
+
+class TestCudaGraphBridgeContracts:
+    """Failure-path coverage for the fixed-address bridge safety rails."""
+
+    def _cuda(self, *shape, dtype=torch.float32):
+        return torch.randn(*shape, device="cuda").to(dtype)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bridge_constructor_rejects_invalid_inputs(self):
+        with pytest.raises(ValueError, match="at least one tensor"):
+            CudaGraphCheckpointBridge(())
+        with pytest.raises(TypeError, match="Tensor or tuple"):
+            CudaGraphCheckpointBridge([torch.empty(2, device="cuda")])
+        with pytest.raises(TypeError, match="only supports Tensor"):
+            CudaGraphCheckpointBridge((torch.empty(2, device="cuda"), "not-a-tensor"))
+        with pytest.raises(ValueError, match="CUDA tensors"):
+            CudaGraphCheckpointBridge(torch.empty(2))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bridge_validate_rejects_metadata_mismatches(self):
+        bridge = CudaGraphCheckpointBridge(self._cuda(4, 8))
+        with pytest.raises(ValueError, match="arity mismatch"):
+            bridge.validate_logical_outputs((self._cuda(4, 8), self._cuda(4, 8)))
+        with pytest.raises(ValueError, match="shape"):
+            bridge.validate_logical_outputs((self._cuda(8, 4),))
+        with pytest.raises(ValueError, match="dtype"):
+            bridge.validate_logical_outputs((self._cuda(4, 8, dtype=torch.bfloat16),))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bridge_materialize_rejects_address_change(self):
+        """The core safety rail: a bridge whose storage moved must refuse to copy."""
+        bridge_tensor = self._cuda(4, 8)
+        bridge = CudaGraphCheckpointBridge(bridge_tensor)
+        bridge_tensor.data = torch.empty_like(bridge_tensor)
+        with pytest.raises(RuntimeError, match="changed address"):
+            bridge.materialize((self._cuda(4, 8),))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bridge_materialize_rejects_metadata_mismatches(self):
+        bridge = CudaGraphCheckpointBridge(self._cuda(4, 8))
+        with pytest.raises(ValueError, match="arity mismatch"):
+            bridge.materialize((self._cuda(4, 8), self._cuda(4, 8)))
+        with pytest.raises(ValueError, match="shape"):
+            bridge.materialize((self._cuda(8, 4),))
+        with pytest.raises(ValueError, match="metadata"):
+            bridge.materialize((self._cuda(4, 8, dtype=torch.bfloat16),))
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_multi_tensor_bridge_materializes_every_output(self):
+        first, second = self._cuda(4, 8), self._cuda(2, 3)
+        bridge = CudaGraphCheckpointBridge((first, second))
+        bridge.validate_logical_outputs((self._cuda(4, 8), self._cuda(2, 3)))
+
+        new_first, new_second = self._cuda(4, 8), self._cuda(2, 3)
+        bridge.materialize((new_first, new_second))
+        assert torch.equal(first, new_first)
+        assert torch.equal(second, new_second)
+
+
+class TestCheckpointRngReplay:
+    """Recompute must replay forward-time RNG (dropout masks) for every tracker kind.
+
+    With a graph-safe tracker, generator handles share the live state, so the
+    snapshot taken by ``CheckpointWithoutOutput`` must clone state contents;
+    otherwise the recompute draws fresh offsets and reproduces a different
+    dropout mask than the forward pass, silently corrupting gradients.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _seed(self, tracker_kind):
+        if tracker_kind == "te":
+            pytest.importorskip("transformer_engine")
+            model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        elif tracker_kind == "graphsafe":
+            model_parallel_cuda_manual_seed(123, use_cudagraphable_rng=True, force_reset_rng=True)
+        else:
+            model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+
+    def _roundtrip(self, run_function):
+        x = torch.randn(4096, device="cuda", requires_grad=True)
+        manager = CheckpointManager()
+        checkpoint = CheckpointWithoutOutput(ckpt_manager=manager)
+        output = checkpoint.checkpoint(run_function, x)
+        forward_values = output.detach().clone()
+        manager.discard_all_outputs()
+
+        # Simulate other microbatches advancing the ambient RNG stream between
+        # the forward pass and the backward-time recompute.
+        torch.rand(8192, device="cuda")
+        ambient_before = torch.cuda.get_rng_state()
+
+        manager.recompute_now()
+
+        assert torch.equal(
+            output, forward_values
+        ), "recompute produced a different dropout mask than the forward pass"
+        assert torch.equal(
+            ambient_before, torch.cuda.get_rng_state()
+        ), "recompute leaked RNG stream advancement into the ambient state"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("tracker_kind", ["plain", "graphsafe", "te"])
+    def test_dropout_in_checkpoint_replays_forward_mask(self, tracker_kind):
+        self._seed(tracker_kind)
+
+        def run_function(value):
+            return F.dropout(value * 3.0, p=0.5, training=True)
+
+        self._roundtrip(run_function)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("tracker_kind", ["plain", "graphsafe", "te"])
+    def test_tracker_fork_in_checkpoint_replays_forward_mask(self, tracker_kind):
+        self._seed(tracker_kind)
+
+        def run_function(value):
+            with get_cuda_rng_tracker().fork():
+                return F.dropout(value * 3.0, p=0.5, training=True)
+
+        self._roundtrip(run_function)
 
 
 if __name__ == "__main__":

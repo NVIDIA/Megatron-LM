@@ -497,22 +497,54 @@ def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):
 
 
 def _get_all_rng_states():
-    """Get all the rng states."""
+    """Get all the rng states.
+
+    With a graph-safe RNG tracker, ``graphsafe_get_state``/``get_states`` return
+    generator handles that share the live generator state objects, so restoring
+    through them later is a no-op: by then the live state has advanced. Outside
+    CUDA graph capture we therefore snapshot state *contents* (``clone_state``)
+    so that checkpoint recompute and ``_fork_rng`` can actually rewind (e.g.
+    dropout inside a checkpointed region must replay the forward-time offsets).
+    Inside capture, host-side state reads are not capture-safe, so the original
+    handle semantics are kept.
+    """
     cpu_rng_state = torch.get_rng_state()
-    cuda_rng_state = _get_cuda_rng_state(
-        graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
-    )
-    cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
+    tracker = get_cuda_rng_tracker()
+    graph_safe = is_graph_safe_cuda_rng_tracker(tracker)
+    if graph_safe and not torch.cuda.is_current_stream_capturing():
+        cuda_rng_state = _get_cuda_rng_state(clone=True, graph_safe=True)
+        cuda_rng_state_tracker = {
+            name: state.clone_state() for name, state in tracker.get_states().items()
+        }
+    else:
+        cuda_rng_state = _get_cuda_rng_state(graph_safe=graph_safe)
+        cuda_rng_state_tracker = tracker.get_states()
     return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
 
 
 def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
-    """Set all the rng states."""
+    """Set all the rng states.
+
+    Graph-safe eager restore writes the snapshot *contents* back into the live
+    state objects instead of pointer-swapping generators: captured CUDA graphs
+    and the RNG tracker hold references to the live generator states, and
+    replacing those objects would orphan them from graph replay bookkeeping.
+    """
     torch.set_rng_state(cpu_rng_state)
-    _set_cuda_rng_state(
-        cuda_rng_state, graph_safe=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker())
-    )
-    get_cuda_rng_tracker().set_states(cuda_rng_state_tracker)
+    tracker = get_cuda_rng_tracker()
+    graph_safe = is_graph_safe_cuda_rng_tracker(tracker)
+    if (
+        graph_safe
+        and isinstance(cuda_rng_state, torch.Generator)
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        _get_cuda_rng_state(graph_safe=True).set_state(cuda_rng_state.get_state())
+        live_states = tracker.get_states()
+        for name, state in cuda_rng_state_tracker.items():
+            live_states[name].set_state(state.get_state())
+    else:
+        _set_cuda_rng_state(cuda_rng_state, graph_safe=graph_safe)
+        tracker.set_states(cuda_rng_state_tracker)
 
 
 @contextlib.contextmanager
@@ -788,11 +820,6 @@ class CudaGraphCheckpointBridge:
         self._tensors = tensors
         self._data_ptrs = tuple(tensor.data_ptr() for tensor in tensors)
 
-    @property
-    def tensors(self) -> tuple[torch.Tensor, ...]:
-        """Return the graph-owned tensors without transferring ownership."""
-        return self._tensors
-
     def validate_logical_outputs(self, outputs: tuple[torch.Tensor, ...]) -> None:
         """Validate the logical-output contract before any storage is discarded."""
         if len(outputs) != len(self._tensors):
@@ -802,6 +829,9 @@ class CudaGraphCheckpointBridge:
             )
 
         for index, (logical, bridge) in enumerate(zip(outputs, self._tensors)):
+            # Storage identity via the private ``_cdata`` handle: unlike
+            # ``data_ptr()`` it also matches offset views that share one
+            # storage. Revisit if PyTorch removes this attribute.
             if logical.untyped_storage()._cdata == bridge.untyped_storage()._cdata:
                 raise ValueError(
                     f"Checkpoint output {index} must use different storage from its "
