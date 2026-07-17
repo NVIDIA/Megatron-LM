@@ -575,7 +575,16 @@ class FSDPModule:
 
             # Move only this module's direct tensors. named_modules() visits each child
             # separately, so it is moved only after its own materialization and reset.
-            m._apply(lambda t: t.to(materialization_device), recurse=False)
+            # Buffer-only modules may own meta tensors without owning meta parameters.
+            # Materialize such tensors instead of copying out of meta storage.
+            m._apply(
+                lambda t: (
+                    torch.empty_like(t, device=materialization_device)
+                    if t.is_meta
+                    else t.to(materialization_device)
+                ),
+                recurse=False,
+            )
 
         if mesh is not None and mesh.size() > 1:
             for param in self.parameters():
