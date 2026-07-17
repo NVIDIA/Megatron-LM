@@ -1,313 +1,121 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Lazy main_grad_buffer management in Megatron FSDP v2
 
-# Lazy main_grad_buffer Design for Megatron FSDP v2
+`main_grad_buffer` is the `DataParallelBuffer` owned by each `ParameterGroup`
+for optimizer-facing gradients.
 
-## 1. Motivation
+During backward, Megatron FSDP v2 stages local parameter gradients into this
+buffer, runs the required data-parallel collective, and exposes DTensor views of
+the reduced result through `dist_param.grad` or `dist_param.decoupled_grad`.
+The optimizer consumes those DTensor gradient views.
 
-In the original Megatron FSDP v2, `main_grad_buffer.data` was allocated **eagerly**
-during `_init_buffers()` for every param group with `requires_grad=True`, and was
-**never freed** for the lifetime of training. The buffer size is `numel × 4 bytes
-(FP32) ÷ dp_size` per param group — collectively a significant fraction of GPU memory.
+Lazy management means the buffer layout is created during FSDP initialization,
+but the backing tensor is allocated only when gradients are first produced. When
+`zero_grad(set_to_none=True)` clears optimizer-facing gradient references, the
+backing tensor can be released. When `zero_grad(set_to_none=False)` is used,
+the existing backing tensor is zeroed in place and kept allocated.
 
-For a 70B BF16 model with `dp=8`, this is **35 GB of permanently-resident GPU memory**
-per rank that is only actually needed during the `reduce_grad()` → `optimizer.step()`
-window.
+## Core idea
 
-Additionally, for large models with frozen sublayers or expert params that
-never receive gradients in a given micro-batch, this memory is wasted
-permanently.
-
-**Goal**: defer allocation to the first backward pass, and free the buffer between
-steps — matching the dynamic memory behavior of PyTorch FSDP2.
-
-### 1.1 Why PyTorch FSDP2 uses less memory
-
-PyTorch's `fully_shard` uses a **dynamic**
-strategy for gradient buffers:
-
-- `_lazy_init()` defers allocation until the first backward pass
-- After reduce-scatter, the full (unsharded) gradient buffer is immediately freed
-- Only the local shard persists — and can be offloaded to CPU between steps
-
-This gives PyTorch FSDP2 a memory advantage during forward, checkpoint I/O,
-and model export.
-
----
-
-## 2. Design
-
-### 2.1 Key Methods
-
-| Method | Location | Role |
-|--------|----------|------|
-| `_init_dist_grads()` | `param_group.py` | Lazy-allocate `main_grad_buffer.data` and rebuild `dist_grads` DTensors on first use |
-| `_release_grad_storage_if_unused()` | `param_group.py` | Free `main_grad_buffer.data` when it has no live gradients |
-| `zero_grad()` | `param_group.py` | Called by `optim.zero_grad()` → triggers `_release_grad_storage_if_unused()` |
-| `_rebuild_dist_views()` | `param_group.py` | Rebuild `_local_tensor` views after buffer changes device |
-| `_ensure_buffers_on_gpu()` | `param_group.py` | Auto-reload any buffer from CPU back to GPU |
-
-### 2.2 `_init_dist_grads()` — Lazy Allocation
+`ParameterGroup._init_buffers()` creates the `DataParallelBuffer` metadata for
+gradients when the parameter group requires gradients:
 
 ```python
-def _init_dist_grads(self) -> None:
-    gbuf = self.main_grad_buffer
-    if gbuf is None or not self.requires_grad:
-        return
-    if gbuf.data is not None:
-        return  # already initialised
-
-    gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
-
-    s = self.sharding_strategy
-    is_grad_shard = s in ("optim", "optim_grads", "optim_grads_params")
-    placements = [Shard(dim=0)] if is_grad_shard else [Replicate()]
-
-    self.dist_grads = []
-    for p, dist_param in zip(self.params, self.dist_params):
-        grad_data = gbuf.get_item(
-            self.param_idx[p], shard_level="inner" if is_grad_shard else "full"
-        )
-        if p.requires_grad and grad_data.numel() > 0:
-            self.dist_grads.append(
-                make_uneven_dtensor(grad_data, p.shape, self.mesh, placements)
-            )
-        else:
-            self.dist_grads.append(None)
-
+if self.requires_grad:
+    main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])
+    self.main_grad_buffer = self._create_buffer(main_grads_dtype, "main_grad")
 ```
 
-Key properties:
-- **Idempotent**: if `gbuf.data` is already allocated, returns immediately
-- **Called from multiple safe points**: backward pre-hook, `reduce_grad()`, post-backward callback
-- **Uses `torch.empty`**: the constructor/`zero_grad()` state makes the first
-  reduce-scatter overwrite uninitialized storage; only later microbatches
-  accumulate into valid gradients — see §5
+At this point the buffer has layout metadata (`BufferIndex`, shard sizes,
+parameter offsets), but `main_grad_buffer.data` is still `None`. The
+corresponding `dist_grads` entries are placeholders.
 
-### 2.3 `_release_grad_storage_if_unused()` — Memory Refresh
+`ParameterGroup._init_dist_grads()` performs the deferred allocation:
 
-```python
-def _release_grad_storage_if_unused(self) -> None:
-    if self.main_grad_buffer is None or self.main_grad_buffer.data is None:
-        return
-    if (
-        self._full_grad_buffer_has_accumulated_grad
-        or self._reduced_grad_buffer_has_accumulated_grad
-    ):
-        return
-    if any(getattr(p, "grad", None) is not None for p in self.dist_params):
-        return
-    self.main_grad_buffer.data = None
-    self.dist_grads = [None for _ in self.params]
-```
+1. return immediately if the group has no grad buffer, does not require grads,
+   or the buffer is already allocated;
+2. allocate `main_grad_buffer.data` with `torch.empty(...)`;
+3. slice the buffer according to the active sharding layout;
+4. build DTensor gradient views in `dist_grads`.
 
-Guarded: only frees when neither the full staging buffer nor the collective
-output contains an accumulated gradient and no `dist_param` still holds a
-`.grad` reference.
+The DTensor views are what the optimizer later sees through
+`dist_param.grad` or `dist_param.decoupled_grad`.
 
-### 2.4 Call Sites
+## Normal lifecycle
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  _init_buffers()                                             │
-│    → main_grad_buffer created but data = None (layout only)  │
-│    → dist_grads = [None]                                     │
-│                                                              │
-│  zero_grad()                          ← optim.zero_grad()    │
-│    → dist_param.grad = None                                  │
-│    → _full_grad_buffer_has_accumulated_grad = False          │
-│    → _reduced_grad_buffer_has_accumulated_grad = False       │
-│    → _release_grad_storage_if_unused() ← frees buffer        │
-│                                                              │
-│  backward_pre_hook                                            │
-│    → _init_dist_grads()              ← re-allocates buffer   │
-│    → fetch_buffer()                  ← allocates full buf    │
-│                                                              │
-│  reduce_grad()                                               │
-│    → _ensure_buffers_on_gpu()        ← auto-reload safety    │
-│    → _init_dist_grads()              ← no-op (already init)  │
-│    → main_grad_buffer.reduce_grad()  ← reduce-scatter        │
-│                                                              │
-│  finish_grad_sync()                                          │
-│    → param.main_grad = dist_grad                             │
-│                                                              │
-│  optim.step()                                                │
-│    → copies main_grad → optimizer param                      │
-│    → updates weights → copies back to model                  │
-└──────────────────────────────────────────────────────────────┘
-```
+| Point in step | Behavior |
+| --- | --- |
+| FSDP initialization | Create `main_grad_buffer` metadata only. `main_grad_buffer.data` is `None`; `dist_grads` contains placeholders. |
+| First post-backward `reduce_grad()` | `_init_dist_grads()` allocates `main_grad_buffer.data` and rebuilds `dist_grads` DTensor views. |
+| Gradient reduction | `param.grad` is staged into `main_grad_buffer`; all-reduce or reduce-scatter writes the optimizer-facing result. |
+| Optimizer step | Optimizer consumes `dist_param.grad` or `dist_param.decoupled_grad`, which are backed by `main_grad_buffer.data`. |
+| `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, reset accumulation flags, and release `main_grad_buffer.data` if nothing still references valid gradients. |
+| `zero_grad(set_to_none=False)` | Keep `main_grad_buffer.data` allocated and zero it in place. |
 
----
+`_release_grad_storage_if_unused()` is also called from the forward pre-hook.
+That call is idempotent and handles the common case where `zero_grad()` has
+already cleared all optimizer-facing gradient references before the next
+forward.
 
-## 3. Memory Lifecycle
+## Release guard
 
-```
-Memory
-  ^
-  │                         ┌──────────────────────┐
-  │                         │ _init_dist_grads()   │  ┌──────────────────────┐
-  │  ┌──────────────────────┤ allocate grad buffer ├──┤ _init_dist_grads()   │
-  │  │  _maybe_free_grad_   │ (torch.zeros)        │  │ re-allocate          │
-  │  │  data() frees buffer │                      │  │                      │
-  │  ├──────────────────────┘                      │  ├──────────────────────┘
-  │  │  ┌──────────┐         ┌──────────┐          │  │  ┌──────────┐
-  │  │  │  model   │         │  model   │          │  │  │  model   │
-  │  │  │  weight  │         │  weight  │          │  │  │  weight  │
-  │  │  │  buffer  │         │  buffer  │          │  │  │  buffer  │
-  └──┴──┴──────────┴─────────┴──────────┴──────────┴──┴──┴──────────┴──────► time
-       init    fwd      bwd      optim    zero_grad   fwd    bwd    optim
+`_release_grad_storage_if_unused()` frees `main_grad_buffer.data` only when all
+of these are true:
 
-    │←── step N ──→│                                         │←── step N+1 ──→│
+- full-iteration CUDA graph mode is not enabled for the group;
+- `main_grad_buffer.data` exists;
+- the full staging buffer does not contain accumulated gradient data;
+- the reduced output buffer does not contain accumulated gradient data;
+- no `dist_param.grad` or `dist_param.decoupled_grad` still references the
+  gradient DTensor.
 
-    Gradient buffer: ALLOCATED only during backward → optimizer window
-                     FREED during forward and between steps
-```
+If any of those conditions fail, storage is kept because it may still be needed
+by gradient accumulation or the optimizer.
 
-### 3.1 Savings Table
+## Accumulation flags
 
-| Phase | Before (eager) | After (lazy) | Delta |
-|-------|---------------|--------------|-------|
-| Init / construction | gradient shard on GPU | 0 bytes | `−model_params × 4 / dp` |
-| Forward | gradient shard on GPU | FREE | `−model_params × 4 / dp` |
-| Backward | gradient shard on GPU | gradient shard on GPU | 0 |
-| Optimizer step | gradient shard on GPU | gradient shard on GPU | 0 |
-| Between steps | gradient shard on GPU | FREE | `−model_params × 4 / dp` |
-| Checkpoint I/O | gradient shard on GPU | FREE | freed for I/O buffers |
-| Model export | gradient shard on GPU | FREE | freed for export |
+Two flags track where valid gradient data currently lives:
 
-**Example** (70B BF16 model, `dp=8`):
-- Gradient shard: `70B × 4 bytes ÷ 8 = 35 GB` (FP32)
-- **35 GB freed** during forward, between steps, and checkpoint I/O
+- `_full_grad_buffer_has_accumulated_grad` tracks the full `(0, 0)` staging
+  buffer used before the collective.
+- `_reduced_grad_buffer_has_accumulated_grad` tracks the collective output
+  consumed by the optimizer.
 
----
+`zero_grad()` resets both flags before trying to release storage. `reduce_grad()`
+sets them according to the active sharding strategy and whether the collective
+consumes the full staging buffer.
 
-## 4. Edge Cases
+These flags are required because some ranks can have empty local optimizer
+shards while the shared buffer still contains valid data for another layout.
 
-### Frozen params (`requires_grad=False`)
+## Safe use of `torch.empty`
 
-`main_grad_buffer` is never created — the existing `if self.requires_grad` guard
-in `_init_buffers` already handles this. No change.
+The lazy allocation uses `torch.empty()` to avoid an unnecessary zero-fill.
+This is safe because the first use after allocation is controlled by the
+accumulation flags:
 
-### Param groups with no gradient flow
+- if no previous gradient has accumulated, staging and collective outputs
+  overwrite the destination;
+- if a previous microbatch has accumulated, later microbatches add into the
+  existing buffer.
 
-Some param groups (e.g., expert params on ranks that don't own the expert) may
-never see a backward pass. With lazy init, the buffer is never allocated —
-saves memory permanently.
+`zero_grad(set_to_none=False)` is the explicit keep-storage path: it zeros
+`main_grad_buffer.data` in place when the buffer exists instead of releasing it.
 
-### Multiple `reduce_grad()` calls (gradient accumulation)
+## CUDA graph exceptions
 
-After the first call, `_init_dist_grads()` is a no-op. Two flags track the
-independent accumulation locations:
+Full-iteration CUDA graph mode keeps optimizer-facing gradient storage alive so
+the captured step can reuse stable gradient objects. In that mode,
+`_release_grad_storage_if_unused()` returns without freeing the buffer, and
+`zero_grad()` clears the existing storage in place.
 
-- `_full_grad_buffer_has_accumulated_grad` controls whether staging adds to or
-  overwrites the full `(0, 0)` gradient buffer.
-- `_reduced_grad_buffer_has_accumulated_grad` controls whether a new collective
-  result adds to or overwrites the local reduced output.
+Per-module CUDA graph capture keeps the normal lazy behavior, except compatible
+main-grad storage may be initialized before capture so trace and replay use the
+same buffer surface.
 
-A reduce-scatter consumes the full input and clears the first flag. An
-all-reduce operates in place, so the full-buffer flag remains set. Any completed
-collective sets the reduced-output flag.
+## Relevant code
 
-| Inner strategy | After a non-final microbatch | After the final microbatch |
-| --- | --- | --- |
-| `no_shard` | full=`True`, reduced=`False` | full=`True`, reduced=`True` |
-| `optim` | full=`True`, reduced=`False` | full=`False`, reduced=`True` |
-| `optim_grads` | full=`False`, reduced=`True` | full=`False`, reduced=`True` |
-| `optim_grads_params` | full=`False`, reduced=`True` | full=`False`, reduced=`True` |
-
-### Full-iteration CUDA graph
-
-`enable_full_iteration_cuda_graph=True` is an explicit exception to the normal
-lazy-freeing policy for optimizer-facing gradients. The full-iteration wrapper
-captures forward/backward but runs the optimizer outside the graph, so the local
-gradient shard and `decoupled_grad` object must keep stable identities.
-
-- `_pre_backward_setup()` allocates dist grads before capture.
-- `_release_grad_storage_if_unused()` keeps optimizer-facing gradient storage alive.
-- `zero_grad()` keeps optimizer-facing objects and clears local storage in place.
-- Optimizer zero-grad keeps marked `grad`/`decoupled_grad` DTensors and zeroes
-  their local storage.
-- Full unsharded weight and gradient buffers remain transient. They allocate and
-  reshard inside capture, so the CUDA graph private pool owns their stable replay
-  addresses and reuses non-overlapping lifetimes.
-
-Both flags default to `False`, so eager and per-module CUDA graph paths retain
-their normal lazy allocation/free behavior.
-
-### Activation recomputation
-
-During recomputation, the forward pre-hook fires again. `_release_grad_storage_if_unused()`
-is a no-op (data already None or grads are live). The backward pre-hook re-allocates
-via `_init_dist_grads()` before backward compute starts — no change in behavior.
-
-### `offload_to_cpu()`
-
-If called before the first `reduce_grad()`, `main_grad_buffer.data` is `None` —
-skip. If called after, the buffer exists on GPU and is offloaded normally.
-`_ensure_buffers_on_gpu()` auto-reloads on next access.
-
----
-
-## 5. Safe `torch.empty` Allocation
-
-### 5.1 First-Write Semantics
-
-The gradient buffer uses `torch.empty()` to avoid an unnecessary zero-fill:
-
-```python
-gbuf.init_data(torch.empty(gbuf.data_size, dtype=gbuf.dtype, device=self.device))
-```
-
-`torch.empty()` returns uninitialized memory, so the first reduced gradient
-must overwrite the local shard. Later microbatches may accumulate:
-
-```python
-# DataParallelBuffer.reduce_grad()
-if accumulate_reduced_grad:
-    local_grad_shard += reduced_grad_shard
-else:
-    local_grad_shard.copy_(reduced_grad_shard)
-```
-
-`_reduced_grad_buffer_has_accumulated_grad=False` selects overwrite for the
-first collective output. `reduce_grad()` then sets it to `True`, selecting
-accumulation for later microbatches. `zero_grad()` resets both accumulation
-flags to `False`.
-
----
-
-## 6. Compatibility with CPU Offload
-
-- `_ensure_buffers_on_gpu()` auto-reloads CPU-offloaded buffers before use
-- `_rebuild_dist_views()` re-slices `_local_tensor` views after device move
-- `_release_grad_storage_if_unused()` frees GPU allocation regardless of CPU copy state
-
-Combined: the gradient buffer is **fully elastic** — on GPU only when needed,
-on CPU (or nowhere) the rest of the time.
-
----
-
-## 7. Impact on Callers
-
-| Call site | Impact |
-|-----------|--------|
-| `reduce_grad()` | Lazy init fires — adds one `torch.zeros` + DTensor rebuild on first call |
-| `zero_grad()` | Already guarded — no-op if data is None; frees buffer via `_release_grad_storage_if_unused` |
-| `_rebuild_dist_views()` | Already guarded — no-op for grads if buffer is None |
-| `_copy_main_weights_to_model_weights()` | No impact (uses model_weight + main_weight only) |
-| `_compute_per_param_norms()` | Reads `dist_grads` — skips if None |
-| `finish_grad_sync()` | Only called after `reduce_grad()` → buffer already created |
-| Checkpoint `state_dict()` | Optimizer state dict references `dist_grads` → None for lazy groups (correct) |
-
----
-
-## 8. Related Files
-
-| File | Relevant Changes |
-|------|-----------------|
-| `param_group.py` | `_init_dist_grads()`, `_release_grad_storage_if_unused()`, `_rebuild_dist_views()`, `_ensure_buffers_on_gpu()`, lazy `_init_buffers()` |
-| `dp_buffer.py` | `_is_on_cpu()`, `_ensure_data_on_gpu()`, `_move_data_to()` |
-| `allocator.py` | `release()`, `_auto_resume()`, `resume()` — pool lifecycle |
-| `fsdp_module.py` | `zero_grad()` override, `_get_fsdp_modules()`, `offload_to_cpu()`, `reload_to_gpu()` |
-| `hooks.py` | `_init_dist_grads()` + `fetch_buffer()` call sites in backward pre-hook |
-| `design.md` | Memory-pool release/resume documentation |
-| `cpu_offload_design.md` | Full CPU offload architecture |
+| File | Relevant pieces |
+| --- | --- |
+| `param_group.py` | `_init_buffers()`, `_init_dist_grads()`, `_release_grad_storage_if_unused()`, `zero_grad()` |
+| `fsdp_module.py` | `reduce_grad()` stages local parameter grads and installs `dist_grads` on `dist_params` |
+| `hooks.py` | forward pre-hook release path and CUDA-graph pre-initialization path |
