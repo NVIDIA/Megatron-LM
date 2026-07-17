@@ -179,6 +179,7 @@ DATA=(
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
   "data.filter_overlong_prompts=True"
+  "+data.apply_chat_template_kwargs.chat_template='${DS4_CHAT_TEMPLATE}'"
   "data.truncation=error"
   "data.dataloader_num_workers=8"
 )

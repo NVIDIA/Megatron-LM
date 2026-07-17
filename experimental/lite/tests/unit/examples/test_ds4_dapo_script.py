@@ -83,6 +83,7 @@ def test_ds4_dapo_weight_and_r3_knobs(
     assert "algorithm.rollout_correction.bypass_mode=False" in command
     assert "data.max_response_length=6144" in command
     assert "actor_rollout_ref.model.custom_chat_template=" in command
+    assert "+data.apply_chat_template_kwargs.chat_template=" in command
     assert "data.custom_cls" not in command
     assert "data.label_key" not in command
     assert "data.default_data_source" not in command
