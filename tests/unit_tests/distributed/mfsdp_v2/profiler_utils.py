@@ -13,6 +13,14 @@ def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
     )
 
 
+def _linked_correlation_id(event: FunctionEvent) -> int | None:
+    return getattr(event, "linked_correlation_id", None)
+
+
+def _is_device_work(event: FunctionEvent) -> bool:
+    return event.device_type == DeviceType.CUDA and not event.name.startswith("nccl:")
+
+
 def collect_linked_device_events(
     events: list[FunctionEvent], cpu_event_name_substring: str
 ) -> list[FunctionEvent]:
@@ -24,25 +32,50 @@ def collect_linked_device_events(
     op is simply ``aten::mm``, and under zero-CTA the all-gather is not even a distinct
     kernel, just a generic copy-engine ``Memcpy``.
 
-    Returns a list of device events in event order.
+    Returns a flat list of device events in matching CPU-op order.
+    """
+    return [
+        event
+        for group in collect_linked_device_event_groups(events, cpu_event_name_substring)
+        for event in group
+    ]
+
+
+def collect_linked_device_event_groups(
+    events: list[FunctionEvent], cpu_event_name_substring: str
+) -> list[list[FunctionEvent]]:
+    """Collect device events grouped by matching CPU op instance.
+
+    One logical CPU op can emit multiple device events; zero-CTA all-gather, for example,
+    decomposes into several copy-engine memcpys.
     """
     # A correlation id is shared by a device event and the leaf runtime op that issued it,
     # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
     # is the "no device correlation" sentinel and is skipped.
-    matching_correlations: set[int] = set()
+    correlation_to_group: dict[int, int] = {}
+    group_index_by_cpu_event: dict[int, int] = {}
+    groups: list[list[FunctionEvent]] = []
     for event in events:
-        if event.device_type != DeviceType.CPU or not event.linked_correlation_id:
+        correlation_id = _linked_correlation_id(event)
+        if event.device_type != DeviceType.CPU or not correlation_id:
             continue
         node = event
         while node is not None:
             if cpu_event_name_substring in node.name:
-                matching_correlations.add(event.linked_correlation_id)
+                cpu_event_id = id(node)
+                group_index = group_index_by_cpu_event.get(cpu_event_id)
+                if group_index is None:
+                    group_index = len(groups)
+                    group_index_by_cpu_event[cpu_event_id] = group_index
+                    groups.append([])
+                correlation_to_group[correlation_id] = group_index
                 break
             node = node.cpu_parent
 
-    return [
-        event
-        for event in events
-        if event.device_type == DeviceType.CUDA
-        and event.linked_correlation_id in matching_correlations
-    ]
+    for event in events:
+        correlation_id = _linked_correlation_id(event)
+        group_index = correlation_to_group.get(correlation_id)
+        if _is_device_work(event) and group_index is not None:
+            groups[group_index].append(event)
+
+    return [group for group in groups if group]

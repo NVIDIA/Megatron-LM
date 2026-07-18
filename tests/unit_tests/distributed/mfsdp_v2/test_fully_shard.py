@@ -23,6 +23,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
+    collect_linked_device_event_groups,
     collect_linked_device_events,
     events_overlap,
 )
@@ -579,44 +580,56 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         f"{[event.name for event in gemm_events]}"
     )
 
-    all_gather_events = collect_linked_device_events(events, _ALL_GATHER_OP_NAME_SUBSTRING)
-    reduce_scatter_events = collect_linked_device_events(events, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # The num_children child layers plus the root are each a sharded module; each does a
-    # forward and a backward all-gather and one reduce-scatter.
-    num_sharded_modules = num_children + 1
-    assert len(reduce_scatter_events) == num_sharded_modules, (
-        f"Expected {num_sharded_modules} reduce-scatters, got {len(reduce_scatter_events)}: "
-        f"{[event.name for event in reduce_scatter_events]}"
+    all_gather_event_groups = collect_linked_device_event_groups(
+        events, _ALL_GATHER_OP_NAME_SUBSTRING
     )
-    assert len(all_gather_events) == 2 * num_sharded_modules, (
-        f"Expected {2 * num_sharded_modules} all-gathers, got {len(all_gather_events)}: "
-        f"{[event.name for event in all_gather_events]}"
+    reduce_scatter_event_groups = collect_linked_device_event_groups(
+        events, _REDUCE_SCATTER_OP_NAME_SUBSTRING
+    )
+    # The num_children child layers plus the root are each a sharded module; each does a
+    # forward and a backward all-gather and one reduce-scatter. Zero-CTA all-gather can
+    # emit several copy-engine events, so count linked CPU-op groups here.
+    num_sharded_modules = num_children + 1
+    assert len(reduce_scatter_event_groups) == num_sharded_modules, (
+        f"Expected {num_sharded_modules} reduce-scatters, got "
+        f"{len(reduce_scatter_event_groups)}: "
+        f"{[[event.name for event in group] for group in reduce_scatter_event_groups]}"
+    )
+    assert len(all_gather_event_groups) == 2 * num_sharded_modules, (
+        f"Expected {2 * num_sharded_modules} all-gathers, got "
+        f"{len(all_gather_event_groups)}: "
+        f"{[[event.name for event in group] for group in all_gather_event_groups]}"
     )
 
+    all_gather_events = [event for group in all_gather_event_groups for event in group]
+    reduce_scatter_events = [event for group in reduce_scatter_event_groups for event in group]
     all_gather_streams = {event.device_resource_id for event in all_gather_events}
     reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
     gemm_streams = {event.device_resource_id for event in gemm_events}
-    assert len(all_gather_streams) == 1
+    if not use_symm_mem:
+        assert len(all_gather_streams) == 1
     assert len(reduce_scatter_streams) == 1
     assert all_gather_streams.isdisjoint(reduce_scatter_streams)
     assert all_gather_streams.isdisjoint(gemm_streams)
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
     all_gather_overlap_count = sum(
-        any(events_overlap(event, gemm) for gemm in gemm_events) for event in all_gather_events
+        any(events_overlap(event, gemm) for event in group for gemm in gemm_events)
+        for group in all_gather_event_groups
     )
     reduce_scatter_overlap_count = sum(
-        any(events_overlap(event, gemm) for gemm in gemm_events) for event in reduce_scatter_events
+        any(events_overlap(event, gemm) for event in group for gemm in gemm_events)
+        for group in reduce_scatter_event_groups
     )
     expected_all_gather_overlap = 2 * (num_children - 1)
     expected_reduce_scatter_overlap = num_children - 1
     assert all_gather_overlap_count >= expected_all_gather_overlap, (
         f"Expected at least {expected_all_gather_overlap} all-gathers to "
-        f"overlap compute, got {all_gather_overlap_count}/{len(all_gather_events)}."
+        f"overlap compute, got {all_gather_overlap_count}/{len(all_gather_event_groups)}."
     )
     assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap, (
         f"Expected at least {expected_reduce_scatter_overlap} reduce-scatters to overlap "
-        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
+        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_event_groups)}."
     )
 
     # Release the dedicated communicator so it does not leak into the shared session.
