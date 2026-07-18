@@ -488,7 +488,7 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
 @pytest.mark.parametrize(
     "use_symm_mem",
     [
-        pytest.param(False, marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev], id="default"),
+        pytest.param(False, id="default"),
         pytest.param(True, id="symmetric_memory"),
     ],
 )
@@ -510,6 +510,13 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     num_children = 4
     dtype = torch.bfloat16
 
+    # new_group requires a default process group. Initialize it here so this test works
+    # in isolation. Do not eagerly initialize it with device_id in the shared fixture:
+    # that can hang teardown after communicator splits; see
+    # https://github.com/pytorch/pytorch/issues/190396.
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
     if use_symm_mem:
         # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
         # per-communicator property, so scoping it to this group leaves the rest of the
@@ -518,13 +525,13 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         # memcpys). This 1-D group models the DP (FSDP) sub-mesh that mfsdp is handed in
         # production: with EP/TP the full device mesh is multi-dimensional, but mfsdp
         # requires an all-FSDP mesh (see experimental/module.py) and never sees the TP/EP
-        # axes, so only the DP communicator needs the zero-CTA policy. Creating the group
-        # off the conftest's device_id eager-initialized default process group uses a comm
-        # split, which avoids the cold-communicator symmetric-memory rendezvous failure
-        # (https://github.com/pytorch/pytorch/issues/188567).
+        # axes, so only the DP communicator needs the zero-CTA policy.
         zero_cta_options = dist.ProcessGroupNCCL.Options()
         zero_cta_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
         dp_group = dist.new_group(backend="nccl", pg_options=zero_cta_options)
+        # NCCL window registration can fail when symmetric-memory rendezvous is the first
+        # operation on a communicator, so initialize this communicator explicitly.
+        dist.barrier(group=dp_group, device_ids=[device.index])
     else:
         dp_group = dist.new_group(backend="nccl")
 
