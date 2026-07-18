@@ -483,13 +483,7 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-@pytest.mark.parametrize(
-    "use_symm_mem",
-    [
-        pytest.param(False, id="default"),
-        pytest.param(True, id="symmetric_memory"),
-    ],
-)
+@pytest.mark.parametrize("use_symm_mem", [False, True], ids=["default", "symmetric_memory"])
 def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
