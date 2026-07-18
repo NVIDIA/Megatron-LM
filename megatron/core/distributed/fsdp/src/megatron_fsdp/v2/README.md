@@ -18,6 +18,8 @@ v2/
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
 ├── mixed_precision.py           # MixedPrecisionPolicy, FP8Policy, NVFP4Policy
 ├── utils.py                     # Internal utilities (mesh init, backward Function)
+├── design/mfsdp_v2_builtin_cuda_graph_design.md  # Per-module CUDA graph design
+├── design/full_iteration_cuda_graph_design.md    # Full-iteration CUDA graph design
 ├── design/hsdp_design.md        # HSDP mesh, buffer layouts, and conversions
 ├── design.md                    # Overlap, memory, and synchronization design
 ├── nvfp4_design.md              # NVFP4 primary-weights design
@@ -103,10 +105,9 @@ Mixin class added to wrapped modules. Methods:
 > feature.  The API and behaviour may change in future releases without notice.
 
 **Why MFSDP v2 can support CUDA graphs.**  The [`TracePoolAllocator`](allocator.py)
-pre-plans every parameter/gradient buffer slot at a fixed offset in a
-persistent pool tensor during the first (trace) micro-batch.  Once `plan()`
-has committed those offsets, all buffer addresses become deterministic across
-micro-batches — the stable memory foundation that CUDA graph capture requires.
+traces one micro-batch, assigns each FSDP temporary buffer key to a stable slot,
+and returns the same cached tensor view on later micro-batches.  Those stable
+addresses are the memory foundation that CUDA graph capture requires.
 
 Enable it per-module with ``enable_cuda_graph=True``:
 
@@ -144,7 +145,8 @@ for layer in model.layers:
 fully_shard(model, enable_cuda_graph=True)   # raises RuntimeError
 ```
 
-See [`design/cuda_graph_design.md`](design/cuda_graph_design.md) for the full architecture.
+See [`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md)
+for the full per-module architecture.
 
 ### DataParallelBuffer
 
@@ -208,10 +210,11 @@ strategy controls which buffers and communication collectives are used.
 
 - **Experimental.** Enable via ``enable_cuda_graph=True`` on leaf FSDP modules.
   Built on vendored [te-graph-runtime](https://github.com/buptzyb/te-graph-runtime)
-  with local modifications. See [`design/cuda_graph_design.md`](design/cuda_graph_design.md).
+  with local modifications. See
+  [`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md).
 - **Requires `TracePoolAllocator`.** CUDA graph capture depends on the
-  deterministic buffer addresses provided by the trace pool; modules must be
-  wrapped with ``enable_trace_pool=True``.
+  deterministic buffer addresses provided by the trace pool. It is selected
+  automatically when ``enable_cuda_graph=True``.
 - **Nesting not supported.** Only leaf FSDP modules (those without FSDP children)
   are eligible for capture.
 

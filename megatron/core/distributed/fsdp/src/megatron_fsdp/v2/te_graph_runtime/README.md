@@ -48,8 +48,9 @@ the graph pool a clean, unfragmented state.
   so capture reuses them instead of freeing and reallocating.  Saves
   significant GPU memory vs. a throwaway stream.
 - A throwaway warmup stream is used only as a workaround for `torch.compile`
-  compatibility (see `cuda_graph_design.md` §9).  The ideal state removes
-  this workaround once the underlying compile guard mismatch is fixed.
+  compatibility (see `../design/mfsdp_v2_builtin_cuda_graph_design.md`).  The
+  ideal state removes this workaround once the underlying compile guard
+  mismatch is fixed.
 
 ## Prefer pip install
 
