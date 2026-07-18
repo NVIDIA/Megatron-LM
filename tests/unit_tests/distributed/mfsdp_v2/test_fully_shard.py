@@ -612,13 +612,8 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         any(events_overlap(event, gemm) for event in group for gemm in gemm_events)
         for group in reduce_scatter_events.values()
     )
-    # The symmetric-memory case uses NCCL's zero-CTA policy so the all-gather runs on the
-    # copy engine (SM-free) instead of an SM-based kernel: it can never contend with the
-    # GEMMs for SMs, so the overlap count is deterministic and the strict theoretical
-    # maximum thresholds hold. The default case preserves the original non-symmetric path
-    # with looser thresholds since SM-based NCCL kernels can jitter with launch timing.
-    expected_all_gather_overlap = 2 * (num_children - 1) if use_symm_mem else 2
-    expected_reduce_scatter_overlap = num_children - 1 if use_symm_mem else 1
+    expected_all_gather_overlap = 2 * (num_children - 1)
+    expected_reduce_scatter_overlap = num_children - 1
     assert all_gather_overlap_count >= expected_all_gather_overlap, (
         f"Expected at least {expected_all_gather_overlap} all-gathers to "
         f"overlap compute, got {all_gather_overlap_count}/{len(all_gather_events)}."
