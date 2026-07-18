@@ -15,8 +15,8 @@ def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
 
 def collect_linked_device_events(
     events: list[FunctionEvent], cpu_event_name_substring: str
-) -> list[list[FunctionEvent]]:
-    """Collect device events linked to each matching CPU op instance.
+) -> list[FunctionEvent]:
+    """Collect device events linked to matching CPU op instances.
 
     Device events are attributed by their launching CPU op rather than searched by their
     own name: device-side names vary across GPU architectures and kernel libraries -- for
@@ -24,28 +24,25 @@ def collect_linked_device_events(
     op is simply ``aten::mm``, and under zero-CTA the all-gather is not even a distinct
     kernel, just a generic copy-engine ``Memcpy``.
 
-    Returns a list, in event order, where each entry contains the device events for one
-    matching op instance.
+    Returns a list of device events in event order.
     """
     # A correlation id is shared by a device event and the leaf runtime op that issued it,
     # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
     # is the "no device correlation" sentinel and is skipped.
-    op_by_correlation: dict[int, FunctionEvent] = {}
+    matching_correlations: set[int] = set()
     for event in events:
         if event.device_type != DeviceType.CPU or not event.linked_correlation_id:
             continue
         node = event
         while node is not None:
             if cpu_event_name_substring in node.name:
-                op_by_correlation[event.linked_correlation_id] = node
+                matching_correlations.add(event.linked_correlation_id)
                 break
             node = node.cpu_parent
 
-    device_events_by_op: dict[FunctionEvent, list[FunctionEvent]] = {}
-    for event in events:
-        if event.device_type != DeviceType.CUDA:
-            continue
-        op = op_by_correlation.get(event.linked_correlation_id)
-        if op is not None:
-            device_events_by_op.setdefault(op, []).append(event)
-    return list(device_events_by_op.values())
+    return [
+        event
+        for event in events
+        if event.device_type == DeviceType.CUDA
+        and event.linked_correlation_id in matching_correlations
+    ]
