@@ -15,8 +15,8 @@ def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
 
 def collect_linked_device_events(
     events: list[FunctionEvent], cpu_event_name_substring: str
-) -> dict[FunctionEvent, list[FunctionEvent]]:
-    """Map each matching CPU op instance to the device events linked to it.
+) -> list[list[FunctionEvent]]:
+    """Collect device events linked to each matching CPU op instance.
 
     Device events are attributed by their launching CPU op rather than searched by their
     own name: device-side names vary across GPU architectures and kernel libraries -- for
@@ -24,8 +24,8 @@ def collect_linked_device_events(
     op is simply ``aten::mm``, and under zero-CTA the all-gather is not even a distinct
     kernel, just a generic copy-engine ``Memcpy``.
 
-    Returns a dict, in event order, from each matching op (one per instance) to its
-    device events.
+    Returns a list, in event order, where each entry contains the device events for one
+    matching op instance.
     """
     # A correlation id is shared by a device event and the leaf runtime op that issued it,
     # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
@@ -48,4 +48,4 @@ def collect_linked_device_events(
         op = op_by_correlation.get(event.linked_correlation_id)
         if op is not None:
             device_events_by_op.setdefault(op, []).append(event)
-    return device_events_by_op
+    return list(device_events_by_op.values())
