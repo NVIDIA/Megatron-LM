@@ -623,10 +623,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
     )
 
-    # Release the dedicated communicator so it does not leak into the shared session
-    # (the mfsdp_v2 bucket keeps one process group alive across tests). On a failure
-    # above the group leaks, which is acceptable. Destroying this subgroup leaves the
-    # default process group and conftest teardown barrier.
+    # Release the dedicated communicator so it does not leak into the shared session.
     dist.destroy_process_group(dp_group)
 
 
