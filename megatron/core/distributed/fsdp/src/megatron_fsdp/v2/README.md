@@ -1,8 +1,10 @@
 # Megatron FSDP v2
 
-> ⚠️ Prototype Implementation — Not Yet Production Ready
+> ⚠️ Prototype implementation — not yet production ready
 
-Megatron FSDP v2 (M-FSDP2) inherits the performance of Megatron FSDP v1 and supports API drop-in replacement for FSDP2.
+Megatron FSDP v2 (M-FSDP2) is a DTensor-backed FSDP implementation integrated
+with Megatron Core. It exposes an FSDP2-like `fully_shard()` API where practical,
+but not every PyTorch FSDP2 option is implemented.
 
 ## Architecture
 
@@ -15,15 +17,22 @@ v2/
 ├── hooks.py                     # Forward/backward hook registration
 ├── param_group.py               # ParameterGroup — groups params with shared buffers
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
+├── buffer_index.py              # Flat-buffer item indexing and shard metadata
 ├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
-├── mixed_precision.py           # MixedPrecisionPolicy, FP8Policy, NVFP4Policy
+├── cuda_graph_runner.py         # Per-module CUDA graph capture orchestration
+├── mixed_precision.py           # MixedPrecisionPolicy, FullyShardFP8Policy, FullyShardNVFP4Policy
 ├── utils.py                     # Internal utilities (mesh init, backward Function)
-├── design/mfsdp_v2_builtin_cuda_graph_design.md  # Per-module CUDA graph design
-├── design/full_iteration_cuda_graph_design.md    # Full-iteration CUDA graph design
-├── design/hsdp_design.md        # HSDP mesh, buffer layouts, and conversions
-├── design.md                    # Overlap, memory, and synchronization design
-├── mixed_precision_training_design.md  # Mixed precision training buffer design
-└── mcore_fsdp_checkpoint_design.md  # Checkpoint save/load and format conversion design
+├── te_graph_runtime/            # Vendored TE CUDA graph runtime compatibility layer
+└── design/
+    ├── design.md                              # Overlap, memory, and synchronization design
+    ├── trace_pool_allocator_design.md         # TracePoolAllocator design
+    ├── mfsdp_v2_builtin_cuda_graph_design.md  # Per-module CUDA graph design
+    ├── full_iteration_cuda_graph_design.md    # Full-iteration CUDA graph design
+    ├── hsdp_design.md                         # HSDP mesh, buffer layouts, and conversions
+    ├── hooks_api.md                           # Hook API contracts and Q&A
+    ├── lazy_grad_buffer_design.md             # Lazy main grad buffer lifecycle
+    ├── mixed_precision_training_design.md     # Mixed precision training support
+    └── mcore_fsdp_checkpoint_design.md        # Checkpoint save/load and conversion design
 ```
 
 For the broader `megatron_fsdp` package layout, see the parent directory.
@@ -109,7 +118,8 @@ traces one micro-batch, assigns each FSDP temporary buffer key to a stable slot,
 and returns the same cached tensor view on later micro-batches.  Those stable
 addresses are the memory foundation that CUDA graph capture requires.
 
-Enable it per-module with ``enable_cuda_graph=True``:
+When using the standalone API, enable per-module capture with
+``enable_cuda_graph=True``:
 
 ```python
 for layer in model.layers:
@@ -193,9 +203,9 @@ strategy controls which buffers and communication collectives are used.
 ### Parallelism
 
 - **Tensor Parallelism (TP):** The FSDP DeviceMesh contains DP/EDP dimensions,
-  not a TP placement. Parameters that are already partitioned by TP layers
-  (e.g., `ColumnParallelLinear`, `RowParallelLinear`) are not represented with
-  TP-aware DTensor metadata.
+  not a TP placement. TP layers can be used with MCore training, but their TP
+  partitioning is represented by the layer implementation rather than by FSDP
+  DTensor placements.
 - **Hybrid Sharding (HSDP):** A 2D `(dp_outer, dp/edp)` mesh supports outer
   replication and outer optimizer-state sharding. Outer `optim` currently
   requires inner `optim_grads_params`; NVFP4 outer optimizer sharding is not
@@ -209,6 +219,8 @@ strategy controls which buffers and communication collectives are used.
 ### CUDA Graph
 
 - **Experimental.** Enable via ``enable_cuda_graph=True`` on leaf FSDP modules.
+  In Megatron-LM training, use ``--mfsdp-cuda-graph`` with one or more module
+  selectors (`transformer`, `mamba`, `attn`, `mlp`, `moe`, `moe_router`).
   Built on vendored [te-graph-runtime](https://github.com/buptzyb/te-graph-runtime)
   with local modifications. See
   [`design/mfsdp_v2_builtin_cuda_graph_design.md`](design/mfsdp_v2_builtin_cuda_graph_design.md).
@@ -231,14 +243,20 @@ yet implemented** (marked `TODO`):
 
 - **GPU only.** CUDA devices only. CPU, XPU, and ROCm are not tested or supported.
 - **NVFP4** (`mixed_precision.py`): The non-distributed quantization path is
-  not implemented (`FIXME` at `mixed_precision.py:686`). Distributed NVFP4
-  (reduce-scatter + quantize) is functional.
+  not implemented. Distributed NVFP4 quantization is implemented for sharded
+  model-weight buffers.
 
 ### Checkpointing
 
 - **Async checkpoint:** Not supported for the v2 path.
 - **`dp_reshardable` checkpoints:** Loading from `dp_reshardable` format is
-  not supported. Re-save checkpoints with `--ckpt-fully-parallel-save` first.
+  not supported. Re-save checkpoints with
+  `--dist-ckpt-optim-fully-reshardable` first.
+
+### MCore Integration
+
+- **`--ddp-average-in-collective`:** Not supported with Megatron FSDP v2. The
+  adapter raises a `NotImplementedError` if both options are enabled.
 
 ## Integration with Megatron
 
@@ -246,22 +264,22 @@ There are two ways to use Megatron FSDP v2:
 
 ### Option A: Through Megatron Core (MCore)
 
-Set `--use-megatron-fsdp-v2` in your training arguments. The adapter
-(`mcore_fsdp_adapter.py`) will automatically route to the v2 `fully_shard`
-path for model sharding.
+Set `--use-megatron-fsdp-v2` in your training arguments. Argument validation
+sets `--use-megatron-fsdp` automatically and the adapter (`mcore_fsdp_adapter.py`)
+routes model sharding to the v2 `fully_shard` path.
 
 ```bash
 python pretrain_gpt.py \
     --use-megatron-fsdp-v2 \
-    --use-megatron-fsdp \
     ...
 ```
 
 This is the recommended path for Megatron-LM training workflows.
 
-### Option B: Standalone (without Megatron-LM)
+### Option B: Standalone API from the source tree
 
-Import `fully_shard` directly from the `megatron_fsdp.v2` package:
+Import `fully_shard` directly from the `megatron_fsdp.v2` package when the
+source tree is on `PYTHONPATH`:
 
 ```python
 from megatron_fsdp.v2 import FSDPModule, fully_shard
@@ -272,22 +290,13 @@ fully_shard(model)
 
 ### Installation
 
-**Pre-release (current):** v2 has not been released as a standalone package yet.
-Clone and install via `PYTHONPATH`:
+Megatron FSDP v2 is not published as a standalone PyPI package from this source
+tree. Use a Megatron-LM checkout and add the FSDP source directory to
+`PYTHONPATH`:
 
 ```bash
-git clone -b mfsdp_refactor https://github.com/shjwudp/Megatron-LM.git
-export PYTHONPATH=$PWD/Megatron-LM/megatron/core/distributed/fsdp/src:$PYTHONPATH
+export PYTHONPATH=/path/to/Megatron-LM/megatron/core/distributed/fsdp/src:$PYTHONPATH
 ```
-
-**After release** (once `megatron-fsdp` is published to PyPI):
-
-```bash
-pip install megatron-fsdp
-```
-
-The standalone import (`from megatron_fsdp.v2 import fully_shard`) will work
-without any Megatron-LM dependency once the package is released.
 
 ## Toy Example
 
@@ -321,7 +330,7 @@ torchrun --nproc_per_node=2 \
 
 ## Gotchas / Pitfalls
 
-- **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
+- **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design/design.md) for details and the fix in `param_group.py`.
 - **Temporary communication bucket lifecycle.** Temporary all-gather /
   reduce-scatter buckets are allocated on the caller CUDA stream. Parameter
   all-gathers run on `ag_stream`; gradient collectives run on `rs_stream`,
@@ -333,7 +342,8 @@ torchrun --nproc_per_node=2 \
 ## Unit Tests
 
 ```bash
-# Run all v2 unit tests (requires 2 GPUs)
+# Run v2 unit tests. Most distributed tests require at least 2 GPUs; some
+# HSDP/EP cases require more and will skip when the topology is unavailable.
 TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
 torchrun --nproc_per_node=2 -m pytest \
     tests/unit_tests/distributed/megatron_fsdp/v2/ -v -x
