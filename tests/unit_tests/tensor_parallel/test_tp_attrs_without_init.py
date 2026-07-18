@@ -8,6 +8,7 @@ from megatron.core.tensor_parallel.layers import (
     RowParallelLinear,
     VocabParallelEmbedding,
     copy_tensor_model_parallel_attributes,
+    param_is_not_tensor_parallel_duplicate,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -100,3 +101,60 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
 
     assert destination.is_qkv is True
     assert destination.qkv_split_shapes == source.qkv_split_shapes
+
+
+def test_non_allreduce_param_uses_expert_tp_group_for_duplicate_filter():
+    class RankGroup:
+        def __init__(self, rank):
+            self._rank = rank
+
+        def rank(self):
+            return self._rank
+
+    param = torch.empty(1)
+    regular_tp_group = RankGroup(rank=1)
+    expert_tp_group = RankGroup(rank=0)
+    assert not param_is_not_tensor_parallel_duplicate(param, regular_tp_group)
+
+    param.allreduce = False
+    assert param_is_not_tensor_parallel_duplicate(
+        param, tp_group=regular_tp_group, expert_tp_group=expert_tp_group
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_expert_linear_parameters_use_expert_topology_metadata():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_tensor_parallel_size=1)
+    cfg = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+        use_cpu_initialization=True,
+        perform_initialization=False,
+    )
+
+    column = ColumnParallelLinear(
+        input_size=8,
+        output_size=8,
+        init_method=cfg.init_method,
+        bias=True,
+        config=cfg,
+        gather_output=False,
+        skip_bias_add=False,
+        is_expert=True,
+    )
+    row = RowParallelLinear(
+        input_size=8,
+        output_size=8,
+        init_method=cfg.init_method,
+        bias=True,
+        input_is_parallel=True,
+        config=cfg,
+        skip_bias_add=False,
+        is_expert=True,
+    )
+
+    for param in (*column.parameters(), *row.parameters()):
+        assert param.allreduce is False
