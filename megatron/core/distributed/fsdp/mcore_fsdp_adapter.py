@@ -758,25 +758,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
         _load_rng_state_dict(broadcast_list[0])
 
 
-def _reset_parameters(module):
-    """
-    Recursively reset parameters for the module and its submodules.
-    This is used to ensure that all ranks start with the same initial parameters
-    before sharding, which is important for correctness when using FSDP.
-    """
-    parent_fsdp_module_map = {}
-    for m in module.modules():
-        if isinstance(m, FSDPModule):
-            for child in m.module.modules():
-                parent_fsdp_module_map[child] = m
-
-    for m in module.modules():
-        if hasattr(m, "reset_parameters"):
-            parent_fsdp_module_map[m].unshard()
-            m.reset_parameters()
-            parent_fsdp_module_map[m].reshard()
-
-
 def _build_hsdp_dp_mesh(
     outer_group,
     inner_group,
