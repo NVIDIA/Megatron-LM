@@ -169,7 +169,11 @@ bound only from `(0, 0)`; reshard releases temporary storage.
 ## State transitions
 
 The flows below assume inner `optim_grads_params`. The optimizer-step
-boundary is identified by `set_is_last_backward(True)`.
+boundary is identified by `set_is_last_backward(True)`. The final backward
+callback marks the model-weight refresh pending at that boundary. An integrated
+optimizer may install updated model weights immediately; otherwise the next
+normal root pre-forward installs them before any outer or inner unshard.
+Activation-recompute forwards do not consume the pending refresh.
 
 The unshard tables distinguish the persistent model-storage allocation from
 the currently valid weight view. Under the assumed inner strategy,

@@ -31,11 +31,11 @@ owning FSDP module.
 
 | Function | Accepted module argument | Main responsibility |
 |---|---|---|
-| `mfsdp_forward_pre_hook(hook_module, args, kwargs)` | `FSDPModule` or owned submodule | Resolve the FSDP target, enter forward phase when appropriate, unshard parameters, release stale grad storage, and record CUDA-graph sample inputs for direct FSDP-module calls. |
+| `mfsdp_forward_pre_hook(hook_module, args, kwargs)` | `FSDPModule` or owned submodule | Resolve the FSDP target, install a pending optimizer-to-model weight refresh at the next normal root forward, enter forward phase when appropriate, unshard parameters, release stale grad storage, and record CUDA-graph sample inputs for direct FSDP-module calls. |
 | `mfsdp_post_forward_hook(module, *unused)` | `FSDPModule` only | Record CUDA-graph sample outputs when applicable, then reshard after forward unless the module is being used by activation recomputation. |
 | `mfsdp_pre_backward_setup(hook_module, grads=None, skip_final_callback=False)` | `FSDPModule` or owned submodule | Resolve the FSDP target, enter backward phase on the root, optionally enqueue the final callback, unshard for backward, and reset per-module backward bookkeeping. |
 | `mfsdp_post_backward_hook(module)` | `FSDPModule` only | For the module and its recursive FSDP submodules whose post-backward work has not issued, reshard, reduce gradients, and mark them done. |
-| `mfsdp_post_backward_final_callback(root_module)` | Root `FSDPModule` only | Finish skipped post-backward work, drain async reduce-grad events, reset root backward state, clear fine-grained pre-backward flags, finalize trace-pool planning, and trigger CUDA-graph capture when eligible. |
+| `mfsdp_post_backward_final_callback(root_module)` | Root `FSDPModule` only | Finish skipped post-backward work, drain async reduce-grad events, arm a lazy optimizer-to-model weight refresh at an optimizer-step boundary, reset root backward state, clear fine-grained pre-backward flags, finalize trace-pool planning, and trigger CUDA-graph capture when eligible. |
 
 All hook APIs assert that they are not called while `ctx.cuda_graph_active` is
 true. CUDA graph replay must not run Python hooks.
@@ -48,6 +48,10 @@ This is the shared pre-forward implementation for both default FSDP-module hooks
 and fine-grained submodule hooks.
 
 - No-ops if `_find_fsdp_target(hook_module)` returns `None`.
+- On the next normal root forward after an `is_last_backward=True` callback,
+  consumes `ctx.model_weight_refresh_pending` by calling
+  `_copy_main_weights_to_model_weights()` before parameter unshard or prefetch.
+  Activation-recompute forwards never consume this flag.
 - Sets root forward/backward phase state for a normal forward pass.
 - Unshards the target's parameters for forward; during activation recomputation,
   also ensures backward-pass buffers are available.
@@ -113,6 +117,10 @@ The callback is the final cleanup point for a microbatch backward pass:
 - It handles any FSDP module in `ctx.forward_order` whose post-backward hook did
   not issue.
 - It waits on and releases pending async reduce-grad buckets.
+- When `ctx.is_last_backward` is true, it sets
+  `ctx.model_weight_refresh_pending=True`. An integrated optimizer may consume
+  the flag immediately by calling `_copy_main_weights_to_model_weights()`;
+  otherwise the next normal root pre-forward consumes it lazily.
 - It resets root backward state so the next microbatch can start cleanly.
 - It clears `_fsdp_pre_backward_done` on all FSDP modules in `ctx.forward_order`.
 - It transitions `TracePoolAllocator` from trace phase to optimized phase on the
@@ -135,6 +143,18 @@ False at init -> False in mfsdp_pre_backward_setup -> True in mfsdp_post_backwar
 ```
 
 Both flags are initialized in `FSDPModule._init_fsdp_state()`.
+
+`model_weight_refresh_pending` tracks an optimizer-boundary weight refresh:
+
+```text
+False at init
+  -> True in the final callback when is_last_backward=True
+  -> False when explicit optimizer integration or the next normal root forward
+     calls _copy_main_weights_to_model_weights()
+```
+
+Intermediate gradient-accumulation backwards do not arm the flag, and
+activation recomputation does not consume it.
 
 ## Q&A
 
