@@ -10,11 +10,10 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import fields
 
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
+from examples.mimo.training.batch import map_batch_tensors, move_batch_to_cuda
 
 PREFETCHED_FEATURES_KEY = "_mimo_prefetched_encoder_features"
 PROJECTION_TIMER_KEY = "_mimo_encoder_prefetch_projection_timer"
@@ -63,10 +62,6 @@ def validate_encoder_prefetch_args(args) -> None:
         raise ValueError("encoder prefetch depth must be positive")
     if args.rerun_mode != "disabled":
         raise ValueError("encoder prefetch does not support rerun modes")
-    if args.cuda_graph_impl == "full_iteration":
-        raise ValueError("encoder prefetch does not support full-iteration CUDA graphs")
-    if args.virtual_pipeline_model_parallel_size is not None:
-        raise ValueError("encoder prefetch does not support virtual pipeline iterators")
 
 
 def prefetch_frozen_features(
@@ -76,35 +71,13 @@ def prefetch_frozen_features(
         return module.combine_embeddings(module.encode(encoder_inputs))
 
 
-def _map_batch_tensors(value, transform: Callable[[torch.Tensor], torch.Tensor]):
-    if isinstance(value, torch.Tensor):
-        return transform(value)
-    if isinstance(value, dict):
-        return {key: _map_batch_tensors(item, transform) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_map_batch_tensors(item, transform) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_map_batch_tensors(item, transform) for item in value)
-    if isinstance(value, PackedSeqParams):
-        for field in fields(value):
-            item = getattr(value, field.name)
-            if isinstance(item, torch.Tensor):
-                setattr(value, field.name, transform(item))
-    return value
-
-
-def move_batch_to_cuda(value):
-    """Move tensor leaves, including PackedSeqParams tensor fields, to CUDA."""
-    return _map_batch_tensors(value, lambda tensor: tensor.cuda(non_blocking=True))
-
-
 def _record_batch_stream(value, stream: torch.cuda.Stream) -> None:
     def record(tensor: torch.Tensor) -> torch.Tensor:
         if tensor.is_cuda:
             tensor.record_stream(stream)
         return tensor
 
-    _map_batch_tensors(value, record)
+    map_batch_tensors(value, record)
 
 
 def _log_producer_debug(

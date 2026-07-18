@@ -20,7 +20,6 @@ from examples.mimo.training.encoder_prefetch import (
     prefetch_frozen_features,
     validate_encoder_prefetch_args,
 )
-from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 
 ENCODER = "clip_encoder"
@@ -34,8 +33,6 @@ def _args(**overrides):
         "freeze_projection": False,
         "encoder_tp": 1,
         "rerun_mode": "disabled",
-        "cuda_graph_impl": "none",
-        "virtual_pipeline_model_parallel_size": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -52,7 +49,6 @@ def _args(**overrides):
         ("encoder_ep", 2, "EP=1"),
         ("mimo_encoder_prefetch_depth", 0, "positive"),
         ("rerun_mode", "validate_results", "rerun"),
-        ("cuda_graph_impl", "full_iteration", "CUDA graphs"),
     ],
 )
 def test_prefetch_validation(field, value, match):
@@ -87,41 +83,6 @@ def test_prefetch_skips_backbone_autograd_but_keeps_projection_gradients():
     assert all(parameter.grad is not None for parameter in submodule.input_projections.parameters())
     with pytest.raises(ValueError, match="mutually exclusive"):
         submodule(encoder_inputs=inputs, hidden_states=features)
-
-
-def test_mimo_encoder_path_calls_wrapped_submodule():
-    inner = VisionModalitySubmodules(
-        encoders={"radio": nn.Identity()}, input_projections=[nn.Identity()]
-    )
-
-    class _Wrapper(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-            self.calls = 0
-
-        def forward(self, **kwargs):
-            self.calls += 1
-            return self.module(**kwargs)
-
-    wrapper = _Wrapper(inner)
-    hook_calls = []
-    hook = wrapper.register_forward_pre_hook(lambda *_args: hook_calls.append(True))
-    model = MimoModel.__new__(MimoModel)
-    nn.Module.__init__(model)
-    model.role = SimpleNamespace(modality_module_names=(ENCODER,))
-    model.modality_submodules = nn.ModuleDict({ENCODER: wrapper})
-    model.special_token_ids = {ENCODER: 511}
-
-    features = torch.ones(3, 4)
-    try:
-        output = model._forward_encoders(torch.tensor([[511]]), None, {ENCODER: features})
-    finally:
-        hook.remove()
-
-    torch.testing.assert_close(output[ENCODER], features)
-    assert wrapper.calls == 1
-    assert hook_calls == [True]
 
 
 class _FakeEvent:

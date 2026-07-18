@@ -78,88 +78,79 @@ def main() -> None:
     set_global_variables(args, build_tokenizer=False)
     provider = resolve_provider(args)
 
-    topology = None
     prefetch_loader = None
-    try:
-        initialize_distributed()
-        # The grid/rank-layout args model a single encoder region; the builder itself is
-        # generic over any number of encoder grids in the topology.
-        encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
-        specs = build_module_grid_specs(args, args.world_size, encoder_name)
-        topology = create_topology(specs)
+    initialize_distributed()
+    # The grid/rank-layout args model a single encoder region; the builder itself is
+    # generic over any number of encoder grids in the topology.
+    encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
+    specs = build_module_grid_specs(args, args.world_size, encoder_name)
+    topology = create_topology(specs)
 
-        communicator = provider.build_communicator(args, topology)
+    communicator = provider.build_communicator(args, topology)
 
-        if args.mimo_encoder_prefetch and len(provider.encoder_module_names) != 1:
-            raise ValueError("encoder prefetch requires exactly one encoder")
+    if args.mimo_encoder_prefetch and len(provider.encoder_module_names) != 1:
+        raise ValueError("encoder prefetch requires exactly one encoder")
 
-        captured_model = {} if args.mimo_encoder_prefetch else None
-        hooks = []
-        if captured_model is not None:
+    captured_model = {} if args.mimo_encoder_prefetch else None
+    hooks = []
+    if captured_model is not None:
 
-            def capture_model(models):
-                if len(models) != 1:
-                    raise ValueError("encoder prefetch requires exactly one outer model")
-                captured_model["model"] = models[0]
-                return models
+        def capture_model(models):
+            if len(models) != 1:
+                raise ValueError("encoder prefetch requires exactly one outer model")
+            captured_model["model"] = models[0]
+            return models
 
-            hooks.append(capture_model)
-        model_cfg = MimoBuildConfig(_topology=topology, post_wrap_hooks=hooks)
-        cfg = pretrain_cfg_container_from_args(args, model_cfg)
+        hooks.append(capture_model)
+    model_cfg = MimoBuildConfig(_topology=topology, post_wrap_hooks=hooks)
+    cfg = pretrain_cfg_container_from_args(args, model_cfg)
 
-        def train_valid_test_data_provider(_train_val_test_num_samples):
-            nonlocal prefetch_loader
-            loaders = build_train_valid_test_data_loaders(args, topology)
-            iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
-            if not args.mimo_encoder_prefetch or loaders[0] is None:
-                return iterators
-
-            assert captured_model is not None
-            mimo_model = unwrap_model(captured_model["model"])
-            if not mimo_model.role.has_modality_modules:
-                return iterators
-            if prefetch_loader is not None:
-                raise RuntimeError("encoder prefetch loader was already built")
-
-            active_encoders = tuple(mimo_model.role.modality_module_names)
-            if active_encoders != (encoder_name,):
-                raise ValueError(
-                    f"encoder prefetch expected {(encoder_name,)}, got {active_encoders}"
-                )
-            installed = mimo_model.modality_submodules[encoder_name]
-            encoder_module = unwrap_model(installed)
-            prefetch_loader = EncoderPrefetchLoader(
-                source=iter(loaders[0]),
-                encoder_name=encoder_name,
-                feature_producer=partial(prefetch_frozen_features, encoder_module),
-                depth=args.mimo_encoder_prefetch_depth,
-                debug=args.mimo_encoder_prefetch_debug,
-            )
-            prefetch_loader.start()
-            iterators = (prefetch_loader, *iterators[1:])
+    def train_valid_test_data_provider(_train_val_test_num_samples):
+        nonlocal prefetch_loader
+        loaders = build_train_valid_test_data_loaders(args, topology)
+        iterators = tuple(iter(loader) if loader is not None else None for loader in loaders)
+        if not args.mimo_encoder_prefetch or loaders[0] is None:
             return iterators
 
-        train_valid_test_data_provider.is_distributed = True
-        pretrain(
-            cfg,
-            train_valid_test_data_provider,
-            ModelType.encoder_or_decoder,
-            mimo_forward_step,
-            model_provider=None,
-            skip_model_parallel_init=True,
-            p2p_communicator=communicator,
-            pg_collection=topology.schedule_pg_collection,
+        assert captured_model is not None
+        mimo_model = unwrap_model(captured_model["model"])
+        if not mimo_model.role.has_modality_modules:
+            return iterators
+        if prefetch_loader is not None:
+            raise RuntimeError("encoder prefetch loader was already built")
+
+        active_encoders = tuple(mimo_model.role.modality_module_names)
+        if active_encoders != (encoder_name,):
+            raise ValueError(f"encoder prefetch expected {(encoder_name,)}, got {active_encoders}")
+        installed = mimo_model.modality_submodules[encoder_name]
+        encoder_module = unwrap_model(installed)
+        prefetch_loader = EncoderPrefetchLoader(
+            source=iter(loaders[0]),
+            encoder_name=encoder_name,
+            feature_producer=partial(prefetch_frozen_features, encoder_module),
+            depth=args.mimo_encoder_prefetch_depth,
+            debug=args.mimo_encoder_prefetch_debug,
         )
-    finally:
-        try:
-            if prefetch_loader is not None:
-                prefetch_loader.close()
-        finally:
-            try:
-                if topology is not None:
-                    topology.destroy()
-            finally:
-                shutdown_distributed()
+        prefetch_loader.start()
+        iterators = (prefetch_loader, *iterators[1:])
+        return iterators
+
+    train_valid_test_data_provider.is_distributed = True
+    pretrain(
+        cfg,
+        train_valid_test_data_provider,
+        ModelType.encoder_or_decoder,
+        mimo_forward_step,
+        model_provider=None,
+        skip_model_parallel_init=True,
+        p2p_communicator=communicator,
+        pg_collection=topology.schedule_pg_collection,
+    )
+
+    if prefetch_loader is not None:
+        prefetch_loader.close()
+    topology.destroy()
+    shutdown_distributed()
 
 
 if __name__ == "__main__":

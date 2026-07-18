@@ -9,11 +9,8 @@ from functools import partial
 
 import torch
 
-from examples.mimo.training.encoder_prefetch import (
-    PREFETCHED_FEATURES_KEY,
-    PROJECTION_TIMER_KEY,
-    move_batch_to_cuda,
-)
+from examples.mimo.training.batch import move_batch_to_cuda
+from examples.mimo.training.encoder_prefetch import PREFETCHED_FEATURES_KEY, PROJECTION_TIMER_KEY
 
 
 def loss_func(output_tensor: torch.Tensor, *, loss_mask: torch.Tensor):
