@@ -4,6 +4,7 @@
 
 from torch.autograd import DeviceType
 from torch.autograd.profiler_util import FunctionEvent
+from torch.profiler import profile as TorchProfiler
 
 
 def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
@@ -13,20 +14,8 @@ def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
     )
 
 
-def _linked_correlation_id(event: FunctionEvent) -> int | None:
-    return getattr(event, "linked_correlation_id", None)
-
-
-def _is_device_kernel(event: FunctionEvent) -> bool:
-    return (
-        event.device_type == DeviceType.CUDA
-        and event.activity_type == "kernel"
-        and not event.name.startswith("nccl:")
-    )
-
-
-def collect_linked_device_events(
-    events: list[FunctionEvent], cpu_event_name_substring: str
+def collect_linked_kernels(
+    prof: TorchProfiler, cpu_event_name_substring: str
 ) -> list[FunctionEvent]:
     """Collect device kernel events linked to matching CPU op instances.
 
@@ -41,20 +30,26 @@ def collect_linked_device_events(
     # A correlation id is shared by a device event and the leaf runtime op that issued it,
     # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
     # is the "no device correlation" sentinel and is skipped.
+    events = prof.events()
     matching_correlations: set[int] = set()
     for event in events:
-        correlation_id = _linked_correlation_id(event)
-        if event.device_type != DeviceType.CPU or not correlation_id:
+        if event.device_type != DeviceType.CPU or not event.linked_correlation_id:
             continue
         node = event
         while node is not None:
             if cpu_event_name_substring in node.name:
-                matching_correlations.add(correlation_id)
+                matching_correlations.add(event.linked_correlation_id)
                 break
             node = node.cpu_parent
 
-    return [
-        event
-        for event in events
-        if _is_device_kernel(event) and _linked_correlation_id(event) in matching_correlations
-    ]
+    linked_kernels: list[FunctionEvent] = []
+    for event in events:
+        if event.device_type != DeviceType.CUDA:
+            continue
+        if event.activity_type != "kernel":
+            continue
+        if event.linked_correlation_id not in matching_correlations:
+            continue
+        linked_kernels.append(event)
+
+    return linked_kernels

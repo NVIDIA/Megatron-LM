@@ -23,7 +23,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
-    collect_linked_device_events,
+    collect_linked_kernels,
     events_overlap,
 )
 
@@ -564,63 +564,58 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         # drop the CUDA events.
         torch.cuda.synchronize(device)
 
-    events = prof.events()
-    # A GEMM launches under aten::mm as the matmul kernel plus a cudaMemsetAsync
-    # (device events collected by CPU op -- see collect_linked_device_events);
-    # keep the matmuls.
-    gemm_events = [
-        event
-        for event in collect_linked_device_events(events, _GEMM_OP_NAME_SUBSTRING)
-        if "memset" not in event.name.lower()
-    ]
-    # Each of the num_children child Linears runs one forward and two backward matmuls.
-    assert len(gemm_events) == 3 * num_children, (
-        f"Expected {3 * num_children} GEMMs, got {len(gemm_events)}: "
-        f"{[event.name for event in gemm_events]}"
+    gemm_kernels = collect_linked_kernels(prof, _GEMM_OP_NAME_SUBSTRING)
+    # Each child Linear runs one forward and two backward matmuls. aten::mm may also
+    # launch auxiliary kernels, so check only the matmul lower bound.
+    assert len(gemm_kernels) >= 3 * num_children, (
+        f"Expected at least {3 * num_children} kernels linked to GEMMs, got "
+        f"{len(gemm_kernels)}: "
+        f"{[event.name for event in gemm_kernels]}"
     )
 
-    all_gather_events = collect_linked_device_events(events, _ALL_GATHER_OP_NAME_SUBSTRING)
-    reduce_scatter_events = collect_linked_device_events(events, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
+    allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
+    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
     # The num_children child layers plus the root are each a sharded module; each does a
     # forward and a backward all-gather and one reduce-scatter. Zero-CTA moves the
     # all-gather to copy-engine memcpys, so it should not emit all-gather kernels.
     num_sharded_modules = num_children + 1
-    expected_all_gather_count = 0 if use_symm_mem else 2 * num_sharded_modules
-    assert len(all_gather_events) == expected_all_gather_count, (
-        f"Expected {expected_all_gather_count} all-gather kernels, got "
-        f"{len(all_gather_events)}: {[event.name for event in all_gather_events]}"
+    expected_allgather_kernel_count = 0 if use_symm_mem else 2 * num_sharded_modules
+    assert len(allgather_kernels) == expected_allgather_kernel_count, (
+        f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
+        f"{len(allgather_kernels)}: {[event.name for event in allgather_kernels]}"
     )
-    assert len(reduce_scatter_events) == num_sharded_modules, (
+    assert len(reduce_scatter_kernels) == num_sharded_modules, (
         f"Expected {num_sharded_modules} reduce-scatter kernels, got "
-        f"{len(reduce_scatter_events)}: {[event.name for event in reduce_scatter_events]}"
+        f"{len(reduce_scatter_kernels)}: {[event.name for event in reduce_scatter_kernels]}"
     )
 
-    all_gather_streams = {event.device_resource_id for event in all_gather_events}
-    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
-    gemm_streams = {event.device_resource_id for event in gemm_events}
-    if all_gather_events:
-        assert len(all_gather_streams) == 1
+    allgather_streams = {event.device_resource_id for event in allgather_kernels}
+    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_kernels}
+    gemm_streams = {event.device_resource_id for event in gemm_kernels}
+    if allgather_kernels:
+        assert len(allgather_streams) == 1
     assert len(reduce_scatter_streams) == 1
-    assert all_gather_streams.isdisjoint(reduce_scatter_streams)
-    assert all_gather_streams.isdisjoint(gemm_streams)
+    assert allgather_streams.isdisjoint(reduce_scatter_streams)
+    assert allgather_streams.isdisjoint(gemm_streams)
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
-    all_gather_overlap_count = sum(
-        any(events_overlap(event, gemm) for gemm in gemm_events) for event in all_gather_events
+    allgather_overlap_count = sum(
+        any(events_overlap(event, gemm) for gemm in gemm_kernels) for event in allgather_kernels
     )
     reduce_scatter_overlap_count = sum(
-        any(events_overlap(event, gemm) for gemm in gemm_events) for event in reduce_scatter_events
+        any(events_overlap(event, gemm) for gemm in gemm_kernels)
+        for event in reduce_scatter_kernels
     )
-    expected_all_gather_overlap = 2 * (num_children - 1)
+    expected_allgather_overlap = 2 * (num_children - 1)
     expected_reduce_scatter_overlap = num_children - 1
     if not use_symm_mem:
-        assert all_gather_overlap_count >= expected_all_gather_overlap, (
-            f"Expected at least {expected_all_gather_overlap} all-gathers to "
-            f"overlap compute, got {all_gather_overlap_count}/{len(all_gather_events)}."
+        assert allgather_overlap_count >= expected_allgather_overlap, (
+            f"Expected at least {expected_allgather_overlap} all-gathers to "
+            f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."
         )
     assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap, (
         f"Expected at least {expected_reduce_scatter_overlap} reduce-scatters to overlap "
-        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
+        f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_kernels)}."
     )
 
     # Release the dedicated communicator so it does not leak into the shared session.
