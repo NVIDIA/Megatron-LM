@@ -22,7 +22,7 @@ v2/
 ├── design/full_iteration_cuda_graph_design.md    # Full-iteration CUDA graph design
 ├── design/hsdp_design.md        # HSDP mesh, buffer layouts, and conversions
 ├── design.md                    # Overlap, memory, and synchronization design
-├── nvfp4_design.md              # NVFP4 primary-weights design
+├── mixed_precision_training_design.md  # Mixed precision training buffer design
 └── mcore_fsdp_checkpoint_design.md  # Checkpoint save/load and format conversion design
 ```
 
