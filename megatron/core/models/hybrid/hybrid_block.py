@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -114,6 +114,19 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
         super().__init__(config=config)
+        if (
+            config.cuda_graph_impl == "transformer_engine"
+            and config.recompute_granularity == "selective"
+            and "mhc" in (config.recompute_modules or [])
+        ):
+            raise ValueError(
+                "mHC selective recompute with Transformer Engine CUDA Graphs is not "
+                "supported for HybridStack mHC layers: the hybrid wrapper captures the "
+                "mHC producer inside the graph, so per-microbatch checkpoint "
+                "registration cannot run. The guarded attention-only split exists only "
+                "on the GPT HyperConnectionTransformerLayer path. Disable CUDA graphs "
+                "or remove 'mhc' from recompute_modules."
+            )
         self.inner_layer = layer
         self.layer_number = layer.layer_number
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)

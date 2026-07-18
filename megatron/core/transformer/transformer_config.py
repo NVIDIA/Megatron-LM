@@ -1165,18 +1165,29 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers per MHC recompute block.
-    
-    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
-    layer in the transformer block) will:
-    - NOT checkpoint its final MLP BDA
-    - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointManager is created for subsequent layers
-    
-    If None, all layers in the transformer block share a single recompute block.
+    """Number of layers in each mHC recompute group.
 
-    Must be a positive integer when set."""
+    Layers are grouped in their local transformer-block order. The last layer in each group leaves
+    its final MLP BDA output uncheckpointed and closes the current ``CheckpointManager``; a new
+    manager is created for the next group.
+
+    In the standard forward path, the group-ending layer registers a unified recompute hook on its
+    MLP BDA output. In the fine-grained expert-parallel overlap schedule, the group outputs are
+    discarded explicitly and a compute-stream schedule node replays the group before its backward
+    computation.
+
+    If ``None``, all local layers in the transformer block share one recompute group. The value must
+    be a positive integer when set.
+    """
+
+    mhc_post_on_compute_stream: bool = False
+    """Run MLP-side mHC post-processing as a separate node on the compute stream.
+
+    This option only applies to mHC layers using MoE expert-parallel communication overlap.
+    When False, mHC post-processing remains part of the MoE combine node on the communication
+    stream. When True, the combine node completes communication and MoE post-processing first,
+    then a separate mHC post node runs on the existing compute stream.
+    """
 
     ####################
     # miscellaneous
@@ -2122,7 +2133,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.fine_grained_activation_offloading and self.offload_modules:
                 # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
                 # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
-                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # recompute trigger runs before GroupCommitFunction.backward() initializes
                 # the backward chunk, so tensor_pop hits a None chunk for these modules.
                 # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
                 # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
@@ -2132,12 +2143,42 @@ class TransformerConfig(ModelParallelConfig):
                 if conflicting:
                     raise ValueError(
                         f"'mhc' in recompute_modules is incompatible with "
-                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"offload_modules {conflicting}. The mHC recompute replay starts "
                         f"before the offloading backward chunk is initialized for these "
                         f"modules, causing tensor_pop on a None chunk. Remove "
                         f"{conflicting} from offload_modules or remove 'mhc' from "
                         f"recompute_modules."
                     )
+
+        use_mhc_recompute = (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        )
+        # NOTE: the mHC-recompute/CUDA-graph capability gate lives further down in
+        # __post_init__, after cuda_graph_modules normalization and the deprecated
+        # enable_cuda_graph/external_cuda_graph migration, so that string module
+        # forms and legacy flags reach the same gate.
+
+        if (
+            self.overlap_moe_expert_parallel_comm
+            and use_mhc_recompute
+            and (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            )
+        ):
+            raise ValueError(
+                "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
+                "to be disabled because explicit group replay is eager-only."
+            )
+
+        if self.mhc_post_on_compute_stream:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "mhc_post_on_compute_stream requires enable_hyper_connections=True."
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "mhc_post_on_compute_stream requires overlap_moe_expert_parallel_comm=True."
+                )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
@@ -2812,6 +2853,46 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        # mHC selective recompute couples with CUDA graphs only through the guarded
+        # attention-only Transformer Engine split. This gate must stay below the
+        # cuda_graph_modules normalization and the deprecated flag migration above:
+        # earlier placement would compare unnormalized string module forms and let
+        # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
+        if (
+            self.recompute_granularity == "selective"
+            and "mhc" in self.recompute_modules
+            and self.cuda_graph_impl != "none"
+        ):
+            if self.cuda_graph_impl in ("local", "full_iteration"):
+                # Intentionally fail-closed even for inference-only local-graph
+                # configs that carry leftover training recompute args: mHC
+                # recompute is inert outside training, but silently accepting
+                # the combination would mask misconfigured training runs.
+                raise ValueError(
+                    f"mHC recompute is not supported with cuda_graph_impl="
+                    f"'{self.cuda_graph_impl}': eager mHC recompute and its per-microbatch "
+                    "checkpoint registration need host execution between captured "
+                    "segments, which only the Transformer Engine partial implementation "
+                    "provides. Use cuda_graph_impl='transformer_engine' with "
+                    "cuda_graph_modules=['attn'], or disable CUDA graphs."
+                )
+            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+                self.recompute_modules
+            ) != ["mhc"]:
+                raise ValueError(
+                    "mHC recompute with Transformer Engine CUDA Graphs currently supports "
+                    "only the initial attention-only split: cuda_graph_modules=[attn] and "
+                    "recompute_modules=[mhc]. The eager mHC producer must remain outside "
+                    "the captured consumer."
+                )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    "mHC recompute with attention-only TE CUDA Graphs has not been "
+                    "validated with interleaved pipeline (VPP) schedules: graph-slot "
+                    "lifetimes are only proven for non-interleaved 1F1B. Disable "
+                    "virtual pipeline or CUDA graphs."
+                )
 
         if self.cuda_graph_impl != "none":
 

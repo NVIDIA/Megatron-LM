@@ -2691,6 +2691,7 @@ class TECudaGraphHelper:
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
+                    static_hidden_inputs = []
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:
                             graph_idx = (
@@ -2703,6 +2704,13 @@ class TECudaGraphHelper:
                                 + layer_number
                             )
                         layer.cuda_graphs.append(graphs[graph_idx])
+                        # TE may rebind sample inputs while optimizing graph-buffer
+                        # reuse, so retain the final fixed-address surface only
+                        # after make_graphed_callables() has returned.  Use the
+                        # exact graph index above to keep graph and input slots in
+                        # lockstep, including intentional cross-slot aliasing.
+                        static_hidden_inputs.append(sample_args[graph_idx][0])
+                    layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
                 num_layers_accumulated += len(layers)
 
             self._graphs_created = True
@@ -2737,6 +2745,7 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
+                layer.clear_te_cuda_graph_static_hidden_inputs()
 
         log_on_each_pipeline_stage(
             logger=logger,
