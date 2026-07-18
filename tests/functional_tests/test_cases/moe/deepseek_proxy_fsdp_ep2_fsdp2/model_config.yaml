@@ -43,7 +43,7 @@ MODEL_ARGS:
   --sequence-parallel: true
   --disable-bias-linear: true
   --micro-batch-size: 32
-  --global-batch-size: 128
+  --global-batch-size: 256
   --train-iters: 50
   --exit-duration-in-mins: 60
   --no-check-for-nan-in-loss-and-grad: true
