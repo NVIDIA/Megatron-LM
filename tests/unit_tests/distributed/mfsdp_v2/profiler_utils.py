@@ -2,8 +2,6 @@
 
 """Helpers for parsing ``torch.profiler`` events in the mfsdp_v2 tests."""
 
-import re
-
 from torch.autograd import DeviceType
 from torch.autograd.profiler_util import FunctionEvent
 
@@ -16,7 +14,7 @@ def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
 
 
 def collect_linked_device_events(
-    events: list[FunctionEvent], cpu_event_name_pattern: re.Pattern
+    events: list[FunctionEvent], cpu_event_name_substring: str
 ) -> dict[FunctionEvent, list[FunctionEvent]]:
     """Map each matching CPU op instance to the device events linked to it.
 
@@ -38,7 +36,7 @@ def collect_linked_device_events(
             continue
         node = event
         while node is not None:
-            if cpu_event_name_pattern.search(node.name):
+            if cpu_event_name_substring in node.name:
                 op_by_correlation[event.linked_correlation_id] = node
                 break
             node = node.cpu_parent

@@ -3,7 +3,6 @@
 """Unit tests for the minimal Megatron-FSDP path."""
 
 import logging
-import re
 
 import pytest
 import torch
@@ -127,9 +126,9 @@ def _mb(num_bytes: int) -> str:
 
 # CPU ops that a device event chains up to via cpu_parent, used to attribute the device
 # work to its enclosing collective or matmul operation.
-_ALL_GATHER_OP_PATTERN = re.compile(r"allgather")
-_REDUCE_SCATTER_OP_PATTERN = re.compile(r"reduce_scatter")
-_GEMM_OP_PATTERN = re.compile(r"aten::mm")
+_ALL_GATHER_OP_NAME_SUBSTRING = "allgather"
+_REDUCE_SCATTER_OP_NAME_SUBSTRING = "reduce_scatter"
+_GEMM_OP_NAME_SUBSTRING = "aten::mm"
 
 
 def _nccl_events(cuda_events, *name_fragments):
@@ -576,7 +575,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     # (device events collected by CPU op -- see collect_linked_device_events);
     # keep the matmuls.
     gemm_events = []
-    for op_device_events in collect_linked_device_events(events, _GEMM_OP_PATTERN).values():
+    for op_device_events in collect_linked_device_events(events, _GEMM_OP_NAME_SUBSTRING).values():
         gemm_events += [event for event in op_device_events if "memset" not in event.name.lower()]
     # Each of the num_children child Linears runs one forward and two backward matmuls.
     assert len(gemm_events) == 3 * num_children, (
@@ -584,8 +583,8 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         f"{[event.name for event in gemm_events]}"
     )
 
-    all_gather_events = collect_linked_device_events(events, _ALL_GATHER_OP_PATTERN)
-    reduce_scatter_events = collect_linked_device_events(events, _REDUCE_SCATTER_OP_PATTERN)
+    all_gather_events = collect_linked_device_events(events, _ALL_GATHER_OP_NAME_SUBSTRING)
+    reduce_scatter_events = collect_linked_device_events(events, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
     # The num_children child layers plus the root are each a sharded module; each does a
     # forward and a backward all-gather and one reduce-scatter.
     num_sharded_modules = num_children + 1
