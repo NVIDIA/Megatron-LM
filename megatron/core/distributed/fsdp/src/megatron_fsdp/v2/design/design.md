@@ -139,6 +139,17 @@ matching the v1 behavior.
 
 ### Hook entry points
 
+For callable hook contracts and Q&A, see [`hooks_api.md`](hooks_api.md). This
+section owns the hook lifecycle summary.
+
+| Phase | Hook API | Lifecycle responsibility |
+|---|---|---|
+| Forward pre-hook | `mfsdp_forward_pre_hook` | Enter forward phase, unshard parameters, and release stale gradient storage. |
+| Forward post-hook | `mfsdp_post_forward_hook` | Record CUDA-graph outputs when applicable, then reshard after forward. |
+| Backward pre-hook | `mfsdp_pre_backward_setup` | Enter backward phase, unshard parameters for backward, and enqueue or defer the final callback. |
+| Backward post-hook | `mfsdp_post_backward_hook` | Reshard completed modules, reduce gradients, and advance backward-order tracking. |
+| Final callback | `mfsdp_post_backward_final_callback` | Finish skipped post-backward work, drain async reductions, reset microbatch state, and finalize allocator/CUDA-graph transitions. |
+
 ```python
 # _register_forward_pre_hook:
 module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
