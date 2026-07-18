@@ -666,9 +666,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         assert (
             isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
             or optimizer is None
+            or init_state_fn is not None
         ), (
-            "Only Adam and HybridDeviceOptimizer currently supported, "
-            "due to checkpointing requirements."
+            "Only Adam, HybridDeviceOptimizer, and optimizers with an init_state_fn "
+            "(e.g., Lion) are currently supported, due to checkpointing requirements."
         )
 
         # when freezing sub-models we have no real optimizer
@@ -777,6 +778,27 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         with the non-distributed optimizer).
         """
         return getattr(self, 'grad_stats_parallel_group', None)
+
+    @property
+    def optimizer_state_keys(self):
+        """Return the optimizer's tensor state keys, e.g., ('exp_avg', 'exp_avg_sq') for Adam
+        or ('exp_avg',) for Lion."""
+        _OPTIMIZER_STATE_KEYS = {"lion": ("exp_avg",)}
+        optimizer_name = self.config.optimizer
+        # When Muon is the top-level optimizer, the DistributedOptimizer wrapping
+        # scalar parameters uses muon_scalar_optimizer (e.g., Lion) as the actual
+        # optimizer, so look up state keys by that name instead.
+        if optimizer_name == "muon":
+            optimizer_name = self.config.muon_scalar_optimizer
+        return _OPTIMIZER_STATE_KEYS.get(optimizer_name, ("exp_avg", "exp_avg_sq"))
+
+    def _get_state_key_dtype(self, key):
+        """Return the dtype for a given optimizer state key."""
+        dtype_map = {
+            "exp_avg": self.config.exp_avg_dtype,
+            "exp_avg_sq": self.config.exp_avg_sq_dtype,
+        }
+        return dtype_map.get(key, torch.float32)
 
     def state_dict(self):
         """
@@ -957,8 +979,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # For precision_aware_optimizer, the empty tensors should also be
                             #  initialized with the correct dtype.
                             tensors = {
-                                "exp_avg": init_shard(self.config.exp_avg_dtype),
-                                "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
+                                key: init_shard(self._get_state_key_dtype(key))
+                                for key in self.optimizer_state_keys
                             }
                             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                                 if self.config.store_param_remainders and self.config.bf16:
@@ -1047,12 +1069,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Return a dict containing the main param and optimizer states corresponding to the input
         model_param.
 
-        The structure of the returned dict:
-        tensors = {
-            "param": torch.Tensor
-            "exp_avg": torch.Tensor
-            "exp_avg_sq": torch.Tensor
-        }
+        The returned dict always contains "param" and one entry per optimizer state tensor
+        (e.g., "exp_avg" and "exp_avg_sq" for Adam, or just "exp_avg" for Lion).
         """
         group_index, group_order = self.model_param_group_index_map[model_param]
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -1143,12 +1161,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
         """Set the main param and optimizer states corresponding to the input model_param.
 
-        The structure of the input `tensors`:
-        tensors = {
-            "param": torch.Tensor
-            "exp_avg": torch.Tensor
-            "exp_avg_sq": torch.Tensor
-        }
+        The input `tensors` dict contains "param" and one entry per optimizer state tensor
+        (e.g., "exp_avg" and "exp_avg_sq" for Adam, or just "exp_avg" for Lion).
         """
         group_index, group_order = self.model_param_group_index_map[model_param]
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -1271,7 +1285,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         key: torch.zeros(
                             (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
                         )
-                        for key in ("param", "exp_avg", "exp_avg_sq")
+                        for key in ("param",) + self.optimizer_state_keys
                     }
                     world_tensors["numel_unpadded"] = buffer_numel_unpadded
 
@@ -1293,7 +1307,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         local_shards = {
                             key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
-                            for key in ("param", "exp_avg", "exp_avg_sq")
+                            for key in ("param",) + self.optimizer_state_keys
                         }
 
                         # Build contiguous DP rank shards (for param + optim states).
@@ -1652,8 +1666,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         `fully_reshardable` format involves gathering the tensors on DP rank 0 during save.
         Flat DistOpt buffers are unflattened and reshaped into model param like sizes.
         This results in a state dict similar to a regular optimizer one, where each
-        param of shape (X, Y, Z) has corresponding 'param', 'exp_avg' and 'exp_avg_sq'
-        tensors of shape (X, Y, Z) in the optimizer state dict.
+        param of shape (X, Y, Z) has corresponding 'param' and optimizer state
+        tensors (e.g., 'exp_avg', 'exp_avg_sq') of shape (X, Y, Z) in the optimizer state dict.
 
         During loading there is no data exchange - each rank requests to load the whole
         state dict (and flattens and trims the tensors afterwards). It is recommended
@@ -2125,7 +2139,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         t.numel() for t in state_dict[gbuf_idx][torch.float32]["param"]
                     ]
                     assert sum(model_numels) == sum(checkpoint_numels)
-                for key in ("param", "exp_avg", "exp_avg_sq"):
+                for key in ("param",) + self.optimizer_state_keys:
                     legacy_world_tensors = self._update_legacy_world_tensors(
                         state_dict[gbuf_idx][torch.float32][key],
                         [
@@ -2246,7 +2260,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f"({buffer_numel_unpadded}) and checkpoint ({checkpoint_numel_unpadded})"
                     )
                 recv_tensors = {}
-                for key in ("param", "exp_avg", "exp_avg_sq"):
+                for key in ("param",) + self.optimizer_state_keys:
                     offset_in_world_tensors = 0
                     for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                         # Compute local DP contiguous shard's size.
@@ -2459,7 +2473,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
-            for key in ['param', 'exp_avg', 'exp_avg_sq']:
+            for key in ('param',) + self.optimizer_state_keys:
                 tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
