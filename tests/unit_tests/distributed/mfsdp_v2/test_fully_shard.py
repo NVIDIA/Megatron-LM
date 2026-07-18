@@ -126,10 +126,9 @@ def _mb(num_bytes: int) -> str:
 
 
 # CPU ops that a device event chains up to via cpu_parent, used to attribute the device
-# work. mfsdp's all-gather / reduce-scatter (dist.all_gather_into_tensor /
-# reduce_scatter_tensor) dispatch to c10d::_..._base_; the Linear matmuls to aten::mm.
-_ALL_GATHER_OP_PATTERN = re.compile(r"_allgather_base")
-_REDUCE_SCATTER_OP_PATTERN = re.compile(r"_reduce_scatter_base")
+# work to its enclosing collective or matmul operation.
+_ALL_GATHER_OP_PATTERN = re.compile(r"allgather")
+_REDUCE_SCATTER_OP_PATTERN = re.compile(r"reduce_scatter")
 _GEMM_OP_PATTERN = re.compile(r"aten::mm")
 
 
