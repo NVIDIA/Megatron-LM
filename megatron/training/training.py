@@ -1010,6 +1010,21 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def _should_save_final_checkpoint(
+    cfg_container: PretrainConfigContainer,
+    initial_iteration: int,
+    iteration: int,
+) -> bool:
+    """Return whether the current run needs a final checkpoint."""
+    return bool(
+        not cfg_container.validation.skip_train
+        and cfg_container.checkpoint.save
+        and iteration > initial_iteration
+        and iteration != 0
+        and iteration % cfg_container.checkpoint.save_interval != 0
+    )
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1410,6 +1425,8 @@ def pretrain(
         )
         print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
 
+    initial_iteration = args.iteration
+
     if not cfg_container.validation.skip_train or args.perform_rl_step:
         if cfg_container.validation.skip_train:
             print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
@@ -1437,7 +1454,7 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
+        if _should_save_final_checkpoint(cfg_container, initial_iteration, iteration):
             save_checkpoint_and_time(
                 iteration,
                 model,
