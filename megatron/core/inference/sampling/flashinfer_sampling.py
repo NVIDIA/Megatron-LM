@@ -108,21 +108,21 @@ class FlashInferSampling(Sampling):
             probs = torch.softmax(scaled, dim=-1)
             return flashinfer.sampling.sampling_from_probs(
                 probs, deterministic=True, generator=self._rng
-            )
+            ).long()
         elif no_top_k:
             # Top-p only -> dedicated exact nucleus kernel.
             probs = torch.softmax(scaled, dim=-1)
             top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
             return flashinfer.sampling.top_p_sampling_from_probs(
                 probs, top_p_safe, deterministic=True, generator=self._rng
-            )
+            ).long()
         elif no_top_p:
             # Top-k only -> dedicated exact top-k kernel.
             probs = torch.softmax(scaled, dim=-1)
             top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
             return flashinfer.sampling.top_k_sampling_from_probs(
                 probs, top_k_safe, deterministic=True, generator=self._rng
-            )
+            ).long()
         else:
             # Mixed batch (some top-k, some top-p, or requests using both) -> joint
             # kernel, fed the temperature-scaled logits.
@@ -130,7 +130,7 @@ class FlashInferSampling(Sampling):
             top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
             return flashinfer.sampling.top_k_top_p_sampling_from_logits(
                 scaled, top_k_safe, top_p_safe, deterministic=True, generator=self._rng
-            )
+            ).long()
 
     def log_probs_kernel(
         self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
