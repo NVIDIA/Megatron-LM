@@ -460,6 +460,43 @@ def _get_static_grad_buffers(inputs):
     return tuple(_get_compatible_main_grad_buffer(input_tensor) for input_tensor in inputs)
 
 
+def _returned_param_grad_clone_slots(
+    static_grad_inputs,
+    module_params,
+    static_grad_buffers,
+    clone_param_grads_on_return,
+):
+    """Select parameter gradients that Graphed.backward must clone.
+
+    ``static_grad_buffers`` records the buffers bound by
+    ``_static_grad_context_wrapper``. Reusing that capture-time decision is
+    important for allocators with traced lifetimes: calling ``get_main_grad``
+    again here would reallocate a buffer that the capture-time FSDP post-hook
+    has already released.
+    """
+    if not clone_param_grads_on_return:
+        return (False,) * len(static_grad_inputs)
+    if len(static_grad_inputs) != len(static_grad_buffers):
+        raise ValueError("Static gradient inputs and buffers must have matching lengths")
+
+    module_param_start = len(static_grad_inputs) - len(module_params)
+    clone_slots = []
+    for idx, (grad_input, main_grad) in enumerate(zip(static_grad_inputs, static_grad_buffers)):
+        if idx < module_param_start:
+            clone_slots.append(False)
+            continue
+        param = module_params[idx - module_param_start]
+        uses_main_grad = (
+            grad_input is not None
+            and main_grad is not None
+            and grad_input.data_ptr() == main_grad.data_ptr()
+        )
+        clone_slots.append(
+            not uses_main_grad and not getattr(param, "skip_backward_post_hook", False)
+        )
+    return tuple(clone_slots)
+
+
 def _refresh_module_parameter_surface(func, user_inputs, parameter_indices=None):
     """Refresh parameters after capture-time replacement hooks.
 
@@ -882,28 +919,6 @@ def _make_graphed_callables(
     bwd_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
     bwd_dw_graphs = [torch.cuda.CUDAGraph() for _ in range(len(flatten_sample_args))]
     graph_callables = [None for _ in range(len(flatten_sample_args))]
-
-    def _returned_param_grad_clone_slots(static_grad_inputs, module_params):
-        """Snapshot static grad slots that need clones before Graphed.backward returns."""
-        if not _clone_param_grads_on_return:
-            return (False,) * len(static_grad_inputs)
-        module_param_start = len(static_grad_inputs) - len(module_params)
-        clone_slots = []
-        for idx, grad_input in enumerate(static_grad_inputs):
-            if idx < module_param_start:
-                clone_slots.append(False)
-                continue
-            param = module_params[idx - module_param_start]
-            main_grad = _get_compatible_main_grad_buffer(param)
-            uses_main_grad = (
-                grad_input is not None
-                and main_grad is not None
-                and grad_input.data_ptr() == main_grad.data_ptr()
-            )
-            clone_slots.append(
-                not uses_main_grad and not getattr(param, "skip_backward_post_hook", False)
-            )
-        return tuple(clone_slots)
 
     # For cases with multiple active RNG states, e.g. TP.
     if graph_safe_rng_available():
@@ -1359,19 +1374,26 @@ def _make_graphed_callables(
                     # Pads out the actually-needed grads with Nones in gradient slots for inputs
                     # that don't require grad. I couldn't think of a one-liner for this pattern.
                     static_grad_inputs = []
+                    static_grad_buffers = []
                     grad_idx = 0
                     for arg in static_input_surface:
                         if is_training and isinstance(arg, torch.Tensor) and arg.requires_grad:
                             static_grad_inputs.append(grad_inputs[grad_idx])
+                            static_grad_buffers.append(input_grad_buffers[grad_idx])
                             grad_idx += 1
                         else:
                             static_grad_inputs.append(None)  # type: ignore[arg-type]
+                            static_grad_buffers.append(None)
                     static_grad_inputs = tuple(static_grad_inputs)  # type: ignore[assignment]
+                    static_grad_buffers = tuple(static_grad_buffers)
 
                     per_callable_static_grad_outputs[per_callable_bwd_idx] = static_grad_outputs
                     per_callable_static_grad_inputs[per_callable_bwd_idx] = static_grad_inputs
                     returned_param_grad_clone_slots = _returned_param_grad_clone_slots(
-                        static_grad_inputs, per_callable_module_params[per_callable_bwd_idx]
+                        static_grad_inputs,
+                        per_callable_module_params[per_callable_bwd_idx],
+                        static_grad_buffers,
+                        _clone_param_grads_on_return,
                     )
                     per_callable_returned_param_grad_clone_slots[per_callable_bwd_idx] = (
                         returned_param_grad_clone_slots
@@ -1513,21 +1535,28 @@ def _make_graphed_callables(
             # Pads out the actually-needed grads with Nones in gradient slots for inputs that
             # don't require grad. I couldn't think of a slick one-liner for this pattern.
             static_grad_inputs = []
+            static_grad_buffers = []
             grad_idx = 0
             for arg in static_input_surface:
                 if is_training and isinstance(arg, torch.Tensor) and arg.requires_grad:
                     static_grad_inputs.append(grad_inputs[grad_idx])
+                    static_grad_buffers.append(input_grad_buffers[grad_idx])
                     grad_idx += 1
                 else:
                     static_grad_inputs.append(None)  # type: ignore[arg-type]
+                    static_grad_buffers.append(None)
             static_grad_inputs = tuple(static_grad_inputs)  # type: ignore[assignment]
+            static_grad_buffers = tuple(static_grad_buffers)
             captured_grad_inputs[bwd_idx] = static_grad_inputs
 
             per_callable_static_grad_outputs.append(static_grad_outputs)
             per_callable_static_grad_inputs.append(static_grad_inputs)
             per_callable_returned_param_grad_clone_slots.append(
                 _returned_param_grad_clone_slots(
-                    static_grad_inputs, per_callable_module_params[bwd_idx]
+                    static_grad_inputs,
+                    per_callable_module_params[bwd_idx],
+                    static_grad_buffers,
+                    _clone_param_grads_on_return,
                 )
             )
 

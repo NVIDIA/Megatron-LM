@@ -484,9 +484,15 @@ class TracePoolAllocator(BucketAllocator):
         slot_idx = self._key_to_slot[key]
         slot = self._slots[slot_idx]
         if slot.in_use and key not in self._active_keys:
+            active_slot_keys = tuple(
+                active_key
+                for active_key in self._active_keys
+                if self._key_to_slot.get(active_key) == slot_idx
+            )
             raise RuntimeError(
                 f"TracePoolAllocator slot collision: slot {slot_idx} is already in use "
-                f"while allocating key {key!r}. The optimized allocation lifetimes "
+                f"by {active_slot_keys!r} while allocating key {key!r}. "
+                "The optimized allocation lifetimes "
                 "differ from the traced lifetimes."
             )
         assert size <= slot.size, (

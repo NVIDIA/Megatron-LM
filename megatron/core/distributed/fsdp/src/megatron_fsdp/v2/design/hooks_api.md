@@ -133,6 +133,15 @@ The callback is the final cleanup point for a microbatch backward pass:
   first microbatch.
 - It triggers CUDA graph capture and installation when the graph runner is ready.
 
+During graph construction, the capture-time backward post-hook reshards
+parameters and releases the temporary full `main_grad` allocation after its
+address has been recorded. Gradient reduction remains disabled for capture,
+but the allocator lifetime must match eager backward so non-overlapping module
+keys can safely share trace-pool slots.
+The graph runtime carries the pre-capture static-gradient binding into its
+returned-gradient clone decision. It does not refetch `main_grad` after this
+release, which would reactivate a trace-pool key outside its traced lifetime.
+
 ## State flags
 
 `_fsdp_pre_backward_done` deduplicates pre-backward work for fine-grained hooks:

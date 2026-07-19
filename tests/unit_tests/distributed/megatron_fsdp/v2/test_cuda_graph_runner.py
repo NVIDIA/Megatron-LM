@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.allocator import TracePoolAllocator
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.cuda_graph_runner import (
     CudaGraphRunner,
     _make_bwd_post_hook,
@@ -34,6 +35,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime.graph 
     _get_compatible_main_grad_buffer,
     _get_static_grad_buffers,
     _refresh_module_parameter_surface,
+    _returned_param_grad_clone_slots,
     _static_grad_context_wrapper,
     make_graphed_callables,
 )
@@ -50,8 +52,15 @@ def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
     dist_param.grad = torch.full_like(dist_param, 4)
 
     reshard_calls = []
+    release_calls = []
     module = SimpleNamespace(
-        _fsdp_param_groups=[SimpleNamespace(params=[full_param], dist_params=[dist_param])],
+        _fsdp_param_groups=[
+            SimpleNamespace(
+                params=[full_param],
+                dist_params=[dist_param],
+                release_grad_buffer=lambda: release_calls.append(True),
+            )
+        ],
         reshard=lambda: reshard_calls.append(True),
     )
 
@@ -61,6 +70,60 @@ def test_capture_backward_post_hook_clears_only_unsharded_parameter_grads():
     assert torch.equal(full_param.main_grad, torch.full_like(full_param, 3))
     assert torch.equal(dist_param.grad, torch.full_like(dist_param, 4))
     assert reshard_calls == [True]
+    assert release_calls == [True]
+
+
+def test_capture_backward_post_hook_releases_reusable_trace_pool_grad_slot():
+    """Sequential module captures must preserve traced main-grad lifetimes."""
+    allocator = TracePoolAllocator()
+    first_key = ("layer.0", "main_grad")
+    second_key = ("layer.1", "main_grad")
+
+    # Eager tracing observes the two same-sized full-gradient buffers as
+    # non-overlapping, so the optimized plan intentionally shares one slot.
+    for key in (first_key, second_key):
+        allocator.allocate(key=key, size=16, dtype=torch.float32, device=torch.device("cpu"))
+        allocator.free(key=key)
+    allocator.plan()
+    assert allocator._key_to_slot[first_key] == allocator._key_to_slot[second_key]
+
+    allocator.allocate(
+        key=first_key, size=16, dtype=torch.float32, device=torch.device("cpu")
+    )
+    module = SimpleNamespace(
+        _fsdp_param_groups=[
+            SimpleNamespace(
+                params=[],
+                release_grad_buffer=lambda: allocator.free(key=first_key),
+            )
+        ],
+        reshard=lambda: None,
+    )
+    _make_bwd_post_hook(module)(module, (), ())
+
+    # Without the capture-time grad release this raises the same slot
+    # collision seen when QwenImage captures its next transformer block.
+    allocator.allocate(
+        key=second_key, size=16, dtype=torch.float32, device=torch.device("cpu")
+    )
+
+
+def test_returned_param_grad_clone_slots_reuses_capture_binding_without_refetch():
+    """Clone-slot detection must not reacquire a released main-grad allocation."""
+    param = torch.nn.Parameter(torch.ones(4))
+    static_main_grad = torch.zeros_like(param)
+    getter_calls = []
+    param.get_main_grad = lambda: getter_calls.append(True) or static_main_grad
+
+    clone_slots = _returned_param_grad_clone_slots(
+        static_grad_inputs=(static_main_grad,),
+        module_params=(param,),
+        static_grad_buffers=(static_main_grad,),
+        clone_param_grads_on_return=True,
+    )
+
+    assert clone_slots == (False,)
+    assert getter_calls == []
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
