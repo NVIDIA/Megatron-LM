@@ -330,9 +330,30 @@ def test_zero_grad_set_to_none_false_reuses_dist_grads(strategy):
     torch.distributed.barrier()
 
 
-@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
-def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy):
-    groups, _, _, _, _, _ = _build_groups(strategy)
+@pytest.mark.parametrize(
+    ("strategy", "outer_strategy"),
+    [
+        ("no_shard", "no_shard"),
+        ("optim", "no_shard"),
+        ("optim_grads", "no_shard"),
+        ("optim_grads_params", "no_shard"),
+        ("optim_grads_params", "optim"),
+    ],
+)
+@pytest.mark.parametrize("main_grad_dtype", [None, torch.float32])
+def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(
+    strategy, outer_strategy, main_grad_dtype
+):
+    device = torch.device(
+        f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}"
+    )
+    mesh = _build_hsdp_mesh(device) if outer_strategy == "optim" else None
+    groups, _, _, _, _, _ = _build_groups(
+        strategy,
+        mesh=mesh,
+        mp_policy=MixedPrecisionPolicy(main_grads_dtype=main_grad_dtype),
+        outer_dp_sharding_strategy=outer_strategy,
+    )
 
     for pg in groups:
         pg._init_dist_grads()
@@ -341,6 +362,7 @@ def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy):
             continue
 
         original_dist_grads = list(pg.dist_grads)
+        live_dist_grads = pg.dist_grads
         original_local_shapes = [
             None if dist_grad is None else dist_grad._local_tensor.shape
             for dist_grad in original_dist_grads
@@ -350,14 +372,17 @@ def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy):
         pg.zero_grad(set_to_none=True)
 
         assert gbuf.data is None
-        for before, after in zip(original_dist_grads, pg.dist_grads):
-            assert after is before
-            if after is not None:
-                assert after._local_tensor is None
+        assert pg.dist_grads is live_dist_grads
+        assert all(dist_grad is None for dist_grad in pg.dist_grads)
+        for before, cached in zip(original_dist_grads, pg._dist_grad_cache):
+            assert cached is before
+            if cached is not None:
+                assert cached._local_tensor is None
 
         pg._init_dist_grads()
 
         assert gbuf.data is not None
+        assert pg.dist_grads is live_dist_grads
         for before, after, local_shape in zip(
             original_dist_grads, pg.dist_grads, original_local_shapes
         ):
@@ -366,6 +391,13 @@ def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy):
                 assert after._local_tensor is not None
                 assert after._local_tensor.shape == local_shape
                 assert hasattr(after._local_tensor, "__create_chunk_list__")
+        assert all(
+            validated
+            for cached, validated in zip(
+                pg._dist_grad_cache, pg._dist_grad_cache_validated
+            )
+            if cached is not None
+        )
 
     torch.distributed.barrier()
 

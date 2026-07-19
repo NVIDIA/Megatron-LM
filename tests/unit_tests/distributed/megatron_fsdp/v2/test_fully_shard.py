@@ -1113,6 +1113,41 @@ class TestLifecycle:
         assert observed_at_root_unshard
         assert all(observed_at_root_unshard[0])
 
+    def test_fused_adam_reuses_dist_grad_wrappers_across_steps(self):
+        """Rebound DTensor grads retain optimizer-compatible shape and identity."""
+        torch.manual_seed(42)
+        model = fully_shard(SimpleMLP(16).to(_device()))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+        x = torch.randn(2, 16, device=_device())
+        wrapper_ids = None
+
+        for iteration in range(3):
+            loss = model(x).float().square().mean()
+            loss.backward()
+            model.finish_grad_sync()
+
+            param_group = model._fsdp_param_groups[0]
+            live_grads = [grad for grad in param_group.dist_grads if grad is not None]
+            assert live_grads
+            if wrapper_ids is None:
+                wrapper_ids = [id(grad) for grad in live_grads]
+            else:
+                assert [id(grad) for grad in live_grads] == wrapper_ids
+            for dist_param, dist_grad in zip(param_group.dist_params, param_group.dist_grads):
+                if dist_grad is not None:
+                    assert dist_grad._local_tensor.shape == dist_param._local_tensor.shape
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            assert torch.isfinite(loss)
+
+            if iteration < 2:
+                # Plain optimizer zero-grad leaves release to the next root
+                # forward. The following iteration exercises detach + rebind.
+                assert param_group.main_grad_buffer.data is not None
+
+        assert all(torch.isfinite(param._local_tensor).all() for param in model.parameters())
+
     def test_params_unsharded_during_forward(self):
         """During forward, model parameters should be in unsharded state (full tensors)."""
         torch.manual_seed(42)

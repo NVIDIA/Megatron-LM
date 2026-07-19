@@ -35,10 +35,21 @@ corresponding `dist_grads` entries are placeholders.
    or the buffer is already allocated;
 2. allocate `main_grad_buffer.data` with `torch.empty(...)`;
 3. slice the buffer according to the active sharding layout;
-4. build DTensor gradient views in `dist_grads`.
+4. build DTensor gradient views in `dist_grads` on first use, or rebind cached
+   wrappers to the new local slices after a prior storage release.
 
 The DTensor views are what the optimizer later sees through
 `dist_param.grad` or `dist_param.decoupled_grad`.
+
+Reusing wrappers avoids rebuilding the complete Python DTensor object graph on
+every iteration. `ParameterGroup._dist_grad_cache` owns those wrappers while
+storage is absent. During that detached interval, public `dist_grads` entries
+remain `None`; a DTensor whose local tensor has been detached is never exposed
+to optimizer or checkpoint code. The uneven-DTensor module centralizes the
+private `_local_tensor` detach/rebind operation, including local-shape recovery
+and checkpoint chunk-metadata restoration. This is the only lifecycle code
+in the lazy-gradient detach/rebind path that should depend on PyTorch's private
+DTensor field.
 
 ## Normal lifecycle
 
@@ -48,7 +59,7 @@ The DTensor views are what the optimizer later sees through
 | First post-backward `reduce_grad()` | `_init_dist_grads()` allocates `main_grad_buffer.data` and rebuilds `dist_grads` DTensor views. |
 | Gradient reduction | `param.grad` is staged into `main_grad_buffer`; all-reduce or reduce-scatter writes the optimizer-facing result. |
 | Optimizer step | Optimizer consumes `dist_param.grad` or `dist_param.decoupled_grad`, which are backed by `main_grad_buffer.data`. |
-| `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, reset accumulation flags, and release `main_grad_buffer.data` if nothing still references valid gradients. |
+| `zero_grad(set_to_none=True)` | Clear optimizer-facing gradient references, privately cache and detach reusable DTensor wrappers, reset accumulation flags, and release `main_grad_buffer.data` if nothing still references valid gradients. |
 | `zero_grad(set_to_none=False)` | Keep `main_grad_buffer.data` allocated and zero it in place. |
 
 `_release_grad_storage_if_unused()` is also called from the forward pre-hook.
@@ -92,6 +103,19 @@ of these are true:
 
 If any of those conditions fail, storage is kept because it may still be needed
 by gradient accumulation or the optimizer.
+
+On release, each live `dist_grads` wrapper moves to the private cache before
+its local tensor reference is removed. `dist_grads` is then reset to `None`
+placeholders. On the next `_init_dist_grads()`, the backing buffer is allocated,
+the cached wrappers are rebound to correctly shaped local slices, uneven chunk
+metadata is restored from the corresponding distributed parameter, and only
+then are the wrappers published through `dist_grads` again.
+
+The wrapper layout is immutable for the lifetime of a parameter group. Rebind
+validates shape, dtype, device, mesh, placements, and checkpoint metadata the
+first time a cached wrapper is reused. Later iterations update the fixed-size
+cache and live-gradient lists in place and skip repeated structural validation;
+the backing buffer may change, but its established layout contract does not.
 
 ## Accumulation flags
 

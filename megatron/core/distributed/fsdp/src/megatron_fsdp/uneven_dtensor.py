@@ -569,6 +569,71 @@ def split_dtensor(
         yield new_dtensor
 
 
+def _reshape_uneven_local_tensor(local_tensor: torch.Tensor, shape: torch.Size) -> torch.Tensor:
+    """Apply the local layout used by uneven DTensors sharded on dim 0."""
+    if local_tensor.numel() == 0:
+        local_shape = (0,) + tuple(shape[1:]) if len(shape) > 1 else (0,)
+        return local_tensor.reshape(local_shape)
+    return local_tensor.view(-1, *shape[1:])
+
+
+def detach_uneven_dtensor_local_tensor(dtensor: DTensor) -> None:
+    """Drop a cached uneven-DTensor wrapper's local tensor reference.
+
+    The wrapper must not be exposed as a live parameter or gradient while
+    detached. This helper exists solely for internal object-cache lifecycles
+    where retaining the local tensor would keep a released flat buffer alive.
+
+    PyTorch does not currently expose a public API for rebinding a DTensor's
+    local tensor while retaining the wrapper identity. Keep the private-field
+    mutation isolated here so callers do not duplicate that dependency.
+    """
+    if dtensor._local_tensor is None:
+        return
+    dtensor._local_tensor = None
+
+
+def rebind_uneven_dtensor_local_tensor(
+    dtensor: DTensor,
+    local_tensor: torch.Tensor,
+    shape: torch.Size,
+    *,
+    copy_chunk_meta_from: DTensor,
+    validate: bool = True,
+) -> DTensor:
+    """Rebind a cached uneven-DTensor wrapper to newly allocated local storage.
+
+    This is the inverse of :func:`detach_uneven_dtensor_local_tensor`. The
+    wrapper must remain private between those calls and may be published only
+    after this helper restores both its local view and checkpoint metadata.
+    """
+    if validate:
+        if dtensor.shape != shape:
+            raise ValueError(f"DTensor shape changed while cached: {dtensor.shape} vs {shape}")
+        source_local_tensor = copy_chunk_meta_from._local_tensor
+        if not hasattr(source_local_tensor, "__create_chunk_list__") or not hasattr(
+            source_local_tensor, "__create_write_items__"
+        ):
+            raise ValueError("Metadata source is missing uneven-DTensor chunk metadata")
+        if local_tensor.dtype != dtensor.dtype:
+            raise ValueError(
+                "Local tensor dtype does not match cached DTensor: "
+                f"{local_tensor.dtype} vs {dtensor.dtype}"
+            )
+        if local_tensor.device != dtensor.device:
+            raise ValueError(
+                "Local tensor device does not match cached DTensor: "
+                f"{local_tensor.device} vs {dtensor.device}"
+            )
+        if dtensor.device_mesh != copy_chunk_meta_from.device_mesh:
+            raise ValueError("Cached DTensor and metadata source use different device meshes")
+        if dtensor.placements != copy_chunk_meta_from.placements:
+            raise ValueError("Cached DTensor and metadata source use different placements")
+    dtensor._local_tensor = _reshape_uneven_local_tensor(local_tensor, shape)
+    copy_chunk_metadata(copy_chunk_meta_from, dtensor)
+    return dtensor
+
+
 def make_uneven_dtensor(
     local_tensor: torch.Tensor,
     shape: torch.Size,
@@ -597,11 +662,7 @@ def make_uneven_dtensor(
         raise ValueError(
             f"Expected {dp_mesh.ndim} placements for DeviceMesh, got {len(placements)}."
         )
-    if local_tensor.numel() == 0:
-        local_shape = (0,) + tuple(shape[1:]) if len(shape) > 1 else (0,)
-        local_tensor = local_tensor.reshape(local_shape)
-    else:
-        local_tensor = local_tensor.view(-1, *shape[1:])
+    local_tensor = _reshape_uneven_local_tensor(local_tensor, shape)
     dtensor = DTensor.from_local(
         local_tensor=local_tensor,
         device_mesh=dp_mesh,
