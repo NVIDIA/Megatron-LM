@@ -1173,6 +1173,39 @@ class TransformerConfig(ModelParallelConfig):
     """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
     None causes the states to follow the activation dtype."""
 
+    multi_decay_num_channels: int = 8
+    """Number of cumulative decay channels in a Multi-Decay FoX ('#') hybrid layer."""
+
+    multi_decay_decay_generation: Literal['full', 'scaled_basis'] = 'scaled_basis'
+    """How Multi-Decay FoX generates per-channel decay values."""
+
+    multi_decay_decay_type: Literal['logsigmoid', 'mamba2'] = 'logsigmoid'
+    """Negative log-decay parameterization: log-sigmoid FoX gates or Mamba-2-style A/dt."""
+
+    multi_decay_aggregate_mode: Literal['query_mix', 'mean', 'concat'] = 'query_mix'
+    """How Multi-Decay FoX combines its decay-channel outputs."""
+
+    multi_decay_training_kernel: Literal['reference', 'fused', 'bridge', 'fa4', 'auto'] = 'auto'
+    """Backend selected by the external Multi-Decay FoX implementation during training."""
+
+    multi_decay_qkv_bias: bool = False
+    """Add bias to the Multi-Decay FoX Q, K, and V projections."""
+
+    multi_decay_qk_norm: bool = False
+    """Apply per-head RMS normalization to Multi-Decay FoX queries and keys."""
+
+    multi_decay_window_size: int | None = None
+    """Optional local window size for Multi-Decay FoX; None uses the full causal sequence."""
+
+    multi_decay_decay_bias: bool = True
+    """Add bias to the Multi-Decay FoX decay projection."""
+
+    multi_decay_use_output_gate: bool = False
+    """Apply the optional sigmoid output gate in Multi-Decay FoX layers."""
+
+    multi_decay_use_nope: bool = False
+    """Reserve the first Multi-Decay channel as an exact no-position-encoding channel."""
+
     use_mamba_mem_eff_path: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
     )

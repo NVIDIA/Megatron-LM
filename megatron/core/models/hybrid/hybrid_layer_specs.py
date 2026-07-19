@@ -38,6 +38,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.multi_decay_attention import (
+    MultiDecayAttention,
+    MultiDecaySelfAttention,
+    MultiDecaySelfAttentionSubmodules,
+)
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
@@ -134,6 +139,26 @@ hybrid_stack_spec = ModuleSpec(
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
+        multi_decay_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=MultiDecaySelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MultiDecaySelfAttentionSubmodules(
+                        linear_qkv=TELayerNormColumnParallelLinear,
+                        core_attention=MultiDecayAttention,
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=TENorm,
+                        k_layernorm=TENorm,
+                        f_proj=TEColumnParallelLinear,
+                        mix_proj=TEColumnParallelLinear,
+                        g_proj=TEColumnParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
         dsa_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -224,6 +249,26 @@ hybrid_inference_stack_spec = ModuleSpec(
                         linear_qkv=InferenceLayerNormColumnParallelLinear,
                         core_attention=TEDotProductAttention,
                         linear_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        multi_decay_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                self_attention=ModuleSpec(
+                    module=MultiDecaySelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MultiDecaySelfAttentionSubmodules(
+                        linear_qkv=TELayerNormColumnParallelLinear,
+                        core_attention=MultiDecayAttention,
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=TENorm,
+                        k_layernorm=TENorm,
+                        f_proj=TEColumnParallelLinear,
+                        mix_proj=TEColumnParallelLinear,
+                        g_proj=TEColumnParallelLinear,
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,

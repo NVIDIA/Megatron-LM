@@ -33,6 +33,25 @@ a single node. Select between 800M-scale and 8B-scale models by setting the
 `MODEL_SCALE` variable. The 8B-scale hybrid model architecture is the same as
 the one described in the technical report.
 
+[`train_2B_A500M_moe_mda_r4.sh`](./train_2B_A500M_moe_mda_r4.sh) is the
+`2B_A500M_moe` recipe with Multi-Decay FoX R4. It preserves the scaling-ladder
+baseline's 12 Mamba and 12 MoE layers, replaces its three regular attention
+layers with `#`, and uses four decay channels with `scaled_basis`, `query_mix`,
+and the automatic training kernel. One of the four channels is an exact
+no-decay NoPE channel, preserving the baseline attention's full-history view.
+For example:
+
+```bash
+./train_2B_A500M_moe_mda_r4.sh \
+    <per-split-data-args-path> <tokenizer-path>
+```
+
+By default, large outputs go under
+`~/storage/megatron-lm-mda/2B_A500M_moe_mda_r4`; set `RUN_ROOT` to
+override that location or `MDA_ROOT` to select a different `multi-decay-att`
+checkout. The launcher defaults to the local four-GPU node layout with EP=4;
+set `LOCAL_WORLD_SIZE` and `EXPERT_MODEL_PARALLEL_SIZE` for another allocation.
+
 ## Text Generation
 
 Use [`run_text_gen_server_8b.sh`](./run_text_gen_server_8b.sh) to start a text
@@ -73,6 +92,7 @@ the model using a string of single-character symbols:
 
 * `M` — Mamba layer
 * `*` — Attention layer
+* `#` — Multi-Decay FoX attention layer
 * `-` — MLP layer
 * `E` — MoE layer
 
@@ -90,6 +110,44 @@ layers.
 
 A pure Mamba model uses only `M` symbols (e.g., `MMMMMMMM` for 8 layers).
 A pure transformer model uses only `*` and `-` symbols.
+
+### Multi-Decay FoX hybrid layers
+
+The `#` symbol builds Multi-Decay FoX from the companion `multi-decay-att`
+checkout while preserving `*` for regular softmax attention. Put that checkout
+before the packaged FLA installation on `PYTHONPATH`:
+
+```bash
+export PYTHONPATH="$HOME/multi-decay-att:$PYTHONPATH"
+```
+
+Then replace the desired attention symbols in the pattern and quote the pattern
+so the shell treats `#` literally:
+
+```bash
+--position-embedding-type none \
+--hybrid-layer-pattern 'M-M-M--M-M#-M-M-M-M--M#-' \
+--no-create-attention-mask-in-dataloader \
+--multi-decay-num-channels 8 \
+--multi-decay-decay-generation scaled_basis \
+--multi-decay-decay-type logsigmoid \
+--multi-decay-aggregate-mode query_mix \
+--multi-decay-training-kernel auto
+```
+
+Other controls are `--multi-decay-qkv-bias`, `--multi-decay-qk-norm`,
+`--multi-decay-window-size`, `--no-multi-decay-decay-bias`,
+`--multi-decay-use-output-gate`, and `--multi-decay-use-nope`. The integration
+uses Megatron tensor-parallel projections and distributed checkpoint metadata
+while delegating the attention algorithm and backend routing to the companion
+`fla.ops.mda` implementation. All channel counts and aggregation modes use the
+same SelfAttention-integrated path. In particular, R1 + NoPE omits auxiliary
+decay and mixing parameters; with the optional output gate disabled, it retains
+the regular attention parameter shell.
+
+The current integration supports full-sequence training and evaluation.
+It does not yet support context parallelism, packed sequences, padding/custom
+attention masks, or KV-cache decoding.
 
 ### Pipeline parallelism
 

@@ -3333,12 +3333,40 @@ def _add_experimental_args(parser):
                        '`transformer_block.py`, or `transformer_layer.py`')
     group.add_argument('--hybrid-layer-pattern', type=str, default=None,
                        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
-                       '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+                       '* (attention), # (multi-decay FoX), D (dsa), - (mlp), E (moe). '
+                       'Use | to define pipeline '
                        'stage boundaries for flexible virtual pipeline parallel (fVPP). '
                        'Use / to separate MTP patterns. '
                        'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
                        'When this flag is used, it is the sole indicator that a hybrid model '
                        'is being run.')
+    group.add_argument('--multi-decay-num-channels', type=int, default=8,
+                       help='Number of cumulative decay channels in Multi-Decay attention.')
+    group.add_argument('--multi-decay-decay-generation', type=str, default='scaled_basis',
+                       choices=['full', 'scaled_basis'],
+                       help='How Multi-Decay attention generates per-channel decay values.')
+    group.add_argument('--multi-decay-decay-type', type=str, default='logsigmoid',
+                       choices=['logsigmoid', 'mamba2'],
+                       help='Parameterization used for Multi-Decay log-decay values.')
+    group.add_argument('--multi-decay-aggregate-mode', type=str, default='query_mix',
+                       choices=['query_mix', 'mean', 'concat'],
+                       help='How Multi-Decay attention combines decay-channel outputs.')
+    group.add_argument('--multi-decay-training-kernel', type=str, default='auto',
+                       choices=['reference', 'fused', 'bridge', 'fa4', 'auto'],
+                       help='Training backend used by the companion Multi-Decay implementation.')
+    group.add_argument('--multi-decay-qkv-bias', action='store_true',
+                       help='Add bias to Multi-Decay Q, K, and V projections.')
+    group.add_argument('--multi-decay-qk-norm', action='store_true',
+                       help='Apply per-head RMS normalization to Multi-Decay queries and keys.')
+    group.add_argument('--multi-decay-window-size', type=int, default=None,
+                       help='Optional causal local window size for Multi-Decay attention.')
+    group.add_argument('--no-multi-decay-decay-bias', action='store_false',
+                       dest='multi_decay_decay_bias',
+                       help='Disable bias in the Multi-Decay decay projection.')
+    group.add_argument('--multi-decay-use-output-gate', action='store_true',
+                       help='Apply a learned sigmoid gate to Multi-Decay outputs.')
+    group.add_argument('--multi-decay-use-nope', action='store_true',
+                       help='Reserve the first Multi-Decay channel as an exact NoPE channel.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Deprecated. Use --hybrid-layer-pattern instead. '
                        'If specified, its value will be forwarded to --hybrid-layer-pattern.')

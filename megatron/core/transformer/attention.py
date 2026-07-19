@@ -410,7 +410,7 @@ class Attention(MegatronModule, ABC):
 
         # Output.
         self.linear_proj = submodules.linear_proj(
-            self.query_projection_size,
+            self._get_linear_proj_input_size(),
             self.config.hidden_size,
             config=self.config,
             init_method=not_none(self.config.output_layer_init_method),
@@ -440,6 +440,14 @@ class Attention(MegatronModule, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    def _get_linear_proj_input_size(self) -> int:
+        """Return the global input width of the attention output projection."""
+        return self.query_projection_size
+
+    def get_core_attention_extra_kwargs(self) -> dict[str, Tensor]:
+        """Return tensor inputs required by a custom core-attention implementation."""
+        return {}
 
     def _checkpointed_attention_forward(
         self,
@@ -1380,6 +1388,7 @@ class Attention(MegatronModule, ABC):
                 not self.config.attention_output_gate
             ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
             mixed_qkv, qkv_split_arg_list = qkv_output
+        core_attention_extra_kwargs = self.get_core_attention_extra_kwargs()
         nvtx_range_pop(suffix="qkv")
 
         # ===================================================
@@ -1524,12 +1533,13 @@ class Attention(MegatronModule, ABC):
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                core_attention_extra_kwargs=core_attention_extra_kwargs,
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with core_attn_manager as query:
-                    core_attn_out = apply_module(self.core_attention)(
+                    core_attn_out = self._run_core_attention(
                         query,
                         key,
                         value,
@@ -1537,10 +1547,15 @@ class Attention(MegatronModule, ABC):
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
+                        **core_attention_extra_kwargs,
                     )
 
             else:
                 # Dynamic batching attention kernel.
+                if core_attention_extra_kwargs:
+                    raise NotImplementedError(
+                        "Custom core-attention inputs are not supported with dynamic batching"
+                    )
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
@@ -1658,7 +1673,7 @@ class SelfAttention(Attention):
             config=self.config,
             init_method=not_none(self.config.init_method),
             gather_output=False,
-            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+            bias=self._get_qkv_bias(),
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='qkv',
@@ -1702,6 +1717,7 @@ class SelfAttention(Attention):
             if q_norm_cls is not None
             else None
         )
+
         self.k_layernorm = (
             k_norm_cls(
                 hidden_size=self.hidden_size_per_attention_head,
@@ -1711,6 +1727,10 @@ class SelfAttention(Attention):
             if k_norm_cls is not None
             else None
         )
+
+    def _get_qkv_bias(self) -> bool:
+        """Return whether the fused QKV projection has a bias."""
+        return self.config.add_bias_linear or self.config.add_qkv_bias
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -1802,6 +1822,16 @@ class SelfAttention(Attention):
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
         mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        return self._split_mixed_qkv(mixed_qkv, output_gate=output_gate, split_qkv=split_qkv)
+
+    def _split_mixed_qkv(
+        self, mixed_qkv: Tensor, output_gate: bool = False, split_qkv: bool = True
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor]
+        | tuple[Tensor, list[int]]
+    ):
+        """Split a fused QKV projection into per-head query, key, and value tensors."""
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
