@@ -1,0 +1,363 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Unit tests for the fsdp_dtensor -> torch_dist reverse converter helpers.
+
+These exercise the pure key/tensor transforms of
+``tools/checkpoint/checkpoint_inspector.py`` (the inverse of
+``convert_checkpoint``) without a distributed environment: prefix stripping,
+optimizer-key reversal, SwiGLU merge, expert re-stacking, layer stacking, MTP
+rename, homogeneity detection, and common-state unflattening.
+"""
+
+import os
+import sys
+
+import pytest
+import torch
+
+_INSPECTOR_DIR = os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", "tools", "checkpoint"
+)
+sys.path.insert(0, _INSPECTOR_DIR)
+
+from checkpoint_inspector import (  # noqa: E402  (import after sys.path tweak)
+    _layers_are_homogeneous,
+    _merge_swiglu,
+    _model_param_dtype,
+    _rebuild_param_groups_from_meta,
+    _restack_experts,
+    _reverse_mtp_keys,
+    _reverse_optimizer_state_key,
+    _stack_layers,
+    _strip_fsdp_model_prefix,
+    _unflatten,
+)
+
+
+class TestStripModelPrefix:
+    def test_default_prefix(self):
+        assert (
+            _strip_fsdp_model_prefix("model.module.decoder.layers.0.mlp.linear_fc1.weight")
+            == "decoder.layers.0.mlp.linear_fc1.weight"
+        )
+
+    def test_deeper_wrapper_run(self):
+        assert (
+            _strip_fsdp_model_prefix("model.module.module.embedding.word_embeddings.weight")
+            == "embedding.word_embeddings.weight"
+        )
+
+    def test_bare_model_prefix(self):
+        assert _strip_fsdp_model_prefix("model.output_layer.weight") == "output_layer.weight"
+
+    def test_non_model_key_returns_none(self):
+        assert _strip_fsdp_model_prefix("optimizer.state.module.module.module.x.exp_avg") is None
+        assert _strip_fsdp_model_prefix("checkpoint_version") is None
+
+
+class TestReverseOptimizerKey:
+    def test_exp_avg(self):
+        fsdp = "optimizer.state.module.module.module.decoder.layers.0.mlp.linear_fc2.weight.exp_avg"
+        assert (
+            _reverse_optimizer_state_key(fsdp)
+            == "optimizer.state.exp_avg.decoder.layers.0.mlp.linear_fc2.weight"
+        )
+
+    def test_exp_avg_sq(self):
+        fsdp = "optimizer.state.module.module.module.embedding.word_embeddings.weight.exp_avg_sq"
+        assert (
+            _reverse_optimizer_state_key(fsdp)
+            == "optimizer.state.exp_avg_sq.embedding.word_embeddings.weight"
+        )
+
+    def test_step(self):
+        fsdp = "optimizer.state.module.module.module.output_layer.weight.step"
+        assert _reverse_optimizer_state_key(fsdp) == "optimizer.state.step.output_layer.weight"
+
+    def test_wrapper_depth_agnostic(self):
+        # Any run of ``module.`` wrappers is stripped.
+        fsdp = "optimizer.state.module.decoder.final_norm.weight.exp_avg"
+        assert (
+            _reverse_optimizer_state_key(fsdp)
+            == "optimizer.state.exp_avg.decoder.final_norm.weight"
+        )
+
+
+class TestReverseMTP:
+    def test_top_level_mtp(self):
+        out, n = _reverse_mtp_keys(
+            {"mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight": torch.zeros(1)}
+        )
+        assert n == 1
+        assert "mtp.layers.0.transformer_layer.mlp.linear_fc1.weight" in out
+
+    def test_nested_mtp(self):
+        out, n = _reverse_mtp_keys(
+            {"language_model.mtp.layers.1.mtp_model_layer.self_attention.w": torch.zeros(1)}
+        )
+        assert n == 1
+        assert "language_model.mtp.layers.1.transformer_layer.self_attention.w" in out
+
+    def test_non_mtp_untouched(self):
+        out, n = _reverse_mtp_keys({"decoder.layers.0.mlp.linear_fc1.weight": torch.zeros(1)})
+        assert n == 0
+        assert "decoder.layers.0.mlp.linear_fc1.weight" in out
+
+
+class TestMergeSwiglu:
+    def test_dense_weight_merge(self):
+        w = torch.arange(6.0).reshape(3, 2)
+        v = torch.arange(6.0, 12.0).reshape(3, 2)
+        out, n = _merge_swiglu(
+            {
+                "decoder.layers.0.mlp.linear_fc1.weight_w": w,
+                "decoder.layers.0.mlp.linear_fc1.weight_v": v,
+            }
+        )
+        assert n == 1
+        merged = out["decoder.layers.0.mlp.linear_fc1.weight"]
+        assert torch.equal(merged, torch.cat([w, v], dim=0))
+        assert "decoder.layers.0.mlp.linear_fc1.weight_w" not in out
+
+    def test_optimizer_swiglu_merge(self):
+        w = torch.ones(2, 2)
+        v = torch.zeros(2, 2)
+        key_w = "optimizer.state.exp_avg.decoder.layers.0.mlp.linear_fc1.weight_w"
+        key_v = "optimizer.state.exp_avg.decoder.layers.0.mlp.linear_fc1.weight_v"
+        out, n = _merge_swiglu({key_w: w, key_v: v})
+        assert n == 1
+        assert "optimizer.state.exp_avg.decoder.layers.0.mlp.linear_fc1.weight" in out
+
+    def test_indexed_expert_weight(self):
+        out, n = _merge_swiglu(
+            {
+                "decoder.layers.0.mlp.experts.linear_fc1.weight3_w": torch.ones(1, 2),
+                "decoder.layers.0.mlp.experts.linear_fc1.weight3_v": torch.ones(1, 2),
+            }
+        )
+        assert n == 1
+        assert "decoder.layers.0.mlp.experts.linear_fc1.weight3" in out
+
+    def test_module_scope_filter(self):
+        keys = {
+            "language_model.decoder.layers.0.mlp.linear_fc1.weight_w": torch.ones(1, 1),
+            "language_model.decoder.layers.0.mlp.linear_fc1.weight_v": torch.ones(1, 1),
+            "vision_model.decoder.layers.0.mlp.linear_fc1.weight_w": torch.ones(1, 1),
+            "vision_model.decoder.layers.0.mlp.linear_fc1.weight_v": torch.ones(1, 1),
+        }
+        out, n = _merge_swiglu(keys, swiglu_modules=["language_model"])
+        assert n == 1
+        assert "language_model.decoder.layers.0.mlp.linear_fc1.weight" in out
+        assert "vision_model.decoder.layers.0.mlp.linear_fc1.weight_w" in out
+
+    def test_fc2_not_merged(self):
+        out, n = _merge_swiglu({"decoder.layers.0.mlp.linear_fc2.weight": torch.ones(2, 2)})
+        assert n == 0
+
+
+class TestRestackExperts:
+    def test_stack_grouped_experts(self):
+        t = {
+            "decoder.layers.0.mlp.experts.linear_fc1.weight0": torch.zeros(4, 2),
+            "decoder.layers.0.mlp.experts.linear_fc1.weight1": torch.ones(4, 2),
+        }
+        out, n = _restack_experts(t)
+        assert n == 1
+        key = "decoder.layers.0.mlp.experts.experts.linear_fc1.weight"
+        assert out[key].shape == (2, 4, 2)
+        assert torch.equal(out[key][1], torch.ones(4, 2))
+
+    def test_optimizer_experts(self):
+        t = {
+            "optimizer.state.exp_avg.decoder.layers.0.mlp.experts.linear_fc2.weight0": torch.zeros(
+                2
+            ),
+            "optimizer.state.exp_avg.decoder.layers.0.mlp.experts.linear_fc2.weight1": torch.ones(
+                2
+            ),
+        }
+        out, n = _restack_experts(t)
+        assert n == 1
+        assert (
+            "optimizer.state.exp_avg.decoder.layers.0.mlp.experts.experts.linear_fc2.weight" in out
+        )
+
+    def test_non_contiguous_raises(self):
+        t = {
+            "decoder.layers.0.mlp.experts.linear_fc1.weight0": torch.zeros(1),
+            "decoder.layers.0.mlp.experts.linear_fc1.weight2": torch.zeros(1),
+        }
+        with pytest.raises(AssertionError):
+            _restack_experts(t)
+
+    def test_shared_experts_untouched(self):
+        t = {"decoder.layers.0.mlp.shared_experts.linear_fc1.weight": torch.zeros(2)}
+        out, n = _restack_experts(t)
+        assert n == 0
+        assert "decoder.layers.0.mlp.shared_experts.linear_fc1.weight" in out
+
+
+class TestStackLayers:
+    def test_dense_stack(self):
+        t = {
+            "decoder.layers.0.mlp.linear_fc2.weight": torch.zeros(2, 3),
+            "decoder.layers.1.mlp.linear_fc2.weight": torch.ones(2, 3),
+            "embedding.word_embeddings.weight": torch.zeros(5, 3),
+        }
+        out, n = _stack_layers(t)
+        assert n == 1
+        assert out["decoder.layers.mlp.linear_fc2.weight"].shape == (2, 2, 3)
+        # non-layer keys pass through unchanged
+        assert out["embedding.word_embeddings.weight"].shape == (5, 3)
+
+    def test_optimizer_and_model_stack_together(self):
+        t = {
+            "decoder.layers.0.w": torch.zeros(2),
+            "decoder.layers.1.w": torch.zeros(2),
+            "optimizer.state.exp_avg.decoder.layers.0.w": torch.zeros(2),
+            "optimizer.state.exp_avg.decoder.layers.1.w": torch.zeros(2),
+        }
+        out, n = _stack_layers(t)
+        assert n == 2
+        assert out["decoder.layers.w"].shape == (2, 2)
+        assert out["optimizer.state.exp_avg.decoder.layers.w"].shape == (2, 2)
+
+    def test_heterogeneous_layers_raise(self):
+        # 'a' present in both layers, 'b' only in layer 0 -> heterogeneous.
+        t = {
+            "decoder.layers.0.a": torch.zeros(1),
+            "decoder.layers.1.a": torch.zeros(1),
+            "decoder.layers.0.b": torch.zeros(1),
+        }
+        with pytest.raises(ValueError, match="Heterogeneous"):
+            _stack_layers(t)
+
+
+class TestLayersAreHomogeneous:
+    def _uniform(self, per_layer_suffixes, n_layers, extra=()):
+        keys = list(extra)
+        for i in range(n_layers):
+            for s in per_layer_suffixes:
+                keys.append(f"decoder.layers.{i}.{s}")
+        return keys
+
+    def test_plain_dense_multi_layer_is_homogeneous(self):
+        keys = self._uniform(
+            ["self_attention.linear_qkv.weight", "mlp.linear_fc1.weight"],
+            4,
+            extra=["embedding.word_embeddings.weight"],
+        )
+        assert _layers_are_homogeneous(keys)
+
+    def test_uniform_all_moe_is_homogeneous(self):
+        # Every layer is MoE (moe_layer_freq == 1) -> mcore stacks the block.
+        keys = self._uniform(
+            [
+                "self_attention.linear_qkv.weight",
+                "mlp.router.weight",
+                "mlp.experts.experts.linear_fc1.weight",
+                "mlp.experts.experts.linear_fc2.weight",
+            ],
+            8,
+        )
+        assert _layers_are_homogeneous(keys)
+
+    def test_interleaved_moe_and_dense_is_non_homogeneous(self):
+        keys = [
+            "decoder.layers.0.mlp.linear_fc1.weight",  # dense layer
+            "decoder.layers.1.mlp.experts.experts.linear_fc1.weight",  # MoE layer
+        ]
+        assert not _layers_are_homogeneous(keys)
+
+    def test_interleaved_linear_attention_is_non_homogeneous(self):
+        keys = [
+            "decoder.layers.0.self_attention.linear_qkv.weight",
+            "decoder.layers.2.self_attention.in_proj.weight",  # GDN layer differs
+            "decoder.layers.2.self_attention.conv1d.weight",
+        ]
+        assert not _layers_are_homogeneous(keys)
+
+    def test_mtp_layers_do_not_block_decoder_stacking(self):
+        keys = self._uniform(
+            ["mlp.experts.experts.linear_fc1.weight"],
+            4,
+            extra=["mtp.layers.0.transformer_layer.mlp.linear_fc1.weight"],
+        )
+        assert _layers_are_homogeneous(keys)
+
+    def test_no_per_layer_keys_returns_false(self):
+        assert not _layers_are_homogeneous(["embedding.word_embeddings.weight"])
+
+
+class TestUnflatten:
+    def test_scalars_and_namespace_leaf(self):
+        from types import SimpleNamespace
+
+        ns = SimpleNamespace(x=1)
+        flat = {
+            "args": ns,
+            "checkpoint_version": 3.0,
+            "iteration": 100,
+            "optimizer.param_groups.0.lr": 0.001,
+            "optimizer.param_groups.0.weight_decay": 0.1,
+        }
+        out = _unflatten(flat)
+        assert out["args"] is ns
+        assert out["checkpoint_version"] == 3.0
+        assert out["optimizer"]["param_groups"][0]["lr"] == 0.001
+        assert out["optimizer"]["param_groups"][0]["weight_decay"] == 0.1
+
+    def test_int_keyed_dict_becomes_list(self):
+        out = _unflatten({"g.0": "a", "g.1": "b", "g.2": "c"})
+        assert out["g"] == ["a", "b", "c"]
+
+
+class TestRebuildParamGroupsFromMeta:
+    _PREFIX = "optimizer.param_to_group_meta."
+
+    def _meta(self, fqn, wd_mult, weight_decay, lr=1e-4, expert=False):
+        # one flat entry per attribute, mirroring the fsdp on-disk layout
+        attrs = {
+            "wd_mult": wd_mult,
+            "lr_mult": 1.0,
+            "is_expert_parallel": expert,
+            "is_decoupled_lr": False,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "betas": (0.9, 0.999),
+            "eps": 1e-8,
+            "step": 25,
+        }
+        return {f"{self._PREFIX}module.module.module.{fqn}.{a}": v for a, v in attrs.items()}
+
+    def test_groups_by_identifier_tuple(self):
+        flat = {}
+        # two decay params, one no-decay param, one expert param -> 3 distinct groups
+        flat.update(self._meta("decoder.layers.0.self_attention.linear_qkv.weight", 1.0, 0.1))
+        flat.update(self._meta("decoder.layers.1.self_attention.linear_qkv.weight", 1.0, 0.1))
+        flat.update(self._meta("decoder.layers.0.self_attention.linear_qkv.bias", 0.0, 0.0))
+        flat.update(self._meta("decoder.layers.0.mlp.experts.linear_fc1.weight0", 1.0, 0.1, expert=True))
+
+        groups = _rebuild_param_groups_from_meta(flat, self._PREFIX)
+        idents = {
+            (g["wd_mult"], g["lr_mult"], g["is_expert_parallel"], g["is_decoupled_lr"])
+            for g in groups
+        }
+        assert len(groups) == 3
+        assert idents == {(1.0, 1.0, False, False), (0.0, 1.0, False, False), (1.0, 1.0, True, False)}
+        # full hyperparameters are carried; params are contiguous integer indices
+        decay = next(g for g in groups if g["wd_mult"] == 1.0 and not g["is_expert_parallel"])
+        assert decay["weight_decay"] == 0.1 and decay["betas"] == (0.9, 0.999)
+        assert decay["step"] == 25 and "params" in decay
+        allparams = sorted(i for g in groups for i in g["params"])
+        assert allparams == list(range(4))  # one index per parameter, no gaps/dupes
+
+
+class TestModelParamDtype:
+    def test_bf16_fp16_fp32_and_none(self):
+        from types import SimpleNamespace
+
+        assert _model_param_dtype(SimpleNamespace(bf16=True, fp16=False)) == torch.bfloat16
+        assert _model_param_dtype(SimpleNamespace(bf16=False, fp16=True)) == torch.float16
+        assert _model_param_dtype(SimpleNamespace(bf16=False, fp16=False)) == torch.float32
+        assert _model_param_dtype(None) is None
