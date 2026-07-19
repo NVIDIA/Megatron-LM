@@ -286,6 +286,26 @@ torchrun --nproc_per_node=8 --nnodes=1 \
 
 > ℹ️ For multi-node conversion tasks, please refer to the DeepSeek-V3 example script (`sbatch_checkpoint_convert.sh`) in [Megatron-LM/examples/megatron_fsdp](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/megatron_fsdp).
 
+#### Converting Megatron-FSDP (`fsdp_dtensor`) to N-D Parallel (`torch_dist`) Checkpoints
+
+The reverse direction converts a Megatron-FSDP `fsdp_dtensor` checkpoint back into a native `torch_dist` checkpoint, so a classic N-D-parallel (DDP, TP, PP, and/or EP) job can resume from a model trained with Megatron-FSDP:
+
+```bash
+python tools/checkpoint/checkpoint_inspector.py \
+    convert-fsdp-dtensor-to-torch-dist \
+    /path/to/input_fsdp_dtensor_checkpoint/ \
+    /path/to/output_torch_dist_checkpoint/
+```
+
+This tool is the inverse of `convert-torch-dist-to-fsdp-dtensor`: it merges the SwiGLU `_w`/`_v` fc1 pairs, re-stacks per-expert (and, for dense/homogeneous models, per-layer) tensors into mcore's native stacked layout, renames Multi-Token-Prediction keys back to `transformer_layer`, strips the Megatron-FSDP wrapper prefixes, and writes bare `torch_dist` keys plus `common.pt` / `metadata.json`. It runs as a single CPU-only process (no `torchrun`, no GPU required) — PyTorch DCP stores each tensor's full global shape, so the source parallelism is transparent, and mcore re-shards the output into any TP/PP/EP/VPP on load.
+
+> ⚠️ **Resume flags.** Because the converted checkpoint drops information that a native `torch_dist` checkpoint normally carries, the resuming N-D-parallel job must set:
+> - `--dist-ckpt-optim-fully-reshardable` — required *only if resuming with optimizer state*. It selects the one distributed-optimizer format whose on-disk layout is per-parameter and model-shaped, exactly what the `fsdp_dtensor` checkpoint holds and what this tool emits. (Convert model weights only with `--no-optimizer` if you do not need optimizer resume.)
+> - `--dist-ckpt-strictness log_all` — the converted checkpoint omits TransformerEngine `_extra_state` blobs (bf16-safe); a non-`assume_ok_unexpected` strictness removes those "unexpected" keys from the load template instead of erroring.
+> - `--no-load-rng` — RNG state is not round-tripped, so skip loading it.
+
+> ℹ️ SwiGLU is auto-detected from the `_w`/`_v` keys (no `--swiglu` needed); pass `--swiglu-modules language_model` to restrict merging to specific modules (e.g. VLMs where only the language model uses SwiGLU). Layer stacking is auto-detected — dense/homogeneous models are stacked, while MoE / Gated-DeltaNet / MTP models stay per-layer — and can be overridden with `--stack-layers` / `--non-homogeneous-layers`. FP8 `_extra_state` is not round-tripped (it is already discarded in the `fsdp_dtensor` checkpoint), so this path targets bf16/fp32 checkpoints.
+
 ## Megatron-FSDP Feature Guide & API
 
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
