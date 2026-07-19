@@ -5,6 +5,8 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pylint: disable=unused-import
+
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
@@ -13,9 +15,7 @@ from typing import Callable, Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 
-from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -38,12 +38,12 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.gated_delta_rule import chunk_gated_delta_rule  # pylint: disable=unused-import
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
@@ -74,8 +74,9 @@ class _GDNBase(MegatronModule):
     convolution on q/k/v, the CP all-to-all plumbing, the kernel-input preparation
     skeleton, the gated output norm + projection, and sharded checkpointing.
 
-    Concrete variants implement `_setup_variant` (in_proj sizing, split tables, gate
-    parameter dims, and kernel selection) and `_reset_dt_bias`.
+    Concrete variants implement `_setup_variant_attrs` (in_proj sizing, split tables,
+    gate parameter dims, and kernel selection) and `forward` (so each variant can apply
+    its own gating math and optimizations, composing the shared helpers on this class).
 
     The layer takes input with size [s, b, h] and returns output of the same size.
     """
@@ -258,9 +259,6 @@ class _GDNBase(MegatronModule):
 
         self.reset_parameters()
 
-    ####################
-    # Variant hooks
-    ####################
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
 
@@ -297,250 +295,54 @@ class _GDNBase(MegatronModule):
 
     def forward(
         self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ):
-        """
-        Perform a forward pass through the GDN module.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # pylint: disable=missing-function-docstring
+        raise NotImplementedError
 
-        Args:
-            hidden_states (Tensor): Hidden states.
-            attention_mask (Tensor): Attention mask.
-            inference_context (Optional[BaseInferenceContext]): Inference context that manages
-                KV cache.
-            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
-            sequence_len_offset (Optional[int]): Sequence length offset used for
-                inference CUDA graphs.
+    def _gated_norm_and_a2a(
+        self,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
+        thd_cp_a2a_inv: torch.Tensor | None,
+        batch: int,
+        seq_len: int,
+        packed_seq_params: PackedSeqParams | None = None,
+    ) -> torch.Tensor:
+        # RMSNorm
+        nvtx_range_push(suffix="gated_norm")
+        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
 
-        Return:
-            (tuple[Tensor, Tensor]) GDN output and bias.
+        # Transpose: b s x --> s b x
+        # From bshd back to sbhd format
+        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
-        """
-        # TODO: Deal with attention_mask
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
-
-        if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "GDN does not currently support dynamic inference batching."
-            assert not self.config.sequence_parallel
-            # TODO: support inference
-            raise NotImplementedError("GDN does not support inference for now.")
-
+        # CP all to all: HP to CP
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            assert batch == 1, "Packed sequence expects batch dimension to be 1"
-            assert (
-                not self.config.deterministic_mode
-            ), "Packed sequence does not support deterministic mode."
-
-            # Resolve cu_seqlens with alignment padding handling.
-            cu_seqlens_q = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_q_padded,
-                packed_seq_params.cu_seqlens_q,
-                seq_len,
-                "cu_seqlens_q",
-                cp_size=self.cp_size,
-            )
-            cu_seqlens_kv = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_kv_padded,
-                packed_seq_params.cu_seqlens_kv,
-                seq_len,
-                "cu_seqlens_kv",
-                cp_size=self.cp_size,
-            )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
-            num_packed_seqs = cu_seqlens_q.shape[0] - 1
-            assert num_packed_seqs > 0, (
-                "Number of packed sequences must be greater than 0, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
-        else:
-            cu_seqlens_q = None
-            cu_seqlens_kv = None
-
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
-
-        # CP All to All: CP to HP
-        if self.cp_size > 1:
-            # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
-            head_perm = _build_head_perm_for_split_sections(
-                self.in_proj_split_sections,
-                self.pg_collection.cp.size(),
-                torch.cuda.current_device(),
-            )
-            qkvzba = qkvzba.index_select(-1, head_perm)
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
+            if self.cp_size > 1:
+                norm_out_hp = norm_out_hp.index_select(0, thd_cp_a2a_inv)
+            norm_out = tensor_a2a_hp2cp(
+                norm_out_hp,
                 seq_dim=0,
                 head_dim=-1,
                 cp_group=self.pg_collection.cp,
-                undo_attention_load_balancing=False,
+                redo_attention_load_balancing=False,
             )
-            if self.cp_size > 1:
-                # Permute at the seq dim so that a single unsectioned a2a
-                # is equivalent to per-sequence a2a.
-                # This also folds the ``_undo_attention_load_balancing`` step.
-                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
-                    cu_seqlens_q, self.cp_size, seq_len
-                )
-                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
         else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+            norm_out = tensor_a2a_hp2cp(
+                norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
             )
 
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
-
-        # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
-        # (beta, alpha for GDN; f, b, w for GDN2)
-        qkv, gate, *gate_feats = torch.split(qkvzba, self.feat_dim_split, dim=-1)
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-
-        # Convolution on qkv
-        nvtx_range_push(suffix="conv1d")
-        seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
-            )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
-            )
-        nvtx_range_pop(suffix="conv1d")
-
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
-
-        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
-        nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        query, key, value, gate, gate_feats = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, gate_feats, batch, seq_len
-        )
-        nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
-
-        nvtx_range_push(suffix="g_and_beta")
-        beta, alpha = gate_feats
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
-        nvtx_range_pop(suffix="g_and_beta")
-
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
-
-        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
-            # RMSNorm
-            nvtx_range_push(suffix="gated_norm")
-            norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
-            nvtx_range_pop(suffix="gated_norm")
-
-            # Transpose: b s x --> s b x
-            # From bshd back to sbhd format
-            norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
-            norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
-
-            # CP all to all: HP to CP
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                if self.cp_size > 1:
-                    norm_out_hp = norm_out_hp.index_select(0, thd_cp_a2a_inv)
-                norm_out = tensor_a2a_hp2cp(
-                    norm_out_hp,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=self.pg_collection.cp,
-                    redo_attention_load_balancing=False,
-                )
-            else:
-                norm_out = tensor_a2a_hp2cp(
-                    norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                )
-
-            return norm_out
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_out = self.norm_out_checkpoint.checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
-        else:
-            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
-
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
+        return norm_out
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
