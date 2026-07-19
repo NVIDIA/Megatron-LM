@@ -15,8 +15,11 @@
 | `dp_buffer.py` | `DataParallelBuffer.unshard()` (all-gather + `p.data` rebind), `reduce_grad()` (reduce-scatter + shard accumulation) |
 | `allocator.py` | `BucketAllocator` hierarchy: `TemporaryBucketAllocator`, `StorageFreeingBucketAllocator`, `TracePoolAllocator` — pooled memory for unsharded parameter and gradient buffers |
 | `mcore_fsdp_adapter.py` | `FullyShardedDataParallel.stop_communication()` — synchronizes ag_stream and rs_stream into main stream |
+| `utils.py` | V2-to-v1 compatibility proxy used by the existing EP-overlap schedule |
 
-No changes to `utils.py` are needed for either overlap feature.
+The generic `combined_1f1b` schedule remains unchanged. `find_megatron_fsdp()`
+returns the native v1 wrapper or a cached v2 compatibility proxy implementing
+the same narrow schedule-facing interface.
 
 ---
 

@@ -11,6 +11,10 @@ default registration path, such as the 1F1B EP-overlap schedule.
 These functions are integration APIs for Megatron FSDP v2 internals, not a
 general user extension mechanism.
 
+The existing EP-overlap schedule reaches these hooks through the compatibility
+proxy returned by `find_megatron_fsdp()`. This keeps `combined_1f1b.py` on its
+original v1-facing interface while the proxy delegates lifecycle calls to v2.
+
 ## Target resolution
 
 ### `_find_fsdp_target(hook_module) -> Optional[FSDPModule]`

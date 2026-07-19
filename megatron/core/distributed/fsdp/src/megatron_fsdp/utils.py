@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -106,8 +106,8 @@ def is_submodule(module, parent_module, strict=True):
     return False
 
 
-def find_megatron_fsdp(model):
-    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+def _find_megatron_fsdp_v1(model):
+    """Walk the model wrapper chain to find a MegatronFSDP v1 instance, if any."""
     # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
     # this module during its own initialization, so a top-level import of
     # MegatronFSDP here would fail with a partially-initialized module error.
@@ -123,69 +123,64 @@ def find_megatron_fsdp(model):
     return None
 
 
-class _MegatronFSDPOverlapAdapter:
-    """Small adapter used by the EP-overlap pipeline schedule.
+class _MegatronFSDP2DDPConfigProxy:
+    """Expose the DDP config field consumed by the EP-overlap schedule."""
 
-    The schedule only needs a version-neutral FSDP surface: prepare before
-    layer-direct forward execution, run root pre/post-backward callbacks, and
-    expose per-layer reshard hooks.  Keep the v1/v2-specific details here so
-    pipeline scheduling code does not depend on Megatron FSDP internals.
-    """
-
-    def __init__(self, root_module, is_v2: bool):
+    def __init__(self, root_module):
         self.root_module = root_module
-        self.is_v2 = is_v2
 
     @property
     def data_parallel_sharding_strategy(self):
-        if self.is_v2:
-            for module in self.root_module.modules():
-                if hasattr(module, '_fsdp_param_groups'):
-                    for param_group in module._fsdp_param_groups:
-                        return param_group.sharding_strategy
-            return "no_shard"
+        for module in self.root_module.modules():
+            if hasattr(module, '_fsdp_param_groups'):
+                for param_group in module._fsdp_param_groups:
+                    return param_group.sharding_strategy
+        return "no_shard"
 
-        return self.root_module.ddp_config.data_parallel_sharding_strategy
 
-    def prepare_forward_schedule(self):
-        if not self.is_v2:
-            # The overlap schedule bypasses MegatronFSDP.forward(), which normally
-            # swaps distributed (optimizer-managed) parameters back to raw parameters.
-            self.root_module._replace_param_with_raw_if_needed()
+class _MegatronFSDP2CompatProxy:
+    """Present the v1 schedule interface for a Megatron FSDP v2 root.
+
+    ``combined_1f1b`` predates v2 and intentionally remains unaware of its
+    hook implementation. This proxy implements only the v1 attributes that
+    schedule consumes and delegates them to the corresponding v2 lifecycle
+    hooks.
+    """
+
+    def __init__(self, root_module):
+        self.root_module = root_module
+        self.ddp_config = _MegatronFSDP2DDPConfigProxy(root_module)
+
+    def _replace_param_with_raw_if_needed(self):
+        """No-op: v2 parameters are installed by its fine-grained hooks."""
 
     def pre_backward(self):
-        if self.is_v2:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
-                mfsdp_pre_backward_setup,
-            )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_pre_backward_setup,
+        )
 
-            mfsdp_pre_backward_setup(self.root_module, skip_final_callback=True)
-        else:
-            self.root_module.pre_backward()
+        mfsdp_pre_backward_setup(self.root_module, skip_final_callback=True)
 
     def post_backward(self):
-        if self.is_v2:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
-                mfsdp_post_backward_final_callback,
-            )
-
-            mfsdp_post_backward_final_callback(self.root_module)
-        else:
-            self.root_module.post_backward()
-
-    def get_reshard_hooks(self):
-        if self.is_v2:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
-                mfsdp_post_backward_hook,
-                mfsdp_post_forward_hook,
-            )
-
-            return mfsdp_post_forward_hook, mfsdp_post_backward_hook
-
-        return (
-            self.root_module.post_forward_release_module,
-            self.root_module.post_backward_release_module,
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_backward_final_callback,
         )
+
+        mfsdp_post_backward_final_callback(self.root_module)
+
+    def post_forward_release_module(self, module, *unused):
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_forward_hook,
+        )
+
+        return mfsdp_post_forward_hook(module, *unused)
+
+    def post_backward_release_module(self, module, *unused):
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_backward_hook,
+        )
+
+        return mfsdp_post_backward_hook(module)
 
 
 def _find_megatron_fsdp_v2_root(model):
@@ -216,15 +211,23 @@ def _find_megatron_fsdp_v2_root(model):
     return None
 
 
-def get_megatron_fsdp_overlap_adapter(model):
-    """Return a v1/v2-neutral adapter for EP-overlap schedules, if using M-FSDP."""
-    fsdp_v1 = find_megatron_fsdp(model)
+def find_megatron_fsdp(model):
+    """Return the Megatron FSDP wrapper expected by generic schedules.
+
+    V1 already implements the schedule-facing interface. V2 returns a cached
+    compatibility proxy so callers do not need version-specific branches.
+    """
+    fsdp_v1 = _find_megatron_fsdp_v1(model)
     if fsdp_v1 is not None:
-        return _MegatronFSDPOverlapAdapter(fsdp_v1, is_v2=False)
+        return fsdp_v1
 
     fsdp_v2_root = _find_megatron_fsdp_v2_root(model)
     if fsdp_v2_root is not None:
-        return _MegatronFSDPOverlapAdapter(fsdp_v2_root, is_v2=True)
+        proxy = getattr(fsdp_v2_root, '_megatron_fsdp_v1_compat_proxy', None)
+        if proxy is None:
+            proxy = _MegatronFSDP2CompatProxy(fsdp_v2_root)
+            fsdp_v2_root._megatron_fsdp_v1_compat_proxy = proxy
+        return proxy
 
     return None
 
