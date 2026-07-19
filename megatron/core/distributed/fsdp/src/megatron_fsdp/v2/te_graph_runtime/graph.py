@@ -185,6 +185,33 @@ def graph_safe_rng_available() -> bool:
     )
 
 
+def _ensure_graph_safe_rng_states() -> Dict[Any, Any]:
+    """Upgrade legacy tensor RNG states before CUDA graph registration.
+
+    Transformer Engine's RNG tracker may retain tensor states created before
+    graph-safe RNG was enabled.  CUDA graphs require generator states, so
+    preserve each legacy state while moving it into a clone of the current
+    device generator.
+    """
+    rng_states = get_all_rng_states()
+    if not graph_safe_rng_available():
+        return rng_states
+
+    default_generator = torch.cuda.default_generators[torch.cuda.current_device()]
+    for name, state in tuple(rng_states.items()):
+        if isinstance(state, torch.Generator):
+            continue
+        if not torch.is_tensor(state):
+            raise TypeError(
+                f"Expected RNG state {name!r} to be a tensor or torch.Generator, "
+                f"but got {type(state).__name__}"
+            )
+        generator = default_generator.clone_state()
+        generator.set_state(state)
+        rng_states[name] = generator
+    return rng_states
+
+
 def _te_required_error(feature: str) -> RuntimeError:
     detail = f" Original import error: {_TE_IMPORT_ERROR}" if _TE_IMPORT_ERROR else ""
     return RuntimeError(
@@ -922,7 +949,7 @@ def _make_graphed_callables(
 
     # For cases with multiple active RNG states, e.g. TP.
     if graph_safe_rng_available():
-        for _, state in get_all_rng_states().items():
+        for _, state in _ensure_graph_safe_rng_states().items():
             for fwd_graph, bwd_graph, bwd_dw_graph in zip(fwd_graphs, bwd_graphs, bwd_dw_graphs):
                 fwd_graph.register_generator_state(state)
                 bwd_graph.register_generator_state(state)
@@ -2167,7 +2194,7 @@ def make_graphed_callables(
     if graph_safe_rng_available():
         generators = [
             torch.cuda.default_generators[torch.cuda.current_device()],
-            *get_all_rng_states().values(),
+            *_ensure_graph_safe_rng_states().values(),
         ]
         original_rng_states = [state.get_state() for state in generators]
     else:
