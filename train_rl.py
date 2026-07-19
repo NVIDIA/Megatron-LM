@@ -2,6 +2,7 @@
 
 import inspect
 import os
+import sys
 from contextlib import nullcontext
 from functools import partial
 
@@ -384,6 +385,21 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+
+    def _exit_hard_on_uncaught(exc_type, exc, tb):
+        # A fatal error (e.g. rank-0 OOM) must kill this task so slurm tears
+        # the step down. Normal interpreter shutdown hangs forever here:
+        # aiohttp session finalizers raise cross-event-loop errors and leave
+        # non-daemon threads blocking Py_Finalize, so the step sits "running"
+        # on all nodes until preemption. Print and exit without finalizers.
+        import traceback
+
+        traceback.print_exception(exc_type, exc, tb)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+
+    sys.excepthook = _exit_hard_on_uncaught
 
     from megatron.inference.utils import add_inference_args
 
