@@ -22,10 +22,12 @@ import torch
 # not require torch.distributed.
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.datasets.varlen_dataset import (
+    ChatTemplateSample,
     MockVarlenDataset,
     VarlenDataset,
     VarlenLowLevelDataset,
     _alpaca_to_messages,
+    _ensure_list_field,
     _looks_like_hf_id,
     _messages_passthrough,
     _raw_text_loader,
@@ -148,14 +150,16 @@ def test_sharegpt_role_map(speaker, expected_role):
 
 
 def test_messages_passthrough_prepends_system_when_missing():
-    out = _messages_passthrough(
+    sample = _messages_passthrough(
         {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}
     )
+    out = sample.messages
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
+    assert sample.chat_template_kwargs == {}
 
 
 def test_messages_passthrough_keeps_existing_system():
-    out = _messages_passthrough(
+    sample = _messages_passthrough(
         {
             "messages": [
                 {"role": "system", "content": "be terse"},
@@ -164,23 +168,187 @@ def test_messages_passthrough_keeps_existing_system():
             ]
         }
     )
+    out = sample.messages
     assert [m["role"] for m in out] == ["system", "user", "assistant"]
     assert out[0]["content"] == "be terse"
 
 
-def test_messages_passthrough_strips_extra_keys():
-    """OpenAI-style messages may carry ``name`` / ``tool_calls`` etc.;
-    chat-template input only wants ``role`` and ``content``."""
-    out = _messages_passthrough(
+def test_messages_passthrough_preserves_math_v3_template_fields():
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "stateful_python_code_exec", "parameters": {"type": "object"}},
+        }
+    ]
+    sample = _messages_passthrough(
+        {
+            "tools": tools,
+            "messages": [
+                {"role": "user", "content": "solve"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "I should calculate this.",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "stateful_python_code_exec",
+                                "arguments": '{"code":"1 + 1"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "name": "stateful_python_code_exec",
+                    "tool_call_id": "call-1",
+                    "content": "2",
+                },
+            ],
+        }
+    )
+    assert sample.chat_template_kwargs == {"tools": tools}
+    assert sample.messages[2]["content"] == ""
+    assert sample.messages[2]["reasoning_content"] == "I should calculate this."
+    assert sample.messages[2]["tool_calls"][0]["function"]["name"] == "stateful_python_code_exec"
+    assert sample.messages[3]["name"] == "stateful_python_code_exec"
+    assert sample.messages[3]["tool_call_id"] == "call-1"
+
+
+def test_messages_passthrough_rejects_non_list_tools():
+    with pytest.raises(ValueError, match="field 'tools' must be a list"):
+        _messages_passthrough(
+            {"messages": [{"role": "user", "content": "hi"}], "tools": {"name": "bad"}}
+        )
+
+
+def test_messages_passthrough_decodes_json_encoded_parquet_columns():
+    messages = [
+        {"role": "user", "content": "solve"},
+        {"role": "assistant", "content": "2", "reasoning_content": "1 + 1"},
+    ]
+    tools = [{"type": "function", "function": {"name": "python"}}]
+    sample = _messages_passthrough({"messages": json.dumps(messages), "tools": json.dumps(tools)})
+    assert sample.messages == [{"role": "system", "content": ""}, *messages]
+    assert sample.chat_template_kwargs == {"tools": tools}
+
+
+def test_messages_passthrough_decodes_swe_v3_tool_calls():
+    tool_calls = [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "execute_bash", "arguments": '{"command":"ls"}'},
+        }
+    ]
+    sample = _messages_passthrough(
         {
             "messages": [
-                {"role": "user", "content": "hi", "name": "alice"},
-                {"role": "assistant", "content": "hi alice", "tool_calls": [{"function": "foo"}]},
+                {"role": "user", "content": "inspect"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I should inspect the repository.",
+                    "tool_calls": json.dumps(tool_calls),
+                },
             ]
         }
     )
-    for m in out:
-        assert set(m.keys()) == {"role", "content"}
+    assert sample.messages[2]["tool_calls"] == tool_calls
+
+
+def test_messages_passthrough_normalizes_opencode_tools_and_results():
+    sample = _messages_passthrough(
+        {
+            "tools": [
+                {
+                    "id": "shell",
+                    "description": "Run a command",
+                    "inputSchema": {
+                        "jsonSchema": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                        }
+                    },
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": "list files"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "shell", "arguments": '{"command":"ls"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": [
+                        {
+                            "type": "tool-result",
+                            "toolCallId": "call-1",
+                            "toolName": "shell",
+                            "output": {"type": "text", "value": "a.txt"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    assert sample.chat_template_kwargs["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    assert sample.messages[3]["content"] == "a.txt"
+    assert sample.messages[3]["tool_call_id"] == "call-1"
+    assert sample.messages[3]["name"] == "shell"
+
+
+def test_messages_passthrough_normalizes_legacy_roles_and_function_call():
+    sample = _messages_passthrough(
+        {
+            "messages": [
+                {"role": "developer", "content": "Use tools."},
+                {"role": "user", "content": "calculate"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "python", "arguments": '{"code":"1+1"}'},
+                },
+            ]
+        }
+    )
+    assert [message["role"] for message in sample.messages] == ["system", "user", "assistant"]
+    assert sample.messages[2]["tool_calls"] == [
+        {"type": "function", "function": {"name": "python", "arguments": '{"code":"1+1"}'}}
+    ]
+
+
+def test_messages_passthrough_preserves_agentic_chat_template_kwargs():
+    sample = _messages_passthrough(
+        {
+            "messages": [{"role": "user", "content": "search"}],
+            "chat_template_kwargs": json.dumps({"thinking": True}),
+        }
+    )
+    assert sample.chat_template_kwargs == {"thinking": True}
+
+
+def test_ensure_list_field_rejects_invalid_json():
+    with pytest.raises(ValueError, match="contains invalid JSON"):
+        _ensure_list_field("[broken", "messages")
 
 
 # ----------------------------------------------------------------------------
@@ -188,8 +356,8 @@ def test_messages_passthrough_strips_extra_keys():
 # ----------------------------------------------------------------------------
 
 
-def test_messages_rejects_list_content():
-    with pytest.raises(ValueError, match="must be a string"):
+def test_messages_rejects_multimodal_list_content():
+    with pytest.raises(ValueError, match="unsupported.*type 'image'"):
         _messages_passthrough(
             {"messages": [{"role": "user", "content": [{"type": "image", "url": "x.png"}]}]}
         )
@@ -370,7 +538,8 @@ def test_low_level_loads_jsonl_messages(tmp_path):
     ll = VarlenLowLevelDataset(path)
     assert ll.schema_name == "openai-messages"
     sample = ll[0]
-    assert [m["role"] for m in sample] == ["system", "user", "assistant"]
+    assert isinstance(sample, ChatTemplateSample)
+    assert [m["role"] for m in sample.messages] == ["system", "user", "assistant"]
 
 
 def test_low_level_jsonl_heterogeneous_columns(tmp_path):
@@ -417,6 +586,92 @@ def test_low_level_loads_jsonl_pretrain_text(tmp_path):
     assert ll[1] == "Doc two body..."
 
 
+class _FakeHubDataset:
+    def __init__(self, rows):
+        self.rows = rows
+        self.column_names = list(dict.fromkeys(key for row in rows for key in row))
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
+
+
+def test_low_level_hub_loads_all_configs_and_thematic_splits(monkeypatch):
+    datasets = pytest.importorskip("datasets")
+    calls = []
+
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["cfg-a", "cfg-b"])
+    monkeypatch.setattr(
+        datasets,
+        "get_dataset_split_names",
+        lambda path, config: ["train", "validation"] if config == "cfg-a" else ["python", "cpp"],
+    )
+
+    def fake_load_dataset(path, name, split):
+        calls.append((path, name, split))
+        return _FakeHubDataset([{"messages": [{"role": "user", "content": f"{name}/{split}"}]}])
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    low_level = VarlenLowLevelDataset("nvidia/Nemotron-SFT-Test")
+
+    assert calls == [
+        ("nvidia/Nemotron-SFT-Test", "cfg-a", "train"),
+        ("nvidia/Nemotron-SFT-Test", "cfg-b", "python"),
+        ("nvidia/Nemotron-SFT-Test", "cfg-b", "cpp"),
+    ]
+    assert len(low_level) == 3
+    assert low_level[0].messages[1]["content"] == "cfg-a/train"
+    assert low_level[1].messages[1]["content"] == "cfg-b/python"
+    assert low_level[-1].messages[1]["content"] == "cfg-b/cpp"
+    with pytest.raises(IndexError):
+        low_level[3]
+
+
+def test_low_level_hub_falls_back_to_raw_json_payload(monkeypatch, tmp_path):
+    datasets = pytest.importorskip("datasets")
+    from datasets.exceptions import DatasetGenerationError
+
+    raw_path = _write_jsonl(
+        tmp_path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+            },
+            {"messages": [{"role": "user", "content": "not selected"}]},
+        ],
+    )
+    monkeypatch.setattr(datasets, "get_dataset_config_names", lambda path: ["default"])
+    monkeypatch.setattr(datasets, "get_dataset_split_names", lambda path, config: ["train"])
+    monkeypatch.setattr(
+        datasets,
+        "load_dataset_builder",
+        lambda path, name: SimpleNamespace(
+            config=SimpleNamespace(data_files={"train": [raw_path]})
+        ),
+    )
+
+    def fake_load_dataset(path, name, split):
+        raise DatasetGenerationError("incompatible nested JSON schema")
+
+    def fake_from_generator(generator, features, gen_kwargs):
+        assert list(features) == ["__varlen_json_payload__"]
+        assert isinstance(gen_kwargs["data_files"], list)
+        return _FakeHubDataset(list(generator(**gen_kwargs)))
+
+    monkeypatch.setattr(datasets, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(datasets.Dataset, "from_generator", staticmethod(fake_from_generator))
+
+    low_level = VarlenLowLevelDataset("nvidia/Nemotron-SFT-Math-v4")
+    assert len(low_level) == 2
+    assert low_level.schema_name == "json-payload"
+    assert low_level[0].messages[2]["content"] == "answer"
+
+
 # ----------------------------------------------------------------------------
 # VarlenDataset / MockVarlenDataset __getitem__ (fake tokenizer, no GPU)
 #
@@ -439,6 +694,7 @@ class _FakeTokenizer:
     def __init__(self, eod: int = 0, pad=None):
         self._eod = eod
         self._pad = pad
+        self.last_chat_template_kwargs = None
 
     @property
     def eod(self):
@@ -451,7 +707,10 @@ class _FakeTokenizer:
     def tokenize(self, text):
         return [ord(c) % 100 + 1 for c in text]  # always >= 1, never eod (0)
 
-    def tokenize_conversation(self, messages, return_target=True, add_generation_prompt=False):
+    def tokenize_conversation(
+        self, messages, return_target=True, add_generation_prompt=False, chat_template_kwargs=None
+    ):
+        self.last_chat_template_kwargs = chat_template_kwargs
         tokens, targets = [], []
         for m in messages:
             ids = self.tokenize(m["content"])
@@ -526,6 +785,22 @@ def test_getitem_thd_sft_prompt_is_masked():
     loss_mask = out["loss_mask"]
     assert torch.all(loss_mask[labels == IGNORE_INDEX] == 0.0)
     assert loss_mask.sum() > 0  # assistant span still contributes
+
+
+def test_getitem_forwards_openai_chat_template_kwargs():
+    tok = _FakeTokenizer(eod=0, pad=7)
+    tools = [{"type": "function", "function": {"name": "python"}}]
+    item = ChatTemplateSample(
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+        ],
+        chat_template_kwargs={"tools": tools},
+    )
+    ds = _make_varlen([item], _make_config(tok, seq_length=64))
+    out = ds[0]
+    assert tok.last_chat_template_kwargs == {"tools": tools}
+    assert out["tokens"].numel() > 0
 
 
 def test_getitem_thd_pad_masked_by_position_keeps_real_eod():
