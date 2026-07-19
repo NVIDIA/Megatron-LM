@@ -551,7 +551,19 @@ class DataParallelInferenceCoordinator:
                 for finished_request in finished_requests:
                     self.detokenize(finished_request)
                     fid = finished_request["request_id"]
-                    client_identity = self.request_id_to_client_id[fid]
+                    client_identity = self.request_id_to_client_id.get(fid)
+                    if client_identity is None:
+                        # A request that fails mid-flight (e.g.
+                        # MaxSequenceLengthOverflowError around an engine
+                        # suspend/resume) can be reported in two ENGINE_REPLYs;
+                        # the first delivery already popped its routing entries.
+                        # A KeyError here kills the coordinator process and
+                        # wedges the whole job, so drop the duplicate instead.
+                        logging.warning(
+                            f"Coordinator: dropping finished request {fid} with "
+                            f"no routing entry (duplicate reply?)"
+                        )
+                        continue
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
                     del self.request_id_to_client_request_id[fid]
