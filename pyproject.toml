@@ -97,7 +97,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.50",
     "opentelemetry-api~=1.33.1",
-    "flash-linear-attention~=0.4.0",
+    "flash-linear-attention[cuda]>=0.5.1",
     "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
