@@ -63,21 +63,28 @@ batches; these runs establish stable convergence only.
   PyTorch FSDP1 with Megatron-FSDP v2 using the pretrained 60-block QwenImage
   transformer.
 
-The matched eager QwenImage run at `c2e9b8e00700` measured FSDP1 at 521.46 ms
-median / 75.39 GB peak and Megatron-FSDP v2 at 552.33 ms / 74.67 GB. Both
-passed the real-data convergence check; v2 trades 5.9% median throughput for a
-0.72 GB memory reduction in this case.
+The matched QwenImage rerun at `31334f8807d6` measured the following results:
 
-The QwenImage CUDA-graph path was tested separately with `--cuda-graph`, both
-with and without an explicit `--trace-pool`. At this commit both variants fail
-during graph capture with a `TracePoolAllocator slot collision` while creating
-static `main_grad` buffers, so the report intentionally does not publish a CUDA
-graph throughput number.
+| Backend | Average step | Median step | Peak memory | Final / initial loss |
+| --- | ---: | ---: | ---: | ---: |
+| PyTorch FSDP1 | 516.03 ms | **491.23 ms** | 75.39 GB | 0.642 |
+| Megatron-FSDP v2 | 505.89 ms | 506.46 ms | **74.67 GB** | 0.634 |
+| Megatron-FSDP v2 + CUDA graph | **385.89 ms** | **385.53 ms** | 86.72 GB | 0.641 |
 
-Current-tip Nsight captures show nearly matched forward time (252.84 ms for
-FSDP1 and 256.56 ms for v2 per rank-step) but 415.52 ms versus 520.79 ms in
-backward. A single v2 rank spends 353.08 ms in one `MFSDP reduce_grad` range
-before launching a reduce-scatter, producing 357.24 ms of cross-rank start skew
-and approximately 358 ms wait kernels on the three early ranks. FSDP1's maximum
-start skew is 5.42 ms. This is an eager gradient-staging/launch cavitation issue,
-not evidence of lower NCCL reduce-scatter bandwidth.
+All three real-data runs pass the 20-step convergence threshold. Eager v2 is
+1.96% faster than FSDP1 by average step because it avoids FSDP1's single
+824.48 ms tail, while FSDP1 remains 3.10% faster by median step. Eager v2 uses
+0.72 GB less peak memory. CUDA graph improves the v2 median by 23.88% at the
+cost of 12.05 GB additional peak memory.
+
+The CUDA-graph run completes capture and all measured steps. The earlier
+`TracePoolAllocator slot collision` is fixed by the captured-gradient lifetime
+change merged before this rerun.
+
+Nsight profiling of the gradient-DTensor wrapper-reuse change shows that its
+original rank-local stall is removed. The maximum `MFSDP reduce_grad` duration
+on the delayed rank falls from 353.08 ms to 1.81 ms, and maximum GPU
+reduce-scatter start skew falls from 357.24 ms to 6.12 ms. Average start skew is
+5.52 ms after the fix versus 4.23 ms for FSDP1. A smaller, gradually accumulating
+host-side arrival skew remains, but it no longer creates the catastrophic
+reduce-scatter cavitation seen before wrapper reuse.

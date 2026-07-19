@@ -118,9 +118,10 @@ torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
 
 ## Benchmark results
 
-The following comparison uses one reproducible configuration for both
-backends. It was measured at commit `c2e9b8e00700` after the lazy distributed
-gradient-storage fix.
+The following comparison uses one reproducible configuration for all cases. It
+was measured at merged `mfsdp_refactor` commit `31334f8807d6`, including the
+lazy gradient-storage, trace-pool gradient-lifetime, and gradient-DTensor
+wrapper-reuse fixes.
 
 | Setting | Value |
 | --- | --- |
@@ -138,53 +139,55 @@ gradient-storage fix.
 
 | Backend | Average step | Median step | Peak memory | Final / initial loss |
 | --- | ---: | ---: | ---: | ---: |
-| PyTorch FSDP1 | **521.70 ms** | **521.46 ms** | 75.39 GB | 0.641 |
-| Megatron-FSDP v2 | 592.67 ms | 552.33 ms | **74.67 GB** | 0.636 |
+| PyTorch FSDP1 | 516.03 ms | **491.23 ms** | 75.39 GB | 0.642 |
+| Megatron-FSDP v2 | 505.89 ms | 506.46 ms | **74.67 GB** | 0.634 |
+| Megatron-FSDP v2 + CUDA graph | **385.89 ms** | **385.53 ms** | 86.72 GB | 0.641 |
 
-Both runs pass the 20-step convergence threshold of 0.7. V2 uses 0.72 GB less
-peak memory and is 5.9% slower by median step time. Two approximately 0.9-second
-v2 outliers widen the average-time gap to 13.6%; both values are retained so
-the result does not hide the tail behavior. The memory result confirms that v2
-does not retain an additional main-weight buffer and that unused lazy gradient
-storage is released before the next unshard.
+All three runs pass the 20-step convergence threshold of 0.7. Eager v2 is 1.96%
+faster than FSDP1 by average step because FSDP1 contains one 824.48 ms tail,
+while FSDP1 is 3.10% faster by median step. Eager v2 uses 0.72 GB less peak
+memory. Compared with eager v2, CUDA graph improves average step time by 23.72%
+and median step time by 23.88%, while increasing peak memory by 12.05 GB.
+
+The eager v2 result no longer contains the approximately 0.9-second rank-local
+stalls seen before gradient-DTensor wrapper reuse. The memory result confirms
+that wrapper caching does not retain the released flat gradient storage.
 
 ### CUDA graph validation
 
-CUDA graph capture was also tested at the same commit. Both invocations reach
-the first warmup step and record all 60 transformer blocks, but fail while
-constructing the static gradient buffers, before any measured iteration.
+CUDA graph capture succeeds for all 60 transformer blocks. `TracePoolAllocator`
+plans six slots containing 3,318.4 MB of elements, and the run completes all 20
+measured iterations without a slot collision. Capture increases peak allocated
+memory from 74.67 GB in eager v2 to 86.72 GB.
 
-| Invocation | Result |
-| --- | --- |
-| `--cuda-graph` | Failed during graph capture |
-| `--cuda-graph --trace-pool` | Failed during graph capture |
-
-Both variants report `TracePoolAllocator slot collision` while
-`get_main_grad()` allocates a `main_grad` buffer. This is the same path because
-CUDA graphs enable the trace-pool allocator internally. No performance number
-is reported for CUDA graphs until the traced and replayed gradient-buffer
-lifetimes agree.
+The `--cuda-graph` option selects `TracePoolAllocator` internally. The explicit
+`--trace-pool` used for this measurement documents that allocator choice but
+does not select a different execution path.
 
 ### Nsight Systems analysis
 
-Three additional steps were captured under Nsight Systems with the same model
-and runtime configuration. Profiler-instrumented timings are diagnostic and
-should not be compared directly with the 20-step performance table.
+Three additional steps were captured under Nsight Systems before and after the
+gradient-DTensor wrapper-reuse change. Profiler-instrumented timings are
+diagnostic and should not be compared directly with the 20-step performance
+table.
 
-| Per-rank metric | PyTorch FSDP1 | Megatron-FSDP v2 |
-| --- | ---: | ---: |
-| Forward | 252.84 ms | 256.56 ms |
-| Backward | 415.52 ms | 520.79 ms |
-| Optimizer | 5.79 ms | 17.02 ms |
-| Maximum reduce-scatter start skew | 5.42 ms | 357.24 ms |
+| Metric | PyTorch FSDP1 | V2 before wrapper reuse | V2 with wrapper reuse |
+| --- | ---: | ---: | ---: |
+| Average GPU reduce-scatter start skew | 4.23 ms | 8.73 ms | 5.52 ms |
+| Maximum GPU reduce-scatter start skew | 5.42 ms | 357.24 ms | 6.12 ms |
+| Maximum delayed-rank `MFSDP reduce_grad` | N/A | 353.08 ms | 1.81 ms |
+| Peak memory | 75.39 GB | 74.67 GB | 74.66 GB |
 
-The slow v2 step is caused by cross-rank launch skew rather than lower
-collective bandwidth. One rank remains in a single `MFSDP reduce_grad` CPU
-range for 353.08 ms before launching reduce-scatter collective 115. The other
-three ranks enter about 357 ms earlier and wait inside NCCL; their kernels last
-approximately 358 ms while the late rank's kernel lasts 0.88 ms. Python-side
-work before `param_group.reduce_grad()` is therefore the primary optimization
-target.
+Rebuilding every gradient DTensor after lazy gradient-buffer release created a
+large Python object graph and, in the captured slow step, stalled one rank
+inside `MFSDP reduce_grad`. Reusing detached DTensor wrappers removes that stall
+without retaining their backing gradient storage. The maximum collective-start
+skew is now close to FSDP1.
+
+The CPU-side NCCL API arrival skew still grows gradually to approximately 39 ms
+across the backward pass. Because each `MFSDP reduce_grad` range remains below
+1.81 ms, the remaining drift occurs before the reduce-grad hook and is tracked
+separately from the wrapper-lifecycle fix.
 
 ## torch FSDP1 (reference API)
 
