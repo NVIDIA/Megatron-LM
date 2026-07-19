@@ -155,6 +155,8 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         cp_group=ps.cp_group,
         split_cp=False,
         labels=_nested_from_packed_tensor(batch.labels, seq_lens),
+        roll_labels=True,
+        roll_loss_mask=True,
         loss_mask=_nested_from_packed_tensor(batch.loss_mask, seq_lens),
     )
     kwargs: dict[str, Any] = {

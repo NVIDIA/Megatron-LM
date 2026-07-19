@@ -32,7 +32,12 @@ from megatron.core.transformer.hyper_connection import (
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import (
+    GraphableMegatronModule,
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -113,7 +118,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         self.layer_number = layer.layer_number
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
         if config.params_dtype is not None:
-            self.hyper_connection.to(dtype=config.params_dtype)
+            convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
 
@@ -124,7 +129,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         returns [s, b, C], but mHC layers carry n-stream hidden states [s, b, n*C].
         Mirrors ``HyperConnectionTransformerLayer.get_layer_static_inputs``.
         """
-        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        if hasattr(self.inner_layer, "get_layer_static_inputs"):
+            static_inputs = self.inner_layer.get_layer_static_inputs(seq_length, micro_batch_size)
+        else:
+            static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         hs = static_inputs["hidden_states"]
         n = self.config.num_residual_streams
         static_inputs["hidden_states"] = torch.ones(
@@ -134,6 +142,41 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             device=hs.device,
         )
         return static_inputs
+
+    @staticmethod
+    def _decompose_packed_seq_params_to_kwargs(kwargs):
+        """Decompose PackedSeqParams into tensor kwargs for TE CUDA graphs."""
+        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        if packed_seq_params is None:
+            return
+        kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
+        kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
+        kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
+        kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+
+    def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
+        """Reconstruct THD PackedSeqParams from tensor kwargs in the graph capture path."""
+        if 'cu_seqlens_q' not in kwargs:
+            return
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cp_partition_mode=self.config.cp_partition_mode,
+            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
+            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
+            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
+            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            pad_between_seqs=False,
+        )
+        kwargs['packed_seq_params'] = packed_seq_params
+
+    def __call__(self, *args, **kwargs):
+        # Keep non-tensor recompute state out of TE CUDA graph inputs; the GPT
+        # hyper-connection path follows the same pattern.
+        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        return super().__call__(*args, **kwargs)
 
     def _inner_is_moe(self) -> bool:
         """True when the inner layer is an MoE ``TransformerLayer``. Such layers use the
@@ -174,10 +217,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         hybrid layer types, so it is dropped (a tuple containing ``None`` cannot be a
         CUDA-graph output).
         """
+        self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+
         if self._inner_is_partial_moe_capture():
             hidden_states = args[0] if args else kwargs["hidden_states"]
             aggregated, h_res, h_post, residual = self.hyper_connection(hidden_states)
-            inner_out = list(self.inner_layer._te_cuda_graph_capture(aggregated))
+            inner_kwargs = dict(kwargs)
+            inner_kwargs.pop("hidden_states", None)
+            inner_out = list(self.inner_layer._te_cuda_graph_capture(aggregated, **inner_kwargs))
             # inner_out = router/preprocess intermediates ending in the inner residual;
             # append the mHC state AND the n-stream `residual` returned by the (graphed)
             # hyper_connection. Routing `residual` through the graph as an output keeps its
@@ -204,6 +251,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         wrapper tail (``layer_delta = layer_output - aggregated`` then
         ``fused_h_res_h_post_bda``), just with the deterministic prefix graphed.
         """
+        self._decompose_packed_seq_params_to_kwargs(kwargs)
+
         if self._inner_is_partial_moe_capture():
             out = list(super()._te_cuda_graph_replay(*args, **kwargs))
             residual = out.pop()  # n-stream [s, b, n*C] — graph output (see capture)
@@ -388,7 +437,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         attention backend when the mask is ``None``).
         """
 
-        """Run the wrapped hybrid layer through one layer-boundary mHC update."""
+        if mhc_recompute_manager is None:
+            mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
+
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
@@ -671,9 +722,9 @@ class HybridStack(MegatronModule):
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
             hc_mult = self.config.num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
-            self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
-            self.hc_head_scale = nn.Parameter(torch.ones(1))
+            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
             nn.init.xavier_uniform_(self.hc_head_fn)
             if self.config.sequence_parallel:
                 setattr(self.hc_head_fn, 'sequence_parallel', True)

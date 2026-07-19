@@ -189,12 +189,21 @@ class _DeepEPCombine(torch.autograd.Function):
 class TokenDispatcher:
 
     def __init__(
-        self, num_experts: int, hidden_size: int, ps: ParallelState, *, use_deepep: bool = True
+        self,
+        num_experts: int,
+        hidden_size: int,
+        ps: ParallelState,
+        *,
+        use_deepep: bool = True,
+        moe_permute_fusion: bool | None = None,
     ):
         self.ps = ps
         self.num_experts = num_experts
         self.ep_size = ps.ep_size
         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
+        self.moe_permute_fusion = (
+            _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
+        )
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
         if self.use_deepep:
@@ -245,7 +254,7 @@ class TokenDispatcher:
             expert_output,
             self._row_id_map,
             restore_shape=self._restore_shape,
-            fused=_use_moe_permute_fusion(),
+            fused=self.moe_permute_fusion,
         )
         previous_event = (
             EventOverlap(EventHandle())
@@ -294,7 +303,7 @@ class TokenDispatcher:
             routing_map,
             probs=probs_2d,
             num_out_tokens=num_out,
-            fused=_use_moe_permute_fusion(),
+            fused=self.moe_permute_fusion,
         )[:3]
 
         self._row_id_map = sorted_indices
@@ -308,7 +317,7 @@ class TokenDispatcher:
             expert_output,
             self._row_id_map,
             restore_shape=self._restore_shape,
-            fused=_use_moe_permute_fusion(),
+            fused=self.moe_permute_fusion,
         )
         self._row_id_map = None
         self._restore_shape = None
@@ -336,7 +345,7 @@ class TokenDispatcher:
             routing_map,
             probs=probs_2d,
             num_out_tokens=num_out,
-            fused=_use_moe_permute_fusion(),
+            fused=self.moe_permute_fusion,
         )[:3]
         self._row_id_map = sorted_indices
         self._restore_shape = hidden_states.shape
@@ -398,7 +407,7 @@ class TokenDispatcher:
             combined,
             self._row_id_map,
             restore_shape=self._restore_shape,
-            fused=_use_moe_permute_fusion(),
+            fused=self.moe_permute_fusion,
         )
         self._row_id_map = None
         self._restore_shape = None
@@ -503,7 +512,7 @@ class TokenDispatcher:
             routing_map,
             probs=probs_2d,
             num_out_tokens=num_out,
-            fused=_use_moe_permute_fusion(),
+            fused=self.moe_permute_fusion,
         )[:3]
         self._row_id_map = sorted_indices
         self._restore_shape = recv_hidden.shape
@@ -562,7 +571,7 @@ class TokenDispatcher:
             expert_output,
             self._row_id_map,
             restore_shape=self._restore_shape,
-            fused=_use_moe_permute_fusion(),
+            fused=self.moe_permute_fusion,
         )
         if torch.is_grad_enabled():
             combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)

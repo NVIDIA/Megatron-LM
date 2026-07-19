@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.module import Float16Module, MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -100,3 +100,18 @@ class TestFloat16Module:
         x = torch.ones((2, 2)).cuda()
         # inputs are converted to bf16 then outputs are converted to fp32
         assert bf16_module(x).dtype == torch.float32
+
+    @pytest.mark.parametrize(
+        ('precision', 'dtype'), [('fp16', torch.float16), ('bf16', torch.bfloat16)]
+    )
+    def test_keep_in_fp32_params(self, precision, dtype):
+        transformer_config = self.transformer_config
+        megatron_module = self.megatron_module
+        megatron_module.fp32_param = mark_keep_in_fp32(
+            torch.nn.Parameter(torch.zeros(4, dtype=torch.float32, device='cuda'))
+        )
+        setattr(transformer_config, precision, True)
+        float16_module = Float16Module(config=transformer_config, module=megatron_module)
+
+        assert float16_module.module.linear.weight.dtype == dtype
+        assert float16_module.module.fp32_param.dtype == torch.float32

@@ -29,7 +29,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -264,10 +264,9 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     )
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
 
-    rolled_tensor = tensor.clone()
-
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
+        rolled_tensor = tensor.clone()
         # CP disabled: roll each packed sequence independently within its boundaries
         for i in range(len(cu_seqlens) - 1):
             start_idx = cu_seqlens[i]
@@ -277,6 +276,25 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             rolled_seq[..., shifts:] = fill_value
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
         return rolled_tensor, rolled_tensor.sum()
+
+    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+    if cp_partition_mode == 'zigzag':
+        rolled_tensor = _roll_tensor_packed_seq_zigzag_cp(
+            tensor, shifts, dims, cu_seqlens, cp_group, fill_value=fill_value
+        )
+        return rolled_tensor, rolled_tensor.sum()
+    if cp_partition_mode == 'contiguous':
+        rolled_tensor = _roll_tensor_packed_seq_contiguous_cp(
+            tensor, dims, cu_seqlens, cp_group, fill_value=fill_value
+        )
+        return rolled_tensor, rolled_tensor.sum()
+    raise ValueError(f"Unsupported packed sequence CP partition mode: {cp_partition_mode}")
+
+
+def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0):
+    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries."""
+    cp_size = cp_group.size()
+    rolled_tensor = tensor.clone()
 
     # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
     local_rank = torch.distributed.get_rank(group=cp_group)
@@ -350,7 +368,55 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # update the rolled tensor
         rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
-    return rolled_tensor, rolled_tensor.sum()
+    return rolled_tensor
+
+
+def _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group, fill_value=0):
+    """Roll a contiguous-CP THD shard without crossing packed sequence boundaries."""
+    local_seq_len = tensor.size(dims)
+    rolled_tensor = torch.roll(tensor, shifts=-1, dims=dims)
+    if local_seq_len == 0:
+        return rolled_tensor
+
+    cp_size = cp_group.size()
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    if cu.numel() > 1:
+        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+        cu = cu[nonduplicate_boundaries]
+    if cu.numel() <= 1:
+        rolled_tensor.fill_(fill_value)
+        return rolled_tensor
+
+    global_start = local_rank * local_seq_len
+    global_positions = global_start + torch.arange(local_seq_len, device=tensor.device)
+    seq_idx = torch.bucketize(global_positions, cu[1:], right=True).clamp(max=cu.numel() - 2)
+    seq_ends = cu[1:][seq_idx]
+    valid_next = (global_positions < cu[-1]) & (global_positions + 1 < seq_ends)
+
+    invalid_next = ~valid_next
+    rolled_tensor[..., invalid_next] = fill_value
+
+    recv_next_first = torch.empty_like(tensor.select(dims, 0))
+    ops = []
+    if local_rank < cp_size - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(torch.distributed.irecv(tensor=recv_next_first, src=next_rank))
+    if local_rank > 0:
+        prev_rank = global_ranks[local_rank - 1]
+        send_first = tensor.select(dims, 0).contiguous()
+        ops.append(torch.distributed.isend(tensor=send_first, dst=prev_rank))
+    for op in ops:
+        op.wait()
+
+    if local_rank < cp_size - 1:
+        last = rolled_tensor.select(dims, -1)
+        last.copy_(torch.where(valid_next[-1], recv_next_first, last))
+
+    return rolled_tensor
 
 
 class MTPLossLoggingHelper:
@@ -371,8 +437,8 @@ class MTPLossLoggingHelper:
         """Save normalized MTP loss and acceptance counts for logging.
 
         This compatibility path is used by tests and callers that already
-        computed a normalized per-layer loss. Dynamic-CP code should use
-        ``save_loss_to_tracker`` so loss is weighted by token counts.
+        computed a normalized per-layer loss. Dynamic-CP code uses
+        ``save_loss_to_tracker`` to normalize each local contribution safely.
         """
         if layer_number is None:
             return
@@ -402,11 +468,12 @@ class MTPLossLoggingHelper:
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        """Save the mtp loss sum and token count for logging.
+        """Normalize and accumulate a local MTP loss for logging.
 
-        Stores raw sums so that the global per-token loss can be computed
-        correctly after all-reduce, even when token counts differ across
-        ranks (e.g. Dynamic CP) or microbatches.
+        MTP is normalized independently for each microbatch. The tracker
+        accumulates those normalized losses, then reduction combines the sums
+        across ranks. This intentionally preserves sequence-packing semantics
+        instead of changing the metric to global ``sum(loss) / sum(tokens)``.
 
         Args:
             loss_sum (torch.Tensor): Sum of per-element losses on this rank.
@@ -415,8 +482,8 @@ class MTPLossLoggingHelper:
             num_layers (int): The number of total layers.
             correct (Optional[torch.Tensor]): Number of correct MTP predictions.
             total (Optional[torch.Tensor]): Total number of MTP predictions.
-            reduce_group (torch.distributed.ProcessGroup): The group for sum-reducing losses.
-            avg_group (torch.distributed.ProcessGroup): The group for sum-reducing before averaging.
+            reduce_group (torch.distributed.ProcessGroup): Group for summing losses.
+            avg_group (torch.distributed.ProcessGroup): Group for averaging losses.
         """
         if layer_number is None:
             return
@@ -424,9 +491,8 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" not in tracker:
             tracker["loss_sums"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-            tracker["num_tokens"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        loss_sum = (loss_sum * (num_tokens > 0).to(loss_sum.dtype)) / num_tokens.clamp(min=1)
         tracker["loss_sums"][layer_number] += loss_sum.detach()
-        tracker["num_tokens"][layer_number] += num_tokens.detach()
         if correct is not None and total is not None:
             if "correct_values" not in tracker:
                 tracker["correct_values"] = torch.zeros(
@@ -485,7 +551,6 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" in tracker:
             tracker["loss_sums"].zero_()
-            tracker["num_tokens"].zero_()
         if "values" in tracker:
             tracker["values"].zero_()
         if "correct_values" in tracker:
@@ -499,21 +564,21 @@ class MTPLossLoggingHelper:
     def reduce_loss_in_tracker():
         """Collect and reduce the mtp losses across ranks.
 
-        Packs loss sums and token counts into a single tensor for one
-        all-reduce, then computes per-token loss.  This produces correct
-        weighted-average results even when ranks hold different numbers
-        of tokens (e.g. Dynamic CP with variable CP sizes).
+        Each element is already a sum of normalized microbatch losses. Sum
+        reductions preserve additive groups, while the DP+CP average keeps the
+        legacy logging contract.
         """
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" not in tracker:
             return
-        packed = torch.cat([tracker["loss_sums"], tracker["num_tokens"]])
-        for group_key in ('reduce_group', 'avg_group'):
-            group = tracker.get(group_key)
-            if group is not None:
-                torch.distributed.all_reduce(packed, group=group)
-        loss_sums, num_tokens = packed.chunk(2)
-        tracker["values"] = loss_sums / num_tokens.clamp(min=1)
+        values = tracker["loss_sums"]
+        if tracker.get('reduce_group') is not None:
+            torch.distributed.all_reduce(values, group=tracker['reduce_group'])
+        if tracker.get('avg_group') is not None:
+            torch.distributed.all_reduce(
+                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+            )
+        tracker["values"] = values
 
     @staticmethod
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
@@ -1237,9 +1302,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.mhc_enabled:
             hc_mult = self.config.num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
-            self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
-            self.hc_head_scale = nn.Parameter(torch.ones(1))
+            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
             nn.init.xavier_uniform_(self.hc_head_fn)
             if self.config.sequence_parallel:
                 setattr(self.hc_head_fn, 'sequence_parallel', True)

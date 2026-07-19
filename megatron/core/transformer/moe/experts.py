@@ -402,18 +402,40 @@ class TEGroupedMLP(MegatronModule):
             return _unsupported(
                 "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set; CuTe DSL fused kernel disabled"
             )
-        if use_glu_fusion and self.config.moe_mlp_glu_interleave_size != 32:
-            return _unsupported(
-                f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
-                f"(CuTe DSL GLU fusion requires 32)"
-            )
-
         return True
 
     def _make_fused_ops(self) -> torch.nn.Module:
         """Construct fused module for FC1, activation, and FC2."""
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
+
+        def register_grouped_linear_params(
+            op: torch.nn.Module,
+            linear: torch.nn.Module,
+            single_grouped_weight: bool,
+            single_grouped_bias: bool,
+        ) -> None:
+            """Register real GroupedLinear params on a meta TE op shell."""
+            if single_grouped_weight:
+                op.register_parameter("weight", linear.get_parameter("weight"))
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"weight{idx}", None)
+            else:
+                op.register_parameter("weight", None)
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"weight{idx}", linear.get_parameter(f"weight{idx}"))
+
+            if not linear.use_bias:
+                return
+
+            if single_grouped_bias:
+                op.register_parameter("bias", linear.get_parameter("bias"))
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"bias{idx}", None)
+            else:
+                op.register_parameter("bias", None)
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
@@ -455,17 +477,11 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
-        # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc1_single_grouped_weight:
-            setattr(op, "weight", getattr(self.linear_fc1, "weight"))
-
-        for idx in range(self.linear_fc1.num_gemms):
-            if not fc1_single_grouped_weight:
-                setattr(op, f"weight{idx}", getattr(self.linear_fc1, f"weight{idx}"))
-            if self.linear_fc1.use_bias and not fc1_single_grouped_bias:
-                setattr(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
-        if self.linear_fc1.use_bias and fc1_single_grouped_bias:
-            setattr(op, "bias", getattr(self.linear_fc1, "bias"))
+        # In single grouped mode, clear stale per-expert meta params so TE does not reset
+        # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
+        register_grouped_linear_params(
+            op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
+        )
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped GeGLU, or SReLU).
@@ -562,17 +578,11 @@ class TEGroupedMLP(MegatronModule):
             delay_wgrad_compute=fc2_delay_wgrad_compute,
         )
 
-        # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc2_single_grouped_weight:
-            setattr(op, "weight", getattr(self.linear_fc2, "weight"))
-
-        for idx in range(self.linear_fc2.num_gemms):
-            if not fc2_single_grouped_weight:
-                setattr(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
-            if self.linear_fc2.use_bias and not fc2_single_grouped_bias:
-                setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
-        if self.linear_fc2.use_bias and fc2_single_grouped_bias:
-            setattr(op, "bias", getattr(self.linear_fc2, "bias"))
+        # In single grouped mode, clear stale per-expert meta params so TE does not reset
+        # the op and replace the shared DDP parameter with a fresh one lacking main_grad.
+        register_grouped_linear_params(
+            op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
+        )
         ops.append(op)
 
         # Emulate submodule pre-forward hooks

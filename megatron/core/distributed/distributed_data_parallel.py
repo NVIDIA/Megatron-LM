@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from contextlib import contextmanager
@@ -123,8 +123,16 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
-        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). fp8 params key to
+        # uint8 (own buffer); partition_buckets later merges the small non-fp8 bucket groups into
+        # the fp8 group to aggregate their communication.
+        buffer_groups = group_params_for_buffers(
+            all_params,
+            self.ddp_config.grad_reduce_in_fp32,
+            merge_layerwise_fp8_grads=not getattr(
+                self.ddp_config, 'use_layer_wise_param_layout', True
+            ),
+        )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -408,7 +416,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Force synchronize parameters.
         if param_sync:
-            self.start_param_sync(force_sync=True)
+            # Hook-disable paths (eval/checkpointing/shutdown) synchronize params as an
+            # explicit state update, not as differentiable forward compute.
+            with torch.no_grad():
+                self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """
@@ -528,6 +539,19 @@ class DistributedDataParallel(_BaseDataParallel):
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
+
+    def reset_param_sync_dispatch_state(self):
+        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            # A non-None handle means the previous all-gather is still in flight. Resetting only
+            # the dispatch flag would create the invalid state
+            # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
+            # second all-gather into the same parameter buffer.
+            assert bucket_group.param_gather_handle is None, (
+                "Cannot reset parameter all-gather dispatch state while an asynchronous "
+                "parameter all-gather is still in flight."
+            )
+            bucket_group.param_gather_dispatched = False
 
     def start_grad_sync(self, *unused):
         """
