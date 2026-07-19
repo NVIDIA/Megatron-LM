@@ -1141,6 +1141,36 @@ def _strip_module_prefix(key: str) -> str:
     return key[len("module.") :] if key.startswith("module.") else key
 
 
+def _candidate_torch_dist_keys(base_key: str) -> list[str]:
+    """Return torch_dist metadata key candidates for a canonical parameter key."""
+    candidates = []
+    for key in (base_key, reverse_normalize_torch_dist_key(base_key)):
+        for candidate in (key, f"model.{key}", f"module.{key}", f"model.module.{key}"):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _optimizer_state_key_candidates(state_key: str, param_key: str) -> list[str]:
+    """Return optimizer-state metadata key candidates for a parameter key."""
+    return [
+        f"optimizer.state.{state_key}.{candidate}"
+        for candidate in _candidate_torch_dist_keys(param_key)
+    ]
+
+
+def _grouped_mlp_source_field(field: str) -> tuple[Optional[str], Optional[int]]:
+    """Map a v2 GroupedMLP expert field to its torch_dist grouped-expert field."""
+    exp_m = _EXPERT_V2_KEY_RE.search(field)
+    if not exp_m:
+        return None, None
+    sub_layer_prefix = exp_m.group(1) or ""
+    fc_type = exp_m.group(2)
+    expert_idx = int(exp_m.group(3))
+    source_field = f"{sub_layer_prefix}mlp.experts.experts.linear_fc{fc_type}.weight"
+    return source_field, expert_idx
+
+
 def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
     """Build maps from torch_dist checkpoint keys to Megatron FSDP v2 DTensors.
 
@@ -1171,7 +1201,12 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
         """Return match info for a v2 key whose fused counterpart exists in metadata.
 
         Returns:
-            ``(td_key, layer_idx)`` for regular fused-layer keys and GroupedMLP keys.
+            ``(td_key, layer_idx, "fused_layer")`` for regular fused-layer keys.
+            ``(td_key, layer_idx, expert_idx, "grouped_mlp_fused")`` for
+            GroupedMLP keys fused across layers and experts.
+            ``(td_key, expert_idx, "grouped_mlp_per_layer")`` for GroupedMLP
+            keys whose torch_dist source keeps the layer index and fuses only
+            across experts.
             ``(td_key, local_expert_idx, "seq_mlp")`` for SequentialMLP expert keys.
             ``None`` if no fused counterpart was found.
         """
@@ -1201,10 +1236,7 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
                 f"{sub_layer_prefix}mlp.experts.experts.{fc_type}.weight"
             )
             td_base = reverse_normalize_torch_dist_key(td_base)
-            candidates = [td_base]
-            candidates.append(f"model.{td_base}")
-            candidates.append(f"module.{td_base}")
-            candidates.append(f"model.module.{td_base}")
+            candidates = _candidate_torch_dist_keys(td_base)
             for c in candidates:
                 if c in metadata:
                     return c, local_expert_idx, "seq_mlp"
@@ -1215,30 +1247,30 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
         # td:   ``{prefix}layers.{field}`` (no layer index)
         fused_base = f"{prefix}layers.{field}"
 
-        candidates = [fused_base]
-        # Torch_dist metadata may have "model." prefix
-        candidates.append(f"model.{fused_base}")
-        candidates.append(f"module.{fused_base}")
-        candidates.append(f"model.module.{fused_base}")
+        candidates = _candidate_torch_dist_keys(fused_base)
 
         # For GroupedMLP expert params: v2 uses "experts.linear_fc1.weight{N}"
-        # torch_dist uses "experts.experts.linear_fc1.weight"
-        exp_m = _EXPERT_V2_KEY_RE.search(field)
-        if exp_m:
-            fc_type = exp_m.group(2)
-            field_exp = (
-                _EXPERT_V2_KEY_RE.sub(rf"mlp.experts.experts.linear_fc\2.weight", field).rstrip(
-                    ".weight"
-                )
-                + ".weight"
-            )
+        # and torch_dist uses "experts.experts.linear_fc1.weight".  Some
+        # torch_dist checkpoints also keep the layer index, so try the
+        # per-layer grouped-expert key before the fused-across-layers key.
+        field_exp, expert_idx = _grouped_mlp_source_field(field)
+        if field_exp is not None:
+            per_layer_exp = f"{prefix}layers.{layer_idx}.{field_exp}"
+            per_layer_candidates = _candidate_torch_dist_keys(per_layer_exp)
+            for c in per_layer_candidates:
+                if c in metadata:
+                    return c, expert_idx, "grouped_mlp_per_layer"
+
             fused_exp = f"{prefix}layers.{field_exp}"
-            candidates.append(fused_exp)
-            candidates.append(f"model.{fused_exp}")
+            candidates.extend(
+                c for c in _candidate_torch_dist_keys(fused_exp) if c not in candidates
+            )
 
         for c in candidates:
             if c in metadata:
-                return c, layer_idx
+                if field_exp is not None:
+                    return c, layer_idx, expert_idx, "grouped_mlp_fused"
+                return c, layer_idx, "fused_layer"
 
         # Debug: log first failure per unique field
         if not hasattr(_match_fused_key, '_logged'):
@@ -1265,33 +1297,37 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
     )
 
     for v2_key, v2_val in v2_by_canonical.items():
+        for candidate in _candidate_torch_dist_keys(v2_key):
+            if candidate in metadata:
+                regular_model[candidate] = v2_val
+                break
+        else:
+            candidate = None
+        if candidate is not None:
+            continue
+
         result = _match_fused_key(v2_key, v2_val)
         if result:
-            if len(result) == 3 and result[2] == "seq_mlp":
+            if result[-1] == "seq_mlp":
                 # SequentialMLP: (td_key, local_expert_idx, "seq_mlp")
                 td_key, local_expert_idx, _ = result
                 fused_layer_groups.setdefault(td_key, []).append(
                     (v2_key, v2_val, local_expert_idx, "seq_mlp")
                 )
+            elif result[-1] == "grouped_mlp_per_layer":
+                td_key, expert_idx, _ = result
+                fused_layer_groups.setdefault(td_key, []).append(
+                    (v2_key, v2_val, expert_idx, "grouped_mlp_per_layer")
+                )
+            elif result[-1] == "grouped_mlp_fused":
+                td_key, layer_idx, expert_idx, _ = result
+                fused_layer_groups.setdefault(td_key, []).append(
+                    (v2_key, v2_val, layer_idx, expert_idx, "grouped_mlp_fused")
+                )
             else:
-                # Fused layer or GroupedMLP: (td_key, layer_idx)
-                td_key, layer_idx = result
-                exp_m = _EXPERT_V2_KEY_RE.match(v2_key)
-                if exp_m:
-                    expert_idx = int(exp_m.group(3))
-                    fused_layer_groups.setdefault(td_key, []).append(
-                        (v2_key, v2_val, layer_idx, expert_idx)
-                    )
-                else:
-                    fused_layer_groups.setdefault(td_key, []).append((v2_key, v2_val, layer_idx))
-            continue
-        # Not fused — check 1:1
-        if v2_key in metadata:
-            regular_model[v2_key] = v2_val
-            continue
-        m_key = f"module.{v2_key}"
-        if m_key in metadata:
-            regular_model[m_key] = v2_val
+                # Regular fused layer: (td_key, layer_idx, "fused_layer")
+                td_key, layer_idx, _ = result
+                fused_layer_groups.setdefault(td_key, []).append((v2_key, v2_val, layer_idx))
             continue
 
     # ------------------------------------------------------------------
@@ -1342,38 +1378,44 @@ def _build_torch_dist_to_v2_map(metadata, v2_by_canonical, v2_optim_state):
                 optim_matched.add(param_name)
             continue
 
-        # Check GroupedMLP expert format
-        fused_base = f"{prefix}layers.{field}"
-        exp_m = _EXPERT_V2_KEY_RE.search(field)
-        if exp_m:
-            fc_type = exp_m.group(2)
-            field_exp = (
-                _EXPERT_V2_KEY_RE.sub(rf"mlp.experts.experts.linear_fc\2.weight", field).rstrip(
-                    ".weight"
-                )
-                + ".weight"
-            )
-            fused_base = f"{prefix}layers.{field_exp}"
-            expert_idx = int(exp_m.group(3))
-        else:
-            expert_idx = None
+        # Check GroupedMLP expert format.  Support both source layouts:
+        #   layers.{N}.mlp.experts.experts.linear_fc*.weight
+        #   layers.mlp.experts.experts.linear_fc*.weight
+        field_exp, expert_idx = _grouped_mlp_source_field(field)
+        grouped_per_layer_base = (
+            f"{prefix}layers.{layer_idx}.{field_exp}" if field_exp is not None else None
+        )
+        fused_base = f"{prefix}layers.{field_exp if field_exp is not None else field}"
 
         for sk, sv in states.items():
             if sk not in ("exp_avg", "exp_avg_sq"):
                 continue
             td_opt_key = None
-            for candidate in [
-                f"optimizer.state.{sk}.{fused_base}",
-                f"optimizer.state.{sk}.model.{fused_base}",
-            ]:
+            td_layout = None
+            candidates = []
+            if grouped_per_layer_base is not None:
+                candidates.extend(
+                    (candidate, "grouped_mlp_per_layer")
+                    for candidate in _optimizer_state_key_candidates(sk, grouped_per_layer_base)
+                )
+            candidates.extend(
+                (candidate, "grouped_mlp_fused" if expert_idx is not None else "fused_layer")
+                for candidate in _optimizer_state_key_candidates(sk, fused_base)
+            )
+            for candidate, layout in candidates:
                 if candidate in metadata:
                     td_opt_key = candidate
+                    td_layout = layout
                     break
             if td_opt_key is None:
                 continue
-            if expert_idx is not None:
+            if td_layout == "grouped_mlp_per_layer":
                 fused_layer_groups.setdefault(td_opt_key, []).append(
-                    (param_name, sv, layer_idx, expert_idx)
+                    (param_name, sv, expert_idx, "grouped_mlp_per_layer")
+                )
+            elif expert_idx is not None:
+                fused_layer_groups.setdefault(td_opt_key, []).append(
+                    (param_name, sv, layer_idx, expert_idx, "grouped_mlp_fused")
                 )
             else:
                 fused_layer_groups.setdefault(td_opt_key, []).append((param_name, sv, layer_idx))
@@ -1476,10 +1518,9 @@ def _load_torch_dist_into_megatron_fsdp_v2(
 
     1. **Preprocess & verify** — wrap optimizer states as uneven DTensors
        and verify ``__create_chunk_list__`` / ``__create_write_items__`` metadata.
-       When ``args.mamba`` is True, split fused MambaMixer params
-       (``in_proj.weight`` → ``.z`` / ``.x`` / ``.B`` / ``.C`` / ``.dt``,
-       ``conv1d.*`` → ``.x`` / ``.B`` / ``.C``) so they match the torch_dist
-       split keys.
+       Split Megatron-specific fused params (GDN, MambaMixer) in a temporary
+       load skeleton so the online converter can read torch_dist checkpoints
+       that store their component keys independently.
     2. **Build name mapping** — match torch_dist metadata keys to v2 DTensors,
        handling fused layers, GroupedMLP, and SequentialMLP expert formats.
     3. **DCP load 1:1 entries** — load regular model weights and optimizer
@@ -1497,20 +1538,28 @@ def _load_torch_dist_into_megatron_fsdp_v2(
 
     # ---- Phase 1: Preprocess & verify v2 state dict ----
 
-    # Split fused MambaMixer params so that the sub-keys match the
-    # torch_dist checkpoint (which stores e.g. ``in_proj.weight.z``).
+    raw_model_state_dict = v2_state_dict["model"].copy()
+    raw_optimizer_state_dict = (
+        v2_state_dict["optimizer"].copy() if "optimizer" in v2_state_dict else None
+    )
+    load_state_dict = v2_state_dict.copy()
+
+    # Split fused params whose torch_dist representation stores component keys.
+    # These split DTensors share storage with the raw state dict entries, so we
+    # can restore the raw state dict before returning.
     if model is not None:
         if isinstance(model, (list, tuple)):
             assert len(model) == 1
             model = model[0]
-        model_sd, new_opt = handle_mamba_in_state_dict_v2(
-            model, v2_state_dict["model"], v2_state_dict.get("optimizer")
-        )
-        v2_state_dict["model"] = model_sd
-        if new_opt is not None:
-            v2_state_dict["optimizer"] = new_opt
+        model_sd = load_state_dict["model"]
+        opt_sd = load_state_dict.get("optimizer")
+        model_sd, opt_sd = handle_gdn_in_state_dict_v2(model, model_sd, opt_sd)
+        model_sd, opt_sd = handle_mamba_in_state_dict_v2(model, model_sd, opt_sd)
+        load_state_dict["model"] = model_sd
+        if opt_sd is not None:
+            load_state_dict["optimizer"] = opt_sd
 
-    v2_by_canonical, v2_optim_state = _preprocess_and_verify_v2_state_dict(v2_state_dict, model)
+    v2_by_canonical, v2_optim_state = _preprocess_and_verify_v2_state_dict(load_state_dict, model)
 
     # ---- Phase 2: Read torch_dist metadata & build name mapping ----
     reader = FileSystemReader(checkpoint_name)
@@ -1547,21 +1596,50 @@ def _load_torch_dist_into_megatron_fsdp_v2(
         mapped_sd.update({k: v for k, v in hi_prec_model.items() if k not in mapped_sd})
 
     # ---- Phase 4: Load fused layer / expert params by slicing ----
-    # Handles three tensor formats:
-    #   Regular fused:  shape (num_layers, ...)            → flat[layer_idx]
-    #   GroupedMLP:     shape (num_layers, num_experts, ...) → flat[layer_idx, expert_idx]
-    #   SequentialMLP:  shape (num_global_experts, ...)     → flat[global_expert_idx]
+    # Handles four tensor formats:
+    #   Regular fused:       shape (num_layers, ...)              → flat[layer_idx]
+    #   GroupedMLP fused:    shape (num_layers, num_experts, ...) → flat[layer, expert]
+    #   GroupedMLP per-layer: shape (num_experts, ...)            → flat[expert]
+    #   SequentialMLP:       shape (num_global_experts, ...)      → flat[global_expert]
     #
     # Entry types by tag:
     #   (v2_key, v2_val, layer_idx)                      → regular fused layer
-    #   (v2_key, v2_val, layer_idx, expert_idx)           → GroupedMLP expert
+    #   (v2_key, v2_val, layer_idx, expert_idx, "grouped_mlp_fused")
+    #                                                    → GroupedMLP fused across layers
+    #   (v2_key, v2_val, expert_idx, "grouped_mlp_per_layer")
+    #                                                    → GroupedMLP fused within one layer
     #   (v2_key_or_param_name, v2_val, local_expert_idx, "seq_mlp") → SequentialMLP expert
+    configured_num_experts = getattr(args, "num_experts", None)
+    if isinstance(configured_num_experts, (list, tuple)):
+        configured_num_experts = configured_num_experts[0] if configured_num_experts else None
+
+    def _source_expert_index(expert_idx: int, source_num_experts: int) -> int:
+        """Map a v2 local expert index to the global source expert index when needed."""
+        if configured_num_experts is None or source_num_experts != configured_num_experts:
+            return expert_idx
+
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        if ep_size <= 1:
+            return expert_idx
+
+        num_local_experts = configured_num_experts // ep_size
+        if expert_idx < num_local_experts:
+            return mpu.get_expert_model_parallel_rank() * num_local_experts + expert_idx
+        return expert_idx
+
     for td_key, entries in fused_layer_groups.items():
         td_meta = metadata.get(td_key)
         assert td_meta is not None, f"Missing metadata for fused key '{td_key}'"
         first_entry = entries[0]
         is_seq_mlp = len(first_entry) >= 4 and first_entry[-1] == "seq_mlp"
-        is_grouped_mlp = len(first_entry) >= 4 and not is_seq_mlp
+        is_grouped_mlp_per_layer = (
+            len(first_entry) >= 4 and first_entry[-1] == "grouped_mlp_per_layer"
+        )
+        is_grouped_mlp = (
+            len(first_entry) >= 4
+            and first_entry[-1] == "grouped_mlp_fused"
+            and not is_seq_mlp
+        )
 
         entries.sort(key=lambda x: x[2])  # sort by layer_idx / local_expert_idx
         example_val = entries[0][1]  # v2_val (model) or optimizer state tensor
@@ -1573,6 +1651,9 @@ def _load_torch_dist_into_megatron_fsdp_v2(
             fused_shape.insert(0, num_total_experts)
             num_local = len(entries)
             ep_rank = mpu.get_expert_model_parallel_rank()
+        elif is_grouped_mlp_per_layer:
+            num_experts = td_meta.size[0]
+            fused_shape.insert(0, num_experts)
         elif is_grouped_mlp:
             num_layers = td_meta.size[0]
             num_experts = td_meta.size[1]
@@ -1612,9 +1693,12 @@ def _load_torch_dist_into_megatron_fsdp_v2(
             if is_seq_mlp:
                 v2_key_or_param, v2_val, local_expert_idx = entry[:3]
                 chunk = flat[ep_rank * num_local + local_expert_idx]
+            elif is_grouped_mlp_per_layer:
+                v2_key_or_param, v2_val, expert_idx = entry[:3]
+                chunk = flat[_source_expert_index(expert_idx, num_experts)]
             elif is_grouped_mlp:
                 v2_key_or_param, v2_val, layer_idx, expert_idx = entry[:4]
-                chunk = flat[layer_idx, expert_idx]
+                chunk = flat[layer_idx, _source_expert_index(expert_idx, num_experts)]
             else:
                 v2_key_or_param, v2_val, layer_idx = entry[:3]
                 chunk = flat[layer_idx]
@@ -1637,7 +1721,7 @@ def _load_torch_dist_into_megatron_fsdp_v2(
             mapped_sd[v2_key_or_param] = v2_val
 
     # ---- Phase 5: Verify all v2 params & optimizer states were loaded ----
-    loaded = set(_canonicalize_td_key(k) for k in mapped_sd)
+    loaded = set(_strip_module_prefix(_canonicalize_td_key(k)) for k in mapped_sd)
     all_v2 = set(v2_by_canonical.keys())
     unloaded = all_v2 - loaded - {k for k in all_v2 if k.endswith("._extra_state")}
 
@@ -1679,5 +1763,8 @@ def _load_torch_dist_into_megatron_fsdp_v2(
             if "optimizer" in opt_common:
                 opt_common = opt_common["optimizer"]
     v2_state_dict.update(common_info)
+    v2_state_dict["model"] = raw_model_state_dict
+    if raw_optimizer_state_dict is not None:
+        v2_state_dict["optimizer"] = raw_optimizer_state_dict
 
     return v2_state_dict

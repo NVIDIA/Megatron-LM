@@ -33,7 +33,10 @@ import re
 import pytest
 import torch
 
-from megatron.core.distributed.fsdp.checkpoint import _detect_gdn_layers
+from megatron.core.distributed.fsdp.checkpoint import (
+    _build_torch_dist_to_v2_map,
+    _detect_gdn_layers,
+)
 from megatron.core.distributed.fsdp.checkpoint import _match_gdn_key as _match_gdn_key_v2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
@@ -327,6 +330,73 @@ class TestMTPKeyRenaming:
     def test_auto_detect_does_not_trigger_without_transformer_layer(self):
         keys = ["model.module.language_model.mtp.layers.0.mtp_model_layer.mlp.weight"]
         assert not self._should_auto_detect_mtp(keys)
+
+
+class TestTorchDistToMegatronFSDPV2Map:
+    """Regression coverage for torch_dist → Megatron FSDP v2 key mapping."""
+
+    @staticmethod
+    def _build(metadata_keys, v2_keys):
+        metadata = {key: object() for key in metadata_keys}
+        tensors = {key: torch.empty(1) for key in v2_keys}
+        regular_model, fused_layer_groups, _, _, _ = _build_torch_dist_to_v2_map(
+            metadata, tensors, {}
+        )
+        return tensors, regular_model, fused_layer_groups
+
+    def test_direct_mtp_transformer_layer_key_matches_v2_mtp_model_layer(self):
+        td_key = (
+            "language_model.mtp.layers.0.transformer_layer."
+            "mlp.shared_experts.linear_fc1.weight"
+        )
+        v2_key = (
+            "language_model.mtp.layers.0.mtp_model_layer."
+            "mlp.shared_experts.linear_fc1.weight"
+        )
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {td_key: tensors[v2_key]}
+        assert fused_layer_groups == {}
+
+    def test_grouped_mlp_per_layer_expert_key_matches_source_experts_tensor(self):
+        td_key = "language_model.decoder.layers.0.mlp.experts.experts.linear_fc1.weight"
+        v2_key = "language_model.decoder.layers.0.mlp.experts.linear_fc1.weight3"
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {}
+        assert fused_layer_groups == {
+            td_key: [(v2_key, tensors[v2_key], 3, "grouped_mlp_per_layer")]
+        }
+
+    def test_mtp_grouped_mlp_per_layer_key_preserves_transformer_layer_prefix(self):
+        td_key = (
+            "language_model.mtp.layers.0.transformer_layer."
+            "mlp.experts.experts.linear_fc1.weight"
+        )
+        v2_key = (
+            "language_model.mtp.layers.0.mtp_model_layer."
+            "mlp.experts.linear_fc1.weight7"
+        )
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {}
+        assert fused_layer_groups == {
+            td_key: [(v2_key, tensors[v2_key], 7, "grouped_mlp_per_layer")]
+        }
+
+    def test_grouped_mlp_fused_expert_key_still_matches_source_experts_tensor(self):
+        td_key = "language_model.decoder.layers.mlp.experts.experts.linear_fc1.weight"
+        v2_key = "language_model.decoder.layers.2.mlp.experts.linear_fc1.weight3"
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {}
+        assert fused_layer_groups == {
+            td_key: [(v2_key, tensors[v2_key], 2, 3, "grouped_mlp_fused")]
+        }
 
 
 # ============================================================================
