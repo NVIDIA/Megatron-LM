@@ -295,6 +295,9 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.use_megatron_fsdp_v2:
+            self.use_megatron_fsdp = True
+
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 

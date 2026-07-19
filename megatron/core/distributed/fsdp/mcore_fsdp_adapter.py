@@ -271,17 +271,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 "--ddp-average-in-collective is not supported with Megatron FSDP v2."
             )
 
-        # The legacy fallback intentionally imports a different fully_shard implementation.
-        # pylint: disable=possibly-used-before-assignment
-        if ddp_config.use_megatron_fsdp:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-                FullyShardFP8Policy,
-                FullyShardNVFP4Policy,
-                MixedPrecisionPolicy,
-            )
-        else:
-            from torch.distributed.fsdp import fully_shard
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+            FullyShardFP8Policy,
+            FullyShardNVFP4Policy,
+            MixedPrecisionPolicy,
+        )
 
         if (
             fsdp_unit_modules is None
@@ -317,7 +312,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 enabled=ddp_config.fp4_param_gather, recipe=config.fp4_recipe
             ),
         )
-        # pylint: enable=possibly-used-before-assignment
         kwargs = {
             "mp_policy": fully_shard_mp_policy,
             "enable_unshard_prefetch": ddp_config.overlap_param_gather,
