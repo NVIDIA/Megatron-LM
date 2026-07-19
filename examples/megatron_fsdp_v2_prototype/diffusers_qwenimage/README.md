@@ -164,31 +164,6 @@ The `--cuda-graph` option selects `TracePoolAllocator` internally. The explicit
 `--trace-pool` used for this measurement documents that allocator choice but
 does not select a different execution path.
 
-### Nsight Systems analysis
-
-Three additional steps were captured under Nsight Systems before and after the
-gradient-DTensor wrapper-reuse change. Profiler-instrumented timings are
-diagnostic and should not be compared directly with the 20-step performance
-table.
-
-| Metric | PyTorch FSDP1 | V2 before wrapper reuse | V2 with wrapper reuse |
-| --- | ---: | ---: | ---: |
-| Average GPU reduce-scatter start skew | 4.23 ms | 8.73 ms | 5.52 ms |
-| Maximum GPU reduce-scatter start skew | 5.42 ms | 357.24 ms | 6.12 ms |
-| Maximum delayed-rank `MFSDP reduce_grad` | N/A | 353.08 ms | 1.81 ms |
-| Peak memory | 75.39 GB | 74.67 GB | 74.66 GB |
-
-Rebuilding every gradient DTensor after lazy gradient-buffer release created a
-large Python object graph and, in the captured slow step, stalled one rank
-inside `MFSDP reduce_grad`. Reusing detached DTensor wrappers removes that stall
-without retaining their backing gradient storage. The maximum collective-start
-skew is now close to FSDP1.
-
-The CPU-side NCCL API arrival skew still grows gradually to approximately 39 ms
-across the backward pass. Because each `MFSDP reduce_grad` range remains below
-1.81 ms, the remaining drift occurs before the reduce-grad hook and is tracked
-separately from the wrapper-lifecycle fix.
-
 ## torch FSDP1 (reference API)
 
 ```python
