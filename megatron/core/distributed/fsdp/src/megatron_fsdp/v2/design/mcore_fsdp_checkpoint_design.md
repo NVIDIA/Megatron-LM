@@ -119,6 +119,26 @@ plain-tensor format expected by the underlying optimizer.
 | `megatron/core/optimizer/distrib_optimizer.py` | Produces and consumes the `fsdp_dtensor` optimizer state dict with name-keyed parameter state. |
 | `megatron/core/distributed/fsdp/mcore_fsdp_adapter.py` | Routes the FSDP v2 adapter state-dict calls and synchronizes module state after load. |
 
+### Distributed optimizer boundary
+
+`DistributedDataParallelConfig` makes `use_megatron_fsdp_v2=True` imply
+`use_megatron_fsdp=True`. `DistributedOptimizer` therefore uses
+`use_megatron_fsdp` for behavior shared by both M-FSDP generations, including
+skipping legacy gradient-buffer setup, accepting only the `fsdp_dtensor`
+sharding type, and loading state directly into the wrapped optimizer.
+
+Only format behavior unique to v2 checks `use_megatron_fsdp_v2`:
+
+- `state_dict()` returns the wrapped optimizer's complete state because the v2
+  DCP path consumes parameter state and group metadata together.
+- Parameter names remain aligned with the live v2 model. Expert-key remapping
+  is deferred to the v2 checkpoint adapter, alongside its other format
+  transformations.
+
+Keeping this boundary explicit prevents the common optimizer path from growing
+parallel `v1 or v2` conditions and makes v2-specific checkpoint behavior easy to
+locate.
+
 ## MCore postprocessing
 
 `_apply_mcore_postprocess(raw_state_dict, args, model)` is the v2 entry point for
