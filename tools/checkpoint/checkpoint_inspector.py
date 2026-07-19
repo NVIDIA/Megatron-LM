@@ -11,12 +11,12 @@ import gc
 import io
 import json
 import os
-from pathlib import Path
-import time
 import re
 import shutil
-from typing import Optional
 import tempfile
+import time
+from pathlib import Path
+from typing import Optional
 
 import click
 import torch
@@ -29,23 +29,22 @@ from torch.distributed.checkpoint import (
     FileSystemWriter,
 )
 from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
-from torch.distributed.checkpoint.metadata import (
-    BytesStorageMetadata,
-    TensorStorageMetadata,
-)
+from torch.distributed.checkpoint.metadata import BytesStorageMetadata, TensorStorageMetadata
 from torch.distributed.checkpoint.state_dict_saver import _save_state_dict
 from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, redistribute_uneven_dtensor_to_replicated
-
-from megatron.core.dist_checkpointing.strategies.common import load_common
+from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+from megatron.core.dist_checkpointing.strategies.common import load_common, save_common
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
-from megatron.core.dist_checkpointing.strategies.torch import (
-    TorchDistLoadShardedStrategy,
-)
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
 from megatron.core.dist_checkpointing.validation import verify_checkpoint
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    redistribute_uneven_dtensor_to_replicated,
+    split_dtensor,
+    uneven_dtensor_to_full_tensor,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 
@@ -939,6 +938,644 @@ def convert_torch_dist_to_fsdp_dtensor(
         param_to_param_group_map=param_to_param_group_map,
         rename_mtp_keys=rename_mtp_keys,
         swiglu_modules=_swiglu_modules,
+    )
+
+    click.echo(
+        click.style(
+            f"Converted checkpoint saved to {output_dir}.", fg="green", bold=True
+        )
+    )
+
+
+# ============================================================================
+# Reverse conversion: fsdp_dtensor -> torch_dist
+# ============================================================================
+#
+# This is the exact inverse of ``convert_checkpoint`` above. Whereas the forward
+# path loads native torch_dist tensors, *splits* stacked layers/experts and
+# SwiGLU fc1 weights, and re-prefixes keys into the Megatron-FSDP DTensor layout,
+# the reverse path loads the fsdp_dtensor store, *merges* those pieces back, and
+# rewrites native (bare) torch_dist keys.
+#
+# Key facts that make the reverse path simple and CPU-only:
+#   * PyTorch DCP records each tensor's full ``global_shape`` in metadata, so a
+#     plain single-rank ``dcp.load`` into ``torch.empty(global_shape)`` returns a
+#     fully-gathered tensor regardless of the TP/PP/EP/FSDP sharding it was
+#     written with (same trick as ``dist_checkpoint_io.load_dist_checkpoint_full``).
+#   * A native torch_dist checkpoint keys model weights by the *bare* mcore FQN
+#     (``ShardedTensor.key``) and optimizer state by
+#     ``optimizer.state.<subkey>.<param>``; mcore's load validates key + global
+#     shape, so the reverse must reproduce mcore's stacking (experts always
+#     stacked; dense layers stacked) but must NOT emit ``mcore_data`` /
+#     ``nd_reformulated_orig_global_shape`` (legacy/disabled).
+#
+# NOTE: resuming an N-D-parallel job *with optimizer state* from the produced
+# checkpoint requires ``--dist-ckpt-optim-fully-reshardable`` — that is the only
+# distributed-optimizer format whose on-disk layout is per-parameter and
+# model-shaped (what the fsdp checkpoint holds and what this tool emits).
+
+# mcore parameter FQNs never start with these; used to auto-detect prefixes.
+_FSDP_MODEL_PREFIX_DEFAULT = "model.module"
+
+_MTP_FSDP_INFIX = ".mtp_model_layer."
+_MTP_TORCH_DIST_INFIX = ".transformer_layer."
+# ``mtp.layers.`` at the start of a bare key or nested after a ``.``.
+_MTP_LAYERS_RE = re.compile(r"(^|\.)mtp\.layers\.")
+
+# First ``(weight|bias)[digits]`` immediately followed by the SwiGLU ``_w`` tag.
+_SWIGLU_W_RE = re.compile(r"((?:weight|bias)\d*)_w(.*)")
+# A grouped-expert parameter with a trailing expert index.
+_EXPERT_RE = re.compile(r"^(.*\.mlp\.experts\.linear_fc[12]\.(?:weight|bias))(\d+)$")
+# A per-layer parameter with an explicit layer index.
+_LAYER_RE = re.compile(r"^(.*\.layers)\.(\d+)\.(.+)$")
+
+
+def _strip_fsdp_model_prefix(key, configured_prefix=_FSDP_MODEL_PREFIX_DEFAULT):
+    """Return the bare mcore key for an fsdp model-weight key, else ``None``.
+
+    Strips the configured prefix when it matches; otherwise strips a leading
+    ``model.`` plus any run of ``module.`` wrappers (robust to wrapper depth).
+    Real mcore parameter FQNs never start with ``model.``/``module.``.
+    """
+    if configured_prefix and key.startswith(configured_prefix + "."):
+        rest = key[len(configured_prefix) + 1 :]
+    elif key.startswith("model."):
+        rest = key[len("model.") :]
+    else:
+        return None
+    while rest.startswith("module."):
+        rest = rest[len("module.") :]
+    return rest
+
+
+def _reverse_optimizer_state_key(key):
+    """Invert the forward optimizer-key remap.
+
+    fsdp:       ``optimizer.state.<module.>*<param_fqn>.<subkey>``
+    torch_dist: ``optimizer.state.<subkey>.<param_fqn>``
+
+    The trailing dotted token is the optimizer sub-state (``exp_avg`` /
+    ``exp_avg_sq`` / ``step`` / ...); the ``module.`` wrapper run is stripped.
+    """
+    assert key.startswith("optimizer.state."), key
+    rest = key[len("optimizer.state.") :]
+    while rest.startswith("module."):
+        rest = rest[len("module.") :]
+    param_fqn, subkey = rest.rsplit(".", 1)
+    return f"optimizer.state.{subkey}.{param_fqn}"
+
+
+def _in_swiglu_modules(key, modules):
+    """True if *key* is in one of the (optional) SwiGLU module scopes."""
+    if not modules:
+        return True
+    return any(f".{m}." in key or key.startswith(f"{m}.") for m in modules)
+
+
+def _reverse_mtp_keys(tensors):
+    """Rename ``mtp_model_layer`` back to ``transformer_layer`` in MTP keys."""
+    out = {}
+    renamed = 0
+    for key, value in tensors.items():
+        if _MTP_LAYERS_RE.search(key) and _MTP_FSDP_INFIX in key:
+            key = key.replace(_MTP_FSDP_INFIX, _MTP_TORCH_DIST_INFIX, 1)
+            renamed += 1
+        out[key] = value
+    return out, renamed
+
+
+def _merge_swiglu(tensors, swiglu_modules=None):
+    """Concatenate SwiGLU ``_w``/``_v`` fc1 pairs back into a single tensor.
+
+    Inverts ``split_swiglu_weight`` (``torch.chunk(..., 2, dim=0)``). Only fc1
+    keys carry the ``_w``/``_v`` tags, so this is unambiguous; the optional
+    ``swiglu_modules`` scope mirrors the forward ``--swiglu-modules`` filter.
+    """
+    out = dict(tensors)
+    merged = 0
+    for key in list(out.keys()):
+        if key not in out or ".linear_fc1." not in key:
+            continue
+        if _SWIGLU_W_RE.search(key) is None:
+            continue
+        if not _in_swiglu_modules(key, swiglu_modules):
+            continue
+        base_key = _SWIGLU_W_RE.sub(r"\1\2", key, count=1)
+        v_key = _SWIGLU_W_RE.sub(r"\1_v\2", key, count=1)
+        if v_key not in out:
+            continue  # unpaired _w — leave untouched
+        w = out.pop(key)
+        v = out.pop(v_key)
+        out[base_key] = torch.cat([w, v], dim=0)
+        merged += 1
+    return out, merged
+
+
+def _restack_experts(tensors):
+    """Stack per-expert ``...linear_fc{1,2}.weight{idx}`` into one axis-0 tensor.
+
+    Inverts ``split_expert_weights``. Output key re-inserts the doubled
+    ``experts.experts.`` segment used by SequentialMLP/TEGroupedMLP
+    sharded_state_dict, with global shape ``(num_global_experts, *param)``.
+    Applies uniformly to model and ``optimizer.state.*`` keys.
+    """
+    groups = {}
+    out = {}
+    for key, value in tensors.items():
+        m = _EXPERT_RE.match(key)
+        if m is None:
+            out[key] = value
+            continue
+        groups.setdefault(m.group(1), {})[int(m.group(2))] = value
+    restacked = 0
+    for stem, by_idx in groups.items():
+        n = len(by_idx)
+        assert set(by_idx) == set(range(n)), (
+            f"Expert indices for '{stem}' are not contiguous 0..{n - 1}: "
+            f"{sorted(by_idx)} — an incomplete or partially-gathered checkpoint?"
+        )
+        out_key = stem.replace(
+            ".mlp.experts.linear_fc", ".mlp.experts.experts.linear_fc", 1
+        )
+        out[out_key] = torch.stack([by_idx[i] for i in range(n)], dim=0)
+        restacked += 1
+    return out, restacked
+
+
+def _stack_layers(tensors):
+    """Stack per-layer ``...layers.{i}.<param>`` into one ``...layers.<param>``.
+
+    Inverts ``split_layers`` for dense/homogeneous blocks (global shape
+    ``(num_layers, *param)``). Raises if the block is heterogeneous (a param is
+    missing from some layers) so the caller can fall back to per-layer via
+    ``--non-homogeneous-layers``.
+    """
+    groups = {}
+    out = {}
+    prefix_idxs = {}
+    for key, value in tensors.items():
+        m = _LAYER_RE.match(key)
+        if m is None or _MTP_LAYERS_RE.search(key):
+            # Non-layer key, or an MTP layer (a separate block that mcore always
+            # stores per-layer) — leave untouched.
+            out[key] = value
+            continue
+        prefix, idx, suffix = m.group(1), int(m.group(2)), m.group(3)
+        groups.setdefault((prefix, suffix), {})[idx] = value
+        prefix_idxs.setdefault(prefix, set()).add(idx)
+    stacked_count = 0
+    for (prefix, suffix), by_idx in groups.items():
+        full = prefix_idxs[prefix]
+        if set(by_idx) != full:
+            raise ValueError(
+                f"Heterogeneous layers: '{suffix}' under '{prefix}' appears in "
+                f"layers {sorted(by_idx)} but the block spans {sorted(full)}. "
+                f"Re-run with --non-homogeneous-layers to keep per-layer keys."
+            )
+        n = max(full) + 1
+        assert sorted(full) == list(range(n)), (
+            f"Non-contiguous layers under '{prefix}': {sorted(full)}"
+        )
+        out[f"{prefix}.{suffix}"] = torch.stack([by_idx[i] for i in range(n)], dim=0)
+        stacked_count += 1
+    return out, stacked_count
+
+
+def _layers_are_homogeneous(keys):
+    """Whether the transformer block's decoder layers are stored *stacked*.
+
+    Mirrors ``TransformerBlock.sharded_state_dict`` (transformer_block.py:727-746):
+    a block is stored **per-layer** (non-homogeneous) only when its layers differ
+    in structure — interleaved MoE/dense (``moe_layer_freq > 1``), interleaved
+    linear-attention/attention (``linear_attention_freq > 1``), or heterogeneous
+    block specs. A **uniform** block — every layer identical, whether all-dense,
+    all-MoE (``moe_layer_freq == 1``), or all-linear-attention — is stored
+    **stacked** with a leading ``num_layers`` axis.
+
+    Model-free proxy for that config rule: group model-weight keys by layer index
+    and compare the index-stripped parameter-name sets. Identical across every
+    layer ⇒ homogeneous ⇒ stack. MTP layers (``mtp.layers.``) are a separate
+    block and never participate in the decoder-stacking decision.
+    """
+    per_prefix = {}  # layer-prefix -> {layer_idx: set(param-suffix)}
+    for key in keys:
+        if _MTP_LAYERS_RE.search(key):
+            continue
+        m = _LAYER_RE.match(key)
+        if m is None:
+            continue
+        prefix, idx, suffix = m.group(1), int(m.group(2)), m.group(3)
+        per_prefix.setdefault(prefix, {}).setdefault(idx, set()).add(suffix)
+    if not per_prefix:
+        return False  # nothing per-layer to stack (already stacked or no layers)
+    for by_idx in per_prefix.values():
+        suffix_sets = list(by_idx.values())
+        if any(s != suffix_sets[0] for s in suffix_sets[1:]):
+            return False  # layers differ in structure ⇒ non-homogeneous
+    return True
+
+
+def _unflatten(flat):
+    """Inverse of ``flatten``: rebuild nested dicts, ints-keyed dicts -> lists."""
+
+    def _lists_from_int_keys(obj):
+        if not isinstance(obj, dict):
+            return obj
+        obj = {k: _lists_from_int_keys(v) for k, v in obj.items()}
+        keys = list(obj.keys())
+        if keys and all(isinstance(k, str) and k.isdigit() for k in keys):
+            idxs = sorted(int(k) for k in keys)
+            if idxs == list(range(len(idxs))):
+                return [obj[str(i)] for i in range(len(idxs))]
+        return obj
+
+    root = {}
+    for key, value in flat.items():
+        parts = key.split(".")
+        node = root
+        for part in parts[:-1]:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[parts[-1]] = value
+    return _lists_from_int_keys(root)
+
+
+# mcore matches checkpoint param_groups to the freshly-built optimizer's groups by
+# this identifier tuple (optimizer.py:97; distrib_optimizer.py:894-912), so each
+# group necessarily has a distinct tuple — deduping by it reproduces the groups.
+_PARAM_GROUP_ID_KEYS = ("wd_mult", "lr_mult", "is_expert_parallel", "is_decoupled_lr")
+
+
+def _rebuild_param_groups_from_meta(param_meta_flat, meta_prefix):
+    """Reconstruct torch optimizer ``param_groups`` from Megatron-FSDP's map.
+
+    Megatron-FSDP stores optimizer hyperparameters **per parameter**
+    (``optimizer.param_to_group_meta.<param>.<attr>``) rather than as grouped
+    ``param_groups``. A classic (non-FSDP) load expects standard ``param_groups``
+    (distrib_optimizer.py:910) and matches checkpoint groups to the freshly-built
+    optimizer's groups by :data:`_PARAM_GROUP_ID_KEYS`, discarding the checkpoint's
+    ``params`` list. Group parameters by that identifier tuple and emit one group
+    per distinct tuple, carrying its full hyperparameters (lr, betas, eps, step, …).
+    """
+    per_param = {}  # param_fqn -> {attr: value}
+    for key, value in param_meta_flat.items():
+        rest = key[len(meta_prefix) :]
+        while rest.startswith("module."):
+            rest = rest[len("module.") :]
+        param_fqn, attr = rest.rsplit(".", 1)
+        per_param.setdefault(param_fqn, {})[attr] = value
+
+    groups = {}  # identifier tuple -> (representative meta, [param_fqns])
+    order = []
+    for param_fqn, meta in per_param.items():
+        ident = tuple(meta.get(k) for k in _PARAM_GROUP_ID_KEYS)
+        if ident not in groups:
+            groups[ident] = (meta, [])
+            order.append(ident)
+        groups[ident][1].append(param_fqn)
+
+    param_groups = []
+    next_index = 0
+    for ident in order:
+        meta, params = groups[ident]
+        group = dict(meta)
+        # ``params`` is discarded on load (distrib_optimizer.py:918) — emit standard
+        # contiguous integer indices purely for on-disk format fidelity.
+        group["params"] = list(range(next_index, next_index + len(params)))
+        next_index += len(params)
+        param_groups.append(group)
+    return param_groups
+
+
+def _model_param_dtype(args):
+    """Training compute dtype for model-section weights, read from saved ``args``.
+
+    mcore stores model weights in the compute dtype (bf16/fp16) while the
+    optimizer keeps fp32 masters. Returns ``None`` when ``args`` is unavailable
+    (leave tensors as-is).
+    """
+    if args is None:
+        return None
+    if getattr(args, "bf16", False):
+        return torch.bfloat16
+    if getattr(args, "fp16", False):
+        return torch.float16
+    return torch.float32
+
+
+def _ensure_cpu_process_group():
+    """Initialize a 1-rank gloo group if none is up (reverse path is CPU-only)."""
+    if dist.is_initialized():
+        return
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    dist.init_process_group(
+        backend="gloo",
+        rank=int(os.getenv("RANK", "0")),
+        world_size=int(os.getenv("WORLD_SIZE", "1")),
+    )
+
+
+def reverse_convert_checkpoint(
+    input_dir,
+    output_dir,
+    swiglu_modules=None,
+    stack_layers=None,
+    include_optimizer=True,
+    input_model_weight_prefix=_FSDP_MODEL_PREFIX_DEFAULT,
+    output_model_weight_prefix="",
+):
+    """Convert a Megatron-FSDP ``fsdp_dtensor`` checkpoint to ``torch_dist``.
+
+    Args:
+        input_dir: fsdp_dtensor checkpoint directory (a single DCP store).
+        output_dir: destination torch_dist checkpoint directory.
+        swiglu_modules: optional list of module scopes to restrict SwiGLU
+            ``_w``/``_v`` merging to (default: merge every fc1 pair found).
+        stack_layers: tri-state layer-stacking control. ``None`` auto-detects
+            via :func:`_layers_are_homogeneous` (stack when every decoder layer is
+            structurally identical — all-dense or all-MoE — keep per-layer when
+            layers differ, e.g. interleaved MoE/dense or linear-attention/GDN);
+            ``True`` forces stacking; ``False`` forces per-layer.
+        include_optimizer: also convert ``optimizer.state.*`` tensors.
+        input_model_weight_prefix: fsdp model-weight prefix to strip.
+        output_model_weight_prefix: prefix to write for model weights (bare "").
+    """
+    _ensure_cpu_process_group()
+
+    # ---- 1. Load the fsdp store into fully-gathered CPU tensors ----------
+    reader = FileSystemReader(input_dir)
+    metadata = reader.read_metadata()
+    load_dict = {}
+    for key, md in metadata.state_dict_metadata.items():
+        if isinstance(md, TensorStorageMetadata):
+            load_dict[key] = torch.empty(md.size, dtype=md.properties.dtype, device="cpu")
+        elif isinstance(md, BytesStorageMetadata):
+            load_dict[key] = io.BytesIO()
+        else:
+            raise NotImplementedError(f"Unsupported metadata type: {type(md)}")
+
+    start_time = time.time()
+    dcp.load(load_dict, storage_reader=reader, planner=DefaultLoadPlanner())
+    rank0_echo(f"[Load] Loaded fsdp_dtensor store in {time.time() - start_time:.2f}s.")
+
+    # ---- 2. Classify keys into model / optimizer tensors and common state -
+    # DCP restores tensor items as ``torch.Tensor`` and byte items as their
+    # deserialized Python object (or a ``BytesIO``); classify on the value type.
+    tensors = {}  # canonical (bare model | optimizer.state.<subkey>.<param>) -> tensor
+    common_flat = {}
+    param_meta_flat = {}  # optimizer.param_to_group_meta.* (fsdp-native)
+    n_skipped_extra_state = 0
+    for key, value in load_dict.items():
+        if "_extra_state" in key:
+            n_skipped_extra_state += 1
+            continue
+        if key.startswith("rng_state") or key.startswith("rerun_state_machine"):
+            continue  # RNG is re-seedable; rerun state is optional on load.
+        if isinstance(value, torch.Tensor):
+            bare = _strip_fsdp_model_prefix(key, input_model_weight_prefix)
+            if bare is not None:
+                tensors[bare] = value
+            elif key.startswith("optimizer.state."):
+                if include_optimizer:
+                    tensors[_reverse_optimizer_state_key(key)] = value
+            else:
+                rank0_echo(
+                    click.style(f"[Warn] Unclassified tensor key dropped: {key}", fg="yellow")
+                )
+            continue
+        # Non-tensor: common state (args, param_groups, checkpoint_version, ...).
+        if isinstance(value, io.BytesIO):
+            value.seek(0)
+            value = torch.load(value, weights_only=False)
+        if key.startswith("optimizer.param_to_group_meta."):
+            # fsdp-native per-parameter optimizer config; reconstructed into
+            # standard param_groups below (a classic load needs param_groups).
+            if include_optimizer:
+                param_meta_flat[key] = value
+            continue
+        common_flat[key] = value
+
+    # ---- 2b. Reconstruct fp32 optimizer masters + downcast the model section --
+    # Megatron-FSDP stores fp32 model weights (they *are* the optimizer masters)
+    # and no separate master copy. mcore's fully_reshardable torch_dist optimizer
+    # instead expects, per trainable parameter, a fp32 master under
+    # ``optimizer.state.param.<fqn>`` *plus* a model-section weight in the training
+    # compute dtype (bf16/fp16). Synthesize the master from each fp32 model weight
+    # that carries optimizer moments, then downcast the model section. Done here
+    # (pre-transform, in the fsdp-split key space) so the master rides through the
+    # SwiGLU/expert/layer transforms identically to ``exp_avg``. A checkpoint that
+    # already carries masters (e.g. produced by the forward converter) is left
+    # untouched. ``.contiguous()`` protects the later single-chunk write.
+    n_masters = 0
+    if include_optimizer and not any(k.startswith("optimizer.state.param.") for k in tensors):
+        for key in list(tensors):
+            if not key.startswith("optimizer.state.exp_avg."):
+                continue
+            fqn = key[len("optimizer.state.exp_avg.") :]
+            master = tensors.get(fqn)
+            if master is not None:
+                tensors[f"optimizer.state.param.{fqn}"] = master.detach().clone()
+                n_masters += 1
+    model_dtype = _model_param_dtype(common_flat.get("args"))
+    if model_dtype is not None and model_dtype != torch.float32:
+        for key in list(tensors):
+            value = tensors[key]
+            if (
+                not key.startswith("optimizer.")
+                and isinstance(value, torch.Tensor)
+                and value.dtype == torch.float32
+            ):
+                tensors[key] = value.to(model_dtype)
+
+    # ---- 3. Apply the inverse transforms (order mirrors the forward split) -
+    tensors, n_mtp = _reverse_mtp_keys(tensors)
+    tensors, n_swiglu = _merge_swiglu(tensors, swiglu_modules)
+    tensors, n_experts = _restack_experts(tensors)
+
+    model_keys = [k for k in tensors if not k.startswith("optimizer.")]
+    do_stack = stack_layers if stack_layers is not None else _layers_are_homogeneous(model_keys)
+    if do_stack:
+        tensors, n_layers = _stack_layers(tensors)
+    else:
+        n_layers = 0
+
+    rank0_echo(
+        f"[Convert] mtp={n_mtp} swiglu={n_swiglu} experts={n_experts} "
+        f"layer-stacks={n_layers} masters={n_masters} "
+        f"extra_state-dropped={n_skipped_extra_state} "
+        f"layout={'stacked' if do_stack else 'per-layer'}"
+    )
+
+    # ---- 4. Rebuild common.pt (unflatten; drop rerun/rng; pin version) -----
+    # Invert the forward converter's chained-optimizer flattening: mcore wraps
+    # the DistributedOptimizer in a ChainedOptimizer, so its common state nests
+    # ``optimizer.optimizer.param_groups`` (the forward collapsed the doubled
+    # ``optimizer.`` to a single one).
+    renamed_common = {}
+    for key, value in common_flat.items():
+        if key.startswith("optimizer.param_groups."):
+            key = key.replace("optimizer.param_groups.", "optimizer.optimizer.param_groups.", 1)
+        renamed_common[key] = value
+    common_state = _unflatten(renamed_common)
+    common_state.setdefault("checkpoint_version", 3.0)
+
+    # mcore's load reads the distributed-optimizer sharding type from the
+    # checkpoint's *content metadata* (``dist_checkpointing.load_content_metadata``,
+    # stored under ``common['content_metadata']``). Without it, a classic
+    # (non-FSDP) load defaults to the unsupported ``fully_sharded_model_space``
+    # and raises "ShardedTensor.flattened_range is not supported.". Emit the
+    # ``fully_reshardable`` content metadata (mirrors ``_build_sharded_state_dict_metadata``)
+    # so the converted torch_dist checkpoint loads as fully_reshardable — the one
+    # format whose on-disk layout matches what this tool writes.
+    common_state["content_metadata"] = {
+        "distrib_optim_sharding_type": "fully_reshardable",
+        "distrib_optim_fully_reshardable_mem_efficient": False,
+        "singleton_local_shards": False,
+        "chained_optim_avoid_prefix": True,
+    }
+
+    # Real Megatron-FSDP checkpoints store a per-parameter ``param_to_group_meta``
+    # map instead of grouped ``param_groups``; a classic load needs the latter.
+    # Rebuild it into the ChainedOptimizer(DistributedOptimizer) nesting mcore
+    # expects: ``common['optimizer']['optimizer']['param_groups']``
+    # (optimizer.py:1382 -> distrib_optimizer.py:910), a sibling of the sharding
+    # type. Forward-converted checkpoints already carry param_groups (handled by
+    # the re-nesting above) and produce no ``param_meta_flat``.
+    if include_optimizer and param_meta_flat:
+        param_groups = _rebuild_param_groups_from_meta(
+            param_meta_flat, "optimizer.param_to_group_meta."
+        )
+        common_state["optimizer"] = {
+            "optimizer": {"param_groups": param_groups},
+            "param_state_sharding_type": "fully_reshardable",
+        }
+
+    # ---- 5. Write the torch_dist checkpoint (bare keys, no mcore_data) ------
+    if output_model_weight_prefix:
+        tensors = {f"{output_model_weight_prefix}.{k}": v for k, v in tensors.items()}
+    for key in tensors:
+        if not tensors[key].is_contiguous():
+            tensors[key] = tensors[key].contiguous()
+
+    os.makedirs(output_dir, exist_ok=True)
+    save_checkpoint_with_pickle_protocol(tensors, output_dir)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        if common_state:
+            save_common(common_state, output_dir)
+        save_config(CheckpointingConfig(sharded_backend="torch_dist"), output_dir)
+    if dist.is_initialized():
+        dist.barrier()
+
+
+@cli.command()
+@click.argument("input_dir", type=click.Path(exists=True))
+@click.argument("output_dir", type=click.Path())
+@click.option(
+    "--swiglu-modules",
+    type=str,
+    default=None,
+    help="Comma-separated module scopes to restrict SwiGLU _w/_v merging to "
+    "(e.g. 'language_model'). Default: merge every fc1 _w/_v pair found.",
+)
+@click.option(
+    "--stack-layers/--non-homogeneous-layers",
+    "stack_layers",
+    default=None,
+    help="Force a stacked or per-layer torch_dist layout. Default: auto-detect — "
+    "stack when every decoder layer is structurally identical (all-dense or "
+    "all-MoE), keep per-layer when layers differ (interleaved MoE/dense or GDN).",
+)
+@click.option(
+    "--no-optimizer",
+    is_flag=True,
+    help="Convert model weights only; skip optimizer state.",
+)
+@click.option(
+    "--input-model-weight-prefix",
+    default=_FSDP_MODEL_PREFIX_DEFAULT,
+    help="fsdp model-weight key prefix to strip (default: 'model.module').",
+)
+@click.option(
+    "--output-model-weight-prefix",
+    default="",
+    help="Prefix to write for model-weight keys (default: '' — bare mcore keys, "
+    "which is what a native torch_dist checkpoint uses).",
+)
+@click.option("--enable-msc", is_flag=True, help="Enable MultiStorageClient feature.")
+def convert_fsdp_dtensor_to_torch_dist(
+    input_dir,
+    output_dir,
+    swiglu_modules,
+    stack_layers,
+    no_optimizer,
+    input_model_weight_prefix,
+    output_model_weight_prefix,
+    enable_msc,
+):
+    """Convert a Megatron-FSDP fsdp_dtensor checkpoint to torch_dist format.
+
+    \b
+    This is the inverse of ``convert-torch-dist-to-fsdp-dtensor``: it merges the
+    SwiGLU ``_w``/``_v`` fc1 pairs, re-stacks per-expert (and, for dense models,
+    per-layer) tensors into mcore's native stacked layout, renames MTP keys back
+    to ``transformer_layer``, strips the FSDP wrapper prefixes, and rewrites
+    native (bare) torch_dist keys plus ``common.pt`` / ``metadata.json``.
+
+    \b
+    IMPORTANT — optimizer resume
+    ============================
+    To resume an N-D-parallel (TP/PP/EP) job *with optimizer state* from the
+    produced checkpoint, the resuming job must set:
+
+    \b
+      --dist-ckpt-optim-fully-reshardable
+
+    That is the only distributed-optimizer checkpoint format whose on-disk
+    layout is per-parameter and model-shaped — exactly what the fsdp_dtensor
+    checkpoint holds and what this tool emits. FP8 ``_extra_state`` is not
+    round-tripped (it was already discarded when the fsdp checkpoint was made),
+    so this path targets bf16/fp32 checkpoints.
+
+    \b
+    Examples
+    ========
+    Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
+
+    \b
+      python checkpoint_inspector.py \\
+        convert-fsdp-dtensor-to-torch-dist \\
+        /path/to/fsdp_dtensor /path/to/torch_dist \\
+        --swiglu-modules language_model
+
+    \b
+    Dense model (layers auto-stacked):
+
+    \b
+      python checkpoint_inspector.py \\
+        convert-fsdp-dtensor-to-torch-dist \\
+        /path/to/fsdp_dtensor /path/to/torch_dist
+    """
+    if not enable_msc:
+        MultiStorageClientFeature.disable()
+
+    _swiglu_modules = (
+        [m.strip() for m in swiglu_modules.split(",") if m.strip()]
+        if swiglu_modules is not None
+        else None
+    )
+
+    reverse_convert_checkpoint(
+        Path(input_dir),
+        Path(output_dir),
+        swiglu_modules=_swiglu_modules,
+        stack_layers=stack_layers,
+        include_optimizer=not no_optimizer,
+        input_model_weight_prefix=input_model_weight_prefix,
+        output_model_weight_prefix=output_model_weight_prefix,
     )
 
     click.echo(
