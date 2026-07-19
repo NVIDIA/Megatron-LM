@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
 import inspect
@@ -1024,16 +1024,16 @@ class TorchDistLoadShardedStrategy:
             except AttributeError:
                 os.sync()
         ## move the old metadata
-        fs_writer.fs.rename(fs_writer.metadata_path, old_path)
+        fs_writer.fs.rename(metadata_filename, old_path)
         try:
             ## rename the new metadata
-            fs_writer.fs.rename(tmp_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(tmp_path, metadata_filename)
 
             ## finally, remove the files we want to drop
             for f in files_to_remove:
-                fs_writer.fs.rm_file(checkpoint_dir / f)
+                fs_writer.fs.rm_file(Path(checkpoint_dir) / f)
         except Exception as e:
-            fs_writer.fs.rename(old_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(old_path, metadata_filename)
             raise e
         else:
             fs_writer.fs.rm_file(old_path)
