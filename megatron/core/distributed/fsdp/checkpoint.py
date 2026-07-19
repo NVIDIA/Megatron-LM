@@ -417,26 +417,56 @@ def handle_swiglu_in_state_dict_v2(
 # GDN key patterns and helpers
 # ------------------------------------------------------------------
 
+GDN_IN_PROJ_NAMES = ["query", "key", "value", "z", "beta", "alpha"]
 GDN_CONV1D_NAMES = ["query", "key", "value"]
 
-_GDN_KEY_PATTERNS = [
-    r"(.*)\.self_attention\.linear_proj\.weight$",
-    r"(.*)\.self_attention\.linear_qkv\.weight$",
-    r"(.*)\.self_attention\.linear_qkv\.bias$",
-]
+
+def _detect_gdn_layers(model: nn.Module) -> dict:
+    """Return ``{layer_path: split_info}`` for GatedDeltaNet modules."""
+    gdn_info = {}
+    for name, module in model.named_modules():
+        if not (
+            hasattr(module, 'qk_dim_local_tp')
+            and hasattr(module, 'v_dim_local_tp')
+            and hasattr(module, 'num_value_heads')
+            and hasattr(module, 'tp_size')
+        ):
+            continue
+        gdn_info[_strip_wrappers(name)] = {
+            "in_proj_sizes": [
+                module.qk_dim_local_tp,
+                module.qk_dim_local_tp,
+                module.v_dim_local_tp,
+                module.v_dim_local_tp,
+                module.num_value_heads // module.tp_size,
+                module.num_value_heads // module.tp_size,
+            ],
+            "conv1d_sizes": [module.qk_dim_local_tp, module.qk_dim_local_tp, module.v_dim_local_tp],
+        }
+    return gdn_info
 
 
-def _match_gdn_key(key: str, dtensor: DTensor):
-    for pat in _GDN_KEY_PATTERNS:
-        m = re.match(pat, key)
-        if m:
-            dim = 0
-            size = dtensor.shape[dim]
-            assert (
-                size % 3 == 0
-            ), f"Expected GDN projection size divisible by 3, got {size} for key {key}"
-            qkv_size = size // 3
-            return [qkv_size, qkv_size, qkv_size], GDN_CONV1D_NAMES, dim
+def _match_gdn_key(key: str, dtensor: DTensor, gdn_info: Optional[dict] = None):
+    """Return GDN split metadata for ``key`` or ``None`` if it is not a GDN fused key."""
+    if not gdn_info:
+        return None
+    norm = _strip_wrappers(key)
+    for gdn_path, info in gdn_info.items():
+        if not norm.startswith(gdn_path + '.'):
+            continue
+        rel = norm[len(gdn_path) + 1 :]
+        if rel == "in_proj.weight":
+            expected = sum(info["in_proj_sizes"])
+            assert dtensor.shape[0] == expected, (
+                f"Expected GDN in_proj size {expected}, got {dtensor.shape[0]} for key {key}"
+            )
+            return info["in_proj_sizes"], GDN_IN_PROJ_NAMES, 0
+        if rel in ("conv1d.weight", "conv1d.bias"):
+            expected = sum(info["conv1d_sizes"])
+            assert dtensor.shape[0] == expected, (
+                f"Expected GDN conv1d size {expected}, got {dtensor.shape[0]} for key {key}"
+            )
+            return info["conv1d_sizes"], GDN_CONV1D_NAMES, 0
     return None
 
 
@@ -447,11 +477,18 @@ def handle_gdn_in_state_dict_v2(
 
     Megatron FSDP v2 version.  Delegates to :func:`_split_fused_params_v2`.
     """
+    gdn_info = _detect_gdn_layers(model)
+    if not gdn_info:
+        return model_state_dict, optimizer_state_dict
+
+    def detector(key, dtensor, _model):
+        return _match_gdn_key(key, dtensor, gdn_info)
+
     return _split_fused_params_v2(
         model,
         model_state_dict,
         optimizer_state_dict,
-        _match_gdn_key,
+        detector,
         lambda k, s: f"{k}.{s}",
         "GDN v2",
     )

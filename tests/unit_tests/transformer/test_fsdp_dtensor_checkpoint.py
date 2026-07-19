@@ -33,6 +33,7 @@ import re
 import pytest
 import torch
 
+from megatron.core.distributed.fsdp.checkpoint import _detect_gdn_layers
 from megatron.core.distributed.fsdp.checkpoint import _match_gdn_key as _match_gdn_key_v2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
@@ -528,15 +529,67 @@ class TestGDNKeyMatching:
 class TestMegatronFSDPV2GDNKeyMatching:
     """Regression coverage for Megatron FSDP v2 GDN key matching."""
 
-    def test_match_gdn_key_uses_shape_dimension(self):
-        tensor = torch.empty(6, 4)
+    class FakeGDN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qk_dim_local_tp = 2
+            self.v_dim_local_tp = 4
+            self.num_value_heads = 2
+            self.tp_size = 1
 
-        result = _match_gdn_key_v2(
-            "decoder.layers.0.self_attention.linear_qkv.weight",
-            tensor,
+    def test_detect_gdn_layers_uses_gdn_module_attrs(self):
+        model = torch.nn.Module()
+        model.decoder = torch.nn.Module()
+        model.decoder.layer = torch.nn.Module()
+        model.decoder.layer.self_attention = self.FakeGDN()
+
+        gdn_info = _detect_gdn_layers(model)
+
+        assert gdn_info == {
+            "decoder.layer.self_attention": {
+                "in_proj_sizes": [2, 2, 4, 4, 2, 2],
+                "conv1d_sizes": [2, 2, 4],
+            }
+        }
+
+    def test_match_gdn_key_uses_real_gdn_keys(self):
+        gdn_info = {
+            "decoder.layers.0.self_attention": {
+                "in_proj_sizes": [2, 2, 4, 4, 2, 2],
+                "conv1d_sizes": [2, 2, 4],
+            }
+        }
+
+        in_proj = _match_gdn_key_v2(
+            "module.decoder.layers.0.self_attention.in_proj.weight",
+            torch.empty(16, 4),
+            gdn_info,
+        )
+        conv1d = _match_gdn_key_v2(
+            "module.decoder.layers.0.self_attention.conv1d.weight",
+            torch.empty(8, 1, 4),
+            gdn_info,
         )
 
-        assert result == ([2, 2, 2], ["query", "key", "value"], 0)
+        assert in_proj == ([2, 2, 4, 4, 2, 2], ["query", "key", "value", "z", "beta", "alpha"], 0)
+        assert conv1d == ([2, 2, 4], ["query", "key", "value"], 0)
+
+    def test_match_gdn_key_ignores_attention_projection_keys(self):
+        gdn_info = {
+            "decoder.layers.0.self_attention.gdn": {
+                "in_proj_sizes": [2, 2, 4, 4, 2, 2],
+                "conv1d_sizes": [2, 2, 4],
+            }
+        }
+
+        assert (
+            _match_gdn_key_v2(
+                "decoder.layers.0.self_attention.linear_qkv.weight",
+                torch.empty(16, 4),
+                gdn_info,
+            )
+            is None
+        )
 
 
 class TestGDNFSDPTensorParallelMetadata:
