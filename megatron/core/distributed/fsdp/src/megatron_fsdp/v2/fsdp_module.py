@@ -1089,65 +1089,6 @@ class FSDPModule:
         # this method. Whichever installs the weights first consumes the work.
         self._fsdp_root_context.model_weight_refresh_pending = False
 
-    def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
-        """
-        Compute per-parameter L2 norms for params and grads.
-
-        Returns {param_name: {"param_norm": float, "grad_norm": float}}.
-        Sharded DTensor squared norms are all-reduced across the DP group;
-        replicated no-shard norms are computed from the local full tensor.
-        """
-        results = {}
-        reduce_norms = {}
-        dp_group = None
-
-        for module_name, child in self.named_modules():
-            if not isinstance(child, FSDPModule):
-                continue
-            for param_names, param_group in child._named_param_groups:
-                if dp_group is None and param_group.dp_group is not None:
-                    dp_group = param_group.dp_group
-                for param_name, dist_param, dist_grad in zip(
-                    param_names, param_group.dist_params, param_group.dist_grads
-                ):
-                    full_name = f"{module_name}.{param_name}" if module_name else param_name
-                    results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
-                    reduce_norms[full_name] = param_group.sharding_strategy != "no_shard"
-                    if dist_param._local_tensor.numel() > 0:
-                        results[full_name]["param_norm"] = (
-                            dist_param._local_tensor.float().norm(p=2).item() ** 2
-                        )
-                    if dist_grad is not None and dist_grad._local_tensor.numel() > 0:
-                        results[full_name]["grad_norm"] = (
-                            dist_grad._local_tensor.float().norm(p=2).item() ** 2
-                        )
-
-        if dp_group is not None:
-            for param_name in results:
-                if not reduce_norms[param_name]:
-                    for key in ("param_norm", "grad_norm"):
-                        results[param_name][key] = results[param_name][key] ** 0.5
-                    continue
-                for key in ("param_norm", "grad_norm"):
-                    value = torch.tensor([results[param_name][key]], device="cuda")
-                    torch.distributed.all_reduce(value, group=dp_group)
-                    results[param_name][key] = value.sqrt().item()
-
-        return results
-
-    def _log_per_param_norms(self, iteration: int, prefix: str = ""):
-        """Log per-parameter param and gradient L2 norms on rank 0."""
-        norms = self._compute_per_param_norms()
-        if torch.distributed.get_rank() != 0:
-            return
-        for param_name in sorted(norms.keys()):
-            param_norm = norms[param_name]["param_norm"]
-            grad_norm = norms[param_name]["grad_norm"]
-            logger.info(
-                f"{prefix} iter={iteration} param={param_name} "
-                f"param_norm={param_norm:.6f} grad_norm={grad_norm:.6f}"
-            )
-
     def _log_parameter_groups(self):
         """Print a compact summary of rewrite-path FSDP parameter groups."""
 
