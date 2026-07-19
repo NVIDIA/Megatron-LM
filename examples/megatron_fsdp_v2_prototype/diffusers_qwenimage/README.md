@@ -69,6 +69,21 @@ torchrun --nproc_per_node=4 test_qwenimage.py \
   --attention flash --compile --bench_steps 20 --warmup_steps 3
 ```
 
+### Megatron-FSDP v2 with CUDA graphs
+
+CUDA graphs are available only with the `mfsdpv2` backend. Enabling CUDA
+graphs automatically selects `TracePoolAllocator`; `--trace-pool` is therefore
+not required in the CUDA-graph command.
+
+```bash
+torchrun --nproc_per_node=4 test_qwenimage.py \
+  --backend mfsdpv2 --sharding full \
+  --pretrained_model_name_or_path /tmp/qwen-image \
+  --num_gpus_per_node 4 --batch_size 4 --height 512 --width 512 \
+  --attention flash --compile --cuda-graph \
+  --bench_steps 20 --warmup_steps 3 --real-data
+```
+
 ### Single node, 8 GPU (hybrid shard)
 
 ```bash
@@ -101,19 +116,75 @@ torchrun --nnodes=$NNODES --node_rank=$NODE_RANK \
   --attention _flash_3 --compile --bench_steps 20 --warmup_steps 3
 ```
 
-## Benchmarks
+## Benchmark results
 
-`QwenImageTransformer2DModel`, `bs=4`, `512×512`, `bf16`, `torch.compile`, FA2.
-`[mfsdpv2+cg]` uses `--cuda-graph --trace-pool`.
+The following comparison uses one reproducible configuration for both
+backends. It was measured at commit `c2e9b8e00700` after the lazy distributed
+gradient-storage fix.
 
-| Backend | 8×H100 | 4×GB200 |
-|---------|--------|---------|
-| **fsdp1** | 729 ms / 60.2 GB | 679 ms / 75.4 GB |
-| **mfsdpv2** | 769 ms / 59.3 GB | 647 ms / 74.7 GB |
-| **mfsdpv2+cg** | **674 ms** / 68.3 GB | **364 ms** / 88.7 GB |
+| Setting | Value |
+| --- | --- |
+| Hardware | 4×GB200 |
+| Model | Pretrained 60-block `QwenImageTransformer2DModel` |
+| Data | Real-data training path |
+| Sharding | Full shard |
+| Per-rank batch size | 4 |
+| Image size | 512×512 |
+| Precision and attention | BF16, FlashAttention 2 |
+| Compilation | Per-block `torch.compile` |
+| Measurement | 3 warmup steps + 20 measured steps |
 
-CG delivers **11% faster** on H100 and **44% faster** on GB200 at the cost
-of higher peak memory (pool-backed graph buffers).
+### Eager performance and convergence
+
+| Backend | Average step | Median step | Peak memory | Final / initial loss |
+| --- | ---: | ---: | ---: | ---: |
+| PyTorch FSDP1 | **521.70 ms** | **521.46 ms** | 75.39 GB | 0.641 |
+| Megatron-FSDP v2 | 592.67 ms | 552.33 ms | **74.67 GB** | 0.636 |
+
+Both runs pass the 20-step convergence threshold of 0.7. V2 uses 0.72 GB less
+peak memory and is 5.9% slower by median step time. Two approximately 0.9-second
+v2 outliers widen the average-time gap to 13.6%; both values are retained so
+the result does not hide the tail behavior. The memory result confirms that v2
+does not retain an additional main-weight buffer and that unused lazy gradient
+storage is released before the next unshard.
+
+### CUDA graph validation
+
+CUDA graph capture was also tested at the same commit. Both invocations reach
+the first warmup step and record all 60 transformer blocks, but fail while
+constructing the static gradient buffers, before any measured iteration.
+
+| Invocation | Result |
+| --- | --- |
+| `--cuda-graph` | Failed during graph capture |
+| `--cuda-graph --trace-pool` | Failed during graph capture |
+
+Both variants report `TracePoolAllocator slot collision` while
+`get_main_grad()` allocates a `main_grad` buffer. This is the same path because
+CUDA graphs enable the trace-pool allocator internally. No performance number
+is reported for CUDA graphs until the traced and replayed gradient-buffer
+lifetimes agree.
+
+### Nsight Systems analysis
+
+Three additional steps were captured under Nsight Systems with the same model
+and runtime configuration. Profiler-instrumented timings are diagnostic and
+should not be compared directly with the 20-step performance table.
+
+| Per-rank metric | PyTorch FSDP1 | Megatron-FSDP v2 |
+| --- | ---: | ---: |
+| Forward | 252.84 ms | 256.56 ms |
+| Backward | 415.52 ms | 520.79 ms |
+| Optimizer | 5.79 ms | 17.02 ms |
+| Maximum reduce-scatter start skew | 5.42 ms | 357.24 ms |
+
+The slow v2 step is caused by cross-rank launch skew rather than lower
+collective bandwidth. One rank remains in a single `MFSDP reduce_grad` CPU
+range for 353.08 ms before launching reduce-scatter collective 115. The other
+three ranks enter about 357 ms earlier and wait inside NCCL; their kernels last
+approximately 358 ms while the late rank's kernel lasts 0.88 ms. Python-side
+work before `param_group.reduce_grad()` is therefore the primary optimization
+target.
 
 ## torch FSDP1 (reference API)
 

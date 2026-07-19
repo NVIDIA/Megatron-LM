@@ -72,3 +72,21 @@ torchrun --standalone --nproc_per_node=2 \
 | `--record-memory-history DIR` | unset | Write one CUDA memory snapshot per rank. |
 
 Use `--help` for the complete option list.
+
+## Validation results
+
+The example was exercised on four GB200 GPUs. Each performance case used 100
+measured steps after warmup.
+
+| Backend | Average step | Samples/s | Peak allocated |
+| --- | ---: | ---: | ---: |
+| PyTorch FSDP2, full shard | 13.05 ms | 2,453 | 0.96 GB |
+| Megatron-FSDP v2, full shard | 11.57 ms | 2,766 | 1.01 GB |
+| Megatron-FSDP v2, CUDA graph + trace pool | **9.22 ms** | **3,471** | 1.32 GB |
+| Megatron-FSDP v2, HSDP | 12.12 ms | 2,640 | 1.16 GB |
+
+The deterministic BF16 HSDP correctness check was repeated at exact commit
+`5d0cef0c18a9`, which is included in `mfsdp_refactor`. Full sharding ended at
+loss `6.1461e-5` and HSDP at `6.1469e-5`; the absolute difference was `8e-9`
+against a `1e-7` limit. Both runs started at `1.3577e-3` and reached a
+final/initial ratio of `0.045`.

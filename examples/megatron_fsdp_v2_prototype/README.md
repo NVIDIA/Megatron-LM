@@ -8,6 +8,9 @@ These examples exercise prototype APIs and may change as Megatron-FSDP v2
 evolves. For the established Megatron-FSDP training and checkpoint-conversion
 examples, see [`examples/megatron_fsdp`](../megatron_fsdp/README.md).
 
+Measured GB200 performance and real-data convergence results are collected in
+[`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md).
+
 ## Examples
 
 | Example | Description |
