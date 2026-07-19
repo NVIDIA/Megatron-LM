@@ -1053,7 +1053,15 @@ class FSDPModule:
 
         If any gradient is still live, the model may be between accumulated
         microbatches, so this method leaves every group untouched.
+
+        Full-iteration CUDA graph mode owns stable optimizer-facing gradient
+        storage across iterations. Its zeroing is part of the graph-compatible
+        optimizer lifecycle, so this eager root sweep must not inspect or
+        mutate parameter-group gradient state in that mode.
         """
+        if self._fsdp_state.enable_full_iteration_cuda_graph:
+            return
+
         param_groups = [
             param_group
             for child in self._get_fsdp_modules(recursive=True)

@@ -46,6 +46,8 @@ Megatron FSDP v2 handles this by:
 - zeroing kept gradient storage in place during `zero_grad()`;
 - disabling lazy release of optimizer-facing `main_grad_buffer.data` while
   `enable_full_iteration_cuda_graph=True`;
+- bypassing the eager root-wide unused-gradient sweep, including its
+  parameter-group `zero_grad()` calls;
 - keeping transient full weight/gradient buffers outside the optimizer-facing
   object contract.
 

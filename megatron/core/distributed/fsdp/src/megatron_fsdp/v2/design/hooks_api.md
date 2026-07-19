@@ -55,7 +55,9 @@ and fine-grained submodule hooks.
 - Before any normal root parameter unshard, performs a root-wide gradient
   liveness sweep. If a plain PyTorch optimizer has cleared every
   optimizer-facing gradient, the sweep resets stale parameter-group
-  accumulation flags and releases distributed-gradient backing storage.
+  accumulation flags and releases distributed-gradient backing storage. This
+  sweep is skipped entirely for full-iteration CUDA graph mode, which owns
+  stable gradient storage and in-place zeroing across graph replays.
 - Sets root forward/backward phase state for a normal forward pass.
 - Unshards the target's parameters for forward; during activation recomputation,
   also ensures backward-pass buffers are available.

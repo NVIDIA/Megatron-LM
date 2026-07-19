@@ -1023,6 +1023,23 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
+    def test_root_grad_release_skips_full_iteration_cuda_graph(self, monkeypatch):
+        """Full-iteration graphs own stable grad storage and zeroing."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        model = fully_shard(model, enable_full_iteration_cuda_graph=True)
+        param_group = model._fsdp_param_groups[0]
+        zero_grad_calls = []
+
+        def capture_zero_grad(*args, **kwargs):
+            zero_grad_calls.append((args, kwargs))
+
+        monkeypatch.setattr(param_group, "zero_grad", capture_zero_grad)
+
+        model._release_grad_storage_if_unused()
+
+        assert zero_grad_calls == []
+
     def test_root_grad_release_keeps_live_accumulation(self):
         """A live optimizer-facing grad prevents a root-wide storage release."""
         torch.manual_seed(42)
