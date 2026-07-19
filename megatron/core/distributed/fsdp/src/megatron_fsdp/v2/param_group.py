@@ -405,8 +405,15 @@ class ParameterGroup:
             + [getattr(p, "decoupled_grad", None) is not None for p in self.dist_params]
         ):
             return
+        # Keep the DTensor wrappers and their global metadata alive while
+        # dropping the local views that retain the gradient-buffer storage.
+        # Reusing these wrappers in _init_dist_grads avoids rebuilding the
+        # DTensor object graph on every iteration (and the resulting periodic
+        # Python-GC stalls in backward).
+        for dist_grad in self.dist_grads:
+            if dist_grad is not None:
+                dist_grad._local_tensor = None
         self.main_grad_buffer.data = None
-        self.dist_grads = [None for _ in self.params]
 
     def _init_dist_params(self):
         """
@@ -514,8 +521,8 @@ class ParameterGroup:
             Shard(dim=0) if is_grad_shard else Replicate(),
         ]
 
-        self.dist_grads = []
-        for p, dist_param in zip(self.params, self.dist_params):
+        rebuilt_dist_grads = []
+        for p, dist_param, dist_grad in zip(self.params, self.dist_params, self.dist_grads):
             item_id = self.param_idx[p]
             # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
             shard_layout = (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
@@ -523,16 +530,25 @@ class ParameterGroup:
             # Empty local shards are optimizer no-ops. Keeping them as None also
             # avoids fused multi-tensor optimizer failures on neighboring shards.
             if not p.requires_grad or grad_data.numel() == 0:
-                self.dist_grads.append(None)
+                rebuilt_dist_grads.append(None)
                 continue
-            grad_dtensor = make_uneven_dtensor(
-                grad_data,
-                p.shape,
-                self.mesh,
-                placements,
-                copy_chunk_meta_from=dist_param,
-            )
-            self.dist_grads.append(grad_dtensor)
+            if dist_grad is None:
+                dist_grad = make_uneven_dtensor(
+                    grad_data,
+                    p.shape,
+                    self.mesh,
+                    placements,
+                    copy_chunk_meta_from=dist_param,
+                )
+            else:
+                # Match make_uneven_dtensor's local layout. The buffer exposes
+                # a flat slice, while fused optimizers require the parameter,
+                # gradient, and optimizer-state local tensors to share shape
+                # and layout.
+                dist_grad._local_tensor = grad_data.view(-1, *p.shape[1:])
+                copy_chunk_metadata(dist_param, dist_grad)
+            rebuilt_dist_grads.append(dist_grad)
+        self.dist_grads = rebuilt_dist_grads
 
     def _rebuild_dist_views(self) -> None:
         """In-place update ``dist_params._local_tensor`` / ``dist_grad._local_tensor``.

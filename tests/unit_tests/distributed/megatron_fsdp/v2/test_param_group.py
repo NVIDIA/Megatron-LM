@@ -331,6 +331,46 @@ def test_zero_grad_set_to_none_false_reuses_dist_grads(strategy):
 
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
+def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy):
+    groups, _, _, _, _, _ = _build_groups(strategy)
+
+    for pg in groups:
+        pg._init_dist_grads()
+        gbuf = pg.main_grad_buffer
+        if gbuf is None:
+            continue
+
+        original_dist_grads = list(pg.dist_grads)
+        original_local_shapes = [
+            None if dist_grad is None else dist_grad._local_tensor.shape
+            for dist_grad in original_dist_grads
+        ]
+        assert any(dist_grad is not None for dist_grad in original_dist_grads)
+
+        pg.zero_grad(set_to_none=True)
+
+        assert gbuf.data is None
+        for before, after in zip(original_dist_grads, pg.dist_grads):
+            assert after is before
+            if after is not None:
+                assert after._local_tensor is None
+
+        pg._init_dist_grads()
+
+        assert gbuf.data is not None
+        for before, after, local_shape in zip(
+            original_dist_grads, pg.dist_grads, original_local_shapes
+        ):
+            assert after is before
+            if after is not None:
+                assert after._local_tensor is not None
+                assert after._local_tensor.shape == local_shape
+                assert hasattr(after._local_tensor, "__create_chunk_list__")
+
+    torch.distributed.barrier()
+
+
+@pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
 def test_hsdp_reduce_grad(strategy, outer_strategy):
     if outer_strategy == "optim" and strategy != "optim_grads_params":
