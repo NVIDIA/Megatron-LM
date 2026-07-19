@@ -88,6 +88,11 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
 
     # ---- root: forward-phase setup (once per micro-batch) ------------------
     if target._fsdp_state._is_root and not is_recompute:
+        # A plain torch optimizer clears ``dist_param.grad`` without entering
+        # FSDPModule.zero_grad(). Sweep every FSDP parameter group at the root
+        # boundary so stale distributed-gradient storage is released before
+        # the first parameter unshard of the new forward.
+        target._release_grad_storage_if_unused()
         # The last-backward contract guarantees that an optimizer decision has
         # happened before this next normal forward. Install updated main-weight
         # shards before any parameter unshard/prefetch can consume model weights.

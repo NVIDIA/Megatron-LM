@@ -1023,6 +1023,79 @@ class TestIgnoredParams:
 
 
 class TestLifecycle:
+    def test_root_grad_release_keeps_live_accumulation(self):
+        """A live optimizer-facing grad prevents a root-wide storage release."""
+        torch.manual_seed(42)
+        model = SimpleMLP(16).to(_device())
+        model = fully_shard(model)
+
+        model(torch.randn(2, 16, device=_device())).float().square().mean().backward()
+        model.finish_grad_sync()
+        param_group = model._fsdp_param_groups[0]
+        assert param_group.main_grad_buffer.data is not None
+        assert any(
+            getattr(dist_param, "grad", None) is not None
+            or getattr(dist_param, "decoupled_grad", None) is not None
+            for dist_param in param_group.dist_params
+        )
+
+        model._release_grad_storage_if_unused()
+
+        assert param_group.main_grad_buffer.data is not None
+
+    def test_root_forward_releases_optimizer_cleared_grad_storage_before_unshard(
+        self, monkeypatch
+    ):
+        """Plain optimizer zero-grad must not overlap stale grads with next unshard."""
+        torch.manual_seed(42)
+        model = TinyLLM(vocab=32, hidden=16, num_layers=2).to(_device())
+        for index, layer in enumerate(model.layers):
+            model.layers[index] = fully_shard(layer)
+        model = fully_shard(model)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        x = torch.randint(0, 32, (2, 4), device=_device())
+        model(x).float().square().mean().backward()
+        model.finish_grad_sync()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        param_groups = [
+            param_group
+            for module in model._get_fsdp_modules(recursive=True)
+            for param_group in module._fsdp_param_groups
+        ]
+        assert any(
+            param_group.main_grad_buffer is not None
+            and param_group.main_grad_buffer.data is not None
+            for param_group in param_groups
+        )
+        assert all(
+            getattr(dist_param, "grad", None) is None
+            and getattr(dist_param, "decoupled_grad", None) is None
+            for param_group in param_groups
+            for dist_param in param_group.dist_params
+        )
+
+        observed_at_root_unshard = []
+        original_unshard = model.unshard
+
+        def capture_root_unshard(*args, **kwargs):
+            observed_at_root_unshard.append(
+                [
+                    param_group.main_grad_buffer is None
+                    or param_group.main_grad_buffer.data is None
+                    for param_group in param_groups
+                ]
+            )
+            return original_unshard(*args, **kwargs)
+
+        monkeypatch.setattr(model, "unshard", capture_root_unshard)
+        model(torch.randint(0, 32, (2, 4), device=_device()))
+
+        assert observed_at_root_unshard
+        assert all(observed_at_root_unshard[0])
+
     def test_params_unsharded_during_forward(self):
         """During forward, model parameters should be in unsharded state (full tensors)."""
         torch.manual_seed(42)

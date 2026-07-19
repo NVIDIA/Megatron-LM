@@ -52,6 +52,10 @@ and fine-grained submodule hooks.
   consumes `ctx.model_weight_refresh_pending` by calling
   `_copy_main_weights_to_model_weights()` before parameter unshard or prefetch.
   Activation-recompute forwards never consume this flag.
+- Before any normal root parameter unshard, performs a root-wide gradient
+  liveness sweep. If a plain PyTorch optimizer has cleared every
+  optimizer-facing gradient, the sweep resets stale parameter-group
+  accumulation flags and releases distributed-gradient backing storage.
 - Sets root forward/backward phase state for a normal forward pass.
 - Unshards the target's parameters for forward; during activation recomputation,
   also ensures backward-pass buffers are available.
