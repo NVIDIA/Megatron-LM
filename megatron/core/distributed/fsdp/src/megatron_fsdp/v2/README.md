@@ -1,10 +1,15 @@
 # Megatron FSDP v2
 
-> ⚠️ Prototype implementation — not yet production ready
+> [!WARNING]
+> Megatron FSDP v2 is an experimental prototype and is not production ready.
 
-Megatron FSDP v2 (M-FSDP2) is a DTensor-backed FSDP implementation integrated
-with Megatron Core. It exposes an FSDP2-like `fully_shard()` API where practical,
-but not every PyTorch FSDP2 option is implemented.
+Megatron FSDP v2 (M-FSDP2) brings a PyTorch FSDP2-style `fully_shard()` API to
+Megatron Core. It uses DTensor to shard model weights, gradients, and optimizer
+states while integrating with Megatron's distributed optimizer, mixed-precision
+training, checkpointing, communication overlap, HSDP, and CUDA Graph execution.
+
+M-FSDP2 currently implements the subset of PyTorch FSDP2 required by supported
+Megatron workflows. See [Known Limitations](#known-limitations) for details.
 
 ## Architecture
 
