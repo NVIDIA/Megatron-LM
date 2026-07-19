@@ -3101,15 +3101,23 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
+        moe_layer_freq = args.moe_layer_freq
+        mtp_num_layers = args.mtp_num_layers
         if is_hybrid_model(args):
-            from operator import itemgetter
-
             from megatron.core.ssm.mamba_hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                parse_hybrid_pattern,
             )
 
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+            parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            main_pattern = (parsed_hybrid_pattern.main_pattern or "").replace(Symbols.PIPE, "")
+            layers = len(main_pattern) + parsed_hybrid_pattern.mtp_num_depths
+            moe_layer_freq = [int(layer_type == Symbols.MOE) for layer_type in main_pattern]
+            moe_layer_freq.extend(
+                parsed_hybrid_pattern.mtp_pattern.count(Symbols.MOE)
+                for _ in range(parsed_hybrid_pattern.mtp_num_depths)
+            )
+            mtp_num_layers = None
         else:
             layers = args.num_layers
 
@@ -3122,18 +3130,18 @@ def training_log(
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
-            moe_layer_freq=args.moe_layer_freq,
-            mtp_num_layers=args.mtp_num_layers,
+            moe_layer_freq=moe_layer_freq,
+            mtp_num_layers=mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        # MTP tracker stores raw loss sums and token counts, so after reduction
-        # tracker["values"] already equals the per-token loss (loss_sum / num_tokens)
-        # aggregated across all ranks and microbatches. No further scaling needed.
-        mtp_loss_scale = 1.0
+        # The tracker stores a sum of normalized microbatch losses.
+        # Sequence-packing schedulers may change the number of microbatches for
+        # this step, so use the scheduled count passed to training_log.
+        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -3334,13 +3342,17 @@ def enable_forward_pre_hook(model_chunks):
         model_chunk.enable_forward_pre_hook()
 
 
-def disable_forward_pre_hook(model_chunks, param_sync=True):
+def disable_forward_pre_hook(model_chunks, optimizer=None, param_sync=True):
+    if param_sync and optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model_chunks: list[DDP]) -> None:
+def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
+    if optimizer is not None:
+        optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
@@ -3367,7 +3379,7 @@ def save_checkpoint_and_time(
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
-        force_param_sync(model)
+        force_param_sync(model, optimizer=optimizer)
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
@@ -3480,7 +3492,7 @@ def post_training_step_callbacks(
         and iteration % args.check_weight_hash_across_dp_replicas_interval == 0
     ):
         if should_disable_forward_pre_hook(args):
-            disable_forward_pre_hook(model)
+            disable_forward_pre_hook(model, optimizer=optimizer)
         assert check_param_hashes_across_dp_replicas(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
@@ -4301,16 +4313,8 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
-            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-                # disable_forward_pre_hook(param_sync=True) below force-syncs params for eval.
-                # Copy the main params to param buffer before the forced AllGather.
-                for model_chunk in model:
-                    model_chunk.zero_grad_buffer()
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
             if should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model)
+                disable_forward_pre_hook(model, optimizer=optimizer)
                 pre_hook_enabled = False
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
@@ -4414,7 +4418,7 @@ def train(
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
-        disable_forward_pre_hook(model)
+        disable_forward_pre_hook(model, optimizer=optimizer)
 
     ft_integration.on_checkpointing_start()
     # This will finalize all unfinalized async request and terminate

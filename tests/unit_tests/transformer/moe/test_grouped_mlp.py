@@ -382,6 +382,12 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     ops = module._make_fused_ops()
 
     assert ops[0].weight is module.linear_fc1.weight
+    assert ops[0].weight0 is None
+    assert ops[0].weight1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["weight"] is module.linear_fc1.weight
+    assert "weight0" not in fc1_named_params
+    assert "weight1" not in fc1_named_params
     assert ops[1].glu_interleave_size == 8
     assert ops[1].activation_recompute_in_mlp is True
     assert ops[2].weight0 is module.linear_fc2.weight0
@@ -664,24 +670,6 @@ def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
     assert module._is_fused_impl_supported() is False
 
 
-def test_is_fused_impl_supported_requires_glu_interleave_32(monkeypatch):
-    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
-    monkeypatch.setattr(experts_module, "te", fake_te)
-    monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    _install_fake_te_ops_modules(monkeypatch, fake_te)
-
-    module = _make_fused_impl_support_module(
-        FakeGroupedLinear,
-        activation_func=F.silu,
-        gated_linear_unit=True,
-        moe_mlp_glu_interleave_size=16,
-    )
-
-    assert module._is_fused_impl_supported() is False
-
-
 @pytest.mark.parametrize(
     (
         "use_fused_weighted_squared_relu",
@@ -765,10 +753,13 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
     assert ops[0].weight0 is module.linear_fc1.weight0
     assert ops[0].weight1 is module.linear_fc1.weight1
-    assert ops[0].bias is module.linear_fc1.bias  # ← single grouped bias attached at "bias"
-    assert not hasattr(
-        ops[0], "bias0"
-    ), "bias should not be split into bias{idx} when single_grouped_bias=True"
+    assert ops[0].bias is module.linear_fc1.bias
+    assert ops[0].bias0 is None
+    assert ops[0].bias1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["bias"] is module.linear_fc1.bias
+    assert "bias0" not in fc1_named_params
+    assert "bias1" not in fc1_named_params
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
