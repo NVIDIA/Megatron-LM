@@ -431,7 +431,7 @@ def _match_gdn_key(key: str, dtensor: DTensor):
         m = re.match(pat, key)
         if m:
             dim = 0
-            size = dtensor[dim]
+            size = dtensor.shape[dim]
             assert (
                 size % 3 == 0
             ), f"Expected GDN projection size divisible by 3, got {size} for key {key}"

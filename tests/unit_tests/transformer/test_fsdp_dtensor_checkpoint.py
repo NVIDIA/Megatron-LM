@@ -33,6 +33,7 @@ import re
 import pytest
 import torch
 
+from megatron.core.distributed.fsdp.checkpoint import _match_gdn_key as _match_gdn_key_v2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_model_parallel,
@@ -522,6 +523,20 @@ class TestGDNKeyMatching:
         # TP=2 should halve the split sizes
         assert r1[0][0] == 64 and r2[0][0] == 32
         assert r1[0][2] == 128 and r2[0][2] == 64
+
+
+class TestMegatronFSDPV2GDNKeyMatching:
+    """Regression coverage for Megatron FSDP v2 GDN key matching."""
+
+    def test_match_gdn_key_uses_shape_dimension(self):
+        tensor = torch.empty(6, 4)
+
+        result = _match_gdn_key_v2(
+            "decoder.layers.0.self_attention.linear_qkv.weight",
+            tensor,
+        )
+
+        assert result == ([2, 2, 2], ["query", "key", "value"], 0)
 
 
 class TestGDNFSDPTensorParallelMetadata:
