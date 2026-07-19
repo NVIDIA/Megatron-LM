@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -268,6 +268,12 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
+    log_per_param_norm: bool = False
+    """If set, log parameter and gradient norms for each Megatron FSDP parameter.
+
+    Requires ``log_params_norm`` because this diagnostic runs at the same logging point.
+    """
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 
@@ -386,6 +392,10 @@ class LoggerConfig:
 
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
+
+    def __post_init__(self):
+        if self.log_per_param_norm and not self.log_params_norm:
+            raise ValueError("log_per_param_norm requires log_params_norm")
 
 
 @dataclass(kw_only=True)
