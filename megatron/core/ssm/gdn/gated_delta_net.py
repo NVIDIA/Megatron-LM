@@ -178,7 +178,7 @@ class GatedDeltaNet(_GDNBase):
 
         # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
         # (beta, alpha for GDN; f, b, w for GDN2)
-        qkv, gate, *gate_feats = torch.split(qkvzba, self.feat_dim_split, dim=-1)
+        qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
         # Convolution on qkv
@@ -238,15 +238,13 @@ class GatedDeltaNet(_GDNBase):
 
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        query, key, value, gate, gate_feats = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, gate_feats, batch, seq_len
+        query, key, value, gate, beta, alpha = self._prepare_input_for_gated_delta_rule(
+            qkv, gate, batch, seq_len, beta, alpha
         )
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
         nvtx_range_push(suffix="g_and_beta")
-        beta, alpha = gate_feats
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
+        g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")

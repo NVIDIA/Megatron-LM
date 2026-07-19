@@ -357,7 +357,14 @@ class _GDNBase(MegatronModule):
         return y
 
     @jit_fuser
-    def _prepare_input_for_gated_delta_rule(self, qkv, gate, gate_feats, batch, seq_len):
+    def _prepare_input_for_gated_delta_rule(
+        self,
+        qkv: torch.Tensor,
+        gate: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        *gate_feats: tuple[torch.Tensor],
+    ) -> tuple[torch.Tensor, ...]:
         """
         Prepare the query, key, value, gate, and variant gate-feature tensors for the
         gated delta rule kernels.
@@ -398,7 +405,23 @@ class _GDNBase(MegatronModule):
         gate = gate.contiguous()
         gate_feats = tuple(t.contiguous() for t in gate_feats)
 
-        return query, key, value, gate, gate_feats
+        return query, key, value, gate, *gate_feats
+
+    @jit_fuser
+    def _compute_g_and_beta(
+        self,
+        A_log_local_cp: torch.Tensor,
+        dt_bias_local_cp: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute g (decay) and beta (sigmoid) for gated delta rule.
+        Fuses exp, softplus, mul, neg, and sigmoid operations.
+        """
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        beta = beta.sigmoid()
+        return g, beta
 
     def _resolve_cu_seqlens(
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
