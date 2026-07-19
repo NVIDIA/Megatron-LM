@@ -21,23 +21,47 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 def _apply_rope_fp32(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=None,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
 ):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
     Mirrors ``Qwen3VLSelfAttention.apply_rotary_pos_emb_absolute`` in Megatron-Bridge
     with ``apply_rotary_pos_emb_in_fp32=True``.
+
+    The signature matches ``rope_utils.apply_rotary_pos_emb`` parameter-for-parameter so the
+    wrapper can substitute it positionally. One deliberate divergence: the
+    ``mla_rotary_interleaved`` *default* is ``None`` (config-derived, matching this wrapper's
+    legacy behaviour) where upstream's signature default is ``False``; explicit arguments and
+    explicit ``None`` behave identically to upstream.
     """
     from megatron.core.models.common.embeddings import rope_utils
     from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 
     orig_dtype = t.dtype
+    if mla_rotary_interleaved is None:
+        mla_rotary_interleaved = getattr(config, 'multi_latent_attention', False)
     if (
         cu_seqlens is not None
         and getattr(config, "apply_rope_fusion", False)
         and getattr(config, "mrope_section", None) is not None
         and getattr(config, "rotary_interleaved", False) is False
         and getattr(config, "multi_latent_attention", False) is False
+        # The fused mRoPE kernel implements neither the inverse rotation nor MLA output
+        # de-interleaving, and takes no mla_rotary_interleaved argument. Taking this path
+        # with any of them requested would silently compute the wrong rotation, so fall
+        # through to the unfused wrapper instead.
+        and not inverse
+        and not mla_output_remove_interleaving
+        and mla_rotary_interleaved is False
         and mscale == 1.0
         and t.dim() == 3
         and freqs.dim() == 4
@@ -75,21 +99,33 @@ def _apply_rope_fp32(
         cu_seqlens=cu_seqlens,
         mscale=mscale,
         cp_group=cp_group,
-        mla_rotary_interleaved=getattr(config, 'multi_latent_attention', False),
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        inverse=inverse,
+        mla_output_remove_interleaving=mla_output_remove_interleaving,
         max_seqlen=max_seqlen,
     )
     return out.to(orig_dtype)
 
 
 def _apply_rope_fp32_no_cp(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=None,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    max_seqlen=None,
 ):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
     The vision encoder uses THD packed sequences for variable-resolution
     images.  When the language model uses CP>1, the global CP group would
     incorrectly split the vision seqlens.  This wrapper substitutes a
-    trivial group so the vision RoPE sees the full packed sequence.
+    trivial group so the vision RoPE sees the full packed sequence; the
+    caller's ``cp_group`` argument is intentionally ignored.
     """
     range_name = "qwen35_vl.vision_encoder.rope_apply"
     nvtx_range_push(range_name)
@@ -101,6 +137,9 @@ def _apply_rope_fp32_no_cp(
             cu_seqlens,
             mscale,
             cp_group=_NO_CP_GROUP,
+            mla_rotary_interleaved=mla_rotary_interleaved,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
         )
     finally:
@@ -120,6 +159,13 @@ class Qwen35VLVisionSelfAttention(SelfAttention):
     def forward(self, *args, **kwargs):
         import megatron.core.transformer.attention as _attn_mod
 
+        # The fp32 cast rides on the module-level UNFUSED RoPE entry point. The fused-QKV
+        # entry (config.fused_single_qkv_rope) cannot bypass it here: vision always runs THD
+        # packed sequences, and packed_seq_params forces split_qkv=True in SelfAttention.
+        # The cos/sin and flash-decode entries are inference-context-only and likewise
+        # unreachable during vision training.
+        # Save/restore of a module global: exception-safe and reentrancy-safe, but not
+        # thread-safe — concurrent forwards from separate Python threads would race.
         _orig = _attn_mod.apply_rotary_pos_emb
         _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_no_cp
         try:
