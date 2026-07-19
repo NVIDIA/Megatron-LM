@@ -232,12 +232,13 @@ strategy controls which buffers and communication collectives are used.
 
 ### `fully_shard()` API Parameters
 
-The following parameters are accepted in the function signature but are **not
-yet implemented** (marked `TODO`):
+The following PyTorch FSDP2-compatible parameters are present in the function
+signature but are **not supported yet**. Passing any of them raises
+`NotImplementedError`:
 
-- `reshard_after_forward` — no-op
-- `shard_placement_fn` — no-op; all params use `Shard(0)` on the DP dimension
-- `offload_policy` — no-op; CPU offloading is not supported
+- `reshard_after_forward`
+- `shard_placement_fn`; all parameters currently use `Shard(0)` on the DP dimension
+- `offload_policy`; CPU offloading is not supported
 
 ### Hardware & Platform
 

@@ -28,11 +28,7 @@ from .allocator import Bucket, TemporaryBucketAllocator
 from .buffer_index import BufferIndex
 from .dp_buffer import DataParallelBuffer
 from .fully_shard import FSDPModule, fully_shard
-from .mixed_precision import (
-    FullyShardFP8Policy,
-    MixedPrecisionPolicy,
-    FullyShardNVFP4Policy,
-)
+from .mixed_precision import FullyShardFP8Policy, FullyShardNVFP4Policy, MixedPrecisionPolicy
 from .param_group import ParameterGroup
 
 __all__ = [

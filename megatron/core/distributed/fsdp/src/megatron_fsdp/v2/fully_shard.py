@@ -80,6 +80,17 @@ def fully_shard(
             pre-hook.  The caller must invoke the final callback manually
             (used by the 1F1B EP overlap schedule).
     """
+    unsupported_args = {
+        "reshard_after_forward": reshard_after_forward,
+        "shard_placement_fn": shard_placement_fn,
+        "offload_policy": offload_policy,
+    }
+    for arg_name, arg_value in unsupported_args.items():
+        if arg_value is not None:
+            raise NotImplementedError(
+                f"Megatron FSDP v2 does not support `{arg_name}` yet."
+            )
+
     if isinstance(module, FSDPModule):
         raise ValueError(
             "The input module has already been fully sharded. "
