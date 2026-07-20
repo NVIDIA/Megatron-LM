@@ -1491,7 +1491,8 @@ def dump_staleness_data(
     for group_num_turns in group_stats.num_turns:
         adv_row = []
         for nt in group_num_turns:
-            adv_row.append(float(adv_flat[_t]))
+            cur_adv = 0.0 if nt == 0 else float(adv_flat[_t])
+            adv_row.append(cur_adv)
             _t += nt
         per_group_adv.append(adv_row)
 
@@ -1503,8 +1504,8 @@ def dump_staleness_data(
         group_degenerate = group_reward_std < 1e-6
         for rollout_idx, rollout in enumerate(group):
             turns = []
-            for turn_idx, (pe, kve) in enumerate(
-                zip(rollout.policy_epoch, rollout.kv_cache_epoch)
+            for turn_idx, (traj, pe, kve) in enumerate(
+                zip(rollout.trajectory, rollout.policy_epoch, rollout.kv_cache_epoch)
             ):
                 evicts = (
                     int(rollout.num_evictions[turn_idx])
@@ -1512,7 +1513,7 @@ def dump_staleness_data(
                     else 0
                 )
                 turns.append({
-                    "token_count": len(rollout.trajectory[turn_idx]),
+                    "token_count": len(traj),
                     "prompt_length": _turn_prompt_length(rollout, turn_idx),
                     "policy_epoch": [[int(s), int(e)] for s, e in pe],
                     "kv_cache_epoch": [[int(s), int(e)] for s, e in kve],
