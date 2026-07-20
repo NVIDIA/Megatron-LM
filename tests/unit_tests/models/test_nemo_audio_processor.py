@@ -167,3 +167,289 @@ def test_materialize_empty_waveform_yields_no_frames():
     log_mel, valid_frames = p.materialize(audio)
     assert valid_frames == 0
     assert log_mel.shape == (0, p.input_feature_dim)
+
+
+# ---------------------------------------------------------------------------
+# Public methods / properties
+# ---------------------------------------------------------------------------
+
+
+def test_processor_properties():
+    p = _processor()
+    assert p.sample_rate == 16000
+    assert p.input_feature_dim == p._n_mels
+
+
+def test_compute_num_frames_and_embeddings_from_waveform_ref():
+    p = _processor()
+    audio = _audio_ref(data=torch.zeros(16000, dtype=torch.float32), sample_rate=16000)
+    # 16000 samples @ hop=160 -> 100 frames -> 13 embeddings (see slice-primitive tests).
+    assert p.compute_num_frames(audio) == 100
+    assert p.compute_num_embeddings(audio) == 13
+
+
+def test_validate_sample_rate_mismatch_raises():
+    p = _processor()
+    audio = _audio_ref(data=torch.zeros(16000, dtype=torch.float32), sample_rate=8000)
+    with pytest.raises(ValueError, match="Expected audio sample rate 16000"):
+        p.compute_num_frames(audio)
+
+
+# ---------------------------------------------------------------------------
+# Lazy AV-decoder decode chain (duck-typed decoder fakes)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAVData:
+    def __init__(self, clips):
+        self.audio_clips = clips
+
+
+class _FakeDecoder:
+    """Minimal AVDecoder-like stand-in exposing get_audio + sample-rate probes."""
+
+    def __init__(self, clips, samples_per_second=None):
+        self._clips = clips
+        self._samples_per_second = samples_per_second
+
+    def get_audio(self):
+        return _FakeAVData(self._clips)
+
+    def get_audio_samples_per_second(self):
+        return self._samples_per_second
+
+
+def test_audio_clip_to_float32_1d_float_is_unsqueezed():
+    out = audio_processor._audio_clip_to_float32(torch.tensor([0.1, 0.2], dtype=torch.float32))
+    assert out.shape == (1, 2)
+    assert out.dtype == torch.float32
+
+
+def test_audio_clip_to_float32_from_python_list():
+    out = audio_processor._audio_clip_to_float32([0.0, 1.0, -1.0])
+    assert out.shape == (1, 3)
+    assert out.dtype == torch.float32
+
+
+def test_audio_clip_to_float32_uint8_is_centered_and_scaled():
+    out = audio_processor._audio_clip_to_float32(torch.tensor([0, 128, 255], dtype=torch.uint8))
+    assert torch.allclose(out[0], torch.tensor([-1.0, 0.0, (255 - 128) / 128.0]))
+
+
+def test_audio_clip_to_float32_int16_is_scaled_by_max():
+    out = audio_processor._audio_clip_to_float32(torch.tensor([0, 32767], dtype=torch.int16))
+    assert torch.allclose(out[0], torch.tensor([0.0, 1.0]))
+
+
+def test_audio_clip_to_float32_rejects_bad_ndim():
+    with pytest.raises(ValueError, match="Unsupported decoded audio clip shape"):
+        audio_processor._audio_clip_to_float32(torch.zeros(2, 2, 2))
+
+
+def test_audio_clip_to_float32_rejects_bad_dtype():
+    with pytest.raises(ValueError, match="Unsupported decoded audio dtype"):
+        audio_processor._audio_clip_to_float32(torch.tensor([True, False]))
+
+
+def test_decoder_sample_rate_prefers_explicit():
+    assert audio_processor._decoder_sample_rate(object(), 22050) == 22050
+
+
+def test_decoder_sample_rate_from_samples_per_second():
+    dec = _FakeDecoder(clips=[], samples_per_second=16000)
+    assert audio_processor._decoder_sample_rate(dec, None) == 16000
+
+
+def test_decoder_sample_rate_from_metadata():
+    class _MetaDecoder:
+        def get_metadata(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(audio_sample_rate=8000)
+
+    assert audio_processor._decoder_sample_rate(_MetaDecoder(), None) == 8000
+
+
+def test_decoder_sample_rate_none_when_unavailable():
+    assert audio_processor._decoder_sample_rate(object(), None) is None
+
+
+def test_resolve_lazy_media_unwraps_get_and_sequence():
+    dec = _FakeDecoder(clips=[])
+    lazy = SimpleNamespace(get=lambda: [dec])
+    assert audio_processor._resolve_lazy_media(lazy) is dec
+
+
+def test_resolve_lazy_media_empty_sequence_raises():
+    with pytest.raises(ValueError, match="empty sequence"):
+        audio_processor._resolve_lazy_media([])
+
+
+def test_decode_avdecoder_concatenates_clips():
+    dec = _FakeDecoder(
+        clips=[
+            torch.tensor([0.0, 1.0], dtype=torch.float32),
+            torch.tensor([2.0], dtype=torch.float32),
+        ],
+        samples_per_second=16000,
+    )
+    waveform, sr = audio_processor._decode_avdecoder(dec, "<test>")
+    assert sr == 16000
+    assert waveform.shape == (1, 3)
+    assert waveform[0].tolist() == [0.0, 1.0, 2.0]
+
+
+def test_decode_avdecoder_rejects_non_decoder():
+    with pytest.raises(ValueError, match="Expected AVDecoder-like"):
+        audio_processor._decode_avdecoder(object(), "<test>")
+
+
+def test_decode_avdecoder_rejects_missing_clips():
+    with pytest.raises(ValueError, match="did not contain audio clips"):
+        audio_processor._decode_avdecoder(_FakeDecoder(clips=[]), "<test>")
+
+
+def test_load_waveform_from_spec_dispatches_avdecoder():
+    dec = _FakeDecoder(clips=[torch.tensor([0.5], dtype=torch.float32)], samples_per_second=16000)
+    waveform, sr = audio_processor._load_waveform_from_spec(
+        {"kind": "avdecoder", "decoder": dec, "sample_rate": 16000}
+    )
+    assert sr == 16000
+    assert waveform.shape == (1, 1)
+
+
+def test_load_waveform_from_spec_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="Unsupported audio kind"):
+        audio_processor._load_waveform_from_spec({"kind": "wav"})
+
+
+# ---------------------------------------------------------------------------
+# Sample-rate / tolerance resolution
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_sample_rate_prefers_audio_ref():
+    audio = _audio_ref(sample_rate=16000, data={})
+    assert audio_processor._resolve_sample_rate(audio, 8000) == 16000
+
+
+def test_resolve_sample_rate_falls_back_to_decoded():
+    audio = _audio_ref(sample_rate=None, data={})
+    assert audio_processor._resolve_sample_rate(audio, 8000) == 8000
+
+
+def test_resolve_sample_rate_falls_back_to_data_dict():
+    audio = _audio_ref(sample_rate=None, data={"sampling_rate": 22050})
+    assert audio_processor._resolve_sample_rate(audio, None) == 22050
+
+
+def test_resolve_sample_rate_none_when_unknown():
+    audio = _audio_ref(sample_rate=None, data=torch.zeros(1))
+    assert audio_processor._resolve_sample_rate(audio, None) is None
+
+
+def test_audio_num_sample_tolerance():
+    audio = _audio_ref(sample_rate=16000, data={})
+    # ceil(0.5 * 16000) = 8000 samples of allowed drift.
+    assert audio_processor._audio_num_sample_tolerance(audio, None) == 8000
+
+
+def test_audio_num_sample_tolerance_zero_without_sample_rate():
+    audio = _audio_ref(sample_rate=None, data=torch.zeros(1))
+    assert audio_processor._audio_num_sample_tolerance(audio, None) == 0
+
+
+# ---------------------------------------------------------------------------
+# Waveform normalization branches
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_stereo_is_averaged_to_mono():
+    data = torch.tensor([[0.0, 2.0], [2.0, 4.0]], dtype=torch.float32)  # [C=2, T=2]
+    audio = _audio_ref(data=data, sample_rate=16000)
+    waveform, _ = audio_processor._normalize_mono_waveform(audio)
+    assert waveform.tolist() == [1.0, 3.0]
+
+
+def test_normalize_pads_up_to_num_samples_within_tolerance():
+    audio = _audio_ref(data=torch.ones(10, dtype=torch.float32), sample_rate=16000, num_samples=13)
+    waveform, _ = audio_processor._normalize_mono_waveform(audio)
+    assert waveform.shape[0] == 13
+    assert waveform[10:].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_normalize_crops_down_to_num_samples():
+    audio = _audio_ref(data=torch.arange(10, dtype=torch.float32), sample_rate=16000, num_samples=4)
+    waveform, _ = audio_processor._normalize_mono_waveform(audio)
+    assert waveform.tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_normalize_rejects_num_samples_beyond_tolerance():
+    audio = _audio_ref(
+        data=torch.ones(10, dtype=torch.float32), sample_rate=16000, num_samples=9000
+    )
+    with pytest.raises(ValueError, match="exceeds waveform length"):
+        audio_processor._normalize_mono_waveform(audio)
+
+
+def test_normalize_rejects_non_float32():
+    audio = _audio_ref(data=torch.zeros(10, dtype=torch.float64), sample_rate=16000)
+    with pytest.raises(ValueError, match="Expected raw float32 waveform"):
+        audio_processor._normalize_mono_waveform(audio)
+
+
+def test_normalize_rejects_bad_ndim():
+    audio = _audio_ref(data=torch.zeros(2, 2, 2, dtype=torch.float32), sample_rate=16000)
+    with pytest.raises(ValueError, match="Unsupported waveform shape"):
+        audio_processor._normalize_mono_waveform(audio)
+
+
+def test_normalize_rejects_unsupported_data_type():
+    audio = _audio_ref(data="not-a-waveform", sample_rate=16000)
+    with pytest.raises(ValueError, match="must be a raw float32 waveform"):
+        audio_processor._normalize_mono_waveform(audio)
+
+
+def test_normalize_rejects_bad_slice_range():
+    audio = _audio_ref(
+        data=torch.ones(10, dtype=torch.float32), sample_rate=16000, slice_range=(5, 2)
+    )
+    with pytest.raises(ValueError, match="slice_range must satisfy"):
+        audio_processor._normalize_mono_waveform(audio)
+
+
+# ---------------------------------------------------------------------------
+# _infer_num_samples branches
+# ---------------------------------------------------------------------------
+
+
+def test_infer_num_samples_from_num_samples_field():
+    audio = _audio_ref(num_samples=1234, data=torch.zeros(1, dtype=torch.float32))
+    assert audio_processor._infer_num_samples(audio) == 1234
+
+
+def test_infer_num_samples_from_1d_tensor():
+    audio = _audio_ref(data=torch.zeros(500, dtype=torch.float32))
+    assert audio_processor._infer_num_samples(audio) == 500
+
+
+def test_infer_num_samples_from_2d_tensor_uses_time_dim():
+    audio = _audio_ref(data=torch.zeros(2, 640, dtype=torch.float32))
+    assert audio_processor._infer_num_samples(audio) == 640
+
+
+def test_infer_num_samples_from_spec():
+    dec = _FakeDecoder(clips=[torch.zeros(320, dtype=torch.float32)], samples_per_second=16000)
+    audio = _audio_ref(data={"kind": "avdecoder", "decoder": dec})
+    assert audio_processor._infer_num_samples(audio) == 320
+
+
+def test_infer_num_samples_rejects_unsupported_data():
+    audio = _audio_ref(data=42)
+    with pytest.raises(ValueError, match="must be a raw float32 waveform"):
+        audio_processor._infer_num_samples(audio)
+
+
+def test_infer_num_samples_rejects_non_float32():
+    audio = _audio_ref(data=torch.zeros(10, dtype=torch.int32))
+    with pytest.raises(ValueError, match="Expected raw float32 waveform"):
+        audio_processor._infer_num_samples(audio)
