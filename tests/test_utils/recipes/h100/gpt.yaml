@@ -468,6 +468,16 @@ products:
   #   scope: [mr] # Broken: #484
   # - environment: [lts]
   #   scope: [nightly] # Requires PyT 2.4: #481
+  - test_case: [gpt3_per_layer_profiling_tp1_pp1_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_per_layer_profiling_tp1_pp2_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
   #######################################################################
   # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
   #######################################################################
