@@ -299,11 +299,7 @@ class TestRLUtils:
                 "--rl-generation-lag requires --rl-partial-rollouts",
                 id="lag_requires_partial_rollouts",
             ),
-            pytest.param(
-                {"rl_generation_lag": -2},
-                "must be >= -1",
-                id="lag_below_minimum",
-            ),
+            pytest.param({"rl_generation_lag": -2}, "must be >= -1", id="lag_below_minimum"),
             pytest.param(
                 {"rl_submission_granularity": "R"},
                 "Rollout submission granularity requires streaming grouped rollouts",
