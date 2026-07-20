@@ -6,7 +6,6 @@ import logging
 import os
 from collections import Counter, defaultdict
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -25,7 +24,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     is_main_replica,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import maybe_msc
 
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
@@ -207,12 +206,7 @@ def verify_checkpoint(checkpoint_dir: str):
     Args:
         checkpoint_dir (str): checkpoint directory
     """
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        isdir = msc.os.path.isdir(str(checkpoint_dir), strict=False)
-    else:
-        isdir = os.path.isdir(checkpoint_dir)
-    if not isdir:
+    if not maybe_msc.path_isdir(str(checkpoint_dir), strict=False):
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
     if not check_is_distributed_checkpoint(checkpoint_dir):
@@ -506,15 +500,9 @@ def _compute_file_hash(file_path: str) -> str:
         Lowercase hex-encoded SHA-256 digest string.
     """
     h = hashlib.sha256()
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        with msc.open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(_READ_CHUNK_SIZE), b''):
-                h.update(chunk)
-    else:
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(_READ_CHUNK_SIZE), b''):
-                h.update(chunk)
+    with maybe_msc.open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(_READ_CHUNK_SIZE), b''):
+            h.update(chunk)
     return h.hexdigest()
 
 
@@ -528,28 +516,16 @@ def save_integrity_manifest(checkpoint_dir: str) -> None:
     """
     manifest: Dict[str, str] = {}
 
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        ckpt_path = msc.Path(checkpoint_dir)
-        for entry in sorted(ckpt_path.iterdir(), key=lambda p: str(p)):
-            if entry.name != INTEGRITY_FNAME:
-                manifest[entry.name] = _compute_file_hash(str(entry))
-    else:
-        ckpt_path = Path(checkpoint_dir)
-        for entry in sorted(ckpt_path.iterdir()):
-            if entry.is_file() and entry.name != INTEGRITY_FNAME:
-                manifest[entry.name] = _compute_file_hash(str(entry))
+    ckpt_path = maybe_msc.Path(checkpoint_dir)
+    for entry in sorted(ckpt_path.iterdir(), key=lambda p: str(p)):
+        if entry.is_file() and entry.name != INTEGRITY_FNAME:
+            manifest[entry.name] = _compute_file_hash(str(entry))
 
     integrity_path = os.path.join(checkpoint_dir, INTEGRITY_FNAME)
     payload = {'algorithm': _HASH_ALGORITHM, 'files': manifest}
 
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        with msc.open(integrity_path, 'w') as f:
-            json.dump(payload, f, indent=2)
-    else:
-        with open(integrity_path, 'w') as f:
-            json.dump(payload, f, indent=2)
+    with maybe_msc.open(integrity_path, 'w') as f:
+        json.dump(payload, f, indent=2)
 
     logger.info("Saved integrity manifest with %d file(s) to %s", len(manifest), integrity_path)
 
@@ -567,25 +543,14 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
     """
     integrity_path = os.path.join(checkpoint_dir, INTEGRITY_FNAME)
 
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        if not msc.os.path.exists(integrity_path):
-            raise CheckpointingException(
-                f'Integrity manifest not found at {integrity_path}. '
-                'The checkpoint must be saved with integrity verification enabled '
-                '(save_integrity=True) before it can be verified on load.'
-            )
-        with msc.open(integrity_path) as f:
-            manifest_data = json.load(f)
-    else:
-        if not os.path.exists(integrity_path):
-            raise CheckpointingException(
-                f'Integrity manifest not found at {integrity_path}. '
-                'The checkpoint must be saved with integrity verification enabled '
-                '(save_integrity=True) before it can be verified on load.'
-            )
-        with open(integrity_path) as f:
-            manifest_data = json.load(f)
+    if not maybe_msc.os.path.exists(integrity_path):
+        raise CheckpointingException(
+            f'Integrity manifest not found at {integrity_path}. '
+            'The checkpoint must be saved with integrity verification enabled '
+            '(save_integrity=True) before it can be verified on load.'
+        )
+    with maybe_msc.open(integrity_path) as f:
+        manifest_data = json.load(f)
 
     algorithm = manifest_data.get('algorithm', _HASH_ALGORITHM)
     if algorithm != _HASH_ALGORITHM:
