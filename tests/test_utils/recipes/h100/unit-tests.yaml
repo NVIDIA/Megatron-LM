@@ -39,13 +39,6 @@ spec:
     BUCKET="{test_case}"
     UNIT_TEST_REPEAT={n_repeat}
 
-    # Set this in the bucket launcher, not mfsdp_v2/conftest.py. Pytest imports the
-    # parent unit-test conftest first, which imports megatron.core and resolves the
-    # MFSDP adapter alias before a v2-local conftest could set MFSDP_VERSION.
-    if [[ "$BUCKET" == tests/unit_tests/distributed/mfsdp_v2/* ]]; then
-        export MFSDP_VERSION=2
-    fi
-
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
     else

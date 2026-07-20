@@ -66,6 +66,7 @@ class TestMcoreAdapter:
             config=config,
             ddp_config=DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
                 use_distributed_optimizer=True,
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
@@ -113,6 +114,7 @@ class TestMcoreAdapter:
             config=config,
             ddp_config=DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
                 use_distributed_optimizer=True,
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import logging
-import os
 import random
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -663,9 +662,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 communication is complete when backward returns."""
 
 
-FullyShardedDataParallel = (
-    FullyShardedDataParallelV2 if os.getenv("MFSDP_VERSION") == "2" else FullyShardedDataParallelV1
-)
+def FullyShardedDataParallel(
+    config: TransformerConfig,
+    ddp_config: DistributedDataParallelConfig,
+    module: torch.nn.Module,
+    fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
+    disable_bucketing: bool = False,
+    device: Optional[torch.device] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> _BaseDataParallel:
+    """Construct the configured Megatron-FSDP implementation."""
+    fsdp_class = (
+        FullyShardedDataParallelV2
+        if ddp_config.megatron_fsdp_version == 2
+        else FullyShardedDataParallelV1
+    )
+    return fsdp_class(
+        config, ddp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
+    )
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
