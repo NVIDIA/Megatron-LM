@@ -44,6 +44,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    DynamicBatchControllerStepResult,
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
@@ -1001,18 +1002,16 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         model_config = self.controller.inference_wrapped_model.model.config
-        if self.num_speculative_tokens > 0:
-            raise ValueError("Async scheduling does not support speculative tokens.")
+        if self.enable_chunked_prefill:
+            raise ValueError("Async scheduling does not support chunked prefill.")
+        if self.num_speculative_tokens > self.controller.num_mtp_depths:
+            raise ValueError("Async scheduling requires one MTP depth per speculative token.")
         if self.context.is_hybrid_model:
             raise ValueError("Async scheduling does not support hybrid/Mamba models.")
         if self.context.enable_prefix_caching:
             raise ValueError("Async scheduling does not support prefix caching.")
         if not self.materialize_only_last_token_logits:
             raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
-        if model_config.expert_model_parallel_size > 1:
-            raise ValueError("Async scheduling does not support expert parallelism.")
-        if model_config.num_moe_experts is not None:
-            raise ValueError("Async scheduling does not support MoE models.")
         if model_config.moe_enable_routing_replay:
             raise ValueError("Async scheduling does not support routing replay.")
 
@@ -1607,8 +1606,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def schedule_waiting_requests(self):
-        """Tries to schedule any requests in the waiting pool."""
+    def schedule_waiting_requests(self) -> None:
+        """Try to schedule requests from the waiting pool."""
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
         if self.enable_chunked_prefill:
@@ -1624,10 +1623,48 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
 
-    def schedule_non_chunked_prefill(self):
+    def _can_schedule_non_chunked_prefill(self, req, *, record_cg_wait: bool) -> bool:
+        """Return whether the queue-head request can be admitted now.
+
+        Args:
+            req: Queue-head inference request.
+            record_cg_wait (bool): Whether a CUDA-graph miss should update the
+                request's wait counter.
+
+        Returns:
+            bool: Whether all request, token, KV-cache, and CUDA-graph checks pass.
         """
-        Perform the same original scheduling logic for non-chunked runs
+        if not all(self.context.check_availability(req)):
+            return False
+
+        if not self._cg_admission_gating_active():
+            return True
+
+        candidate = InferenceBatchDimensions(
+            token_count=self.context.active_token_count + len(req.remaining_prompt_tokens),
+            prefill_req_count=self.context.num_prefill_requests + 1,
+            decode_req_count=self.context.num_decode_requests,
+        )
+        if record_cg_wait:
+            return self._cg_admission_check(req, candidate)
+        return self._matches_cg_admission(candidate)
+
+    def _has_async_sched_prefill_work(self) -> bool:
+        """Return whether this step should use async prefill ordering.
+
+        Returns:
+            bool: Whether prefill is active or the queue head is currently admissible.
         """
+        if self.context.num_prefill_requests > 0:
+            return True
+        if not self.waiting_request_ids:
+            return False
+
+        req = self.get_request(self.waiting_request_ids[0])
+        return self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
+
+    def schedule_non_chunked_prefill(self) -> None:
+        """Schedule non-chunked prefill requests."""
         prefix_caching_enabled = self.context.enable_prefix_caching
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1647,24 +1684,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(self.waiting_request_ids.popleft())
                     continue
 
-            request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
-                self.context.check_availability(req)
-            )
-            if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                # CUDA graph-aware admission gating: defer if the resulting batch shape lacks a
-                # matching captured CG. Non-chunked admit takes the request whole, so the
-                # candidate token_count is active + remaining_prompt_tokens.
-                if self._cg_admission_gating_active():
-                    candidate = InferenceBatchDimensions(
-                        token_count=(
-                            self.context.active_token_count + len(req.remaining_prompt_tokens)
-                        ),
-                        prefill_req_count=self.context.num_prefill_requests + 1,
-                        decode_req_count=self.context.num_decode_requests,
-                    )
-                    if not self._cg_admission_check(req, candidate):
-                        break
-
+            if self._can_schedule_non_chunked_prefill(req, record_cg_wait=True):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
@@ -1755,6 +1775,28 @@ class DynamicInferenceEngine(AbstractEngine):
         Caller is responsible for breaking the scheduler loop on False.
         Passes match_ep_token_counts=False so this local admission probe doesn't force a per-attempt
         NCCL all-reduce — the step-time matcher does its own EP sync.
+
+        Args:
+            req: Request whose CUDA-graph wait state should be updated.
+            candidate (InferenceBatchDimensions): Candidate batch after admission.
+
+        Returns:
+            bool: Whether a compatible captured graph exists.
+        """
+        if self._matches_cg_admission(candidate):
+            req.cg_wait_iters = 0
+            return True
+        self._register_cg_wait(req)
+        return False
+
+    def _matches_cg_admission(self, candidate: InferenceBatchDimensions) -> bool:
+        """Return whether a candidate batch matches a captured CUDA graph.
+
+        Args:
+            candidate (InferenceBatchDimensions): Candidate batch after admission.
+
+        Returns:
+            bool: Whether a compatible captured graph exists.
         """
         matched = CUDAGraphBatchDimensionBuilder.match_graph_config(
             real_batch_dim=candidate,
@@ -1762,11 +1804,7 @@ class DynamicInferenceEngine(AbstractEngine):
             strict=self.context.is_hybrid_model,
             match_ep_token_counts=False,
         )
-        if matched is not None:
-            req.cg_wait_iters = 0
-            return True
-        self._register_cg_wait(req)
-        return False
+        return matched is not None
 
     def schedule_chunked_prefill(self):
         """
@@ -1917,7 +1955,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
-    async def async_forward(self) -> Tuple[Dict, Dict, float]:
+    async def async_forward(self) -> Tuple[Optional[Dict], Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
 
@@ -1933,8 +1971,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
-        # schedule requests
-        self.schedule_waiting_requests()
+        mode = self.context.config.async_sched_mode
+        if mode == AsyncScheduleMode.LEGACY:
+            self.schedule_waiting_requests()
+            run_async_prefill = False
+        else:
+            run_async_prefill = self._has_async_sched_prefill_work()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
@@ -1945,7 +1987,11 @@ class DynamicInferenceEngine(AbstractEngine):
             and (self.context.step_count + 1) % self.logging_step_interval == 0
         )
 
-        is_decode_only = self.context.is_decode_only()
+        is_decode_only = (
+            self.context.is_decode_only()
+            if mode == AsyncScheduleMode.LEGACY
+            else not run_async_prefill
+        )
         if will_log_this_step:
             pre_step_context_state = {
                 "is_decode_only": is_decode_only,
@@ -1971,7 +2017,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        controller_result: DynamicBatchControllerStepResult = (
+            await self.controller.async_generate_output_tokens_dynamic_batch(
+                run_async_prefill=run_async_prefill,
+                schedule_waiting_requests=(
+                    self.schedule_waiting_requests if run_async_prefill else None
+                ),
+            )
+        )
+        result = controller_result.output
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
