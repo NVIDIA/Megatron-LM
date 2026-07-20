@@ -321,7 +321,7 @@ def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
-    model = getattr(chunk, "model", None)
+    model = getattr(chunk, "model", chunk)
     if model is None:
         return []
     layers = list(getattr(model, "layers", {}).values())
