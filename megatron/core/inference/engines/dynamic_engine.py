@@ -1209,12 +1209,17 @@ class DynamicInferenceEngine(AbstractEngine):
             # tokenization) is truncated rather than failed: a hard fail here
             # propagates through the serving stack and can kill a whole RL run
             # over one sample.
-            if self.rank == 0:
+            # Warn once only: agentic clients routinely request the full
+            # theoretical room (max_sequence_length - prompt), so every request
+            # lands in this clamp and per-request warnings flood the log.
+            if self.rank == 0 and not getattr(self, "_warned_generation_room_clamp", False):
+                self._warned_generation_room_clamp = True
                 warnings.warn(
                     f"Request {request_id}: clamping num_tokens_to_generate "
                     f"{request.sampling_params.num_tokens_to_generate} -> {generation_room} "
                     f"(prompt {len(request.prompt_tokens)} tokens, "
-                    f"max_sequence_length {self.context.max_sequence_length})."
+                    f"max_sequence_length {self.context.max_sequence_length}). "
+                    f"Further clamp warnings suppressed."
                 )
             request.sampling_params.num_tokens_to_generate = generation_room
 
