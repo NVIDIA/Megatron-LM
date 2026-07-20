@@ -1620,8 +1620,8 @@ def validate_args(args, defaults={}):
         )
         assert args.rampup_batch_size is None, (
             '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
-            'mapping for checkpoint-free dump segments (--skip-train-samples) assumes a fixed '
-            'global batch size.'
+            'mapping for checkpoint-free dump segments (--override-ckpt-iteration) assumes a '
+            'fixed global batch size.'
         )
 
     if args.freeze_all_layers:
@@ -1635,9 +1635,6 @@ def validate_args(args, defaults={}):
                 '--freeze-all-layers incompatible with overlap_param_gather. Disabling overlap_param_gather.'
             )
             args.overlap_param_gather = False
-
-    if args.override_ckpt_iteration is not None:
-        assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -2732,14 +2729,14 @@ def _add_checkpointing_args(parser):
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
     group.add_argument('--override-ckpt-iteration', type=int, default=None,
-                       help='Override the iteration stored in the loaded checkpoint. '
-                            'Also resets consumed_train_samples accordingly so the '
-                            'data loader replays samples from that iteration onward.')
-    group.add_argument('--skip-train-samples', type=int, default=0,
-                       help='On a fresh --finetune load, start the data loader at this '
-                            'global sample offset (consumed_train_samples). Enables '
-                            'checkpoint-free offline-KD dump segments over disjoint '
-                            'sample windows.')
+                       help='Start training as if the loaded checkpoint were at this '
+                            'iteration, resetting consumed_train_samples = iteration * '
+                            'global_batch_size so the data loader replays from that offset. '
+                            'Works on a resumable checkpoint (rewrites the stored iteration) '
+                            'and on a fresh --finetune load of a bare checkpoint that carries '
+                            'no saved args (seeds the data loader directly). Enables '
+                            'checkpoint-free offline-KD dump segments over disjoint sample '
+                            'windows.')
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')

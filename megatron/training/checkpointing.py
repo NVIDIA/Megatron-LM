@@ -1992,28 +1992,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
-    # Override iteration/consumed_samples if requested (e.g. to rewind the data loader).
-    if getattr(args, 'override_ckpt_iteration', None) is not None:
-        target_iter = args.override_ckpt_iteration
-        state_dict['iteration'] = target_iter
-        if 'args' in state_dict:
-            checkpoint_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
-            if (
-                checkpoint_global_batch_size is not None
-                and checkpoint_global_batch_size != args.global_batch_size
-            ):
-                raise RuntimeError(
-                    '--override-ckpt-iteration recomputes consumed_train_samples from the target '
-                    f'iteration and current global_batch_size, but checkpoint global_batch_size '
-                    f'({checkpoint_global_batch_size}) != current global_batch_size '
-                    f'({args.global_batch_size}). This would replay the data loader from the '
-                    'wrong sample offset.'
-                )
-            state_dict['args'].consumed_train_samples = target_iter * args.global_batch_size
-            state_dict['args'].skipped_train_samples = 0
-        print_rank_0(f'Overriding checkpoint iteration to {target_iter} '
-                     f'(consumed_train_samples = {target_iter * args.global_batch_size})')
-
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
@@ -2037,17 +2015,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
-    # Offline-KD teacher: on a fresh --finetune load (no resumable
-    # state) start the data loader at an explicit sample offset so checkpoint-free
-    # save segments can each cover a disjoint sample window.
-    if args.finetune and getattr(args, 'skip_train_samples', 0):
-        iteration = args.skip_train_samples // args.global_batch_size
-        args.consumed_train_samples = args.skip_train_samples
-        args.skipped_train_samples = 0
-        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
-        print_rank_0(f'--skip-train-samples: data loader starts at sample '
-                     f'{args.skip_train_samples} (iteration {iteration})')
-
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
@@ -2061,6 +2028,31 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                               'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+
+    # --override-ckpt-iteration: rewind the data loader to this iteration, overriding the
+    # baseline resolved above -- the checkpoint's on a resume, or 0 on a bare --finetune load
+    # (no saved args) -- so one path covers both. Enables checkpoint-free offline-KD dump
+    # segments over disjoint sample windows. GBS must match so the sample offset is correct.
+    if getattr(args, 'override_ckpt_iteration', None) is not None:
+        if 'args' in state_dict:
+            ckpt_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
+            if (
+                ckpt_global_batch_size is not None
+                and ckpt_global_batch_size != args.global_batch_size
+            ):
+                raise RuntimeError(
+                    '--override-ckpt-iteration recomputes consumed_train_samples from the target '
+                    f'iteration and current global_batch_size, but checkpoint global_batch_size '
+                    f'({ckpt_global_batch_size}) != current global_batch_size '
+                    f'({args.global_batch_size}). This would replay the data loader from the '
+                    'wrong sample offset.'
+                )
+        iteration = args.override_ckpt_iteration
+        args.consumed_train_samples = iteration * args.global_batch_size
+        args.skipped_train_samples = 0
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
+        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
+                     f'(consumed_train_samples {args.consumed_train_samples})')
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""

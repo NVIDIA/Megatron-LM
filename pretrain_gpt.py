@@ -13,7 +13,6 @@ import json
 import contextlib
 import os
 import warnings
-
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
