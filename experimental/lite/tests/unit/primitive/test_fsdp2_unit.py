@@ -64,9 +64,108 @@ class NestedToyBlock(ToyBlock):
         self.inner = ToyBlock()
 
 
+class ToyExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class ToyMoEBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dense = nn.Linear(4, 4, bias=False)
+        self.experts = ToyExperts()
+
+    def forward(self, x):
+        return self.experts(self.dense(x))
+
+
 def test_fsdp2_config_validates_empty_wrap_surface():
     with pytest.raises(ValueError, match="wrap_root=True"):
         FSDP2Config(wrap_root=False)
+
+
+def test_fsdp2_pipeline_preserves_reshard_after_forward_setting():
+    ps = SimpleNamespace(pp_size=4)
+
+    assert (
+        fsdp2_optimizer._fsdp2_unit_reshard_after_forward(
+            ps, reshard_after_forward=True
+        )
+        is True
+    )
+
+
+def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
+    model = ToyMoEBlock()
+    dense_calls = []
+    expert_calls = []
+    expert_mesh = SimpleNamespace(name="expert_dp")
+    optimizer = object()
+    ps = ParallelState(
+        pp_size=2,
+        ep_size=2,
+        dp_cp_size=4,
+        expert_dp_size=2,
+        ep_dp_group=object(),
+    )
+
+    def fake_wrap_expert(module, _ps, config, **kwargs):
+        expert_calls.append((module, config, kwargs))
+        return module
+
+    def fake_wrap_dense(module, _ps, config, **kwargs):
+        dense_calls.append((module, config, kwargs))
+        return module
+
+    monkeypatch.setattr(
+        fsdp2_optimizer,
+        "build_fsdp2_process_group_mesh",
+        lambda *args, **kwargs: expert_mesh,
+    )
+    monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2_module", fake_wrap_expert)
+    monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2", fake_wrap_dense)
+    monkeypatch.setattr(
+        fsdp2_optimizer,
+        "build_fsdp2_adamw",
+        lambda *args, **kwargs: optimizer,
+    )
+
+    result = fsdp2_optimizer.build_fsdp2_training_optimizer(
+        [model],
+        None,
+        ps,
+        unit_modules=(ToyMoEBlock,),
+        expert_classifier=lambda name: ".experts." in f".{name}",
+        reshard_after_forward=True,
+        use_fp32_shards=False,
+        use_fp32_master=False,
+    )
+
+    assert result is optimizer
+    assert len(expert_calls) == 1
+    expert_module, expert_config, expert_kwargs = expert_calls[0]
+    assert expert_module is model.experts
+    assert expert_config.reshard_after_forward is True
+    assert expert_kwargs["reshard_after_forward"] is True
+    assert expert_kwargs["mesh"] is expert_mesh
+
+    assert len(dense_calls) == 1
+    dense_module, dense_config, dense_kwargs = dense_calls[0]
+    assert dense_module is model
+    assert dense_config.reshard_after_forward is True
+    assert dense_config.last_unit_reshard_after_forward is True
+    assert dense_kwargs["ignored_params"] == set(model.experts.parameters())
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_fsdp2_pipeline_preserves_prefetch_depth(depth: int):
+    ps = SimpleNamespace(pp_size=4)
+
+    assert fsdp2_optimizer._fsdp2_prefetch_depth(ps, default_depth=depth) == depth
 
 
 @pytest.mark.parametrize("field", ["mesh_dim_name", "device_type"])
