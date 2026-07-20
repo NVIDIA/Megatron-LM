@@ -39,7 +39,7 @@ from megatron.core.datasets.object_storage_utils import (
     is_object_storage_path,
     parse_s3_path,
 )
-from megatron.core.msc_utils import maybe_msc
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)

@@ -180,10 +180,7 @@ def load(
 def _legacy_common_state_exists(checkpoint_dir: str) -> bool:
     """Check whether the checkpoint stores common data in a legacy common.pt file."""
     path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        return msc.Path(path).exists()
-    return os.path.exists(path)
+    return maybe_msc.Path(path).exists()
 
 
 def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
