@@ -306,6 +306,10 @@ This tool is the inverse of `convert-torch-dist-to-fsdp-dtensor`: it merges the 
 
 > ℹ️ SwiGLU is auto-detected from the `_w`/`_v` keys (no `--swiglu` needed); pass `--swiglu-modules language_model` to restrict merging to specific modules (e.g. VLMs where only the language model uses SwiGLU). Layer stacking is auto-detected — dense/homogeneous models are stacked, while MoE / Gated-DeltaNet / MTP models stay per-layer — and can be overridden with `--stack-layers` / `--non-homogeneous-layers`. FP8 `_extra_state` is not round-tripped (it is already discarded in the `fsdp_dtensor` checkpoint), so this path targets bf16/fp32 checkpoints.
 
+> ℹ️ **Supported architectures.** Dense, SwiGLU, MoE (both grouped-GEMM and SequentialMLP experts — including aux-loss-free routing, whose fp32 `router.expert_bias` buffer is preserved rather than downcast), Multi-Latent Attention, Multi-Token Prediction, and Gated-DeltaNet hybrids are handled. Architectures the converter cannot faithfully invert — Mamba/Mamba-2 (fused `conv1d_weight`/`conv1d_bias` projections) and other un-indexed stacked-layer buffers — raise `NotImplementedError` rather than silently emitting an incorrect checkpoint.
+
+> ⚠️ **Optimizer state and expert parallelism.** Model weights reshard into any target layout (validated for TP, PP, and EP). Optimizer state also reshards under tensor and pipeline parallelism, but it **cannot** be loaded into a job whose expert-parallel size introduces a different number of chained optimizers: expert parallelism splits the distributed optimizer into a second `ChainedOptimizer`, whereas the converter (like the source `fsdp_dtensor` checkpoint) emits a single optimizer grouping — a `ChainedOptimizer` entry-count mismatch results (a general Megatron distributed-optimizer constraint, not specific to this converter). Resume with optimizer state at `EP=1`, or resume weights-only (`--finetune --no-load-optim`) under `EP>1`.
+
 ## Megatron-FSDP Feature Guide & API
 
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
