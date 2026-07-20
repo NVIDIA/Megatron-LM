@@ -22,8 +22,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-pytestmark = pytest.mark.mlite
-
 
 class _LayerNorm(nn.Module):
     def __init__(self, dim: int):

@@ -25,7 +25,6 @@ import torch
 
 from megatron.lite.primitive.parallel.cp import get_thd_context_parallel_rank_indices
 
-pytestmark = pytest.mark.mlite
 
 # Hand-computed indices for the anchor case (cp=2, cu=[0,8,12]): seq0 len8 splits into
 # 4 chunks [0,1|2,3|4,5|6,7] with zigzag owners r0,r1,r1,r0; seq1 len4 -> [8|9|10|11]
@@ -111,7 +110,6 @@ def _reshuffle_worker(rank, world, cu_list, port, results):
         dist.destroy_process_group()
 
 
-@pytest.mark.distributed
 @pytest.mark.parametrize(
     "cp, cu, port",
     [

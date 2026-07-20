@@ -16,8 +16,6 @@ from megatron.lite.primitive.parallel.sp import (
 )
 from megatron.lite.primitive.parallel.state import ParallelState
 
-pytestmark = pytest.mark.mlite
-
 
 def test_tp_vocab_embedding_and_output_single_rank_contract(transformer_engine_import_stub):
     transformer_engine_import_stub()

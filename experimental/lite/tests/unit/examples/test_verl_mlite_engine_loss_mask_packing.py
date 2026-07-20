@@ -17,14 +17,37 @@ with ``_nested_from_packed_tensor``; no GPU, model init, or torch.distributed.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
-from tensordict import TensorDict
 
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
+if str(VERL_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
+
+
 from megatron.lite.model.deepseek_v4.lite.protocol import _nested_from_packed_tensor
 
-pytestmark = pytest.mark.mlite
+pytestmark = pytest.mark.optional
+
+
+@pytest.fixture(autouse=True)
+def _require_verl() -> None:
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+
+
+def _tensor_dict(data, batch_size):
+    from tensordict import TensorDict
+
+    return TensorDict(data, batch_size=batch_size)
+
+
+def _loss_mask_for_packing(micro_batch, input_ids):
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
+    return MegatronLiteEngine._loss_mask_for_packing(micro_batch, input_ids)
 
 
 def _full_input_ids(full_lengths: list[int]) -> torch.Tensor:
@@ -64,11 +87,11 @@ def test_nested_response_only_loss_mask_expands_to_full_length():
     loss_mask = torch.nested.as_nested_tensor(
         [_response_mask_row(r) for r in response_lengths], layout=torch.jagged
     )
-    micro_batch = TensorDict(
+    micro_batch = _tensor_dict(
         {"input_ids": input_ids, "loss_mask": loss_mask}, batch_size=[len(full_lengths)]
     )
 
-    packed = MegatronLiteEngine._loss_mask_for_packing(micro_batch, input_ids)
+    packed = _loss_mask_for_packing(micro_batch, input_ids)
     _assert_packs_to_full(packed, input_ids, full_lengths, response_lengths)
 
 
@@ -80,11 +103,11 @@ def test_full_length_nested_loss_mask_is_unchanged():
     loss_mask = torch.nested.as_nested_tensor(
         [torch.ones(r, dtype=torch.float32) for r in response_lengths], layout=torch.jagged
     )
-    micro_batch = TensorDict(
+    micro_batch = _tensor_dict(
         {"input_ids": input_ids, "loss_mask": loss_mask}, batch_size=[len(full_lengths)]
     )
 
-    packed = MegatronLiteEngine._loss_mask_for_packing(micro_batch, input_ids)
+    packed = _loss_mask_for_packing(micro_batch, input_ids)
     _assert_packs_to_full(packed, input_ids, full_lengths, response_lengths)
 
 
@@ -97,11 +120,11 @@ def test_dense_response_loss_mask_expands_to_full_length():
     dense = torch.zeros(len(response_lengths), max_response, dtype=torch.float32)
     for i, r in enumerate(response_lengths):
         dense[i, :r] = torch.ones(r, dtype=torch.float32)
-    micro_batch = TensorDict(
+    micro_batch = _tensor_dict(
         {"input_ids": input_ids, "loss_mask": dense}, batch_size=[len(full_lengths)]
     )
 
-    packed = MegatronLiteEngine._loss_mask_for_packing(micro_batch, input_ids)
+    packed = _loss_mask_for_packing(micro_batch, input_ids)
     seq_lens = input_ids.offsets().diff().to(torch.int64)
     assert int(packed.values().numel()) == sum(full_lengths)
     # Must not overflow when packed against the full seq_lens.
@@ -115,8 +138,6 @@ def test_response_longer_than_input_is_rejected():
     loss_mask = torch.nested.as_nested_tensor(
         [torch.ones(64, dtype=torch.float32)], layout=torch.jagged
     )
-    micro_batch = TensorDict(
-        {"input_ids": input_ids, "loss_mask": loss_mask}, batch_size=[1]
-    )
+    micro_batch = _tensor_dict({"input_ids": input_ids, "loss_mask": loss_mask}, batch_size=[1])
     with pytest.raises(ValueError, match="tokens but packed input"):
-        MegatronLiteEngine._loss_mask_for_packing(micro_batch, input_ids)
+        _loss_mask_for_packing(micro_batch, input_ids)

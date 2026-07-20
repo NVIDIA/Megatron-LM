@@ -29,7 +29,9 @@ reference output (forward), and likewise for the input gradient; weight grads ar
 CP-all-reduced then compared to the reference weight grads. Both modes are expected
 to be bitwise-exact (max_abs == 0) vs the reference.
 
-Run under: torchrun --nproc_per_node={2,4} gdn_cp_mode_parity.py
+Run both CP sizes through:
+  experimental/lite/tests/run_tests.sh \
+    experimental/lite/tests/smoke/primitive/test_gdn_cp_mode_parity.py
 """
 from __future__ import annotations
 
@@ -37,6 +39,7 @@ import os
 import sys
 import traceback
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -319,6 +322,18 @@ def main():
     if rank == 0:
         print("GDN_CP_PARITY_DONE", flush=True)
 
+
+@pytest.mark.parametrize(
+    "expected_world_size",
+    [
+        pytest.param(2, marks=pytest.mark.gpus(2), id="cp2"),
+        pytest.param(4, marks=pytest.mark.gpus(4), id="cp4"),
+    ],
+)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
+def test_gdn_cp_mode_parity(expected_world_size):
+    assert int(os.environ["WORLD_SIZE"]) == expected_world_size
+    main()
 
 if __name__ == "__main__":
     try:

@@ -5,6 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
+pytestmark = [
+    pytest.mark.gpus(2),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
+
 
 def _init_dist_or_skip():
     import os
@@ -470,6 +475,7 @@ def test_kimi_k2_packed_thd_variable_sequence_cp2_smoke():
         )
 
 
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS=None)
 def test_kimi_k2_tiny_model_fsdp2_optimizer_step_smoke():
     import torch
     import torch.distributed as dist

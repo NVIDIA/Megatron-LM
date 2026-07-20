@@ -18,8 +18,6 @@ from megatron.lite.primitive.parallel import (
     zigzag_split_for_cp,
 )
 
-pytestmark = pytest.mark.mlite
-
 
 def test_cp_zigzag_split_slice_and_reconstruct_match():
     tensor = torch.arange(16).reshape(1, 8, 2)

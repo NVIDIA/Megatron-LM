@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = [
+    pytest.mark.gpus(2),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
+
 
 def _make_train_config(ps):
     from types import SimpleNamespace
@@ -142,11 +147,23 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
     return float(stats[0].item()), float((stats[0] / stats[1]).item())
 
 
-def _hf_state_dict_for_glm5_loader(model):
-    return {
+def _hf_state_dict_for_glm5_loader(model, native, cfg):
+    """Build the synthetic HF fixture, including GLM5-only DSA indexer weights."""
+    from megatron.lite.model.glm5.lite.checkpoint import Glm5WeightSpec
+
+    state = {
         name: tensor.detach().cpu().contiguous().clone()
         for name, tensor in model.state_dict().items()
     }
+    spec = Glm5WeightSpec(cfg)
+    indexer_names = [name for name in native.state_dict() if ".indexer." in name]
+    assert indexer_names
+    for native_name in indexer_names:
+        mappings = spec.native_to_hf(native_name, native.state_dict()[native_name])
+        assert len(mappings) == 1
+        hf_name, tensor = mappings[0]
+        state[hf_name] = tensor.detach().cpu().contiguous().clone()
+    return state
 
 
 def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
@@ -170,7 +187,6 @@ def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
     )
 
 
-@pytest.mark.gpu
 def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     import torch
     import torch.distributed as dist
@@ -215,7 +231,6 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     torch.testing.assert_close(local_x.grad, expected_grad, atol=8e-2, rtol=8e-2)
 
 
-@pytest.mark.gpu
 def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     import torch
     import torch.distributed as dist
@@ -242,18 +257,17 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(100)
-    full_hidden = torch.randn(batch, seq, cfg.hidden_size, device=device, dtype=torch.bfloat16)
-    local_hidden = zigzag_slice_for_cp(full_hidden, rank, world, seq_dim=1).contiguous()
+    full_ids = torch.randint(0, cfg.vocab_size, (batch, seq), device=device)
+    local_ids = zigzag_slice_for_cp(full_ids, rank, world, seq_dim=1).contiguous()
 
     with torch.no_grad():
-        cp_hidden = cp_model(hidden_states=local_hidden)["hidden_states"]
-        ref_hidden = ref_model(hidden_states=full_hidden)["hidden_states"]
-    expected = zigzag_slice_for_cp(ref_hidden, rank, world, seq_dim=1)
+        cp_hidden = cp_model(input_ids=local_ids)["hidden_states"]
+        ref_hidden = ref_model(input_ids=full_ids)["hidden_states"]
+    expected = zigzag_slice_for_cp(ref_hidden, rank, world, seq_dim=0)
 
     torch.testing.assert_close(cp_hidden, expected, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.gpu
 def test_glm5_tiny_model_cp2_forward_backward_smoke():
     import torch
     import torch.distributed as dist
@@ -278,7 +292,7 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     input_ids = zigzag_slice_for_cp(full_ids, rank, world, seq_dim=1).contiguous()
 
     output = model(input_ids=input_ids)
-    assert output["hidden_states"].shape == (batch, seq // world, cfg.hidden_size)
+    assert output["hidden_states"].shape == (seq // world, batch, cfg.hidden_size)
     assert torch.isfinite(output["hidden_states"].float()).all()
     loss = output["hidden_states"].float().square().mean()
     assert loss.ndim == 0
@@ -292,7 +306,6 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     assert torch.isfinite(grad_norm)
 
 
-@pytest.mark.gpu
 def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     import torch
     import torch.distributed as dist
@@ -374,7 +387,6 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
         )
 
 
-@pytest.mark.gpu
 def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     import torch
     import torch.distributed as dist
@@ -396,12 +408,13 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
         device=device, dtype=torch.bfloat16
     )
     hf_ref.eval()
-    rank_tmp_path = tmp_path / f"rank{rank}"
-    save_safetensors(_hf_state_dict_for_glm5_loader(hf_ref), str(rank_tmp_path))
-
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
     native = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     native.eval()
+    rank_tmp_path = tmp_path / f"rank{rank}"
+    save_safetensors(
+        _hf_state_dict_for_glm5_loader(hf_ref, native, cfg), str(rank_tmp_path)
+    )
     load_hf_weights(native, str(rank_tmp_path), cfg, ps)
 
     batch, seq = 1, _fused_dsa_seq_len(world)
@@ -446,7 +459,8 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     for layer_idx, (actual, full_expected) in enumerate(
         zip(native_layer_outputs, hf_layer_outputs, strict=True)
     ):
-        expected = zigzag_slice_for_cp(full_expected, rank, world, seq_dim=1).contiguous()
+        expected = zigzag_slice_for_cp(full_expected, rank, world, seq_dim=1)
+        expected = expected.transpose(0, 1).contiguous()
         max_abs, max_rel = _distributed_diff_stats(actual, expected)
         if rank == 0:
             print(

@@ -6,8 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytestmark = pytest.mark.mlite
-
 
 @pytest.fixture(autouse=True)
 def _te_import_stub(transformer_engine_import_stub):

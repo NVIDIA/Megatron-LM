@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import types
 from dataclasses import dataclass
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,8 +22,6 @@ from megatron.lite.runtime.backends.mlite.runtime import (
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
-
-pytestmark = pytest.mark.mlite
 
 
 def test_runtime_returns_loss_separately_from_microbatch_metrics():
@@ -526,64 +522,3 @@ def test_runtime_dispatch_creates_mlite_backend():
 def test_runtime_dispatch_unknown_backend_raises():
     with pytest.raises(KeyError):
         create_runtime(RuntimeConfig(backend="nonexistent"))
-
-
-def _run_verl_sft_dry_run(script: Path, tmp_path: Path, **env_overrides: str) -> str:
-    env = {
-        **os.environ,
-        "MODEL_PATH": "/tmp/mlite-model",
-        "TRAIN_FILES": "/tmp/mlite-train.parquet",
-        "OUTPUT_ROOT": str(tmp_path),
-        "DRY_RUN": "1",
-        "NUM_GPUS": "1",
-        "NPROC_PER_NODE": "1",
-        "TP_SIZE": "1",
-        "PP_SIZE": "1",
-        "CP_SIZE": "1",
-        "EP_SIZE": "1",
-        "ETP_SIZE": "1",
-        **env_overrides,
-    }
-    completed = subprocess.run([str(script)], env=env, text=True, capture_output=True, check=True)
-    return completed.stdout
-
-
-def test_verl_sft_script_maps_offload_env_to_backend_args(tmp_path):
-    script = (
-        Path(__file__).resolve().parents[3]
-        / "examples"
-        / "verl"
-        / "scripts"
-        / "run_qwen3moe_sft.sh"
-    )
-
-    command = _run_verl_sft_dry_run(
-        script,
-        tmp_path,
-        PARAM_OFFLOAD="True",
-        OPTIMIZER_OFFLOAD="True",
-        OPTIMIZER_STATE_OFFLOAD_FRACTION="0.75",
-    )
-
-    assert "engine.param_offload=True" in command
-    assert "engine.optimizer_offload=True" in command
-    assert "+optim.override_optimizer_config.offload_fraction=0.75" in command
-    assert "+optim.override_optimizer_config.use_precision_aware_optimizer=True" in command
-
-
-def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp_path):
-    script = (
-        Path(__file__).resolve().parents[3]
-        / "examples"
-        / "verl"
-        / "scripts"
-        / "run_qwen3moe_sft.sh"
-    )
-
-    command = _run_verl_sft_dry_run(
-        script, tmp_path, PARAM_OFFLOAD="False", OPTIMIZER_OFFLOAD="False"
-    )
-
-    assert "engine.param_offload=False" in command
-    assert "engine.optimizer_offload=False" in command
-    assert "override_optimizer_config.offload_fraction" not in command

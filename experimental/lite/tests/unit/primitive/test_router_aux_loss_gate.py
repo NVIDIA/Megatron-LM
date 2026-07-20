@@ -1,9 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Aux-loss gating: a zero coefficient must not attach aux-loss gradients.
 
-The RL reference backend (verl megatron) runs
-``moe_router_load_balancing_type='none'`` — no load-balancing gradient at all.
-mLite routers previously attached the switch load-balancing loss through
+Configurations with ``moe_router_load_balancing_type='none'`` require no
+load-balancing gradient. MLite routers previously attached the switch loss through
 ``MoEAuxLossAutoScaler`` whenever ``compute_aux_loss=True`` and training,
 even when the coefficient resolved to zero, injecting a coherent all-token
 gradient into every parameter below the router.
@@ -58,6 +57,8 @@ def counting_scaler(monkeypatch):
     return _CountingScaler
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 @pytest.mark.parametrize("coef,expected_calls", [(0.0, 0), (0.001, 1)])
 def test_topk_router_skips_aux_loss_when_coef_zero(counting_scaler, coef, expected_calls):
     if not torch.cuda.is_available():

@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = pytest.mark.gpus(2)
 
 
 def _init_dist_or_skip():
@@ -95,7 +95,6 @@ def test_glm5_tiny_model_builds_and_steps_with_fsdp2_backend(cuda_dist):
     assert callable(bundle.extras["post_model_load_hook"])
 
     model = bundle.chunks[0]
-    model.initialize_weights()
     updates = bundle.extras["post_model_load_hook"]()
     bundle.optimizer = updates["optimizer"]
     assert isinstance(bundle.optimizer, FSDP2Optimizer)

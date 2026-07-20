@@ -1,12 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from verl_mlite.engine.config import MegatronLiteEngineConfig
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
+VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
+if str(VERL_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
+
+
 from megatron.lite.runtime.contracts import LossContext
+
+pytestmark = pytest.mark.optional
+
+
+@pytest.fixture(autouse=True)
+def _require_verl() -> None:
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -32,9 +44,9 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
     )
 
 
-def _engine(
-    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
-) -> MegatronLiteEngine:
+def _engine(*, engine_config: object, optimizer_config: SimpleNamespace | None = None):
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
             local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
@@ -45,7 +57,9 @@ def _engine(
     )
 
 
-def _engine_config(**kwargs) -> MegatronLiteEngineConfig:
+def _engine_config(**kwargs):
+    from verl_mlite.engine.config import MegatronLiteEngineConfig
+
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
@@ -170,6 +184,8 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
+    from verl_mlite.engine.mlite_engine import _build_lr_scheduler
+
     optimizer = SimpleNamespace(param_groups=[{"lr": 0.0, "weight_decay": 0.1}])
     opt = SimpleNamespace(
         total_training_steps=4,

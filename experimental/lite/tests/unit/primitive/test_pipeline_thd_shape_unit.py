@@ -178,7 +178,6 @@ def _fixed_buffer_worker(rank, world, port, results):
         dist.destroy_process_group()
 
 
-@pytest.mark.distributed
 def test_dynamic_shape_variable_len_recv_gloo():  # NEW: recv sized from wire, 0 mismatch
     import torch.multiprocessing as mp
     results = multiprocessing.Manager().list()
@@ -192,7 +191,6 @@ def test_dynamic_shape_variable_len_recv_gloo():  # NEW: recv sized from wire, 0
         assert bitwise_ok, f"S={s}: recv hidden not bitwise-equal to sent hidden"
 
 
-@pytest.mark.distributed
 def test_fixed_buffer_truncates_variable_len_gloo():  # OLD: fixed buffer overflows -> abort
     import torch.multiprocessing as mp
     results = multiprocessing.Manager().list()

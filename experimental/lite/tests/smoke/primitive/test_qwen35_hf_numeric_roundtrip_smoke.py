@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen3.5 HF<->lite checkpoint NUMERIC round-trip + ground-truth smoke.
 
-The existing export unit tests (tests/unit/model/test_qwen35_export.py) and the
+The existing export unit tests (tests/model/test_qwen35_export.py) and the
 save/load/export coverage smoke only assert NAMES / DTYPE / FINITENESS, never
 numeric fidelity — so a transform that is self-consistent on the round-trip but
 wrong vs real HF would pass silently. This smoke closes that blind spot:
@@ -21,8 +21,9 @@ wrong vs real HF would pass silently. This smoke closes that blind spot:
     both wrong vs forward semantics. Needs an 80GB GPU; loads only the first 8
     decoder layers to bound memory/time.
 
-Run single GPU:
-  torchrun --nproc_per_node=1 -m pytest tests/smoke/primitive/test_qwen35_hf_numeric_roundtrip_smoke.py
+Run the standard numeric case with:
+  experimental/lite/tests/run_tests.sh \
+    experimental/lite/tests/smoke/primitive/test_qwen35_hf_numeric_roundtrip_smoke.py
 """
 from __future__ import annotations
 
@@ -32,7 +33,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu]
+pytestmark = [
+    pytest.mark.gpus(1),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
 
 
 def _qwen35_tiny_cfg():
@@ -143,6 +147,7 @@ def test_qwen35_save_load_numeric_roundtrip(tmp_path):
     not os.environ.get("QWEN35_HF_DIR"),
     reason="set QWEN35_HF_DIR to a real Qwen3.5 HF checkpoint to run the ground-truth check.",
 )
+@pytest.mark.optional
 def test_qwen35_real_hf_load_export_matches_original(tmp_path):
     if dist.get_world_size() != 1:
         pytest.skip("ground-truth smoke runs single-rank (tp1).")

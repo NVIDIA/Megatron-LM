@@ -15,7 +15,10 @@ from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConf
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.gpus(8),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
 
 
 def _qwen3_moe_symbols():

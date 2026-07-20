@@ -23,6 +23,8 @@ from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
+pytestmark = pytest.mark.gpus(1)
+
 
 class TinyUnit(nn.Module):
     def __init__(self):
@@ -230,8 +232,7 @@ def test_fsdp2_offload_fraction_keeps_optimizer_update_state_on_cpu_single_gpu()
     assert _optimizer_state_devices(optimizer) == {"cpu"}
 
 
-@pytest.mark.gpu
-@pytest.mark.distributed
+@pytest.mark.gpus(8)
 def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     if dist.get_world_size() != 8:
         pytest.skip("PP2+CP2+EP2/EDP2 coverage requires torchrun with exactly 8 ranks.")

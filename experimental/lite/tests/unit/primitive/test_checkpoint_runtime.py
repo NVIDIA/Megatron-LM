@@ -220,6 +220,7 @@ def test_primitive_explicit_dcp_saves_optimizer_rank_sidecar(tmp_path):
     model = TinyMLP()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
     parallel = ParallelConfig(tp=1, ep=1, pp=1, cp=1)
+    parallel_state = SimpleNamespace(pp_size=1, pp_rank=0)
 
     with (
         patch("megatron.lite.primitive.ckpt.dcp._build_meshes", return_value=(None, None)),
@@ -230,7 +231,7 @@ def test_primitive_explicit_dcp_saves_optimizer_rank_sidecar(tmp_path):
         patch("megatron.lite.primitive.ckpt.dcp.dcp.save") as dcp_save_mock,
     ):
         save_training_checkpoint(
-            model, optimizer, 12, str(tmp_path), parallel, object(), use_dcp=True
+            model, optimizer, 12, str(tmp_path), parallel, parallel_state, use_dcp=True
         )
 
     dcp_save_mock.assert_called_once()

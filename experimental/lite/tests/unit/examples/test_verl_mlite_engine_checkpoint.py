@@ -1,10 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from verl_mlite.engine.config import MegatronLiteEngineConfig
-from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
+VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
+if str(VERL_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
+
+
+pytestmark = pytest.mark.optional
 
 
 class _Scheduler:
@@ -19,8 +26,11 @@ class _Scheduler:
 
 
 @pytest.fixture(autouse=True)
-def _single_process_dist(monkeypatch):
-    monkeypatch.setattr("verl_mlite.engine.mlite_engine.dist.is_initialized", lambda: False)
+def _single_process_dist(monkeypatch) -> None:
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    import verl_mlite.engine.mlite_engine as engine_module
+
+    monkeypatch.setattr(engine_module.dist, "is_initialized", lambda: False)
 
 
 def _optimizer_config() -> SimpleNamespace:
@@ -38,13 +48,17 @@ def _optimizer_config() -> SimpleNamespace:
     )
 
 
-def _engine_config(**kwargs) -> MegatronLiteEngineConfig:
+def _engine_config(**kwargs):
+    from verl_mlite.engine.config import MegatronLiteEngineConfig
+
     values = {"custom_backend_module": None, "impl_cfg": {"use_thd": True}}
     values.update(kwargs)
     return MegatronLiteEngineConfig(**values)
 
 
 def _initialized_engine(*, checkpoint_config=None, param_offload=False):
+    from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
             local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
@@ -210,9 +224,7 @@ def test_hf_model_save_fails_loudly_when_model_config_is_missing(tmp_path):
 
 
 def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monkeypatch):
-    engine, module, *_ = _initialized_engine(
-        checkpoint_config={"save_contents": ["hf_model"]}
-    )
+    engine, module, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
     model_cfg = object()
     chunks = [module, object()]
     export_calls = []
@@ -235,25 +247,17 @@ def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monke
         {
             "model_cfg": model_cfg,
             "model_chunks": chunks,
-            "protocol": SimpleNamespace(
-                save_hf_weights=lambda *args: export_calls.append(args)
-            ),
+            "protocol": SimpleNamespace(save_hf_weights=lambda *args: export_calls.append(args)),
         }
     )
     monkeypatch.setattr(
         "verl_mlite.engine.mlite_engine.save_training_checkpoint",
-        lambda *args, **kwargs: pytest.fail(
-            "hf_model-only save wrote a native checkpoint"
-        ),
+        lambda *args, **kwargs: pytest.fail("hf_model-only save wrote a native checkpoint"),
     )
 
     engine.save_checkpoint(str(tmp_path), global_step=1)
 
     hf_path = str(tmp_path / "huggingface")
     assert export_calls == [(chunks, hf_path, model_cfg, engine.handle._parallel_state)]
-    assert metadata_calls == [
-        ("config", hf_path),
-        ("tokenizer", hf_path),
-        ("processor", hf_path),
-    ]
+    assert metadata_calls == [("config", hf_path), ("tokenizer", hf_path), ("processor", hf_path)]
     assert hf_config.auto_map == {"AutoModel": "modeling.Model"}

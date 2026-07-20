@@ -21,8 +21,6 @@ from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
 from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
 from megatron.lite.primitive.parallel.state import ParallelState
 
-pytestmark = pytest.mark.mlite
-
 fsdp2_wrap = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.wrap")
 fsdp2_optimizer = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.optimizer")
 fsdp2_grad_clip = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.grad_clip")
@@ -391,6 +389,7 @@ def test_clip_grads_with_sharded_norm_scales_cpu_grads_once():
     torch.testing.assert_close(p1.grad, torch.tensor([0.0, 12.0]) * scale)
 
 
+@pytest.mark.gpus(1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for NCCL scalar test.")
 def test_all_reduce_scalar_moves_cpu_value_to_nccl_device(monkeypatch):
     group = object()

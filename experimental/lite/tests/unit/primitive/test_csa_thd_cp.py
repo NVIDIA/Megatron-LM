@@ -6,23 +6,22 @@ Coverage strategy (see the module docstring of
 the full ``_forward_thd_cp`` is gated behind CuTeDSL/CUDA kernels
 (``prepare_cp_compressor_input`` and ``build_attention_indices``), so its numeric
 ``CP=1 == unsharded`` invariant is only reachable on a GPU with those kernels and
-is marked ``gpu``. The CPU-reachable pieces -- the THD tensor layout built by the
-dispatch, the zero left-boundary at ``cp_size == 1``, the boundary-KV projection,
-the differentiability of that pre-CP path, and the pre-grouped compressor overlap
-transform -- are exercised directly here by stubbing ``_forward_thd_cp``.
+is marked ``gpu``. The THD tensor layout built by the dispatch, the zero
+left-boundary at ``cp_size == 1``, the boundary-KV projection, and the
+differentiability of that pre-CP path require a GPU for real Transformer Engine
+layers. The pre-grouped compressor overlap transform remains CPU-only.
 
-These tests require a real Transformer Engine install (Megatron Core's CSA module
-imports ``transformer_engine.pytorch.float8_tensor``); they skip cleanly when it
-is absent rather than failing collection.
+These tests require a real Transformer Engine install because Megatron Core CSA
+imports ``transformer_engine.pytorch.float8_tensor``. A missing dependency
+therefore fails the strict standard harness.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
 import torch
-
-pytestmark = pytest.mark.mlite
 
 
 def _csa():
@@ -51,6 +50,33 @@ def _tiny_config():
         num_hidden_layers=1,
         num_nextn_predict_layers=1,
     )
+
+
+def _fused_kernel_config():
+    config = _tiny_config()
+    config.num_attention_heads = 64
+    config.head_dim = 512
+    config.qk_rope_head_dim = 64
+    config.index_head_dim = 128
+    config.index_n_heads = 64
+    return config
+
+
+@pytest.fixture
+def _single_rank_nccl():
+    import os
+
+    import torch.distributed as dist
+
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    created_group = not dist.is_initialized()
+    if created_group:
+        dist.init_process_group("nccl")
+    try:
+        yield dist.group.WORLD
+    finally:
+        if created_group and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _ps(cp_size: int = 1, cp_rank: int = 0):
@@ -88,7 +114,9 @@ def test_overlap_transform_thd_layout():
     fake_self = SimpleNamespace(head_dim=d)
     ratio, n = 4, 2
     # (total_comp, ratio, 1, coff * d) with coff == 2.
-    tensor = torch.arange(n * ratio * 1 * (2 * d), dtype=torch.float32).reshape(n, ratio, 1, 2 * d)
+    tensor = torch.arange(n * ratio * 1 * (2 * d), dtype=torch.float32).reshape(
+        n, ratio, 1, 2 * d
+    )
     is_first = torch.tensor([True, False])
     out = csa.CompressedSequenceCompressor._overlap_transform_thd(
         fake_self, tensor, is_first, fill_value=0.0
@@ -103,29 +131,32 @@ def test_overlap_transform_thd_layout():
 
 
 # ---------------------------------------------------------------------------
-# THD dispatch + boundary-KV projection (CPU-reachable with real TE; the
+# THD dispatch + boundary-KV projection (one GPU with real TE; the
 # CuTeDSL-gated core is stubbed out).
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gpus(1)
 def test_forward_thd_packed_builds_layout_and_is_differentiable(monkeypatch):
     csa = _csa()
     torch.manual_seed(0)
     config = _tiny_config()
+    device = torch.device("cuda")
     try:
-        module = csa.CompressedSparseAttention(config, layer_idx=0, ps=_ps())
+        module = csa.CompressedSparseAttention(config, layer_idx=0, ps=_ps()).to(device)
     except RuntimeError as exc:  # te.RMSNorm/te.Linear unavailable (stubbed TE)
         pytest.skip(f"real Transformer Engine required to build CSA: {exc}")
 
     seq_len = 8  # divisible by ratio; >= D_window so the boundary window fits.
-    device = torch.device("cpu")
     x = torch.randn(1, seq_len, config.hidden_size, device=device, requires_grad=True)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
     psp = _packed_seq_params(seq_len, device)
 
     captured = {}
 
-    def _fake_forward_thd_cp(query, key, x_thd, qr, boundary_hidden, boundary_kv, packed):
+    def _fake_forward_thd_cp(
+        query, key, x_thd, qr, boundary_hidden, boundary_kv, packed
+    ):
         captured.update(
             query=query,
             key=key,
@@ -161,18 +192,20 @@ def test_forward_thd_packed_builds_layout_and_is_differentiable(monkeypatch):
     assert torch.isfinite(x.grad).all()
 
 
+@pytest.mark.gpus(1)
 def test_project_boundary_kv_shape(monkeypatch):
     csa = _csa()
     torch.manual_seed(0)
     config = _tiny_config()
+    device = torch.device("cuda")
     try:
-        module = csa.CompressedSparseAttention(config, layer_idx=0, ps=_ps())
+        module = csa.CompressedSparseAttention(config, layer_idx=0, ps=_ps()).to(device)
     except RuntimeError as exc:
         pytest.skip(f"real Transformer Engine required to build CSA: {exc}")
 
     dwin = _d_window(config)
-    boundary_hidden = torch.randn(dwin, 1, config.hidden_size)
-    cu = torch.tensor([0, 8], dtype=torch.int32)
+    boundary_hidden = torch.randn(dwin, 1, config.hidden_size, device=device)
+    cu = torch.tensor([0, 8], dtype=torch.int32, device=device)
     bkv = module._project_boundary_kv(
         boundary_hidden, cu, global_start=0, rope_theta=config.compress_rope_theta
     )
@@ -185,9 +218,11 @@ def test_project_boundary_kv_shape(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA + CuTeDSL kernels")
-def test_cp1_thd_equals_bshd_fused():
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires CUDA + CuTeDSL kernels"
+)
+def test_cp1_thd_equals_bshd_fused(_single_rank_nccl):
     """CP=1 THD packed attention equals the (unsharded) CP=1 BSHD fused path.
 
     Both routes share the DSv4 sparse-attention formula (sliding window +
@@ -198,22 +233,28 @@ def test_cp1_thd_equals_bshd_fused():
     """
     csa = _csa()
     torch.manual_seed(0)
-    config = _tiny_config()
+    config = _fused_kernel_config()
     device = torch.device("cuda")
-    module = csa.CompressedSparseAttention(config, layer_idx=0, ps=_ps()).to(device)
+    ps = _ps()
+    ps.cp_group = _single_rank_nccl
+    module = csa.CompressedSparseAttention(config, layer_idx=0, ps=ps).to(
+        device=device, dtype=torch.bfloat16
+    )
     # Select a fused sparse backend for both the BSHD and THD routes.
     module.attention_backend = "flash"
     module.apply_dsa_kernel_fusion = True
     module.eval()
 
     seq_len = 8
-    x = torch.randn(1, seq_len, config.hidden_size, device=device)
+    x = torch.randn(1, seq_len, config.hidden_size, device=device, dtype=torch.bfloat16)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
     with torch.no_grad():
         out_bshd = module(x, position_ids=position_ids)
         out_thd = module(
-            x, position_ids=position_ids, packed_seq_params=_packed_seq_params(seq_len, device)
+            x,
+            position_ids=position_ids,
+            packed_seq_params=_packed_seq_params(seq_len, device),
         )
 
     assert out_thd.shape == out_bshd.shape == (1, seq_len, config.hidden_size)

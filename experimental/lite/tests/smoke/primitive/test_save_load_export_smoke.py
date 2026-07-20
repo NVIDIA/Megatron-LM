@@ -13,10 +13,7 @@ tp2/ep2/pp2 topology (exactly 8 GPUs). fsdp2 cases use torch DCP on a
 pure-DP mesh. Both checkpoint paths are exercised through the unified
 MegatronLiteRuntime so the matrix guards the runtime entry points.
 
-Run with torchrun --nproc_per_node=8 -m pytest, selecting per-env subsets
-with -k (qwen3_5 needs the qwen3.5 canary site; the four deepseek/qwen3_moe
-models need the DSA overlay). Models gate themselves with importorskip so a
-wrong-env invocation skips rather than errors.
+Run this file through experimental/lite/tests/run_tests.sh.
 """
 from __future__ import annotations
 
@@ -34,7 +31,7 @@ from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConf
 from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = pytest.mark.gpus(8)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -223,7 +220,14 @@ MODELS = {
     "deepseek_v4": _deepseek_v4,
 }
 
-BACKENDS = ("dist_opt", "fsdp2")
+BACKENDS = (
+    pytest.param(
+        "dist_opt",
+        marks=pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+        id="dist_opt",
+    ),
+    pytest.param("fsdp2", id="fsdp2"),
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -277,18 +281,48 @@ def _single_node_cuda_dist():
 
 @pytest.fixture(autouse=True)
 def _reset_parallel_state_between_tests():
-    """Tear down Megatron model-parallel groups after each case.
+    """Tear down every model-parallel group created by a case.
 
-    The matrix builds models with different topologies (tp2/ep2/pp2 for
-    dist_opt, pure-DP for fsdp2). Leaving a prior case's mpu groups initialized
-    desyncs the next case's collectives, so reset between tests.
+    Dist-opt cases build several topologies in one worker. MCore
+    destroy_model_parallel clears its globals, but MLite init_parallel groups
+    are owned by ParallelState and must be destroyed explicitly before the
+    next dist-opt topology. FSDP2 DeviceMesh owns and caches its process groups,
+    so those remain scoped to the isolated worker instead.
     """
     yield
+    import gc
+
     from megatron.core import parallel_state as mpu
 
     if mpu.is_initialized():
         mpu.destroy_model_parallel()
+    gc.collect()
+    for ps in _BUILT_PARALLEL_STATES:
+        for attr in _PS_GROUP_ATTRS:
+            group = getattr(ps, attr, None)
+            if group is not None:
+                try:
+                    dist.destroy_process_group(group)
+                except Exception:
+                    pass
+    _BUILT_PARALLEL_STATES.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
+
+_BUILT_PARALLEL_STATES: list = []
+_PS_GROUP_ATTRS = (
+    "tp_group",
+    "ep_group",
+    "etp_group",
+    "cp_group",
+    "pp_group",
+    "pp_cpu_group",
+    "dp_group",
+    "dp_cp_group",
+    "tp_ep_group",
+    "ep_dp_group",
+)
 
 # GLM5 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
 # through primitives), so their dist_opt topology shards via ep/pp/cp instead.
@@ -360,6 +394,7 @@ def _build_handle(
         optimizer = bundle.extras["post_model_load_hook"]()["optimizer"]
     else:
         optimizer = bundle.optimizer
+        _BUILT_PARALLEL_STATES.append(bundle.parallel_state)
 
     extras = dict(bundle.extras)
     extras.update(
@@ -557,6 +592,7 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
     _assert_params_bitwise_equal(saved, loaded)
 
 
+@pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")
 @pytest.mark.parametrize("model_name", list(MODELS))
 def test_export_hf_bf16_reload(model_name, tmp_path):
     """Export HF weights (bf16) and reload the safetensors shards.

@@ -13,10 +13,9 @@ tp2/ep2 for TP-capable models, tp1/ep2 for glm5 / deepseek_v4 (native lite TP=1)
 CP=1: cp>1 on these tiny proxy seqs breaks TE attention backend selection
 (orthogonal to layout; covered by the dedicated CP smokes).
 
-Run: torchrun --nproc_per_node=8 -m pytest --mlite-smoke, selecting per-env subsets
-with -k (qwen3_5 on the qwen3.5 site; the rest on the DSA overlay). Models also
-gate themselves with importorskip.
+Run this file through experimental/lite/tests/run_tests.sh.
 """
+
 from __future__ import annotations
 
 import os
@@ -32,7 +31,10 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.gpus(8),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
 
 # 9 decoders over pp=4 is non-divisible; 9 is small enough to stay fast yet leaves no
 # empty stage even for the MTP model (deepseek_v4 adds a slot on the last stage).
@@ -201,7 +203,9 @@ def _glm5():
 
 
 def _deepseek_v4():
-    pytest.importorskip("cudnn", reason="deepseek_v4 fused DSA needs the cudnn DSA stack.")
+    pytest.importorskip(
+        "cudnn", reason="deepseek_v4 fused DSA needs the cudnn DSA stack."
+    )
     _require_te()
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
     from megatron.lite.model.deepseek_v4.lite import protocol
@@ -211,13 +215,15 @@ def _deepseek_v4():
         hidden_size=128,
         moe_intermediate_size=16,
         num_hidden_layers=_NUM_LAYERS,
-        num_attention_heads=8,
+        num_attention_heads=64,
         num_key_value_heads=1,
-        head_dim=64,
-        qk_rope_head_dim=16,
+        # Keep the production fused-kernel geometry; only model width/depth and
+        # expert counts are reduced for the proxy.
+        head_dim=512,
+        qk_rope_head_dim=64,
         q_lora_rank=32,
         o_lora_rank=32,
-        o_groups=2,
+        o_groups=8,
         n_routed_experts=4,
         n_shared_experts=1,
         num_experts_per_tok=2,
@@ -227,8 +233,8 @@ def _deepseek_v4():
         sliding_window=128,
         num_hash_layers=2,
         hc_mult=2,
-        index_head_dim=64,
-        index_n_heads=8,
+        index_head_dim=128,
+        index_n_heads=64,
         index_topk=512,
         # Real MTP: an extra nextn layer on the last stage exercises the
         # MTP-aware branch of the auto layout balancing.
@@ -288,8 +294,16 @@ def _single_node_cuda_dist():
 # teardown can free them (mcore's destroy_model_parallel frees only mcore's groups).
 _BUILT_PARALLEL_STATES: list = []
 _PS_GROUP_ATTRS = (
-    "tp_group", "ep_group", "etp_group", "cp_group", "pp_group", "pp_cpu_group",
-    "dp_group", "dp_cp_group", "tp_ep_group", "ep_dp_group",
+    "tp_group",
+    "ep_group",
+    "etp_group",
+    "cp_group",
+    "pp_group",
+    "pp_cpu_group",
+    "dp_group",
+    "dp_cp_group",
+    "tp_ep_group",
+    "ep_dp_group",
 )
 
 

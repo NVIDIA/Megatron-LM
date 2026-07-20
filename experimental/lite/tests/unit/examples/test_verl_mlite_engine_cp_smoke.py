@@ -1,16 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Two-GPU VERL connector coverage for an optional downstream workflow."""
+
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
 
+VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
+if str(VERL_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
+
 pytestmark = [
-    pytest.mark.mlite,
-    pytest.mark.smoke,
-    pytest.mark.gpu,
-    pytest.mark.distributed,
+    pytest.mark.optional,
+    pytest.mark.gpus(2),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
 ]
 
 
@@ -29,8 +36,8 @@ def _init_dist_or_skip():
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
         dist.init_process_group("nccl")
-    if dist.get_world_size() < 2:
-        pytest.skip("MLite VERL CP smoke requires at least 2 ranks.")
+    if dist.get_world_size() != 2:
+        pytest.skip("MLite VERL CP smoke requires exactly 2 ranks.")
     return torch.device("cuda", local_rank)
 
 
@@ -188,6 +195,7 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     apply_runtime_patches()
     from verl_mlite.engine.config import MegatronLiteEngineConfig
     from verl_mlite.engine.mlite_engine import MegatronLiteEngine
+
     from megatron.lite.runtime.contracts import PackedBatch
 
     device = _init_dist_or_skip()

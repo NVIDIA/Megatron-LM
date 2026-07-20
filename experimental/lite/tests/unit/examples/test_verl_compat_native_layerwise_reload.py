@@ -1,12 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from contextlib import contextmanager
 import sys
+from contextlib import contextmanager
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
+VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
+if str(VERL_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
+
 from verl_mlite import compat
+
+pytestmark = pytest.mark.optional
 
 
 def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:

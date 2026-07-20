@@ -22,7 +22,7 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = pytest.mark.gpus(2)
 
 
 class TinyUnit(nn.Module):

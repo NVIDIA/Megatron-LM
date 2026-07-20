@@ -16,8 +16,6 @@ from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_s
 from megatron.lite.primitive.train_step import compute_and_clip_grad_norm, run_microbatch_loop
 from megatron.lite.primitive.utils import ensure_divisible
 
-pytestmark = pytest.mark.mlite
-
 
 def test_vocab_parallel_cross_entropy_matches_torch_cross_entropy():
     logits = torch.randn(2, 3, 5, dtype=torch.float64, requires_grad=True)

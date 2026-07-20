@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.optional
+
 
 SCRIPT = (
     Path(__file__).resolve().parents[3]

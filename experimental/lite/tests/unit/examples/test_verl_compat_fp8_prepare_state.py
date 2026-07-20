@@ -1,9 +1,18 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
+VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
+if str(VERL_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
+
 from verl_mlite import compat
+
+pytestmark = pytest.mark.optional
 
 
 def test_pure_fp8_ds4_prepare_state_is_promoted(monkeypatch) -> None:

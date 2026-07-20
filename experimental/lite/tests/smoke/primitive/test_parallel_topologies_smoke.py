@@ -10,13 +10,18 @@ import torch.distributed as dist
 
 from megatron.lite.primitive.parallel import (
     PackedSeqParams,
+    ParallelState,
     contiguous_to_zigzag_chunks,
     init_parallel,
+    split_packed_to_cp_local,
     zigzag_split_for_cp,
     zigzag_to_contiguous_chunks,
 )
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.gpus(2),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -64,6 +69,7 @@ def _topologies(world_size: int):
         yield "tp2_ep2_etp2_pp2", SimpleNamespace(tp=2, ep=2, etp=2, cp=1, pp=2)
 
 
+@pytest.mark.gpus(8)
 def test_parallel_state_builds_expected_primitive_groups():
     world_size = dist.get_world_size()
     for name, cfg in _topologies(world_size):
@@ -107,7 +113,10 @@ def test_cp_zigzag_contiguous_chunk_swap_roundtrip():
         pytest.skip("CP chunk swap smoke requires at least 2 ranks.")
 
     ps = init_parallel(SimpleNamespace(tp=1, ep=1, etp=1, cp=2, pp=1))
-    full = torch.arange(8, device="cuda", dtype=torch.float32).reshape(1, 8, 1) + 100 * ps.dp_rank
+    full = (
+        torch.arange(8, device="cuda", dtype=torch.float32).reshape(1, 8, 1)
+        + 100 * ps.dp_rank
+    )
     local_zigzag = zigzag_split_for_cp(full, ps.cp_rank, cp_size=2, seq_dim=1)
 
     local_contiguous = zigzag_to_contiguous_chunks(local_zigzag, ps.cp_group, seq_dim=1)
@@ -118,15 +127,17 @@ def test_cp_zigzag_contiguous_chunk_swap_roundtrip():
     assert torch.equal(restored, local_zigzag)
 
 
-def test_gdn_rejects_thd_context_parallel_until_validated():
+def test_gdn_packed_thd_cp2_matches_full_sequence_reference():
     if dist.get_world_size() < 2:
-        pytest.skip("GDN THD+CP guard smoke requires at least 2 ranks.")
+        pytest.skip("GDN packed THD+CP smoke requires at least 2 ranks.")
 
     pytest.importorskip("transformer_engine.pytorch")
     from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 
+    torch.manual_seed(20260714)
+    torch.cuda.manual_seed_all(20260714)
     ps = init_parallel(SimpleNamespace(tp=1, ep=1, etp=1, cp=2, pp=1))
-    gdn = (
+    cp_gdn = (
         GatedDeltaNet(
             hidden_size=16,
             linear_num_key_heads=2,
@@ -140,9 +151,49 @@ def test_gdn_rejects_thd_context_parallel_until_validated():
         .cuda()
         .to(torch.bfloat16)
     )
+    reference_gdn = (
+        GatedDeltaNet(
+            hidden_size=16,
+            linear_num_key_heads=2,
+            linear_key_head_dim=4,
+            linear_num_value_heads=2,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=2,
+            rms_norm_eps=1e-6,
+            ps=ParallelState(),
+        )
+        .cuda()
+        .to(torch.bfloat16)
+    )
+    reference_gdn.load_state_dict(cp_gdn.state_dict())
+    assert cp_gdn.cp_mode == "headwise"
+    cp_gdn.eval()
+    reference_gdn.eval()
+
     cu_seqlens = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
     packed_seq_params = PackedSeqParams.from_cu_seqlens(cu_seqlens, max_seqlen=8)
-    local_hidden = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+    full_hidden = torch.linspace(
+        -0.5, 0.5, steps=8 * 16, device="cuda", dtype=torch.bfloat16
+    ).reshape(8, 1, 16)
+    local_hidden = split_packed_to_cp_local(
+        full_hidden,
+        cu_seqlens_padded=cu_seqlens,
+        cp_size=2,
+        cp_rank=ps.cp_rank,
+        dim=0,
+    )
 
-    with pytest.raises(NotImplementedError, match="all-gather CP"):
-        gdn(local_hidden, packed_seq_params=packed_seq_params)
+    with torch.no_grad():
+        actual = cp_gdn(local_hidden, packed_seq_params=packed_seq_params)
+        full_reference = reference_gdn(full_hidden, packed_seq_params=packed_seq_params)
+    expected = split_packed_to_cp_local(
+        full_reference,
+        cu_seqlens_padded=cu_seqlens,
+        cp_size=2,
+        cp_rank=ps.cp_rank,
+        dim=0,
+    )
+
+    assert actual.shape == local_hidden.shape
+    assert torch.isfinite(actual.float()).all()
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)

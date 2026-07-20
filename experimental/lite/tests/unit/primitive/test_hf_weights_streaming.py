@@ -136,6 +136,7 @@ def test_export_defaults_to_device_resident_tensors() -> None:
     assert inspect.signature(export_hf_weights).parameters["cpu"].default is False
 
 
+@pytest.mark.gpus(1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gpu_resident_export_is_bitwise_equal_to_legacy_cpu_export() -> None:
     class Model(nn.Module):

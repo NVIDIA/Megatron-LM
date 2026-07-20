@@ -14,8 +14,6 @@ from megatron.lite.primitive.modules.lora import (
     trainable_param_stats,
 )
 
-pytestmark = pytest.mark.mlite
-
 
 def test_lora_config_aliases_and_trainable_param_accounting():
     cfg = normalize_lora_config({"enabled": True, "rank": 2, "alpha": 6, "targets": ["qkv", "fc2"]})

@@ -7,9 +7,6 @@ from megatron.lite.runtime import RuntimeConfig, create_runtime
 from megatron.lite.runtime.backends.mlite.config import DebugConfig, MegatronLiteConfig
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
-pytestmark = pytest.mark.mlite
-
-
 def test_mlite_config_defaults_are_stable():
     cfg = MegatronLiteConfig(model_name="qwen3_moe")
 

@@ -23,7 +23,10 @@ from megatron.lite.runtime.contracts.config import OptimizerConfig as LiteOptimi
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.gpus(2),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
 
 
 class TinyDense(nn.Module):
@@ -274,6 +277,7 @@ def test_dist_opt_checkpoint_load_matches_uninterrupted_training_single_node(tmp
     _assert_model_close(direct_model, loaded_model)
 
 
+@pytest.mark.gpus(8)
 def test_dist_opt_checkpoint_reshards_from_pp_ep_to_tp_pp_ep_etp(tmp_path):
     if torch.distributed.get_world_size() < 8:
         pytest.skip("TP2/PP2/EP2/ETP2 dist_opt reshard smoke requires 8 GPUs.")
