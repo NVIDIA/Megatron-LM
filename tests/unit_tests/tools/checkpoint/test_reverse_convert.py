@@ -217,8 +217,12 @@ class TestRestackExperts:
 
     def test_local_experts_optimizer(self):
         t = {
-            "optimizer.state.exp_avg.decoder.layers.3.mlp.experts.local_experts.0.linear_fc2.weight": torch.zeros(2),  # noqa: E501
-            "optimizer.state.exp_avg.decoder.layers.3.mlp.experts.local_experts.1.linear_fc2.weight": torch.ones(2),  # noqa: E501
+            "optimizer.state.exp_avg.decoder.layers.3.mlp.experts.local_experts.0.linear_fc2.weight": torch.zeros(
+                2
+            ),  # noqa: E501
+            "optimizer.state.exp_avg.decoder.layers.3.mlp.experts.local_experts.1.linear_fc2.weight": torch.ones(
+                2
+            ),  # noqa: E501
         }
         out, n = _restack_experts(t)
         assert n == 1
@@ -228,7 +232,9 @@ class TestRestackExperts:
 
     def test_shared_experts_not_treated_as_local(self):
         # shared_experts must not match the local_experts pattern.
-        t = {"decoder.layers.0.mlp.shared_experts.local_experts.0.linear_fc1.weight": torch.zeros(2)}
+        t = {
+            "decoder.layers.0.mlp.shared_experts.local_experts.0.linear_fc1.weight": torch.zeros(2)
+        }
         out, n = _restack_experts(t)
         assert n == 0
 
@@ -256,7 +262,12 @@ class TestSplitGdnProjections:
         assert n == 1
         assert key not in out
         for name, size in [
-            ("query", qk), ("key", qk), ("value", v), ("z", v), ("beta", nvh), ("alpha", nvh)
+            ("query", qk),
+            ("key", qk),
+            ("value", v),
+            ("z", v),
+            ("beta", nvh),
+            ("alpha", nvh),
         ]:
             assert out[f"{key}.{name}"].shape == (size, 3)
         # concatenating the parts in factory order reproduces the fused blob.
@@ -440,7 +451,9 @@ class TestRebuildParamGroupsFromMeta:
         flat.update(self._meta("decoder.layers.0.self_attention.linear_qkv.weight", 1.0, 0.1))
         flat.update(self._meta("decoder.layers.1.self_attention.linear_qkv.weight", 1.0, 0.1))
         flat.update(self._meta("decoder.layers.0.self_attention.linear_qkv.bias", 0.0, 0.0))
-        flat.update(self._meta("decoder.layers.0.mlp.experts.linear_fc1.weight0", 1.0, 0.1, expert=True))
+        flat.update(
+            self._meta("decoder.layers.0.mlp.experts.linear_fc1.weight0", 1.0, 0.1, expert=True)
+        )
 
         groups = _rebuild_param_groups_from_meta(flat, self._PREFIX)
         idents = {
@@ -448,7 +461,11 @@ class TestRebuildParamGroupsFromMeta:
             for g in groups
         }
         assert len(groups) == 3
-        assert idents == {(1.0, 1.0, False, False), (0.0, 1.0, False, False), (1.0, 1.0, True, False)}
+        assert idents == {
+            (1.0, 1.0, False, False),
+            (0.0, 1.0, False, False),
+            (1.0, 1.0, True, False),
+        }
         # full hyperparameters are carried; params are contiguous integer indices
         decay = next(g for g in groups if g["wd_mult"] == 1.0 and not g["is_expert_parallel"])
         assert decay["weight_decay"] == 0.1 and decay["betas"] == (0.9, 0.999)
@@ -526,7 +543,9 @@ class TestSplitMambaProjections:
 
     def test_in_proj_split_names_sizes_and_reproduce(self):
         blob = torch.randn(132, 24)
-        out, n = _split_mamba_projections({"decoder.layers.0.mixer.in_proj.weight": blob}, self.ARGS)
+        out, n = _split_mamba_projections(
+            {"decoder.layers.0.mixer.in_proj.weight": blob}, self.ARGS
+        )
         assert n == 1
         base = "decoder.layers.0.mixer.in_proj.weight"
         names = ("z", "x", "B", "C", "dt")
