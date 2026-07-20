@@ -999,6 +999,54 @@ _LOCAL_EXPERT_RE = re.compile(
 # A per-layer parameter with an explicit layer index.
 _LAYER_RE = re.compile(r"^(.*\.layers)\.(\d+)\.(.+)$")
 
+# Key patterns the reverse converter cannot faithfully invert. Emitting a
+# checkpoint for one of these would silently corrupt it, so fail loudly instead.
+#   - Mamba / Mamba-2 keep their causal conv fused as an ``nn.Parameter``
+#     ``conv1d_weight`` / ``conv1d_bias`` (underscore) alongside a z/x/B/C/dt
+#     ``in_proj`` split this tool does not implement. (GatedDeltaNet instead uses
+#     a dotted ``conv1d.weight`` ``nn.Conv1d`` and a query/key/value/z/beta/alpha
+#     ``in_proj`` split, which IS handled by :func:`_split_gdn_projections`; the
+#     underscore form below never matches the dotted GDN keys.)
+#   - A bare ``.layers.`` with no following index is an already-stacked
+#     multi-layer buffer whose per-layer structure cannot be recovered.
+_UNSUPPORTED_SCOPE_RES = (
+    (
+        re.compile(r"\.(?:conv1d_weight|conv1d_bias)(?:$|\.)"),
+        "Mamba (fused conv1d_weight/conv1d_bias projections)",
+    ),
+    (re.compile(r"\.layers\.(?!\d)"), "an un-indexed stacked-layer buffer"),
+)
+
+# Persistent buffers that mcore deliberately keeps in fp32 regardless of the
+# training compute dtype (the aux-loss-free load-balancing ``router.expert_bias``;
+# see ``TopKRouter._maintain_float32_expert_bias``). Downcasting these to the
+# model compute dtype corrupts routing on resume, so exclude them from the
+# fp32 -> compute-dtype model downcast below.
+_KEEP_FP32_KEY_RES = (re.compile(r"(^|\.)expert_bias$"),)
+
+
+def _assert_supported_scope(tensors):
+    """Raise ``NotImplementedError`` on any key the converter cannot invert.
+
+    Runs on the classified (pre-transform) keys so an unsupported architecture
+    fails loudly here instead of silently emitting a corrupt checkpoint.
+
+    Args:
+        tensors: mapping of classified model / ``optimizer.state.*`` keys.
+    """
+    for key in tensors:
+        for pattern, what in _UNSUPPORTED_SCOPE_RES:
+            if pattern.search(key):
+                raise NotImplementedError(
+                    f"{what} is not supported by the fsdp_dtensor -> torch_dist "
+                    f"converter (offending key: {key!r})."
+                )
+
+
+def _is_keep_fp32_key(key):
+    """Return ``True`` if ``key`` names a buffer that must stay fp32."""
+    return any(pattern.search(key) for pattern in _KEEP_FP32_KEY_RES)
+
 
 def _strip_fsdp_model_prefix(key, configured_prefix=_FSDP_MODEL_PREFIX_DEFAULT):
     """Return the bare mcore key for an fsdp model-weight key, else ``None``.
@@ -1438,6 +1486,12 @@ def reverse_convert_checkpoint(
             continue
         common_flat[key] = value
 
+    # ---- 2a. Fail loudly on architectures this tool cannot invert ----------
+    # (Mamba fused conv1d, un-indexed stacked-layer buffers). Done before any
+    # transform so an unsupported checkpoint raises rather than silently
+    # producing a wrong one. GatedDeltaNet's dotted conv1d.weight is unaffected.
+    _assert_supported_scope(tensors)
+
     # ---- 2b. Reconstruct fp32 optimizer masters + downcast the model section --
     # Megatron-FSDP stores fp32 model weights (they *are* the optimizer masters)
     # and no separate master copy. mcore's fully_reshardable torch_dist optimizer
@@ -1467,6 +1521,7 @@ def reverse_convert_checkpoint(
                 not key.startswith("optimizer.")
                 and isinstance(value, torch.Tensor)
                 and value.dtype == torch.float32
+                and not _is_keep_fp32_key(key)
             ):
                 tensors[key] = value.to(model_dtype)
 
