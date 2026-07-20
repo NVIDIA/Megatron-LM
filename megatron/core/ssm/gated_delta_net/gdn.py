@@ -9,19 +9,15 @@ from functools import partial
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
-    _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     _GDNBase,
-    causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
-    tensor_a2a_cp2hp,
     torch_chunk_gated_delta_rule,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
@@ -126,30 +122,8 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
-
-        # CP All to All: CP to HP
-        if self.cp_size > 1:
-            # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
-            head_perm = _build_head_perm_for_split_sections(
-                self.in_proj_split_sections,
-                self.pg_collection.cp.size(),
-                torch.cuda.current_device(),
-            )
-            qkvzba = qkvzba.index_select(-1, head_perm)
-
         thd_cp_a2a_idx, thd_cp_a2a_inv = None, None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-                undo_attention_load_balancing=False,
-            )
             if self.cp_size > 1:
                 # Permute at the seq dim so that a single unsectioned a2a
                 # is equivalent to per-sequence a2a.
@@ -157,70 +131,22 @@ class GatedDeltaNet(_GDNBase):
                 thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
                     cu_seqlens_q, self.cp_size, seq_len
                 )
-                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
-        else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
 
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
-
-        # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
-        # (beta, alpha for GDN; f, b, w for GDN2)
-        qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-
-        # Convolution on qkv
-        nvtx_range_push(suffix="conv1d")
-        seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
+        in_proj_conv_func = partial(
+            self._in_proj_conv,
+            thd_cp_a2a_idx=thd_cp_a2a_idx,
+            batch=batch,
+            seq_len=seq_len,
+            cu_seqlens_q=cu_seqlens_q,
+            packed_seq_params=packed_seq_params,
         )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
-                dim=0,
-                cp_group=self.pg_collection.cp,
-                split_sections=qkv_channels_split_sections,
+
+        if self.recompute_in_proj_conv:
+            qkv, gate, beta, alpha = tensor_parallel.checkpoint(
+                in_proj_conv_func, False, hidden_states
             )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
-            )
-        nvtx_range_pop(suffix="conv1d")
+            qkv, gate, beta, alpha = in_proj_conv_func(hidden_states)
 
         A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
         dt_bias_local_cp = get_parameter_local_cp(

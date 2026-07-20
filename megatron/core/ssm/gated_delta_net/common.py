@@ -261,8 +261,11 @@ class _GDNBase(MegatronModule):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
+        self.recompute_in_proj_conv = False
+        # recompute_gated_delta_rule may need a checkpoint instance (same as norm_out) later
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_in_proj_conv = "gdn_in_proj_conv" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -365,6 +368,101 @@ class _GDNBase(MegatronModule):
             )
 
         return norm_out
+
+    def _in_proj_conv(
+        self, hidden_states, *, thd_cp_a2a_idx, batch, seq_len, cu_seqlens_q, packed_seq_params
+    ):
+        """inproj + all2all + split view + conv1d"""
+        # Input projection
+        nvtx_range_push(suffix="in_proj")
+        qkvzba, _ = self.in_proj(hidden_states)
+        nvtx_range_pop(suffix="in_proj")
+
+        # CP All to All: CP to HP
+        if self.cp_size > 1:
+            # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
+            head_perm = _build_head_perm_for_split_sections(
+                self.in_proj_split_sections,
+                self.pg_collection.cp.size(),
+                torch.cuda.current_device(),
+            )
+            qkvzba = qkvzba.index_select(-1, head_perm)
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            qkvzba = tensor_a2a_cp2hp(
+                qkvzba,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.pg_collection.cp,
+                undo_attention_load_balancing=False,
+            )
+            if self.cp_size > 1:
+                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
+        else:
+            qkvzba = tensor_a2a_cp2hp(
+                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+            )
+
+        # Transpose: s b x --> b s x
+        # From sbhd to bshd format
+        qkvzba = qkvzba.transpose(0, 1)
+
+        # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
+        # (beta, alpha for GDN; f, b, w for GDN2)
+        qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
+        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+
+        # Convolution on qkv
+        nvtx_range_push(suffix="conv1d")
+        seq_len = qkv.shape[1]
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=self.pg_collection.cp,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=self.pg_collection.cp,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
+        if self.config.deterministic_mode:
+            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+            conv_out = F.conv1d(
+                input=qkv,  # Torch-native only accept [b, d, s] format input
+                weight=conv1d_weight,
+                bias=conv1d_bias,
+                stride=self.conv1d.stride,
+                padding=self.conv1d.padding,
+                dilation=self.conv1d.dilation,
+                groups=self.conv_dim_local_tp // self.cp_size,
+            )
+            qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+        else:
+            assert self.activation in ["silu", "swish"]
+            qkv, _ = causal_conv1d(
+                x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                bias=conv1d_bias,
+                activation=self.activation,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens_q,
+            )
+        nvtx_range_pop(suffix="conv1d")
+
+        return qkv, gate, beta, alpha
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
