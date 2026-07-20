@@ -630,6 +630,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         """Build the HybridModel combined-1F1B schedule plan."""
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
 
         from .model_chunk_schedule_plan import HybridStackModelChunkSchedulePlan
 

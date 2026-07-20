@@ -695,7 +695,8 @@ class TopKRouter(Router):
                 num_layers += self.config.mtp_num_layers
 
             if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
+                mtp_depth = ((self.layer_number - 1) % self.config.mtp_num_layers) + 1
+                layer_number = mtp_depth + self.config.num_layers
             else:
                 layer_number = self.layer_number
 
