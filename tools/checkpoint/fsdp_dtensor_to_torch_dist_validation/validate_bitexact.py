@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 """Bit-exact per-tensor check for the fsdp_dtensor -> torch_dist reverse converter.
 
 Loads a *reverse-converted* torch_dist checkpoint into a real classic (non-FSDP)
