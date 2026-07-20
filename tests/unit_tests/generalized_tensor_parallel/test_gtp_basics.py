@@ -304,6 +304,52 @@ class TestGroupedLinearGTP:
         _run_distributed(_worker_grouped_linear, 4, num_gemms)
 
 
+def _worker_ops_grouped_linear(rank, world_size, port, num_gemms):
+    """GTP on the fusible-op ``te.ops.GroupedLinear`` -- the unfused fallback path (run standalone,
+    so no op fusion). Exercises materialize (fwd/bwd all-gather) + wgrad reduce-scatter wiring in
+    transformer_engine/pytorch/ops/basic/grouped_linear.py."""
+    torch.manual_seed(0)
+    in_f, out_f, total_tokens = 32, 64, num_gemms * 4
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    op = te.ops.GroupedLinear(num_gemms, in_f, out_f, bias=False, device="cuda", dtype=dtype)
+    op.gtp_remat_size = gtp_remat_group.size()
+    wrap_module_params_gtp(
+        op, [f"weight{i}" for i in range(num_gemms)], gtp_remat_group, is_grouped=True
+    )
+    assert isinstance(op.weight0, GTPShardedParam)
+
+    m_splits = [total_tokens // num_gemms] * num_gemms
+    m_splits[-1] += total_tokens - sum(m_splits)
+    split_sizes = torch.tensor(m_splits, dtype=torch.int64, device="cuda")
+
+    inp = torch.randn(total_tokens, in_f, dtype=dtype, device="cuda", requires_grad=True)
+    dist.broadcast(inp, src=0)
+
+    out = op(inp, split_sizes)
+    assert out.shape == (total_tokens, out_f), f"unexpected output shape {out.shape}"
+
+    for i in range(num_gemms):
+        w = getattr(op, f"weight{i}")
+        w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
+    out.sum().backward()
+    assert inp.grad is not None and inp.grad.shape == inp.shape
+    # wgrad reduce-scatter delivered a grad for each per-expert shard.
+    for i in range(num_gemms):
+        w = getattr(op, f"weight{i}")
+        assert w.grad is not None and w.grad.shape == w.shape
+
+
+class TestOpsGroupedLinearGTP:
+    """GTP on the fusible-op ``te.ops.GroupedLinear`` (the unfused fallback for grouped-MLP)."""
+
+    @pytest.mark.parametrize("num_gemms", [2, 4])
+    def test_forward_backward(self, num_gemms):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_ops_grouped_linear, 4, num_gemms)
+
+
 # ---------------------------------------------------------------------------
 # Prefetch chain: next_w / prev_w wiring after first forward pass
 # ---------------------------------------------------------------------------
