@@ -592,3 +592,206 @@ def test_mock_getitem_thd_keys_and_pad_fallback():
     n = out["tokens"].numel()
     assert out["labels"].numel() == n and out["loss_mask"].numel() == n
     assert int(out["padded_seq_len"].item()) % 4 == 0
+
+
+# ----------------------------------------------------------------------------
+# THD handoff: _unpack_batch contract for VarlenDataset-style samples
+#
+# VarlenDataset already emits one unpacked sub-sample carrying ``padded_seq_len``,
+# so _unpack_batch must short-circuit (no cu_seqlens slicing) and only normalize
+# the collate batch dim. SFTDataset-style pre-packed samples (cu_seqlens, no
+# padded_seq_len) still take the slicing path.
+# ----------------------------------------------------------------------------
+
+
+def test_unpack_batch_short_circuits_for_varlen_samples():
+    from megatron.core.datasets.data_schedule_utils import _unpack_batch
+
+    # Two VarlenDataset-style samples, each already a single sub-sample with a
+    # leading batch dim (as added by the default collate_fn) and padded_seq_len.
+    batch = [
+        {
+            "tokens": torch.arange(4, dtype=torch.int64).view(1, 4),
+            "labels": torch.arange(4, dtype=torch.int64).view(1, 4),
+            "loss_mask": torch.ones(1, 4),
+            "position_ids": torch.arange(4, dtype=torch.int64).view(1, 4),
+            "padded_seq_len": torch.tensor([4], dtype=torch.int32),
+        },
+        {
+            "tokens": torch.arange(8, dtype=torch.int64).view(1, 8),
+            "labels": torch.arange(8, dtype=torch.int64).view(1, 8),
+            "loss_mask": torch.ones(1, 8),
+            "position_ids": torch.arange(8, dtype=torch.int64).view(1, 8),
+            "padded_seq_len": torch.tensor([8], dtype=torch.int32),
+            "original_seq_len": torch.tensor([8], dtype=torch.int32),
+        },
+    ]
+    out = _unpack_batch(batch)
+    # Short-circuit: same number of samples (no slicing into sub-samples).
+    assert len(out) == 2
+    # Leading collate batch dim dropped.
+    assert out[0]["tokens"].shape == (4,)
+    assert out[1]["tokens"].shape == (8,)
+    # Missing original_seq_len synthesized from padded_seq_len.
+    assert "original_seq_len" in out[0]
+    assert int(out[0]["original_seq_len"].item()) == 4
+    # Existing original_seq_len preserved.
+    assert int(out[1]["original_seq_len"].item()) == 8
+
+
+def test_unpack_batch_slices_prepacked_cu_seqlens_samples():
+    from megatron.core.datasets.data_schedule_utils import _unpack_batch
+
+    # SFTDataset-style pre-packed sample: two sub-sequences [0:3) and [3:5),
+    # described by cu_seqlens, NO padded_seq_len -> takes the slicing path.
+    batch = [
+        {
+            "tokens": torch.arange(5, dtype=torch.int64),
+            "labels": torch.arange(5, dtype=torch.int64),
+            "loss_mask": torch.ones(5),
+            "position_ids": torch.arange(5, dtype=torch.int64),
+            "cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32),
+        }
+    ]
+    out = _unpack_batch(batch)
+    # One packed sample with two sub-sequences -> two unpacked samples.
+    assert len(out) == 2
+    assert out[0]["tokens"].numel() == 3
+    assert out[1]["tokens"].numel() == 2
+    assert int(out[0]["padded_seq_len"].item()) == 3
+    assert int(out[1]["padded_seq_len"].item()) == 2
+
+
+# ----------------------------------------------------------------------------
+# DataLoader collate selection (distributed; run under torch.distributed.run).
+#
+# Validates the build_pretraining_data_loader contract for the varlen paths:
+#   * --varlen-sbhd-validation emits fixed-length [seq_length] samples that the
+#     DEFAULT collate stacks into a [mbs, seq_length] batch.
+#   * The THD path (--use-varlen-dataset without SBHD) uses the identity collate
+#     (variable-length dicts are returned as a list, not stacked).
+# ----------------------------------------------------------------------------
+
+
+def _build_varlen_for_loader(items, config, num_samples):
+    from megatron.core.datasets.utils import Split
+
+    ds = VarlenDataset.__new__(VarlenDataset)
+    ds.config = config
+    ds.dataset = items
+    ds.indices = np.arange(len(items))
+    ds.num_samples = num_samples
+    ds.index_split = Split.train
+    return ds
+
+
+def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
+    return SimpleNamespace(
+        dataloader_type='single',
+        micro_batch_size=mbs,
+        global_batch_size=mbs if gbs is None else gbs,
+        full_validation=False,
+        num_workers=0,
+        use_varlen_dataset=use_varlen,
+        varlen_sbhd_validation=sbhd,
+        sequence_packing_scheduler=scheduler,
+    )
+
+
+def test_sbhd_validation_dataloader_uses_default_collate():
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        seq_len, mbs = 16, 2
+        # One global batch needs micro_batch_size * data_parallel_size samples;
+        # size the dataset off the runtime DP world size so this passes under
+        # any --nproc-per-node (the CI default is 8 ranks -> dp=8).
+        dp = parallel_state.get_data_parallel_world_size()
+        n = mbs * dp * 4
+        cfg = _make_config(tok, seq_length=seq_len, sbhd=True)
+        ds = _build_varlen_for_loader(["hello world"] * n, cfg, num_samples=n)
+        set_args(_loader_args(use_varlen=True, sbhd=True, scheduler=None, mbs=mbs))
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # Default collate stacks fixed-length SBHD samples into a tensor batch.
+        assert isinstance(batch, dict)
+        assert batch["tokens"].shape == (mbs, seq_len)
+        assert batch["labels"].shape == (mbs, seq_len)
+        assert batch["loss_mask"].shape == (mbs, seq_len)
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
+def test_thd_dataloader_uses_identity_collate():
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs = 2
+        dp = parallel_state.get_data_parallel_world_size()
+        n = mbs * dp * 4
+        cfg = _make_config(tok, seq_length=64, sbhd=False)
+        # Variable-length samples so identity collate is required.
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        set_args(_loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs))
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # Identity collate returns the raw list of per-sample dicts (unstacked).
+        assert isinstance(batch, list)
+        assert len(batch) == mbs
+        assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
+def test_packing_scheduler_dataloader_yields_microbatches():
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs = 2
+        num_microbatches = 3
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        n = gbs * 2
+        cfg = _make_config(tok, seq_length=64, dp=dp, cp=1)
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        set_args(
+            _loader_args(
+                use_varlen=True,
+                sbhd=False,
+                scheduler="dp_balanced",
+                mbs=mbs,
+                gbs=gbs,
+            )
+        )
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # The packing scheduler calls next(data_iterator) num_microbatches times;
+        # each loader step must therefore be one local microbatch, not all
+        # local samples from the global batch.
+        assert isinstance(batch, list)
+        assert len(batch) == mbs
+        assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
