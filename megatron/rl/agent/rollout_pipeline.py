@@ -253,6 +253,9 @@ class RolloutPipeline:
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
         self.output_queue = asyncio_Queue()
+        self.bank = asyncio_Queue()
+        self.banked_batches = 0
+        self.consumed_batches = 0
 
         # Buffers of partial results.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
@@ -283,6 +286,7 @@ class RolloutPipeline:
             asyncio.create_task(self.stage_prepare()),
             asyncio.create_task(self.stage_infer()),
             asyncio.create_task(self.stage_assemble()),
+            asyncio.create_task(self.stage_bank()),
         )
         try:
             async for group in self.stage_consume():
@@ -438,10 +442,10 @@ class RolloutPipeline:
             self.output_queue.shutdown()
 
     def _record_output_dwell(self, group: RolloutGroup) -> None:
-        """Record how long a group sat in output_queue before being yielded.
+        """Record how long a group waited between assembly and being yielded.
 
         Args:
-            group: The group being handed to the consumer.
+            group: The group being yielded to the consumer.
         """
         key = (group.batch_id, group.index_in_batch)
         enqueued_at = self._output_enqueued_at.pop(key, 0.0)
@@ -451,31 +455,58 @@ class RolloutPipeline:
         self.yielded_groups_per_env[self.gran_policy.env_of_index(group.index_in_batch)] += 1
 
     async def _next_group(self) -> RolloutGroup | None:
-        """Pop the next group off output_queue and record its dwell.
+        """Pop the next group off output_queue.
 
         Returns:
             The next RolloutGroup, or None once the queue shuts down.
         """
         try:
-            group = await self.output_queue.get()
+            return await self.output_queue.get()
         except asyncio_QueueShutDown:
             return None
-        self._record_output_dwell(group)
-        return group
 
-    async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
-        """Deliver groups in the order defined by the consumption granularity.
+    @property
+    def ready_batches(self) -> int:
+        """Full batches banked and not yet dequeued for consumption."""
+        return self.banked_batches - self.consumed_batches
 
-        Yields:
-            RolloutGroup: Groups ordered by the configured consumption mode.
-        """
-        consume = {
+    @trace_async_exceptions(verbose=True)
+    async def stage_bank(self) -> None:
+        """Bank complete batches cut from the consumption-ordered group stream."""
+        order = {
             "G": self._consume_completion_order,
             "E": self._consume_env_units,
             "B": self._consume_batch_order,
         }[self.gran_policy.consumption]
-        async for group in consume():
-            yield group
+        batch: list[RolloutGroup] = []
+        try:
+            async for group in order():
+                batch.append(group)
+                if len(batch) == self.gran_policy.num_groups_per_batch:
+                    self.bank.put_nowait(batch)
+                    self.banked_batches += 1
+                    batch = []
+            assert self.request.streaming or not (batch or self._consume_pending), (
+                "Stream ended with groups not forming a full batch."
+            )
+        finally:
+            self.bank.shutdown()
+
+    async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
+        """Unwrap banked batches for the consumer.
+
+        Yields:
+            RolloutGroup: Groups ordered by the configured consumption mode.
+        """
+        while True:
+            try:
+                batch = await self.bank.get()
+            except asyncio_QueueShutDown:
+                return
+            self.consumed_batches += 1
+            for group in batch:
+                self._record_output_dwell(group)
+                yield group
 
     async def _consume_completion_order(self) -> AsyncIterator[RolloutGroup]:
         """G consumption: deliver each group as soon as it assembles.
