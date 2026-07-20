@@ -360,9 +360,9 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
-    sampling_backend: Literal['torch', 'flashinfer'] = 'flashinfer'
-    """Which sampling kernels to use during inference. Defaults to 'flashinfer' and
-    falls back to 'torch' with a warning if the flashinfer package is not installed."""
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
+    "flashinfer" is requested but the package is not installed."""
 
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     """Mode used to schedule dynamic batching inference work."""
