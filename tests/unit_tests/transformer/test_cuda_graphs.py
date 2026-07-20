@@ -34,6 +34,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _set_te_param_grad_clone_policy,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -868,6 +869,32 @@ class TestParallelHybridBlockCudagraphs:
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
 _unique_buffer_counts = {}
+
+
+def test_set_te_param_grad_clone_policy(monkeypatch):
+    """MCore opts out through the public TE API while remaining compatible with older TE."""
+
+    def make_graphed_callables_with_clone_policy(*, clone_param_grads_on_return=True):
+        return clone_param_grads_on_return
+
+    monkeypatch.setattr(
+        'megatron.core.transformer.cuda_graphs.make_graphed_callables',
+        make_graphed_callables_with_clone_policy,
+    )
+    kwargs = {}
+    _set_te_param_grad_clone_policy(kwargs)
+    assert kwargs['clone_param_grads_on_return'] is False
+
+    def legacy_make_graphed_callables():
+        return None
+
+    monkeypatch.setattr(
+        'megatron.core.transformer.cuda_graphs.make_graphed_callables',
+        legacy_make_graphed_callables,
+    )
+    kwargs = {}
+    _set_te_param_grad_clone_policy(kwargs)
+    assert 'clone_param_grads_on_return' not in kwargs
 
 
 class TestTECudaGraphHelper:
