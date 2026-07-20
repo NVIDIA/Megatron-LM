@@ -20,6 +20,8 @@ from megatron.core.context_parallel_layout import (
     contiguous_to_zigzag_chunks,
     zigzag_to_contiguous_chunks,
 )
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -508,23 +510,6 @@ class GatedDeltaNet(MegatronModule):
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
-        # Chunkwise CP expects the contiguous-time chunk layout (rank r holds chunks
-        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule. Megatron attention CP
-        # feeds us the zigzag attention-load-balanced layout (rank r holds
-        # [r, 2*cp-r-1]), so reshuffle chunks over the CP group with a single
-        # all-to-all — no full-sequence gather required.
-        # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid models can
-        # enter contiguous layout before GDN regions instead of paying module-local conversions.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="zigzag_to_contiguous")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                qkvzba = zigzag_to_contiguous_chunks(
-                    qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
-            nvtx_range_pop(suffix="zigzag_to_contiguous")
-
         qkvzba, thd_cp_a2a_inv = self._a2a_cp_to_hp(
             qkvzba,
             cp_size_headwise,
@@ -601,23 +586,6 @@ class GatedDeltaNet(MegatronModule):
         # From bshd back to sbhd format
         norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
-        # Restores the Megatron attention-load-balanced layout that downstream
-        # layers and loss computation expect.
-        # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous and
-        # restore zigzag only at SDPA/canonical-layout boundaries.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="contiguous_to_zigzag")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0
-                )
-            nvtx_range_pop(suffix="contiguous_to_zigzag")
 
         norm_out = self._a2a_hp_to_cp(
             norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
