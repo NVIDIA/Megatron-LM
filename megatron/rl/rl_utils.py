@@ -1481,8 +1481,8 @@ def dump_staleness_data(
         group_degenerate = group_reward_std < 1e-6
         for rollout_idx, rollout in enumerate(group):
             turns = []
-            for turn_idx, (pe, kve) in enumerate(
-                zip(rollout.policy_epoch, rollout.kv_cache_epoch)
+            for turn_idx, (traj, pe, kve) in enumerate(
+                zip(rollout.trajectory, rollout.policy_epoch, rollout.kv_cache_epoch)
             ):
                 evicts = (
                     int(rollout.num_evictions[turn_idx])
@@ -1490,7 +1490,7 @@ def dump_staleness_data(
                     else 0
                 )
                 turns.append({
-                    "token_count": len(rollout.trajectory[turn_idx]),
+                    "token_count": len(traj),
                     "prompt_length": _turn_prompt_length(rollout, turn_idx),
                     "policy_epoch": [[int(s), int(e)] for s, e in pe],
                     "kv_cache_epoch": [[int(s), int(e)] for s, e in kve],
