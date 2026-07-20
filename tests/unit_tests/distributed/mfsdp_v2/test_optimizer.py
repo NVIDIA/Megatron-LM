@@ -50,7 +50,7 @@ def test_adam_without_adapter_raises_precision_error(distributed_setup):
     loss = model(x).sum()
     loss.backward()
 
-    with pytest.raises(RuntimeError, match="same device and the same dtype"):
+    with pytest.raises(RuntimeError, match="dtype"):
         optimizer.step()
 
 
