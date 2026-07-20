@@ -70,6 +70,10 @@ class TokenRollout(AgentBaseModel):
     policy_epoch: list[list[tuple[int, int]]]
     kv_cache_epoch: list[list[tuple[int, int]]]
     num_evictions: list[int]
+    # When set, replaces this rollout's group-normalized advantage with a fixed
+    # value (e.g. -5.0 for format violations such as tool-call syntax emitted as
+    # plain text). Applied after group normalization in calculate_grpo_advantages.
+    advantage_override: float | None = None
 
 
 Rollouts = list[TokenRollout | Rollout]

@@ -1307,13 +1307,23 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
         return logprobs
 
 
-def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:
+def calculate_grpo_advantages(
+    rewards: list[list[float]],
+    num_turns: list[list[int]],
+    advantage_overrides: list[list[float | None]] | None = None,
+) -> np.ndarray:
     """Calculate GRPO advantages from rewards/num_turns.
 
     For multiturn rollouts, the logic is a bit more involved.
     # For training, we'll be turning each turn into a trajectory with the same reward
     # within a trajectory, e.g. if [[a,b],[c,d,e]] trajectory has reward 1.0, we will
     # get [a,b] with 1.0 and [c,d,e] with 1.0 when doing updates.
+
+    advantage_overrides mirrors the [group, group_size] shape of rewards; a
+    non-None entry replaces that rollout's normalized advantage with the fixed
+    value (format-violation penalties). The rollout's reward still participates
+    in the group mean/std, matching the reference implementation where the
+    override is applied to the advantages tensor after normalization.
     """
 
     rewards = np.array(rewards)
@@ -1331,7 +1341,17 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     # @vitalyk: this will go away when we start sending env-based sample reqs.
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
-    return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
+    advantages = (rewards - reward_means) / (1e-4 + reward_stds)
+
+    if advantage_overrides is not None:
+        overrides = np.array(
+            [[np.nan if o is None else o for o in group] for group in advantage_overrides],
+            dtype=np.float64,
+        )
+        overrides = overrides.flatten().repeat(num_turns.flatten())
+        advantages = np.where(np.isnan(overrides), advantages, overrides)
+
+    return advantages.tolist()
 
 
 def expand_epoch_segments(
@@ -1545,6 +1565,7 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
+    advantage_overrides = []
     all_policy_first = []
     all_policy_avg = []
     all_policy_last = []
@@ -1560,6 +1581,7 @@ def compute_group_stats(
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
+        group_advantage_overrides = []
         group_policy_first = []
         group_policy_avg = []
         group_policy_last = []
@@ -1593,6 +1615,7 @@ def compute_group_stats(
                 )
             group_num_turns.append(len(rollout.trajectory))
             group_rewards.append(rollout.reward)
+            group_advantage_overrides.append(getattr(rollout, 'advantage_override', None))
             # Each turn's sequence is cumulative (prompt + all turns so far); refer to the deltas.
             cum_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(
@@ -1639,6 +1662,7 @@ def compute_group_stats(
         turn_lens.append(group_turn_lengths or [0])
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
         rewards.append(group_rewards)
+        advantage_overrides.append(group_advantage_overrides)
         # https://arxiv.org/abs/2504.21233 reports that lens variance hurts.
         # Let's track this.
         num_turns.append(group_num_turns)
@@ -1652,7 +1676,7 @@ def compute_group_stats(
         # with the inner list being the group data.
         env_ids=env_ids,
         num_turns=num_turns,
-        advantages=calculate_grpo_advantages(rewards, num_turns),
+        advantages=calculate_grpo_advantages(rewards, num_turns, advantage_overrides),
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
