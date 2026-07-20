@@ -1436,6 +1436,55 @@ class MegatronFSDP(torch.nn.Module):
         """
         self.param_and_grad_buffer.copy_main_weights_to_model_weights()
 
+    @torch.no_grad()
+    def _compute_per_param_norms(self) -> Dict[str, Dict[str, float]]:
+        """Compute parameter and gradient L2 norms from optimizer-facing FSDP storage."""
+        results = {}
+        param_to_group = self.param_and_grad_buffer.param_to_param_group
+        sharded_params = self.data_parallel_sharding_strategy == "optim_grads_params"
+        sharded_grads = self.data_parallel_sharding_strategy != "no_shard"
+
+        for name, param in self.module.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            local_param = to_local_if_dtensor(param)
+            param_sq = local_param.float().square().sum()
+            grad_sq = torch.zeros((), dtype=torch.float32, device=local_param.device)
+
+            group = self.param_and_grad_buffer.parameter_groups[param_to_group[param]]
+            grad_buffer = group.hfsdp_helper_gbuf or group.main_grad_buffer
+            if group.requires_grad and grad_buffer is not None and grad_buffer.data is not None:
+                local_grad = grad_buffer.get_item(group.param_idx[param], only_shard=True)
+                grad_sq = local_grad.float().square().sum()
+
+            is_expert_parallel = not getattr(param, "allreduce", True)
+            dp_group = self.dist_index.get_dp_group(is_expert_parallel=is_expert_parallel)
+            if sharded_params:
+                torch.distributed.all_reduce(param_sq, group=dp_group)
+            if sharded_grads:
+                torch.distributed.all_reduce(grad_sq, group=dp_group)
+
+            param_norm, grad_norm = torch.stack((param_sq, grad_sq)).sqrt().cpu().tolist()
+            results[name] = {"param_norm": param_norm, "grad_norm": grad_norm}
+
+        return results
+
+    def _log_per_param_norms(self, iteration: int, prefix: str = "") -> None:
+        """Log per-parameter parameter and gradient L2 norms on rank zero."""
+        norms = self._compute_per_param_norms()
+        if torch.distributed.get_rank() != 0:
+            return
+        for name in sorted(norms):
+            logger.info(
+                "%s iter=%d param=%s param_norm=%.6f grad_norm=%.6f",
+                prefix,
+                iteration,
+                name,
+                norms[name]["param_norm"],
+                norms[name]["grad_norm"],
+            )
+
     def broadcast_params(self):
         """
         Syncs parameters across all DP ranks.

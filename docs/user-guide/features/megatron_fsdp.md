@@ -174,6 +174,10 @@ unset CUDA_DEVICE_MAX_CONNECTIONS
 --fsdp-manual-registration
 ```
 
+For debugging convergence, `--log-per-param-norm` logs each Megatron FSDP
+parameter's parameter and gradient L2 norm. It requires `--log-params-norm` and
+adds synchronization overhead, so it should be enabled only for diagnostic runs.
+
 ### 🤖 Megatron-Core
 
 Megatron-FSDP has a lower-level `FullyShardedDataParallel` class API that can be used with a simplified version of Megatron-LM's training loop.

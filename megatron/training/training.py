@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 import argparse
@@ -4279,6 +4279,12 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+            if args.log_per_param_norm:
+                model_chunks = model if isinstance(model, list) else [model]
+                for model_chunk in model_chunks:
+                    if not hasattr(model_chunk, 'log_per_param_norms'):
+                        raise RuntimeError("--log-per-param-norm currently requires Megatron FSDP.")
+                    model_chunk.log_per_param_norms(iteration, prefix="[PER-PARAM]")
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
