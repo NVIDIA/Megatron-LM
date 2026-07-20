@@ -662,12 +662,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
-        # capped at max_requests * (num_speculative_tokens + 1) inside the helper; this
-        # only widens the prefill/mixed range when `cuda_graph_all_prefills` is set.
+        # capped at max_requests * (num_speculative_tokens + 1) inside the helper. By
+        # default the prefill/mixed range is bounded by `cuda_graph_max_tokens`, clamped
+        # to never fall below that decode bound nor exceed `max_tokens`; setting
+        # `cuda_graph_all_prefills` widens the range to the full `max_tokens`.
+        decode_bound = self.max_requests * (self.num_speculative_tokens + 1)
         cuda_graph_max_tokens = (
             self.max_tokens
             if inference_config.cuda_graph_all_prefills
-            else self.max_requests * (self.num_speculative_tokens + 1)
+            else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
         )
 
         # CUDA graph config list.
@@ -2468,14 +2471,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Legacy steps call this from initialize_attention_state(). Async
         scheduling instead delays publication until after preparation and the
-        GPU sample-to-input copy. All copies use non_blocking=True with pinned
-        CPU memory. CUDA stream ordering guarantees the forward pass sees
-        completed transfers.
+        GPU sample-to-input copy. Legacy transfers block because the pinned CPU
+        source is re-staged in place. Async scheduling requests an event-tracked
+        non-blocking copy and synchronizes that event before reusing the source.
 
         The bookkeeping fields are backed by one contiguous pinned CPU buffer
-        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
-        Request-level staging slots are refreshed from the persistent CPU
-        tensors immediately before the H2D (GPU reads them at `[:n_active]`
+        and one contiguous GPU buffer; a single memcpy covers the whole
+        transfer. Request-level staging slots are refreshed from the persistent
+        CPU tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
 
         Args:
@@ -2483,7 +2486,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 `gpu_view.token_to_input_ids` unchanged while copying the rest
                 of the bookkeeping buffer.
             record_done_event (bool): Whether to record and return an event after
-                the bookkeeping transfer.
+                an asynchronous bookkeeping transfer.
 
         Returns:
             Optional[torch.cuda.Event]: Event marking H2D completion, or `None`
@@ -2530,7 +2533,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             0 if self._bookkeeping_no_real_work else self.batch_dimensions.token_count
         )
 
-        # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
+        # Coalesced H2D: one copy for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # redundant launch overheads vs. per-field copies. Async scheduling
@@ -2542,8 +2545,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         else:
             token_to_input_ids_offset = 0
+        # Only event-tracked callers may leave the copy in flight; legacy callers
+        # block before the pinned CPU source can be re-staged.
         self.gpu_view._buf[token_to_input_ids_offset:].copy_(
-            self._cpu_bookkeeping_buf[token_to_input_ids_offset:], non_blocking=True
+            self._cpu_bookkeeping_buf[token_to_input_ids_offset:], non_blocking=record_done_event
         )
 
         # MHA metadata GPU views were already bound to state_data in
@@ -3020,10 +3025,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # Track prefix cache hits.
+        # Track prefix cache hits. num_cached_tokens accumulates across prefill
+        # chunks: each chunk matches a disjoint block range (start advances with
+        # finished_chunk_token_count), so a long cached prefix is discovered
+        # incrementally and must be summed, not overwritten.
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
+            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
