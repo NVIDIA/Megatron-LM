@@ -79,6 +79,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -1488,6 +1489,34 @@ def validate_args(args, defaults={}):
     # fsdp_dtensor checkpointing format checks.
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick a default scheduler when
+            # the user did not request one explicitly:
+            # Otherwise fall back to ``dp_balanced`` (static packing).
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
 
     # Packed-sequence buffer-size check. Placed after varlen scheduler
     # auto-select so it validates the final resolved scheduler.
@@ -3508,6 +3537,47 @@ def _add_sft_args(parser):
         'the variability of the lognormal distribution. '
         'If not specified and --mock-data is set, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action="store_true",
+        help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+        'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+        'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+        '/ openai-messages) is auto-detected from the dataset columns. '
+        'Mutually exclusive with --sft. Auto-picks a sequence packing '
+        'scheduler when none is given: ``dp_balanced``. '
+        'Combine with --mock-data for a synthetic lognormal sequence-length '
+        'distribution; see --varlen-mock-dataset-config-json.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action="store_true",
+        help='Reference SBHD mode for THD numerical verification. When set, '
+        'VarlenDataset emits SBHD-style samples right-padded to '
+        '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+        'be compared against the THD path to validate correctness. '
+        'Incompatible with --sequence-packing-scheduler.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema as --sft-mock-dataset-config-json: either '
+        '{"mode":"file","path":"/path/to/lengths.csv"}, '
+        '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+        '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'If not specified, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+        'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
     return parser
 
