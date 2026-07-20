@@ -35,7 +35,6 @@ class GroupedRolloutRequest(Request):
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
-    streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
 
@@ -210,7 +209,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         ...
 
     def rollout_group_layout(self, num_groups: int) -> list[int]:
-        """Returns the groups within a batch that each env contributes to one batch, in env order.
+        """Returns the groups each env contributes to every trainer batch, in env order.
 
         Args:
             num_groups: Total groups in one trainer batch.

@@ -502,16 +502,12 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        submit_rollouts_at_rollout_granularity = (
-            args.rl_submission_granularity == "R"
-        )
         if args.rl_generation_lag > 0:
             assert args.rl_partial_rollouts, \
                 "--rl-generation-lag requires --rl-partial-rollouts."
-        if submit_rollouts_at_rollout_granularity:
-            assert (
-                args.rl_partial_rollouts
-            ), "Rollout submission granularity requires streaming grouped rollouts."
+        assert args.rl_submission_granularity == "B" or args.rl_partial_rollouts, \
+            f"--rl-submission-granularity {args.rl_submission_granularity} requires " \
+            "--rl-partial-rollouts."
         assert args.rl_consumption_granularity != "R", \
             "--rl-consumption-granularity R is not currently supported."
 

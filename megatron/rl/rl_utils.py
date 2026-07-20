@@ -579,10 +579,9 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         The async iterator produced by RolloutPipeline.run().
     """
     global _ROLLOUT_GENERATOR, _ROLLOUT_PIPELINE
-    if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
+    if _ROLLOUT_GENERATOR is None:
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
-            streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
@@ -600,12 +599,34 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         _ROLLOUT_PIPELINE = RolloutPipeline(
             agent=get_agent(args),
             request=request,
-            # Submission gate depth in trainer batches; the pipeline scales
-            # it to submission units.
             parallel_generation_tasks=args.rl_generation_lag + 1,
         )
         _ROLLOUT_GENERATOR = _ROLLOUT_PIPELINE.run()
     return _ROLLOUT_GENERATOR
+
+
+def assert_no_inflight_rollouts(pipeline):
+    """Verify no rollouts are buffered or in-flight in the pipeline for lag=0."""
+    buffered = {
+        'infer_queue': pipeline.infer_queue.qsize(),
+        'assemble_queue': pipeline.assemble_queue.qsize(),
+        'output_queue': pipeline.output_queue.qsize(),
+        'assemble_pending': sum(len(items) for items in pipeline._assemble_pending.values()),
+        'consume_pending': sum(len(groups) for groups in pipeline._consume_pending.values()),
+    }
+    assert not any(buffered.values()), (
+        f"Non-streaming RL: the rollout pipeline has buffered rollouts at iteration "
+        f"boundary: {buffered}. The streaming generator has run ahead under a stale policy."
+    )
+    in_flight = (
+        pipeline.prepared_count - pipeline.yielded_count * pipeline.request.rollouts_per_group
+    )
+    assert in_flight == 0, (
+        f"Non-streaming RL: the rollout pipeline prepared {pipeline.prepared_count} "
+        f"rollout(s) but yielded {pipeline.yielded_count} group(s) of "
+        f"{pipeline.request.rollouts_per_group}; {in_flight} rollout(s) in flight at "
+        f"iteration boundary."
+    )
 
 
 def get_environment_rollouts(
@@ -692,12 +713,7 @@ def get_environment_rollouts(
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
-                        while True:
-                            try:
-                                loop.run_until_complete(anext(rollout_generator))
-                                assert False, "Unexpected group left in generator."
-                            except StopAsyncIteration:
-                                break
+                        assert_no_inflight_rollouts(_ROLLOUT_PIPELINE)
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
@@ -1165,14 +1181,9 @@ def _collect_rollout_pipeline_metrics() -> dict:
             metrics[f"rollout_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
             metrics[f"rollout_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
     # Per-env group counters, mapped from env_index to env_id via the
-    # multi-env layout (active envs, in layout order).
+    # multi-env layout (weighted envs, in layout order).
     if dist:
-        active_env_ids = [
-            env_id
-            for env_id, groups in zip(dist["env_ids"], dist["agent_groups"])
-            if groups > 0
-        ]
-        for env_index, env_id in enumerate(active_env_ids):
+        for env_index, env_id in enumerate(dist["env_ids"]):
             metrics[f"{env_id}_prepared_groups"] = (
                 pipeline.prepared_groups_per_env[env_index]
             )
@@ -1191,23 +1202,24 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.inferred_count = 0
     pipeline.assembled_count = 0
     pipeline.yielded_count = 0
-    pipeline.prepared_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
-    pipeline.assembled_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
-    pipeline.yielded_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
+    pipeline.prepared_groups_per_env = [0] * pipeline.gran_policy.num_envs
+    pipeline.assembled_groups_per_env = [0] * pipeline.gran_policy.num_envs
+    pipeline.yielded_groups_per_env = [0] * pipeline.gran_policy.num_envs
     gate.prepare_blocked_seconds = 0.0
     gate.acquire_calls = 0
     gate.release_calls = 0
 
-    # WeightedMultiTask per-batch group distribution.
     if dist:
-        # An env_id can appear more than once in the config (e.g. an active
-        # entry plus an evaluation-only twin with zero weight). Sum per
-        # env_id so the zero twin does not overwrite the active entry.
+        # The code allows for the same env name to exist in two forms: training and eval-only.
         per_env: dict = {}
-        for env_id, groups in zip(dist["env_ids"], dist["agent_groups"]):
-            per_env[env_id] = per_env.get(env_id, 0) + groups
-        for env_id, groups in per_env.items():
+        for env_id, groups, weight in zip(
+            dist["env_ids"], dist["agent_groups"], dist["weights"]
+        ):
+            prev_groups, prev_weight = per_env.get(env_id, (0, 0.0))
+            per_env[env_id] = (prev_groups + groups, prev_weight + weight)
+        for env_id, (groups, weight) in per_env.items():
             metrics[f"{env_id}_agent_groups"] = groups
+            metrics[f"{env_id}_weight"] = weight
     return metrics
 
 

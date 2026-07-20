@@ -96,7 +96,7 @@ class _GranularityConfig(NamedTuple):
 
         Args:
             request: Grouped rollout request to check.
-            num_groups_per_env: Proposed per-env group layout.
+            num_groups_per_env: Constant per-env group layout.
 
         Raises:
             AssertionError: If consumption is finer than submission, the layout
@@ -118,8 +118,7 @@ class _GranularityConfig(NamedTuple):
         ), "The sum of groups per environment must equal the total number of groups requested."
         assert not request.filter_groups_with_same_reward, (
             "filter_groups_with_same_reward is not currently supported: dropped groups "
-            "are not regenerated, so non-streaming callers receive fewer groups than "
-            "requested and batch-order consumers stall on incomplete batches."
+            "are not regenerated, so batch-order consumers stall on incomplete batches."
         )
 
 
@@ -244,10 +243,6 @@ class RolloutPipeline:
             * self.gran_policy.num_groups_per_batch
             * request.rollouts_per_group
         )
-        if not request.streaming:
-            self.num_infer_workers = min(
-                self.num_infer_workers, request.num_groups * request.rollouts_per_group
-            )
 
         # Core queues.
         self.infer_queue = asyncio_Queue()
@@ -294,45 +289,40 @@ class RolloutPipeline:
 
     async def stage_prepare(self) -> None:
         """Generate gated inference work items."""
-        assert (
-            self.request.streaming
-            or self.request.num_groups % self.gran_policy.num_groups_per_batch == 0
-        ), "non-streaming requires num_groups to be a multiple of num_groups_per_batch"
         group_id = 0
+        batch_id = 0
         try:
-            while self.request.streaming or group_id < self.request.num_groups:
+            while True:
                 await self.gate.acquire_for("B")
-                batch_id = group_id // self.gran_policy.num_groups_per_batch
 
-                env_index = -1
-                next_env_start = 0
-                for index_in_batch in range(self.gran_policy.num_groups_per_batch):
-                    if index_in_batch == next_env_start:
-                        # Env-unit boundary: under E submission, hold one gate
-                        # slot per env-unit until its last group assembles.
-                        env_index += 1
-                        next_env_start += self.gran_policy.num_groups_per_env[env_index]
-                        await self.gate.acquire_for("E")
-                    await self.gate.acquire_for("G")
-                    params: GroupRolloutParams = await self.agent.prepare_group_rollout(
-                        self.request, env_index=env_index
-                    )
-                    self.prepared_groups_per_env[env_index] += 1
-
-                    for rollout_idx in range(self.request.rollouts_per_group):
-                        await self.gate.acquire_for("R")
-                        item = _InferWorkItem(
-                            group_id=group_id,
-                            rollout_idx=rollout_idx,
-                            batch_id=batch_id,
-                            index_in_batch=index_in_batch,
-                            params=params,
-                            env_index=env_index,
-                            prepared_at=time.monotonic(),
+                index_in_batch = 0
+                for env_index, env_groups in enumerate(self.gran_policy.num_groups_per_env):
+                    # Env-unit boundary: under E submission, hold one gate
+                    # slot per env-unit until its last group assembles.
+                    await self.gate.acquire_for("E")
+                    for _ in range(env_groups):
+                        await self.gate.acquire_for("G")
+                        params: GroupRolloutParams = await self.agent.prepare_group_rollout(
+                            self.request, env_index=env_index
                         )
-                        await self.infer_queue.put(item)
-                        self.prepared_count += 1
-                    group_id += 1
+                        self.prepared_groups_per_env[env_index] += 1
+
+                        for rollout_idx in range(self.request.rollouts_per_group):
+                            await self.gate.acquire_for("R")
+                            item = _InferWorkItem(
+                                group_id=group_id,
+                                rollout_idx=rollout_idx,
+                                batch_id=batch_id,
+                                index_in_batch=index_in_batch,
+                                params=params,
+                                env_index=env_index,
+                                prepared_at=time.monotonic(),
+                            )
+                            await self.infer_queue.put(item)
+                            self.prepared_count += 1
+                        group_id += 1
+                        index_in_batch += 1
+                batch_id += 1
         finally:
             self.infer_queue.shutdown()
 

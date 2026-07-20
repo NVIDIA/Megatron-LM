@@ -142,7 +142,6 @@ class FastAPIEnvServer(EnvironmentServer):
         assert (
             request.submission_granularity != "R"
         ), "FastAPIEnvServer does not support rollout submission granularity"
-        assert not request.streaming, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient() as client:
