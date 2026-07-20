@@ -1374,6 +1374,9 @@ class GTPShardedParam(torch.nn.Parameter):
 
         Do NOT set param.grad before calling the hook — the hook checks param.grad and would
         accumulate it into main_grad if zero_out_wgrad is True, corrupting it with a dummy.
+
+        Returns a cached dummy wgrad; sync callers use it as the graph-safe grad, async drains
+        discard it.
         """
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = True

@@ -333,12 +333,18 @@ def _worker_ops_grouped_linear(rank, world_size, port, num_gemms):
     for i in range(num_gemms):
         w = getattr(op, f"weight{i}")
         w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
+        # DDP initializes this on every param; the backward wgrad-fusion path sets it True and
+        # returns a throwaway dummy .grad (real grad is reduce-scattered into main_grad).
+        w.grad_added_to_main_grad = False
     out.sum().backward()
     assert inp.grad is not None and inp.grad.shape == inp.shape
-    # wgrad reduce-scatter delivered a grad for each per-expert shard.
+    # The wgrad reduce-scatter wrote each per-expert shard's gradient into main_grad (the gradient
+    # of record for GTP), and flagged it so DDP won't double-add the dummy .grad.
     for i in range(num_gemms):
         w = getattr(op, f"weight{i}")
-        assert w.grad is not None and w.grad.shape == w.shape
+        assert w.grad_added_to_main_grad is True
+        assert w.main_grad.shape == w.shape
+        assert torch.count_nonzero(w.main_grad) > 0, f"weight{i} main_grad not populated by RS"
 
 
 class TestOpsGroupedLinearGTP:
