@@ -400,6 +400,15 @@ if __name__ == "__main__":
         # on all nodes until preemption. Print and exit without finalizers.
         import traceback
 
+        # os._exit can beat srun's async IO forwarding and drop the printed
+        # traceback entirely (observed on rp1s2p), so persist it to a file
+        # first — the write completes before _exit.
+        try:
+            rank = os.environ.get('SLURM_PROCID', os.environ.get('RANK', 'x'))
+            with open(f'crash_rank{rank}.log', 'a') as f:
+                traceback.print_exception(exc_type, exc, tb, file=f)
+        except Exception:
+            pass
         traceback.print_exception(exc_type, exc, tb)
         sys.stdout.flush()
         sys.stderr.flush()
