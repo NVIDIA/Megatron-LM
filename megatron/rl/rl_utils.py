@@ -1029,24 +1029,36 @@ def vocab_parallel_selective_log_softmax(vocab_parallel_logits, index, tp_group=
     return _VocabParallelSelectiveLogProbs.apply(vocab_parallel_logits, index, tp_group, chunk_tokens)
 
 
-def _zigzag_slice(x: torch.Tensor, cp_size: int, cp_rank: int) -> torch.Tensor:
-    """Pick chunks ``cp_rank`` and ``2*cp_size - cp_rank - 1`` after viewing
-    the sequence dim as ``2*cp_size`` equal chunks, then concatenate.
+def _thd_partitioned_indices(
+    cu_seqlens_padded: torch.Tensor, total_tokens: int, cp_size: int, cp_rank: int
+) -> torch.Tensor:
+    """Global token indices owned by ``cp_rank`` under the TE THD CP layout.
 
-    Mirrors ``get_batch_on_this_cp_rank`` in ``megatron/core/utils.py`` — the
-    canonical Megatron-LM load-balanced (zigzag) CP layout that TE ring
-    attention, RoPE-CP, and Mamba-CP all assume.
+    Pure-torch mirror of ``tex.thd_get_partitioned_indices`` (TE >= 1.10) —
+    the authoritative consumers of this layout are TE ring attention and
+    ``_undo/_redo_attention_load_balancing`` in
+    ``megatron/core/ssm/mamba_context_parallel.py``. EACH sequence of the
+    packed batch (as delimited by ``cu_seqlens_padded``) is viewed as
+    ``2*cp_size`` equal chunks; rank ``r`` owns that sequence's chunks
+    ``(r, 2*cp_size-1-r)``, concatenated in that order, with sequences kept in
+    ``cu_seqlens_padded`` order. Every padded sequence length must be a
+    multiple of ``2*cp_size``.
+
+    Returns an int64 index tensor of shape ``[total_tokens // cp_size]``.
     """
-    seq_len = x.shape[1]
-    chunk_size = seq_len // (2 * cp_size)
-    # [B, S, ...] -> [B, 2*CP, S/(2*CP), ...]
-    x = x.view(x.shape[0], 2 * cp_size, chunk_size, *x.shape[2:])
-    index = torch.tensor(
-        [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.int64, device=x.device
-    )
-    x = x.index_select(1, index)
-    # [B, 2, S/(2*CP), ...] -> [B, S/CP, ...]
-    return x.reshape(x.shape[0], -1, *x.shape[3:]).contiguous()
+    cu = cu_seqlens_padded.to(dtype=torch.long)
+    local_cu = cu // cp_size
+    k = torch.arange(total_tokens // cp_size, device=cu.device)
+    # searchsorted(right=True) skips zero-length ghost sequences (repeated
+    # cu entries kept for CUDA-graph shape stability).
+    seq = torch.searchsorted(local_cu, k, right=True) - 1
+    i = k - local_cu[seq]
+    # Per-sequence chunk size: L_s / (2*cp_size) = local length / 2.
+    half = (local_cu[seq + 1] - local_cu[seq]) // 2
+    # First local half -> chunk cp_rank, second half -> chunk 2*cp_size-1-cp_rank
+    # (identical formula to TE's thd_partition_indices kernel).
+    offset = torch.where(i < half, cp_rank, 2 * (cp_size - 1) - cp_rank)
+    return cu[seq] + i + half * offset
 
 
 def _scatter_for_context_parallel(
@@ -1054,20 +1066,35 @@ def _scatter_for_context_parallel(
     position_ids: torch.Tensor,
     packed_seq_params: 'PackedSeqParams',
     cp_size: int,
+    pad_token: Optional[int] = None,
 ) -> tuple:
-    """Prepare local inputs for one context-parallel rank using the
-    canonical Megatron-LM zigzag (load-balanced) CP layout.
+    """Prepare local inputs for one context-parallel rank using the TE THD
+    per-sequence zigzag (load-balanced) CP layout.
 
-    Each CP rank receives a NON-CONTIGUOUS pair of chunks
-    ``(chunk_r, chunk_{2*cp_size-r-1})`` after a 2*cp_size partition of the
-    sequence dim — matching what TE ring attention (``cp_comm_type=p2p``),
-    Megatron's RoPE-CP slicer, and the Mamba CP layer all expect. A plain
-    contiguous slice produces silently-wrong attention / SSM outputs (see
-    cp_zigzag_scatter_bug memory).
+    EACH sequence in the bin is independently split into ``2*cp_size`` equal
+    chunks of its padded length, and rank ``r`` receives that sequence's
+    chunks ``(r, 2*cp_size-r-1)`` — matching ``tex.thd_get_partitioned_indices``,
+    which is what TE ring attention (``cp_comm_type=p2p``), RoPE-CP and the
+    Mamba CP layer all assume for THD data. Zigzag-splitting the whole bin as
+    if it were one sequence silently reassembles multi-sequence bins in the
+    wrong token order.
 
-    Labels are pre-shifted globally then zigzag-sliced the same way, so each
-    rank's local labels stay aligned with its local tokens with no cross-rank
-    communication. The final boundary label is a dummy (always loss-masked).
+    Because each sequence's padded length must be a multiple of ``2*cp_size``,
+    the bin is first repacked into the padded frame described by
+    ``cu_seqlens_q_padded`` (built by ``create_packed_seq_params_for_bin``):
+    sequence ``s`` keeps its tokens at ``[cu_padded[s], cu_padded[s]+L_s)`` and
+    the remainder up to ``cu_padded[s+1]`` is filled with ``pad_token``. The
+    inserted pad positions are dropped again by the gather, so the existing
+    loss-mask machinery (built on the unpadded layout) applies unchanged.
+    When ``cu_seqlens_q_padded`` is absent (single-sequence params from the
+    unpacked path or ``get_default_packed_seq_params``), the unpadded
+    cu_seqlens are aliased — valid because a single full-length sequence is
+    already ``2*cp_size``-aligned (asserted below).
+
+    Labels are pre-shifted in the padded frame then sliced the same way, so
+    each rank's local labels stay aligned with its local tokens with no
+    cross-rank communication. Positions whose shifted label crosses a
+    sequence (or padding) boundary are always loss-masked.
 
     Args:
         tokens:          Full token tensor  [batch, seq_len].
@@ -1076,10 +1103,15 @@ def _scatter_for_context_parallel(
                          returned with the ``cp_group`` and ``local_cp_size``
                          fields set so Transformer Engine uses ring attention.
         cp_size:         Context-parallel world size.
+        pad_token:       Token id used for the per-sequence padding. Defaults
+                         to the tokenizer's pad token.
 
     Returns:
-        (local_tokens, local_position_ids, cp_packed_seq_params, local_labels)
-        where every tensor has sequence length ``seq_len // cp_size``.
+        (local_tokens, local_position_ids, cp_packed_seq_params, local_labels,
+        cp_gather_index) where every local tensor has sequence length
+        ``seq_len // cp_size`` and ``cp_gather_index`` is the precomputed
+        index that lets ``_gather_logprobs_context_parallel`` invert the
+        scatter back to the unpadded layout.
     """
     cp_rank  = mpu.get_context_parallel_rank()
     cp_group = mpu.get_context_parallel_group()
@@ -1090,52 +1122,97 @@ def _scatter_for_context_parallel(
         f"({2 * cp_size}) for the zigzag CP layout."
     )
 
-    # Pre-shifted labels: tokens_shifted[i] = tokens[i+1] for i < S-1, and
-    # tokens_shifted[S-1] = tokens[S-1] (dummy boundary, always loss-masked).
-    # Zigzag-slicing this together with tokens keeps labels aligned per-rank.
-    tokens_shifted = torch.cat([tokens[:, 1:], tokens[:, -1:]], dim=1)
-
-    local_tokens       = _zigzag_slice(tokens,          cp_size, cp_rank)
-    local_position_ids = _zigzag_slice(position_ids,    cp_size, cp_rank)
-    local_labels       = _zigzag_slice(tokens_shifted,  cp_size, cp_rank)
-
     # Shallow-copy so we do not mutate the caller's object.
     cp_packed_seq_params = copy.copy(packed_seq_params)
     cp_packed_seq_params.cp_group      = cp_group
     cp_packed_seq_params.local_cp_size = cp_size
-    # THD CP path needs cu_seqlens_*_padded; fall back to the unpadded variant
-    # when the caller didn't supply one (matches get_thd_batch_on_this_cp_rank).
+    # THD CP path needs cu_seqlens_*_padded. Multi-sequence bins carry real
+    # padded offsets built by create_packed_seq_params_for_bin; aliasing the
+    # unpadded variant is only correct when every sequence is already a
+    # multiple of 2*cp_size (single-sequence params — guaranteed by the
+    # seq_len assert above).
     if cp_packed_seq_params.cu_seqlens_q_padded is None:
         cp_packed_seq_params.cu_seqlens_q_padded  = cp_packed_seq_params.cu_seqlens_q
     if cp_packed_seq_params.cu_seqlens_kv_padded is None:
         cp_packed_seq_params.cu_seqlens_kv_padded = cp_packed_seq_params.cu_seqlens_kv
 
-    return local_tokens, local_position_ids, cp_packed_seq_params, local_labels
+    cu_actual = cp_packed_seq_params.cu_seqlens_q.to(dtype=torch.long)
+    cu_padded = cp_packed_seq_params.cu_seqlens_q_padded.to(dtype=torch.long)
+
+    if pad_token is None:
+        pad_token = get_tokenizer().pad
+
+    # ---- Repack the bin into the padded frame (no host synchronization). ----
+    # The unpadded layout is the contiguous concatenation of the sequences, so
+    # cu_actual doubles as its physical offsets. For every padded position,
+    # find its sequence, its offset within it, and whether it is a real token.
+    pos = torch.arange(seq_len, device=tokens.device)
+    seg = torch.searchsorted(cu_padded, pos, right=True) - 1
+    seg_off = pos - cu_padded[seg]
+    actual_lens = (cu_actual[1:] - cu_actual[:-1]).clamp(min=0)
+    is_actual = seg_off < actual_lens[seg]
+    src = (cu_actual[seg] + seg_off).clamp(max=seq_len - 1)
+
+    padded_tokens       = torch.where(is_actual, tokens[:, src], pad_token)
+    padded_position_ids = torch.where(is_actual, position_ids[:, src], 0)
+    # Pre-shifted labels in the padded frame: labels[i] = padded_tokens[i+1],
+    # with a dummy boundary label at the final position. Within a sequence's
+    # real tokens this is the correct next token; at sequence/padding
+    # boundaries the label is junk but those positions are always loss-masked.
+    padded_labels = torch.cat([padded_tokens[:, 1:], padded_tokens[:, -1:]], dim=1)
+
+    # ---- Per-sequence zigzag slice for this rank. ----
+    local_index = _thd_partitioned_indices(cu_padded, seq_len, cp_size, cp_rank)
+    local_tokens       = padded_tokens.index_select(1, local_index).contiguous()
+    local_position_ids = padded_position_ids.index_select(1, local_index).contiguous()
+    local_labels       = padded_labels.index_select(1, local_index).contiguous()
+
+    # ---- Precompute the gather index that inverts the scatter. ----
+    # all_gather concatenates rank slices, so global padded position
+    # all_index[k] lands at flat position k; invert that permutation, then
+    # compose with the unpadded->padded position map (padding drops out).
+    all_index = torch.cat(
+        [_thd_partitioned_indices(cu_padded, seq_len, cp_size, r) for r in range(cp_size)]
+    )
+    inverse = torch.empty_like(all_index)
+    inverse[all_index] = torch.arange(seq_len, device=tokens.device)
+    seg_orig = torch.searchsorted(cu_actual, pos, right=True) - 1
+    # Unpadded positions beyond the last accounted segment (physical trailing
+    # pads displaced by the inserted per-sequence padding) have no image in
+    # the padded frame; clamp them onto the final position — they are junk in
+    # the cp_size == 1 layout as well and always loss-masked.
+    orig_to_padded = (cu_padded[seg_orig] + (pos - cu_actual[seg_orig])).clamp(max=seq_len - 1)
+    cp_gather_index = inverse[orig_to_padded[:-1]]
+
+    return local_tokens, local_position_ids, cp_packed_seq_params, local_labels, cp_gather_index
 
 
 def _gather_logprobs_context_parallel(
     local_logprobs: torch.Tensor,
+    cp_gather_index: torch.Tensor,
     no_grad: bool,
 ) -> torch.Tensor:
-    """All-gather per-rank logprobs and invert the zigzag scatter.
+    """All-gather per-rank logprobs and invert the per-sequence zigzag scatter.
 
-    Each rank holds ``[batch, 2*chunk]`` logprobs corresponding to chunks
-    ``(r, 2*cp_size-r-1)`` of the global sequence. After all-gather we split
-    each rank's slice into halves and place them in their global chunk slots
-    to reconstruct ``[batch, seq_len]``, then drop the final dummy position
-    appended by ``_scatter_for_context_parallel`` → ``[batch, seq_len - 1]``.
+    Each rank holds ``[batch, seq_len // cp_size]`` logprobs laid out per the
+    TE THD CP convention (chunks ``(r, 2*cp_size-r-1)`` of every sequence).
+    After all-gather, ``cp_gather_index`` (precomputed by
+    ``_scatter_for_context_parallel``) maps each unpadded global position to
+    its slot in the concatenated rank slices, dropping the per-sequence pad
+    positions and the final dummy boundary → ``[batch, seq_len - 1]``.
 
     Uses ``torch.distributed.nn.functional.all_gather`` on the training path so
     that gradients flow back through the gather (reduce-scatter) to each rank's
-    local forward pass; ``cat`` in zigzag order routes each chunk's gradient
-    back to its source rank.
+    local forward pass; ``index_select`` routes each position's gradient back
+    to its source rank (pad positions receive zero gradient).
 
     Args:
-        local_logprobs: Local logprob tensor  [batch, 2*chunk].
-        no_grad:        True when called in inference/reference-logprob mode.
+        local_logprobs:  Local logprob tensor  [batch, seq_len // cp_size].
+        cp_gather_index: Index tensor  [seq_len - 1]  from the scatter.
+        no_grad:         True when called in inference/reference-logprob mode.
 
     Returns:
-        Full logprob tensor  [batch, seq_len - 1].
+        Full logprob tensor  [batch, seq_len - 1] in the unpadded layout.
     """
     cp_group = mpu.get_context_parallel_group()
     cp_size  = mpu.get_context_parallel_world_size()
@@ -1148,16 +1225,8 @@ def _gather_logprobs_context_parallel(
         # each rank's gradient slice back to the correct local forward pass.
         gathered = torch.distributed.nn.functional.all_gather(local_logprobs, group=cp_group)
 
-    # Each rank's gather result contains [chunk_r | chunk_{2*CP-r-1}]; split
-    # and place in global chunk order.
-    chunk_size = local_logprobs.shape[1] // 2
-    chunks = [None] * (2 * cp_size)
-    for r in range(cp_size):
-        chunks[r]                    = gathered[r][:, :chunk_size]
-        chunks[2 * cp_size - r - 1]  = gathered[r][:, chunk_size:]
-
-    # cat → [batch, seq_len]; drop the dummy boundary position → [batch, seq_len-1].
-    return torch.cat(chunks, dim=1)[:, :-1]
+    # [batch, seq_len] in (rank, local position) order → unpadded global order.
+    return torch.cat(gathered, dim=1).index_select(1, cp_gather_index)
 
 
 def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
@@ -1255,9 +1324,13 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
             if cp_size > 1:
                 # Scatter: each rank processes seq_len // cp_size tokens.
-                local_tokens, local_position_ids, cp_packed_seq_params, local_labels = (
-                    _scatter_for_context_parallel(tokens, position_ids, packed_seq_params, cp_size)
-                )
+                (
+                    local_tokens,
+                    local_position_ids,
+                    cp_packed_seq_params,
+                    local_labels,
+                    cp_gather_index,
+                ) = _scatter_for_context_parallel(tokens, position_ids, packed_seq_params, cp_size)
                 with torch.no_grad() if no_grad else nullcontext():
                     logits_or_hidden_states = model(
                         local_tokens,
@@ -1297,7 +1370,9 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     )
                 else:
                     local_logprobs = selective_log_softmax(logits, local_labels)
-                logprobs = _gather_logprobs_context_parallel(local_logprobs, no_grad)
+                logprobs = _gather_logprobs_context_parallel(
+                    local_logprobs, cp_gather_index, no_grad
+                )
             else:
                 # We do not need logprobs for the n+1 token.
                 if use_vp_logprobs:

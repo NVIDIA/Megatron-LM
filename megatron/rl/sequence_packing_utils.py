@@ -417,6 +417,7 @@ def create_packed_seq_params(packing_context: PackingContext):
     bin_size = packing_context.bin_size
     max_sequences_per_bin = packing_context.packer.max_sequences_per_bin
     device = packing_context.packed_trajs.device
+    cp_size = mpu.get_context_parallel_world_size()
     for bin_idx in range(len(packing_context.packed_trajs)):
         params = create_packed_seq_params_for_bin(
             packing_info=packing_info,
@@ -424,6 +425,7 @@ def create_packed_seq_params(packing_context: PackingContext):
             bin_size=bin_size,
             max_sequences_per_bin=max_sequences_per_bin,
             device=device,
+            cp_size=cp_size,
         )
         cached_packed_seq_params.append(params)
     return cached_packed_seq_params
@@ -433,7 +435,8 @@ def create_packed_seq_params_for_bin(
     bin_idx: int,
     bin_size: int,
     max_sequences_per_bin: int,
-    device: torch.device
+    device: torch.device,
+    cp_size: int = 1,
 ) -> Optional[PackedSeqParams]:
     """Create PackedSeqParams for a single bin to enable proper attention masking in TE.
 
@@ -441,12 +444,19 @@ def create_packed_seq_params_for_bin(
     (cumulative sequence lengths) so that TE knows the boundaries between sequences
     within a packed bin. This prevents attention leakage between unrelated sequences.
 
+    With context parallelism (cp_size > 1), TE's THD convention zigzag-splits EACH
+    sequence into 2*cp_size chunks, which requires each sequence's padded length to be
+    a multiple of 2*cp_size. In that case real cu_seqlens_*_padded are built describing
+    the per-sequence padding inserted by the CP scatter (_scatter_for_context_parallel
+    in rl_utils.py), while cu_seqlens keeps the unpadded lengths.
+
     Args:
         packing_info: PackingInfo object containing packing metadata from SequencePacker
         bin_idx: Index of the bin to create params for
         bin_size: Size of the bin (padded sequence length)
         max_sequences_per_bin: Maximum number of sequences per bin
         device: Device to create tensors on
+        cp_size: Context-parallel world size the bin will be trained with
 
     Returns:
         PackedSeqParams with cu_seqlens set for proper attention masking (or None if empty)
@@ -460,9 +470,30 @@ def create_packed_seq_params_for_bin(
     # Get actual sequence lengths for sequences in this bin
     seq_lengths_in_bin = [packing_info.seq_lengths[idx] for idx in seq_indices]
 
-    # Build cumulative sequence lengths for actual sequences
-    # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
-    cu_seqlens_list = np.append(np.cumsum([0] + seq_lengths_in_bin), bin_size)
+    if cp_size > 1:
+        multiple = 2 * cp_size
+        assert bin_size % multiple == 0, (
+            f"Bin size {bin_size} must be divisible by 2*context_parallel_size "
+            f"({multiple}) for the zigzag CP layout."
+        )
+        padded_lengths = [math.ceil(length / multiple) * multiple for length in seq_lengths_in_bin]
+        total_padded = sum(padded_lengths)
+        assert total_padded <= bin_size, (
+            f"Per-sequence CP padding overflows the bin ({total_padded} > {bin_size}); "
+            f"SequencePacker must be built with seq_length_multiple={multiple}."
+        )
+        # Keep the trailing pad region as a final pseudo-sequence (actual ==
+        # padded length), mirroring the cp_size == 1 params where cu_seqlens
+        # jumps to bin_size. Its length is a multiple of 2*cp_size because
+        # bin_size and every padded length are.
+        tail = bin_size - total_padded
+        cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin + [tail])
+        cu_seqlens_padded_list = np.cumsum([0] + padded_lengths + [tail])
+    else:
+        # Build cumulative sequence lengths for actual sequences
+        # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
+        cu_seqlens_list = np.append(np.cumsum([0] + seq_lengths_in_bin), bin_size)
+        cu_seqlens_padded_list = None
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
@@ -470,9 +501,17 @@ def create_packed_seq_params_for_bin(
     # This ensures a fixed tensor size for CUDA graph compatibility
     # We add 2 to account for the initial 0 and the final bin_size.
     if len(cu_seqlens) < max_sequences_per_bin + 2:
-        out = cu_seqlens.new_full((max_sequences_per_bin + 2,), bin_size)
+        out = cu_seqlens.new_full((max_sequences_per_bin + 2,), int(cu_seqlens_list[-1]))
         out[:len(cu_seqlens)] = cu_seqlens
         cu_seqlens = out
+
+    cu_seqlens_padded = None
+    if cu_seqlens_padded_list is not None:
+        cu_seqlens_padded = torch.tensor(cu_seqlens_padded_list, dtype=torch.int32, device=device)
+        if len(cu_seqlens_padded) < max_sequences_per_bin + 2:
+            out = cu_seqlens_padded.new_full((max_sequences_per_bin + 2,), bin_size)
+            out[:len(cu_seqlens_padded)] = cu_seqlens_padded
+            cu_seqlens_padded = out
 
     max_seqlen = bin_size
 
@@ -480,8 +519,8 @@ def create_packed_seq_params_for_bin(
         qkv_format='thd',
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=None,
-        cu_seqlens_kv_padded=None,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         total_tokens=bin_size,
@@ -603,10 +642,21 @@ def compute_packed_inference_logprobs_stats(
 class SequencePacker:
     """Packs multiple sequences into bins to minimize padding and improve GPU utilization."""
 
-    def __init__(self, bin_size: int, pad_token: int, max_sequences_per_bin: int = 16):
+    def __init__(
+        self,
+        bin_size: int,
+        pad_token: int,
+        max_sequences_per_bin: int = 16,
+        seq_length_multiple: int = 1,
+    ):
         self.bin_size = bin_size
         self.pad_token = pad_token
         self.max_sequences_per_bin = max_sequences_per_bin
+        # Bin capacity is checked against each sequence's length rounded up to
+        # this multiple (2*cp_size under context parallelism), so the
+        # per-sequence padding inserted by the CP scatter can never overflow a
+        # bin. The physical packing itself stays contiguous and unpadded.
+        self.seq_length_multiple = seq_length_multiple
 
     def pack_sequences(
         self, trajs: torch.Tensor, generation_masks: Optional[torch.Tensor] = None
@@ -630,11 +680,13 @@ class SequencePacker:
         current_bin_indices = []
         current_bin_length = 0
 
-        # Pack sequences into bins
+        # Pack sequences into bins. Capacity is accounted with each sequence's
+        # length rounded up to seq_length_multiple (a no-op when it is 1).
+        multiple = self.seq_length_multiple
         sequences_per_bin = []
         for idx in sorted_indices:
             seq = sequences[idx]
-            seq_len = len(seq)
+            seq_len = math.ceil(len(seq) / multiple) * multiple
 
             if (
                 current_bin_length + seq_len <= self.bin_size
@@ -940,11 +992,16 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             inference_logprobs = _gather(inference_logprobs)
 
     with nvtx_range("rl/pack-sequences", time=True):
-        # Create packer with max sequences per bin limit to prevent extreme imbalance
+        # Create packer with max sequences per bin limit to prevent extreme imbalance.
+        # With context parallelism, account bin capacity per sequence rounded up to
+        # 2*cp_size so the per-sequence padding required by the TE THD CP layout
+        # (see create_packed_seq_params_for_bin) can never overflow a bin.
+        cp_size = mpu.get_context_parallel_world_size()
         packer = SequencePacker(
             bin_size=bin_size,
             pad_token=tokenizer.pad,
             max_sequences_per_bin=max_sequences_per_bin,
+            seq_length_multiple=2 * cp_size if cp_size > 1 else 1,
         )
 
         # Pack sequences with generation masks
@@ -989,6 +1046,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
                 bin_size=bin_size,
                 max_sequences_per_bin=max_sequences_per_bin,
                 device=packed_trajs.device,
+                cp_size=cp_size,
             ) for bin_idx in range(len(packed_trajs))
     ]
 

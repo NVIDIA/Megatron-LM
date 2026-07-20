@@ -1,29 +1,39 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Functional tests for context-parallel logprob computation.
 
-Each test spawns 2 GPU (or CPU) processes via torch.multiprocessing.spawn,
-sets up a minimal process group with CP size = 2, and verifies that the
-get_logprobs CP path returns the same tensor as a single-rank reference
-computation.
+Each test spawns 2 CPU processes via torch.multiprocessing.spawn, sets up a
+minimal gloo process group with CP size = 2, and verifies that the
+scatter -> local logprobs -> gather pipeline returns the same tensor as a
+single-rank reference computation, for both a single full-length sequence
+and a multi-sequence packed bin (per-sequence zigzag layout with real
+cu_seqlens_*_padded).
 
 Run with:
     pytest tests/unit_tests/rl/test_context_parallel_functional.py -v
-or via torchrun for GPU:
-    torchrun --nproc_per_node=2 -m pytest tests/unit_tests/rl/test_context_parallel_functional.py
 """
 
-import os
+import sys
 import tempfile
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+PAD = 0
+MAX_SEQUENCES_PER_BIN = 8
+
 # ---------------------------------------------------------------------------
 # Worker helpers
 # ---------------------------------------------------------------------------
+
+def _stub_triton_if_missing():
+    try:  # pragma: no cover
+        import triton  # noqa: F401
+    except ImportError:
+        sys.modules.setdefault('megatron.core.transformer.moe.paged_stash', MagicMock())
+
 
 def _init_pg(rank: int, world_size: int, store_path: str) -> dist.ProcessGroup:
     """Create an in-process distributed group backed by a file store."""
@@ -37,37 +47,68 @@ def _init_pg(rank: int, world_size: int, store_path: str) -> dist.ProcessGroup:
     return dist.new_group(ranks=list(range(world_size)), backend="gloo")
 
 
+def _make_bin_params(seq_lengths, bin_size, cp_size):
+    from megatron.rl.sequence_packing_utils import (
+        PackingInfo,
+        create_packed_seq_params_for_bin,
+    )
+
+    packing_info = PackingInfo(
+        bin_seq_indices=[list(range(len(seq_lengths)))],
+        seq_starts={0: []},
+        seq_lengths=list(seq_lengths),
+        seq_to_bin_idx=[0] * len(seq_lengths),
+        packing_algo='fifo',
+    )
+    return create_packed_seq_params_for_bin(
+        packing_info=packing_info,
+        bin_idx=0,
+        bin_size=bin_size,
+        max_sequences_per_bin=MAX_SEQUENCES_PER_BIN,
+        device=torch.device('cpu'),
+        cp_size=cp_size,
+    )
+
+
+def _make_inputs(seq_lengths, bin_size, vocab):
+    """Deterministic bin tokens (unique ids), position ids and a per-token-id
+    logits table shared by all ranks and the reference."""
+    total = sum(seq_lengths)
+    tokens = torch.full((1, bin_size), PAD, dtype=torch.long)
+    tokens[0, :total] = torch.arange(1, total + 1)
+    position_ids = torch.zeros(1, bin_size, dtype=torch.long)
+    start = 0
+    for length in seq_lengths:
+        position_ids[0, start : start + length] = torch.arange(length)
+        start += length
+    torch.manual_seed(0)
+    logits_table = torch.randn(1, vocab, vocab)
+    return tokens, position_ids, logits_table
+
+
 def _worker_get_logprobs_cp(
     rank: int,
     world_size: int,
     store_path: str,
-    seq_len: int,
-    batch: int,
-    vocab: int,
+    seq_lengths: list,
+    bin_size: int,
     result_queue: mp.Queue,
 ) -> None:
-    """Worker function: set up CP group, call get_logprobs, put result in queue."""
+    """Worker: scatter, compute local logprobs from a shared per-token-id
+    logits table, gather, and return the full-sequence logprob tensor."""
     try:
+        _stub_triton_if_missing()
         cp_group = _init_pg(rank, world_size, store_path)
 
-        from megatron.rl.rl_utils import _scatter_for_context_parallel, _gather_logprobs_context_parallel, selective_log_softmax
-        from megatron.core.packed_seq_params import PackedSeqParams
-
-        torch.manual_seed(0)
-        tokens      = torch.randint(0, vocab, (batch, seq_len))
-        position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch, -1)
-
-        # Simulate full logits known to all ranks (deterministic, same on both)
-        torch.manual_seed(0)
-        logits_full = torch.randn(batch, seq_len, vocab)
-
-        cu = torch.tensor([0, seq_len], dtype=torch.int32)
-        psp = PackedSeqParams(
-            qkv_format='thd',
-            cu_seqlens_q=cu, cu_seqlens_kv=cu,
-            max_seqlen_q=seq_len, max_seqlen_kv=seq_len,
-            total_tokens=seq_len,
+        from megatron.rl.rl_utils import (
+            _gather_logprobs_context_parallel,
+            _scatter_for_context_parallel,
+            selective_log_softmax,
         )
+
+        vocab = sum(seq_lengths) + 2
+        tokens, position_ids, logits_table = _make_inputs(seq_lengths, bin_size, vocab)
+        psp = _make_bin_params(seq_lengths, bin_size, world_size)
 
         # Patch mpu to return our synthetic CP group.
         with patch('megatron.rl.rl_utils.mpu') as mock_mpu:
@@ -75,20 +116,22 @@ def _worker_get_logprobs_cp(
             mock_mpu.get_context_parallel_rank.return_value       = rank
             mock_mpu.get_context_parallel_group.return_value      = cp_group
 
-            local_tokens, local_pos, cp_psp, local_labels = _scatter_for_context_parallel(
-                tokens, position_ids, psp, world_size
+            local_tokens, _, _, local_labels, cp_gather_index = (
+                _scatter_for_context_parallel(
+                    tokens, position_ids, psp, world_size, pad_token=PAD
+                )
             )
-            # Use the matching local slice of the full logits as the model output.
-            local_size  = seq_len // world_size
-            start       = rank * local_size
-            local_logits = logits_full[:, start : start + local_size, :]
-
+            # "Model output" for a token is its row of the shared logits
+            # table, so the local slice is exactly the padded-frame slice.
+            local_logits = logits_table[:, local_tokens[0], :]
             local_lp = selective_log_softmax(local_logits, local_labels)
-            full_lp  = _gather_logprobs_context_parallel(local_lp, no_grad=True)
+            full_lp = _gather_logprobs_context_parallel(
+                local_lp, cp_gather_index, no_grad=True
+            )
 
         result_queue.put(("ok", full_lp.cpu()))
 
-    except Exception as exc:  # pragma: no cover
+    except Exception:  # pragma: no cover
         import traceback
         result_queue.put(("err", traceback.format_exc()))
     finally:
@@ -128,48 +171,51 @@ def _run_2rank_test(worker_fn, **kwargs) -> list:
 
 class TestCPLogprobsFunctional:
 
-    def _check_results(self, results, expected_logprobs):
-        """Assert all workers returned successfully and matching logprobs."""
+    @staticmethod
+    def _reference_logprobs(seq_lengths, bin_size):
+        _stub_triton_if_missing()
+        from megatron.rl.rl_utils import selective_log_softmax
+
+        vocab = sum(seq_lengths) + 2
+        tokens, _, logits_table = _make_inputs(seq_lengths, bin_size, vocab)
+        return selective_log_softmax(logits_table[:, tokens[0, :-1], :], tokens[:, 1:])
+
+    @staticmethod
+    def _valid_mask(seq_lengths, bin_size):
+        """Positions whose shifted label stays within the same sequence — the
+        only positions the loss mask can select."""
+        valid = torch.zeros(bin_size - 1, dtype=torch.bool)
+        start = 0
+        for length in seq_lengths:
+            valid[start : start + length - 1] = True
+            start += length
+        return valid
+
+    def _check(self, seq_lengths, bin_size):
+        expected = self._reference_logprobs(seq_lengths, bin_size)
+        valid = self._valid_mask(seq_lengths, bin_size)
+        results = _run_2rank_test(
+            _worker_get_logprobs_cp, seq_lengths=seq_lengths, bin_size=bin_size
+        )
+        payloads = []
         for status, payload in results:
             assert status == "ok", f"Worker failed:\n{payload}"
-            torch.testing.assert_close(payload, expected_logprobs, atol=1e-5, rtol=1e-4)
+            assert payload.shape == expected.shape
+            torch.testing.assert_close(
+                payload[0, valid], expected[0, valid], atol=1e-5, rtol=1e-4
+            )
+            payloads.append(payload)
+        # Both CP ranks must return the identical full tensor.
+        torch.testing.assert_close(payloads[0], payloads[1])
 
-    def _reference_logprobs(self, seq_len, batch, vocab):
-        torch.manual_seed(0)
-        tokens = torch.randint(0, vocab, (batch, seq_len))
-        torch.manual_seed(0)
-        logits = torch.randn(batch, seq_len, vocab)
-        from megatron.rl.rl_utils import selective_log_softmax
-        return selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
+    def test_cp2_single_sequence(self):
+        """CP=2, one full-length sequence (no per-sequence padding)."""
+        self._check(seq_lengths=[16], bin_size=16)
 
-    def test_cp2_small_sequence(self):
-        """CP=2 logprobs must match the reference single-rank computation."""
-        seq_len, batch, vocab = 8, 1, 16
-        expected = self._reference_logprobs(seq_len, batch, vocab)
-        results  = _run_2rank_test(
-            _worker_get_logprobs_cp,
-            seq_len=seq_len, batch=batch, vocab=vocab,
-        )
-        self._check_results(results, expected)
+    def test_cp2_packed_bin_odd_lengths(self):
+        """CP=2, multi-sequence bin with odd lengths (per-sequence padding)."""
+        self._check(seq_lengths=[7, 5, 9], bin_size=32)
 
-    def test_cp2_larger_sequence(self):
-        """CP=2 with a larger sequence (16 tokens)."""
-        seq_len, batch, vocab = 16, 2, 32
-        expected = self._reference_logprobs(seq_len, batch, vocab)
-        results  = _run_2rank_test(
-            _worker_get_logprobs_cp,
-            seq_len=seq_len, batch=batch, vocab=vocab,
-        )
-        self._check_results(results, expected)
-
-    def test_cp2_all_ranks_agree(self):
-        """Both CP ranks must return the identical full-sequence logprob tensor."""
-        seq_len, batch, vocab = 8, 1, 16
-        results = _run_2rank_test(
-            _worker_get_logprobs_cp,
-            seq_len=seq_len, batch=batch, vocab=vocab,
-        )
-        statuses = [r[0] for r in results]
-        assert all(s == "ok" for s in statuses), str(results)
-        lp0, lp1 = results[0][1], results[1][1]
-        torch.testing.assert_close(lp0, lp1)
+    def test_cp2_packed_bin_aligned_lengths(self):
+        """CP=2, multi-sequence bin whose lengths are already 2*CP multiples."""
+        self._check(seq_lengths=[8, 4, 12], bin_size=32)
