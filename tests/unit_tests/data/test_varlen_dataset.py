@@ -9,12 +9,22 @@ varlen-specific contracts (auto-detect schema, normalize to messages,
 ValueError on unsupported shapes).
 """
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
+import torch
 
 # Import via the public module path so this test gets discovered through the
 # regular pytest entry point. The functions under test are pure Python and do
 # not require torch.distributed.
+from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.datasets.varlen_dataset import (
+    MockVarlenDataset,
+    VarlenDataset,
+    VarlenLowLevelDataset,
     _alpaca_to_messages,
     _looks_like_hf_id,
     _messages_passthrough,
@@ -290,3 +300,295 @@ def test_select_converter_alpaca_beats_pretrain_text():
 def test_select_converter_messages_beats_pretrain_text():
     fn, name = _select_converter(["text", "messages"])
     assert name == "openai-messages"
+
+
+# ----------------------------------------------------------------------------
+# VarlenLowLevelDataset on local jsonl (no HF Hub network needed)
+# ----------------------------------------------------------------------------
+
+
+def _write_jsonl(tmp_path: Path, rows):
+    p = tmp_path / "data.jsonl"
+    with p.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    return str(p)
+
+
+def test_low_level_loads_jsonl_alpaca(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {"instruction": "i1", "output": "o1"},
+            {"instruction": "i2", "output": "o2", "file": "extra"},
+        ],
+    )
+    ll = VarlenLowLevelDataset(path)
+    assert len(ll) == 2
+    assert ll.schema_name == "alpaca"
+    sample = ll[0]
+    assert [m["role"] for m in sample] == ["system", "user", "assistant"]
+    assert sample[1]["content"] == "i1"
+    assert sample[2]["content"] == "o1"
+
+
+def test_low_level_loads_jsonl_sharegpt(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {"conversations": [{"from": "human", "value": "q1"}, {"from": "gpt", "value": "a1"}]},
+            {"conversations": [{"from": "human", "value": "q2"}, {"from": "gpt", "value": "a2"}]},
+        ],
+    )
+    ll = VarlenLowLevelDataset(path)
+    assert len(ll) == 2
+    assert ll.schema_name == "sharegpt"
+    sample = ll[1]
+    # system prepended + 2 turns from the conversation
+    assert [m["role"] for m in sample] == ["system", "user", "assistant"]
+    assert sample[1]["content"] == "q2"
+
+
+def test_low_level_loads_jsonl_messages(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ]
+            }
+        ],
+    )
+    ll = VarlenLowLevelDataset(path)
+    assert ll.schema_name == "openai-messages"
+    sample = ll[0]
+    assert [m["role"] for m in sample] == ["system", "user", "assistant"]
+
+
+def test_low_level_jsonl_heterogeneous_columns(tmp_path):
+    """Real datasets often mix rows that have / lack an optional field. Our
+    pandas-based loader must accept the union schema without ``CastError``."""
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    rows = [{"instruction": "a", "output": "x"}] * 100 + [
+        {"instruction": "b", "output": "y", "file": "extra"}
+    ] * 100
+    path = _write_jsonl(tmp_path, rows)
+    ll = VarlenLowLevelDataset(path)
+    assert len(ll) == 200
+    # Both halves should normalize to the same messages structure.
+    assert [m["role"] for m in ll[0]] == ["system", "user", "assistant"]
+    assert [m["role"] for m in ll[150]] == ["system", "user", "assistant"]
+
+
+def test_low_level_rejects_unknown_schema(tmp_path):
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(tmp_path, [{"foo": "bar"}])
+    with pytest.raises(ValueError, match="cannot infer schema"):
+        VarlenLowLevelDataset(path)
+
+
+def test_low_level_loads_jsonl_pretrain_text(tmp_path):
+    """Pretrain-text corpora (Dolma / OLMo midtraining) typically have
+    ``text`` + extra fields like ``id`` / ``url`` / ``metadata``."""
+    pytest.importorskip("datasets")
+    pytest.importorskip("pandas")
+    path = _write_jsonl(
+        tmp_path,
+        [
+            {"text": "Doc one body...", "id": "1", "url": "https://x/1"},
+            {"text": "Doc two body...", "id": "2", "url": "https://x/2"},
+        ],
+    )
+    ll = VarlenLowLevelDataset(path)
+    assert ll.schema_name == "pretrain-text"
+    assert len(ll) == 2
+    # Each item is a raw string, NOT a messages list.
+    assert ll[0] == "Doc one body..."
+    assert ll[1] == "Doc two body..."
+
+
+# ----------------------------------------------------------------------------
+# VarlenDataset / MockVarlenDataset __getitem__ (fake tokenizer, no GPU)
+#
+# These bypass the heavy SFTDataset.__init__ and inject the minimal attributes
+# __getitem__ reads, so the EOD handling / position-based loss masking /
+# pad-to-divisor / packing-metadata contracts can be unit tested without a
+# real tokenizer or torch.distributed.
+# ----------------------------------------------------------------------------
+
+
+class _FakeTokenizer:
+    """Minimal tokenizer for exercising VarlenDataset.__getitem__.
+
+    ``tokenize`` maps each character to a non-zero id (so plain text never
+    collides with ``eod``/``pad``); ``tokenize("")`` returns ``[]`` to exercise
+    the empty-row guard. ``tokenize_conversation`` masks non-assistant turns
+    with ``IGNORE_INDEX`` in the targets.
+    """
+
+    def __init__(self, eod: int = 0, pad=None):
+        self._eod = eod
+        self._pad = pad
+
+    @property
+    def eod(self):
+        return self._eod
+
+    @property
+    def pad(self):
+        return self._pad
+
+    def tokenize(self, text):
+        return [ord(c) % 100 + 1 for c in text]  # always >= 1, never eod (0)
+
+    def tokenize_conversation(self, messages, return_target=True, add_generation_prompt=False):
+        tokens, targets = [], []
+        for m in messages:
+            ids = self.tokenize(m["content"])
+            tokens.extend(ids)
+            # Only assistant turns contribute to the loss; prompt is masked.
+            targets.extend(ids if m["role"] == "assistant" else [IGNORE_INDEX] * len(ids))
+        return (torch.tensor(tokens, dtype=torch.int64), torch.tensor(targets, dtype=torch.int64))
+
+
+def _make_config(tokenizer, seq_length=64, *, cp=1, dp=1, sp=1, sbhd=False):
+    return SimpleNamespace(
+        tokenizer=tokenizer,
+        sequence_length=seq_length,
+        reset_position_ids=False,
+        create_attention_mask=False,
+        reset_attention_mask=False,
+        varlen_sbhd_validation=sbhd,
+        data_parallel_size=dp,
+        context_parallel_size=cp,
+        hybrid_context_parallel=False,
+        sequence_parallel_size=sp,
+    )
+
+
+def _make_varlen(items, config):
+    ds = VarlenDataset.__new__(VarlenDataset)
+    ds.config = config
+    ds.dataset = items
+    ds.indices = np.arange(len(items))
+    return ds
+
+
+def _make_mock_varlen(token_arrays, config):
+    ds = MockVarlenDataset.__new__(MockVarlenDataset)
+    ds.config = config
+    ds.dataset = token_arrays  # each item exposes .tolist()
+    ds.indices = np.arange(len(token_arrays))
+    return ds
+
+
+def test_getitem_thd_pretrain_text_keys_and_shapes():
+    tok = _FakeTokenizer(eod=0, pad=7)
+    ds = _make_varlen(["hello world"], _make_config(tok, seq_length=64))
+    out = ds[0]
+    assert set(out) == {
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "original_seq_len",
+        "padded_seq_len",
+    }
+    n = out["tokens"].numel()
+    assert out["labels"].numel() == n
+    assert out["loss_mask"].numel() == n
+    assert out["position_ids"].numel() == n
+    assert int(out["padded_seq_len"].item()) == n
+
+
+def test_getitem_thd_sft_prompt_is_masked():
+    tok = _FakeTokenizer(eod=0, pad=7)
+    messages = [
+        {"role": "system", "content": ""},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    ds = _make_varlen([messages], _make_config(tok, seq_length=64))
+    out = ds[0]
+    # Prompt (user) tokens are IGNORE_INDEX in labels and must be masked out;
+    # assistant tokens must contribute to the loss.
+    labels = out["labels"]
+    loss_mask = out["loss_mask"]
+    assert torch.all(loss_mask[labels == IGNORE_INDEX] == 0.0)
+    assert loss_mask.sum() > 0  # assistant span still contributes
+
+
+def test_getitem_thd_pad_masked_by_position_keeps_real_eod():
+    """Regression: with pad falling back to eod, the real end-of-document EOD
+    target must stay in the loss (masked by position, not by value)."""
+    tok = _FakeTokenizer(eod=0, pad=None)  # pad falls back to eod
+    # cp=2 -> pad divisor = cp*2 = 4, so a 3-token doc gets a padding tail.
+    ds = _make_varlen(["abc"], _make_config(tok, seq_length=64, cp=2))
+    out = ds[0]
+    loss_mask = out["loss_mask"].tolist()
+    labels = out["labels"].tolist()
+    # tokens=[a,b,c,eod] padded to 4 -> labels=[b,c,eod,eod(pad)]
+    assert len(loss_mask) == 4
+    # index 2 is the real end-of-document EOD target -> kept (would be wrongly
+    # dropped by value-based ``labels == pad`` masking).
+    assert labels[2] == tok.eod and loss_mask[2] == 1.0
+    # index 3 is the appended pad -> masked.
+    assert loss_mask[3] == 0.0
+
+
+def test_getitem_thd_padded_to_divisor():
+    tok = _FakeTokenizer(eod=0, pad=7)
+    ds = _make_varlen(["abcde"], _make_config(tok, seq_length=64, cp=2))  # divisor 4
+    out = ds[0]
+    assert int(out["padded_seq_len"].item()) % 4 == 0
+
+
+def test_getitem_thd_empty_text_does_not_crash():
+    """A blank pretrain-text row tokenizes to [] -> must not crash and must
+    yield a valid (non-zero-length) sample."""
+    tok = _FakeTokenizer(eod=0, pad=7)
+    ds = _make_varlen([""], _make_config(tok, seq_length=64))
+    out = ds[0]
+    assert out["tokens"].numel() >= 1
+    assert out["labels"].numel() == out["tokens"].numel()
+    assert out["loss_mask"].numel() == out["tokens"].numel()
+
+
+def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
+    tok = _FakeTokenizer(eod=0, pad=None)
+    ds = _make_varlen(["abc"], _make_config(tok, seq_length=8, sbhd=True))
+    out = ds[0]
+    # SBHD emits fixed [seq_length] samples with no packing metadata.
+    assert set(out) == {"tokens", "labels", "loss_mask", "position_ids"}
+    assert out["tokens"].numel() == 8
+    loss_mask = out["loss_mask"].tolist()
+    # tokens=[a,b,c,eod]: valid_len=3 -> first 3 kept (incl. real eod), rest masked.
+    assert loss_mask[0:3] == [1.0, 1.0, 1.0]
+    assert all(v == 0.0 for v in loss_mask[3:])
+
+
+def test_mock_getitem_thd_keys_and_pad_fallback():
+    tok = _FakeTokenizer(eod=0, pad=None)  # exercise the eod fallback (no crash)
+    ds = _make_mock_varlen([np.array([1, 2, 3, 4], dtype=np.int64)], _make_config(tok, cp=2))
+    out = ds[0]
+    assert set(out) == {
+        "tokens",
+        "labels",
+        "loss_mask",
+        "position_ids",
+        "original_seq_len",
+        "padded_seq_len",
+    }
+    n = out["tokens"].numel()
+    assert out["labels"].numel() == n and out["loss_mask"].numel() == n
+    assert int(out["padded_seq_len"].item()) % 4 == 0
