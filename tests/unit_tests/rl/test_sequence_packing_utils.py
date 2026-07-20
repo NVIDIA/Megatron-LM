@@ -603,9 +603,11 @@ def test_sequence_packing_alignment_pipeline(
     if expected_cu_padded is None:
         assert params.cu_seqlens_q_padded is None
         assert params.cu_seqlens_kv_padded is None
+        assert params.pad_between_seqs is False
     else:
         assert params.cu_seqlens_q_padded.tolist() == expected_cu_padded
         assert params.cu_seqlens_kv_padded.tolist() == expected_cu_padded
+        assert params.pad_between_seqs is True
     assert params.cu_seqlens_q.tolist() == expected_cu
 
 

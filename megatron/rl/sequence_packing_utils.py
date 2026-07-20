@@ -407,6 +407,7 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
         max_seqlen_q=seq_length,
         max_seqlen_kv=seq_length,
         total_tokens=seq_length,
+        pad_between_seqs=False,
     )
 
 def create_packed_seq_params(packing_context: PackingContext):
@@ -525,6 +526,7 @@ def create_packed_seq_params_for_bin(
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         total_tokens=bin_size,
+        pad_between_seqs=seq_length_multiple > 1,
     )
 
 

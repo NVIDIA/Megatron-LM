@@ -271,6 +271,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 max_seqlen_q=tokens.shape[1],
                 max_seqlen_kv=tokens.shape[1],
                 total_tokens=tokens.shape[1],
+                pad_between_seqs=False,
             )
 
     # Clear RoPE cache to avoid inference tensor errors
