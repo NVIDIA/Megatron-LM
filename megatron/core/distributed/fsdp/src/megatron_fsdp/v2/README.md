@@ -366,3 +366,11 @@ torchrun --nproc_per_node=2 -m pytest \
 pytest tests/unit_tests/distributed/megatron_fsdp/v2/ -v \
     -k "test_double_shard_rejected or test_no_params_module or test_get_state_dict_strict"
 ```
+
+## Acknowledgements
+
+Megatron-FSDP v2 prototype development and validation benefited from close
+collaboration across the China Devtech Team. Special
+thanks go to [Tong Liu](https://github.com/Autumn1998), [Hongbin Liu](https://github.com/lhb8125), [Ruby Chen](https://github.com/RubiaCx), [Robin Zhang](https://github.com/buptzyb), and [Jianbin Chang](https://github.com/shjwudp)
+for their contributions to the design, implementation, benchmarking, debugging,
+and validation of this work.
