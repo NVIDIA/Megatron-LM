@@ -28,6 +28,7 @@ from checkpoint_inspector import (  # noqa: E402  (import after sys.path tweak)
     _restack_experts,
     _reverse_mtp_keys,
     _reverse_optimizer_state_key,
+    _split_gdn_projections,
     _stack_layers,
     _strip_fsdp_model_prefix,
     _unflatten,
@@ -195,6 +196,104 @@ class TestRestackExperts:
         out, n = _restack_experts(t)
         assert n == 0
         assert "decoder.layers.0.mlp.shared_experts.linear_fc1.weight" in out
+
+    def test_stack_non_grouped_local_experts(self):
+        # SequentialMLP (no --moe-grouped-gemm) stores experts per local index;
+        # mcore's sharded_state_dict still re-stacks them into the grouped key.
+        t = {
+            "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight": torch.zeros(4, 2),
+            "decoder.layers.0.mlp.experts.local_experts.1.linear_fc1.weight": torch.ones(4, 2),
+        }
+        out, n = _restack_experts(t)
+        assert n == 1
+        key = "decoder.layers.0.mlp.experts.experts.linear_fc1.weight"
+        assert out[key].shape == (2, 4, 2)
+        assert torch.equal(out[key][1], torch.ones(4, 2))
+
+    def test_local_experts_optimizer(self):
+        t = {
+            "optimizer.state.exp_avg.decoder.layers.3.mlp.experts.local_experts.0.linear_fc2.weight": torch.zeros(2),  # noqa: E501
+            "optimizer.state.exp_avg.decoder.layers.3.mlp.experts.local_experts.1.linear_fc2.weight": torch.ones(2),  # noqa: E501
+        }
+        out, n = _restack_experts(t)
+        assert n == 1
+        assert (
+            "optimizer.state.exp_avg.decoder.layers.3.mlp.experts.experts.linear_fc2.weight" in out
+        )
+
+    def test_shared_experts_not_treated_as_local(self):
+        # shared_experts must not match the local_experts pattern.
+        t = {"decoder.layers.0.mlp.shared_experts.local_experts.0.linear_fc1.weight": torch.zeros(2)}
+        out, n = _restack_experts(t)
+        assert n == 0
+
+
+class TestSplitGdnProjections:
+    @staticmethod
+    def _args():
+        from types import SimpleNamespace
+
+        # qk_dim = 4*64 = 256, v_dim = 8*64 = 512, num_value_heads = 8
+        return SimpleNamespace(
+            experimental_attention_variant="gated_delta_net",
+            linear_num_key_heads=4,
+            linear_key_head_dim=64,
+            linear_num_value_heads=8,
+            linear_value_head_dim=64,
+        )
+
+    def test_in_proj_split_names_sizes_and_order(self):
+        qk, v, nvh = 256, 512, 8
+        rows = 2 * qk + 2 * v + 2 * nvh  # 1552
+        key = "decoder.layers.0.self_attention.in_proj.weight"
+        blob = torch.arange(rows * 3).float().reshape(rows, 3)
+        out, n = _split_gdn_projections({key: blob}, self._args())
+        assert n == 1
+        assert key not in out
+        for name, size in [
+            ("query", qk), ("key", qk), ("value", v), ("z", v), ("beta", nvh), ("alpha", nvh)
+        ]:
+            assert out[f"{key}.{name}"].shape == (size, 3)
+        # concatenating the parts in factory order reproduces the fused blob.
+        cat = torch.cat(
+            [out[f"{key}.{name}"] for name in ["query", "key", "value", "z", "beta", "alpha"]],
+            dim=0,
+        )
+        assert torch.equal(cat, blob)
+
+    def test_conv1d_split(self):
+        qk, v = 256, 512
+        key = "decoder.layers.0.self_attention.conv1d.weight"
+        out, n = _split_gdn_projections({key: torch.zeros(2 * qk + v, 1, 4)}, self._args())
+        assert n == 1
+        assert out[f"{key}.query"].shape == (qk, 1, 4)
+        assert out[f"{key}.value"].shape == (v, 1, 4)
+
+    def test_optimizer_state_split(self):
+        key = "optimizer.state.exp_avg.decoder.layers.0.self_attention.in_proj.weight"
+        out, n = _split_gdn_projections({key: torch.zeros(1552, 3)}, self._args())
+        assert n == 1
+        assert f"{key}.alpha" in out and f"{key}.query" in out
+
+    def test_stacked_block_splits_second_dim(self):
+        # A homogeneous (all-GDN) block stacks layers on axis 0, so the projection
+        # dim is axis 1 and must be split there.
+        key = "decoder.layers.self_attention.in_proj.weight"  # no explicit layer index
+        out, n = _split_gdn_projections({key: torch.zeros(3, 1552, 5)}, self._args())
+        assert n == 1
+        assert out[f"{key}.query"].shape == (3, 256, 5)
+
+    def test_noop_without_gdn_variant(self):
+        from types import SimpleNamespace
+
+        key = "decoder.layers.0.self_attention.in_proj.weight"
+        out, n = _split_gdn_projections({key: torch.zeros(1552, 3)}, SimpleNamespace())
+        assert n == 0 and key in out
+
+    def test_noop_when_args_none(self):
+        key = "decoder.layers.0.self_attention.in_proj.weight"
+        out, n = _split_gdn_projections({key: torch.zeros(1552, 3)}, None)
+        assert n == 0 and key in out
 
 
 class TestStackLayers:

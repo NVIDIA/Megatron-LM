@@ -986,6 +986,16 @@ _MTP_LAYERS_RE = re.compile(r"(^|\.)mtp\.layers\.")
 _SWIGLU_W_RE = re.compile(r"((?:weight|bias)\d*)_w(.*)")
 # A grouped-expert parameter with a trailing expert index.
 _EXPERT_RE = re.compile(r"^(.*\.mlp\.experts\.linear_fc[12]\.(?:weight|bias))(\d+)$")
+# A non-grouped (SequentialMLP) routed-expert parameter with an explicit
+# local-expert index. Even without ``--moe-grouped-gemm`` mcore's
+# ``SequentialMLP.sharded_state_dict`` re-stacks every local expert into a single
+# grouped ``experts.experts.linear_fcN`` tensor via a ShardedTensorFactory, so the
+# reverse must stack these exactly like the grouped-gemm case. ``shared_experts``
+# (``.mlp.shared_experts.``) never carry ``.experts.local_experts.`` and so are
+# left untouched.
+_LOCAL_EXPERT_RE = re.compile(
+    r"^(.*\.mlp\.experts)\.local_experts\.(\d+)\.(linear_fc[12]\.(?:weight|bias))$"
+)
 # A per-layer parameter with an explicit layer index.
 _LAYER_RE = re.compile(r"^(.*\.layers)\.(\d+)\.(.+)$")
 
@@ -1072,30 +1082,39 @@ def _merge_swiglu(tensors, swiglu_modules=None):
 
 
 def _restack_experts(tensors):
-    """Stack per-expert ``...linear_fc{1,2}.weight{idx}`` into one axis-0 tensor.
+    """Stack per-expert weights into one axis-0 ``(num_global_experts, *param)`` tensor.
 
-    Inverts ``split_expert_weights``. Output key re-inserts the doubled
-    ``experts.experts.`` segment used by SequentialMLP/TEGroupedMLP
-    sharded_state_dict, with global shape ``(num_global_experts, *param)``.
+    Inverts ``split_expert_weights``. Handles both expert storage layouts, which
+    mcore's sharded_state_dict unifies into the same grouped
+    ``...mlp.experts.experts.linear_fc{1,2}.<weight|bias>`` key:
+
+    * grouped-gemm (TEGroupedMLP): ``...mlp.experts.linear_fc{1,2}.weight{idx}``
+    * non-grouped (SequentialMLP): ``...mlp.experts.local_experts.{idx}.linear_fc{1,2}.weight``
+
     Applies uniformly to model and ``optimizer.state.*`` keys.
     """
-    groups = {}
+    groups = {}  # grouped out_key -> {idx: tensor}
     out = {}
     for key, value in tensors.items():
         m = _EXPERT_RE.match(key)
-        if m is None:
-            out[key] = value
+        if m is not None:
+            out_key = m.group(1).replace(
+                ".mlp.experts.linear_fc", ".mlp.experts.experts.linear_fc", 1
+            )
+            groups.setdefault(out_key, {})[int(m.group(2))] = value
             continue
-        groups.setdefault(m.group(1), {})[int(m.group(2))] = value
+        m = _LOCAL_EXPERT_RE.match(key)
+        if m is not None:
+            out_key = f"{m.group(1)}.experts.{m.group(3)}"
+            groups.setdefault(out_key, {})[int(m.group(2))] = value
+            continue
+        out[key] = value
     restacked = 0
-    for stem, by_idx in groups.items():
+    for out_key, by_idx in groups.items():
         n = len(by_idx)
         assert set(by_idx) == set(range(n)), (
-            f"Expert indices for '{stem}' are not contiguous 0..{n - 1}: "
+            f"Expert indices for '{out_key}' are not contiguous 0..{n - 1}: "
             f"{sorted(by_idx)} — an incomplete or partially-gathered checkpoint?"
-        )
-        out_key = stem.replace(
-            ".mlp.experts.linear_fc", ".mlp.experts.experts.linear_fc", 1
         )
         out[out_key] = torch.stack([by_idx[i] for i in range(n)], dim=0)
         restacked += 1
@@ -1173,6 +1192,66 @@ def _layers_are_homogeneous(keys):
         if any(s != suffix_sets[0] for s in suffix_sets[1:]):
             return False  # layers differ in structure ⇒ non-homogeneous
     return True
+
+
+# Gated-DeltaNet fuses q/k/v/gate/beta/alpha into one ``in_proj.weight`` and
+# q/k/v into one ``conv1d.weight``. mcore's GatedDeltaNet.sharded_state_dict
+# (ssm/gated_delta_net.py:671-700) stores these via a ``_split_tensor_factory``
+# that splits dim-0 into named sub-tensors, so a classic torch_dist load expects
+# the checkpoint to already carry the split ``<key>.<name>`` sub-keys. fsdp_dtensor
+# stores the fused blob instead, so the reverse path must reproduce the split.
+_GDN_INPROJ_SUFFIX = ".self_attention.in_proj.weight"
+_GDN_CONV_SUFFIXES = (".self_attention.conv1d.weight", ".self_attention.conv1d.bias")
+
+
+def _split_gdn_projections(tensors, args):
+    """Split fused GatedDeltaNet ``in_proj``/``conv1d`` into named factory sub-keys.
+
+    Mirrors ``GatedDeltaNet.sharded_state_dict`` at TP=1: ``in_proj`` splits dim-0
+    into ``[qk, qk, v, v, nvh, nvh]`` named ``query,key,value,z,beta,alpha`` and
+    ``conv1d`` into ``[qk, qk, v]`` named ``query,key,value`` (``qk =
+    num_key_heads*key_head_dim``, ``v = num_value_heads*value_head_dim``, ``nvh =
+    num_value_heads``). Applies to model weights and their ``optimizer.state.*``
+    counterparts (the fully_reshardable optimizer mirrors the model factories).
+    No-op unless the checkpoint's ``args`` selects the gated_delta_net variant.
+    """
+    if args is None or getattr(args, "experimental_attention_variant", None) != "gated_delta_net":
+        return tensors, 0
+    qk = args.linear_num_key_heads * args.linear_key_head_dim
+    v = args.linear_num_value_heads * args.linear_value_head_dim
+    nvh = args.linear_num_value_heads
+    inproj = ([qk, qk, v, v, nvh, nvh], ["query", "key", "value", "z", "beta", "alpha"])
+    conv = ([qk, qk, v], ["query", "key", "value"])
+
+    def spec_for(key):
+        if key.endswith(_GDN_INPROJ_SUFFIX):
+            return inproj
+        if any(key.endswith(s) for s in _GDN_CONV_SUFFIXES):
+            return conv
+        return None
+
+    out = {}
+    n_split = 0
+    for key, value in tensors.items():
+        spec = spec_for(key)
+        if spec is None:
+            out[key] = value
+            continue
+        sections, names = spec
+        # Per-layer keys keep an explicit ``.layers.{idx}.`` (interleaved GDN) and
+        # split dim 0; a stacked homogeneous block carries a leading num-layers axis
+        # and splits dim 1.
+        dim = 0 if re.search(r"\.layers\.\d+\.", key) else 1
+        assert value.shape[dim] == sum(sections), (
+            f"GDN split for '{key}': dim {dim} size {value.shape[dim]} != "
+            f"sum({sections})={sum(sections)} — args/checkpoint mismatch?"
+        )
+        start = 0
+        for size, name in zip(sections, names):
+            out[f"{key}.{name}"] = value.narrow(dim, start, size).contiguous()
+            start += size
+        n_split += 1
+    return out, n_split
 
 
 def _unflatten(flat):
@@ -1403,9 +1482,13 @@ def reverse_convert_checkpoint(
     else:
         n_layers = 0
 
+    # Gated-DeltaNet fused-projection split (in_proj/conv1d -> named sub-keys).
+    # Runs after stacking so the per-layer/stacked dim is unambiguous.
+    tensors, n_gdn = _split_gdn_projections(tensors, common_flat.get("args"))
+
     rank0_echo(
         f"[Convert] mtp={n_mtp} swiglu={n_swiglu} experts={n_experts} "
-        f"layer-stacks={n_layers} masters={n_masters} "
+        f"layer-stacks={n_layers} gdn-splits={n_gdn} masters={n_masters} "
         f"extra_state-dropped={n_skipped_extra_state} "
         f"layout={'stacked' if do_stack else 'per-layer'}"
     )
