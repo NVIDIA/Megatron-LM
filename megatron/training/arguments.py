@@ -505,9 +505,17 @@ def validate_args(args, defaults={}):
         submit_rollouts_at_rollout_granularity = (
             args.rl_submission_granularity == "R"
         )
-        if args.rl_generation_lag > 0:
-            assert args.rl_partial_rollouts, \
-                "--rl-generation-lag requires --rl-partial-rollouts."
+        if args.rl_generation_lag is None:
+            # With --rl-partial-rollouts the lag is autotuned from engine capacity
+            # at inference launch; otherwise generation is fully synchronous.
+            if not args.rl_partial_rollouts:
+                args.rl_generation_lag = 0
+        else:
+            assert args.rl_generation_lag >= -1, \
+                f"--rl-generation-lag ({args.rl_generation_lag}) must be >= -1."
+            if args.rl_generation_lag > 0:
+                assert args.rl_partial_rollouts, \
+                    "--rl-generation-lag requires --rl-partial-rollouts."
         if submit_rollouts_at_rollout_granularity:
             assert (
                 args.rl_partial_rollouts
@@ -2426,9 +2434,13 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
-    group.add_argument('--rl-generation-lag', type=int, default=0,
-                       help='Number of trainer batches of rollout generation lag to allow. '
-                            'The number of in-flight trainer batches is this value plus one. '
+    group.add_argument('--rl-generation-lag', type=float, default=None,
+                       help='Number of trainer batches of rollout generation lag (collection lag) '
+                            'to allow. The number of in-flight trainer batches is this value plus '
+                            'one. May be fractional; the minimum of -1 keeps a single unit of '
+                            'generation work in flight. If omitted, the lag is autotuned to the '
+                            'inference engine\'s request capacity when --rl-partial-rollouts is '
+                            'set, and is 0 otherwise. '
                             'Requires --rl-partial-rollouts when greater than 0.')
     # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
     group.add_argument('--rl-submission-granularity', type=str,
