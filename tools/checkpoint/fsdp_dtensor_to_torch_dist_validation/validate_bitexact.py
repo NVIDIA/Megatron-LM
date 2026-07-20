@@ -98,8 +98,9 @@ def main():
     parse_and_validate_args(args_defaults={"tokenizer_type": "NullTokenizer"})
     initialize_megatron()
 
+    # mcore's setup_model_and_optimizer takes (model_type, model_provider_func).
     model, optimizer, opt_sched = setup_model_and_optimizer(
-        partial(model_provider, gpt_builder), ModelType.encoder_or_decoder
+        ModelType.encoder_or_decoder, partial(model_provider, gpt_builder)
     )
     iteration, _ = load_checkpoint(model, optimizer, opt_sched)
     print(f"[bitexact] loaded iteration {iteration} from {td}")
@@ -118,8 +119,11 @@ def main():
     # _compare_two_checkpoint prints per-key metadata/value mismatches; empty == pass.
     _compare_two_checkpoint(src, dst)
     print(
-        "[bitexact] done — no mismatch lines above == bit-exact load "
-        "(weights + optimizer masters/moments/param_groups)."
+        "[bitexact] done. EXPECTED differences: the converter intentionally omits "
+        "_extra_state / rng_state / rerun_state_machine_state, so those keys appear "
+        "only in the reload (checkpoint 2). Any decoder.*/embedding.*/output_layer.* "
+        "weight or optimizer.state.* tensor listed above is a REAL mismatch; none of "
+        "those == bit-exact weights + optimizer (masters, moments, param_groups)."
     )
 
 
