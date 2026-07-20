@@ -462,11 +462,6 @@ def validate_args(args, defaults={}):
         assert not args.rl_training_cuda_graphs or args.cuda_graph_impl != "none", (
             "--rl-training-cuda-graphs is set but no CUDA graphs are being built."
         )
-        # Training CGs cannot be captured under context parallelism due to TE `pad_between_seqs`.
-        # TODO: TDE fix this.
-        assert not (args.rl_training_cuda_graphs and args.context_parallel_size > 1), (
-            "--rl-training-cuda-graphs is not supported with --context-parallel-size > 1."
-        )
         # If CUDA graphs persist and KV cache memory address is not static, we need
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
         if args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
