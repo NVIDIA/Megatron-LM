@@ -52,6 +52,10 @@ from megatron.core.distributed import (
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as megatron_FSDP,
 )
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallelV1,
+    FullyShardedDataParallelV2,
+)
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
@@ -3440,7 +3444,9 @@ def train(
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
+    if isinstance(
+        model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
+    ) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
@@ -3829,7 +3835,9 @@ def train(
             and iteration ==  start_iteration + 1
         ):
             for model_chunk in model:
-                if isinstance(model_chunk, megatron_FSDP) and getattr(
+                if isinstance(
+                    model_chunk, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+                ) and getattr(
                     model_chunk.ddp_config, "fsdp_manual_registration", False
                 ):
                     param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
