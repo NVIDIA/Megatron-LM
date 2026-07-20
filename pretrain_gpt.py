@@ -75,7 +75,11 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+def get_batch(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    cp_partition_mode="zigzag",
+):
     """Generate a batch.
 
     Packed sequence support (SFT / ``--sft`` flag):
@@ -138,6 +142,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
+            cp_partition_mode=cp_partition_mode,
         )
 
     # TODO: this is pretty hacky, find a better way
@@ -182,17 +187,24 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 max_seqlen_q=int(max_seqlen[0].item()),
                 max_seqlen_kv=int(max_seqlen[0].item()),
                 qkv_format='thd',
+                cp_partition_mode=cp_partition_mode,
             ),
             None,
         )
 
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        batch = get_batch_on_this_cp_rank(  # The implementation of this function is in MCore
+            batch, cp_partition_mode=cp_partition_mode
+        )
         packed_seq_params = None
     else:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
-            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
+            batch,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seqlen,
+            cp_partition_mode=cp_partition_mode,
         )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
@@ -357,8 +369,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        cp_partition_mode = get_attr_wrapped_model(model, "get_input_cp_partition_mode")()
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
-            get_batch(data_iterator, vp_stage)
+            get_batch(data_iterator, vp_stage, cp_partition_mode=cp_partition_mode)
         )
     timers('batch-generator').stop()
 

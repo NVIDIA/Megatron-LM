@@ -2,6 +2,7 @@
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
 )
@@ -17,6 +18,7 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
 from megatron.core.transformer.spec_utils import import_module
+from megatron.core.utils import get_pg_rank
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
@@ -29,14 +31,25 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
+    cp_stage_entry_partition_mode = "zigzag"
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:
         use_te = args.transformer_impl == "transformer_engine"
 
         if args.experimental_attention_variant is not None:
+            pp_rank = (
+                get_pg_rank(pg_collection.pp)
+                if pg_collection is not None and hasattr(pg_collection, "pp")
+                else None
+            )
+            cp_stage_entry_partition_mode = (
+                get_experimental_attention_variant_stage_input_cp_partition_mode(
+                    config=config, vp_stage=vp_stage, pp_rank=pp_rank
+                )
+            )
             transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
-                config=config, vp_stage=vp_stage
+                config=config, vp_stage=vp_stage, pp_rank=pp_rank
             )
         elif args.num_experts:
             # Define the decoder block spec
@@ -107,6 +120,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         mtp_block_spec=mtp_block_spec,
         vp_stage=vp_stage,
         pg_collection=pg_collection,
+        cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
     )
 
     return model
