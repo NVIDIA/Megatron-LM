@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -41,7 +42,10 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
+    log_single_rank,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class GPTModel(LanguageModule):
@@ -111,6 +115,13 @@ class GPTModel(LanguageModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
+            "features. Please reference the migration guide "
+            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
+        )
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
