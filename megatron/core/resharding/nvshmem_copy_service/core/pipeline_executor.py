@@ -7,6 +7,7 @@ Orchestrates the pack/send/unpack pipeline with double-buffering
 and proper stream synchronization.
 """
 
+import time
 from typing import Dict, List, Optional
 
 from ..compat import ensure_nvshmem_compat
@@ -34,7 +35,10 @@ class PipelineExecutor:
     """Executes pipelined NVSHMEM communication with pack/send/unpack overlap."""
 
     def __init__(
-        self, kernel_launcher: KernelLauncher, buffer_manager: DoubleBufferManager, my_pe: int
+        self,
+        kernel_launcher: KernelLauncher,
+        buffer_manager: DoubleBufferManager,
+        my_pe: int,
     ):
         """
         Initialize pipeline executor.
@@ -93,7 +97,9 @@ class PipelineExecutor:
         self.barrier_events = barrier_events
 
     def execute_pipeline(
-        self, iter_schedules: List[Dict[str, Optional[ScheduledBatch]]], num_iterations: int
+        self,
+        iter_schedules: List[Dict[str, Optional[ScheduledBatch]]],
+        num_iterations: int,
     ) -> None:
         """
         Execute pipelined communication.
@@ -117,6 +123,17 @@ class PipelineExecutor:
         """
         PELogger.info(f"Executing pipeline: {num_iterations} iterations")
 
+        pipeline_start = time.perf_counter()
+        wait_unpack_seconds = 0.0
+        put_submit_seconds = 0.0
+        quiet_submit_seconds = 0.0
+        barrier_submit_seconds = 0.0
+        barrier_host_sync_seconds = 0.0
+        wait_pack_seconds = 0.0
+        final_unpack_seconds = 0.0
+        slowest_barrier_sync_iteration = -1
+        slowest_barrier_sync_seconds = 0.0
+
         # Priming: Pack iteration 0 (async, no CPU sync needed —
         # step 3 uses GPU-level event wait for pack→put ordering)
         if num_iterations > 0 and iter_schedules[0]["send"]:
@@ -130,7 +147,9 @@ class PipelineExecutor:
             nvtx_range_push(nvtx_iter_msg)
             has_send = iter_schedules[i]["send"] is not None
             has_recv = iter_schedules[i]["recv"] is not None
-            has_next_send = i + 1 < num_iterations and iter_schedules[i + 1]["send"] is not None
+            has_next_send = (
+                i + 1 < num_iterations and iter_schedules[i + 1]["send"] is not None
+            )
             has_prior_recv = i > 0 and iter_schedules[i - 1]["recv"] is not None
 
             slot = i % 2
@@ -148,7 +167,9 @@ class PipelineExecutor:
                 if has_recv
                 else ""
             )
-            PELogger.debug(f"Iteration {i}/{num_iterations}: slot={slot}{send_info}{recv_info}")
+            PELogger.debug(
+                f"Iteration {i}/{num_iterations}: slot={slot}{send_info}{recv_info}"
+            )
 
             # Step 1: Pack NEXT iteration (async)
             if has_next_send:
@@ -156,7 +177,7 @@ class PipelineExecutor:
                 next_batch = iter_schedules[i + 1]["send"]
                 assert next_batch is not None
                 PELogger.debug(
-                    f"  Pack next (iter {i+1}): {len(next_batch.tasks)} tasks "
+                    f"  Pack next (iter {i + 1}): {len(next_batch.tasks)} tasks "
                     f"→ PE {next_batch.dest_pe}"
                 )
                 self._launch_pack(i + 1, next_batch)
@@ -168,12 +189,14 @@ class PipelineExecutor:
                 prior_batch = iter_schedules[i - 1]["recv"]
                 assert prior_batch is not None
                 PELogger.debug(
-                    f"  Unpack prior (iter {i-1}): {prior_batch.total_size} bytes "
+                    f"  Unpack prior (iter {i - 1}): {prior_batch.total_size} bytes "
                     f"← PE {prior_batch.src_pe}"
                 )
                 # GPU-level event wait: ensures send_stream's barrier_all from
                 # the prior iteration has completed before unpack_stream proceeds.
-                self.torch_unpack_stream_wrapper.wait_event(self.barrier_events[(i - 1) % 2])
+                self.torch_unpack_stream_wrapper.wait_event(
+                    self.barrier_events[(i - 1) % 2]
+                )
                 self._launch_unpack(i - 1, prior_batch)
                 nvtx_range_pop("Step 2: Unpack Prior")
 
@@ -183,7 +206,9 @@ class PipelineExecutor:
                 batch = iter_schedules[i]["send"]
                 assert batch is not None
                 transfer_size = batch.total_size
-                PELogger.debug(f"  Send current: {transfer_size} bytes → PE {batch.dest_pe}")
+                PELogger.debug(
+                    f"  Send current: {transfer_size} bytes → PE {batch.dest_pe}"
+                )
 
                 # GPU-level event wait: ensures pack data in send_slot is visible
                 # to send_stream before NVSHMEM put reads it. The pack kernel's
@@ -191,39 +216,50 @@ class PipelineExecutor:
                 # the NIC's DMA engine.
                 self.torch_send_stream_wrapper.wait_event(self.pack_events[slot])
 
+                put_start = time.perf_counter()
                 nvshmem.core.put(
                     self.buffer_manager.recv_slots[slot][0:transfer_size],
                     self.buffer_manager.send_slots[slot][0:transfer_size],
                     batch.dest_pe,
                     stream=self.send_stream,
                 )
+                put_submit_seconds += time.perf_counter() - put_start
                 nvtx_range_pop("Step 3: Send Current")
 
             # Step 4a: Wait for prior unpack to complete BEFORE the barrier.
             nvtx_range_push("Step 4a: Wait Unpack")
             if has_prior_recv:
+                wait_start = time.perf_counter()
                 self.unpack_events[(i - 1) % 2].synchronize()
+                wait_unpack_seconds += time.perf_counter() - wait_start
             nvtx_range_pop("Step 4a: Wait Unpack")
 
             # Ensure all NVSHMEM operations on send_stream complete (stream-ordered)
+            quiet_start = time.perf_counter()
             nvshmem.core.quiet(stream=self.send_stream)
+            quiet_submit_seconds += time.perf_counter() - quiet_start
 
-            # Step 4b: Global barrier + CPU sync + record event
+            # Step 4b: Global barrier + CPU sync + record event.
             nvtx_range_push("Step 4b: Barrier")
+            barrier_start = time.perf_counter()
             nvshmem.core.barrier_all(stream=self.send_stream)
-            # CPU-sync the send_stream to ensure barrier_all has actually
-            # completed (not just submitted). Without this, the barrier_event
-            # can fire before RDMA data from the remote PE is visible, because
-            # stream-ordered operations are only guaranteed to be submitted,
-            # not completed, when the event is recorded.
+            barrier_submit_seconds += time.perf_counter() - barrier_start
+            sync_start = time.perf_counter()
             self.torch_send_stream_wrapper.synchronize()
+            sync_seconds = time.perf_counter() - sync_start
+            barrier_host_sync_seconds += sync_seconds
+            if sync_seconds > slowest_barrier_sync_seconds:
+                slowest_barrier_sync_iteration = i
+                slowest_barrier_sync_seconds = sync_seconds
             self.barrier_events[slot].record(stream=self.torch_send_stream_wrapper)
             nvtx_range_pop("Step 4b: Barrier")
 
             # Step 5: Wait for async pack to complete (double-buffer safety)
             nvtx_range_push("Step 5: Wait Pack")
             if has_next_send:
+                wait_start = time.perf_counter()
                 self.pack_events[(i + 1) % 2].synchronize()
+                wait_pack_seconds += time.perf_counter() - wait_start
             nvtx_range_pop("Step 5: Wait Pack")
 
             nvtx_range_pop(nvtx_iter_msg)
@@ -231,7 +267,7 @@ class PipelineExecutor:
         # Final unpack for last iteration
         if num_iterations > 0 and iter_schedules[num_iterations - 1]["recv"]:
             nvtx_range_push("Final Unpack")
-            PELogger.debug(f"Final unpack: iteration {num_iterations-1}")
+            PELogger.debug(f"Final unpack: iteration {num_iterations - 1}")
             last_recv = iter_schedules[num_iterations - 1]["recv"]
             assert last_recv is not None
             # GPU-level event wait for NVSHMEM RDMA data visibility
@@ -239,9 +275,25 @@ class PipelineExecutor:
                 self.barrier_events[(num_iterations - 1) % 2]
             )
             self._launch_unpack(num_iterations - 1, last_recv)
+            wait_start = time.perf_counter()
             self.unpack_events[(num_iterations - 1) % 2].synchronize()
+            final_unpack_seconds += time.perf_counter() - wait_start
             nvtx_range_pop("Final Unpack")
 
+        pipeline_seconds = time.perf_counter() - pipeline_start
+        PELogger.info(
+            "Pipeline timing: "
+            f"total={pipeline_seconds:.6f}s "
+            f"wait_unpack={wait_unpack_seconds:.6f}s "
+            f"put_submit={put_submit_seconds:.6f}s "
+            f"quiet_submit={quiet_submit_seconds:.6f}s "
+            f"barrier_submit={barrier_submit_seconds:.6f}s "
+            f"barrier_host_sync={barrier_host_sync_seconds:.6f}s "
+            f"wait_pack={wait_pack_seconds:.6f}s "
+            f"final_unpack={final_unpack_seconds:.6f}s "
+            f"slowest_barrier_sync_iteration={slowest_barrier_sync_iteration} "
+            f"slowest_barrier_sync={slowest_barrier_sync_seconds:.6f}s"
+        )
         PELogger.info(f"Pipeline complete: {num_iterations} iterations")
 
     def _launch_pack(self, iteration: int, batch: ScheduledBatch) -> None:
@@ -293,7 +345,9 @@ class PipelineExecutor:
                 if recv_req.task_id in local_sends:
                     send_req = local_sends[recv_req.task_id]
                     PELogger.debug(
-                        "  Self-move: task_id=%d, size=%d bytes", recv_req.task_id, send_req.size
+                        "  Self-move: task_id=%d, size=%d bytes",
+                        recv_req.task_id,
+                        send_req.size,
                     )
 
                     # Create views of the tensors with offsets
