@@ -546,7 +546,7 @@ def select_pipeline_segment(
     last_stage_layers: Optional[int] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[List[str], int]:
+) -> Tuple[List[LayerPatternItem], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
     When the main pattern contains '|' pipe separators, splits by '|' into

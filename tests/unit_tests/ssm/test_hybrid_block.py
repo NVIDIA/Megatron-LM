@@ -45,7 +45,7 @@ class TestHybridBlock:
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
             # will generate errors.
-            num_layers=len(layer_type_list),
+            num_layers=get_layer_type_list_physical_count(layer_type_list),
             num_attention_heads=4,
             use_cpu_initialization=True,
             **config_kwargs,
@@ -197,6 +197,7 @@ class TestHybridBlock:
             Symbols.MLP * 5,
             Symbols.ATTENTION + Symbols.MLP + Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
             Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
+            "[*-]",
         ],
     )
     def test_recompute(self, recompute_kwargs: dict, layer_pattern: str):
