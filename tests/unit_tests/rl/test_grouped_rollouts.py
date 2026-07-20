@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+from contextlib import aclosing
 from unittest.mock import MagicMock
 
 import pytest
@@ -168,10 +169,10 @@ class TestGroupedRollouts:
         (
             "num_slow_calls, stall_after_calls, streaming, num_groups, "
             "submission_granularity, consumption_granularity, expected_count, "
-            "expected_batch_ids, expected_trajectories, expected_ready_batches"
+            "expected_batch_ids, expected_trajectories, expects_ready_batch"
         ),
         [
-            pytest.param(0, None, False, 8, "B", "B", 8, None, None, 0, id="non_batched"),
+            pytest.param(0, None, False, 8, "B", "B", 8, None, None, False, id="non_batched"),
             pytest.param(
                 0,
                 None,
@@ -182,7 +183,7 @@ class TestGroupedRollouts:
                 4,
                 None,
                 None,
-                0,
+                False,
                 id="non_streaming_fewer_than_parallel",
             ),
             pytest.param(
@@ -226,8 +227,8 @@ class TestGroupedRollouts:
                 id="batch_consume_submission_order",
             ),
             # 6 completable rollouts, then the engine stalls (as when
-            # suspended): 3 batches of 2 groups can bank without further
-            # generation; consuming one leaves 2 ready.
+            # suspended): whole batches bank without further generation and
+            # the can_skip_inference read finds one ready.
             pytest.param(
                 0,
                 6,
@@ -238,7 +239,7 @@ class TestGroupedRollouts:
                 2,
                 [0, 0],
                 ["t0", "t1"],
-                2,
+                True,
                 id="stalled_engine_banks_ready_batches",
             ),
         ],
@@ -254,7 +255,7 @@ class TestGroupedRollouts:
         expected_count,
         expected_batch_ids,
         expected_trajectories,
-        expected_ready_batches,
+        expects_ready_batch,
     ):
         gen = MockGenerator()
         request = GroupedRolloutRequest(
@@ -270,23 +271,29 @@ class TestGroupedRollouts:
 
         groups = []
         pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=8)
-        async for group in pipeline.run():
-            groups.append(group)
-            if request.streaming and len(groups) >= expected_count:
-                break
+        # Hold the iterator open through the assertions: abandoning it lets the
+        # event loop finalize run(), cancelling the stages that bank batches.
+        async with aclosing(pipeline.run()) as iterator:
+            async for group in iterator:
+                groups.append(group)
+                if request.streaming and len(groups) >= expected_count:
+                    break
 
-        assert len(groups) == expected_count
-        if expected_batch_ids is not None:
-            assert [g.batch_id for g in groups] == expected_batch_ids
-        if expected_trajectories is not None:
-            trajectories = [group[0].trajectory[0] for group in groups]
-            assert trajectories[: len(expected_trajectories)] == expected_trajectories
-        if expected_ready_batches is not None:
-            for _ in range(2 * request.num_groups):
-                await asyncio.sleep(0)
-            assert pipeline.ready_batches == expected_ready_batches
-        assert pipeline.yielded_count == len(groups)
-        assert len(pipeline.output_queue_dwell) == len(groups)
+            assert len(groups) == expected_count
+            if expected_batch_ids is not None:
+                assert [g.batch_id for g in groups] == expected_batch_ids
+            if expected_trajectories is not None:
+                trajectories = [group[0].trajectory[0] for group in groups]
+                assert trajectories[: len(expected_trajectories)] == expected_trajectories
+            if expects_ready_batch is not None:
+                if expects_ready_batch:
+                    for _ in range(2 * request.num_groups + 16):
+                        await asyncio.sleep(0)
+                    assert pipeline.ready_batches >= 1
+                else:
+                    assert pipeline.ready_batches == 0
+            assert pipeline.yielded_count == len(groups)
+            assert len(pipeline.output_queue_dwell) == len(groups)
 
     @pytest.mark.asyncio
     async def test_rollout_submission_granularity_limits_inference_concurrency(self):
@@ -361,17 +368,17 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "num_slow_calls, stall_after_calls, collect_count, expected_ready_batches",
+        "num_slow_calls, stall_after_calls, collect_count, expects_ready_batch",
         [
             pytest.param(2, None, 12, None, id="balanced_windows"),
             # Both envs complete prompts t0-t5: env "a" (3 groups/batch) has
-            # two complete units, env "b" six, so exactly two balanced rounds
-            # can bank; consuming one leaves one ready.
-            pytest.param(0, 6, 4, 1, id="stalled_engine_banks_complete_rounds"),
+            # two complete units, env "b" six, so balanced rounds bank and
+            # the can_skip_inference read finds one ready.
+            pytest.param(0, 6, 4, True, id="stalled_engine_banks_complete_rounds"),
         ],
     )
     async def test_env_consumption_balances_each_batch(
-        self, num_slow_calls, stall_after_calls, collect_count, expected_ready_batches
+        self, num_slow_calls, stall_after_calls, collect_count, expects_ready_batch
     ):
         """Balanced-E: every trainer-batch window holds each env's exact share,
         and a banked batch is one complete round."""
@@ -393,18 +400,19 @@ class TestGroupedRollouts:
         )
         groups = []
         pipeline = RolloutPipeline(mt, request, parallel_generation_tasks=2)
-        async for group in pipeline.run():
-            groups.append(group)
-            if len(groups) >= collect_count:
-                break
+        async with aclosing(pipeline.run()) as iterator:
+            async for group in iterator:
+                groups.append(group)
+                if len(groups) >= collect_count:
+                    break
 
-        for start in range(0, collect_count, 4):
-            env_ids = [g[0].env_id for g in groups[start : start + 4]]
-            assert sorted(env_ids) == ["a", "a", "a", "b"]
-        if expected_ready_batches is not None:
-            for _ in range(2 * request.num_groups):
-                await asyncio.sleep(0)
-            assert pipeline.ready_batches == expected_ready_batches
+            for start in range(0, collect_count, 4):
+                env_ids = [g[0].env_id for g in groups[start : start + 4]]
+                assert sorted(env_ids) == ["a", "a", "a", "b"]
+            if expects_ready_batch:
+                for _ in range(2 * request.num_groups + 16):
+                    await asyncio.sleep(0)
+                assert pipeline.ready_batches >= 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

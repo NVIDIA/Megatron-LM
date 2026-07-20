@@ -616,7 +616,7 @@ def can_skip_inference(partial_rollouts: bool) -> bool:
     skip = False
     if torch.distributed.get_rank() == 0:
         loop = get_asyncio_loop()
-        for _ in range(2 * _ROLLOUT_PIPELINE.gran_policy.num_groups_per_batch):
+        for _ in range(2 * _ROLLOUT_PIPELINE.gran_policy.num_groups_per_batch + 16):
             loop.run_until_complete(asyncio.sleep(0))
         skip = _ROLLOUT_PIPELINE.ready_batches >= 1
     result = [skip]
