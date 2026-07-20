@@ -75,19 +75,10 @@ class GatedDeltaNet(_GDNBase):
         """
         Perform a forward pass through the GDN module.
 
-        Args:
-            hidden_states (torch.Tensor): Hidden states.
-            attention_mask (torch.Tensor): Attention mask.
-            inference_context (Optional[BaseInferenceContext]): Inference context that manages
-                KV cache.
-            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
-            sequence_len_offset (Optional[int]): Sequence length offset used for
-                inference CUDA graphs.
-
         Return:
             (tuple[torch.Tensor, torch.Tensor]) GDN output and bias.
-
         """
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         seq_len, batch, _ = hidden_states.shape

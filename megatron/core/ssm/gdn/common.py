@@ -73,12 +73,6 @@ class _GDNBase(MegatronModule):
     Hosts everything the GDN variants share: the fused input projection, causal
     convolution on q/k/v, the CP all-to-all plumbing, the kernel-input preparation
     skeleton, the gated output norm + projection, and sharded checkpointing.
-
-    Concrete variants implement `_setup_variant_attrs` (in_proj sizing, split tables,
-    gate parameter dims, and kernel selection) and `forward` (so each variant can apply
-    its own gating math and optimizations, composing the shared helpers on this class).
-
-    The layer takes input with size [s, b, h] and returns output of the same size.
     """
 
     dt_bias_dim: int
@@ -95,11 +89,11 @@ class _GDNBase(MegatronModule):
         layer_number: int = None,
         bias: bool = False,
         conv_bias: bool = False,
-        conv_init: Optional[float] = None,
+        conv_init: float | None = None,
         use_qk_l2norm: bool = True,
         A_init_range: tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
-        cp_comm_type: Optional[str] = None,
+        cp_comm_type: str | None = None,
         name: str | None = None,
     ):
         """

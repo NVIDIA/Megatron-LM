@@ -2,21 +2,16 @@
 
 import copy
 import os
-from unittest import mock
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdn import GatedDeltaNet
 from megatron.core.ssm.gdn.common import (
@@ -27,16 +22,6 @@ from megatron.core.ssm.gdn.common import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import unwrap_model
-from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
-from megatron.training.training import get_model
-from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
-    init_basic_mock_args,
-    init_checkpointing_mock_args,
-)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
