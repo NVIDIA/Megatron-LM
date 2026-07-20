@@ -1001,21 +1001,11 @@ _LAYER_RE = re.compile(r"^(.*\.layers)\.(\d+)\.(.+)$")
 
 # Key patterns the reverse converter cannot faithfully invert. Emitting a
 # checkpoint for one of these would silently corrupt it, so fail loudly instead.
-#   - Mamba / Mamba-2 keep their causal conv fused as an ``nn.Parameter``
-#     ``conv1d_weight`` / ``conv1d_bias`` (underscore) alongside a z/x/B/C/dt
-#     ``in_proj`` split this tool does not implement. (GatedDeltaNet instead uses
-#     a dotted ``conv1d.weight`` ``nn.Conv1d`` and a query/key/value/z/beta/alpha
-#     ``in_proj`` split, which IS handled by :func:`_split_gdn_projections`; the
-#     underscore form below never matches the dotted GDN keys.)
-#   - A bare ``.layers.`` with no following index is an already-stacked
-#     multi-layer buffer whose per-layer structure cannot be recovered.
-_UNSUPPORTED_SCOPE_RES = (
-    (
-        re.compile(r"\.(?:conv1d_weight|conv1d_bias)(?:$|\.)"),
-        "Mamba (fused conv1d_weight/conv1d_bias projections)",
-    ),
-    (re.compile(r"\.layers\.(?!\d)"), "an un-indexed stacked-layer buffer"),
-)
+# A bare ``.layers.`` with no following index is an already-stacked multi-layer
+# buffer whose per-layer structure cannot be recovered. (Mamba-2 and GatedDeltaNet
+# fused projections are handled by :func:`_split_mamba_projections` /
+# :func:`_split_gdn_projections`, not fenced.)
+_UNSUPPORTED_SCOPE_RES = ((re.compile(r"\.layers\.(?!\d)"), "an un-indexed stacked-layer buffer"),)
 
 # Persistent buffers that mcore deliberately keeps in fp32 regardless of the
 # training compute dtype (the aux-loss-free load-balancing ``router.expert_bias``;
@@ -1251,6 +1241,14 @@ def _layers_are_homogeneous(keys):
 _GDN_INPROJ_SUFFIX = ".self_attention.in_proj.weight"
 _GDN_CONV_SUFFIXES = (".self_attention.conv1d.weight", ".self_attention.conv1d.bias")
 
+# Mamba-2 mixer fused projections. The classic ``MambaMixer.sharded_state_dict``
+# stores these split (``in_proj`` 5-way, ``conv1d`` 3-way) with the underscore
+# ``conv1d_weight``/``conv1d_bias`` nn.Parameters renamed to dotted ``conv1d.weight``/
+# ``conv1d.bias`` on disk; the fsdp_dtensor source stores them fused.
+_MAMBA_INPROJ_SUFFIX = ".mixer.in_proj.weight"
+_MAMBA_CONV_RE = re.compile(r"^(.*\.mixer\.)(conv1d_weight|conv1d_bias)$")
+_MAMBA_CONV_RENAME = {"conv1d_weight": "conv1d.weight", "conv1d_bias": "conv1d.bias"}
+
 
 def _split_gdn_projections(tensors, args):
     """Split fused GatedDeltaNet ``in_proj``/``conv1d`` into named factory sub-keys.
@@ -1297,6 +1295,67 @@ def _split_gdn_projections(tensors, args):
         start = 0
         for size, name in zip(sections, names):
             out[f"{key}.{name}"] = value.narrow(dim, start, size).contiguous()
+            start += size
+        n_split += 1
+    return out, n_split
+
+
+def _split_mamba_projections(tensors, args):
+    """Split fused Mamba-2 ``in_proj``/``conv1d`` into named factory sub-keys.
+
+    Mirrors ``MambaMixer.sharded_state_dict`` (megatron/core/ssm/mamba_mixer.py):
+    ``mixer.in_proj.weight`` splits dim-0 into ``[d_inner, d_inner, gds, gds, nheads]``
+    named ``z,x,B,C,dt``; the fused ``mixer.conv1d_weight``/``conv1d_bias`` are renamed
+    to the on-disk ``mixer.conv1d.weight``/``conv1d.bias`` and split into
+    ``[d_inner, gds, gds]`` named ``x,B,C`` (``gds = mamba_num_groups *
+    mamba_state_dim``). ``d_inner`` is recovered from each tensor's fused width, so
+    the split needs only the group/state dims and the head dim from the checkpoint
+    ``args`` — not the (optional) head count. ``A_log``/``D``/``dt_bias``/``norm``/
+    ``out_proj`` pass through. Applies to model weights and their ``optimizer.state.*``
+    counterparts. No-op unless the checkpoint carries Mamba mixer keys.
+    """
+    has_mamba = any(k.endswith(_MAMBA_INPROJ_SUFFIX) or _MAMBA_CONV_RE.match(k) for k in tensors)
+    if not has_mamba:
+        return tensors, 0
+    if args is None or getattr(args, "mamba_state_dim", None) is None:
+        raise NotImplementedError(
+            "Mamba mixer keys found but the checkpoint args lack the Mamba config "
+            "(mamba_state_dim / mamba_num_groups / mamba_head_dim) needed to split them."
+        )
+    gds = args.mamba_num_groups * args.mamba_state_dim
+    headdim = args.mamba_head_dim
+
+    out = {}
+    n_split = 0
+    for key, value in tensors.items():
+        is_inproj = key.endswith(_MAMBA_INPROJ_SUFFIX)
+        conv_m = _MAMBA_CONV_RE.match(key)
+        if not is_inproj and conv_m is None:
+            out[key] = value
+            continue
+        # Per-layer keys carry an explicit ``.layers.{idx}.`` (interleaved hybrid) and
+        # split dim 0; a stacked homogeneous block carries a leading num-layers axis.
+        dim = 0 if re.search(r"\.layers\.\d+\.", key) else 1
+        width = value.shape[dim]
+        if is_inproj:
+            # width = 2*d_inner + 2*gds + nheads, with nheads = d_inner / headdim.
+            d_inner = headdim * (width - 2 * gds) // (2 * headdim + 1)
+            nheads = d_inner // headdim
+            sections = [d_inner, d_inner, gds, gds, nheads]
+            names = ["z", "x", "B", "C", "dt"]
+            out_key = key
+        else:
+            d_inner = width - 2 * gds  # conv width = d_inner + 2*gds
+            sections = [d_inner, gds, gds]
+            names = ["x", "B", "C"]
+            out_key = conv_m.group(1) + _MAMBA_CONV_RENAME[conv_m.group(2)]
+        assert d_inner > 0 and sum(sections) == width, (
+            f"Mamba split for '{key}': derived sections {sections} (sum {sum(sections)}) "
+            f"!= dim {dim} size {width} — args/checkpoint mismatch?"
+        )
+        start = 0
+        for size, name in zip(sections, names):
+            out[f"{out_key}.{name}"] = value.narrow(dim, start, size).contiguous()
             start += size
         n_split += 1
     return out, n_split
@@ -1393,6 +1452,53 @@ def _model_param_dtype(args):
     return torch.float32
 
 
+def _output_group_id(fqn, do_stack):
+    """Reduce a bare param FQN to the identity of the output tensor it feeds.
+
+    Keys that must be transformed together (SwiGLU ``_w``/``_v`` halves, the
+    experts of one layer, the layers of one param when stacking, and a param plus
+    its ``optimizer.state.*`` subkeys) all reduce to the same group id, so sharding
+    by group keeps every transform group whole on a single rank. Over-grouping is
+    safe (only balance suffers); splitting a real group would corrupt the output.
+    """
+    g = re.sub(r"((?:weight|bias)\d*)_[wv](?=$|\.)", r"\1", fqn)  # SwiGLU _w/_v tag
+    g = re.sub(r"(\.mlp\.experts\.linear_fc[12]\.(?:weight|bias))\d+$", r"\1", g)  # grouped expert idx
+    g = re.sub(r"\.local_experts\.\d+\.", ".experts.", g)  # SequentialMLP expert idx
+    if do_stack:
+        g = re.sub(r"(\.layers)\.\d+(\.)", r"\1\2", g)  # homogeneous per-layer -> stacked
+    return g
+
+
+def _assign_tensor_keys_to_rank(
+    md_items, input_prefix, include_optimizer, do_stack, rank, world_size
+):
+    """Return the set of fsdp tensor keys this rank owns for a sharded convert.
+
+    Tensor items are partitioned by :func:`_output_group_id` and assigned to ranks
+    round-robin over the sorted group list (deterministic across ranks). ``_extra_state``
+    / RNG / rerun keys are skipped (never written). ``world_size == 1`` returns every key.
+    """
+    key_group = {}
+    for key, md in md_items.items():
+        if not isinstance(md, TensorStorageMetadata) or "_extra_state" in key:
+            continue
+        if key.startswith("rng_state") or key.startswith("rerun_state_machine"):
+            continue
+        bare = _strip_fsdp_model_prefix(key, input_prefix)
+        if bare is not None:
+            fqn = bare
+        elif key.startswith("optimizer.state."):
+            if not include_optimizer:
+                continue
+            rev = _reverse_optimizer_state_key(key)  # optimizer.state.<subkey>.<fqn>
+            fqn = rev.split(".", 3)[3] if rev.count(".") >= 3 else rev
+        else:
+            fqn = "__misc__"
+        key_group[key] = _output_group_id(fqn, do_stack)
+    group_to_rank = {g: i % world_size for i, g in enumerate(sorted(set(key_group.values())))}
+    return {key for key, group in key_group.items() if group_to_rank[group] == rank}
+
+
 def _ensure_cpu_process_group():
     """Initialize a 1-rank gloo group if none is up (reverse path is CPU-only)."""
     if dist.is_initialized():
@@ -1432,14 +1538,39 @@ def reverse_convert_checkpoint(
         output_model_weight_prefix: prefix to write for model weights (bare "").
     """
     _ensure_cpu_process_group()
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
 
     # ---- 1. Load the fsdp store into fully-gathered CPU tensors ----------
+    # Under a multi-rank launch the tensor items are sharded across ranks by
+    # output-group (:func:`_assign_tensor_keys_to_rank`) so peak host RAM scales
+    # ~1/world_size; the collective save below reassembles one torch_dist store.
+    # Byte items (args / param_groups / ...) are small and loaded on every rank so
+    # each has the ``args`` the transforms need. world_size == 1 loads everything.
     reader = FileSystemReader(input_dir)
     metadata = reader.read_metadata()
+    md_items = metadata.state_dict_metadata
+
+    # Layer stacking is a global property of the model keys; compute it from the
+    # full key set so sharded ranks agree (never from a rank's partial subset).
+    global_model_keys = []
+    for k, md in md_items.items():
+        if isinstance(md, TensorStorageMetadata) and "_extra_state" not in k:
+            bare = _strip_fsdp_model_prefix(k, input_model_weight_prefix)
+            if bare is not None:
+                global_model_keys.append(bare)
+    do_stack = (
+        stack_layers if stack_layers is not None else _layers_are_homogeneous(global_model_keys)
+    )
+
+    owned = _assign_tensor_keys_to_rank(
+        md_items, input_model_weight_prefix, include_optimizer, do_stack, rank, world_size
+    )
     load_dict = {}
-    for key, md in metadata.state_dict_metadata.items():
+    for key, md in md_items.items():
         if isinstance(md, TensorStorageMetadata):
-            load_dict[key] = torch.empty(md.size, dtype=md.properties.dtype, device="cpu")
+            if key in owned:
+                load_dict[key] = torch.empty(md.size, dtype=md.properties.dtype, device="cpu")
         elif isinstance(md, BytesStorageMetadata):
             load_dict[key] = io.BytesIO()
         else:
@@ -1447,7 +1578,10 @@ def reverse_convert_checkpoint(
 
     start_time = time.time()
     dcp.load(load_dict, storage_reader=reader, planner=DefaultLoadPlanner())
-    rank0_echo(f"[Load] Loaded fsdp_dtensor store in {time.time() - start_time:.2f}s.")
+    rank0_echo(
+        f"[Load] Loaded fsdp_dtensor store in {time.time() - start_time:.2f}s "
+        f"(rank {rank}/{world_size}, {len(load_dict)} items)."
+    )
 
     # ---- 2. Classify keys into model / optimizer tensors and common state -
     # DCP restores tensor items as ``torch.Tensor`` and byte items as their
@@ -1530,21 +1664,22 @@ def reverse_convert_checkpoint(
     tensors, n_swiglu = _merge_swiglu(tensors, swiglu_modules)
     tensors, n_experts = _restack_experts(tensors)
 
-    model_keys = [k for k in tensors if not k.startswith("optimizer.")]
-    do_stack = stack_layers if stack_layers is not None else _layers_are_homogeneous(model_keys)
+    # ``do_stack`` was decided globally at load time (a per-rank subset must not
+    # re-derive homogeneity from its partial key set).
     if do_stack:
         tensors, n_layers = _stack_layers(tensors)
     else:
         n_layers = 0
 
-    # Gated-DeltaNet fused-projection split (in_proj/conv1d -> named sub-keys).
-    # Runs after stacking so the per-layer/stacked dim is unambiguous.
+    # Gated-DeltaNet and Mamba-2 fused-projection splits (in_proj/conv1d -> named
+    # sub-keys). Run after stacking so the per-layer/stacked dim is unambiguous.
     tensors, n_gdn = _split_gdn_projections(tensors, common_flat.get("args"))
+    tensors, n_mamba = _split_mamba_projections(tensors, common_flat.get("args"))
 
     rank0_echo(
         f"[Convert] mtp={n_mtp} swiglu={n_swiglu} experts={n_experts} "
-        f"layer-stacks={n_layers} gdn-splits={n_gdn} masters={n_masters} "
-        f"extra_state-dropped={n_skipped_extra_state} "
+        f"layer-stacks={n_layers} gdn-splits={n_gdn} mamba-splits={n_mamba} "
+        f"masters={n_masters} extra_state-dropped={n_skipped_extra_state} "
         f"layout={'stacked' if do_stack else 'per-layer'}"
     )
 

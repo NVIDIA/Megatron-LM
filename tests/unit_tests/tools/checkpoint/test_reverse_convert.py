@@ -11,6 +11,7 @@ rename, homogeneity detection, and common-state unflattening.
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,11 +27,13 @@ from checkpoint_inspector import (  # noqa: E402  (import after sys.path tweak)
     _layers_are_homogeneous,
     _merge_swiglu,
     _model_param_dtype,
+    _output_group_id,
     _rebuild_param_groups_from_meta,
     _restack_experts,
     _reverse_mtp_keys,
     _reverse_optimizer_state_key,
     _split_gdn_projections,
+    _split_mamba_projections,
     _stack_layers,
     _strip_fsdp_model_prefix,
     _unflatten,
@@ -467,31 +470,21 @@ class TestModelParamDtype:
 class TestSupportedScope:
     """The scope fence raises on architectures the converter cannot invert."""
 
-    def test_mamba_fused_conv1d_weight_raises(self):
-        with pytest.raises(NotImplementedError, match="Mamba"):
-            _assert_supported_scope({"decoder.layers.0.mixer.conv1d_weight": None})
-
-    def test_mamba_fused_conv1d_bias_raises(self):
-        with pytest.raises(NotImplementedError, match="Mamba"):
-            _assert_supported_scope({"decoder.layers.0.mixer.conv1d_bias": None})
-
-    def test_mamba_key_in_optimizer_state_raises(self):
-        with pytest.raises(NotImplementedError, match="Mamba"):
-            _assert_supported_scope(
-                {"optimizer.state.exp_avg.decoder.layers.0.mixer.conv1d_weight": None}
-            )
-
     def test_unindexed_stacked_layer_buffer_raises(self):
         with pytest.raises(NotImplementedError, match="un-indexed"):
             _assert_supported_scope({"decoder.layers.norm.weight": None})
 
-    def test_gdn_dotted_conv1d_is_supported(self):
-        # GatedDeltaNet's nn.Conv1d ``conv1d.weight`` is handled by the GDN split,
-        # so it must NOT trip the Mamba fence.
+    def test_mamba_and_gdn_conv1d_are_not_fenced(self):
+        # Mamba's fused ``mixer.conv1d_weight`` and GatedDeltaNet's dotted
+        # ``self_attention.conv1d.weight`` are both handled by dedicated splits,
+        # so neither may trip the fence.
         _assert_supported_scope(
             {
+                "decoder.layers.0.mixer.conv1d_weight": None,
+                "decoder.layers.0.mixer.conv1d_bias": None,
+                "decoder.layers.0.mixer.in_proj.weight": None,
                 "decoder.layers.0.self_attention.conv1d.weight": None,
-                "decoder.layers.0.self_attention.conv1d.bias": None,
+                "optimizer.state.exp_avg.decoder.layers.0.mixer.conv1d_weight": None,
             }
         )
 
@@ -522,3 +515,100 @@ class TestKeepFp32Keys:
     def test_substring_expert_bias_not_falsely_matched(self):
         # only a whole trailing ``.expert_bias`` segment matches, not a substring.
         assert not _is_keep_fp32_key("decoder.layers.0.mlp.router.expert_bias_extra")
+
+
+class TestSplitMambaProjections:
+    """Reverse split of fused Mamba-2 in_proj/conv1d into named factory sub-keys."""
+
+    # d_state=16, ngroups=2, head_dim=8 -> nheads=4, d_inner=32, gds=32.
+    # in_proj width = 2*32 + 2*32 + 4 = 132 ; conv width = 32 + 2*32 = 96.
+    ARGS = SimpleNamespace(mamba_state_dim=16, mamba_num_groups=2, mamba_head_dim=8)
+
+    def test_in_proj_split_names_sizes_and_reproduce(self):
+        blob = torch.randn(132, 24)
+        out, n = _split_mamba_projections({"decoder.layers.0.mixer.in_proj.weight": blob}, self.ARGS)
+        assert n == 1
+        base = "decoder.layers.0.mixer.in_proj.weight"
+        names = ("z", "x", "B", "C", "dt")
+        assert set(out) == {f"{base}.{s}" for s in names}
+        assert [out[f"{base}.{s}"].shape[0] for s in names] == [32, 32, 32, 32, 4]
+        # concatenation reproduces the original fused blob (order z,x,B,C,dt)
+        assert torch.equal(torch.cat([out[f"{base}.{s}"] for s in names], dim=0), blob)
+
+    def test_conv1d_weight_renamed_and_split(self):
+        out, n = _split_mamba_projections(
+            {"decoder.layers.1.mixer.conv1d_weight": torch.randn(96, 1, 4)}, self.ARGS
+        )
+        assert n == 1
+        # conv1d_weight -> conv1d.weight (dotted on-disk key), split x/B/C.
+        base = "decoder.layers.1.mixer.conv1d.weight"
+        assert set(out) == {f"{base}.{s}" for s in ("x", "B", "C")}
+        assert [out[f"{base}.{s}"].shape[0] for s in ("x", "B", "C")] == [32, 32, 32]
+
+    def test_conv1d_bias_renamed_and_split(self):
+        out, n = _split_mamba_projections(
+            {"decoder.layers.0.mixer.conv1d_bias": torch.randn(96)}, self.ARGS
+        )
+        assert n == 1
+        assert set(out) == {f"decoder.layers.0.mixer.conv1d.bias.{s}" for s in ("x", "B", "C")}
+
+    def test_optimizer_state_split(self):
+        key = "optimizer.state.exp_avg.decoder.layers.0.mixer.in_proj.weight"
+        out, n = _split_mamba_projections({key: torch.randn(132, 24)}, self.ARGS)
+        assert n == 1
+        assert f"{key}.dt" in out and out[f"{key}.dt"].shape[0] == 4
+
+    def test_stacked_block_splits_second_dim(self):
+        # Homogeneous all-Mamba block: leading num-layers axis, split dim 1.
+        out, n = _split_mamba_projections(
+            {"decoder.layers.mixer.in_proj.weight": torch.randn(3, 132, 24)}, self.ARGS
+        )
+        assert n == 1
+        assert out["decoder.layers.mixer.in_proj.weight.z"].shape == (3, 32, 24)
+
+    def test_passthrough_and_noop_keys_untouched(self):
+        src = {
+            "decoder.layers.0.mixer.A_log": torch.randn(4),
+            "decoder.layers.0.mixer.out_proj.weight": torch.randn(24, 32),
+            "decoder.layers.0.mlp.linear_fc1.weight": torch.randn(8, 8),
+        }
+        out, n = _split_mamba_projections(dict(src), self.ARGS)
+        assert n == 0 and set(out) == set(src)
+
+    def test_missing_args_raises(self):
+        with pytest.raises(NotImplementedError, match="Mamba"):
+            _split_mamba_projections(
+                {"decoder.layers.0.mixer.in_proj.weight": torch.randn(132, 8)}, None
+            )
+
+
+class TestOutputGroupId:
+    """Sharded-convert grouping: keys of one transform group share a group id."""
+
+    def test_swiglu_halves_share_group(self):
+        w = "decoder.layers.0.mlp.linear_fc1.weight_w"
+        v = "decoder.layers.0.mlp.linear_fc1.weight_v"
+        assert _output_group_id(w, False) == _output_group_id(v, False)
+
+    def test_grouped_experts_share_group(self):
+        g0 = "decoder.layers.0.mlp.experts.linear_fc1.weight0"
+        g3 = "decoder.layers.0.mlp.experts.linear_fc1.weight3"
+        assert _output_group_id(g0, False) == _output_group_id(g3, False)
+
+    def test_sequential_experts_share_group(self):
+        e0 = "decoder.layers.0.mlp.experts.local_experts.0.linear_fc1.weight"
+        e5 = "decoder.layers.0.mlp.experts.local_experts.5.linear_fc1.weight"
+        assert _output_group_id(e0, False) == _output_group_id(e5, False)
+
+    def test_layer_index_grouped_only_when_stacking(self):
+        l0 = "decoder.layers.0.mlp.linear_fc1.weight"
+        l1 = "decoder.layers.1.mlp.linear_fc1.weight"
+        # homogeneous/stacked -> all layers of a param share a group (co-resident to stack)
+        assert _output_group_id(l0, True) == _output_group_id(l1, True)
+        # per-layer -> each layer is its own group (finer sharding)
+        assert _output_group_id(l0, False) != _output_group_id(l1, False)
+
+    def test_distinct_params_distinct_groups(self):
+        a = "decoder.layers.0.self_attention.linear_qkv.weight"
+        b = "decoder.layers.0.mlp.linear_fc2.weight"
+        assert _output_group_id(a, True) != _output_group_id(b, True)
