@@ -62,7 +62,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import unwrap_model, get_pg_rank
 
 # A pending timing sample awaiting flush(): the two CUDA events bracket one
 # forward (module pre/post hooks) or one backward (two adjacent boundary markers,
@@ -553,15 +553,31 @@ def per_layer_profiling_start_step(model, should_profile):
         plp.start_step(should_profile=should_profile)
 
 
-def per_layer_profiling_end_step(model):
+def per_layer_profiling_end_step(model, should_flush: bool = False):
     """End per-layer profiling for this step (call after backward)."""
     if len(model) != 1:
         return
     _model = unwrap_model(model[0])
     _dec = getattr(_model, "decoder", None)
     plp = getattr(_dec, "per_layer_profiler", None) if _dec is not None else None
-    if plp is not None:
-        plp.end_step()
+    if plp is None:
+        return
+    plp.end_step()
+    if not should_flush:
+        return
+
+    # Flush and log per-layer profiling.
+    from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+    plp.flush()
+    layer_offset = get_transformer_layer_offset(
+        _dec.config, _dec.vp_stage, get_pg_rank(_dec.pg_collection.pp)
+    )
+    is_log_rank = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    log_per_layer_resource_usage(plp, layer_offset=layer_offset, is_log_rank=is_log_rank)
+    plp.reset()
 
 
 def per_layer_profiling_final_report(model, group=None):

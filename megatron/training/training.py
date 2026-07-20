@@ -153,7 +153,6 @@ from megatron.core.transformer.per_layer_profiling import (
     per_layer_profiling_start_step,
     per_layer_profiling_end_step,
     per_layer_profiling_final_report,
-    log_per_layer_resource_usage,
 )
 
 # Local.
@@ -2373,7 +2372,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             pg_collection=pg_collection,
         )
         if args.log_per_layer_profiling:
-            per_layer_profiling_end_step(model)
+            per_layer_profiling_end_step(model, _should)
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -3891,27 +3890,6 @@ def train(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
-
-        # Per-layer profiling.
-        if args.log_per_layer_profiling and args.log_memory_interval is not None \
-                and iteration % args.log_memory_interval == 0 and len(model) == 1:
-            from megatron.core.transformer.transformer_layer import (
-                get_transformer_layer_offset,
-            )
-            _model = unwrap_model(model[0])
-            _dec = getattr(_model, "decoder", None)
-            _plp = getattr(_dec, "per_layer_profiler", None) if _dec is not None else None
-            if _plp is not None:
-                _plp.flush()
-                log_per_layer_resource_usage(
-                    _plp,
-                    layer_offset=get_transformer_layer_offset(
-                        _dec.config, _dec.vp_stage, get_pg_rank(_dec.pg_collection.pp)
-                    ),
-                    is_log_rank=(torch.distributed.get_rank() == 0),
-                )
-                _plp.reset()
-
         is_first_iteration = False
 
         # Evaluation.
