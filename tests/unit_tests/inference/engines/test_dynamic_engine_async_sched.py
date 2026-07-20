@@ -42,7 +42,9 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
     [
         ({"async_sched_mode": AsyncScheduleMode.LEGACY, "num_speculative_tokens": 1}, False),
         ({}, False),
+        ({"async_sched_mode": AsyncScheduleMode.OVERLAP}, False),
         ({"num_speculative_tokens": 1}, True),
+        ({"async_sched_mode": AsyncScheduleMode.OVERLAP, "num_speculative_tokens": 1}, True),
         ({"context_is_hybrid_model": True}, True),
         ({"context_enable_prefix_caching": True}, True),
         ({"materialize_only_last_token_logits": False}, True),
@@ -67,7 +69,9 @@ def test_validate_async_sched_support_for_config(overrides, should_raise):
     [
         (AsyncScheduleMode.LEGACY, SamplingParams(top_k=0, top_p=0.5), False),
         (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0), False),
+        (AsyncScheduleMode.OVERLAP, SamplingParams(top_k=1, top_p=0.0), False),
         (AsyncScheduleMode.SERIAL, SamplingParams(top_k=0, top_p=0.0), True),
+        (AsyncScheduleMode.OVERLAP, SamplingParams(top_k=0, top_p=0.0), True),
         (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.5), True),
         (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0, return_log_probs=True), True),
         (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0, top_n_logprobs=1), True),
