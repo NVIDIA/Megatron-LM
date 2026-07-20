@@ -792,6 +792,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             min_prompt_length=512,
             max_prompt_length=512,
             num_tokens_to_generate=2,
+            max_sequence_length=770,
             context_max_tokens=900,
         )
         env = self._build_test_env(test_config)
@@ -884,9 +885,111 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         env.engine._add_request(request)
 
-        # Clamped to the remaining budget, not rejected.
+        # Clamped to the remaining budget, not rejected. max_sequence_length
+        # fits in one KV block here, so no dummy-block reserve applies.
         assert request.status != Status.FAILED
         assert request.sampling_params.num_tokens_to_generate == remaining_tokens
+
+        # When the sequence spans more than one KV block, the budget holds back the
+        # last max_sequence_length-implied block: floor((268 - 1) / 256) * 256 = 256.
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=4,
+            max_sequence_length=8 + 4 + 256,
+        )
+        env = self._build_test_env(test_config)
+        request = env.requests[0]
+        request.sampling_params.num_tokens_to_generate = 1000
+
+        env.engine._add_request(request)
+
+        assert request.status != Status.FAILED
+        assert request.sampling_params.num_tokens_to_generate == 256 - 8
+
+        # A prompt inside the held-back window is admitted as scoring-only.
+        scoring_request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.randint(
+                0, test_config.vocab_size - 1, (260,), dtype=torch.int64, device='cuda'
+            ),
+            sampling_params=SamplingParams(num_tokens_to_generate=5),
+        )
+        env.engine._add_request(scoring_request)
+        assert scoring_request.status != Status.FAILED
+        assert scoring_request.sampling_params.num_tokens_to_generate == 0
+
+        # A prompt longer than max_sequence_length itself is a hard failure.
+        overlong_request = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=torch.randint(
+                0, test_config.vocab_size - 1, (269,), dtype=torch.int64, device='cuda'
+            ),
+            sampling_params=SamplingParams(num_tokens_to_generate=5),
+        )
+        env.engine._add_request(overlong_request)
+        assert overlong_request.status == Status.FAILED
+
+        # Speculative decoding pre-allocates the next block early; the budget backs off.
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=4,
+            num_speculative_tokens=2,
+            max_sequence_length=8 + 4 + 256,
+        )
+        env = self._build_test_env(test_config)
+        request = env.requests[0]
+        request.sampling_params.num_tokens_to_generate = 1000
+
+        env.engine._add_request(request)
+
+        assert request.status != Status.FAILED
+        assert request.sampling_params.num_tokens_to_generate == 256 - 2 - 8
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_generation_within_tight_kv_pool(self) -> None:
+        """A default-budgeted request completes in a pool sized to exactly
+        ceil(max_sequence_length / block_size) blocks, one of which is the
+        permanently reserved dummy block. Guards against the livelock where a
+        request waits forever on the pool's last (ungrantable) block."""
+        env = self._build_test_env(DynamicEngineTestConfig())
+        block_size_bytes = env.engine.context.block_size_bytes
+
+        # 2-block pool for max_sequence_length = 512: 1 usable + 1 dummy.
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=None,
+            max_sequence_length=512,
+            context_buffer_size_gb=2 * block_size_bytes / 1024**3,
+            context_paused_buffer_size_gb=0.0,
+            context_max_requests=4,
+        )
+        env = self._build_test_env(test_config)
+        request = env.requests[0]
+        request.sampling_params.termination_id = -1  # never terminate early
+        env.engine._add_request(request)
+
+        # Default budget = the one usable block (256) minus the prompt (8).
+        assert request.sampling_params.num_tokens_to_generate == 248
+
+        # An unbudgeted request would pause forever waiting for a second block;
+        # bound the loop so a regression fails instead of hanging.
+        for _ in range(400):
+            self._run_step(env)
+            if not env.engine.has_unfinished_requests():
+                break
+        assert not env.engine.has_unfinished_requests()
+        assert request.status == Status.COMPLETED
+        assert len(request.output) == 248
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1752,6 +1855,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=prompt_len + 1,
+            max_sequence_length=prompt_len + 1 + 256,
             context_max_tokens=prefill_chunk_size,
             context_max_requests=1,
             context_block_size_tokens=256,
@@ -2119,6 +2223,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     min_prompt_length=1200,
                     max_prompt_length=1200,
                     num_tokens_to_generate=8,
+                    max_sequence_length=1200 + 8 + 256,
                     materialize_only_last_token_logits=True,
                     return_log_probs=True,
                     skip_prompt_log_probs=False,
@@ -2137,6 +2242,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             min_prompt_length=prompt_length,
             max_prompt_length=prompt_length,
             num_tokens_to_generate=num_tokens_to_generate,
+            max_sequence_length=prompt_length + num_tokens_to_generate + 256,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             return_log_probs=True,
             skip_prompt_log_probs=skip_prompt_log_probs,
@@ -2779,6 +2885,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=256,
             num_tokens_to_generate=3,
             num_speculative_tokens=2,
+            max_sequence_length=256 + 3 + 2 + 256,
             context_block_size_tokens=256,  # Exactly matches prompt length
             context_max_requests=16,
             model_provider="gpt",
