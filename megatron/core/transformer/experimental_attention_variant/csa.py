@@ -1651,9 +1651,14 @@ class CompressedSparseAttention(MegatronModule):
 
                 n_valid_per_pos = positions // self.compress_ratio  # [sq, 1]
                 valid = topk_indices_compressed < n_valid_per_pos
-                compress_topk_idxs = torch.where(
-                    valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
-                )
+                # Pass the sentinel as a Python scalar instead of re-creating a
+                # device tensor on every forward step: ``torch.tensor(-1,
+                # device=x.device)`` issues a synchronizing host->device copy on
+                # each call of this hot path. ``torch.where``'s scalar overload
+                # (already used elsewhere in this file) is bitwise-identical
+                # (same int64 dtype and values) and keeps the original single
+                # select kernel -- no host->device copy and no extra passes.
+                compress_topk_idxs = torch.where(valid, topk_indices_compressed + offset, -1)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
                     self.compress_ratio, b, sq, offset, query.device
