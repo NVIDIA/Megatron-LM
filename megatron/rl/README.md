@@ -39,9 +39,11 @@ Below we describe the different conceptual components and how they divide respon
 
 ## Off-Policy Generation
 
-Pure on-policy RL runs rollout generation and training sequentially: each training step has to wait for fresh rollouts from the current policy, and then the inference engine sits idle while training runs. This wastes hardware.
+Pure on-policy RL runs rollout generation and training sequentially: each training step has to wait for fresh rollouts from the current policy. This significantly underutilizes hardware.
 
-Off-policy generation overlaps the two. While training is busy with step *N*, the inference engine keeps generating rollouts that will be consumed by steps *N+1*, *N+2*, … The rollouts come from slightly older policy weights, so they are *stale* by some amount. We call this the **collection lag**:
+Off-policy generation overlaps the two, whether that's in the time dimension (by switching resources between training and inference), in the space dimension (by dividing resources between training and inferences), or both.
+Note that whether we are overlapping in the time dimension (like Python's asyncio) or the space dimension (like Python's threading), the core behavior is almost the same.
+While training is busy with step *N*, the inference engine keeps generating rollouts that will be consumed by steps *N+1*, *N+2*, … The rollouts come from slightly older policy weights, so they are *stale* by some amount. We call this the **collection lag**:
 
 > A lag of *L* means the rollouts consumed by the current training step were generated *L* training steps earlier, i.e. by a policy that is *L* updates behind the one we're training now.
 
