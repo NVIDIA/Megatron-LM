@@ -18,27 +18,30 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import (
+    get_context_parallel_layout_chunk_indices,
+    get_thd_context_parallel_rank_indices,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank):
-    """Zigzag-split *tensor* along *seq_dim* for context parallelism (BSHD).
+def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank, cp_partition_mode="zigzag"):
+    """Split *tensor* along *seq_dim* for context parallelism (BSHD).
 
     Splits the sequence into ``2 * cp_size`` equal chunks, then selects
-    chunks ``[cp_rank, 2*cp_size - cp_rank - 1]`` and concatenates them.
-    This mirrors ``megatron.core.utils.get_batch_on_this_cp_rank``.
+    the two chunks owned by this CP rank in the requested partition mode.
     """
     S = tensor.shape[seq_dim]
     assert S % (2 * cp_size) == 0, f"seq_len {S} not divisible by 2*cp_size={2 * cp_size}"
     tensor = tensor.view(
         *tensor.shape[:seq_dim], 2 * cp_size, S // (2 * cp_size), *tensor.shape[seq_dim + 1 :]
     )
-    index = torch.zeros(2, dtype=torch.int64, device=tensor.device)
-    index[0] = cp_rank
-    index[1] = 2 * cp_size - cp_rank - 1
+    index = get_context_parallel_layout_chunk_indices(
+        cp_size, cp_rank, cp_partition_mode
+    ).to(device=tensor.device)
     tensor = tensor.index_select(seq_dim, index)
     tensor = tensor.view(*tensor.shape[:seq_dim], -1, *tensor.shape[seq_dim + 2 :])
     return tensor
@@ -210,9 +213,8 @@ class MultimodalModel(MegatronModule):
         partitions per-sample via ``tex.thd_get_partitioned_indices`` so
         chunks line up with ``cu_seqlens_q_padded`` boundaries.
         ``position_ids`` and ``attention_mask`` are NOT split in THD —
-        MRoPE returns full freqs and TE attention's
-        ``_apply_rotary_pos_emb_thd`` does the per-sample CP zigzag
-        itself via ``_get_thd_freqs_on_this_cp_rank``.
+        MRoPE returns full freqs and THD RoPE maps local CP tokens back
+        to their global per-sample frequency positions.
         """
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
@@ -221,13 +223,21 @@ class MultimodalModel(MegatronModule):
                 attention_mask, position_ids, padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
+        cp_partition_mode = (
+            self.language_model.get_input_cp_partition_mode()
+            if self.language_model is not None
+            and hasattr(self.language_model, "get_input_cp_partition_mode")
+            else "zigzag"
+        )
 
         if packed_seq_params is not None:
-            total_tokens = (
-                decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
+            cu_seqlens = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
             )
-            idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
+            idx = get_thd_context_parallel_rank_indices(
+                cu_seqlens, cp_size, cp_rank, cp_partition_mode
             )
             if decoder_input is not None:
                 decoder_input = decoder_input.index_select(0, idx)
@@ -245,7 +255,13 @@ class MultimodalModel(MegatronModule):
                 return (
                     None
                     if t is None
-                    else _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
+                    else _cp_split_tensor(
+                        t,
+                        seq_dim=seq_dim,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                        cp_partition_mode=cp_partition_mode,
+                    )
                 )
 
             decoder_input = _split(decoder_input, 0)

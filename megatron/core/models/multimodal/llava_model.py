@@ -11,6 +11,9 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    get_hybrid_stage_input_cp_partition_mode_for_stage,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.multimodal.context_parallel import (
     gather_from_context_parallel_ranks_dynamic_res,
@@ -223,6 +226,20 @@ class LLaVAModel(MegatronModule):
             if language_model_type.startswith('nemotron5-hybrid') or language_model_type.startswith(
                 'nemotron6-moe'
             ):
+                cp_stage_entry_partition_mode = (
+                    get_hybrid_stage_input_cp_partition_mode_for_stage(
+                        language_transformer_config,
+                        hybrid_layer_pattern,
+                        getattr(self.pg_collection, "pp", None),
+                        self.vp_stage,
+                        first_stage_layers=(
+                            language_transformer_config.num_layers_in_first_pipeline_stage
+                        ),
+                        last_stage_layers=(
+                            language_transformer_config.num_layers_in_last_pipeline_stage
+                        ),
+                    )
+                )
                 self.language_model = HybridModel(
                     config=language_transformer_config,
                     hybrid_stack_spec=language_transformer_layer_spec,
@@ -239,6 +256,7 @@ class LLaVAModel(MegatronModule):
                     scatter_embedding_sequence_parallel=False,
                     share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                     pg_collection=self.pg_collection,
+                    cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
                 )
             else:
                 self.language_model = GPTModel(
