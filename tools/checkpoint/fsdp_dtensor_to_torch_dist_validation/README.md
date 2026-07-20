@@ -120,9 +120,11 @@ reassembly, the TP-reshard `nd_reformulated_orig_global_shape` path, the
 — none of which a single-rank source produces. This is what makes
 "parallelism-agnostic" a *tested* property rather than an assumption.
 
-**Status:** `dense`/`DP2` validated (LR exact, `lm loss` within bf16 tol at iters
-61/81). The `TP2`/`PP2`/`EP2` layouts are supported by the driver but not yet run
-end-to-end here.
+**Status (2026-07-20):** `DP2` validated for **all 8 models**; `TP2` (`dense`) and
+`EP2` (`moe_grouped`) validated. `PP2` cannot be validated here — Megatron-FSDP +
+pipeline-parallel *training* fails at model build (`EinopsError`), so no PP2
+checkpoint is produced (a training-side limitation, not a converter issue). See
+**Expected results** for the numbers.
 
 ---
 
@@ -155,22 +157,46 @@ Eight models, each gating a distinct converter transform — all trained through
 
 ## Expected results
 
-Representative resume-continuity numbers from a full six-family run (single-rank,
-one RTX 6000 Ada). Exact losses depend on hardware/kernels; **what matters is
-FSDP ≈ resumed within bf16 tolerance and LR exact**, not the absolute value.
+**Final validation run — 2026-07-20**, single node (mcore dev container; logs
+under `results/_final/`). Losses depend on hardware/kernels; the pass criterion is
+**LR exact and `lm loss` within bf16 tolerance** (FP8 ~1% by design), not the
+absolute value.
 
-| Model | `[Convert]` (key fields) | iter 61 FSDP → resumed | iter 81 FSDP → resumed |
+### Resume continuity + bit-exact (single-rank source)
+
+`lm loss` FSDP → resumed. LR is **exact** at every point (iter 61 `5.710524e-05`,
+iter 81 `2.234264e-05`). "bit-exact (iter 80)" = weights **and** optimizer
+(masters, moments, `param_groups`) match mcore's native re-save; only the
+intentionally-dropped `_extra_state` / `rng_state` / `rerun_state` / `common_state`
+keys differ.
+
+| Model | iter 61 | iter 81 | bit-exact (iter 80) |
 |---|---|---|---|
-| `dense`        | `layout=stacked`                       | 5.787642 → 5.784644 | 4.745402 → 4.744267 |
-| `dense_swiglu` | `swiglu=96 stacked`                    | 6.719251 → 6.717134 | 5.633004 → 5.637542 |
-| `moe_grouped`  | `experts=96 stacked`                   | 5.777692 → 5.778813 | 4.279071 → 4.277475 |
-| `moe_gated`    | `experts=96 stacked`                   | 5.759237 → 5.762474 | 4.225122 → 4.226754 |
-| `mtp`          | `mtp=48 stacked`                       | 3.941385 → 3.941342 | 2.881462 → 2.881354 |
-| `gdn_hybrid`   | `experts=48 gdn-splits=32 per-layer`   | 5.026937 → 5.025422 | 4.086696 → 4.084918 |
+| `dense`        | 5.796581 → 5.793622 | 4.752846 → 4.751805 | ✅ exact |
+| `dense_swiglu` | 6.643600 → 6.642058 | 5.554593 → 5.558852 | ✅ exact |
+| `moe_grouped`  | 5.792314 → 5.795763 | 4.303905 → 4.302549 | ✅ exact |
+| `moe_gated`    | 5.771983 → 5.775371 | 4.246530 → 4.249354 | ✅ exact |
+| `mtp`          | 3.944042 → 3.944121 | 2.887992 → 2.887894 | ✅ exact |
+| `gdn_hybrid`   | 5.027180 → 5.025552 | 4.086754 → 4.085003 | ✅ exact |
+| `moe_mla_mtp`  | 0.632209 → 0.631782 | 0.484988 → 0.485596 | ✅ exact |
+| `dense_fp8`    | 6.695069 → 6.750668 | 5.630019 → 5.699869 | ⚠️ FP8 — 4 weight keys differ |
 
-**FP8 (`dense_fp8`) tracks ~1% looser by design** — the `_extra_state` amax/scale
+**FP8 (`dense_fp8`) is not bit-exact by design** — the `_extra_state` amax/scale
 history is not round-tripped (already discarded in the `fsdp_dtensor` checkpoint),
-so FP8 resume re-initializes amax. Not bit-exact; expected.
+so FP8 resume re-initializes amax and both its `lm loss` (~1%) and 4 weight tensors
+drift. Expected, not a defect.
+
+### Source-side sharding + load-side resharding
+
+| Test | Result |
+|---|---|
+| Source **DP2** (all 8 models) | ✅ pass — LR exact, loss in bf16 tol (FP8 ~1%) |
+| Source **TP2** (`dense`), **EP2** (`moe_grouped`) | ✅ pass |
+| Source **PP2** | ⚠️ **N/A** — Megatron-FSDP + pipeline-parallel *training* fails at model build (`EinopsError`), so no PP2 checkpoint is produced. Training-side, unrelated to the converter. |
+| Reshard **TP2 / PP2 / TP2SP** | ✅ pass — clean load + iter-81 continuity |
+| Reshard **EP2** (`moe_grouped`, `moe_gated`) | ⚠️ **documented limitation** — optimizer state cannot load into EP>1 (`ChainedOptimizer` entry-count mismatch, `Expected 2 entries…got 4`). Resume weights-only under EP>1, or with optimizer at EP=1. |
+
+Logic gate: **60/60** unit tests pass.
 
 ---
 
@@ -215,8 +241,14 @@ drivers generalized to select the training entrypoint and model builder per mode
   extra_state-dropped=… layout={stacked|per-layer}`. Dense/homogeneous models are
   `stacked`; MoE / GDN / MTP interleaved models stay `per-layer`.
 - **`run_all.sh` roll-up** reports whether each stage *ran to completion*, not the
-  numeric verdict — read each model's `VERIFICATION` block (loss + LR) and the
-  bit-exact diff (empty = pass) for the actual pass/fail.
+  numeric verdict — read each model's `VERIFICATION` block (loss + LR) for the
+  resume verdict.
+- **Reading the bit-exact diff:** it is *not* empty — the converter intentionally
+  omits `_extra_state` / `rng_state` / `rerun_state` / `common_state`, which the
+  real re-save re-adds, so those keys always show as "only in checkpoint 2". A
+  clean result = **no `decoder.*` / `embedding.*` / `output_layer.*` weight or
+  `optimizer.state.*` key** appears as missing or "(values differ)". (FP8 is the
+  exception — a few weight tensors legitimately differ.)
 - **GPU contention.** If a GPU is shared, multi-rank (2-GPU) NCCL collectives can
   deadlock (600 s ALLREDUCE timeout). Resume + bit-exact are single-rank and
   immune; the reshard sweep needs a free 2-GPU window.
@@ -227,9 +259,14 @@ drivers generalized to select the training entrypoint and model builder per mode
 
 The automated gate lives in unit tests (CPU/GPU, run by CI):
 - [`test_reverse_convert.py`](../../../tests/unit_tests/tools/checkpoint/test_reverse_convert.py)
-  — pure-logic coverage of every transform.
+  — pure-logic coverage of every transform (**60/60 pass**).
 - [`test_reverse_convert_roundtrip.py`](../../../tests/unit_tests/tools/checkpoint/test_reverse_convert_roundtrip.py)
-  — synthetic `torch_dist → fsdp → torch_dist` identity + a real-model load.
+  — standalone synthetic `torch_dist → fsdp → torch_dist` identity + a real-model
+  load. **Note:** its synthetic archetypes predate two converter changes
+  (all-MoE stacking; fp32-master synthesis), so the `synthetic:dense` / `synthetic:moe`
+  identity checks are currently stale and need refreshing — this is a test-fixture
+  gap, **not** a converter defect (the real-checkpoint bit-exact + resume checks
+  above confirm those exact behaviors).
 
 This harness is the **manual end-to-end GPU proof** on real Megatron-FSDP
 checkpoints that complements those unit tests.
