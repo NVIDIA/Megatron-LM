@@ -290,6 +290,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        _checkpointed_forward_in_parent: bool = False,
     ):
         """
         Forward function of the HybridStack class.
@@ -369,7 +370,11 @@ class HybridStack(MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and not _checkpointed_forward_in_parent
+            ):
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,

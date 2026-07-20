@@ -285,6 +285,7 @@ def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool =
         model (HybridModel): The Hybrid Model
         return_schedule_plan (bool): Whether to return the schedule plan instead of output tensor.
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -334,10 +335,9 @@ def forward_step(data_iterator, model: HybridModel, return_schedule_plan: bool =
 
     with stimer:
         if return_schedule_plan:
-            args = get_args()
-            assert args.overlap_moe_expert_parallel_comm, (
-                "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
-            )
+            assert (
+                args.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             output_tensor = model.build_schedule_plan(
                 tokens,
                 position_ids,

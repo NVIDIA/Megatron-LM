@@ -75,9 +75,10 @@ def checkpointed_forward(
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
+                is_hybrid_group = getattr(layer, "is_layer_group_stack", False)
 
                 # Get appropriate inner quantization context
-                if use_inner_quantization_context:
+                if use_inner_quantization_context and not is_hybrid_group:
                     if self.config.fp8:
                         inner_quantization_context = get_fp8_context(
                             self.config, layer.layer_number - 1
@@ -109,6 +110,11 @@ def checkpointed_forward(
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
+                    elif is_hybrid_group:
+                        for k in ("context", "context_mask", "attention_bias"):
+                            layer_kwargs.pop(k, None)
+                        hidden_states = layer(**layer_kwargs, _checkpointed_forward_in_parent=True)
+                        context = None
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in ("context", "context_mask", "attention_bias", "padding_mask"):
                             layer_kwargs.pop(k, None)
