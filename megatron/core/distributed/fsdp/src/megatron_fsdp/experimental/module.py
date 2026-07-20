@@ -341,7 +341,7 @@ class FsdpModule:
 
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
-                group.reduce_partial_gradients(partial_grad)
+                group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
