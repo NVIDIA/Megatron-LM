@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
@@ -422,8 +423,6 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     elif args.activation_func == "squaredrelu":
-        def squared_relu(x):
-            return torch.pow(F.relu(x), 2)
         kw_args['activation_func'] = squared_relu
     elif args.activation_func == "gelu":
         kw_args['activation_func'] = F.gelu
