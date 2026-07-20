@@ -392,9 +392,9 @@ class DataParallelBuffer:
         Memory allocation always occurs on the caller stream for deterministic
         caching-allocator behaviour.
         """
-        assert self.data is not None, "DataParallelBuffer data not initialized"
         requested_meta = self.buffer_index._get_shard_meta(placements)
         if placements == self.storage_placements:
+            assert self.data is not None, "DataParallelBuffer data not initialized"
             return self.data
 
         data_contains_requested = all(
