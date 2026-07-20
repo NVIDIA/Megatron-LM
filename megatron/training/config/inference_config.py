@@ -136,10 +136,11 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
+    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial", "overlap"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
     existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
-    steps before resolving finished requests."""
+    steps before resolving finished requests. "overlap" uses the same async scheduling path while
+    overlapping prepare/sample and forward/resolve phases."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
