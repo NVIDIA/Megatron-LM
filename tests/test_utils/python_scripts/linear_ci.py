@@ -1,22 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Megatron-LM adapters for nemo-ci-triage's Linear workflow.
+"""Megatron-LM adapters for nemo-ci-triage's failure-reporting workflow.
 
-The triage package owns Linear status, reconciliation, configuration, mutation,
-and Slack follow-up logic, but its NeMo pipeline summarizer is repository-specific.
-This module converts Megatron-LM child-job results into the package's
-``pipeline_summaries.json`` and ``failure_buckets.json`` contracts.
+The triage package owns LLM summarization, Linear reconciliation, and Slack
+follow-up logic. This module only converts Megatron-LM's direct child-pipeline
+jobs into the generic failure records consumed by the package summarizer.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
+
+from nemo_ci_triage.agent import summarize_pipeline_failures as summarizer
 
 LINEAR_MODULE = "megatron_lm"
 _FUNCTIONAL_PREFIX = "functional:run_"
@@ -32,34 +30,54 @@ def _recipe_name(pipeline_name: str, config_name: str) -> str:
     return f"{config_name}@{_variant_name(pipeline_name)}"
 
 
-def _bucket_label(category: str, subtype: str) -> str:
-    """Build a readable, stable label for one exact error fingerprint."""
-    signature = f"{category}\n{subtype}"
-    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:8]
-    slug = re.sub(r"[^a-z0-9]+", "-", category.lower()).strip("-") or "unknown"
-    return f"{slug[:48]}-{digest}"
-
-
 def _job_url(project_url: str, job: dict) -> str:
     return job.get("web_url") or f"{project_url}/-/jobs/{job['id']}"
 
 
 def _failure_record(pipeline_name: str, job: dict, report: dict | None, project_url: str) -> dict:
-    report = report or {}
-    category = report.get("category") or report.get("error_type") or job.get("error_type")
-    category = category or "Unknown"
-    subtype = report.get("error_subtype") or job.get("error_type")
-    subtype = subtype or f"No structured error report was available for {job['config_name']}"
-    rationale = subtype if subtype == category else f"{category}: {subtype}"
+    """Return the raw failure shape accepted by the upstream LLM summarizer."""
     return {
         "test_name": _recipe_name(pipeline_name, job["config_name"]),
         "module": LINEAR_MODULE,
-        "category": category,
-        "summary": rationale,
-        "excerpt": report.get("excerpt"),
+        "report": report,
         "job_url": _job_url(project_url, job),
-        "subtype": subtype,
+        "job_error_type": job.get("error_type"),
     }
+
+
+def _fallback_summary(failure: dict) -> dict:
+    """Preserve a failed test when its per-test LLM summary is unavailable."""
+    report = failure.get("report") or {}
+    category = (
+        report.get("error_type")
+        or report.get("category")
+        or failure.get("job_error_type")
+        or "Unknown"
+    )
+    subtype = report.get("error_subtype") or failure.get("job_error_type")
+    subtype = subtype or (f"No structured error report was available for {failure['test_name']}")
+    summary = subtype if subtype == category else f"{category}: {subtype}"
+    return {
+        "test_name": failure["test_name"],
+        "module": failure["module"],
+        "category": category,
+        "summary": summary,
+        "excerpt": report.get("excerpt"),
+        "job_url": failure["job_url"],
+    }
+
+
+def _summarize_failures(raw_failures: list[dict]) -> list[dict]:
+    """Use upstream LLM summaries, falling back without dropping failures."""
+    with_reports = [failure for failure in raw_failures if failure.get("report")]
+    summarized = summarizer._summarize_failures(
+        with_reports, summarizer._SUMMARIZER_PROMPT.read_text(encoding="utf-8").strip()
+    )
+    by_job = {(failure["test_name"], failure["job_url"]): failure for failure in summarized}
+    return [
+        by_job.get((failure["test_name"], failure["job_url"]), _fallback_summary(failure))
+        for failure in raw_failures
+    ]
 
 
 def build_pipeline_reports(
@@ -78,7 +96,7 @@ def build_pipeline_reports(
     """
     passed: set[str] = set()
     unknown: set[str] = set()
-    failures: list[dict] = []
+    raw_failures: list[dict] = []
     failed_jobs = 0
 
     for pipeline_name, _, jobs in sorted(pipeline_jobs, key=lambda item: item[0]):
@@ -95,36 +113,31 @@ def build_pipeline_reports(
             )
             if status == "failed" or suppressed_failure:
                 failed_jobs += 1
-                failures.append(_failure_record(pipeline_name, job, report, project_url))
+                raw_failures.append(_failure_record(pipeline_name, job, report, project_url))
             elif status == "success" and (not job.get("allow_failure") or report is not None):
                 passed.add(recipe)
             else:
                 unknown.add(recipe)
 
-    failed_recipes = {failure["test_name"] for failure in failures}
+    failed_recipes = {failure["test_name"] for failure in raw_failures}
     passed_tests = sorted(passed - failed_recipes - unknown)
 
-    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for failure in failures:
-        grouped[(failure["category"], failure["subtype"])].append(failure)
-
-    buckets = []
-    for (category, subtype), records in sorted(grouped.items()):
-        tests_by_name = {record["test_name"]: record["job_url"] for record in records}
-        buckets.append(
-            {
-                "label": _bucket_label(category, subtype),
-                "rationale": records[0]["summary"],
-                "category": category,
-                "module": LINEAR_MODULE,
-                "sample_excerpt": next(
-                    (record["excerpt"] for record in records if record.get("excerpt")), None
-                ),
-                "tests": [
-                    {"name": name, "job_url": url} for name, url in sorted(tests_by_name.items())
-                ],
-            }
+    failures = _summarize_failures(raw_failures)
+    buckets, failed_stage = summarizer._subcategorize(failures)
+    bucketing_failed = buckets is None
+    if bucketing_failed:
+        print(
+            f"WARNING: LLM categorizer failed at {failed_stage}; "
+            "Linear reconciliation will skip this report",
+            file=sys.stderr,
         )
+        buckets = []
+    else:
+        summarizer._attach_categories(buckets, failures)
+
+    digest = summarizer._digest(
+        failures, {LINEAR_MODULE: {"passed": len(passed_tests), "failed": failed_jobs}}
+    )
 
     module_stats = {
         "passed": len(passed_tests),
@@ -135,16 +148,14 @@ def build_pipeline_reports(
         "pipeline_id": pipeline_id,
         "scope": scope,
         "modules": {LINEAR_MODULE: module_stats},
-        "digest": (
-            f"Megatron-LM functional CI: {len(passed_tests)} passing recipe variants, "
-            f"{failed_jobs} failed jobs, and {len(unknown)} unknown recipe variants."
-        ),
-        "failures": [
-            {key: value for key, value in failure.items() if key != "subtype"}
-            for failure in failures
-        ],
+        "digest": digest,
+        "failures": failures,
     }
-    failure_buckets = {"pipeline_id": pipeline_id, "bucketing_failed": False, "buckets": buckets}
+    failure_buckets = {
+        "pipeline_id": pipeline_id,
+        "bucketing_failed": bucketing_failed,
+        "buckets": summarizer._denormalize_buckets(buckets, failures),
+    }
     return summaries, failure_buckets
 
 

@@ -1,7 +1,6 @@
 .linear_reconcile_rules:
   rules:
     - if: >-
-        ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") &&
         $FUNCTIONAL_TEST == "yes" &&
         $RUN_LINEAR_STATUS == "True"
       when: always
@@ -62,7 +61,6 @@ triage:linear_write:
       - linear_status_report.json
   rules:
     - if: >-
-        ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") &&
         $FUNCTIONAL_TEST == "yes" &&
         $RUN_LINEAR_STATUS == "True" &&
         $RUN_LINEAR_WRITE == "True"
@@ -87,7 +85,6 @@ triage:slack_linear_followup:
   rules:
     # Post the applied Linear actions under the functional-test notification.
     - if: >-
-        ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") &&
         $FUNCTIONAL_TEST == "yes" &&
         $RUN_LINEAR_STATUS == "True" &&
         $RUN_LINEAR_WRITE == "True"

@@ -12,6 +12,35 @@ from click.testing import CliRunner
 from tests.test_utils.python_scripts import generate_jet_trigger_job, linear_ci, recipe_parser
 
 
+def _mock_llm_reporting(monkeypatch):
+    summarize = Mock(
+        side_effect=lambda failures, _prompt: [
+            linear_ci._fallback_summary(failure) for failure in failures
+        ]
+    )
+
+    def group_failures(failures):
+        grouped = {}
+        for failure in failures:
+            grouped.setdefault((failure["category"], failure["summary"]), []).append(
+                failure["test_name"]
+            )
+        return (
+            [
+                {"label": f"test-bucket-{index}", "rationale": summary, "tests": tests}
+                for index, ((_, summary), tests) in enumerate(grouped.items(), 1)
+            ],
+            None,
+        )
+
+    subcategorize = Mock(side_effect=group_failures)
+    digest = Mock(return_value="LLM pipeline digest")
+    monkeypatch.setattr(linear_ci.summarizer, "_summarize_failures", summarize)
+    monkeypatch.setattr(linear_ci.summarizer, "_subcategorize", subcategorize)
+    monkeypatch.setattr(linear_ci.summarizer, "_digest", digest)
+    return summarize, subcategorize, digest
+
+
 @pytest.fixture
 def notify_module(monkeypatch):
     pytest.importorskip("nemo_ci_triage.slack_notification")
@@ -90,6 +119,44 @@ def test_error_extraction_is_opt_in_for_generated_jobs(
         assert job["artifacts"]["paths"] == ["results/"]
 
 
+def test_notification_rules_cover_all_enabled_test_runs():
+    unit = yaml.safe_load(Path(".gitlab/stages/02.test.yml").read_text())
+    functional = yaml.safe_load(Path(".gitlab/stages/04.functional-tests.yml").read_text())
+    triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
+
+    unit_conditions = [
+        rule["if"] for rule in unit["test:unit_tests_notify"]["rules"] if "if" in rule
+    ]
+    assert unit_conditions == [
+        "$UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && "
+        '$CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"',
+        "$UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'",
+    ]
+
+    smoke_condition = functional["functional:smoke_notify"]["rules"][1]["if"]
+    assert smoke_condition == (
+        '$FUNCTIONAL_TEST == "yes" && ' "$FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/"
+    )
+    assert functional["functional:x_notify"]["rules"][0]["if"] == ('$FUNCTIONAL_TEST == "yes"')
+
+    triage_jobs = (".linear_reconcile_rules", "triage:linear_write", "triage:slack_linear_followup")
+    for job_name in triage_jobs:
+        condition = triage[job_name]["rules"][0]["if"]
+        assert '$FUNCTIONAL_TEST == "yes"' in condition
+        assert "CI_PIPELINE_SOURCE" not in condition
+        assert "CI_COMMIT_BRANCH" not in condition
+
+
+def test_all_generated_test_types_enable_error_extraction():
+    unit = Path(".gitlab/stages/02.test.yml").read_text()
+    integration = Path(".gitlab/stages/03.integration-tests.yml").read_text()
+    functional = Path(".gitlab/stages/04.functional-tests.yml").read_text()
+
+    assert unit.count('"--enable-error-extraction"') >= 1
+    assert integration.count('"--enable-error-extraction"') >= 1
+    assert functional.count('"--enable-error-extraction"') >= 2
+
+
 def test_get_pipeline_jobs_uses_triage_collector(monkeypatch, notify_module):
     notify = notify_module
     bridge = SimpleNamespace(
@@ -113,7 +180,8 @@ def test_get_pipeline_jobs_uses_triage_collector(monkeypatch, notify_module):
     collector.assert_called_once_with(project, 101)
 
 
-def test_build_linear_reports_groups_matching_failures():
+def test_build_linear_reports_groups_matching_failures(monkeypatch):
+    summarize, subcategorize, digest = _mock_llm_reporting(monkeypatch)
     pipeline_jobs = [
         (
             "functional:run_dev_dgx_h100",
@@ -184,9 +252,13 @@ def test_build_linear_reports_groups_matching_failures():
             "job_url": "https://ci.example.com/ADLR/megatron-lm/-/jobs/3",
         },
     ]
+    summarize.assert_called_once()
+    subcategorize.assert_called_once()
+    digest.assert_called_once()
 
 
-def test_allow_failure_without_report_is_not_counted_as_passed():
+def test_allow_failure_without_report_is_not_counted_as_passed(monkeypatch):
+    _mock_llm_reporting(monkeypatch)
     pipeline_jobs = [
         (
             "functional:run_dev_dgx_h100",
@@ -217,7 +289,8 @@ def test_allow_failure_without_report_is_not_counted_as_passed():
     assert buckets["buckets"] == []
 
 
-def test_failed_job_without_report_still_creates_a_safe_bucket():
+def test_failed_job_without_report_still_creates_a_safe_bucket(monkeypatch):
+    _mock_llm_reporting(monkeypatch)
     pipeline_jobs = [
         (
             "functional:run_dev_dgx_h100",
