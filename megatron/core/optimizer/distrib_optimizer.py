@@ -1856,6 +1856,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert gbuf_world_numel_unpadded <= gbuf_world_numel
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
+                    gbuf_local_numel_unpadded = max(
+                        0,
+                        min(
+                            gbuf_local_numel,
+                            gbuf_world_numel_unpadded - data_parallel_rank * gbuf_local_numel,
+                        ),
+                    )
 
                     sharded_bucket_key = (
                         f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
@@ -1870,8 +1877,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     all_pad_tensors = {}
                     for i in range(-1, len(bucket_state)):
                         if i == len(bucket_state) - 1:
-                            # Potential padding at the end
-                            next_param_start = gbuf_local_numel
+                            # Potential intra-param padding at the end. Exclude the
+                            # bucket-end padding beyond the global unpadded boundary.
+                            next_param_start = gbuf_local_numel_unpadded
                         else:
                             next_param_start = bucket_state[i + 1]['gbuf_local_start']
                         if i == -1:
