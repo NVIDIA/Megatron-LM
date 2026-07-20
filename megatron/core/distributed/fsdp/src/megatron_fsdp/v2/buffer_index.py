@@ -14,11 +14,12 @@
 
 import math
 from collections import namedtuple
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.distributed.tensor import DeviceMesh
 
+from .dp_buffer import Placement
 from .utils import ParamGroupIdx
 
 
@@ -26,10 +27,9 @@ class BufferIndex:
     """Describes how params are laid out in a flat buffer, including global layout
     and per-rank shard information.
 
-    The index always builds coordinate metadata for a 2D ``(outer, inner)``
-    mesh. Callers choose which mesh dimensions shard a query via
-    ``shard_layout``: ``(0, 0)`` full, ``(1, 0)`` outer, ``(0, 1)`` inner, and
-    ``(1, 1)`` inner then outer.
+    The index always builds coordinate metadata for a 2D (outer, inner) mesh.
+    Query APIs accept one placement per mesh dimension. FLAT and DIRTY select the
+    rank-owned range; REPLICATE and PARTIAL select the full range.
 
     Each DataParallelBuffer owns its own independent BufferIndex instance.
     """
@@ -242,7 +242,7 @@ class BufferIndex:
             inner_meta, self.outer_dp_world_size, self.outer_dp_rank
         )
 
-        # ``shard_layout`` follows PyTorch DeviceMesh dim order:
+        # Internal metadata keys follow PyTorch DeviceMesh dim order:
         # mesh_dim 0 is outer-DP, mesh_dim 1 is inner-DP.
         # The cache keys below use 0/1 flags to mean unsharded/sharded.
         self.inner_shard_metas = {0: full_meta, 1: inner_meta}
@@ -293,54 +293,48 @@ class BufferIndex:
     #                            start.  Tells what portion of this item
     #                            falls within the current rank's shard.
     #  _get_item_local_range  → (start, end) relative to the selected
-    #                            shard_layout coordinate domain.
+    #                            placement coordinate domain.
     #  _get_item_global_range → (start, end) in the full logical
     #                            (unsharded) buffer, same on all
     #                            ranks.
     # ------------------------------------------------------------------ #
 
-    def _get_shard_meta(self, shard_layout: Iterable[int] | int | None):
-        # shard_layout=(outer, inner): 1 means that dimension is sharded, 0 means replicated.
-        if shard_layout is None:
-            outer_sharded = 0
-            inner_sharded = 0
-        elif isinstance(shard_layout, int):
-            if shard_layout not in (0, 1):
-                raise ValueError(f"Unsupported shard_layout: {shard_layout}")
-            outer_sharded = 0
-            inner_sharded = shard_layout
-        else:
-            shard_layout = tuple(int(dim) for dim in shard_layout)
-            if any(dim not in (0, 1) for dim in shard_layout):
-                raise ValueError(f"Unsupported shard_layout: {shard_layout}")
-            if len(shard_layout) == 0:
-                outer_sharded = 0
-                inner_sharded = 0
-            elif len(shard_layout) == 1:
-                outer_sharded = 0
-                inner_sharded = shard_layout[0]
-            elif len(shard_layout) == 2:
-                outer_sharded, inner_sharded = shard_layout
-            else:
-                raise ValueError(f"Unsupported shard_layout: {shard_layout}")
-        return self.outer_shard_metas[(outer_sharded, inner_sharded)]
+    def _get_shard_meta(
+        self,
+        placements: list[Placement],
+    ):
+        """Return logical metadata, treating FLAT and DIRTY as sharded."""
+        if len(placements) != 2:
+            raise ValueError(f"Expected two placements, got {len(placements)}")
+        if not all(isinstance(placement, Placement) for placement in placements):
+            raise TypeError(f"Unsupported placements: {placements}")
+
+        key = tuple(
+            int(placement in (Placement.FLAT, Placement.DIRTY))
+            for placement in placements
+        )
+        return self.outer_shard_metas[key]
 
     def local_slice_for(
         self,
         global_range: Tuple[int, int],
-        requested_layout: Iterable[int] | int | None,
-        storage_layout: Iterable[int] | int | None,
+        requested_placements: list[Placement],
+        storage_placements: list[Placement],
     ) -> Tuple[Optional[slice], Optional[slice]]:
-        """Clip global_range to requested and storage shard layouts.
+        """Clip global_range to requested and storage placements.
 
         The source slice indexes the object described by global_range relative
         to global_range[0]. The local slice indexes storage physically laid out
-        as storage_layout. Returns (None, None) when the intersection is empty.
+        as storage_placements. Returns (None, None) when the intersection is empty.
         """
         global_start, global_end = global_range
-        requested_meta = self._get_shard_meta(requested_layout)
-        storage_meta = self._get_shard_meta(storage_layout)
-        start = max(global_start, requested_meta.global_data_index, storage_meta.global_data_index)
+        requested_meta = self._get_shard_meta(requested_placements)
+        storage_meta = self._get_shard_meta(storage_placements)
+        start = max(
+            global_start,
+            requested_meta.global_data_index,
+            storage_meta.global_data_index,
+        )
         end = min(
             global_end,
             requested_meta.global_data_index + requested_meta.size,
@@ -360,19 +354,24 @@ class BufferIndex:
         return (idx.global_data_index, idx.global_data_index + idx.size)
 
     def _get_item_self_range(
-        self, item_id: int, *, shard_layout: Iterable[int] | None = (0, 1)
+        self,
+        item_id: int,
+        *,
+        placements: Optional[list[Placement]] = None,
     ) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
 
-        ``shard_layout`` selects the mesh dimensions to shard on.
+        Placements select the valid range on each mesh dimension.
         """
+        if placements is None:
+            placements = [Placement.REPLICATE, Placement.FLAT]
         idx = self.item_index_map[item_id]
         item_start = idx.global_data_index
         item_end = item_start + idx.size
         range_start = item_start
         range_end = item_end
 
-        shard_meta = self._get_shard_meta(shard_layout)
+        shard_meta = self._get_shard_meta(placements)
         shard_start = shard_meta.global_data_index
         shard_end = shard_start + shard_meta.size
         range_start = max(range_start, shard_start)
@@ -384,17 +383,22 @@ class BufferIndex:
         return (range_start - idx.global_data_index, range_end - idx.global_data_index)
 
     def _get_item_local_range(
-        self, item_id: int, *, shard_layout: Iterable[int] | None = (0, 0)
+        self,
+        item_id: int,
+        *,
+        placements: Optional[list[Placement]] = None,
     ) -> Tuple[int, int]:
-        """Return item coordinates relative to the selected shard layout.
+        """Return item coordinates relative to the selected placements.
 
         The result is not aware of DataParallelBuffer storage.
         """
+        if placements is None:
+            placements = [Placement.REPLICATE, Placement.REPLICATE]
         idx = self.item_index_map[item_id]
         range_start = idx.global_data_index
         range_end = range_start + idx.size
 
-        shard_meta = self._get_shard_meta(shard_layout)
+        shard_meta = self._get_shard_meta(placements)
         shard_start = shard_meta.global_data_index
         shard_end = shard_start + shard_meta.size
         range_start = max(range_start, shard_start)

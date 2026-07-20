@@ -58,6 +58,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDP
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
@@ -452,16 +453,22 @@ class TestFullyShardBasic:
         fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
 
         captured_run_dtypes = []
+        original_unshard_weight_buffers = fsdp_module_mod._unshard_weight_buffers
 
         def capture_unshard(
             outer_dp_group, inner_dp_group, weight_buffers, *, async_op, stream, caller_stream
         ):
-            del outer_dp_group, inner_dp_group, async_op, caller_stream
             captured_run_dtypes.append(
                 tuple(weight_buffer.dtype for weight_buffer in weight_buffers)
             )
-            for weight_buffer in weight_buffers:
-                weight_buffer.unshard(unshard_dim=1, bind_params=True, stream=stream)
+            return original_unshard_weight_buffers(
+                outer_dp_group,
+                inner_dp_group,
+                weight_buffers,
+                async_op=async_op,
+                stream=stream,
+                caller_stream=caller_stream,
+            )
 
         monkeypatch.setattr(fsdp_module_mod, "_unshard_weight_buffers", capture_unshard)
 
@@ -548,7 +555,7 @@ class TestFullyShardBasic:
             enable_async_reduce_grad=False,
         )
 
-        original_unshard = DataParallelBuffer.unshard
+        original_redistribute = DataParallelBuffer.redistribute
         original_coalescing_manager = fsdp_module_mod._coalescing_manager
         original_all_gather = torch.distributed.all_gather_into_tensor
         manager_groups = []
@@ -572,7 +579,7 @@ class TestFullyShardBasic:
         if outer_strategy == "optim":
             for weight_buffer in weight_buffers:
                 # Force the post-optimizer/checkpoint state so dim 0 launches AG.
-                weight_buffer._outer_dirty = True
+                weight_buffer.placements[0] = Placement.DIRTY
 
         @contextmanager
         def capture_coalescing_manager(group, *args, **kwargs):
@@ -584,19 +591,29 @@ class TestFullyShardBasic:
                 finally:
                     active_manager_groups.pop()
 
-        def capture_unshard(buffer, *args, **kwargs):
-            unshard_dim = kwargs.get("unshard_dim", args[0] if args else 1)
-            active_group = active_manager_groups[-1] if active_manager_groups else None
-            unshard_calls.append((id(buffer), unshard_dim, active_group))
-            return original_unshard(buffer, *args, **kwargs)
+        def capture_redistribute(buffer, *args, **kwargs):
+            active_group = (
+                active_manager_groups[-1] if active_manager_groups else None
+            )
+            comm_dim = 0 if active_group is outer_dp_group else 1
+            unshard_calls.append((id(buffer), comm_dim, active_group))
+            return original_redistribute(buffer, *args, **kwargs)
 
         def capture_all_gather(*args, **kwargs):
             collective_groups.append(kwargs["group"])
             return original_all_gather(*args, **kwargs)
 
-        monkeypatch.setattr(DataParallelBuffer, "unshard", capture_unshard)
-        monkeypatch.setattr(fsdp_module_mod, "_coalescing_manager", capture_coalescing_manager)
-        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", capture_all_gather)
+        monkeypatch.setattr(DataParallelBuffer, "redistribute", capture_redistribute)
+        monkeypatch.setattr(
+            fsdp_module_mod,
+            "_coalescing_manager",
+            capture_coalescing_manager,
+        )
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_into_tensor",
+            capture_all_gather,
+        )
 
         try:
             model.unshard(async_op=True)
@@ -631,7 +648,7 @@ class TestFullyShardBasic:
                 actual is expected
                 for actual, expected in zip(collective_groups, expected_collective_groups)
             )
-            assert all(not weight_buffer._outer_dirty for weight_buffer in weight_buffers)
+            assert all(weight_buffer.is_unsharded() for weight_buffer in weight_buffers)
         finally:
             model.reshard()
 
@@ -651,8 +668,14 @@ class TestFullyShardBasic:
         param_group = model._fsdp_param_groups[0]
         model_buffer = param_group.model_weight_buffer
         assert param_group.main_weight_buffer is None
-        assert model_buffer.storage_shard_layout == (0, 1)
-        assert not model_buffer._outer_dirty
+        assert model_buffer.storage_placements == [Placement.REPLICATE, Placement.FLAT]
+        assert model_buffer.placements == model_buffer.storage_placements
+        from torch.distributed.tensor.placement_types import Shard
+
+        assert all(
+            isinstance(placement, Shard)
+            for placement in param_group.dist_params[0].placements
+        )
 
         optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
         x = torch.full((2, 16), _rank() + 1, device=_device(), dtype=torch.bfloat16)
@@ -664,6 +687,10 @@ class TestFullyShardBasic:
         model.set_is_last_backward(True)
         model(x).float().sum().backward()
         model.finish_grad_sync()
+        assert param_group.main_grad_buffer.placements == [
+            Placement.DIRTY,
+            Placement.FLAT,
+        ]
 
         ctx = model._fsdp_root_context
         assert ctx.model_weight_refresh_pending
@@ -671,13 +698,13 @@ class TestFullyShardBasic:
         optimizer.step()
         # No optimizer integration performed an explicit model-weight copy.
         assert ctx.model_weight_refresh_pending
-        assert not model_buffer._outer_dirty
+        assert model_buffer.placements == model_buffer.storage_placements
 
         # The normal pre-forward hook marks the direct model-weight storage
         # dirty before unshard, which refreshes the outer replicas exactly once.
         model(torch.zeros_like(x))
         assert not ctx.model_weight_refresh_pending
-        assert not model_buffer._outer_dirty
+        assert model_buffer.placements == model_buffer.storage_placements
 
         outer_replicas = [
             torch.empty_like(model_buffer.data)
@@ -1307,8 +1334,9 @@ class TestActivationCheckpointing:
         model_buffer = param_group.model_weight_buffer
         main_buffer = param_group.main_weight_buffer
         assert main_buffer is not None
-        assert model_buffer.storage_shard_layout == (0, 1)
-        assert main_buffer.storage_shard_layout == (0, 1)
+        expected_storage_placements = [Placement.REPLICATE, Placement.FLAT]
+        assert model_buffer.storage_placements == expected_storage_placements
+        assert main_buffer.storage_placements == expected_storage_placements
 
         model.set_is_last_backward(True)
         x = torch.randn(4, 32, device=device, dtype=torch.bfloat16, requires_grad=True)

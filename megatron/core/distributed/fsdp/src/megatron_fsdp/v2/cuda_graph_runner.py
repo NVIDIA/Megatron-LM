@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils._pytree import tree_flatten
 
+from .dp_buffer import Placement
+
 logger = logging.getLogger(__name__)
 
 
@@ -464,7 +466,9 @@ def _make_bwd_pre_hook(module):
             )
             if has_fused_wgrad and param_group.main_grad_buffer is not None:
                 param_group._init_dist_grads()
-                param_group.main_grad_buffer.fetch_buffer()
+                param_group.main_grad_buffer.fetch_buffer(
+                    [Placement.REPLICATE, Placement.REPLICATE]
+                )
 
     return hook
 

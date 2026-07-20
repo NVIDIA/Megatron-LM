@@ -8,7 +8,10 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import _init_dp_mesh
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel,
+    _init_dp_mesh,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
@@ -16,6 +19,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import 
     HAVE_TE_NVFP4_RECIPE,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
     make_gpt_mock_data_iterator,
@@ -40,6 +45,54 @@ def ref_cache():
 
 
 class TestMegatronFSDPE2E:
+    def test_optim_default_expert_units_use_edp_mesh(self, monkeypatch):
+        grouped_mlp = TEGroupedMLP.__new__(TEGroupedMLP)
+        sequential_mlp = SequentialMLP.__new__(SequentialMLP)
+        torch.nn.Module.__init__(grouped_mlp)
+        torch.nn.Module.__init__(sequential_mlp)
+        model = torch.nn.Sequential(grouped_mlp, sequential_mlp)
+
+        dp_mesh = object()
+        edp_mesh = object()
+        fully_shard_calls = []
+
+        monkeypatch.setattr(
+            "megatron.core.distributed.fsdp.mcore_fsdp_adapter._init_dp_mesh",
+            lambda _pg_collection, _ddp_config, edp=False: edp_mesh if edp else dp_mesh,
+        )
+
+        def record_fully_shard(target, **kwargs):
+            fully_shard_calls.append((target, kwargs["mesh"]))
+            if target is model:
+                raise RuntimeError("root fully_shard reached")
+
+        monkeypatch.setattr(
+            "megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard",
+            record_fully_shard,
+        )
+
+        with pytest.raises(RuntimeError, match="root fully_shard reached"):
+            FullyShardedDataParallel(
+                config=TransformerConfig(
+                    num_attention_heads=1,
+                    num_layers=1,
+                    calculate_per_token_loss=True,
+                ),
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    use_megatron_fsdp_v2=True,
+                    data_parallel_sharding_strategy="optim",
+                ),
+                module=model,
+                fsdp_unit_modules=None,
+                pg_collection=ProcessGroupCollection(),
+            )
+
+        assert len(fully_shard_calls) == 3
+        assert (grouped_mlp, edp_mesh) in fully_shard_calls
+        assert (sequential_mlp, edp_mesh) in fully_shard_calls
+        assert (model, dp_mesh) in fully_shard_calls
+
     @pytest.mark.parametrize("outer_dp_size", [1, 2])
     def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
         if Utils.world_size < 4 or Utils.world_size % 4 != 0:

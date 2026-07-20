@@ -32,6 +32,7 @@ from torch.distributed.tensor import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
@@ -100,6 +101,7 @@ def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strateg
             bf16_params.append(nn.Parameter(p.data.to(torch.bfloat16).to(device)))
 
     # Build one ParameterGroup per dtype, each with its own param_group_id
+    mp_policy = mp_policy or MixedPrecisionPolicy(main_params_dtype=torch.float32)
     groups, originals = [], []
     for gid, params in enumerate([bf16_params, uint8_params]):
         if not params:
@@ -108,7 +110,7 @@ def _build_groups(strategy, mesh=None, mp_policy=None, outer_dp_sharding_strateg
         pg = ParameterGroup(
             params=params,
             param_group_id=ParamGroupIdx(0, gid),
-            mp_policy=mp_policy or MixedPrecisionPolicy(),
+            mp_policy=mp_policy,
             mesh=mesh,
             sharding_strategy=strategy,
             outer_dp_sharding_strategy=outer_dp_sharding_strategy,
@@ -183,15 +185,19 @@ def test_init_buffers(strategy):
         if has_wbuf:
             assert pg.model_weight_buffer is not None
             wbuf = pg.model_weight_buffer
-            assert wbuf.inner_sharded == w_dist
+            assert wbuf.storage_placements[1] is (
+                Placement.FLAT if w_dist else Placement.REPLICATE
+            )
 
             # Per-param check: get_item should return this rank's portion of
             # the original param. A param may span shard boundaries, so the
             # returned slice can be shorter than the full param or even empty.
             for i, p in enumerate(orig):
-                item = wbuf.get_item(i)
+                item = wbuf.get_item(i, placements=wbuf.storage_placements)
                 if w_dist:
-                    s, e = wbuf.buffer_index._get_item_self_range(i)
+                    s, e = wbuf.buffer_index._get_item_self_range(
+                        i, placements=wbuf.storage_placements
+                    )
                     expected = p.flatten()[s:e]
                 else:
                     expected = p.flatten()
@@ -199,7 +205,9 @@ def test_init_buffers(strategy):
         # -- main_grad_buffer --
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
-            assert pg.main_grad_buffer.inner_sharded == g_dist
+            assert pg.main_grad_buffer.storage_placements[1] is (
+                Placement.FLAT if g_dist else Placement.REPLICATE
+            )
             assert pg.main_grad_buffer.data is None  # lazy init
 
     torch.distributed.barrier()
@@ -225,7 +233,9 @@ def test_unshard_reshard(strategy):
         assert wbuf is not None
 
         shard_before = wbuf.data.view(torch.uint8).clone()
-        unsharded = wbuf.unshard()
+        full_placements = [Placement.REPLICATE, Placement.REPLICATE]
+        wbuf.redistribute(full_placements)
+        unsharded = wbuf.fetch_buffer(full_placements)
 
         if not w_dist:
             # Non-distributed: unshard returns self.data directly, no comm
@@ -239,7 +249,7 @@ def test_unshard_reshard(strategy):
                 assert torch.equal(recovered, p.flatten())
 
         # Reshard: release temporary buffer, persistent shard must be intact
-        wbuf.reshard()
+        wbuf.redistribute(wbuf.storage_placements)
         if w_dist:
             assert wbuf._unsharded_buffer is None
         # Compare the persistent storage bit-for-bit. The buffer can contain
@@ -258,46 +268,28 @@ def test_unshard_reshard(strategy):
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_reduce_grad(strategy):
     groups, _, dp_group, rank, ws, device = _build_groups(strategy)
-    _, _, _, g_dist = _flags(strategy)
 
+    full_placements = [Placement.REPLICATE, Placement.REPLICATE]
     for pg in groups:
-        pg._init_dist_grads()  # lazily allocate grad buffer and dist_grads list
+        pg._init_dist_grads()
         gbuf = pg.main_grad_buffer
         if gbuf is None:
-            # uint8 group has requires_grad=False, so no grad buffer
             continue
 
+        full_size = gbuf.buffer_index.bucket_meta.size
+        full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
+        gbuf.fetch_buffer(full_placements).copy_(full)
+        gbuf.placements = [Placement.REPLICATE, Placement.PARTIAL]
+
         if strategy == "no_shard":
-            # No-shard: each rank fills with (rank+1), then all-reduce should
-            # produce the sum across all ranks.
-            gbuf.data.fill_(float(rank + 1))
-            ref = torch.full_like(gbuf.data, float(rank + 1))
-            Ref.all_reduce(ref, dp_group)
-            gbuf.reduce_grad(reduce_scatter=False)
-            assert torch.equal(gbuf.data, ref)
+            expected = full.clone()
+            Ref.all_reduce(expected, dp_group)
         else:
-            # ZeRO-1/2/3: reduce-scatter a full gradient buffer and compare
-            # this rank's optimizer-facing shard against the PyTorch reference.
-            full_size = gbuf.buffer_index.bucket_meta.size
-            full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
+            expected = Ref.reduce_scatter(full.clone(), dp_group)
 
-            ref_shard = Ref.reduce_scatter(full.clone(), dp_group)
-
-            if g_dist:
-                # Pre-populate the allocator so reduce_grad sees the full temp buffer.
-                bucket = gbuf.allocator.allocate(
-                    key=gbuf.alloc_key, size=full_size, dtype=gbuf.dtype, device=device
-                )
-                bucket.data.copy_(full)
-                gbuf.data.zero_()
-            else:
-                gbuf.data.copy_(full)
-            gbuf.reduce_grad()
-
-            # Only compare the shard region of self.data
-            # shard_layout=(outer, inner): (0, 1) means inner sharded only.
-            actual = gbuf.get_shard_view((0, 1))
-            assert torch.equal(actual, ref_shard)
+        pg.reduce_grad(is_last_backward=True)
+        actual = gbuf.get_shard_view(gbuf.placements)
+        assert torch.equal(actual, expected)
 
     torch.distributed.barrier()
 
@@ -407,50 +399,35 @@ def test_hsdp_reduce_grad(strategy, outer_strategy):
     groups, _, _, rank, _, device = _build_groups(
         strategy, mesh=mesh, outer_dp_sharding_strategy=outer_strategy
     )
-    _, _, _, g_dist = _flags(strategy)
 
+    full_placements = [Placement.REPLICATE, Placement.REPLICATE]
     for pg in groups:
-        pg._init_dist_grads()  # lazily allocate grad buffer and dist_grads list
+        pg._init_dist_grads()
         gbuf = pg.main_grad_buffer
         if gbuf is None:
             continue
         assert not pg._full_grad_buffer_has_accumulated_grad
         assert not pg._reduced_grad_buffer_has_accumulated_grad
 
+        full_size = gbuf.buffer_index.bucket_meta.size
+        full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
+        gbuf.fetch_buffer(full_placements).copy_(full)
+        gbuf.placements = [Placement.PARTIAL, Placement.PARTIAL]
+
         if strategy == "no_shard":
-            gbuf.data.fill_(float(rank + 1))
-            ref = torch.full_like(gbuf.data, float(rank + 1))
-            Ref.all_reduce(ref, pg.dp_group)
-            Ref.all_reduce(ref, pg.outer_dp_group)
-            pg.reduce_grad(is_last_backward=True)
-            assert torch.equal(gbuf.data, ref)
+            expected = full.clone()
+            Ref.all_reduce(expected, pg.dp_group)
+            Ref.all_reduce(expected, pg.outer_dp_group)
         else:
-            full_size = gbuf.buffer_index.bucket_meta.size
-            full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
-
-            ref_shard = Ref.reduce_scatter(full.clone(), pg.dp_group)
+            expected = Ref.reduce_scatter(full.clone(), pg.dp_group)
             if outer_strategy == "optim":
-                ref_shard = Ref.reduce_scatter(ref_shard, pg.outer_dp_group)
+                expected = Ref.reduce_scatter(expected, pg.outer_dp_group)
             else:
-                Ref.all_reduce(ref_shard, pg.outer_dp_group)
+                Ref.all_reduce(expected, pg.outer_dp_group)
 
-            if g_dist:
-                bucket = gbuf.allocator.allocate(
-                    key=gbuf.alloc_key, size=full_size, dtype=gbuf.dtype, device=device
-                )
-                bucket.data.copy_(full)
-                gbuf.data.zero_()
-            else:
-                gbuf.data.copy_(full)
-            pg.reduce_grad(is_last_backward=True)
-
-            if outer_strategy == "optim":
-                # shard_layout=(outer, inner): (1, 1) means both dimensions are sharded.
-                actual = gbuf.get_shard_view((1, 1))
-            else:
-                # shard_layout=(outer, inner): (0, 1) means inner sharded only.
-                actual = gbuf.get_shard_view((0, 1))
-            assert torch.equal(actual, ref_shard)
+        pg.reduce_grad(is_last_backward=True)
+        actual = gbuf.get_shard_view(gbuf.placements)
+        assert torch.equal(actual, expected)
 
         assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
         assert pg._reduced_grad_buffer_has_accumulated_grad
@@ -468,18 +445,23 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
     )
 
     num_micro_batches = 3
+    full_placements = [Placement.REPLICATE, Placement.REPLICATE]
     for pg in groups:
         pg._init_dist_grads()
         gbuf = pg.main_grad_buffer
         if gbuf is None:
             continue
 
-        gbuf.data.zero_()
-        full_batch_grad = torch.zeros_like(gbuf.data)
+        full_grad_buffer = gbuf.fetch_buffer(full_placements)
+        full_grad_buffer.zero_()
+        full_batch_grad = torch.zeros_like(full_grad_buffer)
         for microbatch in range(num_micro_batches):
-            micro_grad = torch.full_like(gbuf.data, float((microbatch + 1) * (rank + 1)))
-            gbuf.data.add_(micro_grad)
+            micro_grad = torch.full_like(
+                full_grad_buffer, float((microbatch + 1) * (rank + 1))
+            )
+            full_grad_buffer.add_(micro_grad)
             full_batch_grad.add_(micro_grad)
+            gbuf.placements = [Placement.PARTIAL, Placement.PARTIAL]
             is_last_backward = microbatch == num_micro_batches - 1
             pg.reduce_grad(is_last_backward=is_last_backward)
             if is_last_backward:
@@ -497,8 +479,7 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
         else:
             ref_shard = Ref.reduce_scatter(full_batch_grad, pg.dp_group)
             Ref.all_reduce(ref_shard, pg.outer_dp_group)
-            # shard_layout=(outer, inner): (0, 1) means inner sharded only.
-            actual = gbuf.get_shard_view((0, 1))
+            actual = gbuf.get_shard_view(gbuf.placements)
             assert torch.equal(actual, ref_shard)
 
         pg.zero_grad()

@@ -15,6 +15,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .allocator import BucketAllocator, TracePoolAllocator
+from .dp_buffer import Placement
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -33,7 +34,10 @@ def _unshard_weight_buffers(
 ) -> None:
     """Unshard one communication-compatible buffer run by mesh dimension."""
     # Allocate on the caller stream before entering the communication stream.
-    full_buffers = [weight_buffer.fetch_buffer((0, 0)) for weight_buffer in weight_buffers]
+    full_buffers = [
+        weight_buffer.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
+        for weight_buffer in weight_buffers
+    ]
     if async_op:
         stream.wait_stream(caller_stream)
 
@@ -45,13 +49,17 @@ def _unshard_weight_buffers(
         )
         with cm as coalescing_event:
             for weight_buffer in weight_buffers:
-                weight_buffer.unshard(unshard_dim=unshard_dim, bind_params=False, stream=stream)
+                target_placements = weight_buffer.placements.copy()
+                target_placements[unshard_dim] = Placement.REPLICATE
+                weight_buffer.redistribute(
+                    target_placements,
+                    bind_params=False,
+                    stream=stream,
+                )
         if async_op and coalescing_event is not None:
             coalescing_event.wait()
 
     with torch.cuda.stream(stream):
-        # Dim 0 is state-driven: no_shard and clean buffers fast-path, while
-        # dirty outer=optim buffers issue the outer all-gather.
         unshard_dimension(outer_dp_group, unshard_dim=0)
         unshard_dimension(inner_dp_group, unshard_dim=1)
 
@@ -491,9 +499,11 @@ class FSDPModule:
             gbuf = p._gbuf
             item_id = p._item_id
 
-            # Full (0, 0) unsharded grad: the backward writes the full gradient
-            # (params are all-gathered during bwd); reduce_grad later scatters it.
-            gbuf_data = gbuf.fetch_buffer((0, 0))
+            # The backward writes a fully replicated gradient; reduce_grad later
+            # reduces it to the requested placement.
+            gbuf_data = gbuf.fetch_buffer(
+                [Placement.REPLICATE, Placement.REPLICATE]
+            )
             assert gbuf_data is not None
             assert gbuf_data.numel() > 0
 
@@ -925,6 +935,17 @@ class FSDPModule:
                 if zero_tensors:
                     torch._foreach_zero_(zero_tensors)
 
+            # A non-HSDP mesh has a singleton outer dimension, so only HSDP
+            # produces an outer-DP contribution that still needs reduction.
+            param_group.main_grad_buffer.redistribute(
+                [
+                    Placement.PARTIAL
+                    if param_group.mesh.size(0) > 1
+                    else Placement.REPLICATE,
+                    Placement.PARTIAL,
+                ]
+            )
+
             for param in params_with_grad:
                 if param.grad is not None:
                     del param.grad
@@ -1191,9 +1212,9 @@ class FSDPModule:
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        # shard_layout=(outer, inner): (0, 0) means neither dimension is sharded.
                         param_data = wbuf.get_item(
-                            param_group.param_idx[param], shard_layout=(0, 0)
+                            param_group.param_idx[param],
+                            placements=[Placement.REPLICATE, Placement.REPLICATE],
                         )
                         assert not torch.isnan(
                             param_data

@@ -335,49 +335,54 @@ class FullyShardedDataParallel(_BaseDataParallel):
             gradient_scaling_factor = 1.0 / dp_world_size
             expert_gradient_scaling_factor = 1.0 / dp_world_size
 
-        if fsdp_unit_modules is not None:
-            cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
-            moe_submodules = {
-                submodule
-                for moe_layer in module.modules()
-                if isinstance(moe_layer, MoELayer)
-                for submodule in moe_layer.modules()
-            }
-            # Iterate modules post order to ensure that child modules are fully sharded
-            # before their parents, which is required for correct param group divide.
-            for name, m in reversed(list(module.named_modules())):
-                if isinstance(m, (TEGroupedMLP, SequentialMLP)):
-                    grad_sf = expert_gradient_scaling_factor
-                    mesh = edp_mesh
-                else:
-                    grad_sf = gradient_scaling_factor
-                    mesh = dp_mesh
+        cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
+        moe_submodules = {
+            submodule
+            for moe_layer in module.modules()
+            if isinstance(moe_layer, MoELayer)
+            for submodule in moe_layer.modules()
+        }
+        # Iterate modules post order to ensure that child modules are fully sharded
+        # before their parents, which is required for correct param group divide.
+        for name, m in reversed(list(module.named_modules())):
+            if isinstance(m, (TEGroupedMLP, SequentialMLP)):
+                grad_sf = expert_gradient_scaling_factor
+                mesh = edp_mesh
+            else:
+                grad_sf = gradient_scaling_factor
+                mesh = dp_mesh
 
-                if any(
-                    [
-                        isinstance(m, TransformerLayer) and "transformer" in cuda_graph_on,
-                        isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
-                        isinstance(m, Attention) and "attn" in cuda_graph_on,
-                        isinstance(m, MLP) and m not in moe_submodules and "mlp" in cuda_graph_on,
-                        isinstance(m, (TEGroupedMLP, SequentialMLP)) and "moe" in cuda_graph_on,
-                        isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
-                    ]
-                ):
-                    fully_shard(
-                        m,
-                        enable_cuda_graph=True,
-                        mesh=mesh,
-                        gradient_scaling_factor=grad_sf,
-                        **kwargs,
-                    )
-                elif isinstance(m, tuple(fsdp_unit_modules)):
-                    fully_shard(
-                        m,
-                        mesh=mesh,
-                        gradient_scaling_factor=grad_sf,
-                        enable_cuda_graph=False,
-                        **kwargs,
-                    )
+            enable_cuda_graph = fsdp_unit_modules is not None and any(
+                [
+                    isinstance(m, TransformerLayer) and "transformer" in cuda_graph_on,
+                    isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
+                    isinstance(m, Attention) and "attn" in cuda_graph_on,
+                    isinstance(m, MLP)
+                    and m not in moe_submodules
+                    and "mlp" in cuda_graph_on,
+                    isinstance(m, (TEGroupedMLP, SequentialMLP))
+                    and "moe" in cuda_graph_on,
+                    isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
+                ]
+            )
+            if enable_cuda_graph:
+                fully_shard(
+                    m,
+                    enable_cuda_graph=True,
+                    mesh=mesh,
+                    gradient_scaling_factor=grad_sf,
+                    **kwargs,
+                )
+            elif isinstance(m, (TEGroupedMLP, SequentialMLP)) or (
+                fsdp_unit_modules is not None and isinstance(m, tuple(fsdp_unit_modules))
+            ):
+                fully_shard(
+                    m,
+                    mesh=mesh,
+                    gradient_scaling_factor=grad_sf,
+                    enable_cuda_graph=False,
+                    **kwargs,
+                )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 
         # Propagate relevant attributes from original parameters to the new

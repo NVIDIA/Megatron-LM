@@ -134,7 +134,11 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         requires_grad=True,
         sharding_strategy="optim_grads_params",
         enable_full_iteration_cuda_graph=False,
-        main_grad_buffer=SimpleNamespace(inner_sharded=True),
+        main_grad_buffer=SimpleNamespace(
+            inner_sharded=True,
+            redistribute=lambda *_args, **_kwargs: None,
+        ),
+        mesh=SimpleNamespace(size=lambda _dim: 1),
         _full_grad_buffer_has_accumulated_grad=False,
         params=(param,),
         dist_params=(dist_param,),
@@ -299,12 +303,16 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     regular_fetch_calls = []
     fused_group = SimpleNamespace(
         params=(fused_param,),
-        main_grad_buffer=SimpleNamespace(fetch_buffer=lambda: fused_fetch_calls.append(True)),
+        main_grad_buffer=SimpleNamespace(
+            fetch_buffer=lambda _placements: fused_fetch_calls.append(True)
+        ),
         _init_dist_grads=lambda: fused_init_calls.append(True),
     )
     regular_group = SimpleNamespace(
         params=(regular_param,),
-        main_grad_buffer=SimpleNamespace(fetch_buffer=lambda: regular_fetch_calls.append(True)),
+        main_grad_buffer=SimpleNamespace(
+            fetch_buffer=lambda _placements: regular_fetch_calls.append(True)
+        ),
         _init_dist_grads=lambda: regular_init_calls.append(True),
     )
     unshard_calls = []
@@ -333,7 +341,8 @@ def test_trace_prefetches_static_main_grad_before_backward():
         requires_grad=True,
         sharding_strategy="optim_grads_params",
         main_grad_buffer=SimpleNamespace(
-            dtype=param.dtype, fetch_buffer=lambda: fetch_calls.append(True)
+            dtype=param.dtype,
+            fetch_buffer=lambda _placements: fetch_calls.append(True),
         ),
         _init_dist_grads=lambda: init_calls.append(True),
     )
