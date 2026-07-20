@@ -185,3 +185,75 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, m
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["load_model"] is True
     assert load_kwargs["load_optimizer"] is True
+
+
+def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):
+    engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
+    engine.handle._model = engine.module
+    engine.handle._extras["protocol"] = SimpleNamespace()
+
+    with pytest.raises(RuntimeError, match="does not expose save_hf_weights"):
+        engine.save_checkpoint(str(tmp_path), global_step=1)
+
+
+def test_hf_model_save_fails_loudly_when_model_config_is_missing(tmp_path):
+    engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
+    engine.handle._model = engine.module
+    calls = []
+    engine.handle._extras["protocol"] = SimpleNamespace(
+        save_hf_weights=lambda *args: calls.append(args)
+    )
+
+    with pytest.raises(RuntimeError, match="no model_cfg"):
+        engine.save_checkpoint(str(tmp_path), global_step=1)
+    assert calls == []
+
+
+def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monkeypatch):
+    engine, module, *_ = _initialized_engine(
+        checkpoint_config={"save_contents": ["hf_model"]}
+    )
+    model_cfg = object()
+    chunks = [module, object()]
+    export_calls = []
+    metadata_calls = []
+
+    class Artifact:
+        def __init__(self, name):
+            self.name = name
+
+        def save_pretrained(self, path):
+            metadata_calls.append((self.name, path))
+
+    hf_config = Artifact("config")
+    hf_config.auto_map = {None: "invalid", "AutoModel": "modeling.Model"}
+    engine.model_config.hf_config = hf_config
+    engine.model_config.tokenizer = Artifact("tokenizer")
+    engine.model_config.processor = Artifact("processor")
+    engine.handle._model = module
+    engine.handle._extras.update(
+        {
+            "model_cfg": model_cfg,
+            "model_chunks": chunks,
+            "protocol": SimpleNamespace(
+                save_hf_weights=lambda *args: export_calls.append(args)
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.save_training_checkpoint",
+        lambda *args, **kwargs: pytest.fail(
+            "hf_model-only save wrote a native checkpoint"
+        ),
+    )
+
+    engine.save_checkpoint(str(tmp_path), global_step=1)
+
+    hf_path = str(tmp_path / "huggingface")
+    assert export_calls == [(chunks, hf_path, model_cfg, engine.handle._parallel_state)]
+    assert metadata_calls == [
+        ("config", hf_path),
+        ("tokenizer", hf_path),
+        ("processor", hf_path),
+    ]
+    assert hf_config.auto_map == {"AutoModel": "modeling.Model"}
