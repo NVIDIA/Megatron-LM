@@ -18,6 +18,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     Replicate,
     fully_shard,
+    fully_shard_optimizer,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -138,7 +139,7 @@ def _nccl_events(cuda_events, *name_fragments):
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
+def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatches):
     """Minimal per-module FSDP training should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -676,6 +677,41 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
 
     with pytest.raises(AssertionError):
         torch.testing.assert_close(second_loss, first_loss)
+
+
+def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setup):
+    """Mixed-precision FSDP Adam should track an unsharded Adam baseline."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(2026)
+    baseline = TinyModel().to(device=device, dtype=torch.bfloat16)
+    model = TinyModel().to(device=device, dtype=torch.bfloat16)
+    model.load_state_dict(baseline.state_dict())
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+
+    baseline_optimizer = torch.optim.Adam(baseline.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+
+    x = torch.randn(3, 8, device=device, dtype=torch.bfloat16)
+    target = torch.randn(3, 4, device=device, dtype=torch.bfloat16)
+
+    for _ in range(3):
+        baseline_optimizer.zero_grad()
+        optimizer.zero_grad()
+
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x).float(), target.float())
+        loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+        torch.testing.assert_close(loss, baseline_loss, rtol=0, atol=3e-3)
+
+        baseline_loss.backward()
+        loss.backward()
+        baseline_optimizer.step()
+        optimizer.step()
 
 
 def test_microbatch_scopes_child_contexts(distributed_setup):
