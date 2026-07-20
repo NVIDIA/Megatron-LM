@@ -266,7 +266,7 @@ class TestGPTModel:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, model_provider
         )
         dense_model = unwrap_model(dense_model)
         set_bias_value(dense_model)
