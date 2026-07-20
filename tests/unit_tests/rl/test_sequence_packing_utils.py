@@ -541,15 +541,10 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
 @pytest.mark.parametrize(
     "multiple, bin_size, expected_starts, expected_cu_padded, expected_cu",
     [
-        # Back-to-back placement: both boundary arrays equal the legacy single array.
-        pytest.param(
-            1,
-            16,
-            [0, 7, 12],
-            [0, 7, 12, 16, 16, 16],
-            [0, 7, 12, 16, 16, 16],
-            id="legacy_back_to_back",
-        ),
+        # Back-to-back placement: the layout equals the actual boundaries, so the
+        # padded fields stay None (keeps TE off its pad_between_seqs GPU sync,
+        # which would break CUDA graph capture).
+        pytest.param(1, 16, [0, 7, 12], None, [0, 7, 12, 16, 16, 16], id="legacy_back_to_back"),
         # 4-aligned placement (cp=2): lengths 7 and 5 reserve footprints of 8;
         # cu_seqlens_*_padded is the slot grid (with the trailing ghost slot),
         # cu_seqlens_* the real token counts (the ghost keeps its full size).
@@ -563,7 +558,8 @@ def test_sequence_packing_alignment_pipeline(
 ):
     """pack_sequences places each sequence at a seq_length_multiple-aligned offset
     (gaps stay pad tokens with a zero loss mask) and create_packed_seq_params_for_bin
-    turns that placement into the cu_seqlens / cu_seqlens_padded pair."""
+    turns that placement into the cu_seqlens / cu_seqlens_padded pair, materializing
+    the padded boundaries only when alignment makes them differ."""
     tokenizer = MockTokenizer()
     seq_a = torch.cat([torch.arange(1, 6), torch.full((2,), tokenizer.pad)])  # length 5
     seq_b = torch.arange(10, 17)  # length 7, placed first (packer sorts by length)
@@ -604,7 +600,12 @@ def test_sequence_packing_alignment_pipeline(
         device=torch.device('cpu'),
         seq_length_multiple=multiple,
     )
-    assert params.cu_seqlens_q_padded.tolist() == expected_cu_padded
+    if expected_cu_padded is None:
+        assert params.cu_seqlens_q_padded is None
+        assert params.cu_seqlens_kv_padded is None
+    else:
+        assert params.cu_seqlens_q_padded.tolist() == expected_cu_padded
+        assert params.cu_seqlens_kv_padded.tolist() == expected_cu_padded
     assert params.cu_seqlens_q.tolist() == expected_cu
 
 

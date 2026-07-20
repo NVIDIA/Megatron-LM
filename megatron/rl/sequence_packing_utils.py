@@ -402,8 +402,8 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
         qkv_format='thd',
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens,
-        cu_seqlens_kv_padded=cu_seqlens,
+        cu_seqlens_q_padded=None,
+        cu_seqlens_kv_padded=None,
         max_seqlen_q=seq_length,
         max_seqlen_kv=seq_length,
         total_tokens=seq_length,
@@ -505,7 +505,14 @@ def create_packed_seq_params_for_bin(
     )
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
-    cu_seqlens_padded = torch.tensor(cu_seqlens_padded_list, dtype=torch.int32, device=device)
+    if seq_length_multiple > 1:
+        cu_seqlens_padded = torch.tensor(cu_seqlens_padded_list, dtype=torch.int32, device=device)
+    else:
+        assert np.array_equal(cu_seqlens_padded_list, cu_seqlens_list), (
+            f"bin {bin_idx}: padded layout {cu_seqlens_padded_list.tolist()} deviates from "
+            f"actual boundaries {cu_seqlens_list.tolist()} with seq_length_multiple == 1"
+        )
+        cu_seqlens_padded = None
 
     max_seqlen = bin_size
 
