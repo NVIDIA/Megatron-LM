@@ -499,7 +499,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         (it schedules MTP as separate layer nodes); the eager forward leaves it
         ``True`` so the regular MTP forward runs here.
         """
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
@@ -512,6 +512,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if is_spec_decode is None:
             is_spec_decode = (
                 in_inference_mode
+                and inference_context is not None
                 and inference_context.is_dynamic_batching()
                 and inference_context.num_speculative_tokens > 0
             )
@@ -537,11 +538,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
+            if is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation after
                 # speculative token verification.
-                self._decoder_hidden_states_cache = hidden_states
-            else:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    # Block-scope CUDA graph mode replays into a fixed buffer.
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
                 # In training/eval, fold MTP loss into hidden_states.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
@@ -554,12 +563,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
                     cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
 
         sequence_parallel_override = False
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
