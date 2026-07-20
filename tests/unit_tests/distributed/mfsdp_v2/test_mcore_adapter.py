@@ -40,8 +40,8 @@ class TestMcoreAdapter:
 
     def setup_method(self):
         Utils.initialize_model_parallel(1, 1)
-        if torch.distributed.get_world_size() != 2:
-            pytest.skip("MFSDP v2 MCore integration test requires exactly two ranks.")
+        if torch.distributed.get_world_size() < 2:
+            pytest.skip("MFSDP v2 MCore integration test requires at least two ranks.")
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
