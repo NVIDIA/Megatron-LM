@@ -137,15 +137,15 @@ class KVBlockAllocator:
         """Compute number of paused blocks available."""
         return self.paused_count - self.get_paused_used()
 
-    def is_memory_available(self, num_blocks: int, reserved_evictable: int = 0) -> bool:
+    def is_memory_available(self, num_blocks: int, num_evictable_to_exclude: int = 0) -> bool:
         """Check if memory blocks are available.
 
         Includes both free pool blocks and evictable cached blocks (ref_count == 0).
 
         Args:
             num_blocks (int): Number of blocks to check.
-            reserved_evictable (int): Number of currently-evictable cached blocks
-                that must NOT be counted toward availability because the caller
+            num_evictable_to_exclude (int): Number of currently-evictable cached
+                blocks to subtract from the evictable count because the caller
                 will pin them before allocating (e.g. prefix-matched blocks that
                 get their ref counts bumped in add_request). These blocks are
                 ref_count == 0 now, so they are included in the evictable count,
@@ -163,7 +163,7 @@ class KVBlockAllocator:
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
             return False  # RZ: no cached blocks to evict
         # Also count evictable cached blocks, excluding those the caller will pin.
-        evictable_count = int(self.get_evictable_block_count()) - reserved_evictable
+        evictable_count = int(self.get_evictable_block_count()) - num_evictable_to_exclude
         return (self.total_avail + evictable_count) >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
@@ -428,6 +428,26 @@ class KVBlockAllocator:
         # repeated vectorized scatter/gather. Converges in <= max-chain-depth
         # iterations (bounded by prompt_len / block_size); no per-element Python.
         #
+        # Each block is keyed by the maximum timestamp over its subtree (itself
+        # plus all cached descendants). This makes a parent's key >= every one of
+        # its descendants' keys, so ordering by that key ascending never places a
+        # parent before its descendants; depth (deeper first) breaks ties so
+        # children still precede parents at equal key. The first num_blocks_needed
+        # blocks of that order are therefore "descendant closed" — eviction always
+        # peels from the leaves inward and never orphans a cached block.
+        #
+        # Worked example: chain A(hash 10, root, ts 1) -> B(hash 20, ts 2) ->
+        # C(hash 30, ts 3), evicting 2. The subtree-max propagates the leaf's
+        # timestamp up the chain, one hop per iteration:
+        #     iter | A | B | C
+        #     init | 1 | 2 | 3   (own timestamps)
+        #       1  | 2 | 3 | 3   (each child's value scattered onto its parent)
+        #       2  | 3 | 3 | 3   (C's ts=3 reaches A through B)
+        #       3  | 3 | 3 | 3   (no change -> stop)
+        # Final subtree_max = [3,3,3], depth = [0,1,2]. Ordering by
+        # (subtree_max asc, depth desc) breaks the all-3 tie by depth: C(2), B(1),
+        # A(0). The first 2 evict the leaf C and its parent B, retaining the root A.
+        #
         # The iteration count is capped at num_cached. A valid parent graph is a
         # forest, so depth can never exceed num_cached and the loop fixes well
         # before the cap. The cap is a safety bound: were a hash collision to
@@ -435,13 +455,6 @@ class KVBlockAllocator:
         # converge and spin forever. With the cap we stop at a bounded (if
         # arbitrary) ordering instead of hanging; correctness still degrades
         # gracefully to "some valid block set is evicted".
-        #
-        # TODO(perf): this relaxation is O(max_depth) iterations, each O(num_cached)
-        # work — so O(num_cached * max_depth) per eviction. For very long single
-        # chains (e.g. a 1M-token prompt at block_size 256 is ~4k blocks -> ~4k
-        # iterations) this can get expensive under memory pressure. If it shows up
-        # in profiling, switch to pointer-jumping / path-doubling to converge in
-        # O(log max_depth) iterations instead.
         subtree_max = own_ts.clone()
         depth = torch.zeros(num_cached, dtype=torch.int64)
         for _ in range(num_cached):

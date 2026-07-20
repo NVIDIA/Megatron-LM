@@ -353,6 +353,29 @@ def test_evict_lru_cached_child_with_pinned_parent_treated_as_root():
     assert a.evict_lru_blocks(1) is False
 
 
+def test_evict_lru_partial_chain_eviction_peels_from_leaf_keeping_root():
+    """Evicting fewer blocks than a chain's length peels from the leaf end, even
+    when the root is the least-recently-used block.
+
+    Chain A -> B -> C with the root A oldest (ts 1 < 2 < 3); evict 2. Eviction
+    proceeds leaf-first, so C then B are removed and the root A is retained. The
+    retained cache stays descendant-closed (no cached block is left with an
+    evicted parent).
+    """
+    a = _lru_allocator()
+    _seed_cached_chain(
+        a, block_ids=[0, 1, 2], hashes=[10, 20, 30], parents=[0, 10, 20], timestamps=[1, 2, 3]
+    )
+
+    assert a.evict_lru_blocks(2) is True
+    # Leaf C and its parent B are evicted; the root A survives despite being oldest.
+    assert a.kv_hash_to_block_id == {10: 0}
+    assert a.block_hashes[0].item() == 10  # root A retained
+    assert a.block_hashes[1].item() == -1  # B deregistered
+    assert a.block_hashes[2].item() == -1  # C deregistered
+    _assert_prefix_invariant(a)
+
+
 def test_evict_lru_insufficient_cached_blocks_returns_false():
     """When fewer cached blocks exist than requested, eviction fails without
     touching the cache."""
@@ -388,8 +411,8 @@ def test_evict_lru_terminates_on_cyclic_parent_graph():
     assert b.kv_hash_to_block_id == {}
 
 
-def test_is_memory_available_excludes_reserved_evictable():
-    """reserved_evictable removes soon-to-be-pinned cached blocks from the
+def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
+    """num_evictable_to_exclude removes soon-to-be-pinned cached blocks from the
     evictable capacity, so availability matches what allocation can satisfy
     once those blocks (e.g. prefix matches) are pinned."""
     a = _lru_allocator(total_count=6, paused_count=1)
@@ -406,11 +429,11 @@ def test_is_memory_available_excludes_reserved_evictable():
 
     # Both evictable blocks count toward availability by default.
     assert a.is_memory_available(2) is True
-    # Reserving one (it will be pinned) leaves only one usable for the request.
-    assert a.is_memory_available(2, reserved_evictable=1) is False
-    assert a.is_memory_available(1, reserved_evictable=1) is True
-    # Reserving all evictable blocks leaves nothing to satisfy a new block.
-    assert a.is_memory_available(1, reserved_evictable=2) is False
+    # Excluding one (it will be pinned) leaves only one usable for the request.
+    assert a.is_memory_available(2, num_evictable_to_exclude=1) is False
+    assert a.is_memory_available(1, num_evictable_to_exclude=1) is True
+    # Excluding all evictable blocks leaves nothing to satisfy a new block.
+    assert a.is_memory_available(1, num_evictable_to_exclude=2) is False
 
 
 def test_evict_lru_preserves_invariant_under_random_chains():
