@@ -288,6 +288,7 @@ def _1f1b_schedule(
             tensor_shape,
             fwd_recv_buf=_fwd_recv_buf,
             bwd_recv_buf=_bwd_recv_buf,
+            clone_recv=True,
         )
 
     # ── Warmup: pure forward passes ──
@@ -303,7 +304,10 @@ def _1f1b_schedule(
         hidden = out.get("hidden_states")
         loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
-        need_recv_next = not ps.pp_is_first and k < num_warmup - 1
+        # Non-first stages need to prefetch the fwd_input for the next forward:
+        # either the next warmup step (k+1 < num_warmup) or the first steady step
+        # (num_steady > 0). Equivalently: any remaining forward in this iteration.
+        need_recv_next = not ps.pp_is_first and (k + 1) < num_microbatches
         if not ps.pp_is_last:
             fwd_input, _ = _p2p(send_fwd=hidden, recv_fwd=need_recv_next)
         elif need_recv_next:
