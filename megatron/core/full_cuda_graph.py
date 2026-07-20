@@ -111,6 +111,15 @@ class StaticBufferLoader:
     def __init__(self):
         self.stream = torch.cuda.Stream()
 
+    @classmethod
+    def reset(cls):
+        """Drop all static buffers (e.g. between models or tests).
+
+        Only call after the CUDA graphs referencing these buffers have been
+        destroyed via ``FullCudaGraphWrapper.reset_cuda_graph``.
+        """
+        cls.static_buffers = {'training': [], 'validation': []}
+
     def __call__(self, inputs, stage, microbatch):
         assert stage in ['training', 'validation']
         assert microbatch <= len(StaticBufferLoader.static_buffers[stage])
@@ -148,15 +157,61 @@ class FullCudaGraphWrapper:
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
+    capture_signature = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
+    def __init__(
+        self,
+        forward_backward_func,
+        cuda_graph_warmup_steps=1,
+        use_single_mempool=False,
+        batch_preparation_fn=None,
+    ):
+        """
+        Args:
+            forward_backward_func: The pipeline-parallel forward-backward function to wrap.
+            cuda_graph_warmup_steps: Number of eager iterations to run before capture.
+            use_single_mempool: Share one memory pool across full-iter/optimizer captures.
+            batch_preparation_fn: Optional ``fn(data_iterator, vp_stage) -> dict`` hook that
+                canonicalizes one microbatch to graph-static shapes outside the captured
+                region (e.g. THD packed batches). It is called on every rank for every
+                (model chunk, microbatch) pair in the same order — even on ranks whose
+                data_iterator is None — so it may issue collectives such as TP broadcasts.
+        """
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
+        self.batch_preparation_fn = batch_preparation_fn
+
+    def _data_read_with_batch_preparation(self, data_iterator, model, stage, num_microbatches):
+        """Canonicalize each microbatch outside the graph, then load static buffers.
+
+        Every rank receives an iterator of static batches (the preparation
+        function broadcasts data to ranks without a data_iterator), and each
+        (model chunk, microbatch) pair gets its own static buffer slot.
+        """
+        num_chunks = len(model) if isinstance(model, list) else 1
+        if isinstance(data_iterator, list):
+            assert len(data_iterator) == num_chunks
+            iterators = data_iterator
+        else:
+            iterators = [data_iterator] * num_chunks
+        use_vp_stage = isinstance(model, list) and len(model) > 1
+        data_list = []
+        for i in range(num_chunks):
+            chunk_batches = []
+            for b in range(num_microbatches):
+                batch = self.batch_preparation_fn(iterators[i], i if use_vp_stage else None)
+                chunk_batches.append(self.static_loader(batch, stage, i * num_microbatches + b))
+            data_list.append(iter(chunk_batches))
+        return data_list
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
+        if self.batch_preparation_fn is not None:
+            return self._data_read_with_batch_preparation(
+                data_iterator, model, 'training' if training else 'validation', num_microbatches
+            )
         if not isinstance(model, list) or len(model) == 1:
             assert not isinstance(data_iterator, list) or len(data_iterator) == 1
             iterator0 = data_iterator if not isinstance(data_iterator, list) else data_iterator[0]
@@ -207,15 +262,28 @@ class FullCudaGraphWrapper:
 
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
+        training_str = 'training' if training else 'validation'
+
+        # A captured graph bakes in the schedule topology; replaying it with a
+        # different signature would silently reuse stale shapes and buffers.
+        signature = {
+            'num_microbatches': num_microbatches,
+            'num_model_chunks': len(model) if isinstance(model, list) else 1,
+            'seq_length': kwargs.get('seq_length'),
+            'micro_batch_size': kwargs.get('micro_batch_size'),
+            'decoder_seq_length': kwargs.get('decoder_seq_length'),
+        }
+        self._check_capture_signature(training_str, signature)
+
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
 
-        training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             torch.distributed.barrier()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
+            FullCudaGraphWrapper.capture_signature[training_str] = signature
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
             for _, state in get_all_rng_states().items():
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
@@ -240,6 +308,28 @@ class FullCudaGraphWrapper:
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
+    def _check_capture_signature(self, stage, signature):
+        """Refuse to replay a captured graph whose call signature changed."""
+        captured = FullCudaGraphWrapper.capture_signature[stage]
+        if captured is None:
+            # No graph captured for this stage yet; nothing to enforce.
+            return
+        mismatches = {
+            key: (captured[key], signature[key])
+            for key in captured
+            if captured[key] != signature[key]
+        }
+        if mismatches:
+            details = ', '.join(
+                f"{key}: captured={old} vs current={new}" for key, (old, new) in mismatches.items()
+            )
+            raise RuntimeError(
+                f"Full-iteration CUDA graph signature mismatch for {stage} ({details}). "
+                "The captured graph bakes in the schedule topology (e.g. a fixed "
+                "num_microbatches), so these values must stay constant after capture. "
+                "Keep the schedule fixed or reset the graph via reset_cuda_graph()."
+            )
+
     def curr_iter(self, stage):
         """Return current training/validation iteration."""
         return FullCudaGraphWrapper.curr_iteration[stage]
@@ -248,18 +338,21 @@ class FullCudaGraphWrapper:
         """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1
 
-    def reset_cuda_graph(self, stage=None):
-        """Reset CUDA graph."""
-        if stage is None or stage == 'training':
-            if FullCudaGraphWrapper.cuda_graph['training'] is not None:
-                del FullCudaGraphWrapper.cuda_graph['training']
-                FullCudaGraphWrapper.cuda_graph['training'] = None
-            FullCudaGraphWrapper.result['training'] = None
-            FullCudaGraphWrapper.curr_iteration['training'] = 0
-        if stage is None or stage == 'validation':
-            if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
-                del FullCudaGraphWrapper.cuda_graph['validation']
-                FullCudaGraphWrapper.cuda_graph['validation'] = None
-            FullCudaGraphWrapper.result['validation'] = None
-            FullCudaGraphWrapper.curr_iteration['validation'] = 0
+    @classmethod
+    def reset_cuda_graph(cls, stage=None):
+        """Destroy captured CUDA graph(s) and reset the class-level state.
+
+        Must be called before tearing down the process groups whose collectives
+        were captured (e.g. PP P2P): a live graph keeps references to NCCL
+        resources and destroying the communicators first can hang shutdown.
+        """
+        for reset_stage in ('training', 'validation'):
+            if stage is not None and stage != reset_stage:
+                continue
+            if cls.cuda_graph[reset_stage] is not None:
+                del cls.cuda_graph[reset_stage]
+                cls.cuda_graph[reset_stage] = None
+            cls.result[reset_stage] = None
+            cls.curr_iteration[reset_stage] = 0
+            cls.capture_signature[reset_stage] = None
         gc.collect()

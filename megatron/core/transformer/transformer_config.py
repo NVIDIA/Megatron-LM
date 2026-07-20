@@ -3192,6 +3192,37 @@ class TransformerConfig(ModelParallelConfig):
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
+            if self.cuda_graph_impl == "full_iteration":
+                # The full-iteration graph captures the whole forward_backward_func,
+                # so the entire batch path must satisfy the THD static-input
+                # contract: fixed per-rank token capacity, fixed cu_seqlens width,
+                # a fixed num_microbatches per step, and a static CP topology.
+                assert self.sequence_packing_scheduler is not None, (
+                    "THD full-iteration CUDA graph is only supported with a "
+                    "sequence packing scheduler."
+                )
+                assert not self.dynamic_context_parallel, (
+                    "THD full-iteration CUDA graph does not support dynamic context "
+                    "parallel; use a static CP topology."
+                )
+                assert self.max_seqlen_per_dp_cp_rank is not None, (
+                    "THD full-iteration CUDA graph requires --max-seqlen-per-dp-cp-rank "
+                    "to define the static per-rank token capacity."
+                )
+                assert (
+                    self.thd_max_packed_sequences is not None and self.thd_max_packed_sequences > 0
+                ), (
+                    "THD full-iteration CUDA graph requires a positive "
+                    "--thd-max-packed-sequences to define the static cu_seqlens width."
+                )
+                assert not self.mtp_standalone, (
+                    "THD full-iteration CUDA graph does not support standalone MTP: "
+                    "its PP shape handshake is not graph-capturable."
+                )
+                # Batches are canonicalized to the static per-rank token capacity
+                # before entering the graph, so PP communication uses static shapes
+                # instead of the (non-capturable) variable-seq-length handshake.
+                self.thd_static_pp_communication = True
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

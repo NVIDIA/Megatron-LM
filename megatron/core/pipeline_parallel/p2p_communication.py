@@ -319,7 +319,11 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
-        if config.variable_seq_lengths or config.mtp_standalone:
+        # THD full-iteration CUDA graph mode uses static P2P shapes, so the
+        # per-step shape handshake is skipped: it is not graph-capturable.
+        if (
+            config.variable_seq_lengths and not config.thd_static_pp_communication
+        ) or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
@@ -413,9 +417,15 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if (
+            config.batch_p2p_comm
+            and config.batch_p2p_sync
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             # To protect against race condition when using batch_isend_irecv().
-            # User should assert that we have a modern enough PyTorch to not need this
+            # User should assert that we have a modern enough PyTorch to not need this.
+            # Device synchronization is not permitted (nor needed) during CUDA graph
+            # capture: the captured graph fixes the launch ordering at replay.
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs
