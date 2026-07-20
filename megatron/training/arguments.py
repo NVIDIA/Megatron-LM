@@ -536,6 +536,13 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
+            assert getattr(args, 'cuda_graph_impl', 'none') != 'full_iteration' \
+                or not getattr(args, 'rl_training_cuda_graphs', False), (
+                "Sequence packing is incompatible with full-iteration training CUDA "
+                "graphs: per-bin packed_seq_params, index tensors, and per-bin host "
+                "syncs vary across bins, so a captured whole-iteration graph would "
+                "replay bin-0 metadata for every bin."
+            )
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '

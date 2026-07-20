@@ -47,6 +47,13 @@ def apply_mamba_ssm_channel_last_patch():
     except ImportError:
         return
     if not hasattr(_ssd, 'rearrange_and_update_stride'):
+        logger.warning(
+            "mamba_ssm_compat: mamba_ssm %s has no rearrange_and_update_stride "
+            "to patch — the channel-last densification fix did NOT engage. "
+            "Packed/seq_idx mamba runs may fail with 'seq_idx is only supported "
+            "for channel last layout' at misaligned TP/CP geometries.",
+            getattr(mamba_ssm, '__version__', 'unknown'),
+        )
         return
 
     def _channel_last_rearrange_and_update_stride(tensor, pattern=None, dim=2):

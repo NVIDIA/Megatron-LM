@@ -1047,6 +1047,12 @@ def _thd_partitioned_indices(
     Returns an int64 index tensor of shape ``[total_tokens // cp_size]``.
     """
     cu = cu_seqlens_padded.to(dtype=torch.long)
+    # TE's kernel asserts this on-device; the pure-torch mirror would instead
+    # silently produce a non-permutation on out-of-contract input, so trap it.
+    assert bool(((cu % (2 * cp_size)) == 0).all()), (
+        f"every cu_seqlens_padded entry must be divisible by 2*cp_size "
+        f"({2 * cp_size}); got {cu_seqlens_padded.tolist()[:8]}..."
+    )
     local_cu = cu // cp_size
     k = torch.arange(total_tokens // cp_size, device=cu.device)
     # searchsorted(right=True) skips zero-length ghost sequences (repeated
