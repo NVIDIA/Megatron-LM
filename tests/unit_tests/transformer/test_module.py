@@ -8,6 +8,10 @@ from megatron.core.transformer.module import Float16Module, MegatronModule, mark
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+# Seed for the GB200 unit-test lane: launch this module on GB200 hardware
+# (4 GPUs/node) in CI. Extend coverage by adding this marker to other tests.
+pytestmark = pytest.mark.launch_on_gb200
+
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
@@ -51,6 +55,65 @@ class TestMegatronModule:
         # failed_module = megatron_module
         # failed_module.fp16 = True
         # failed_module.bf16 = True
+
+
+class _FirstMicrobatchModule(torch.nn.Module):
+    """Stand-in for a TE module that exposes the is_first_microbatch flag."""
+
+    def __init__(self):
+        super().__init__()
+        self.is_first_microbatch = False
+
+
+class DummyQuantModule(MegatronModule):
+    def __init__(self, config: TransformerConfig):
+        super().__init__(config)
+        self.child = _FirstMicrobatchModule()
+
+    def forward(self, x):
+        return x
+
+
+class TestSetIsFirstMicrobatch:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_module(self, **overrides):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return DummyQuantModule(config=config)
+
+    def test_quant_recipe_sets_flag(self):
+        # quant_recipe alone must enable the flag, even with fp8/fp4/kitchen off.
+        module = self._build_module(quant_recipe=object())
+        assert module.config.fp8 is None
+        assert module.config.fp4 is None
+        assert getattr(module.config, 'use_kitchen', False) is False
+        assert module.config.quant_recipe is not None
+        assert module.child.is_first_microbatch is False
+
+        module.set_is_first_microbatch()
+        assert module.child.is_first_microbatch is True
+
+    def test_no_quant_leaves_flag_untouched(self):
+        # With no quantization mode configured the flag must not be touched.
+        module = self._build_module()
+        assert module.config.fp8 is None
+        assert module.config.fp4 is None
+        assert getattr(module.config, 'use_kitchen', False) is False
+        assert module.config.quant_recipe is None
+        assert module.child.is_first_microbatch is False
+
+        module.set_is_first_microbatch()
+        assert module.child.is_first_microbatch is False
 
 
 class TestFloat16Module:
