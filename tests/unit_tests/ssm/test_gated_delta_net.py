@@ -27,7 +27,7 @@ from megatron.core.ssm.gated_delta_net import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import unwrap_model
+from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
@@ -411,6 +411,303 @@ class TestGatedDeltaNet:
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
 
+    def test_selective_recompute_in_proj_conv_deterministic(self):
+        """Deterministic mode: recompute of the in_proj+conv region is bit-exact
+        vs no-recompute. Hard gate on all architectures."""
+        pg_collection = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+
+        def build_gdn(config):
+            submod = get_experimental_attention_variant_module_spec(config=config).submodules
+            gdn = GatedDeltaNet(
+                config,
+                submodules=submod,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            return gdn.cuda().bfloat16()
+
+        def run(gdn, hs):
+            gdn.zero_grad(set_to_none=True)
+            hs.grad = None
+            output, _ = gdn(hs, None)
+            output.float().sum().backward()
+            grads = {
+                name: p.grad.detach().clone()
+                for name, p in gdn.named_parameters()
+                if p.grad is not None
+            }
+            return output.detach().clone(), grads, hs.grad.detach().clone()
+
+        micro_batch_size = 2
+        seq_length = 64
+        base_config = copy.deepcopy(self.transformer_config)
+        base_config.deterministic_mode = True
+        rec_config = copy.deepcopy(self.transformer_config)
+        rec_config.deterministic_mode = True
+        rec_config.recompute_granularity = "selective"
+        rec_config.recompute_modules = ["gdn_in_proj_conv"]
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (
+                seq_length // self.sp_size // self.cp_size,
+                micro_batch_size,
+                self.gdn.config.hidden_size,
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_in_proj_conv is False
+        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
+        del base_gdn
+        torch.cuda.empty_cache()
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        rec_gdn = build_gdn(rec_config)
+        assert rec_gdn.recompute_in_proj_conv is True
+        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
+        assert torch.equal(rec_input_grad, base_input_grad), f"Input grad not identical ({rank=})"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            assert torch.equal(
+                rec_grads[name], base_grads[name]
+            ), f"Grad not identical for {name} ({rank=})"
+
+    def test_selective_recompute_in_proj_conv_within_kernel_noise(self):
+        """Non-deterministic mode: recompute not add error beyond the kernels'
+        own run-to-run noise. Tolerance is derived per-run from the baseline's
+        measured noise floor, so it stays valid across architectures. The printed
+        deviations double as the per-HW kernel-determinism characterization.
+        """
+        pg_collection = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+
+        def build_gdn(config):
+            submod = get_experimental_attention_variant_module_spec(config=config).submodules
+            gdn = GatedDeltaNet(
+                config,
+                submodules=submod,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            return gdn.cuda().bfloat16()
+
+        def run(gdn, hs):
+            gdn.zero_grad(set_to_none=True)
+            hs.grad = None
+            output, _ = gdn(hs, None)
+            output.float().sum().backward()
+            grads = {
+                name: p.grad.detach().clone()
+                for name, p in gdn.named_parameters()
+                if p.grad is not None
+            }
+            return output.detach().clone(), grads, hs.grad.detach().clone()
+
+        def max_abs(a, b):
+            return (a - b).abs().max().item()
+
+        micro_batch_size = 2
+        seq_length = 64
+        base_config = copy.deepcopy(self.transformer_config)
+        base_config.deterministic_mode = False
+        rec_config = copy.deepcopy(self.transformer_config)
+        rec_config.deterministic_mode = False
+        rec_config.recompute_granularity = "selective"
+        rec_config.recompute_modules = ["gdn_in_proj_conv"]
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (
+                seq_length // self.sp_size // self.cp_size,
+                micro_batch_size,
+                self.gdn.config.hidden_size,
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        # --- Baseline: run N times (NO reseed between runs) to measure the
+        #     kernels' inherent run-to-run noise floor. ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_in_proj_conv is False
+        n_runs = 5
+        base_runs = [run(base_gdn, hidden_states) for _ in range(n_runs)]
+        del base_gdn
+        torch.cuda.empty_cache()
+
+        def pairwise_noise(select):
+            return max(
+                max_abs(select(base_runs[i]), select(base_runs[j]))
+                for i in range(n_runs)
+                for j in range(i + 1, n_runs)
+            )
+
+        out_noise = pairwise_noise(lambda r: r[0])
+        ig_noise = pairwise_noise(lambda r: r[2])
+        grad_noise = {name: pairwise_noise(lambda r, n=name: r[1][n]) for name in base_runs[0][1]}
+
+        # --- Recompute: one run; must fall within the baseline noise floor. ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        rec_gdn = build_gdn(rec_config)
+        assert rec_gdn.recompute_in_proj_conv is True
+        rec_out, rec_grads, rec_ig = run(rec_gdn, hidden_states)
+
+        base_out, base_grads, base_ig = base_runs[0]
+        out_err = max_abs(rec_out, base_out)
+        ig_err = max_abs(rec_ig, base_ig)
+
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            print(
+                f"[in_proj_conv non-det] output: err={out_err:.3e} noise={out_noise:.3e} | "
+                f"input_grad: err={ig_err:.3e} noise={ig_noise:.3e}"
+            )
+
+        assert (
+            out_err <= out_noise
+        ), f"Recompute output exceeds kernel noise: err={out_err:.3e} > noise={out_noise:.3e} ({rank=})"
+        assert (
+            ig_err <= ig_noise
+        ), f"Recompute input-grad exceeds kernel noise: err={ig_err:.3e} > noise={ig_noise:.3e} ({rank=})"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            g_err = max_abs(rec_grads[name], base_grads[name])
+            assert g_err <= grad_noise[name], (
+                f"Recompute grad '{name}' exceeds kernel noise: "
+                f"err={g_err:.3e} > noise={grad_noise[name]:.3e} ({rank=})"
+            )
+
+    def test_in_proj_recompute_with_delay_wgrad(self):
+        """gdn_in_proj recompute must be compatible with delayed weight-grad compute.
+
+        Design-doc §4.1: in_proj recompute reruns the linear's forward during
+        backward, while delay_wgrad_compute defers its weight-grad to an explicit
+        backward_dw() call. Both branches enable delay_wgrad_compute; the only
+        difference is the recompute switch, so any mismatch isolates a
+        recompute-vs-delayed-wgrad interaction (not TE's delay-vs-no-delay numerics).
+        Deterministic mode makes the comparison bitwise.
+        """
+        if not is_te_min_version("2.3.0"):
+            pytest.skip("delay_wgrad_compute requires TransformerEngine >= 2.3.0")
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        def build_gdn(config):
+            gdn_submodules = get_experimental_attention_variant_module_spec(
+                config=config
+            ).submodules
+            gdn = GatedDeltaNet(
+                config,
+                submodules=gdn_submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            return gdn.cuda().bfloat16()
+
+        def run(gdn, hidden_states):
+            output, _ = gdn(hidden_states, None)
+            output.float().sum().backward()
+            # Flush deferred weight grads (no-op when delay_wgrad_compute is off).
+            gdn.backward_dw()
+            grads = {
+                name: param.grad.detach()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            input_grad = hidden_states.grad.detach().clone()
+            return output.detach(), grads, input_grad
+
+        micro_batch_size = 2
+        seq_length = 64
+
+        # Both branches: deterministic + delayed wgrad. Only recompute differs.
+        base_config = copy.deepcopy(self.transformer_config)
+        base_config.deterministic_mode = True
+        base_config.delay_wgrad_compute = True
+
+        rec_config = copy.deepcopy(self.transformer_config)
+        rec_config.deterministic_mode = True
+        rec_config.delay_wgrad_compute = True
+        rec_config.recompute_granularity = "selective"
+        rec_config.recompute_modules = ["gdn_in_proj"]
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (
+                seq_length // self.sp_size // self.cp_size,
+                micro_batch_size,
+                self.gdn.config.hidden_size,
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+
+        # --- Baseline: delayed wgrad, NO recompute ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        base_gdn = build_gdn(base_config)
+        assert base_gdn.recompute_in_proj is False
+        base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
+        hidden_states.grad = None
+        del base_gdn
+        torch.cuda.empty_cache()
+
+        # --- Delayed wgrad + in_proj recompute ---
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        rec_gdn = build_gdn(rec_config)
+        assert rec_gdn.recompute_in_proj is True
+        rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
+        assert torch.equal(rec_input_grad, base_input_grad), f"Input grad not identical ({rank=})"
+        assert set(rec_grads.keys()) == set(base_grads.keys())
+        for name in base_grads:
+            assert torch.equal(
+                rec_grads[name], base_grads[name]
+            ), f"Grad not identical for {name} ({rank=})"
+
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
@@ -682,3 +979,80 @@ class TestFusedThdAllToAll:
         back = self._batched_a2a_hp2cp(mid, cu, self.cp_group)
 
         assert torch.equal(back, local_t), "Batched cp2hp -> hp2cp not identity"
+
+
+# -----gdn selective-recompute config validation tests, cpu only-----
+class TestGDNSelectiveRecomputeConfigValidation:
+    """selective-recompute config validation tests, cpu only."""
+
+    GDN_RECOMPUTE_MODULES = ["gdn_in_proj", "gdn_conv1d", "gdn_gated_delta_rule"]
+
+    @staticmethod
+    def _gdn_recompute_config_kwargs(**overrides):
+        """Minimal kwargs for a valid gated_delta_net TransformerConfig.
+
+        Only the fields required by ``__post_init__`` for the gated_delta_net
+        branch are set; everything else keeps its default. No CUDA / dist state
+        is touched, so this constructs fine on CPU.
+        """
+        kwargs = dict(
+            num_layers=1,
+            hidden_size=2048,
+            num_attention_heads=16,
+            num_query_groups=2,
+            activation_func=F.silu,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+            recompute_granularity="selective",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    @pytest.mark.parametrize("module", GDN_RECOMPUTE_MODULES)
+    def test_gdn_recompute_module_accepted(self, module):
+        """Each new GDN module is accepted with experimental_attention_variant=gdn."""
+        config = TransformerConfig(**self._gdn_recompute_config_kwargs(recompute_modules=[module]))
+        assert module in config.recompute_modules
+
+    def test_gdn_recompute_all_three_accepted(self):
+        """All three switches together are accepted."""
+        config = TransformerConfig(
+            **self._gdn_recompute_config_kwargs(recompute_modules=list(self.GDN_RECOMPUTE_MODULES))
+        )
+        assert set(self.GDN_RECOMPUTE_MODULES).issubset(set(config.recompute_modules))
+
+    def test_gdn_recompute_coexists_with_norm_out(self):
+        """New switches coexist with the pre-existing gdn_norm_out switch."""
+        modules = ["gdn_norm_out", *self.GDN_RECOMPUTE_MODULES]
+        config = TransformerConfig(**self._gdn_recompute_config_kwargs(recompute_modules=modules))
+        assert set(modules).issubset(set(config.recompute_modules))
+
+    @pytest.mark.parametrize("module", GDN_RECOMPUTE_MODULES)
+    def test_gdn_recompute_requires_gated_delta_net(self, module):
+        """Enabling a GDN switch without the gated_delta_net variant raises."""
+        with pytest.raises(
+            ValueError, match="only supported with experimental_attention_variant='gated_delta_net'"
+        ):
+            TransformerConfig(
+                **self._gdn_recompute_config_kwargs(
+                    recompute_modules=[module],
+                    experimental_attention_variant=None,
+                    # Drop gdn-only required fields so the config is otherwise valid.
+                    linear_attention_freq=None,
+                    linear_conv_kernel_dim=None,
+                    linear_key_head_dim=None,
+                    linear_value_head_dim=None,
+                    linear_num_key_heads=None,
+                    linear_num_value_heads=None,
+                )
+            )
+
+    def test_gdn_recompute_rejects_typo(self):
+        """A misspelled module name is caught by the allowed_modules assert."""
+        with pytest.raises(AssertionError, match="Invalid choices for recompute_modules"):
+            TransformerConfig(**self._gdn_recompute_config_kwargs(recompute_modules=["gdn_inproj"]))
