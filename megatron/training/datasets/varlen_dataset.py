@@ -50,6 +50,21 @@ Limitations (raise a clear ``ValueError`` instead of silently mishandling):
 import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
+import torch
+
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.megatron_dataset import LowLevelDataset
+from megatron.core.datasets.utils import Split
+from megatron.training.datasets.sft_dataset import (
+    IGNORE_INDEX,
+    MockSFTDataset,
+    MockSFTLowLevelDataset,
+    SFTDataset,
+    SFTLowLevelDataset,
+)
+from megatron.training.datasets.utils import load_json_arg
+
 # Field-name synonyms (probed in order; first non-empty wins).
 _INSTRUCTION_FIELDS: Tuple[str, ...] = (
     "instruction", "prompt", "query", "question",
@@ -222,3 +237,312 @@ def _select_converter(
         "sharegpt (conversations), openai-messages (messages), "
         "pretrain-text (text)."
     )
+
+
+class VarlenLowLevelDataset(SFTLowLevelDataset):
+    """Low-level loader: HF Hub repo / local parquet / local jsonl, normalized.
+
+    Dataset path interpretation:
+
+      * HF Hub repo id (e.g. ``Yukang/LongAlpaca-12k``) — contains ``/`` and
+        does not exist on the local filesystem; loaded via
+        ``datasets.load_dataset(path, split="train")``.
+      * Local ``.parquet`` — loaded via
+        ``datasets.load_dataset("parquet", data_files=path, split="all")``;
+        parquet's footer schema makes chunked loading safe.
+      * Otherwise local jsonl/json — loaded via pandas
+        ``read_json(lines=True)`` and wrapped in ``Dataset.from_pandas``.
+        We avoid ``datasets.load_dataset("json", ...)`` for local files
+        because its pyarrow-based JSON reader infers schema per parallel
+        chunk and fails with ``CastError`` when the union of fields varies
+        between rows (e.g. LongAlpaca-12k).
+
+    A per-sample converter is selected once at construction time based on
+    column names and applied at access time. The instruction-tuning schemas
+    convert to a messages list; the ``pretrain-text`` fallback returns the raw
+    string instead.
+    """
+
+    def __init__(self, dataset_path: str) -> None:
+        try:
+            from datasets import Dataset, load_dataset
+        except ImportError as exc:
+            raise ImportError(
+                "VarlenDataset requires the `datasets` library "
+                "(pip install datasets)."
+            ) from exc
+
+        if _looks_like_hf_id(dataset_path):
+            self.dataset = load_dataset(dataset_path, split="train")
+        elif dataset_path.endswith(".parquet"):
+            self.dataset = load_dataset(
+                "parquet", data_files=dataset_path, split="all"
+            )
+        else:
+            try:
+                import pandas as pd
+            except ImportError as exc:
+                raise ImportError(
+                    "VarlenDataset requires `pandas` to load local jsonl "
+                    "files (pip install pandas)."
+                ) from exc
+            df = pd.read_json(dataset_path, lines=True)
+            self.dataset = Dataset.from_pandas(df, preserve_index=False)
+
+        self._converter, self._schema_name = _select_converter(
+            list(self.dataset.column_names)
+        )
+
+    @property
+    def schema_name(self) -> str:
+        """Detected schema name: ``alpaca`` / ``sharegpt`` / ``openai-messages`` /
+        ``pretrain-text`` (the raw ``text``-column fallback)."""
+        return self._schema_name
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> List[Dict[str, str]]:
+        return self._converter(self.dataset[idx])
+
+
+class VarlenDataset(SFTDataset):
+    """Variable-length single-sample SFT dataset for the packed-sequence path.
+
+    Each ``__getitem__`` returns **one tokenized conversation** in unpacked
+    form: ``tokens``/``labels``/``loss_mask``/``position_ids`` whose length
+    equals the sample's actual token count (padded to ``pad_granularity``,
+    NOT to ``sequence_length``), plus ``original_seq_len``/``padded_seq_len``
+    tensors that the upstream packing scheduler consumes directly via
+    :func:`get_batch_and_global_seqlens`.
+
+    This is the schema described in :class:`BasePackingScheduler.get_required_sample_keys`.
+    It deliberately skips the multi-conversation pre-packing that
+    :class:`SFTDataset.__getitem__` does, letting the upstream scheduler
+    pack variable-length samples across the DP×CP grid with no per-sample
+    padding waste.
+
+    Truncation: samples longer than ``config.sequence_length`` are truncated
+    on the right; an EOD token is appended if the truncation removed it.
+    """
+
+    def __init__(
+        self,
+        dataset: LowLevelDataset,
+        dataset_path: Optional[str],
+        indices: np.ndarray,
+        num_samples: Optional[int],
+        index_split: Split,
+        config: GPTDatasetConfig,
+    ) -> None:
+        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+
+    @staticmethod
+    def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
+        return len(low_level_dataset)
+
+    @staticmethod
+    def build_low_level_dataset(
+        dataset_path: str, config: GPTDatasetConfig
+    ) -> LowLevelDataset:
+        return VarlenLowLevelDataset(dataset_path)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        tokenizer = self.config.tokenizer
+        max_len = self.config.sequence_length
+        # HuggingFaceTokenizer returns None for ``pad`` when the underlying
+        # tokenizer has no explicit pad token (common for raw pretraining
+        # tokenizers like Qwen3). Fall back to eod for padding — irrelevant
+        # for loss because loss_mask zeros pad positions out.
+        eod = tokenizer.eod
+        pad = tokenizer.pad if tokenizer.pad is not None else eod
+        assert eod is not None, (
+            "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
+        )
+
+        # 1. Pull a single item from the low-level dataset. For SFT schemas
+        #    (alpaca / sharegpt / openai-messages) this is a messages list;
+        #    for the pretrain-text schema it is a raw string.
+        item = self.dataset[int(self.indices[idx % len(self.indices)])]
+
+        assert not self.config.reset_position_ids
+        assert not self.config.create_attention_mask and not self.config.reset_attention_mask
+
+        # 2. Tokenize. SFT schemas go through tokenize_conversation (chat
+        #    template + role-aware target masking); pretrain-text bypasses
+        #    chat templating and uses the plain ``tokenize`` interface,
+        #    treating every token as a target (no prompt masking).
+        if isinstance(item, str):
+            ids = list(tokenizer.tokenize(item))
+            tokens_list = ids
+            targets_list = list(ids)
+        else:
+            tokens, targets = tokenizer.tokenize_conversation(
+                item, return_target=True, add_generation_prompt=False
+            )
+            tokens_list = tokens.tolist()
+            targets_list = targets.tolist()
+
+        # 2b. Guard against an empty tokenization (e.g. a blank ``pretrain-text``
+        #     row where ``tokenizer.tokenize("")`` returns no ids). Represent it
+        #     as a single end-of-document token so the next-token shift still
+        #     yields a valid 1-token sample instead of raising on
+        #     ``tokens_list[-1]`` below or producing a zero-length sequence.
+        if len(tokens_list) == 0:
+            tokens_list = [eod, eod]
+            targets_list = [eod, eod]
+
+        # 3. Right-truncate to ``sequence_length + 1`` (we drop the last token
+        #    after the input/label shift below). Keep an EOD at the end so a
+        #    truncated assistant turn still has a valid stop token.
+        if len(tokens_list) > max_len + 1:
+            tokens_list = tokens_list[: max_len + 1]
+            targets_list = targets_list[: max_len + 1]
+            if tokens_list[-1] != eod:
+                tokens_list[-1] = eod
+                targets_list[-1] = eod
+
+        # 4. Ensure EOD is the last token (unconditional for short samples).
+        if tokens_list[-1] != eod:
+            tokens_list.append(eod)
+            targets_list.append(eod)
+
+        valid_len = len(tokens_list) - 1
+
+        # 5a. SBHD validation mode: right-pad to sequence_length + 1, drop
+        #     packing metadata, return shape [sequence_length]. Useful as a
+        #     numerical reference for THD path verification (no scheduler).
+        if self.config.varlen_sbhd_validation:
+            pad_len = max_len + 1 - len(tokens_list)
+            if pad_len > 0:
+                tokens_list.extend([pad] * pad_len)
+                targets_list.extend([pad] * pad_len)
+            assert len(tokens_list) == max_len + 1
+            input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
+            labels = torch.tensor(targets_list[1:], dtype=torch.int64)
+            loss_mask = torch.ones(max_len, dtype=torch.float32)
+            loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
+            loss_mask[labels == IGNORE_INDEX] = 0.0
+            return {
+                'tokens': input_ids,
+                'labels': labels,
+                'loss_mask': loss_mask,
+                'position_ids': torch.arange(max_len, dtype=torch.int64),
+            }
+
+        original_seq_len = len(tokens_list) - 1  # length after the shift below
+
+        # 5b. THD path: pad to pad_granularity (dp_size * cp_size * 2 * sp),
+        #     the minimum alignment required by CP slicing. We deliberately
+        #     do NOT pad to sequence_length — the upstream packing scheduler
+        #     will combine variable-length samples up to
+        #     max_seqlen_per_dp_cp_rank.
+        pad_granularity = self._calculate_padding_divisor()
+        mod = original_seq_len % pad_granularity
+        if mod != 0:
+            pad_len = pad_granularity - mod
+            tokens_list.extend([pad] * pad_len)
+            targets_list.extend([pad] * pad_len)
+        padded_seq_len = len(tokens_list) - 1
+
+        # 6. Apply the next-token shift.
+        input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
+        labels = torch.tensor(targets_list[1:], dtype=torch.int64)
+        position_ids = torch.arange(padded_seq_len, dtype=torch.int64)
+        loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
+        loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
+        loss_mask[labels == IGNORE_INDEX] = 0.0
+
+        return {
+            'tokens': input_ids,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            # The packing scheduler consumes these directly; cu_seqlens /
+            # max_seqlen are produced downstream in _pack_sequences.
+            'original_seq_len': torch.tensor([original_seq_len], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([padded_seq_len], dtype=torch.int32),
+        }
+
+
+class MockVarlenDataset(MockSFTDataset):
+    """Mock variable-length dataset for benchmarking the varlen path.
+
+    Uses :class:`MockSFTLowLevelDataset` for sequence-length sampling (lognormal
+    distribution / per-line CSV / IndexedDataset verification mode — same JSON
+    schema as ``--sft-mock-dataset-config-json``, just consumed via
+    ``--varlen-mock-dataset-config-json``).
+
+    Output shape mirrors :class:`VarlenDataset.__getitem__` (not the inherited
+    :meth:`MockSFTDataset.__getitem__`) so the mock and real-data paths
+    exercise exactly the same downstream pipeline:
+
+      * THD mode: emits **one unpacked sample** padded to ``pad_granularity``
+        with ``original_seq_len`` / ``padded_seq_len`` tensors. The upstream
+        scheduler packs across the DP×CP grid.
+
+    ``--varlen-sbhd-validation`` is intentionally not implemented for mock
+    data; it is guarded against in argument validation.
+    """
+
+    @staticmethod
+    def build_low_level_dataset(
+        dataset_path: str, config: GPTDatasetConfig
+    ) -> LowLevelDataset:
+        if config.varlen_mock_dataset_config_json is None:
+            mock_config = {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": config.sequence_length // 2,
+                "max_seq_len": config.sequence_length,
+                "mean_seq_len": config.sequence_length // 4 * 3,
+                "lognormal_sigma": 1.1,
+            }
+        else:
+            mock_config = load_json_arg(config.varlen_mock_dataset_config_json)
+        return MockSFTLowLevelDataset(**mock_config)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        tokenizer = self.config.tokenizer
+        max_len = self.config.sequence_length
+        eod = tokenizer.eod
+        pad = tokenizer.pad if tokenizer.pad is not None else eod
+
+        # MockSFTLowLevelDataset returns ``length - 1`` token ids; append EOD
+        # to make the conversation end on a stop token, mirroring the real
+        # VarlenDataset path.
+        raw = self.dataset[int(self.indices[idx % len(self.indices)])]
+        tokens_list = raw.tolist()
+        tokens_list.append(eod)
+        # Mock data uses ``tokens == targets`` (no role masking).
+        targets_list = list(tokens_list)
+
+        # MockVarlenDataset only implements the THD (packed) path; SBHD
+        # validation is a real-data numerical-reference mode (guarded against
+        # --mock-data in validate_args).
+        # THD mode: unpacked single sample, pad to pad_granularity only.
+        if len(tokens_list) > max_len + 1:
+            tokens_list = tokens_list[: max_len - 1] + [eod]
+            targets_list = targets_list[: max_len - 1] + [eod]
+        original_seq_len = len(tokens_list) - 1
+
+        pad_granularity = self._calculate_padding_divisor()
+        mod = original_seq_len % pad_granularity
+        if mod != 0:
+            pad_len = pad_granularity - mod
+            tokens_list.extend([pad] * pad_len)
+            targets_list.extend([pad] * pad_len)
+        padded_seq_len = len(tokens_list) - 1
+
+        input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
+        labels = torch.tensor(targets_list[1:], dtype=torch.int64)
+        loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
+        loss_mask[original_seq_len:] = 0.0  # mask the right-padded tail by position
+        return {
+            'tokens': input_ids,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': torch.arange(padded_seq_len, dtype=torch.int64),
+            'original_seq_len': torch.tensor([original_seq_len], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([padded_seq_len], dtype=torch.int32),
+        }
