@@ -27,11 +27,14 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     FusedIndexerSparseAttnFromTopkFunc,
+    THDCompactIndexerWorkspace,
     batch_of_row,
     build_flat_topk_idxs,
     dsa_sparse_attn,
     fused_indexer_sparse_attn,
     indexer_topk,
+    prepare_thd_compact_indexer_workspace,
+    thd_compact_indexer_available,
 )
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -1549,9 +1552,96 @@ class CompressedSparseAttention(MegatronModule):
         else:
             self.indexer = None
 
+        # Compact THD CUDA graphs reference caller-owned cuDNN buffers by
+        # address. Retain every warmed-up geometry for the lifetime of this
+        # module so later graph captures cannot invalidate an earlier graph's
+        # storage. ``_active_*`` identifies the immediately preceding warmup.
+        self._thd_compact_indexer_workspaces: list[THDCompactIndexerWorkspace] = []
+        self._active_thd_compact_indexer_workspace: THDCompactIndexerWorkspace | None = None
+
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
+
+    def _get_thd_compact_indexer_workspace(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        topk: int,
+        ratio: int,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        q_causal_offsets: torch.Tensor | None = None,
+        return_softmax: bool = False,
+    ) -> THDCompactIndexerWorkspace | None:
+        """Return persistent compact storage for a warmed-up THD graph geometry.
+
+        Workspace sizing synchronizes with the host, so it is performed only
+        during eager CUDA-graph warmup. Capture reuses the active workspace;
+        when warmup was skipped or static shapes changed, capture must fail
+        clearly. Unsupported devices/frontends retain the non-compact path.
+        """
+        if self.config.cuda_graph_impl == "none" or not thd_compact_indexer_available(q, k):
+            return None
+
+        capturing = torch.cuda.is_current_stream_capturing()
+        workspace = self._active_thd_compact_indexer_workspace
+        if capturing:
+            if workspace is not None and workspace.matches(
+                q=q,
+                k=k,
+                topk=topk,
+                ratio=ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+                return_softmax=return_softmax,
+                check_sequence_values=False,
+            ):
+                return workspace
+            raise ValueError(
+                "THD compact CUDA graph capture requires an eagerly prepared compact "
+                "workspace for the active packed geometry. Run eager warmup before capture."
+            )
+
+        for workspace in self._thd_compact_indexer_workspaces:
+            if workspace.matches(
+                q=q,
+                k=k,
+                topk=topk,
+                ratio=ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                q_causal_offsets=q_causal_offsets,
+                return_softmax=return_softmax,
+                check_sequence_values=True,
+            ):
+                self._active_thd_compact_indexer_workspace = workspace
+                return workspace
+
+        workspace = prepare_thd_compact_indexer_workspace(
+            q,
+            k,
+            topk=topk,
+            ratio=ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            return_softmax=return_softmax,
+        )
+        self._active_thd_compact_indexer_workspace = workspace
+        if workspace is not None:
+            self._thd_compact_indexer_workspaces.append(workspace)
+        return workspace
 
     def _build_kv_full(
         self, kv: torch.Tensor, x: torch.Tensor
@@ -2142,6 +2232,16 @@ class CompressedSparseAttention(MegatronModule):
             topk_indices_cmp = torch.full((total_q, 0), -1, dtype=torch.int32, device=query.device)
         else:
             k_thd = k_indexer.squeeze(1)
+            compact_workspace = self._get_thd_compact_indexer_workspace(
+                q_thd,
+                k_thd,
+                topk=self.indexer.index_topk,
+                ratio=self.compress_ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_compressed_idx,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_compressed_idx,
+            )
             topk_indices_cmp, _ = indexer_topk(
                 q_thd,
                 k_thd,
@@ -2153,6 +2253,7 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens_kv=cu_seqlens_compressed_idx,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_compressed_idx,
+                compact_workspace=compact_workspace,
             )
 
         # Shift into per-segment full-KV index space.
@@ -2228,6 +2329,20 @@ class CompressedSparseAttention(MegatronModule):
         w_thd = weights_indexer.squeeze(1)
         k_thd = k_indexer.squeeze(1)
 
+        compact_workspace = None
+        if sparse_loss:
+            compact_workspace = self._get_thd_compact_indexer_workspace(
+                q_thd,
+                k_thd,
+                topk=self.indexer.index_topk,
+                ratio=self.compress_ratio,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_compressed_idx,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_compressed_idx,
+                return_softmax=True,
+            )
+
         # Supply unpadded cu_seqlens so padding rows are excluded from
         # the indexer KL loss (mirrors the unfused path's cu_seqlens_q_for_loss).
         # Only pass when they actually differ (by reference or storage) to avoid
@@ -2265,6 +2380,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_kv=compressed_kv,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
             cu_seqlens_q_unpadded=cu_seqlens_q_unpadded,
+            compact_workspace=compact_workspace,
         )
 
         if indexer_loss_coeff > 0:

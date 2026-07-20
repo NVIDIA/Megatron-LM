@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -1728,6 +1728,136 @@ class TestCompressedSparseAttentionThd:
         qr = torch.randn(total, 1, self.config.q_lora_rank, dtype=torch.bfloat16, device='cuda')
         packed = _make_packed_seq_params_thd(seg_lens)
         return query, key, value, x, qr, packed
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_compact_workspace_prepared_in_warmup_and_reused_in_capture(self):
+        """CUDA capture reuses warmup-owned storage without running the sizing helper."""
+        csa = self._build_csa(compress_ratio=4)
+        previous_cuda_graph_impl = csa.config.cuda_graph_impl
+        csa.config.cuda_graph_impl = "local"
+        q = torch.empty(8, 64, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(2, 128, dtype=torch.bfloat16, device="cuda")
+        cu_q = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+        workspace = MagicMock()
+        workspace.matches.return_value = True
+
+        try:
+            with (
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "thd_compact_indexer_available",
+                    return_value=True,
+                ),
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "prepare_thd_compact_indexer_workspace",
+                    return_value=workspace,
+                ) as prepare_workspace,
+                patch.object(torch.cuda, "is_current_stream_capturing", side_effect=[False, True]),
+            ):
+                warmup_workspace = csa._get_thd_compact_indexer_workspace(
+                    q,
+                    k,
+                    topk=8,
+                    ratio=4,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_k=cu_k,
+                    max_seqlen_q=8,
+                    max_seqlen_k=2,
+                )
+                capture_workspace = csa._get_thd_compact_indexer_workspace(
+                    q,
+                    k,
+                    topk=8,
+                    ratio=4,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_k=cu_k,
+                    max_seqlen_q=8,
+                    max_seqlen_k=2,
+                )
+
+            assert warmup_workspace is workspace
+            assert capture_workspace is workspace
+            assert csa._thd_compact_indexer_workspaces == [workspace]
+            prepare_workspace.assert_called_once()
+            workspace.matches.assert_called_once()
+        finally:
+            csa.config.cuda_graph_impl = previous_cuda_graph_impl
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_compact_workspace_capture_requires_matching_warmup(self):
+        """Capture must fail clearly when eager warmup did not seed a matching workspace."""
+        csa = self._build_csa(compress_ratio=4)
+        previous_cuda_graph_impl = csa.config.cuda_graph_impl
+        csa.config.cuda_graph_impl = "local"
+        q = torch.empty(8, 64, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(2, 128, dtype=torch.bfloat16, device="cuda")
+        cu_q = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+
+        try:
+            with (
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "thd_compact_indexer_available",
+                    return_value=True,
+                ),
+                patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+            ):
+                with pytest.raises(ValueError, match="Run eager warmup before capture"):
+                    csa._get_thd_compact_indexer_workspace(
+                        q,
+                        k,
+                        topk=8,
+                        ratio=4,
+                        cu_seqlens_q=cu_q,
+                        cu_seqlens_k=cu_k,
+                        max_seqlen_q=8,
+                        max_seqlen_k=2,
+                    )
+        finally:
+            csa.config.cuda_graph_impl = previous_cuda_graph_impl
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_compact_workspace_unavailable_keeps_dense_fallback(self):
+        """Capture needs no compact workspace when the compact kernel cannot dispatch."""
+        csa = self._build_csa(compress_ratio=4)
+        previous_cuda_graph_impl = csa.config.cuda_graph_impl
+        csa.config.cuda_graph_impl = "local"
+        q = torch.empty(8, 64, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(2, 128, dtype=torch.bfloat16, device="cuda")
+        cu_q = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+        cu_k = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+
+        try:
+            with (
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "thd_compact_indexer_available",
+                    return_value=False,
+                ),
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "prepare_thd_compact_indexer_workspace"
+                ) as prepare_workspace,
+                patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+            ):
+                workspace = csa._get_thd_compact_indexer_workspace(
+                    q,
+                    k,
+                    topk=8,
+                    ratio=4,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_k=cu_k,
+                    max_seqlen_q=8,
+                    max_seqlen_k=2,
+                )
+
+            assert workspace is None
+            prepare_workspace.assert_not_called()
+        finally:
+            csa.config.cuda_graph_impl = previous_cuda_graph_impl
 
     # ---- Path A (compress_ratio=128: indexer disabled, all-compressed) ----
 
