@@ -76,7 +76,7 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, cp_partition_mode="zigzag"):
     """Generate a batch."""
 
     batch_keys = [
@@ -124,6 +124,7 @@ def get_batch(data_iterator, vp_stage=None):
             vp_stage=vp_stage,
             dynamic_cp=is_dynamic_cp,
             config=config,
+            cp_partition_mode=cp_partition_mode,
         )
         return (
             attention_mask,
@@ -199,6 +200,7 @@ def get_batch(data_iterator, vp_stage=None):
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        cp_partition_mode=cp_partition_mode,
     )
 
     # Return values in a fixed order so callers can unpack them even when
@@ -287,6 +289,7 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        cp_partition_mode = get_attr_wrapped_model(model, "get_input_cp_partition_mode")()
         (
             attention_mask,
             cu_seqlens,
@@ -300,7 +303,7 @@ def forward_step(data_iterator, model: HybridModel):
             tokens,
             padding_mask,
             packed_seq_params,
-        ) = get_batch(data_iterator, vp_stage)
+        ) = get_batch(data_iterator, vp_stage, cp_partition_mode=cp_partition_mode)
 
     if packed_seq_params is not None:
         if packed_seq_params.cu_seqlens_q is not None:
@@ -327,6 +330,7 @@ def forward_step(data_iterator, model: HybridModel):
             cp_group=hybrid_cp_group,
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
+            cp_partition_mode=cp_partition_mode,
         )
 
     timers('batch-generator').stop()

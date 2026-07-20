@@ -1302,6 +1302,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
                 mtp_layer_number=self.layer_number,
+                cp_stage_entry_partition_mode="zigzag",
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:

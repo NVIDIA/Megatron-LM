@@ -55,10 +55,39 @@ def checkpointed_forward(
         def custom_forward(
             hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
         ):
+            current_partition_mode = (
+                self.get_cp_partition_mode_before_local_index(start)
+                if hasattr(self, "get_cp_partition_mode_before_local_index")
+                else None
+            )
+            local_packed_seq_params = packed_seq_params
+            local_input_ids = input_ids
+            if current_partition_mode is not None:
+                local_packed_seq_params = self._replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, current_partition_mode
+                )
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
+                if current_partition_mode is not None:
+                    (
+                        hidden_states,
+                        rotary_pos_emb,
+                        padding_mask,
+                        local_input_ids,
+                        local_packed_seq_params,
+                        current_partition_mode,
+                    ) = self._convert_cp_partition_mode_for_layer(
+                        local_index=index,
+                        current_partition_mode=current_partition_mode,
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        packed_seq_params=local_packed_seq_params,
+                        padding_mask=padding_mask,
+                        input_ids=local_input_ids,
+                    )
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -87,12 +116,16 @@ def checkpointed_forward(
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     inference_context=None,
-                    packed_seq_params=packed_seq_params,
+                    packed_seq_params=local_packed_seq_params,
                     padding_mask=padding_mask,
-                    input_ids=input_ids,
+                    input_ids=local_input_ids,
                 )
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
+                        hidden_states, context = layer(**layer_kwargs)
+                    elif layer.__class__.__name__ == "HyperConnectionHybridLayer":
+                        for k in ("context", "context_mask", "attention_bias"):
+                            layer_kwargs.pop(k, None)
                         hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (

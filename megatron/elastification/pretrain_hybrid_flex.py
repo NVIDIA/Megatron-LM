@@ -12,6 +12,9 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    get_hybrid_stage_input_cp_partition_mode_for_stage,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
@@ -26,7 +29,6 @@ from megatron.core.parallel_state import (
     get_dynamic_data_context_parallel_groups,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -155,6 +157,15 @@ def model_provider(
     else:
         raise ValueError("You must provide a valid Mamba layer spec!")
 
+    cp_stage_entry_partition_mode = get_hybrid_stage_input_cp_partition_mode_for_stage(
+        config,
+        args.hybrid_layer_pattern,
+        parallel_state.get_pipeline_model_parallel_group(check_initialized=False),
+        vp_stage,
+        first_stage_layers=config.num_layers_in_first_pipeline_stage,
+        last_stage_layers=config.num_layers_in_last_pipeline_stage,
+    )
+
     model = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
@@ -170,6 +181,7 @@ def model_provider(
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
         vp_stage=vp_stage,
+        cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
     )
     from megatron.elastification.flextron_utils import (
         inject_flextron_forward_logic,

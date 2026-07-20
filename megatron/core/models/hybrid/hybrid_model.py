@@ -3,17 +3,26 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel_layout import (
+    CpPartitionMode,
+    convert_cp_partition_mode_nested,
+    get_or_build_thd_cp_partition_route,
+    get_packed_seq_params_cp_partition_cu_seqlens,
+    prebuild_thd_cp_partition_route_cache,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -98,6 +107,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
         vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
+        cp_stage_entry_partition_mode (str, optional): CP partition mode expected at this
+            stage input. Required when context parallelism is enabled. Defaults to None.
     """
 
     def __init__(
@@ -123,6 +134,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -210,7 +222,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
             **logging_pg_kwargs,
         )
-
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
             self.mtp_pattern is not None
@@ -282,6 +293,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
             name="decoder",
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -347,6 +359,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
+
+    def get_input_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode used for this model chunk's batch tensors."""
+        return self.decoder.get_input_cp_partition_mode()
+
+    def get_output_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode produced by this model chunk's decoder."""
+        return self.decoder.get_stage_exit_cp_partition_mode()
 
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
@@ -444,6 +464,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        thd_cp_full_iter_cuda_graph = (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and self.config.context_parallel_size > 1
+            and self.config.cuda_graph_impl == "full_iteration"
+        )
+        # TODO: Use GIN to make A2A CP layout routing compatible with full-iteration CUDA graph
+        # capture.
+        assert not thd_cp_full_iter_cuda_graph, (
+            "Full-iteration CUDA graph is not supported with THD context parallelism "
+            "for HybridModel."
+        )
+
+        prebuild_thd_cp_partition_route_cache(
+            packed_seq_params, resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        )
+
         in_inference_mode = InferenceMode.is_active()
 
         if in_inference_mode:
@@ -477,6 +514,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
+        cp_partition_mode = self.get_input_cp_partition_mode()
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -484,6 +522,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                cp_partition_mode=cp_partition_mode,
             )
         elif self.position_embedding_type == 'yarn':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -493,6 +533,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                cp_partition_mode=cp_partition_mode,
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -538,10 +580,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states = decoder_output
             mhc_multistream = None
 
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
         # Check if speculative decoding is active. When it is, MTP must be
         # computed *after* verification so that it is conditioned on verified
         # tokens rather than stale speculative tokens from the previous step.
@@ -551,6 +589,97 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        needs_batch_layout = self.post_process or (
+            self.mtp_process and not (in_inference_mode or is_spec_decode)
+        )
+        if needs_batch_layout:
+            target_partition_mode = self.get_input_cp_partition_mode()
+            input_partition_mode = target_partition_mode
+            current_partition_mode = self.get_output_cp_partition_mode()
+            cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            cu_seqlens = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
+            if self.config.mtp_num_layers:
+                if cp_group is not None and cp_group.size() > 1:
+                    target_partition_mode = "zigzag"
+            hidden_thd_cp_partition_route = get_or_build_thd_cp_partition_route(
+                packed_seq_params,
+                cp_group,
+                current_partition_mode,
+                target_partition_mode,
+                cu_seqlens=cu_seqlens,
+                device=hidden_states.device,
+            )
+            hidden_conversion_kwargs = {
+                "source_partition_mode": current_partition_mode,
+                "target_partition_mode": target_partition_mode,
+                "cu_seqlens": cu_seqlens,
+                "sequence_parallel": self.config.sequence_parallel,
+                "tp_group": self.pg_collection.tp,
+                "tp_cp_group": getattr(self.pg_collection, "tp_cp", None),
+                "thd_cp_partition_route": hidden_thd_cp_partition_route,
+            }
+            hidden_states = convert_cp_partition_mode_nested(
+                hidden_states,
+                cp_group,
+                seq_dim=0,
+                **hidden_conversion_kwargs,
+            )
+            if mhc_multistream is not None:
+                mhc_multistream = convert_cp_partition_mode_nested(
+                    mhc_multistream,
+                    cp_group,
+                    seq_dim=0,
+                    **hidden_conversion_kwargs,
+                )
+            if input_partition_mode != target_partition_mode:
+                if attention_mask is not None:
+                    raise NotImplementedError(
+                        "Changing CP partition mode for MTP with an explicit attention_mask "
+                        "is not supported yet."
+                    )
+
+                cp_conversion_kwargs = {
+                    "source_partition_mode": input_partition_mode,
+                    "target_partition_mode": target_partition_mode,
+                    "cu_seqlens": cu_seqlens,
+                    "thd_cp_partition_route": get_or_build_thd_cp_partition_route(
+                        packed_seq_params,
+                        cp_group,
+                        input_partition_mode,
+                        target_partition_mode,
+                        cu_seqlens=cu_seqlens,
+                        device=hidden_states.device,
+                    ),
+                }
+                input_ids = convert_cp_partition_mode_nested(
+                    input_ids, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                position_ids = convert_cp_partition_mode_nested(
+                    position_ids, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                labels = convert_cp_partition_mode_nested(
+                    labels, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                loss_mask = convert_cp_partition_mode_nested(
+                    loss_mask, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                padding_mask = convert_cp_partition_mode_nested(
+                    padding_mask, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                # THD RoPE tables stay in global packed-token order; only SBHD
+                # RoPE tensors are CP-rank local and need layout conversion.
+                if packed_seq_params is None:
+                    rotary_pos_emb = convert_cp_partition_mode_nested(
+                        rotary_pos_emb, cp_group, seq_dim=0, **cp_conversion_kwargs
+                    )
+                packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, target_partition_mode
+                )
 
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
         if mtp_forward_ran:
@@ -577,6 +706,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
+                mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -587,7 +717,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
