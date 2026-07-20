@@ -629,6 +629,7 @@ class TestHybridBlock:
             Symbols.MLP * 5,
             Symbols.ATTENTION + Symbols.MLP + Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
             Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
+            "[*-]",
         ],
     )
     def test_recompute(self, recompute_kwargs: dict, layer_pattern: str):

@@ -524,6 +524,7 @@ class HybridStack(MegatronModule):
         padding_mask=None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        _checkpointed_forward_in_parent: bool = False,
     ):
         """
         Forward function of the HybridStack class.
@@ -544,6 +545,9 @@ class HybridStack(MegatronModule):
                 fused-rope inference paths). Defaults to None.
             sequence_len_offset (Tensor, optional): precomputed per-sample sequence offsets
                 for static-batching inference. Computed here when None.
+            _checkpointed_forward_in_parent (bool): set by ``checkpointed_forward`` when the
+                enclosing stack already checkpoints this nested group stack, so the group
+                must not checkpoint its layers a second time.
         Returns:
             Tensor: the output tensor.
         """
@@ -644,7 +648,11 @@ class HybridStack(MegatronModule):
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
 
         with outer_fp8_context:
-            if self.config.recompute_granularity == 'full' and self.training:
+            if (
+                self.config.recompute_granularity == 'full'
+                and self.training
+                and not _checkpointed_forward_in_parent
+            ):
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,
@@ -658,6 +666,8 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                    packed_seq_params_by_layout=packed_seq_params_by_layout,
+                    cp_layout_plan=cp_layout_plan,
                 )
             else:
                 for layer_idx, (layer_config, layer) in enumerate(
