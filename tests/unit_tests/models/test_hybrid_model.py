@@ -23,10 +23,147 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_loggin
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def _make_postprocess_stub(config, training):
+    """Build the minimal model surface needed by ``HybridModel._postprocess``."""
+
+    def output_layer(hidden_states, weight=None, runtime_gather_output=None):
+        return hidden_states, None
+
+    output_layer.sequence_parallel = False
+    pg_collection = SimpleNamespace(cp=object(), tp=object())
+    return SimpleNamespace(
+        config=config,
+        training=training,
+        post_process=True,
+        mtp_process=True,
+        share_embeddings_and_output_weights=False,
+        output_layer=output_layer,
+        pg_collection=pg_collection,
+        tp_group=pg_collection.tp,
+        _scale_logits=lambda logits: logits,
+        compute_language_model_loss=lambda labels, logits: logits,
+    )
+
+
+@pytest.mark.parametrize(
+    "cuda_graph_scope", [InferenceCudaGraphScope.none, InferenceCudaGraphScope.block]
+)
+def test_hybrid_postprocess_caches_spec_decode_hidden_states(cuda_graph_scope):
+    """Speculative decoding publishes decoder states through the inference context."""
+    hidden_states = torch.randn(3, 2, 8)
+    context_buffer = (
+        torch.full((5, 2, 8), -1.0) if cuda_graph_scope == InferenceCudaGraphScope.block else None
+    )
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        num_speculative_tokens=1,
+        mtp_decoder_hidden_states=context_buffer,
+        is_dynamic_batching=lambda: True,
+        is_static_batching=lambda: False,
+    )
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=1, inference_cuda_graph_scope=cuda_graph_scope, use_mup=False
+        ),
+        training=False,
+    )
+
+    with InferenceMode.active():
+        output = HybridModel._postprocess(
+            model,
+            hidden_states=hidden_states,
+            input_ids=torch.zeros(2, 3, dtype=torch.long),
+            position_ids=torch.zeros(2, 3, dtype=torch.long),
+            labels=None,
+            rotary_pos_emb=None,
+            mtp_in_postprocess=False,
+            runtime_gather_output=True,
+            inference_context=inference_context,
+        )
+
+    torch.testing.assert_close(output, hidden_states.transpose(0, 1), rtol=0, atol=0)
+    if cuda_graph_scope == InferenceCudaGraphScope.block:
+        assert inference_context.mtp_decoder_hidden_states is context_buffer
+        torch.testing.assert_close(context_buffer[:3], hidden_states, rtol=0, atol=0)
+        assert torch.all(context_buffer[3:] == -1)
+    else:
+        assert inference_context.mtp_decoder_hidden_states is hidden_states
+    assert not hasattr(model, "_decoder_hidden_states_cache")
+
+
+def test_hybrid_postprocess_does_not_cache_regular_inference_hidden_states():
+    """Regular inference must not make the controller run serial MTP decoding."""
+    hidden_states = torch.randn(3, 2, 8)
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        num_speculative_tokens=0,
+        mtp_decoder_hidden_states=None,
+        is_dynamic_batching=lambda: True,
+        is_static_batching=lambda: False,
+    )
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=1, inference_cuda_graph_scope=InferenceCudaGraphScope.none, use_mup=False
+        ),
+        training=False,
+    )
+
+    with InferenceMode.active():
+        HybridModel._postprocess(
+            model,
+            hidden_states=hidden_states,
+            input_ids=torch.zeros(2, 3, dtype=torch.long),
+            position_ids=torch.zeros(2, 3, dtype=torch.long),
+            labels=None,
+            rotary_pos_emb=None,
+            mtp_in_postprocess=False,
+            runtime_gather_output=True,
+            inference_context=inference_context,
+        )
+
+    assert inference_context.mtp_decoder_hidden_states is None
+    assert not hasattr(model, "_decoder_hidden_states_cache")
+
+
+def test_hybrid_postprocess_forwards_rl_mtp_inputs(monkeypatch):
+    """RL MTP loss receives token IDs and the TP group needed to derive labels."""
+    captured_kwargs = {}
+
+    def fake_process_mtp_loss(**kwargs):
+        captured_kwargs.update(kwargs)
+        return kwargs["hidden_states"][:2]
+
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.process_mtp_loss", fake_process_mtp_loss
+    )
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=1, inference_cuda_graph_scope=InferenceCudaGraphScope.none, use_mup=False
+        ),
+        training=True,
+    )
+    input_ids = torch.arange(4, dtype=torch.long).reshape(1, 4)
+
+    HybridModel._postprocess(
+        model,
+        hidden_states=torch.randn(4, 1, 8),
+        input_ids=input_ids,
+        position_ids=torch.arange(4, dtype=torch.long).reshape(1, 4),
+        labels=None,
+        rotary_pos_emb=None,
+        mtp_in_postprocess=False,
+        runtime_gather_output=False,
+        inference_context=None,
+    )
+
+    assert captured_kwargs["input_ids"] is input_ids
+    assert captured_kwargs["tp_group"] is model.tp_group
 
 
 def test_hybrid_logging_process_groups_are_paired():
