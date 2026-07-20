@@ -208,9 +208,7 @@ test:unit_tests_notify:
     paths:
       - scripts
   rules:
-    # TEMPORARY: Notify for every pipeline that creates unit-test children,
-    # regardless of branch name or pipeline source.
-    - if: $UNIT_TEST == "yes" && $UNIT_TEST_REPEAT != "0"
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || $CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")
       when: always
     - when: never
 

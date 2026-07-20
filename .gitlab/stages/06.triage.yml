@@ -1,9 +1,9 @@
 .linear_reconcile_rules:
   rules:
-    # TEMPORARY: Create the reconciliation job for every functional pipeline.
-    # The command reports missing credentials/configuration explicitly instead
-    # of silently excluding the job at pipeline creation time.
-    - if: $FUNCTIONAL_TEST == "yes" && $RUN_LINEAR_STATUS == "True"
+    - if: >-
+        ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") &&
+        $FUNCTIONAL_TEST == "yes" &&
+        $RUN_LINEAR_STATUS == "True"
       when: always
     - when: never
 
@@ -61,9 +61,8 @@ triage:linear_write:
       - linear_action_plan_post.json
       - linear_status_report.json
   rules:
-    # TEMPORARY: Apply the Linear plan for every functional pipeline, including
-    # pipelines already failed by functional test jobs.
     - if: >-
+        ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") &&
         $FUNCTIONAL_TEST == "yes" &&
         $RUN_LINEAR_STATUS == "True" &&
         $RUN_LINEAR_WRITE == "True"
@@ -88,6 +87,7 @@ triage:slack_linear_followup:
   rules:
     # Post the applied Linear actions under the functional-test notification.
     - if: >-
+        ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") &&
         $FUNCTIONAL_TEST == "yes" &&
         $RUN_LINEAR_STATUS == "True" &&
         $RUN_LINEAR_WRITE == "True"

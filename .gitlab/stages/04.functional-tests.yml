@@ -460,9 +460,7 @@ functional:smoke_notify:
   rules:
     - if: $BUILD == "no"
       when: never
-    # Notify for every pipeline that creates smoke children, regardless of
-    # branch name or pipeline source.
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")
       when: always
     - when: never
 
@@ -517,9 +515,7 @@ functional:x_notify:
       - failure_buckets.json
       - slack_notification.json
   rules:
-    # Notify for every functional pipeline, regardless of branch name or
-    # pipeline source.
-    - if: $FUNCTIONAL_TEST == "yes"
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 
