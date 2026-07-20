@@ -460,7 +460,7 @@ functional:smoke_notify:
   rules:
     - if: $BUILD == "no"
       when: never
-    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")
       when: always
     - when: never
 
@@ -518,7 +518,7 @@ functional:x_notify:
       - inference_metrics.json
       - agent_formatter_debug.txt
   rules:
-    - if: $FUNCTIONAL_TEST == "yes"
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 

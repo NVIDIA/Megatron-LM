@@ -209,9 +209,7 @@ test:unit_tests_notify:
     paths:
       - scripts
   rules:
-    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      when: always
-    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+    - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || $CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")
       when: always
     - when: never
 

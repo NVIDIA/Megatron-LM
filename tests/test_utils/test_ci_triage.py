@@ -119,7 +119,7 @@ def test_error_extraction_is_opt_in_for_generated_jobs(
         assert job["artifacts"]["paths"] == ["results/"]
 
 
-def test_notification_rules_cover_all_enabled_test_runs():
+def test_notification_rules_use_expected_pipeline_sources():
     unit = yaml.safe_load(Path(".gitlab/stages/02.test.yml").read_text())
     functional = yaml.safe_load(Path(".gitlab/stages/04.functional-tests.yml").read_text())
     triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
@@ -128,23 +128,28 @@ def test_notification_rules_cover_all_enabled_test_runs():
         rule["if"] for rule in unit["test:unit_tests_notify"]["rules"] if "if" in rule
     ]
     assert unit_conditions == [
-        "$UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && "
-        '$CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"',
-        "$UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'",
+        '$CI_PIPELINE_SOURCE == "schedule" && '
+        '($CI_COMMIT_BRANCH == "ci-unit-test-extended" || '
+        '$CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")'
     ]
 
     smoke_condition = functional["functional:smoke_notify"]["rules"][1]["if"]
     assert smoke_condition == (
-        '$FUNCTIONAL_TEST == "yes" && ' "$FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/"
+        '$FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && '
+        '($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || '
+        '$CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")'
     )
-    assert functional["functional:x_notify"]["rules"][0]["if"] == ('$FUNCTIONAL_TEST == "yes"')
+    assert functional["functional:x_notify"]["rules"][0]["if"] == (
+        '($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && '
+        '$FUNCTIONAL_TEST == "yes"'
+    )
 
     triage_jobs = (".linear_reconcile_rules", "triage:linear_write", "triage:slack_linear_followup")
     for job_name in triage_jobs:
         condition = triage[job_name]["rules"][0]["if"]
         assert '$FUNCTIONAL_TEST == "yes"' in condition
-        assert "CI_PIPELINE_SOURCE" not in condition
-        assert "CI_COMMIT_BRANCH" not in condition
+        assert '$CI_PIPELINE_SOURCE == "schedule"' in condition
+        assert '$CI_COMMIT_BRANCH == "main"' in condition
 
 
 def test_all_generated_test_types_enable_error_extraction():
