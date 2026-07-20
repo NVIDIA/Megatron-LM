@@ -43,6 +43,7 @@ from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
     accepts_parameter,
@@ -1073,6 +1074,14 @@ class TextGenerationController:
         position_ids_buf[0, active_request_count:] = 0
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
+
+        # MTP MoE forwards are request-count shaped: the routing map holds
+        # active_request_count real rows followed by padding up to padded_count.
+        # The NVLS routing mask defaults to the main step's token count, so point
+        # it at the MTP row count instead, else padding rows route to experts.
+        if context._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(active_request_count)
+
         for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
@@ -1825,7 +1834,7 @@ class TextGenerationController:
             return False
 
         self._wait_for_dummy_context_h2d()
-        context.reset()
+        context.reset(preserve_prefix_cache=True)
         range_push("ep_dummy_async_handoff")
         try:
             input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
@@ -2545,8 +2554,12 @@ class TextGenerationController:
 
         self._wait_for_dummy_context_h2d()
 
-        # clear the context of any temporary state from the dummy forward
-        context.reset()
+        # clear the context of any temporary state from the dummy forward, but
+        # preserve prefix-cache state: a dummy forward runs when the engine is idle
+        # (e.g. between requests, or to keep EP collectives alive with EP > 1) and
+        # must not wipe cached KV/Mamba prefixes, or cross-request prefix reuse would
+        # be destroyed every time the engine briefly idles.
+        context.reset(preserve_prefix_cache=True)
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):

@@ -470,8 +470,11 @@ class MambaMetadata:
 
                 # Pad unused slots with safe defaults for CUDA graph replay:
                 # - chunk_indices=0: reads from chunk 0 (always exists), output ignored
-                # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
-                #   which are within bounds and produce a valid but unused state
+                # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1].
+                #   These are within bounds only when the prefill has at least
+                #   d_conv tokens; shorter sequences (e.g. small CUDA-graph warmup
+                #   buckets) would overrun the token axis, so _ssm_prefill clamps
+                #   the gather positions into range. The gathered state is unused.
                 if real_count < max_count:
                     self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
                     self._intermediate_abs_positions_buffer[real_count:max_count].fill_(self.d_conv)
@@ -489,7 +492,9 @@ class MambaMetadata:
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
-            # (same rationale as padding comment above)
+            # (same rationale as padding comment above; abs_positions=d_conv may
+            # exceed a sub-d_conv warmup sequence, so _ssm_prefill clamps the
+            # gather positions into range and the gathered state is unused)
             self._intermediate_chunk_indices_buffer[:max_count] = 0
             self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
             self.intermediate_count = 0

@@ -1239,8 +1239,8 @@ def test_dummy_async_handoff_mirrors_real_rank_launch(
 ):
     monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
     monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    context = SimpleNamespace(reset_count=0)
-    context.reset = lambda: setattr(context, "reset_count", context.reset_count + 1)
+    context = SimpleNamespace(reset_calls=[])
+    context.reset = lambda **kwargs: context.reset_calls.append(kwargs)
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller._async_forward_launch_count = 0
@@ -1269,7 +1269,9 @@ def test_dummy_async_handoff_mirrors_real_rank_launch(
     controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
 
     assert controller._try_launch_dummy_async_handoff() is expected_ok
-    assert context.reset_count == expected_reset
+    assert len(context.reset_calls) == expected_reset
+    if expected_reset:
+        assert context.reset_calls == [{"preserve_prefix_cache": True}]
     assert events.count("forward") == expected_forwards
     assert events.count("wait_h2d") == expected_reset
     assert controller._async_forward_launch_count == expected_forwards

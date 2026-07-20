@@ -207,6 +207,8 @@ except ImportError:
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
+    from megatron.post_training.utils import maybe_enable_modelopt
+
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
@@ -985,7 +987,13 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            # Treat missing and explicit None identifier values as equivalent.
+            # Wrap each component so None never compares directly with floats or strings.
+            def key_fn(pg):
+                return [
+                    (value is not None, value)
+                    for value in (pg.get(key) for key in param_group_identifier_keys)
+                ]
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -1701,16 +1709,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import has_modelopt_state
-
-        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
-        # set a flag to use our model provider if so.
-        if args.load is not None and has_modelopt_state(args.load):
-            print_rank_0(f'ModelOpt checkpoint detected')
-            args.modelopt_enabled = True
-        elif getattr(args, "export_kd_teacher_load", None):
-            # For distillation ckpts without ModelOpt state
-            args.modelopt_enabled = True
+        maybe_enable_modelopt(args)
 
     # Build model.
     def build_model():
@@ -2017,6 +2016,9 @@ def setup_model_and_optimizer(
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+
     def _build_model_wrapper(wrap_with_ddp: bool):
         if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
             from megatron.training.utils import start_memory_history_recording
@@ -2176,6 +2178,14 @@ def setup_model_and_optimizer(
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+
+    # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
+    # Import locally to prevent circular import: megatron.post_training.checkpointing
+    # imports `get_args` from megatron.training at module scope.
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
+
+        load_kd_teacher_checkpoint(model)
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
