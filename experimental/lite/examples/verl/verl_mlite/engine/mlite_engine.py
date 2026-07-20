@@ -438,7 +438,8 @@ class MegatronLiteEngine(BaseEngine):
         save_contents = self.checkpoint_config.get("save_contents", None)
         save_model = save_contents is None or "model" in save_contents
         save_optimizer = save_contents is None or "optimizer" in save_contents
-        if not save_model and not save_optimizer:
+        save_hf_model = save_contents is not None and "hf_model" in save_contents
+        if not save_model and not save_optimizer and not save_hf_model:
             if self._rank == 0:
                 print(
                     f"Skipping Megatron Lite checkpoint save at step {global_step}: save_contents={save_contents}"
@@ -454,28 +455,72 @@ class MegatronLiteEngine(BaseEngine):
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
-            save_training_checkpoint(
-                self.module,
-                self.handle._optimizer,
-                global_step,
-                local_path,
-                self.handle._config.parallel,
-                self.handle._parallel_state,
-                get_placements=placement_fn,
-                is_expert=expert_classifier,
-                save_model=save_model,
-                save_optimizer=save_optimizer,
-            )
+            if save_model or save_optimizer:
+                save_training_checkpoint(
+                    self.module,
+                    self.handle._optimizer,
+                    global_step,
+                    local_path,
+                    self.handle._config.parallel,
+                    self.handle._parallel_state,
+                    get_placements=placement_fn,
+                    is_expert=expert_classifier,
+                    save_model=save_model,
+                    save_optimizer=save_optimizer,
+                )
             if self.handle._lr_scheduler is not None and self._rank == 0:
                 torch.save(
                     self.handle._lr_scheduler.state_dict(),
                     os.path.join(local_path, _LR_SCHEDULER_STATE),
                 )
+            if save_hf_model:
+                self._save_hf_checkpoint(local_path)
             if dist.is_initialized():
                 dist.barrier()
         finally:
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+    def _save_hf_checkpoint(self, local_path: str) -> None:
+        proto = self.handle._extras.get("protocol")
+        if proto is None or not hasattr(proto, "save_hf_weights"):
+            raise RuntimeError(
+                "hf_model save requested, but the model protocol does not expose "
+                "save_hf_weights; refusing to report a successful checkpoint save."
+            )
+
+        model_chunks = self.handle._extras.get("model_chunks", [self.handle._model])
+        model_cfg = self.handle._extras.get("model_cfg")
+        if model_cfg is None:
+            raise RuntimeError(
+                "hf_model save requested, but the runtime handle has no model_cfg; "
+                "the model-specific exporter cannot be called safely."
+            )
+        ps = self.handle._parallel_state
+        hf_local_path = os.path.join(local_path, "huggingface")
+
+        if self._rank == 0:
+            os.makedirs(hf_local_path, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
+
+        proto.save_hf_weights(model_chunks, hf_local_path, model_cfg, ps)
+
+        if self._rank == 0:
+            hf_config = getattr(self.model_config, "hf_config", None)
+            if hf_config is not None:
+                auto_map = getattr(hf_config, "auto_map", None)
+                if isinstance(auto_map, dict) and None in auto_map:
+                    hf_config.auto_map = {k: v for k, v in auto_map.items() if k is not None}
+                hf_config.save_pretrained(hf_local_path)
+            tokenizer = getattr(self.model_config, "tokenizer", None)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(hf_local_path)
+            processor = getattr(self.model_config, "processor", None)
+            if processor is not None:
+                processor.save_pretrained(hf_local_path)
+        if dist.is_initialized():
+            dist.barrier()
 
     def load_checkpoint(
         self,

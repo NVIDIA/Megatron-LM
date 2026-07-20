@@ -815,6 +815,27 @@ def export_hf_weights(
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
+    def _iter_native_tensors():
+        """Yield parameters plus model-declared persistent export buffers."""
+        is_export_buffer = getattr(spec, "is_export_buffer", None)
+        for chunk in chunks:
+            base_chunk = unwrap_model(chunk)
+            layer_map = (
+                {
+                    i: base_chunk.layer_indices[i]
+                    for i in range(len(base_chunk.layer_indices))
+                }
+                if hasattr(base_chunk, "layer_indices")
+                else {}
+            )
+            for name, param in base_chunk.named_parameters():
+                yield to_global_layer_name(name, layer_map), param.data.detach()
+            if callable(is_export_buffer):
+                for name, buffer in base_chunk.named_buffers():
+                    global_name = to_global_layer_name(name, layer_map)
+                    if is_export_buffer(global_name):
+                        yield global_name, buffer.detach()
+
     if ps.pp_size <= 1:
         exported_params = 0
         expert_bucket: list[tuple[str, torch.Tensor]] = []
@@ -898,24 +919,10 @@ def export_hf_weights(
                         del packed_expert_buffers[packed_name]
                         yield from _iter_mapped({packed_name: packed_tensor})
 
-        def _iter_native_params():
-            for chunk in chunks:
-                base_chunk = unwrap_model(chunk)
-                layer_map = (
-                    {
-                        i: base_chunk.layer_indices[i]
-                        for i in range(len(base_chunk.layer_indices))
-                    }
-                    if hasattr(base_chunk, "layer_indices")
-                    else {}
-                )
-                for name, param in base_chunk.named_parameters():
-                    tensor = _cast_export_tensor(
-                        param.data.detach(), resolved_export_dtype
-                    )
-                    yield to_global_layer_name(name, layer_map), tensor
-
-        native_params = _iter_native_params()
+        native_params = (
+            (name, _cast_export_tensor(tensor, resolved_export_dtype))
+            for name, tensor in _iter_native_tensors()
+        )
         materialized_params = (
             _iter_bucketed_materialized_tensors(
                 native_params, buffer_max_size_bytes=buffer_max_size_bytes
@@ -1003,23 +1010,15 @@ def export_hf_weights(
         Advanced only during this rank's source turn, so at most one bucket of
         gathered params is ever resident — the whole stage is never built.
         """
-        for chunk in chunks:
-            base_chunk = unwrap_model(chunk)
-            layer_map = (
-                {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-                if hasattr(base_chunk, "layer_indices")
-                else {}
-            )
-            for name, param in base_chunk.named_parameters():
-                gname = to_global_layer_name(name, layer_map)
-                t = _materialize_dtensor(param.data.detach())
-                if spec.is_expert(gname):
-                    one: dict[str, torch.Tensor] = {}
-                    _gather_expert(gname, t, spec, ps, one, cpu=False)
-                    for gathered_name, gathered_tensor in one.items():
-                        yield gathered_name, gathered_tensor
-                else:
-                    yield gname, _gather_dense(gname, t, spec, ps, cpu=False)
+        for gname, tensor in _iter_native_tensors():
+            tensor = _materialize_dtensor(tensor)
+            if spec.is_expert(gname):
+                one: dict[str, torch.Tensor] = {}
+                _gather_expert(gname, tensor, spec, ps, one, cpu=False)
+                for gathered_name, gathered_tensor in one.items():
+                    yield gathered_name, gathered_tensor
+            else:
+                yield gname, _gather_dense(gname, tensor, spec, ps, cpu=False)
 
     def _emit_param(native_name: str, tensor: torch.Tensor):
         tensor = _maybe_cpu(tensor, cpu=gather_cpu)
@@ -1121,6 +1120,90 @@ def _gather_expert_etp(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> 
     return tensor
 
 
+def stream_export_to_shards(
+    export_iter: Iterable[tuple[str, torch.Tensor]],
+    path: str,
+    *,
+    shard_size_bytes: int = 5 * 1024**3,
+) -> None:
+    """Consume ``export_iter`` and write sharded safetensors on rank 0.
+
+    Flushes to disk once a shard reaches ``shard_size_bytes`` (default 5 GiB)
+    so rank 0's peak CPU RAM stays at ~one shard instead of the whole model.
+    Non-rank-0 still drains the iterator to drive collective communication
+    inside model-specific ``export_hf_weights`` implementations.
+
+    Emits ``model.safetensors`` when the export fits in a single shard, or
+    ``model-{i:05d}-of-{total:05d}.safetensors`` + ``model.safetensors.index.json``
+    when multiple shards are produced (HF-compatible layout).
+    """
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank == 0:
+        os.makedirs(path, exist_ok=True)
+        # Reusing an export directory must not leave stale shards or an index
+        # that describes a previous export.  Restrict cleanup to files owned by
+        # this writer; unrelated user files in the directory are preserved.
+        stale_patterns = (
+            re.compile(r"^model(?:-\d{5}-of-\d{5})?\.safetensors$"),
+            re.compile(r"^model\.safetensors\.index\.json$"),
+            re.compile(r"^\.model-shard-\d{5}\.safetensors$"),
+        )
+        for entry in os.listdir(path):
+            if any(pattern.fullmatch(entry) for pattern in stale_patterns):
+                os.remove(os.path.join(path, entry))
+
+    shard: dict[str, torch.Tensor] = {}
+    shard_bytes = 0
+    tmp_names: list[str] = []
+    shard_keys: list[list[str]] = []
+    total_size = 0
+
+    def _flush() -> None:
+        nonlocal shard, shard_bytes
+        if not shard:
+            return
+        tmp = f".model-shard-{len(tmp_names) + 1:05d}.safetensors"
+        save_safetensors(shard, path, filename=tmp)
+        tmp_names.append(tmp)
+        shard_keys.append(list(shard.keys()))
+        shard = {}
+        shard_bytes = 0
+
+    for name, tensor in export_iter:
+        if rank != 0:
+            continue
+        nbytes = _tensor_nbytes(tensor)
+        if shard and shard_bytes + nbytes > shard_size_bytes:
+            _flush()
+        shard[name] = tensor
+        shard_bytes += nbytes
+        total_size += nbytes
+
+    if rank == 0:
+        _flush()
+        total = len(tmp_names)
+        if total == 1:
+            os.rename(
+                os.path.join(path, tmp_names[0]),
+                os.path.join(path, "model.safetensors"),
+            )
+        elif total > 1:
+            weight_map: dict[str, str] = {}
+            for idx, (tmp, keys) in enumerate(zip(tmp_names, shard_keys), start=1):
+                final = f"model-{idx:05d}-of-{total:05d}.safetensors"
+                os.rename(os.path.join(path, tmp), os.path.join(path, final))
+                for k in keys:
+                    weight_map[k] = final
+            with open(os.path.join(path, "model.safetensors.index.json"), "w") as f:
+                json.dump(
+                    {"metadata": {"total_size": total_size}, "weight_map": weight_map},
+                    f,
+                )
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
 def save_hf_weights(
     model: nn.Module | list[nn.Module],
     hf_path: str,
@@ -1128,15 +1211,13 @@ def save_hf_weights(
     ps,
     *,
     vocab_size: int | None = None,
+    shard_size_bytes: int = 5 * 1024**3,
 ) -> None:
-    """Export + write to safetensors."""
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    out = dict(
+    """Export + write sharded safetensors via ``stream_export_to_shards``."""
+    stream_export_to_shards(
         export_hf_weights(
             model, spec, ps, vocab_size=vocab_size, rank0_only=True, cpu=True
-        )
+        ),
+        hf_path,
+        shard_size_bytes=shard_size_bytes,
     )
-    if rank == 0 and out:
-        save_safetensors(out, hf_path)
-    if dist.is_initialized():
-        dist.barrier()

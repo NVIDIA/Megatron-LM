@@ -25,6 +25,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     _iter_bucketed_materialized_tensors,
     bucketed_all_gather_into_tensor,
     export_hf_weights,
+    stream_export_to_shards,
 )
 
 
@@ -57,6 +58,78 @@ def test_safe_tensor_reader_context_reuses_and_closes_shard(monkeypatch, tmp_pat
 
     assert events == ["enter", ("get", "a"), ("get", "b"), "exit"]
 
+
+def test_stream_export_removes_stale_owned_files_when_reusing_directory(tmp_path) -> None:
+    for name in (
+        "model.safetensors",
+        "model-00001-of-00002.safetensors",
+        "model.safetensors.index.json",
+        ".model-shard-00001.safetensors",
+    ):
+        (tmp_path / name).write_text("stale")
+    unrelated = tmp_path / "README.txt"
+    unrelated.write_text("keep")
+
+    stream_export_to_shards(
+        iter([("new", torch.ones(2))]), str(tmp_path), shard_size_bytes=1024
+    )
+
+    assert (tmp_path / "model.safetensors").exists()
+    assert unrelated.read_text() == "keep"
+    assert not (tmp_path / "model-00001-of-00002.safetensors").exists()
+    assert not (tmp_path / "model.safetensors.index.json").exists()
+    assert not (tmp_path / ".model-shard-00001.safetensors").exists()
+
+
+def test_stream_export_flushes_bounded_shards_and_writes_hf_index(
+    tmp_path, monkeypatch
+) -> None:
+    flushed = []
+
+    def fake_save_safetensors(tensors, path, *, filename):
+        flushed.append(
+            (list(tensors), sum(t.numel() * t.element_size() for t in tensors.values()))
+        )
+        (Path(path) / filename).touch()
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.save_safetensors",
+        fake_save_safetensors,
+    )
+    tensors = [(f"weight_{i}", torch.ones(2, dtype=torch.float32)) for i in range(3)]
+
+    stream_export_to_shards(iter(tensors), str(tmp_path), shard_size_bytes=8)
+
+    assert flushed == [(["weight_0"], 8), (["weight_1"], 8), (["weight_2"], 8)]
+    index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+    assert index["metadata"] == {"total_size": 24}
+    assert index["weight_map"] == {
+        "weight_0": "model-00001-of-00003.safetensors",
+        "weight_1": "model-00002-of-00003.safetensors",
+        "weight_2": "model-00003-of-00003.safetensors",
+    }
+
+
+def test_stream_export_nonzero_rank_drains_iterator_for_collectives(
+    tmp_path, monkeypatch
+) -> None:
+    consumed = []
+    barriers = []
+
+    def export_iter():
+        for i in range(3):
+            consumed.append(i)
+            yield f"weight_{i}", torch.ones(1)
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(True))
+
+    stream_export_to_shards(export_iter(), str(tmp_path), shard_size_bytes=4)
+
+    assert consumed == [0, 1, 2]
+    assert barriers == [True]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_export_defaults_to_device_resident_tensors() -> None:
@@ -489,10 +562,12 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
         def __init__(self) -> None:
             super().__init__()
             self.weight = nn.Parameter(local_weight.clone())
+            self.register_buffer("router_bias", torch.tensor([1.0, 2.0]))
 
     class Spec:
         num_experts = 0
         is_expert = staticmethod(lambda name: False)
+        is_export_buffer = staticmethod(lambda name: name == "router_bias")
         tp_spec = staticmethod(lambda name: None)
         native_to_hf = staticmethod(lambda name, tensor: [(name, tensor)])
 
@@ -504,8 +579,11 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
     })()
 
     groups = []
-    remote_headers = iter([[("weight2", (2, 3), torch.float32)], []])
-    remote_tensors = iter([remote_weight])
+    remote_bias = torch.tensor([3.0, 4.0])
+    remote_headers = iter(
+        [[("weight2", (2, 3), torch.float32), ("router_bias2", (2,), torch.float32)], []]
+    )
+    remote_tensors = iter([remote_weight, remote_bias])
 
     def fake_broadcast_object_list(object_list, src=None, group=None, device=None):
         groups.append(group)
@@ -526,9 +604,11 @@ def test_pp_export_streams_over_nccl_and_matches_materialized(monkeypatch) -> No
     exported = dict(export_hf_weights(Model(), Spec(), ps))
 
     assert set(groups) == {"nccl-pp"}
-    assert exported.keys() == {"weight", "weight2"}
+    assert exported.keys() == {"weight", "router_bias", "weight2", "router_bias2"}
     assert torch.equal(exported["weight"], local_weight)
+    assert torch.equal(exported["router_bias"], torch.tensor([1.0, 2.0]))
     assert torch.equal(exported["weight2"], remote_weight)
+    assert torch.equal(exported["router_bias2"], remote_bias)
 
 
 

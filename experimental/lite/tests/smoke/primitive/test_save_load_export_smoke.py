@@ -185,13 +185,15 @@ def _deepseek_v4():
         hidden_size=128,
         moe_intermediate_size=16,
         num_hidden_layers=2,
-        num_attention_heads=8,
+        num_attention_heads=64,
         num_key_value_heads=1,
-        head_dim=64,
-        qk_rope_head_dim=16,
+        # Keep the production fused-kernel geometry; only model width/depth and
+        # expert counts are reduced for the proxy.
+        head_dim=512,
+        qk_rope_head_dim=64,
         q_lora_rank=32,
         o_lora_rank=32,
-        o_groups=2,
+        o_groups=8,
         n_routed_experts=4,
         n_shared_experts=1,
         num_experts_per_tok=2,
@@ -201,8 +203,9 @@ def _deepseek_v4():
         sliding_window=128,
         num_hash_layers=2,
         hc_mult=2,
-        index_head_dim=64,
-        index_n_heads=8,
+        # The authoritative SM90 DSA indexer kernel requires 128 exactly.
+        index_head_dim=128,
+        index_n_heads=64,
         index_topk=512,
         # DeepSeek-V4 really has MTP; its ImplConfig defaults mtp_enable=True and
         # requires >=1 nextn layer, so give it one (exercises MTP weight IO too).
@@ -483,19 +486,22 @@ def _export_and_reload(handle: ModelHandle, cfg, protocol, out_dir: str, model_n
     shards = [f for f in os.listdir(out_dir) if f.endswith(".safetensors")]
     assert shards, f"no safetensors exported to {out_dir}"
     keys: set[str] = set()
-    # The shared exporter casts EVERY floating tensor to bf16 (``_cast_export_tensor``
-    # with export_dtype=bf16) and leaves integers untouched.  So every float weight
-    # — including the router correction bias — must be bf16, while integer auxiliary
-    # buffers (e.g. DS4 hash-routing ``tid2eid`` index tables; casting them would
-    # corrupt the indices) keep their native integral dtype.  Excluding such buffers
-    # from the export would be a de-scope; we keep them and check their dtype.
+    # Trainable model weights are bf16. Kimi/GLM router correction biases are
+    # deliberately persistent fp32 state in both the native model and official HF
+    # checkpoints, while integer auxiliary buffers (for example DS4 ``tid2eid``)
+    # retain their integral dtype.
     for shard in shards:
         with safe_open(os.path.join(out_dir, shard), framework="pt") as fh:
             for key in fh.keys():
                 tensor = fh.get_tensor(key)
                 if tensor.dtype.is_floating_point:
-                    assert tensor.dtype == torch.bfloat16, (
-                        f"{key} exported as {tensor.dtype}, want bf16"
+                    expected_dtype = (
+                        torch.float32
+                        if key.endswith(".e_score_correction_bias")
+                        else torch.bfloat16
+                    )
+                    assert tensor.dtype == expected_dtype, (
+                        f"{key} exported as {tensor.dtype}, want {expected_dtype}"
                     )
                 else:
                     assert tensor.dtype in (torch.int64, torch.int32, torch.bool), (

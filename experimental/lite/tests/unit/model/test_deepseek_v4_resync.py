@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace

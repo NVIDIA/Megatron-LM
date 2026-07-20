@@ -657,15 +657,16 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
 
 
 def save_hf_weights(model, path: str, config: DeepseekV4Config, ps: ParallelState, **kwargs) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
+    """Export + write sharded safetensors via ``stream_export_to_shards``."""
+    from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
     kwargs.pop("cpu", None)
-    out = dict(export_hf_weights(model, config, ps, rank0_only=True, cpu=True, **kwargs))
-    if rank == 0 and out:
-        save_safetensors(out, path)
-    if dist.is_initialized():
-        dist.barrier()
+    shard_size_bytes = int(kwargs.pop("shard_size_bytes", 5 * 1024**3))
+    stream_export_to_shards(
+        export_hf_weights(model, config, ps, rank0_only=True, cpu=True, **kwargs),
+        path,
+        shard_size_bytes=shard_size_bytes,
+    )
 
 
 __all__ = [

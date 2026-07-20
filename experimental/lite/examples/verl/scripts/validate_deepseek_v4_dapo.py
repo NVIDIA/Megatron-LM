@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Validate the fixed DeepSeek-V4 DAPO launch contract."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """GLM-5 architecture config."""
 
 from __future__ import annotations
