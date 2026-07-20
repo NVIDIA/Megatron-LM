@@ -28,11 +28,7 @@ import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.model.glm5.config import Glm5Config
-from megatron.lite.primitive.ckpt.hf_weights import (
-    SafeTensorReader,
-    parse_expert_idx,
-    unwrap_model,
-)
+from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader, parse_expert_idx, unwrap_model
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible, log_rank0
 
@@ -181,6 +177,7 @@ def _load_attention(
     hf_prefix: str,
     reader: SafeTensorReader,
     ps: ParallelState,
+    load_indexer: bool = True,
 ) -> None:
     # GLM-5 ONLY: DSA attention.  Native params live under
     # `<local_prefix>.self_attention.self_attention.*` (the wrapper adds one
@@ -190,12 +187,15 @@ def _load_attention(
     out[f"{ap}.q_a_proj.weight"] = _get(reader, f"{hf_prefix}.q_a_proj.weight")
     out[f"{ap}.q_a_layernorm.weight"] = _get(reader, f"{hf_prefix}.q_a_layernorm.weight")
     out[f"{ap}.q_b_proj.weight"] = _get(reader, f"{hf_prefix}.q_b_proj.weight")
-    out[f"{ap}.kv_a_proj_with_mqa.weight"] = _get(
-        reader, f"{hf_prefix}.kv_a_proj_with_mqa.weight"
-    )
+    out[f"{ap}.kv_a_proj_with_mqa.weight"] = _get(reader, f"{hf_prefix}.kv_a_proj_with_mqa.weight")
     out[f"{ap}.kv_a_layernorm.weight"] = _get(reader, f"{hf_prefix}.kv_a_layernorm.weight")
     out[f"{ap}.kv_b_proj.weight"] = _get(reader, f"{hf_prefix}.kv_b_proj.weight")
     out[f"{ap}.o_proj.weight"] = _get(reader, f"{hf_prefix}.o_proj.weight")
+    # GLM5.2 shared IndexShare layers do not instantiate a local indexer and
+    # their HF checkpoints do not carry self_attn.indexer.* tensors.
+    if not load_indexer:
+        return
+
     # DSA indexer.
     ip = f"{ap}.indexer"
     hip = f"{hf_prefix}.indexer"
@@ -409,6 +409,11 @@ class Glm5WeightSpec:
         if suffix == "input_layernorm.weight":
             return [(f"{hp}.input_layernorm.weight", tensor)]
 
+        if suffix.startswith(
+            "self_attention.self_attention.indexer."
+        ) and not self.config.builds_dsa_indexer(layer_idx):
+            return []
+
         # GLM-5 ONLY: DSA attention (incl. indexer) maps 1:1 onto self_attn.*.
         attn_hf = self._ATTN_SUFFIX_MAP.get(suffix)
         if attn_hf is not None:
@@ -530,6 +535,7 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
             hf_prefix=f"{hp}.self_attn",
             reader=reader,
             ps=ps,
+            load_indexer=config.builds_dsa_indexer(global_idx),
         )
         if config.is_moe_layer(global_idx):
             out[f"{lp}.mlp_norm.weight"] = _get(reader, f"{hp}.post_attention_layernorm.weight")
@@ -586,6 +592,7 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
                 hf_prefix=f"{hp}.self_attn",
                 reader=reader,
                 ps=ps,
+                load_indexer=config.builds_dsa_indexer(global_idx),
             )
             if config.is_moe_layer(global_idx):
                 out[f"{tlp}.mlp_norm.weight"] = _get(
