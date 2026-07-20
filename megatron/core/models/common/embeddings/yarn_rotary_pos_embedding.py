@@ -164,6 +164,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_partition_mode="zigzag",
     ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -183,19 +184,35 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            emb = get_pos_emb_on_this_cp_rank(
+                emb, 0, cp_group, cp_partition_mode=cp_partition_mode
+            )
         return emb, _mscale
 
     def _set_cos_sin_cache(
-        self, seq_len, offset, dtype, packed_seq=False, cp_group=None, mscale=None
+        self,
+        seq_len,
+        offset,
+        dtype,
+        packed_seq=False,
+        cp_group=None,
+        cp_partition_mode="zigzag",
+        mscale=None,
     ):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = packed_seq
+        self.cp_partition_mode_cached = cp_partition_mode
         self.mscale_cached = mscale
 
-        emb, _mscale = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
+        emb, _mscale = self.forward(
+            seq_len,
+            offset,
+            packed_seq=packed_seq,
+            cp_group=cp_group,
+            cp_partition_mode=cp_partition_mode,
+        )
         if mscale is not None:
             _mscale = mscale
         self.register_buffer(
@@ -212,6 +229,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         dtype=torch.get_default_dtype(),
         packed_seq=False,
         cp_group=None,
+        cp_partition_mode="zigzag",
         mscale=None,
     ):
         """Get cached cos and sin values.
@@ -231,9 +249,12 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
+            or cp_partition_mode != getattr(self, "cp_partition_mode_cached", None)
             or mscale != getattr(self, "mscale_cached", None)
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group, mscale)
+            self._set_cos_sin_cache(
+                seq_len, offset, dtype, packed_seq, cp_group, cp_partition_mode, mscale
+            )
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 
