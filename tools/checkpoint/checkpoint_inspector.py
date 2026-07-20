@@ -1189,9 +1189,9 @@ def _stack_layers(tensors):
                 f"Re-run with --non-homogeneous-layers to keep per-layer keys."
             )
         n = max(full) + 1
-        assert sorted(full) == list(range(n)), (
-            f"Non-contiguous layers under '{prefix}': {sorted(full)}"
-        )
+        assert sorted(full) == list(
+            range(n)
+        ), f"Non-contiguous layers under '{prefix}': {sorted(full)}"
         out[f"{prefix}.{suffix}"] = torch.stack([by_idx[i] for i in range(n)], dim=0)
         stacked_count += 1
     return out, stacked_count
@@ -1461,7 +1461,9 @@ def _output_group_id(fqn, do_stack):
     safe (only balance suffers); splitting a real group would corrupt the output.
     """
     g = re.sub(r"((?:weight|bias)\d*)_[wv](?=$|\.)", r"\1", fqn)  # SwiGLU _w/_v tag
-    g = re.sub(r"(\.mlp\.experts\.linear_fc[12]\.(?:weight|bias))\d+$", r"\1", g)  # grouped expert idx
+    g = re.sub(
+        r"(\.mlp\.experts\.linear_fc[12]\.(?:weight|bias))\d+$", r"\1", g
+    )  # grouped expert idx
     g = re.sub(r"\.local_experts\.\d+\.", ".experts.", g)  # SequentialMLP expert idx
     if do_stack:
         g = re.sub(r"(\.layers)\.\d+(\.)", r"\1\2", g)  # homogeneous per-layer -> stacked
@@ -1762,9 +1764,7 @@ def reverse_convert_checkpoint(
     "all-MoE), keep per-layer when layers differ (interleaved MoE/dense or GDN).",
 )
 @click.option(
-    "--no-optimizer",
-    is_flag=True,
-    help="Convert model weights only; skip optimizer state.",
+    "--no-optimizer", is_flag=True, help="Convert model weights only; skip optimizer state."
 )
 @click.option(
     "--input-model-weight-prefix",
@@ -1850,11 +1850,7 @@ def convert_fsdp_dtensor_to_torch_dist(
         output_model_weight_prefix=output_model_weight_prefix,
     )
 
-    click.echo(
-        click.style(
-            f"Converted checkpoint saved to {output_dir}.", fg="green", bold=True
-        )
-    )
+    click.echo(click.style(f"Converted checkpoint saved to {output_dir}.", fg="green", bold=True))
 
 
 def _modify_state_dict(input_dir, output_dir, ops, process_group, enable_msc=False):
