@@ -1469,7 +1469,8 @@ def dump_staleness_data(
     for group_num_turns in group_stats.num_turns:
         adv_row = []
         for nt in group_num_turns:
-            adv_row.append(float(adv_flat[_t]))
+            cur_adv = 0.0 if nt == 0 else float(adv_flat[_t])
+            adv_row.append(cur_adv)
             _t += nt
         per_group_adv.append(adv_row)
 
