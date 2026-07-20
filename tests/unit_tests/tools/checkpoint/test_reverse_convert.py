@@ -21,6 +21,8 @@ _INSPECTOR_DIR = os.path.join(
 sys.path.insert(0, _INSPECTOR_DIR)
 
 from checkpoint_inspector import (  # noqa: E402  (import after sys.path tweak)
+    _assert_supported_scope,
+    _is_keep_fp32_key,
     _layers_are_homogeneous,
     _merge_swiglu,
     _model_param_dtype,
@@ -460,3 +462,63 @@ class TestModelParamDtype:
         assert _model_param_dtype(SimpleNamespace(bf16=False, fp16=True)) == torch.float16
         assert _model_param_dtype(SimpleNamespace(bf16=False, fp16=False)) == torch.float32
         assert _model_param_dtype(None) is None
+
+
+class TestSupportedScope:
+    """The scope fence raises on architectures the converter cannot invert."""
+
+    def test_mamba_fused_conv1d_weight_raises(self):
+        with pytest.raises(NotImplementedError, match="Mamba"):
+            _assert_supported_scope({"decoder.layers.0.mixer.conv1d_weight": None})
+
+    def test_mamba_fused_conv1d_bias_raises(self):
+        with pytest.raises(NotImplementedError, match="Mamba"):
+            _assert_supported_scope({"decoder.layers.0.mixer.conv1d_bias": None})
+
+    def test_mamba_key_in_optimizer_state_raises(self):
+        with pytest.raises(NotImplementedError, match="Mamba"):
+            _assert_supported_scope(
+                {"optimizer.state.exp_avg.decoder.layers.0.mixer.conv1d_weight": None}
+            )
+
+    def test_unindexed_stacked_layer_buffer_raises(self):
+        with pytest.raises(NotImplementedError, match="un-indexed"):
+            _assert_supported_scope({"decoder.layers.norm.weight": None})
+
+    def test_gdn_dotted_conv1d_is_supported(self):
+        # GatedDeltaNet's nn.Conv1d ``conv1d.weight`` is handled by the GDN split,
+        # so it must NOT trip the Mamba fence.
+        _assert_supported_scope(
+            {
+                "decoder.layers.0.self_attention.conv1d.weight": None,
+                "decoder.layers.0.self_attention.conv1d.bias": None,
+            }
+        )
+
+    def test_indexed_layers_and_plain_keys_pass(self):
+        _assert_supported_scope(
+            {
+                "embedding.word_embeddings.weight": None,
+                "decoder.layers.0.self_attention.linear_qkv.weight": None,
+                "decoder.final_layernorm.weight": None,
+                "mtp.layers.0.transformer_layer.self_attention.linear_qkv.weight": None,
+                "optimizer.state.exp_avg.decoder.layers.3.mlp.linear_fc1.weight": None,
+            }
+        )
+
+
+class TestKeepFp32Keys:
+    """Persistent fp32 buffers (e.g. router.expert_bias) are protected from downcast."""
+
+    def test_expert_bias_is_kept(self):
+        assert _is_keep_fp32_key("decoder.layers.0.mlp.router.expert_bias")
+        assert _is_keep_fp32_key("decoder.layers.mlp.router.expert_bias")  # stacked form
+
+    def test_ordinary_weights_are_not_kept(self):
+        assert not _is_keep_fp32_key("decoder.layers.0.mlp.linear_fc1.weight")
+        assert not _is_keep_fp32_key("decoder.layers.0.mlp.router.weight")
+        assert not _is_keep_fp32_key("output_layer.weight")
+
+    def test_substring_expert_bias_not_falsely_matched(self):
+        # only a whole trailing ``.expert_bias`` segment matches, not a substring.
+        assert not _is_keep_fp32_key("decoder.layers.0.mlp.router.expert_bias_extra")
