@@ -1207,6 +1207,12 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 max_seqlen_kv=tokens.shape[1],
                 total_tokens=tokens.shape[1],
             )
+            # A single unpacked sequence has no packing boundaries; the
+            # auto-built seq_idx routes the Mamba mixer into causal-conv1d's
+            # strict channel-last varlen kernel, which rejects our layout at
+            # some parallel configs (first seen at CP8/SL196608:
+            # "seq_idx is only supported for channel last layout").
+            packed_seq_params.seq_idx = None
 
     cp_size    = mpu.get_context_parallel_world_size()
     nvtx_range = get_nvtx_range()

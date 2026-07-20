@@ -278,6 +278,12 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 max_seqlen_kv=tokens.shape[1],
                 total_tokens=tokens.shape[1],
             )
+            # A single unpacked sequence has no packing boundaries; the
+            # auto-built seq_idx routes the Mamba mixer into causal-conv1d's
+            # strict channel-last varlen kernel, which rejects our layout at
+            # some parallel configs (first seen at CP8/SL196608:
+            # "seq_idx is only supported for channel last layout").
+            packed_seq_params.seq_idx = None
 
     # Clear RoPE cache to avoid inference tensor errors
     try:
