@@ -1286,6 +1286,9 @@ def validate_args(args, defaults={}):
             assert not args.overlap_param_gather
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
+    if args.log_per_layer_profiling:
+        assert args.log_memory_interval is not None, \
+            '--log-per-layer-profiling requires --log-memory-interval'
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -2124,6 +2127,7 @@ def _add_network_size_args(parser):
         "use_te_rng_tracker",
         "log_max_attention_logit",
         "barrier_with_L1_time",
+        "log_per_layer_profiling",
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",

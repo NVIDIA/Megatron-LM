@@ -150,6 +150,11 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.utils import is_hybrid_model
+from megatron.core.transformer.per_layer_profiling import (
+    per_layer_profiling_start_step,
+    per_layer_profiling_end_step,
+    per_layer_profiling_final_report,
+)
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -2358,6 +2363,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if args.log_per_layer_profiling:
+            _should = (iteration is not None
+                       and args.log_memory_interval is not None
+                       and iteration % args.log_memory_interval == 0)
+            per_layer_profiling_start_step(model, _should)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -2372,6 +2382,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             p2p_communicator=p2p_communicator,
             pg_collection=pg_collection,
         )
+        if args.log_per_layer_profiling:
+            per_layer_profiling_end_step(model, _should)
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -4000,6 +4012,10 @@ def train(
         )
         if should_exit:
             break
+
+    # End-of-run per-layer report: gather cross-rank's running global and print
+    if args.log_per_layer_profiling:
+        per_layer_profiling_final_report(model)
 
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
