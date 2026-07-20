@@ -388,6 +388,27 @@ class TestDistributedOptimizer:
         optimizer_state = optimizer.sharded_state_dict(
             {}, metadata={'distrib_optim_sharding_type': 'dp_reshardable'}
         )
+        param_state = optimizer_state['param_state']
+        per_bucket_numel = next(iter(param_state['per_bucket_numel'].data[0].values()))
+        per_bucket_numel_unpadded = next(
+            iter(param_state['per_bucket_numel_unpadded'].data[0].values())
+        )
+        assert per_bucket_numel == [1152, 1024]
+        assert per_bucket_numel_unpadded == [1088, 1024]
+
+        assert parallel_state.get_data_parallel_world_size(with_context_parallel=True) == 8
+        if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 7:
+            sharded_tensors = nested_values(extract_sharded_tensors(optimizer_state)[0])
+            terminal_padding = [
+                sharded_tensor
+                for sharded_tensor in sharded_tensors
+                if '.bucket_idx_0.' in sharded_tensor.key
+                and sharded_tensor.global_offset == (1060,)
+            ]
+            assert len(terminal_padding) == 3
+            assert all(tensor.local_shape == (28,) for tensor in terminal_padding)
+            assert all(tensor.global_shape == (1088,) for tensor in terminal_padding)
+
         with TempNamedDir(tmp_path_dist_ckpt / 'test_bucket_end_padding', sync=True) as ckpt_dir:
             save(optimizer_state, ckpt_dir)
 
