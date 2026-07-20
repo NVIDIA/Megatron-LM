@@ -43,7 +43,6 @@ from megatron.core.dist_checkpointing.validation import verify_checkpoint
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     redistribute_uneven_dtensor_to_replicated,
     split_dtensor,
-    uneven_dtensor_to_full_tensor,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature
 
