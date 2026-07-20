@@ -1202,9 +1202,10 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.inferred_count = 0
     pipeline.assembled_count = 0
     pipeline.yielded_count = 0
-    pipeline.prepared_groups_per_env = [0] * pipeline.gran_policy.num_envs
-    pipeline.assembled_groups_per_env = [0] * pipeline.gran_policy.num_envs
-    pipeline.yielded_groups_per_env = [0] * pipeline.gran_policy.num_envs
+    num_envs = len(pipeline.gran_policy.num_groups_per_env)
+    pipeline.prepared_groups_per_env = [0] * num_envs
+    pipeline.assembled_groups_per_env = [0] * num_envs
+    pipeline.yielded_groups_per_env = [0] * num_envs
     gate.prepare_blocked_seconds = 0.0
     gate.acquire_calls = 0
     gate.release_calls = 0
