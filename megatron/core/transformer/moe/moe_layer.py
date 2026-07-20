@@ -385,8 +385,7 @@ class MoELayer(BaseMoELayer):
             or self.config.moe_shortcut_untied_norm
             or self.config.moe_shortcut_post_norm
         ):
-            # Use plain torch RMSNorm (no sequence-parallel all-reduce) since postprocess
-            # operates on already-combined tensors outside the SP partition.
+            # Use plain torch RMSNorm since the forward normalization is local to each token.
             eps = self.config.layernorm_epsilon
             if self.config.moe_shortcut_output_norm:
                 self._shortcut_output_norm = torch.nn.RMSNorm(
@@ -409,6 +408,25 @@ class MoELayer(BaseMoELayer):
                 self._shortcut_post_norm = torch.nn.RMSNorm(
                     self.config.hidden_size, eps=eps
                 )
+
+        # These parameters are replicated across TP ranks, but under sequence parallel each
+        # rank sees a different sequence shard. Mark them so finalize_model_grads performs the
+        # required TP gradient all-reduce, just as it does for router and normalization weights.
+        replicated_parameters = [self._shortcut_scalar_gate, self._shortcut_gate_vector]
+        replicated_modules = [
+            self._shortcut_output_norm,
+            self._shortcut_tied_norm,
+            self._shortcut_untied_routed_norm,
+            self._shortcut_untied_shared_norm,
+            self._shortcut_post_norm,
+        ]
+        for parameter in replicated_parameters:
+            if parameter is not None:
+                setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
+        for module in replicated_modules:
+            if module is not None:
+                for parameter in module.parameters():
+                    setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":

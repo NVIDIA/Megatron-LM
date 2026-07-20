@@ -83,6 +83,55 @@ class TestMoELayerInit:
         moe_layer = MoELayer(self.transformer_config, submodules)
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize(
+        "shortcut_options",
+        [
+            {
+                "moe_shortcut_vector_gate": True,
+                "moe_shortcut_tied_norm": True,
+                "moe_shortcut_post_norm": True,
+            },
+            {
+                "moe_shortcut_scalar_gate": True,
+                "moe_shortcut_untied_norm": True,
+            },
+            {"moe_shortcut_output_norm": True},
+        ],
+    )
+    def test_shortcut_parameters_marked_sequence_parallel(self, shortcut_options):
+        """Replicated shortcut parameters must have their gradients reduced across TP ranks."""
+        Utils.initialize_model_parallel(1, 1)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=1,
+            use_cpu_initialization=True,
+            moe_token_dispatcher_type="allgather",
+            moe_router_topk=1,
+            moe_grouped_gemm=False,
+            add_bias_linear=False,
+            sequence_parallel=True,
+            moe_shortcut_connection=True,
+            **shortcut_options,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=1, moe_grouped_gemm=False).mlp
+        )
+        moe_layer = MoELayer(config, submodules)
+
+        shortcut_parameters = {
+            name: parameter
+            for name, parameter in moe_layer.named_parameters()
+            if name.startswith('_shortcut_')
+        }
+        assert shortcut_parameters
+        assert all(
+            getattr(parameter, 'sequence_parallel', False)
+            for parameter in shortcut_parameters.values()
+        )
+        Utils.destroy_model_parallel()
+
     @pytest.mark.skip(
         "Late init of parallel_state was broken after parallel states refactor MR2988."
     )
