@@ -65,6 +65,13 @@ try:
     )
 
     HAVE_MAMBA_SSM = True
+
+    from megatron.core.ssm.mamba_ssm_compat import apply_mamba_ssm_channel_last_patch
+
+    # Keep the conv input channel-last when mamba_ssm densifies misaligned
+    # widths, so causal-conv1d accepts seq_idx at any TP/CP geometry (see
+    # mamba_ssm_compat for the full story).
+    apply_mamba_ssm_channel_last_patch()
 except ImportError:
     mamba_chunk_scan_combined = None
     mamba_split_conv1d_scan_combined = None
