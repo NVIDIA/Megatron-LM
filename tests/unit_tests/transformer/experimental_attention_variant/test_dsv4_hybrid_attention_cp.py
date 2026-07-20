@@ -289,7 +289,6 @@ def _make_dsv4_cp_config(
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         context_parallel_size=context_parallel_size,
-        cp_partition_mode="contiguous" if context_parallel_size > 1 else "zigzag",
         sequence_packing_scheduler="dp_balanced" if context_parallel_size > 1 else None,
         csa_dense_mode=False,
         csa_compress_rotary_base=shape["csa_compress_rotary_base"],

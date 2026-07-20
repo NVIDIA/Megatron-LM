@@ -312,9 +312,9 @@ def test_build_cp_partition_mode_plan_skips_layer_inspection_without_cp():
         [object(), object()], config, None, owner_name="TestBlock"
     )
 
-    assert entry == "zigzag"
+    assert entry is None
     assert plan == [None, None]
-    assert exit_layout == "zigzag"
+    assert exit_layout is None
 
 
 def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern():

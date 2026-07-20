@@ -19,6 +19,7 @@ from megatron.core.context_parallel_layout import (
     get_cp_partition_mode_before_local_index,
     get_or_build_thd_cp_partition_route,
     get_packed_seq_params_cp_partition_cu_seqlens,
+    get_required_cp_partition_mode_for_layer,
     replace_packed_seq_params_cp_partition_mode,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -169,9 +170,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         if 'cu_seqlens_q' not in kwargs:
             return
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        cp_partition_mode = get_required_cp_partition_mode_for_layer(self, self.config)
+        if cp_partition_mode is None:
+            if self.config.context_parallel_size > 1 or self.config.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot reconstruct THD PackedSeqParams for a layout-agnostic Hybrid layer "
+                    "under context parallelism. The CP partition mode must be provided by the "
+                    "model-level layout plan."
+                )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
-            cp_partition_mode=self.config.cp_partition_mode,
+            cp_partition_mode=cp_partition_mode,
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
             cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
@@ -554,7 +563,7 @@ class HybridStack(MegatronModule):
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
         mtp_layer_number (int, optional): enclosing MTP depth for logging nested MTP metrics.
         cp_stage_entry_partition_mode (str, optional): CP partition mode expected at this
-            stage input. Defaults to zigzag for direct stack construction.
+            stage input. Required when context parallelism is enabled.
     """
 
     def __init__(
@@ -571,7 +580,7 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         mtp_layer_number: Optional[int] = None,
-        cp_stage_entry_partition_mode: Optional[str] = "zigzag",
+        cp_stage_entry_partition_mode: Optional[str] = None,
         name: str | None = None,
     ) -> None:
         """
@@ -785,7 +794,7 @@ class HybridStack(MegatronModule):
     @staticmethod
     def _replace_packed_seq_params_cp_partition_mode(
         packed_seq_params: Optional[PackedSeqParams],
-        cp_partition_mode: CpPartitionMode,
+        cp_partition_mode: Optional[CpPartitionMode],
     ) -> Optional[PackedSeqParams]:
         """Return packed-sequence metadata annotated with the current CP partition mode.
 

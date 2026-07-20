@@ -16,7 +16,7 @@ def get_cp_slice_for_thd(
     batch,
     cp_group,
     keys: Optional[Sequence[str]] = None,
-    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag",
+    cp_partition_mode: Optional[Literal["zigzag", "contiguous"]] = None,
     partition_total_tokens: Optional[int] = None,
 ):
     """Partition sequence data for context parallelism in THD format.
@@ -36,6 +36,8 @@ def get_cp_slice_for_thd(
     cp_size = cp_group.size()
     if cp_size <= 1:
         return
+    if cp_partition_mode is None:
+        raise ValueError("cp_partition_mode must be provided for THD context parallel slicing.")
     cp_rank = cp_group.rank()
     # Partition with padded cumulative lengths so CP slices match the THD
     # sequence boundaries consumed by attention kernels.

@@ -281,6 +281,7 @@ def get_batch(data_iterator, vp_stage=None):
         use_per_sequence_balancing=(
             getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
         ),
+        cp_partition_mode="zigzag",
     )
 
     cu_seqlens = batch.get('cu_seqlens')

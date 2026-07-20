@@ -308,8 +308,12 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
-    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
-    """How THD sequence rows are partitioned across context-parallel ranks."""
+    cp_partition_mode: Optional[Literal["zigzag", "contiguous"]] = None
+    """DEPRECATED. CP partition mode is inferred from the model's layer layout.
+
+    This compatibility field is ignored by model-level CP layout planning. Pass
+    cp_partition_mode explicitly to low-level data/layout helpers when needed.
+    """
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -1528,8 +1532,17 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
-        if self.cp_partition_mode not in ("zigzag", "contiguous"):
-            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+        if self.cp_partition_mode is not None:
+            if self.cp_partition_mode not in ("zigzag", "contiguous"):
+                raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+            warnings.warn(
+                "TransformerConfig.cp_partition_mode is deprecated and ignored by "
+                "model-level CP layout planning. CP partition mode is inferred from "
+                "the model's layer layout; pass cp_partition_mode explicitly to "
+                "low-level data/layout helpers when needed.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         if self.experimental_attention_variant == "dsv4_hybrid" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -1537,21 +1550,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.sequence_packing_scheduler is not None
             ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
-
-        if self.context_parallel_size > 1:
-            if (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and self.cp_partition_mode != "contiguous"
-            ):
-                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
-            if (
-                self.experimental_attention_variant not in {"dsv4_hybrid", "gated_delta_net"}
-                and self.cp_partition_mode != "zigzag"
-            ):
-                raise ValueError(
-                    "cp_partition_mode='contiguous' currently is only supported with "
-                    "dsv4_hybrid or gated_delta_net."
-                )
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (

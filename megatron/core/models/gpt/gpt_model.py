@@ -119,7 +119,7 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        cp_stage_entry_partition_mode: Optional[str] = "zigzag",
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 

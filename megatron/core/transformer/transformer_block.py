@@ -297,7 +297,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        cp_stage_entry_partition_mode: Optional[str] = "zigzag",
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ):
         super().__init__(config=config)
 
@@ -616,7 +616,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     @staticmethod
     def _replace_packed_seq_params_cp_partition_mode(
         packed_seq_params: Optional[PackedSeqParams],
-        cp_partition_mode: CpPartitionMode,
+        cp_partition_mode: Optional[CpPartitionMode],
     ) -> Optional[PackedSeqParams]:
         """Return packed-sequence metadata annotated with the current CP partition mode.
 

@@ -450,12 +450,14 @@ class Attention(MegatronModule, ABC):
 
     def _get_cp_partition_mode(self):
         """Return the concrete CP partition mode this attention module expects."""
-        return (
-            get_required_cp_partition_mode_for_layer(
-                self, self.config, cp_comm_type=self.cp_comm_type
-            )
-            or "zigzag"
+        cp_partition_mode = get_required_cp_partition_mode_for_layer(
+            self, self.config, cp_comm_type=self.cp_comm_type
         )
+        if cp_partition_mode is None:
+            raise ValueError(
+                f"{self.__class__.__name__} must declare a concrete CP partition mode."
+            )
+        return cp_partition_mode
 
     def _validate_packed_seq_params_cp_partition_mode(
         self,

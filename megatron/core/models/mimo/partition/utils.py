@@ -210,7 +210,12 @@ class PartitionAdapter:
             batch["loss_mask"] = loss_mask
 
         if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
-            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=self.cfg.cp_group)
+            batch = get_batch_on_this_cp_rank(
+                batch,
+                is_hybrid_cp=False,
+                cp_group=self.cfg.cp_group,
+                cp_partition_mode="zigzag",
+            )
         else:
             assert _HAVE_TEX and is_te_min_version("1.10.0"), (
                 "Please update Transformer Engine to >= 1.10 "

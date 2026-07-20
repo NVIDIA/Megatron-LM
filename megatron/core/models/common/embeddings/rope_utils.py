@@ -310,7 +310,7 @@ def _apply_rotary_pos_emb_thd(
             cp_rank * cp_seg + local_pos,
             full_seqlen - (cp_rank + 1) * cp_seg + (local_pos - cp_seg),
         )
-    elif cp_partition_mode == "zigzag":
+    elif cp_partition_mode == "zigzag" or (cp_partition_mode is None and cp_size <= 1):
         freq_pos = local_pos.to(torch.int64)
     else:
         raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
@@ -348,7 +348,7 @@ def apply_rotary_pos_emb(
     mla_rotary_interleaved: bool = False,
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
-    cp_partition_mode="zigzag",
+    cp_partition_mode=None,
     max_seqlen: Optional[int] = None,
 ):
     """
@@ -395,7 +395,12 @@ def apply_rotary_pos_emb(
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
-            if cp_partition_mode == "zigzag":
+            cp_size = cp_group.size()
+            if cp_partition_mode is None and cp_size > 1:
+                raise ValueError(
+                    "cp_partition_mode must be provided for THD RoPE under context parallelism."
+                )
+            if cp_partition_mode in (None, "zigzag"):
                 assert (
                     fused_apply_rotary_pos_emb_thd is not None
                 ), "apply_rope_fusion is not available."
@@ -403,7 +408,7 @@ def apply_rotary_pos_emb(
                     t,
                     cu_seqlens,
                     freqs,
-                    cp_size=cp_group.size(),
+                    cp_size=cp_size,
                     cp_rank=cp_group.rank(),
                     interleaved=config.rotary_interleaved,
                 )

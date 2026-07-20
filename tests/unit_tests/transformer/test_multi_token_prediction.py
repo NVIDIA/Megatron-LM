@@ -740,7 +740,10 @@ class TestMultiTokenPrediction:
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch,
+                is_hybrid_cp=False,
+                cp_group=get_context_parallel_group(),
+                cp_partition_mode="zigzag",
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -1798,7 +1801,10 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch,
+                is_hybrid_cp=False,
+                cp_group=get_context_parallel_group(),
+                cp_partition_mode="zigzag",
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(

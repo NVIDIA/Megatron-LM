@@ -133,7 +133,7 @@ def build_cp_partition_mode_plan(
     cp_stage_entry_partition_mode: Optional[CpPartitionMode],
     *,
     owner_name: str,
-) -> Tuple[CpPartitionMode, List[Optional[CpPartitionMode]], CpPartitionMode]:
+) -> Tuple[Optional[CpPartitionMode], List[Optional[CpPartitionMode]], Optional[CpPartitionMode]]:
     """Build a local immutable CP partition-mode plan for a block-like module.
 
     The stage entry partition mode is an external pipeline boundary property.
@@ -143,7 +143,7 @@ def build_cp_partition_mode_plan(
         getattr(config, "context_parallel_size", 1) == 1
         and not getattr(config, "dynamic_context_parallel", False)
     ):
-        return "zigzag", [None] * len(layers), "zigzag"
+        return None, [None] * len(layers), None
 
     if cp_stage_entry_partition_mode is None:
         raise ValueError(
@@ -168,10 +168,10 @@ def build_cp_partition_mode_plan(
 
 
 def get_cp_partition_mode_before_local_index(
-    cp_stage_entry_partition_mode: CpPartitionMode,
+    cp_stage_entry_partition_mode: Optional[CpPartitionMode],
     cp_partition_mode_plan: List[Optional[CpPartitionMode]],
     local_index: int,
-) -> CpPartitionMode:
+) -> Optional[CpPartitionMode]:
     """Return the CP partition mode immediately before a local layer index."""
     current_partition_mode = cp_stage_entry_partition_mode
     for required_partition_mode in cp_partition_mode_plan[:local_index]:
@@ -643,8 +643,8 @@ def convert_cp_partition_mode(
     x: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup],
     *,
-    source_partition_mode: str,
-    target_partition_mode: str,
+    source_partition_mode: Optional[str],
+    target_partition_mode: Optional[str],
     seq_dim: int = 0,
     cu_seqlens: Optional[torch.Tensor] = None,
     sequence_parallel: bool = False,
@@ -661,6 +661,13 @@ def convert_cp_partition_mode(
     """
     del tp_cp_group
 
+    if source_partition_mode == target_partition_mode:
+        return x
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        return x
+
     if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
         "zigzag",
         "contiguous",
@@ -669,12 +676,6 @@ def convert_cp_partition_mode(
             f"Unsupported CP partition mode conversion "
             f"{source_partition_mode!r} -> {target_partition_mode!r}."
         )
-    if source_partition_mode == target_partition_mode:
-        return x
-
-    cp_size = cp_group.size() if cp_group is not None else 1
-    if cp_size == 1:
-        return x
 
     if sequence_parallel and tp_group is not None and tp_group.size() > 1:
         from megatron.core.tensor_parallel.mappings import (
@@ -722,7 +723,7 @@ def get_packed_seq_params_cp_partition_cu_seqlens(
 
 def replace_packed_seq_params_cp_partition_mode(
     packed_seq_params: Optional[Any],
-    cp_partition_mode: CpPartitionMode,
+    cp_partition_mode: Optional[CpPartitionMode],
 ) -> Optional[Any]:
     """Return packed-sequence metadata annotated with the current CP partition mode."""
     if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
@@ -736,8 +737,8 @@ def convert_cp_partition_mode_nested(
     value: Any,
     cp_group: Optional[torch.distributed.ProcessGroup],
     *,
-    source_partition_mode: str,
-    target_partition_mode: str,
+    source_partition_mode: Optional[str],
+    target_partition_mode: Optional[str],
     seq_dim: Union[int, Callable[[torch.Tensor], int]] = 0,
     cu_seqlens: Optional[torch.Tensor] = None,
     sequence_parallel: bool = False,
@@ -750,14 +751,6 @@ def convert_cp_partition_mode_nested(
     ``None`` and non-tensor leaves are returned unchanged.  Lists and tuples are
     traversed recursively while preserving their container type.
     """
-    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
-        "zigzag",
-        "contiguous",
-    ):
-        raise ValueError(
-            f"Unsupported CP partition mode conversion "
-            f"{source_partition_mode!r} -> {target_partition_mode!r}."
-        )
     if source_partition_mode == target_partition_mode:
         return value
     if value is None:

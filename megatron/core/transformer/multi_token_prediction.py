@@ -277,7 +277,12 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
         return rolled_tensor, rolled_tensor.sum()
 
-    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', None)
+    if cp_partition_mode is None:
+        raise ValueError(
+            "PackedSeqParams.cp_partition_mode must be set when rolling packed sequences "
+            "under context parallelism."
+        )
     if cp_partition_mode == 'zigzag':
         rolled_tensor = _roll_tensor_packed_seq_zigzag_cp(
             tensor, shifts, dims, cu_seqlens, cp_group, fill_value=fill_value
