@@ -563,6 +563,8 @@ class GatedDeltaNet(MegatronModule):
                 cu_seqlens_q=fused_cu_seqlens_q,
                 seq_idx=seq_idx,
                 cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
+                cp_size_headwise=cp_size_headwise,
+                cp_group_headwise=cp_group_headwise,
             )
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
@@ -781,7 +783,13 @@ class GatedDeltaNet(MegatronModule):
         return query, key, value, gate, beta, g
 
     def _fused_streamed_pre_gated_delta_rule(
-        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None
+        self,
+        qkvzba,
+        cu_seqlens_q=None,
+        seq_idx=None,
+        cp_group=None,
+        cp_size_headwise=1,
+        cp_group_headwise=None,
     ):
         """Call the streamed fused pre-GDR wrapper."""
 
@@ -795,14 +803,42 @@ class GatedDeltaNet(MegatronModule):
                 "dependencies, including causal-conv1d."
             ) from exc
 
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp_headwise(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=cp_group_headwise,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp_headwise(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=cp_group_headwise,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
+        A_log = get_parameter_local_cp_headwise(self.A_log, dim=0, cp_group=cp_group_headwise)
+        dt_bias = get_parameter_local_cp_headwise(
+            self.dt_bias, dim=0, cp_group=cp_group_headwise
+        )
+        num_key_heads = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
+        num_value_heads = self.v_dim_local_tp // self.value_head_dim // cp_size_headwise
+
         return fused_streamed_pre_gated_delta_rule(
             qkvzba,
-            self.conv1d.weight,
-            self.conv1d.bias if self.conv_bias else None,
-            self.A_log,
-            self.dt_bias,
-            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
-            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            conv1d_weight,
+            conv1d_bias,
+            A_log,
+            dt_bias,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
             key_head_dim=self.key_head_dim,
             value_head_dim=self.value_head_dim,
             use_qk_l2norm=self.use_qk_l2norm,

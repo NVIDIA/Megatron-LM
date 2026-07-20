@@ -451,6 +451,74 @@ class TestGatedDeltaNet:
         assert g.shape == alpha.shape
         assert beta_sig.shape == beta.shape
 
+    def test_fused_pre_gated_delta_rule_headwise_cp_uses_cp_local_parameters(self):
+        if not HAVE_FUSED_PRE_GDR:
+            pytest.skip("causal-conv1d fused backward is not installed.")
+        if not (self.linear_cp_mode == "headwise" and self.cp_size > 1):
+            pytest.skip("Only headwise CP with CP>1 needs CP-local fused pre-GDR params.")
+
+        gdn = self.gdn
+        batch = 2
+        seq_len = 16
+        qk_channels = gdn.qk_dim_local_tp // self.cp_size_headwise
+        v_channels = gdn.v_dim_local_tp // self.cp_size_headwise
+        num_key_heads = qk_channels // gdn.key_head_dim
+        num_value_heads = v_channels // gdn.value_head_dim
+        qkvzba_dim = 2 * qk_channels + 2 * v_channels + 2 * num_value_heads
+        qkvzba = torch.randn(
+            seq_len, batch, qkvzba_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        captured = {}
+
+        def fake_fused_streamed_pre_gated_delta_rule(
+            qkvzba_arg,
+            conv1d_weight,
+            conv1d_bias,
+            A_log,
+            dt_bias,
+            *,
+            num_key_heads,
+            num_value_heads,
+            **kwargs,
+        ):
+            captured.update(
+                {
+                    "qkvzba": qkvzba_arg,
+                    "conv1d_weight": conv1d_weight,
+                    "conv1d_bias": conv1d_bias,
+                    "A_log": A_log,
+                    "dt_bias": dt_bias,
+                    "num_key_heads": num_key_heads,
+                    "num_value_heads": num_value_heads,
+                    "cp_group": kwargs["cp_group"],
+                }
+            )
+            return tuple(torch.empty(0, device=qkvzba_arg.device) for _ in range(6))
+
+        with mock.patch(
+            "megatron.core.fusions.fused_pre_gated_delta_rule."
+            "fused_streamed_pre_gated_delta_rule",
+            side_effect=fake_fused_streamed_pre_gated_delta_rule,
+        ):
+            gdn._fused_streamed_pre_gated_delta_rule(
+                qkvzba,
+                cp_size_headwise=self.cp_size_headwise,
+                cp_group_headwise=gdn.pg_collection.cp,
+            )
+
+        assert captured["qkvzba"] is qkvzba
+        assert captured["conv1d_weight"].shape == (
+            2 * qk_channels + v_channels,
+            1,
+            gdn.conv_kernel_dim,
+        )
+        assert captured["conv1d_bias"] is None
+        assert captured["A_log"].shape == (num_value_heads,)
+        assert captured["dt_bias"].shape == (num_value_heads,)
+        assert captured["num_key_heads"] == num_key_heads
+        assert captured["num_value_heads"] == num_value_heads
+        assert captured["cp_group"] is None
+
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
