@@ -350,6 +350,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
+    "sequence_packing_scheduler": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
