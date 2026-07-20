@@ -51,6 +51,7 @@ from megatron.training import (
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.state import GlobalState
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -360,7 +361,7 @@ def get_grad_acc_based_random_choice(args, choices=None, prob=None, base_seed=42
     _global_choice_counter %= grad_accumulation_steps
     return choice
 
-def forward_step(data_iterator, model: HybridModel):
+def forward_step(state: GlobalState, data_iterator, model: HybridModel):
     """Forward training step.
 
     Args:
@@ -368,7 +369,7 @@ def forward_step(data_iterator, model: HybridModel):
         model (HybridModel): The GPT Model
     """
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     # One-time per-component params-norm breakdown (mirrors calc_params_l2_norm).
     global _logged_params_norm

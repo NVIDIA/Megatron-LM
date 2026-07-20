@@ -2,6 +2,7 @@
 import sys
 from functools import partial
 
+from megatron.training.state import GlobalState
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -98,10 +99,12 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
 
     cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    state = GlobalState()
+    state.cfg = cfg_container
     model, optimizer, _ = setup_model_and_optimizer(
+        state=state,
         model_type=ModelType.encoder_or_decoder,
         model_provider_func=partial(model_provider, hybrid_builder),
-        cfg_container=cfg_container,
         pg_collection=pg_collection,
     )
     return model, optimizer

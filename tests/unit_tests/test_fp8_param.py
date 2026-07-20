@@ -5,6 +5,7 @@ import gc
 import os
 import sys
 
+from megatron.training.state import GlobalState
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
@@ -252,6 +253,8 @@ class TestFP8Param:
         model_parallel_cuda_manual_seed(_SEED)
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        state = GlobalState()
+        state.cfg = cfg_container
         if inference:
             model_cfg = cfg_container.model
             builder_cls = model_cfg.get_builder_cls()
@@ -263,9 +266,9 @@ class TestFP8Param:
             optimizer = None
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
+                state,
                 ModelType.encoder_or_decoder,
                 self.model_provider,
-                cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.

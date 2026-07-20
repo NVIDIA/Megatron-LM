@@ -62,6 +62,7 @@ from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.state import GlobalState
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -279,7 +280,7 @@ def loss_func(
     return loss, num_tokens, report
 
 
-def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
+def forward_step(state: GlobalState, data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
@@ -288,7 +289,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()

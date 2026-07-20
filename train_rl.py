@@ -25,6 +25,7 @@ from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.state import GlobalState
 from model_provider import model_provider
 
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -191,7 +192,7 @@ def loss_func(
     return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
 
 
-def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
+def forward_step(state: GlobalState, data_iterator, model: GPTModel, loss_only: bool = False):
     """Forward training step.
 
     Args:
@@ -200,7 +201,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     """
     runtime_state = get_rl_runtime_state()
     args = get_args()
-    timers = get_timers()
+    timers = state.timers
 
     timers('batch-generator', log_level=2).start()
     global stimer
