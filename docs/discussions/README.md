@@ -19,6 +19,8 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 
 ### Training Guides
 
+- [MFSDP Optimizer Design](mfsdp-optimizer-design/mfsdp-optimizer-design.md)
+
 ## Previous News
 
 - **[2025/05]** Megatron Core v0.11.0 brings new capabilities for multi-data center LLM training ([blog](https://developer.nvidia.com/blog/turbocharge-llm-training-across-long-haul-data-center-networks-with-nvidia-nemo-framework/)).
