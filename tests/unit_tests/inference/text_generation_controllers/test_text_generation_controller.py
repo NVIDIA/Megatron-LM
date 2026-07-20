@@ -1085,10 +1085,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         identity and the larger async write lands correctly.
         """
         self.setup_model(
-            torch.float32,
-            batch_size=8,
-            static=False,
-            materialize_only_last_token_logits=True,
+            torch.float32, batch_size=8, static=False, materialize_only_last_token_logits=True
         )
         context = self.text_generation_controller.inference_wrapped_model.inference_context
         controller = self.text_generation_controller
