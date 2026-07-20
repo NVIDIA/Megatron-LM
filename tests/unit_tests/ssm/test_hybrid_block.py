@@ -102,6 +102,7 @@ class TestHybridBlock:
             dsa_indexer_n_heads=8,
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=32,
+            add_bias_linear=False,
             **mhc_kwargs,
         )
         modules = hybrid_stack_spec.submodules
@@ -452,7 +453,7 @@ class TestHybridBlock:
         assert output.dtype == torch.float32
 
     def test_dsa_layer_types(self):
-        """D symbol creates a TransformerLayer with MLASelfAttention."""
+        """D symbol creates a TransformerLayer with MLA and DSA core attention."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
         block = self.get_dsa_mamba_block(layer_pattern)
         layers = block.layers

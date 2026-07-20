@@ -9,6 +9,7 @@ Run with:
 import logging
 from contextlib import ExitStack, contextmanager
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,8 +17,8 @@ import torch.distributed as dist
 from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
+from examples.mimo.training.grad_sync import configure_grad_sync
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -82,25 +83,36 @@ def build_no_sync_func(mimo_model):
 
 
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
-    """Create a HyperCommGrid with specified parallelism."""
+    """Create a HyperCommGrid (base view) plus a dense expert view, matching the topology builder.
+
+    These tests are dense (ep=1); the expert view relabels the base axes over the same ranks
+    (expt_tp=tp, ep=cp=1, expt_dp=dp), so the optimizer's expert groups resolve to the dense
+    collapse (tp_ep_pp = tp x pp, expt_dp = dp) without changing the base rank layout.
+    """
     grid = HyperCommGrid(
-        shape=[tp, cp, pp, dp, 1, 1],  # [tp, cp, pp, dp, ep, expt_dp]
-        dim_names=["tp", "cp", "pp", "dp", "ep", "expt_dp"],
+        shape=[tp, cp, pp, dp],
+        dim_names=["tp", "cp", "pp", "dp"],
         rank_offset=offset,
         backend="nccl",
     )
-    grid.create_pg(["tp"])
-    grid.create_pg(["cp"])
-    grid.create_pg(["pp"])
-    grid.create_pg(["dp"])
-    grid.create_pg(["dp", "cp"])
-    grid.create_pg(["ep"])
-    grid.create_pg(["expt_dp"])
-    # Required by _get_pg_collection_for_optimizer
-    grid.create_pg(["tp", "pp"])
-    grid.create_pg(["tp", "ep", "pp"])
-    grid.create_pg(["dp", "ep"])
-    grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+    grid.register_view(
+        "expert",
+        shape=[tp, cp, pp, dp],
+        dim_names=["expt_tp", "ep", "pp", "expt_dp"],
+        shared_dims=["pp"],
+    )
+    for dims in (
+        ["tp"],
+        ["cp"],
+        ["pp"],
+        ["dp"],
+        ["dp", "cp"],
+        ["tp", "pp"],
+        ["tp", "cp", "dp", "pp"],
+    ):
+        grid.create_pg(dims)
+    for dims in (["ep"], ["expt_dp"], ["expt_tp", "ep", "pp"]):
+        grid.create_pg(dims, view="expert")
     _active_grids.append(grid)
     return grid
 
@@ -121,10 +133,14 @@ def get_pg_collection(grid):
     pg_collection.tp = grid.get_pg("tp")
     pg_collection.cp = grid.get_pg("cp")
     pg_collection.pp = grid.get_pg("pp")
-    pg_collection.ep = grid.get_pg("ep")
+    pg_collection.ep = grid.get_pg("ep", view="expert")
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
-    pg_collection.expt_dp = grid.get_pg("expt_dp")
+    pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
+    # Expert groups from the expert view (dense here, so tp_ep_pp resolves to tp x pp).
+    pg_collection.mp = grid.get_pg(["tp", "pp"])
+    pg_collection.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
+    pg_collection.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     return pg_collection
 
 
@@ -568,7 +584,12 @@ def run_mimo_1f1b_test(
     micro_batch_size=2,
     num_microbatches=4,
 ):
-    """Run MIMO model through 1F1B schedule and verify."""
+    """Run MIMO model through 1F1B schedule and verify.
+
+    Uses the production examples/mimo configure_grad_sync (calculate_per_token_loss=True)
+    as the grad-finalization hook, exercising its cross-grid token sourcing + N_global
+    broadcast on this non-colocated topology.
+    """
     # Clear NVTE env vars that the conftest set_env fixture sets to '0'.
     # GPTModel (LanguageModule) asserts these are unset or match the attention backend.
     import os
@@ -599,26 +620,21 @@ def run_mimo_1f1b_test(
         num_layers=num_layers,
         vocab_size=vocab_size,
         seq_len=seq_length,
+        per_token_loss=True,
     )
 
-    no_sync_func = build_no_sync_func(mimo_model)
+    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
 
-    def finalize_grads_func(*args, **kwargs):
-        if mimo_model.language_model is not None:
-            finalize_model_grads(
-                [mimo_model.language_model], num_tokens=None, pg_collection=language_pg
-            )
-        for submodule in mimo_model.modality_submodules.values():
-            if submodule is not None:
-                finalize_model_grads([submodule], num_tokens=None, pg_collection=vision_pg)
-
-    mimo_model.config.no_sync_func = no_sync_func
-    mimo_model.config.finalize_model_grads_func = finalize_grads_func
-    mimo_model.config.grad_scale_func = lambda loss: (
-        torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
-        if isinstance(loss, (int, float))
-        else loss
+    # Use the production grad-sync hook (finalize per module over its own groups +
+    # cross-grid N_global per-token mean) for every config.
+    grad_sync_topology = SimpleNamespace(
+        grids=module_to_grid_map,
+        module_pgs={
+            MIMO_LANGUAGE_MODULE_KEY: language_pg,
+            **{name: vision_pg for name in mimo_model.modality_submodules},
+        },
     )
+    configure_grad_sync(SimpleNamespace(), mimo_model, grad_sync_topology)
 
     # Create optimizer
     opt_config = OptimizerConfig(
@@ -680,8 +696,17 @@ def run_mimo_1f1b_test(
 
     def step_func(data_iterator, model):
         def loss_func(loss_mask, output_tensor):
+            # calculate_per_token_loss=True: the schedule expects a
+            # (loss_sum, num_tokens, loss_dict) triple, with num_tokens an int tensor.
+            def _ret(loss, num_tokens, reduced):
+                return loss, num_tokens, {'loss_reduced': reduced}
+
+            zero = torch.tensor(0.0, device='cuda', requires_grad=True)
+            # num_tokens must be an int tensor: the schedule accumulates it into an
+            # int total_num_tokens when calculate_per_token_loss=True.
+            one = torch.tensor(1, device='cuda', dtype=torch.int)
             if output_tensor is None:
-                return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
+                return _ret(zero, one, 0.0)
 
             if isinstance(output_tensor, dict):
                 output = output_tensor.get(
@@ -691,10 +716,13 @@ def run_mimo_1f1b_test(
                 output = output_tensor
 
             if output is None:
-                return torch.tensor(0.0, device='cuda', requires_grad=True), {'loss_reduced': 0.0}
+                return _ret(zero, one, 0.0)
 
             loss = output.float().sum()
-            return loss, {'loss_reduced': loss}
+            num_tokens = (
+                loss_mask.sum().to(torch.int).clamp(min=1) if loss_mask is not None else one
+            )
+            return _ret(loss, num_tokens, loss)
 
         batch = next(data_iterator) if data_iterator is not None else {'input_ids': None}
         output_tensor, loss_mask = model(**batch)
