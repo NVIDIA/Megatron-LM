@@ -223,18 +223,22 @@ class DataParallelBuffer:
         **kwargs,
     ) -> None:
         """Redistribute to the target or persistent storage placements."""
+        # Use persistent storage placements when no explicit target is provided.
         if target_placements is None:
             target_placements = self.storage_placements
         assert len(target_placements) == 2
 
+        # Make the communication stream wait for work already queued on the caller stream.
         current_stream = torch.cuda.current_stream()
         stream = stream or current_stream
         if stream != current_stream:
             stream.wait_stream(current_stream)
 
+        # Return when no placement transition is needed.
         if self.placements == target_placements:
             return
 
+        # Resolve an inner partial placement before processing the outer dimension.
         reduce_inner_first = (
             self.placements[1] is Placement.PARTIAL
             and target_placements[1] is not Placement.PARTIAL
@@ -250,84 +254,112 @@ class DataParallelBuffer:
             next_placements = self.placements.copy()
             next_placements[current_dim] = target_placement
 
+            # Materialize the input and output for this single-dimension transition.
+            input_buffer = self.fetch_buffer(self.placements)
+            output_buffer = self.fetch_buffer(next_placements)
+            group = self.outer_dp_group if current_dim == 0 else self.inner_dp_group
+
             if (
                 source_placement in (Placement.FLAT, Placement.DIRTY)
                 and target_placement is Placement.REPLICATE
             ):
-                self.all_gather(
-                    target_placements=next_placements,
-                    comm_dim=current_dim,
-                    stream=stream,
-                    **kwargs,
+                with torch.cuda.stream(stream):
+                    torch.distributed.all_gather_into_tensor(
+                        output_tensor=output_buffer,
+                        input_tensor=input_buffer,
+                        group=group,
+                    )
+                # Parameters can bind only after both mesh dimensions are replicated.
+                if kwargs.get("bind_params", False) and all(
+                    placement is Placement.REPLICATE for placement in next_placements
+                ):
+                    self._bind_buffer_to_params(output_buffer)
+            elif source_placement is Placement.PARTIAL:
+                # Inner-DP shards accumulate across microbatches; outer-DP only reduces
+                # the completed inner result and therefore always overwrites its output.
+                accumulate = kwargs.get("accumulate", False) and current_dim == 1
+                grad_comm_dtype = self.mp_policy.grad_comm_dtype or self.dtype
+
+                # Scale exactly once, when reducing fresh full grads over inner-DP.
+                # Outer-only reduce consumes an already-scaled inner-DP result.
+                scaling_factor = self.gradient_scaling_factor
+                scale_inner = current_dim == 1 and scaling_factor not in (None, 1.0)
+                prescale = scale_inner and grad_comm_dtype == torch.bfloat16
+                op = (
+                    torch.distributed.ReduceOp.SUM
+                    if not scale_inner or prescale
+                    else torch.distributed._make_nccl_premul_sum(scaling_factor)
                 )
-            elif (
-                source_placement is Placement.PARTIAL
-                and target_placement is Placement.REPLICATE
-            ):
-                self.reduce_grad(
-                    target_placements=next_placements,
-                    comm_dim=current_dim,
-                    stream=stream,
-                    reduce_scatter=False,
-                    **kwargs,
-                )
-            elif (
-                source_placement is Placement.PARTIAL
-                and target_placement in (Placement.FLAT, Placement.DIRTY)
-            ):
-                self.reduce_grad(
-                    target_placements=next_placements,
-                    comm_dim=current_dim,
-                    stream=stream,
-                    reduce_scatter=True,
-                    **kwargs,
-                )
+
+                # Stage through allocator-owned storage only when communication changes dtype.
+                comm_input = input_buffer
+                input_key = None
+                if grad_comm_dtype != self.dtype:
+                    input_key = (
+                        self.alloc_key,
+                        "grad_reduce_input",
+                        current_dim,
+                    )
+                    comm_input = self.allocator.allocate(
+                        key=input_key,
+                        size=input_buffer.numel(),
+                        dtype=grad_comm_dtype,
+                        device=self.device,
+                    ).data
+                # Preserve the allocation while work remains queued on the communication stream.
+                if comm_input.is_cuda:
+                    comm_input.record_stream(stream)
+
+                # Keep casting, scaling, communication, and output commit on one stream.
+                with torch.cuda.stream(stream):
+                    if input_key is not None:
+                        comm_input.copy_(input_buffer)
+                    if prescale:
+                        comm_input.mul_(scaling_factor)
+
+                    if target_placement is Placement.REPLICATE:
+                        torch.distributed.all_reduce(comm_input, group=group, op=op)
+                        comm_output = comm_input
+                    else:
+                        input_meta = self.buffer_index._get_shard_meta(self.placements)
+                        output_meta = self.buffer_index._get_shard_meta(next_placements)
+                        output_offset = (
+                            output_meta.global_data_index - input_meta.global_data_index
+                        )
+                        # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
+                        comm_output = comm_input[
+                            output_offset : output_offset + output_buffer.numel()
+                        ]
+                        torch.distributed.reduce_scatter_tensor(
+                            output=comm_output,
+                            input=comm_input,
+                            group=group,
+                            op=op,
+                        )
+
+                    # Commit the result, accumulating prior inner-DP microbatches when requested.
+                    if output_buffer.data_ptr() != comm_output.data_ptr():
+                        if accumulate:
+                            output_buffer.add_(comm_output)
+                        else:
+                            output_buffer.copy_(comm_output)
+                if input_key is not None:
+                    self.allocator.free(input_key)
             elif target_placement in (Placement.DIRTY, Placement.PARTIAL):
+                # These transitions change validity semantics without moving data.
                 pass
             elif target_placement is Placement.FLAT:
-                self.reshard(
-                    target_placements=next_placements,
-                    comm_dim=current_dim,
-                    stream=stream,
-                    **kwargs,
-                )
+                if source_placement is Placement.REPLICATE:
+                    # The persistent shard already exists; discard its full materialization.
+                    self.release_unsharded_buffer()
             else:
                 raise NotImplementedError(
                     f"Unsupported placement transition: "
                     f"{source_placement!r} -> {target_placement!r}"
                 )
 
+            # The next dimension consumes the representation produced by this one.
             self.placements = next_placements
-
-    @torch.no_grad()
-    def all_gather(
-        self,
-        target_placements: list[Placement],
-        *,
-        comm_dim: int,
-        stream: torch.cuda.Stream,
-        **kwargs,
-    ) -> torch.Tensor:
-        """All-gather the selected mesh dimension into target placements."""
-        source_placements = self.placements
-        group = self.outer_dp_group if comm_dim == 0 else self.inner_dp_group
-        input_buffer = self.fetch_buffer(source_placements)
-        output_buffer = self.fetch_buffer(target_placements)
-        if torch.distributed.get_world_size(group) == 1:
-            with torch.cuda.stream(stream):
-                if output_buffer.data_ptr() != input_buffer.data_ptr():
-                    output_buffer.copy_(input_buffer)
-        else:
-            with torch.cuda.stream(stream):
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor=output_buffer, input_tensor=input_buffer, group=group
-                )
-
-        if kwargs.get("bind_params", False) and all(
-            placement is Placement.REPLICATE for placement in target_placements
-        ):
-            self._bind_buffer_to_params(output_buffer)
-        return output_buffer
 
     def _bind_buffer_to_params(self, buffer: torch.Tensor) -> None:
         """Bind the given buffer to the params according to the layout."""
@@ -341,20 +373,6 @@ class DataParallelBuffer:
             idx_shape = self.buffer_index.item_index_map[item_id].shape
             param_data = buffer[start:end].view(idx_shape)
             self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
-
-    @torch.no_grad()
-    def reshard(
-        self,
-        *,
-        comm_dim: Optional[int] = None,
-        **kwargs,
-    ) -> None:
-        """Reshard replicated placements and release temporary full storage."""
-        if comm_dim is not None:
-            source_placement = self.placements[comm_dim]
-            if source_placement is not Placement.REPLICATE:
-                return
-        self.release_unsharded_buffer()
 
     def release_unsharded_buffer(self) -> None:
         """Release the temporary full-sized buffer without changing placements."""
@@ -424,107 +442,3 @@ class DataParallelBuffer:
             requested_meta.bucket_data_index : requested_meta.bucket_data_index
             + requested_meta.size
         ]
-
-    @torch.no_grad()
-    def reduce_grad(
-        self,
-        target_placements: list[Placement],
-        *,
-        comm_dim: int,
-        reduce_scatter: bool,
-        stream: torch.cuda.Stream,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Reduce a partial value into the requested target placements."""
-        source_placements = self.placements
-        input_buffer = self.fetch_buffer(source_placements)
-        output_buffer = self.fetch_buffer(target_placements)
-        group = self.outer_dp_group if comm_dim == 0 else self.inner_dp_group
-        # Inner-DP shards accumulate across microbatches; outer-DP only reduces
-        # the completed inner result and therefore always overwrites its output.
-        reduce_inner = comm_dim == 1
-        accumulate = kwargs.get("accumulate", False) and reduce_inner
-        grad_comm_dtype = (
-            kwargs.get("grad_comm_dtype")
-            or self.mp_policy.grad_comm_dtype
-            or self.dtype
-        )
-
-        # Scale exactly once, when reducing fresh full grads over inner-DP.
-        # Outer-only reduce consumes an already-scaled inner-DP result.
-        if not reduce_inner or self.gradient_scaling_factor in (None, 1.0):
-            op = torch.distributed.ReduceOp.SUM
-            prescale = False
-        elif grad_comm_dtype != torch.bfloat16:
-            op = torch.distributed._make_nccl_premul_sum(
-                self.gradient_scaling_factor
-            )
-            prescale = False
-        else:
-            op = torch.distributed.ReduceOp.SUM
-            prescale = True
-
-        if torch.distributed.get_world_size(group) == 1:
-            if input_buffer.is_cuda:
-                input_buffer.record_stream(stream)
-            with torch.cuda.stream(stream):
-                # A singleton inner-DP group bypasses both NCCL premul-sum and the
-                # BF16 prescale path above, so apply its scaling locally.
-                if reduce_inner and self.gradient_scaling_factor not in (None, 1.0):
-                    input_buffer.mul_(self.gradient_scaling_factor)
-                if output_buffer.data_ptr() != input_buffer.data_ptr():
-                    if accumulate:
-                        output_buffer.add_(input_buffer)
-                    else:
-                        output_buffer.copy_(input_buffer)
-            return output_buffer
-
-        comm_input = input_buffer
-        input_key = None
-        if grad_comm_dtype != self.dtype:
-            input_key = (
-                self.alloc_key,
-                "grad_reduce_input",
-                comm_dim,
-            )
-            input_bucket = self.allocator.allocate(
-                key=input_key, size=input_buffer.numel(), dtype=grad_comm_dtype, device=self.device
-            )
-            comm_input = input_bucket.data
-            with torch.cuda.stream(stream):
-                comm_input.copy_(input_buffer)
-        if comm_input.is_cuda:
-            comm_input.record_stream(stream)
-        if prescale:
-            with torch.cuda.stream(stream):
-                comm_input.mul_(self.gradient_scaling_factor)
-
-        if not reduce_scatter:
-            with torch.cuda.stream(stream):
-                torch.distributed.all_reduce(comm_input, group=group, op=op)
-                if input_key is not None:
-                    output_buffer.copy_(comm_input.to(self.dtype))
-            if input_key is not None:
-                self.allocator.free(input_key)
-            return output_buffer
-
-        input_meta = self.buffer_index._get_shard_meta(source_placements)
-        output_meta = self.buffer_index._get_shard_meta(target_placements)
-        output_offset = output_meta.global_data_index - input_meta.global_data_index
-        # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
-        comm_output = comm_input[
-            output_offset : output_offset + output_buffer.numel()
-        ]
-
-        with torch.cuda.stream(stream):
-            torch.distributed.reduce_scatter_tensor(
-                output=comm_output, input=comm_input, group=group, op=op
-            )
-            if output_buffer.data_ptr() != comm_output.data_ptr():
-                if accumulate:
-                    output_buffer.add_(comm_output)
-                else:
-                    output_buffer.copy_(comm_output)
-        if input_key is not None:
-            self.allocator.free(input_key)
-        return output_buffer

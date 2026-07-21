@@ -327,6 +327,7 @@ class ParameterGroup:
         self._full_grad_buffer_has_accumulated_grad = True
 
         grad_buffer = self.main_grad_buffer
+        # Preserve dimensions whose reduction is deferred on this backward.
         target_placements = grad_buffer.placements.copy()
         for comm_dim, (grad_storage_placement, optimizer_dtensor_placement) in enumerate(
             zip(
@@ -334,13 +335,16 @@ class ParameterGroup:
                 self.dist_params[0].placements,
             )
         ):
+            # Replicated storage accumulates locally until the last backward.
             if not is_last_backward and grad_storage_placement is Placement.REPLICATE:
                 continue
+            # The optimizer DTensor placement determines which gradient extent stays valid.
             target_placement = (
                 Placement.FLAT
                 if isinstance(optimizer_dtensor_placement, Shard)
                 else Placement.REPLICATE
             )
+            # Replicated storage stays physically full while only its owned shard is valid.
             if (
                 target_placement is Placement.FLAT
                 and grad_storage_placement is Placement.REPLICATE
@@ -348,6 +352,7 @@ class ParameterGroup:
                 target_placement = Placement.DIRTY
             target_placements[comm_dim] = target_placement
 
+        # No collective is due for any mesh dimension on this backward.
         if target_placements == grad_buffer.placements:
             return
 
