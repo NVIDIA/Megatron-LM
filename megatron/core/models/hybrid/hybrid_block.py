@@ -247,8 +247,7 @@ class HybridStack(MegatronModule):
 
         Lets generic decoder consumers (e.g. ``GPTModel.PostProcessNode``) discover the
         final norm via the same attribute name they use for non-hybrid decoders, while
-        keeping ``final_norm`` as the registered submodule so existing hybrid checkpoint
-        keys are unchanged.
+        keeping ``final_norm`` as the registered submodule for local state-dict compatibility.
         """
         return getattr(self, "final_norm", None)
 
@@ -526,9 +525,14 @@ class HybridStack(MegatronModule):
         # Add modules other than self.layers
         for name, module in self.named_children():
             if not module is self.layers:
+                module_prefix = f'{prefix}{name}.'
                 module_sharded_state_dict = sharded_state_dict_default(
-                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+                    module, module_prefix, sharded_offsets, metadata, tp_group=self.tp_group
                 )
+                if name == 'final_norm':
+                    replace_prefix_for_sharding(
+                        module_sharded_state_dict, module_prefix, f'{prefix}final_layernorm.'
+                    )
                 sharded_state_dict.update(module_sharded_state_dict)
 
         return sharded_state_dict

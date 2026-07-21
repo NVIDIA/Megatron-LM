@@ -11,6 +11,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
@@ -157,7 +158,7 @@ def test_z_loss_wraps_hybrid_mtp_layer_number_to_tracker_slot():
         is_mtp_layer = True
         layer_number = 5
 
-    clear_aux_losses_tracker()
+    destroy_moe_metrics_tracker()
     try:
         logits = torch.randn(4, 3, requires_grad=True)
         TopKRouter.apply_z_loss(DummyRouter(), logits)
@@ -167,7 +168,7 @@ def test_z_loss_wraps_hybrid_mtp_layer_number_to_tracker_slot():
         assert values[8] > 0
         assert torch.count_nonzero(values) == 1
     finally:
-        clear_aux_losses_tracker()
+        destroy_moe_metrics_tracker()
 
 
 class TestSeqAuxLoss:
