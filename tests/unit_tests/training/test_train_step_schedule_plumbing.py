@@ -34,6 +34,7 @@ def _run(**kwargs):
         micro_batch_size=1,
         decoder_seq_length=None,
         empty_unused_memory_level=0,
+        freeze_all_layers=False,
     )
     captured = {}
     model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
