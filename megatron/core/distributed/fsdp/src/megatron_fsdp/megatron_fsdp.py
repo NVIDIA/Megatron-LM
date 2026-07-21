@@ -311,8 +311,9 @@ class MegatronFSDP(torch.nn.Module):
         recurse_types = fine_grained_recurse_module_types or ()
         self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
-        self._fsdp_optimizer_initialized = False
-        self._fsdp_first_forward_completed = False
+        self._fsdp_optimizer_initialization_attempted = False
+        self._fsdp_first_forward_attempted = False
+        self._fsdp_parameter_reconciliation_failed_reason: Optional[str] = None
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
         # If not provided, Megatron-FSDP will default to a simple data parallel index
@@ -1069,15 +1070,6 @@ class MegatronFSDP(torch.nn.Module):
                 create_custom_backward_hook(module, _pre_backward_param_unshard)
             )
 
-        def _make_grad_acc_hook(param):
-            return lambda p: (
-                None
-                if getattr(p, 'skip_backward_post_hook', False)
-                else _process_post_backward_gradients([p])
-            )
-
-        self._make_grad_acc_hook = _make_grad_acc_hook
-
         # These hooks need to be exposed for manual management by 1F1B Overlapping
         # and triggered by 1F1B Overlapped execution pipeline, except for
         # `param_unshard` hook that needs to be installed at param level,
@@ -1145,7 +1137,18 @@ class MegatronFSDP(torch.nn.Module):
                 ]
 
             for param in grad_acc_param_list:
-                self._register_megatron_grad_acc_hook(self.param_to_name[param], param)
+                # Only register grad acc hook for parameters that require gradients.
+                if not param.requires_grad:
+                    continue
+                self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
+                    param.register_post_accumulate_grad_hook(
+                        lambda p: (
+                            None
+                            if getattr(p, 'skip_backward_post_hook', False)
+                            else _process_post_backward_gradients([p])
+                        )
+                    )
+                )
 
         # Register root module pre- and post-backward hooks in cases where the
         # forward function of root module is not called, but rather the forward
@@ -1510,42 +1513,119 @@ class MegatronFSDP(torch.nn.Module):
         self._reestablish_shared_weights(self.raw_param, owned_parameters)
         self.is_param_fsdp_distributed = distributed
 
-    def _register_megatron_grad_acc_hook(self, name: str, param: torch.nn.Parameter) -> None:
-        if not hasattr(self, "grad_acc_hooks"):
-            return
-        hook_key = f"grad_acc and reduce for {name}"
-        old_handle = self.grad_acc_hooks.pop(hook_key, None)
-        if old_handle is not None:
-            old_handle.remove()
-        if not param.requires_grad or not hasattr(self, "_make_grad_acc_hook"):
-            return
-        self.grad_acc_hooks[hook_key] = param.register_post_accumulate_grad_hook(
-            self._make_grad_acc_hook(param)
+    def _raise_if_parameter_reconciliation_failed(self, operation: str) -> None:
+        if self._fsdp_parameter_reconciliation_failed_reason is not None:
+            raise RuntimeError(
+                f"[Megatron-FSDP] {operation} cannot proceed because parameter-value "
+                "reconciliation previously failed after copying began; the wrapper is "
+                f"terminally closed ({self._fsdp_parameter_reconciliation_failed_reason})."
+            )
+
+    def _parameter_reconciliation_validation_error(
+        self,
+    ) -> Tuple[Optional[str], Optional[Tuple[str, ...]]]:
+        try:
+            self._raise_if_parameter_reconciliation_failed("reregister_parameters()")
+            if self._fsdp_optimizer_initialization_attempted:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() must run before "
+                    "fully_shard_optimizer() initialization is attempted."
+                )
+            if self._fsdp_first_forward_attempted:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() must run before the first "
+                    "forward attempt."
+                )
+
+            was_distributed = self.is_param_fsdp_distributed
+            current_by_fqn = self._current_parameters_by_fqn()
+            expected_fqns = set(self._parameter_fqn_to_canonical)
+            current_fqns = set(current_by_fqn)
+            missing_fqns = sorted(expected_fqns - current_fqns)
+            extra_fqns = sorted(current_fqns - expected_fqns)
+            if missing_fqns or extra_fqns:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() FQN set mismatch: "
+                    f"missing={missing_fqns}, extra={extra_fqns}."
+                )
+
+            expected_alias_topology = {
+                frozenset(alias_group) for alias_group in self._parameter_alias_groups
+            }
+            current_alias_topology = self._parameter_alias_topology(current_by_fqn)
+            if current_alias_topology != expected_alias_topology:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() alias topology mismatch: "
+                    f"expected={expected_alias_topology}, got={current_alias_topology}."
+                )
+
+            logical_by_fqn = (
+                self._logical_raw_parameters_by_fqn(current_by_fqn)
+                if was_distributed
+                else current_by_fqn
+            )
+            planned_parameters = {
+                name: logical_by_fqn[name] for name in self._parameter_canonical_fqns
+            }
+            for name, param in planned_parameters.items():
+                self._validate_registered_parameter(name, param)
+            replacements = {
+                name: param
+                for name, param in planned_parameters.items()
+                if param is not self.raw_param[name]
+            }
+            self.param_and_grad_buffer._build_parameter_value_reconciliation_plan(replacements)
+        except Exception as error:
+            return f"{type(error).__name__}: {error}", None
+        return None, tuple(sorted(replacements))
+
+    def _parameter_reconciliation_validation_consensus(
+        self, local_error: Optional[str], local_plan: Optional[Tuple[str, ...]]
+    ) -> None:
+        group = self.dist_index.get_dp_group()
+        validation_results: List[Tuple[Optional[str], Optional[Tuple[str, ...]]]] = [
+            (None, None)
+        ] * group.size()
+        torch.distributed.all_gather_object(
+            validation_results, (local_error, local_plan), group=group
         )
+        failures = [
+            f"group rank {rank}: {error}"
+            for rank, (error, _) in enumerate(validation_results)
+            if error is not None
+        ]
+        if failures:
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() validation failed before mutation "
+                "on the data-parallel group: " + "; ".join(failures)
+            )
+
+        validation_plans = {plan for _, plan in validation_results}
+        if len(validation_plans) != 1:
+            details = "; ".join(
+                f"group rank {rank}: {plan}" for rank, (_, plan) in enumerate(validation_results)
+            )
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() validation plans differ before "
+                "mutation on the data-parallel group: " + details
+            )
 
     def reregister_parameters(self):
-        """Reconcile pre-optimizer replacement values with Megatron-FSDP storage.
+        """Reconcile validated replacement values with Megatron-FSDP-owned storage.
 
-        The supported flow is fully_shard_model() followed by same-layout
-        load_state_dict(assign=True), restoration of the original alias topology,
-        and this method before the first forward and before fully_shard_optimizer().
-        Replacement objects are temporary value sources: Megatron-FSDP keeps its
-        original raw and distributed Parameter identities, hooks, and ownership state.
+        This collective API supports only 'optim_grads_params' and must run
+        synchronously on the data-parallel group after same-layout
+        load_state_dict(assign=True) and final alias restoration, but before
+        the first forward attempt or optimizer-initialization attempt. External
+        Parameters are temporary value sources; owned identities remain authoritative.
 
-        Shape, dtype, device, tensor subclass, stride, DTensor mesh and placements,
-        the exact FQN set, and the complete alias topology must match the wrapped
-        model. Optimizer-state migration, dtype/device conversion, FP8/transpose
-        storage, delayed-wgrad parameters, and HSDP helper storage are not supported.
+        Validation, including special-storage checks, reaches group consensus
+        before mutation. Validation failures leave storage unchanged. Unexpected
+        failures after copying begins are not rolled back: the wrapper enters a
+        terminal state and rejects later reconciliation, forward, and optimizer use.
         """
-        if self._fsdp_optimizer_initialized:
-            raise RuntimeError(
-                "[Megatron-FSDP] reregister_parameters() must run before "
-                "fully_shard_optimizer() successfully initializes the optimizer."
-            )
-        if self._fsdp_first_forward_completed:
-            raise RuntimeError(
-                "[Megatron-FSDP] reregister_parameters() must run before the first forward."
-            )
+        local_error, local_plan = self._parameter_reconciliation_validation_error()
+        self._parameter_reconciliation_validation_consensus(local_error, local_plan)
 
         was_distributed = self.is_param_fsdp_distributed
         current_by_fqn = self._current_parameters_by_fqn()
@@ -1586,10 +1666,14 @@ class MegatronFSDP(torch.nn.Module):
         if not replacements:
             return self
 
+        copy_plan = self.param_and_grad_buffer._build_parameter_value_reconciliation_plan(
+            replacements
+        )
         try:
-            self.param_and_grad_buffer._reconcile_parameter_values(replacements)
+            self.param_and_grad_buffer._reconcile_parameter_values(replacements, copy_plan)
             self._install_owned_parameter_presentation(distributed=was_distributed)
-        except Exception:
+        except Exception as error:
+            self._fsdp_parameter_reconciliation_failed_reason = f"{type(error).__name__}: {error}"
             self._restore_module_parameter_snapshot(current_by_fqn)
             self.is_param_fsdp_distributed = was_distributed
             raise
@@ -1707,11 +1791,12 @@ class MegatronFSDP(torch.nn.Module):
         """
         Wrapped forward pass of the model managed by FSDP.
         """
+        self._raise_if_parameter_reconciliation_failed("forward()")
+        self._fsdp_first_forward_attempted = True
         self._replace_param_with_raw_if_needed()
         with torch.autograd.profiler.record_function("CustomFSDP.forward"):
             # Call the forward pass of the wrapped module.
             output = self.module(*inputs, **kwargs)
-            self._fsdp_first_forward_completed = True
             return output
 
 

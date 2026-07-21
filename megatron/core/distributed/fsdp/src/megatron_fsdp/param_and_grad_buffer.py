@@ -60,6 +60,10 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+class _ParameterValueReconciliationCopyError(RuntimeError):
+    """Raised after parameter-value reconciliation enters its copy phase."""
+
+
 try:
     # Default to Megatron-LM FW.
     from megatron.core.distributed.distributed_data_parallel_config import (
@@ -3341,13 +3345,17 @@ class ParamAndGradBuffer:
         return named_parameters
 
     @torch.no_grad()
-    def _reconcile_parameter_values(self, replacements: Dict[str, torch.nn.Parameter]) -> None:
-        """Copy validated replacement values into Megatron-FSDP-owned storage.
+    def _build_parameter_value_reconciliation_plan(
+        self, replacements: Dict[str, torch.nn.Parameter]
+    ) -> List[Tuple[Any, ...]]:
+        """Validate reconciliation storage and return a mutation-free copy plan."""
+        if self.ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() only supports the "
+                "'optim_grads_params' sharding strategy; got "
+                f"{self.ddp_config.data_parallel_sharding_strategy!r}."
+            )
 
-        Callers must validate the module FQN, alias, and tensor-layout contract
-        before invoking this helper. This method performs a complete storage
-        support check before copying any values.
-        """
         parameters_by_name = {self.param_to_name[param]: param for param in self.params}
         parameter_locations = {
             param: (group, item_id)
@@ -3416,10 +3424,17 @@ class ParamAndGradBuffer:
             for buffer_name, buffer in (
                 ("model weight", model_weight_buffer),
                 ("main weight", main_weight_buffer),
+                ("main gradient", group.main_grad_buffer),
             ):
-                if buffer is not None and not hasattr(buffer, "data"):
+                if buffer is None:
+                    continue
+                if not hasattr(buffer, "data"):
                     raise RuntimeError(
                         f"[Megatron-FSDP] {buffer_name} storage is not initialized for {name}."
+                    )
+                if original not in buffer.param_idx or buffer.param_idx[original] != item_id:
+                    raise RuntimeError(
+                        f"[Megatron-FSDP] {buffer_name} item mapping mismatch for {name}."
                     )
 
             copy_plan.append(
@@ -3434,24 +3449,47 @@ class ParamAndGradBuffer:
                 )
             )
 
-        for (
-            name,
-            original_local,
-            replacement_local,
-            group,
-            item_id,
-            model_weight_buffer,
-            main_weight_buffer,
-        ) in copy_plan:
-            if model_weight_buffer is None:
-                original_local.copy_(replacement_local)
-            else:
-                model_weight_buffer.set_item(item_id, replacement_local)
-            if main_weight_buffer is not None:
-                main_weight_buffer.set_item(item_id, replacement_local)
-            if group.main_grad_buffer is not None:
-                group.main_grad_buffer.get_item(item_id).zero_()
-            self.dist_main_grad.pop(name, None)
+        return copy_plan
+
+    @torch.no_grad()
+    def _reconcile_parameter_values(
+        self,
+        replacements: Dict[str, torch.nn.Parameter],
+        copy_plan: Optional[List[Tuple[Any, ...]]] = None,
+    ) -> None:
+        """Copy validated replacement values into Megatron-FSDP-owned storage.
+
+        Validation completes before this method starts copying. An unexpected
+        failure after the copy phase begins is not rolled back; callers must
+        transition the owning wrapper into a terminal failed state.
+        """
+        if copy_plan is None:
+            copy_plan = self._build_parameter_value_reconciliation_plan(replacements)
+
+        try:
+            for (
+                name,
+                original_local,
+                replacement_local,
+                group,
+                item_id,
+                model_weight_buffer,
+                main_weight_buffer,
+            ) in copy_plan:
+                if model_weight_buffer is None:
+                    original_local.copy_(replacement_local)
+                else:
+                    model_weight_buffer.set_item(item_id, replacement_local)
+                if main_weight_buffer is not None:
+                    main_weight_buffer.set_item(item_id, replacement_local)
+                if group.main_grad_buffer is not None:
+                    group.main_grad_buffer.get_item(item_id).zero_()
+                self.dist_main_grad.pop(name, None)
+        except Exception as error:
+            raise _ParameterValueReconciliationCopyError(
+                "[Megatron-FSDP] parameter-value reconciliation failed after the copy phase "
+                "began; the wrapper is no longer safe to use."
+            ) from error
 
     def update_main_grads(self):
         """
