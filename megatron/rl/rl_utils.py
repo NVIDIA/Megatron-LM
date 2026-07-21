@@ -68,7 +68,7 @@ from megatron.rl.agent.api import (
     Rollouts,
     TokenRollout,
 )
-from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
+from megatron.rl.agent.weighted_multi_task import PgtRebalanceConfig, WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
@@ -540,9 +540,17 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
 
+    pgt_rebalance = None
+    if getattr(args, 'rl_inference_rebalancing', False):
+        pgt_rebalance = PgtRebalanceConfig(
+            ema_alpha=args.rl_inference_rebalancing_ema_alpha,
+            min_interval_s=args.rl_inference_rebalancing_interval,
+            max_step_fraction=args.rl_inference_rebalancing_max_step,
+        )
     return WeightedMultiTask.from_config(
         config,
         parallel_generation_tasks=parallel_generation_tasks,
+        pgt_rebalance=pgt_rebalance,
     )
 
 
@@ -1143,6 +1151,10 @@ def _collect_rollout_pipeline_metrics() -> dict:
             f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
             f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
         })
+        # Lifetime EMA of per-rollout engine service time (not reset below;
+        # it drives --rl-inference-rebalancing).
+        if pipeline.engine_dwell_ema is not None:
+            metrics[f"{env_id}_engine_dwell_ema_s"] = pipeline.engine_dwell_ema
         for name, samples in (
             ("infer_queue_dwell", pipeline.infer_queue_dwell),
             ("engine_dwell", pipeline.engine_dwell),
@@ -1185,6 +1197,15 @@ def _collect_rollout_pipeline_metrics() -> dict:
             metrics[f"{env_id}_agent_pgts"] = pgt
             metrics[f"{env_id}_agent_slots"] = slots
         metrics["multitask_total_pgt"] = dist["total_pgt"]
+        # Live allocation under --rl-inference-rebalancing (same per-env
+        # summing as agent_pgts above, since env_ids can repeat).
+        if (live := dist.get("live_pgts")) is not None:
+            live_per_env: dict = {}
+            for env_id, pgt in zip(dist["env_ids"], live):
+                live_per_env[env_id] = live_per_env.get(env_id, 0) + pgt
+            for env_id, pgt in live_per_env.items():
+                metrics[f"{env_id}_agent_pgt_live"] = pgt
+        metrics["multitask_pgt_rebalance_count"] = dist.get("rebalance_count", 0)
     return metrics
 
 

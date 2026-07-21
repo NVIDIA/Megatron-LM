@@ -17,7 +17,12 @@ from megatron.rl.agent.api import (
     _SubmissionGate,
 )
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
-from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
+from megatron.rl.agent.weighted_multi_task import (
+    AgentConfig,
+    PgtRebalanceConfig,
+    WeightedMultiTask,
+    _PgtRebalancer,
+)
 from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw
 
 
@@ -126,6 +131,40 @@ class TestSubmissionGate:
         gate.release_for(submission)
         assert gate.held == 0
         assert gate.release_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_grow_wakes_blocked_acquirer(self):
+        gate = _SubmissionGate(capacity=1, submission="G")
+        await gate.acquire_for("G")
+        blocked = asyncio.create_task(gate.acquire_for("G"))
+        await _flush()
+        assert not blocked.done()
+        gate.set_capacity(2)
+        await asyncio.wait_for(blocked, timeout=5)
+        assert gate.held == 2
+
+    @pytest.mark.asyncio
+    async def test_shrink_below_held_never_revokes(self):
+        gate = _SubmissionGate(capacity=4, submission="G")
+        for _ in range(3):
+            await gate.acquire_for("G")
+        gate.set_capacity(2)
+        # In-flight slots are untouched; only new acquires block.
+        assert gate.held == 3
+        blocked = asyncio.create_task(gate.acquire_for("G"))
+        await _flush()
+        assert not blocked.done()
+        gate.release_for("G")  # held 2, still at the new capacity
+        await _flush()
+        assert not blocked.done()
+        gate.release_for("G")  # held 1 < 2: the waiter proceeds
+        await asyncio.wait_for(blocked, timeout=5)
+        assert gate.held == 2
+
+    def test_set_capacity_clamps_to_one(self):
+        gate = _SubmissionGate(capacity=4, submission="G")
+        gate.set_capacity(0)
+        assert gate.capacity == 1
 
 
 class TestConsumptionRelease:
@@ -444,3 +483,146 @@ class TestGroupedRollouts:
             assert min(agent_groups) == 0
             assert all(slots == 0 for slots in agent_slots)
             assert np.gcd.reduce(agent_slots) == 0
+
+
+class TestPgtAllocation:
+    def test_slower_env_gets_proportionally_more(self):
+        # Equal weights, 1.2 min vs 1.0 min: the slower env gets 1.2x slots.
+        new = WeightedMultiTask._compute_pgt_allocation(
+            [0.5, 0.5], [1.2, 1.0], 22, [11, 11], min_pgts=[1, 1], max_step_fraction=0.25
+        )
+        assert new == [12, 10]
+
+    def test_weight_and_duration_combine(self):
+        # weight 3:1, equal durations: allocation follows the weights.
+        new = WeightedMultiTask._compute_pgt_allocation(
+            [0.75, 0.25], [1.0, 1.0], 8, [6, 2], min_pgts=[1, 1], max_step_fraction=1.0
+        )
+        assert new == [6, 2]
+
+    @pytest.mark.parametrize("total", [7, 8, 23])
+    def test_sum_invariant_under_rounding(self, total):
+        current = [total // 2, total - total // 2]
+        new = WeightedMultiTask._compute_pgt_allocation(
+            [0.5, 0.5], [1.3, 0.7], total, current, min_pgts=[1, 1], max_step_fraction=1.0
+        )
+        assert sum(new) == total
+
+    def test_all_unknown_durations_keep_current(self):
+        assert WeightedMultiTask._compute_pgt_allocation(
+            [0.5, 0.5], [None, None], 8, [5, 3], min_pgts=[1, 1], max_step_fraction=1.0
+        ) == [5, 3]
+
+    def test_unknown_duration_falls_back_to_weighted_mean(self):
+        # An env with no estimate is treated as average-speed. Envs 0 and 1
+        # are known (3.0 vs 1.0 → mean 2.0); env 2 is unknown, so it lands
+        # between them instead of defaulting to fastest or slowest.
+        new = WeightedMultiTask._compute_pgt_allocation(
+            [1 / 3, 1 / 3, 1 / 3],
+            [3.0, 1.0, None],
+            12,
+            [4, 4, 4],
+            min_pgts=[1, 1, 1],
+            max_step_fraction=1.0,
+        )
+        assert new[0] > new[2] > new[1]
+        assert sum(new) == 12
+
+    def test_min_pgts_respected(self):
+        new = WeightedMultiTask._compute_pgt_allocation(
+            [0.5, 0.5], [100.0, 0.01], 8, [4, 4], min_pgts=[1, 3], max_step_fraction=1.0
+        )
+        assert new[1] >= 3
+        assert sum(new) == 8
+
+    def test_max_step_limits_movement(self):
+        # Extreme imbalance, but each update moves at most 25% of current.
+        new = WeightedMultiTask._compute_pgt_allocation(
+            [0.5, 0.5], [10.0, 0.1], 20, [10, 10], min_pgts=[1, 1], max_step_fraction=0.25
+        )
+        assert new == [12, 8]
+
+
+class _FakeGate:
+    def __init__(self):
+        self.capacity_history = []
+
+    def set_capacity(self, capacity):
+        self.capacity_history.append(capacity)
+
+
+class _FakePipeline:
+    def __init__(self, ema, samples):
+        self.engine_dwell_ema = ema
+        self.engine_dwell_sample_count = samples
+        self.gate = _FakeGate()
+
+
+class _FakeAgent:
+    def __init__(self, pipeline, pgt):
+        self._active_pipeline = pipeline
+        self.parallel_generation_tasks = pgt
+
+
+class TestPgtRebalancer:
+    def _make(self, emas, samples, pgts, interval=0.0, min_samples=1):
+        agents = [
+            _FakeAgent(_FakePipeline(ema, n), pgt) for ema, n, pgt in zip(emas, samples, pgts)
+        ]
+        rebalancer = _PgtRebalancer(
+            PgtRebalanceConfig(
+                min_interval_s=interval, min_samples_per_env=min_samples, max_step_fraction=1.0
+            ),
+            agent_indices=list(range(len(agents))),
+            weights=[1.0 / len(agents)] * len(agents),
+            current_pgts=list(pgts),
+            min_pgts=[1] * len(agents),
+        )
+        return agents, rebalancer
+
+    def test_shifts_capacity_toward_slow_env(self):
+        agents, rebalancer = self._make([3.0, 1.0], [10, 10], [8, 8])
+        event = rebalancer.maybe_rebalance(agents)
+        assert event is not None
+        assert event["new"] == [12, 4]
+        assert sum(event["new"]) == 16
+        assert agents[0]._active_pipeline.gate.capacity_history == [12]
+        assert agents[1]._active_pipeline.gate.capacity_history == [4]
+        assert [a.parallel_generation_tasks for a in agents] == [12, 4]
+
+    def test_interval_throttles_checks(self):
+        agents, rebalancer = self._make([3.0, 1.0], [10, 10], [8, 8], interval=1000.0)
+        assert rebalancer.maybe_rebalance(agents) is not None
+        # EMAs still differ, but the next check is inside the interval.
+        assert rebalancer.maybe_rebalance(agents) is None
+
+    def test_insufficient_samples_is_noop(self):
+        agents, rebalancer = self._make([3.0, 1.0], [0, 0], [8, 8], min_samples=5)
+        assert rebalancer.maybe_rebalance(agents) is None
+        assert [a.parallel_generation_tasks for a in agents] == [8, 8]
+
+
+class TestEngineDwellEma:
+    @pytest.mark.asyncio
+    async def test_ema_tracks_inferred_rollouts(self):
+        gen = MockGenerator(parallel_generation_tasks=2)
+        gen.max_parallel_generation_tasks = 5
+        request = GroupedRolloutRequest(
+            num_groups=1,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="R",
+            consumption_granularity="B",
+        )
+        it = gen.get_grouped_rollouts(request)
+        try:
+            for _ in range(3):
+                await asyncio.wait_for(anext(it), timeout=10)
+            pipeline = gen._active_pipeline
+            # Workers are sized for the rebalancing ceiling, not the split.
+            assert pipeline.num_infer_workers == 5
+            assert pipeline.engine_dwell_ema is not None
+            assert pipeline.engine_dwell_sample_count >= 3
+        finally:
+            await it.aclose()
