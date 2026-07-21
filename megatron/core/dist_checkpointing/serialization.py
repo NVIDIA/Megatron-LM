@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Entrypoints for saving and loading the distributed checkpoints.
 
@@ -16,8 +16,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
-from megatron.core.msc_utils import MultiStorageClientFeature
-from megatron.core.utils import log_single_rank
+from megatron.core.msc_utils import maybe_msc
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -50,6 +49,9 @@ from .validation import (
 
 logger = logging.getLogger(__name__)
 
+# monkeypatch needed for ModelOpt
+# will be removed once MLM updated to newer ModelOpt
+get_default_load_sharded_strategy = TorchDistLoadShardedStrategy
 
 # flat state dict with sharded objects without any data
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
@@ -178,10 +180,7 @@ def load(
 def _legacy_common_state_exists(checkpoint_dir: str) -> bool:
     """Check whether the checkpoint stores common data in a legacy common.pt file."""
     path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        return msc.Path(path).exists()
-    return os.path.exists(path)
+    return maybe_msc.Path(path).exists()
 
 
 def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
@@ -198,15 +197,7 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     Returns:
         StateDict: state dict with non-sharded objects from the checkpoint
     """
-    if isinstance(checkpoint_dir, Path):
-        checkpoint_dir = str(checkpoint_dir)
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in "
-            "load_common_state_dict will no longer be supported in a future release. "
-            "Please pass it as a string instead.",
-        )
+
     verify_checkpoint(str(checkpoint_dir))
 
     # Legacy checkpoints keep common data in a separate common.pt file.
@@ -332,7 +323,7 @@ def load_content_metadata(
 def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
     """determine the appropriate sharding strategy and delegate removal to the sharded strategy"""
     verify_checkpoint(checkpoint_dir)
-    TorchDistSaveShardedStrategy.remove_sharded_tensors(checkpoint_dir, key_prefix)
+    TorchDistLoadShardedStrategy().remove_sharded_tensors(checkpoint_dir, key_prefix)
 
 
 def save(
@@ -404,11 +395,7 @@ def save(
     from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 
     if torch.distributed.get_rank() == 0:
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            checkpoint_dir_path = msc.Path(str(checkpoint_dir))
-        else:
-            checkpoint_dir_path = Path(checkpoint_dir)
+        checkpoint_dir_path = maybe_msc.Path(str(checkpoint_dir))
 
         if next(checkpoint_dir_path.iterdir(), None) is not None:
             # Don't throw exception here since this could cause a cascade of failures
@@ -462,27 +449,3 @@ def save(
     if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)
     return async_request
-
-
-def get_default_save_sharded_strategy(
-    backend: str = 'torch_dist', version: int = 1
-) -> TorchDistSaveShardedStrategy:
-    """Get default save sharded strategy."""
-    logger.warning(
-        'megatron.core.dist_checkpointing.serialization.get_default_save_sharded_strategy '
-        'is deprecated and will be removed in the future releases. Please, use '
-        'megatron.core.dist_checkpointing.strategies.torch.TorchDistSaveShardedStrategy '
-        'to get the default save sharded strategy.'
-    )
-    return TorchDistSaveShardedStrategy()
-
-
-def get_default_load_sharded_strategy(checkpoint_dir: str) -> TorchDistLoadShardedStrategy:
-    """Get default load sharded strategy."""
-    logger.warning(
-        'megatron.core.dist_checkpointing.serialization.get_default_load_sharded_strategy '
-        'is deprecated and will be removed in the future releases. Please, use '
-        'megatron.core.dist_checkpointing.strategies.torch.TorchDistLoadShardedStrategy '
-        'to get the default load sharded strategy.'
-    )
-    return TorchDistLoadShardedStrategy()
