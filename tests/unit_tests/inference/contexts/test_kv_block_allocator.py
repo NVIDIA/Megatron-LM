@@ -385,11 +385,39 @@ def test_evict_lru_insufficient_cached_blocks_returns_false():
     assert a.kv_hash_to_block_id == {10: 0, 20: 1}
 
 
-def test_evict_lru_terminates_on_cyclic_parent_graph():
-    """Safety bound: a hash collision could make the parent graph cyclic, which
-    would otherwise make the subtree-max / depth recurrence spin forever. The
-    num_cached iteration cap must let eviction terminate and still evict the
-    requested number of blocks (a hang would time this test out)."""
+def test_evict_lru_keeps_hottest_leaf_over_cold_interior_parent():
+    """Optimality: leaf-peeling must retain the single most-recently-used block
+    even when reaching it means evicting a colder interior parent elsewhere. A
+    block is kept only for its own recency, never because a hot descendant props
+    it up, so the hot leaf E survives while the colder interior block B is evicted.
+
+        A(ts 1) -> B(ts 2) -> C(ts 5)
+                          \-> F(ts 3)
+                \-> D(ts 3) -> E(ts 5)
+    """
+    a = _lru_allocator(total_count=8)
+    # hashes: A=10, B=20, C=30, F=40, D=50, E=60
+    _seed_cached_chain(
+        a,
+        block_ids=[0, 1, 2, 3, 4, 5],
+        hashes=[10, 20, 30, 40, 50, 60],
+        parents=[0, 10, 20, 20, 10, 50],
+        timestamps=[1, 2, 5, 3, 3, 5],
+    )
+
+    assert a.evict_lru_blocks(3) is True
+    # Evicted F(3), C(5), then B(2) once childless. Retains A, D, and the hottest
+    # block E -- never evicting E in favor of the colder interior B.
+    assert a.kv_hash_to_block_id == {10: 0, 50: 4, 60: 5}
+    assert a.block_hashes[5].item() == 60  # hottest leaf E retained
+    assert a.block_hashes[1].item() == -1  # cold interior B evicted
+    _assert_prefix_invariant(a)
+
+
+def test_evict_lru_asserts_on_cyclic_parent_graph():
+    """The parent graph is assumed acyclic (a forest). A hash collision producing
+    a cycle exposes no leaf, so the peel cannot collect enough blocks; this is a
+    bug and must fail loudly rather than silently under-evict."""
     a = _lru_allocator()
     # 2-cycle: block 0's parent hash is 20 (block 1) and block 1's parent hash is
     # 10 (block 0). register_kv_block_hashes never produces this — we seed it
@@ -397,18 +425,8 @@ def test_evict_lru_terminates_on_cyclic_parent_graph():
     _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[20, 10], timestamps=[1, 2])
     assert int(a.get_evictable_block_count()) == 2
 
-    # Terminates (no hang) and evicts exactly one of the two cached blocks.
-    assert a.evict_lru_blocks(1) is True
-    assert int(a.get_evictable_block_count()) == 1
-    assert len(a.kv_hash_to_block_id) == 1
-
-    # A longer 3-cycle also terminates and can be fully evicted.
-    b = _lru_allocator()
-    _seed_cached_chain(
-        b, block_ids=[0, 1, 2], hashes=[10, 20, 30], parents=[30, 10, 20], timestamps=[1, 2, 3]
-    )
-    assert b.evict_lru_blocks(3) is True
-    assert b.kv_hash_to_block_id == {}
+    with pytest.raises(AssertionError):
+        a.evict_lru_blocks(1)
 
 
 def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
@@ -436,9 +454,41 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     assert a.is_memory_available(1, num_evictable_to_exclude=2) is False
 
 
+def _reference_leaf_peel(block_ids, hashes, parents, timestamps, k_evict):
+    """Independent, straightforward greedy reference: repeatedly evict the
+    currently-evictable leaf with the oldest (timestamp, block_id). Returns the
+    set of evicted block ids. Used to pin the optimal eviction choice."""
+    hash_to_id = dict(zip(hashes, block_ids))
+    ts = dict(zip(block_ids, timestamps))
+    child_count = {b: 0 for b in block_ids}
+    parent_of = {}
+    for b, p in zip(block_ids, parents):
+        pid = hash_to_id.get(p)
+        parent_of[b] = pid
+        if pid is not None:
+            child_count[pid] += 1
+
+    import heapq as _heapq
+
+    heap = [(ts[b], b) for b in block_ids if child_count[b] == 0]
+    _heapq.heapify(heap)
+    evicted = set()
+    while heap and len(evicted) < k_evict:
+        _, b = _heapq.heappop(heap)
+        evicted.add(b)
+        pid = parent_of[b]
+        if pid is not None:
+            child_count[pid] -= 1
+            if child_count[pid] == 0:
+                _heapq.heappush(heap, (ts[pid], pid))
+    return evicted
+
+
 def test_evict_lru_preserves_invariant_under_random_chains():
     """Property test: across many randomized multi-chain layouts and eviction
-    counts, the retained cache always satisfies the parent-chain invariant."""
+    counts, eviction (a) preserves the parent-chain invariant and (b) evicts
+    exactly the optimal leaf-peel set (matched against an independent
+    reference)."""
     torch.manual_seed(0)
     for _ in range(50):
         n = int(torch.randint(2, 10, (1,)).item())
@@ -452,10 +502,18 @@ def test_evict_lru_preserves_invariant_under_random_chains():
                 parents.append(0)  # root
             else:
                 parents.append(hashes[int(torch.randint(0, k, (1,)).item())])
-        timestamps = torch.randint(1, 20, (n,)).tolist()
+        # Distinct timestamps so the optimal evicted set is unique and the
+        # reference comparison is exact (no tie-break ambiguity).
+        timestamps = torch.randperm(50)[:n].add(1).tolist()
         _seed_cached_chain(a, block_ids, hashes, parents, timestamps)
 
         k_evict = int(torch.randint(1, n + 1, (1,)).item())
+        expected_evicted = _reference_leaf_peel(
+            block_ids, hashes, parents, timestamps, k_evict
+        )
+
         assert a.evict_lru_blocks(k_evict) is True
-        assert len(a.kv_hash_to_block_id) == n - k_evict
+        retained = set(a.kv_hash_to_block_id.values())
+        assert retained == set(block_ids) - expected_evicted
+        assert len(retained) == n - k_evict
         _assert_prefix_invariant(a)

@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import heapq
 from collections import deque
 from typing import Callable, Dict, Optional
 
@@ -382,18 +383,37 @@ class KVBlockAllocator:
         ancestor can be older than its descendant and get evicted first, leaving a
         dangling child.
 
-        To preserve the invariant, we key each cached block by the *maximum*
-        timestamp over its subtree (itself plus all cached descendants): a cached
-        prefix is as recently used as the most-recently-used block extending it.
-        This makes every parent's key >= all of its descendants' keys, so evicting
-        an ascending-key prefix is always "descendant closed" — a parent is only
-        evicted once all of its children have been. Ties are broken by depth
-        (deeper first) so a parent never precedes a child at equal key.
+        To preserve the invariant while staying optimal we peel the cached forest
+        from its leaves inward with a min-heap: only a leaf (a cached block with
+        no cached children) is ever evictable, and among the currently-evictable
+        leaves we always take the one with the oldest *own* timestamp. Evicting a
+        leaf can turn its parent into a leaf, which is then pushed onto the heap.
+        Repeating ``num_blocks_needed`` times gives, at each step, the globally
+        least-recently-used block that can be removed without orphaning a child —
+        the natural generalization of LRU to the parent-chain constraint. Keying
+        each block by its *own* recency (and only reconsidering a parent once its
+        children are gone) is what makes this optimal: a block is retained purely
+        because it is recently used, never because a hot descendant props it up,
+        so a colder evictable block is always evicted before a hotter one.
+
+        Worked example, evicting 3 from::
+
+            A(ts 1) -> B(ts 2) -> C(ts 5)   (C, F are leaves under B)
+                              \-> F(ts 3)
+                    \-> D(ts 3) -> E(ts 5)   (E is a leaf under D)
+
+        Leaf-peel evicts F(3), then C(5); B is now childless so it joins the
+        leaves with its own ts=2 and is evicted next -> retains {A, D, E}, keeping
+        the hottest block E(5) rather than the colder interior block B(2).
 
         Note: because a request holds a contiguous block prefix [0..k], any in-use
         (ref_count > 0) block keeps all of its ancestors in use too. Hence a cached
         (ref_count == 0) block can only have cached children, and considering the
         cached set alone is sufficient to avoid dangling children.
+
+        The parent graph is assumed acyclic (a forest), which holds for any hashes
+        produced by the prefix-chain builder; an assertion guards against a
+        pathological hash collision wedging the peel.
 
         Args:
             num_blocks_needed: Number of blocks to evict.
@@ -408,6 +428,8 @@ class KVBlockAllocator:
         num_cached = cached_block_ids.numel()
         if num_cached < num_blocks_needed:
             return False  # Not enough cached blocks to evict
+        if num_blocks_needed <= 0:
+            return True
 
         own_ts = self.block_timestamps[cached_block_ids]
         hashes = self.block_hashes[cached_block_ids]
@@ -416,63 +438,52 @@ class KVBlockAllocator:
         # Resolve each block's parent hash to the local index of the parent block,
         # or -1 when the parent is not cached (root block with parent hash 0, or a
         # parent still in use). Hashes are unique per cached block, so a single
-        # sorted lookup suffices.
+        # sorted lookup suffices. This O(num_cached log num_cached) setup stays
+        # vectorized; only the inherently-sequential peel below is per-element.
         sorted_hashes, sort_order = torch.sort(hashes)
         pos = torch.searchsorted(sorted_hashes, parents).clamp(max=num_cached - 1)
         found = sorted_hashes[pos] == parents
         parent_idx = torch.where(found, sort_order[pos], torch.full_like(pos, -1))
         has_parent = parent_idx >= 0
-        parent_safe = parent_idx.clamp(min=0)  # -1 -> 0 for masked-out gathers
 
-        # Propagate subtree-max timestamp and depth up/down the parent chain via
-        # repeated vectorized scatter/gather. Converges in <= max-chain-depth
-        # iterations (bounded by prompt_len / block_size); no per-element Python.
-        #
-        # Each block is keyed by the maximum timestamp over its subtree (itself
-        # plus all cached descendants). This makes a parent's key >= every one of
-        # its descendants' keys, so ordering by that key ascending never places a
-        # parent before its descendants; depth (deeper first) breaks ties so
-        # children still precede parents at equal key. The first num_blocks_needed
-        # blocks of that order are therefore "descendant closed" — eviction always
-        # peels from the leaves inward and never orphans a cached block.
-        #
-        # Worked example: chain A(hash 10, root, ts 1) -> B(hash 20, ts 2) ->
-        # C(hash 30, ts 3), evicting 2. The subtree-max propagates the leaf's
-        # timestamp up the chain, one hop per iteration:
-        #     iter | A | B | C
-        #     init | 1 | 2 | 3   (own timestamps)
-        #       1  | 2 | 3 | 3   (each child's value scattered onto its parent)
-        #       2  | 3 | 3 | 3   (C's ts=3 reaches A through B)
-        #       3  | 3 | 3 | 3   (no change -> stop)
-        # Final subtree_max = [3,3,3], depth = [0,1,2]. Ordering by
-        # (subtree_max asc, depth desc) breaks the all-3 tie by depth: C(2), B(1),
-        # A(0). The first 2 evict the leaf C and its parent B, retaining the root A.
-        #
-        # The iteration count is capped at num_cached. A valid parent graph is a
-        # forest, so depth can never exceed num_cached and the loop fixes well
-        # before the cap. The cap is a safety bound: were a hash collision to
-        # create a parent cycle, the depth recurrence would otherwise never
-        # converge and spin forever. With the cap we stop at a bounded (if
-        # arbitrary) ordering instead of hanging; correctness still degrades
-        # gracefully to "some valid block set is evicted".
-        subtree_max = own_ts.clone()
-        depth = torch.zeros(num_cached, dtype=torch.int64)
-        for _ in range(num_cached):
-            new_subtree_max = subtree_max.clone()
-            new_subtree_max.scatter_reduce_(
-                0, parent_idx[has_parent], subtree_max[has_parent], reduce="amax"
-            )
-            new_depth = torch.where(has_parent, depth[parent_safe] + 1, depth)
-            if torch.equal(new_subtree_max, subtree_max) and torch.equal(new_depth, depth):
-                break
-            subtree_max, depth = new_subtree_max, new_depth
+        # Number of cached children per block; a block is an evictable leaf once
+        # this reaches 0.
+        child_count = torch.zeros(num_cached, dtype=torch.int64)
+        child_count.scatter_add_(
+            0, parent_idx[has_parent], torch.ones(int(has_parent.sum()), dtype=torch.int64)
+        )
 
-        # Order by (subtree_max asc, depth desc) so children precede their parents.
-        # Two stable sorts compose into the desired lexicographic order.
-        by_depth = torch.argsort(depth, descending=True, stable=True)
-        order = by_depth[torch.argsort(subtree_max[by_depth], stable=True)]
-        blocks_to_evict = cached_block_ids[order[:num_blocks_needed]]
+        parent_local = parent_idx.tolist()
+        child_count = child_count.tolist()
+        ts = own_ts.tolist()
+        bid = cached_block_ids.tolist()
 
+        # Min-heap of currently-evictable leaves keyed by (own timestamp, block
+        # id). Block ids are unique, so the tie-break is total and deterministic.
+        heap = [(ts[i], bid[i], i) for i in range(num_cached) if child_count[i] == 0]
+        heapq.heapify(heap)
+
+        evicted_local = []
+        while heap and len(evicted_local) < num_blocks_needed:
+            _, _, i = heapq.heappop(heap)
+            evicted_local.append(i)
+            p = parent_local[i]
+            if p >= 0:
+                child_count[p] -= 1
+                if child_count[p] == 0:
+                    heapq.heappush(heap, (ts[p], bid[p], p))
+
+        # A forest is always fully peelable, so the heap always exposes enough
+        # leaves to collect num_blocks_needed (guaranteed by the num_cached >=
+        # num_blocks_needed check above). Falling short means the parent graph is
+        # cyclic — only possible under a hash collision, which we treat as a bug.
+        assert len(evicted_local) == num_blocks_needed, (
+            f"leaf peel evicted {len(evicted_local)} of {num_blocks_needed} "
+            f"requested from {num_cached} cached blocks; parent graph is not a "
+            f"forest (likely a block-hash collision)"
+        )
+
+        blocks_to_evict = cached_block_ids[torch.tensor(evicted_local, dtype=torch.int64)]
         self._deregister_blocks(blocks_to_evict)
 
         return True
