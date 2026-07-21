@@ -36,7 +36,7 @@ class PrefixCachingTestBase:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _mamba_config():
+    def _mamba_config(mamba_chunk_size=128):
         from megatron.core.inference.config import MambaInferenceStateConfig
 
         return MambaInferenceStateConfig(
@@ -45,6 +45,7 @@ class PrefixCachingTestBase:
             ssm_states_shape=(4, 16),
             conv_states_dtype=torch.float32,
             ssm_states_dtype=torch.float32,
+            mamba_chunk_size=mamba_chunk_size,
         )
 
     def _ctx(
@@ -1013,6 +1014,35 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert budget == math.ceil(ctx.max_tokens / bs) + 1
         expected_unfilled = (math.ceil(ctx.max_tokens / bs) - n) + 1
         assert budget - md.intermediate_count == expected_unfilled
+
+    @pytest.mark.internal
+    def test_intermediate_offsets_use_configured_mamba_chunk_size(self):
+        # Regression guard for the fix that reads mamba_chunk_size from the model
+        # config instead of hardcoding 128 in compute_and_store_offsets.
+        #
+        # With a 64-token mamba chunk and 64-token blocks, a 65-token prompt's
+        # block boundary at token 64 is a valid mamba-chunk multiple
+        # (64 % 64 == 0), so its state must be extracted and cached. The old
+        # hardcoded filter (64 % 128 != 0) would have wrongly skipped it, caching
+        # nothing and leaving no resume point for a later turn.
+        bs = 64
+        ctx = self._mctx(
+            mamba_config=self._mamba_config(mamba_chunk_size=64),
+            block_size_tokens=bs,
+            max_sequence_length=512,
+        )
+        assert ctx.mamba_chunk_size == 64
+        msa = ctx.mamba_slot_allocator
+
+        # Fresh 65-token prompt: crosses exactly the block boundary at token 64.
+        ctx.add_request(self._req(ctx, self._prompt(bs + 1)))
+
+        count = msa._intermediate_counts_cpu[0].item()
+        # The boundary at token 64 was recorded -- would be 0 under the old
+        # hardcoded-128 filter, since 64 % 128 != 0.
+        assert count == 1
+        offsets = msa._intermediate_offsets_cpu[0, :count].tolist()
+        assert offsets == [bs]
 
 
 class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
