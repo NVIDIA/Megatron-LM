@@ -6,6 +6,11 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.distributed as dist
 
+from megatron.core.models.bagel.alignment_audit import (
+    audit_branch_tensor,
+    audit_compact_tensor,
+    layer_alignment_audit_enabled,
+)
 from megatron.core.models.bagel.hf_bagel_llm import BagelLLMHuggingFaceModel
 from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
@@ -14,6 +19,18 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 logger = logging.getLogger(__name__)
+
+
+def _native_bagel_squared_error(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Evaluate BAGEL's elementwise MSE with native autocast semantics."""
+
+    use_autocast = prediction.is_cuda and prediction.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    )
+    autocast_dtype = prediction.dtype if use_autocast else torch.bfloat16
+    with torch.amp.autocast("cuda", enabled=use_autocast, dtype=autocast_dtype):
+        return (prediction - target) ** 2
 
 
 def gather_pad_to_length(src: torch.Tensor, idx: torch.Tensor, length: int) -> torch.Tensor:
@@ -159,6 +176,22 @@ def align_bagel_embeddings(
     H = text_emb.shape[-1]
     dtype = text_emb.dtype
 
+    if layer_alignment_audit_enabled(1):
+        if vision_embeddings is not None:
+            audit_branch_tensor(
+                "vision.position_added",
+                "vision",
+                vision_embeddings,
+                layer_number=1,
+            )
+        if visual_latents is not None:
+            audit_branch_tensor(
+                "diffusion.visual_latents",
+                "gen",
+                visual_latents,
+                layer_number=1,
+            )
+
     # ── Step 2: scatter into full [S, H] ────────────────────────────────────
     packed_seq = torch.zeros(sequence_length, H, dtype=dtype, device=device)
     packed_seq[packed_seq_params.packed_text_indexes.to(device)] = text_emb
@@ -184,6 +217,9 @@ def align_bagel_embeddings(
     ).unsqueeze(
         1
     )  # [Lund+Lgen, 1, H]
+
+    if layer_alignment_audit_enabled(1):
+        audit_compact_tensor("decoder_input", decoder_input, Lund, layer_number=1)
 
     return dict(decoder_input=decoder_input)
 
@@ -506,8 +542,24 @@ class BagelMimoModel(MimoModel):
                 hidden_state = lm_output['last_hidden_state']  # [U+G,H]
                 vis_gen_target = vis_gen_target.to(hidden_state.device)
                 gen_hidden_state = hidden_state[Lund:]  # [G, H]
-                noise_pred = self.modality_submodules['diffusion'].llm2vae(gen_hidden_state)
-                mse = (noise_pred - vis_gen_target) ** 2 * gen_loss_mask.unsqueeze(1)
+                # Native BAGEL runs the complete model forward inside BF16
+                # autocast.  In current PyTorch, autocast promotes ``pow`` in
+                # the squared error to FP32; evaluating this expression
+                # directly on BF16 tensors changes both the MSE values and
+                # their gradients before loss_func later casts the result.
+                use_autocast = hidden_state.is_cuda and hidden_state.dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                )
+                autocast_dtype = hidden_state.dtype if use_autocast else torch.bfloat16
+                with torch.amp.autocast(
+                    "cuda", enabled=use_autocast, dtype=autocast_dtype
+                ):
+                    noise_pred = self.modality_submodules['diffusion'].llm2vae(
+                        gen_hidden_state
+                    )
+                mse = _native_bagel_squared_error(noise_pred, vis_gen_target)
+                mse = mse * gen_loss_mask.unsqueeze(1)
                 lm_output['mse'] = mse
                 lm_output['mse_loss_mask'] = gen_loss_mask
         elif isinstance(self.language_model, BagelLLMHuggingFaceModel):

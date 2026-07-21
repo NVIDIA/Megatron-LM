@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.join(_ROOT, "bagel-package"))
 sys.path.insert(0, os.path.join(_ROOT, "bagel-package", "bagel"))
 
 from torch.nn.attention.flex_attention import create_block_mask
+from torch.nn.attention.flex_attention import flex_attention as torch_flex_attention
 
 from megatron.core.models.bagel.flex_attention import FlexAttention  # noqa: E402
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams  # noqa: E402
@@ -796,16 +797,6 @@ def run_mot_vs_nonmot_test(u, g, nh, hd, tp_group, cp_group, seed=42):
         padded_gen_seqlen=Lgen,
     )
 
-    # Non-MoT reference: standard forward, full sequence, no CP
-    pgc_ref = _PGC(tp=tp_group, cp=None)
-    fa_ref = FlexAttention(
-        config=config,
-        layer_number=1,
-        attn_mask_type=None,
-        attention_type="self",
-        pg_collection=pgc_ref,
-    ).to(device)
-
     # MoT path: type-balanced CP with Ulysses A2A
     pgc_mot = _PGC(tp=tp_group, cp=cp_group)
     fa_mot = FlexAttention(
@@ -817,8 +808,18 @@ def run_mot_vs_nonmot_test(u, g, nh, hd, tp_group, cp_group, seed=42):
     ).to(device)
 
     with torch.no_grad():
-        # Standard path: fa.forward without packed_seq_params → no MoT dispatch
-        out_ref = fa_ref.forward(q_full, k_full, v_full, attention_mask=bm, packed_seq_params=None)
+        # Non-MoT reference: invoke the underlying FlexAttention kernel on the
+        # full sequence.  FlexAttention.forward now intentionally requires
+        # MoTPackedSeqParams, so it is no longer the non-MoT entry point.
+        out_ref = torch_flex_attention(
+            q_full.squeeze(1).permute(1, 0, 2).unsqueeze(0),
+            k_full.squeeze(1).permute(1, 0, 2).unsqueeze(0),
+            v_full.squeeze(1).permute(1, 0, 2).unsqueeze(0),
+            block_mask=bm,
+            enable_gqa=True,
+            scale=1.0 / math.sqrt(hd),
+        )
+        out_ref = out_ref.squeeze(0).permute(1, 0, 2).reshape(u + g, 1, hidden)
         # MoT path: type-balanced Ulysses A2A
         out_mot = fa_mot._forward_mot(q_local, k_local, v_local, psp_cpN, bm)
 

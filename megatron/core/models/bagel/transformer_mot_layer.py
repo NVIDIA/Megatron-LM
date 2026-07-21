@@ -6,6 +6,8 @@ support separate processing for understanding (und) and generation (gen) tokens,
 following the MoT architecture. It aligns with megatron.core.transformer.transformer_layer.
 """
 
+import functools
+import inspect
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -25,11 +27,19 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
+    MlpBuilder,
     get_transformer_layer_offset,
 )
 from megatron.core.utils import get_pg_rank, nvtx_range_pop, nvtx_range_push
 
+from .alignment_audit import (
+    audit_branch_tensor,
+    audit_compact_tensor,
+    audit_mlp_linears,
+    layer_alignment_audit_enabled,
+)
 from .mot_streams import mot_overlap_region
+from .mot_utils import attach_zero_grad_dependency
 
 # Import flex_attention for BlockMask support
 try:
@@ -74,9 +84,9 @@ class MoTTransformerLayerSubmodules:
     pre_mlp_layernorm_gen: Union[ModuleSpec, type] = IdentityOp
 
     # MLP (understanding)
-    mlp: Union[ModuleSpec, type] = IdentityOp
+    mlp: Union[ModuleSpec, MlpBuilder, type] = IdentityOp
     # MLP for generation tokens (MoT)
-    mlp_gen: Union[ModuleSpec, type] = IdentityOp
+    mlp_gen: Union[ModuleSpec, MlpBuilder, type] = IdentityOp
 
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
@@ -200,15 +210,11 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         # [Module 5: MLP] - Separate for und/gen
-        additional_mlp_kwargs = self._get_mlp_kwargs(submodules.mlp, pg_collection)
-        self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
+        self.mlp = self._build_mlp(submodules.mlp, pg_collection)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
-        additional_mlp_gen_kwargs = self._get_mlp_kwargs(submodules.mlp_gen, pg_collection)
-        self.mlp_gen = build_module(
-            submodules.mlp_gen, config=self.config, **additional_mlp_gen_kwargs
-        )
+        self.mlp_gen = self._build_mlp(submodules.mlp_gen, pg_collection)
         if hasattr(self.mlp_gen, 'set_layer_number'):
             self.mlp_gen.set_layer_number(self.layer_number)
 
@@ -234,44 +240,64 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         try:
             from megatron.core.transformer.moe.moe_layer import MoELayer
 
-            self.is_moe_layer = isinstance(self.mlp, MoELayer) or isinstance(self.mlp_gen, MoELayer)
+            effective_mlp_gen = (
+                self.mlp_gen if not isinstance(self.mlp_gen, IdentityOp) else self.mlp
+            )
+            self._mlp_is_moe = isinstance(self.mlp, MoELayer)
+            self._mlp_gen_is_moe = isinstance(effective_mlp_gen, MoELayer)
+            self.is_moe_layer = self._mlp_is_moe or self._mlp_gen_is_moe
         except ImportError:
+            self._mlp_is_moe = False
+            self._mlp_gen_is_moe = False
             self.is_moe_layer = False
 
-    def _get_mlp_kwargs(
-        self, mlp_spec: Union[ModuleSpec, type], pg_collection: ProcessGroupCollection
-    ) -> dict:
-        """Get additional kwargs for MLP initialization."""
-        additional_mlp_kwargs = {}
-
-        if not isinstance(mlp_spec, ModuleSpec):
-            return additional_mlp_kwargs
-
+    def _build_mlp(
+        self,
+        mlp_spec: Union[ModuleSpec, MlpBuilder, type],
+        pg_collection: ProcessGroupCollection,
+    ):
+        """Build an MLP through the TransformerLayer builder protocol."""
         try:
             from megatron.core.extensions.transformer_engine import TEFusedMLP
         except ImportError:
             TEFusedMLP = None
 
         try:
-            from megatron.core.transformer.moe.experts import (
-                GroupedMLP,
-                SequentialMLP,
-                TEGroupedMLP,
-            )
             from megatron.core.transformer.moe.moe_layer import MoELayer
-
-            moe_classes = (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP)
         except ImportError:
-            moe_classes = ()
+            MoELayer = None
 
-        if mlp_spec.module in moe_classes:
-            additional_mlp_kwargs["pg_collection"] = pg_collection
-        elif mlp_spec.module == MLP:
-            additional_mlp_kwargs["tp_group"] = pg_collection.tp
-        elif TEFusedMLP is not None and mlp_spec.module == TEFusedMLP:
-            additional_mlp_kwargs["tp_group"] = pg_collection.tp
+        builder = mlp_spec
+        if isinstance(mlp_spec, ModuleSpec):
+            module = mlp_spec.module
+            if module is MLP or (TEFusedMLP is not None and module is TEFusedMLP):
+                builder = functools.partial(
+                    module.as_mlp_submodule,
+                    submodules=mlp_spec.submodules,
+                    **mlp_spec.params,
+                )
+            elif MoELayer is not None and module is MoELayer:
+                builder_kwargs = dict(mlp_spec.params)
+                if mlp_spec.submodules is not None:
+                    builder_kwargs["submodules"] = mlp_spec.submodules
+                builder = functools.partial(module, **builder_kwargs)
+            else:
+                return build_module(mlp_spec, config=self.config)
 
-        return additional_mlp_kwargs
+        kwargs = {
+            "config": self.config,
+            "pg_collection": pg_collection,
+            "is_mtp_layer": False,
+        }
+        try:
+            signature = inspect.signature(builder)
+        except (TypeError, ValueError):
+            signature = None
+
+        if signature is not None and "layer_number" in signature.parameters:
+            kwargs["layer_number"] = self.layer_number
+
+        return builder(**kwargs)
 
     def forward(
         self,
@@ -361,12 +387,27 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         assert packed_seq_params is not None, "packed_seq_params required for MoT training"
         Lund = packed_seq_params.padded_und_seqlen
+        alignment_audit = layer_alignment_audit_enabled(self.layer_number)
+        if alignment_audit:
+            audit_compact_tensor(
+                "layer_input",
+                hidden_states,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # =====================================================================
         # Input layernorm with MoT (compact slicing)
         # =====================================================================
         residual = hidden_states
         hidden_states = self._apply_input_layernorm_mot(hidden_states, Lund)
+        if alignment_audit:
+            audit_compact_tensor(
+                "input_norm",
+                hidden_states,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # =====================================================================
         # Self attention
@@ -383,6 +424,18 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         # print(f"finished self attention for rank {torch.distributed.get_rank()}")
         nvtx_range_pop(suffix="self_attention")
+        if alignment_audit:
+            projected_attention = (
+                attention_output_with_bias[0]
+                if isinstance(attention_output_with_bias, tuple)
+                else attention_output_with_bias
+            )
+            audit_compact_tensor(
+                "attention.o_proj",
+                projected_attention,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # Detach und attention output so no gradient flows back through und weights
         if self.freeze_und and Lund > 0:
@@ -403,6 +456,13 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="self_attn_bda")
+        if alignment_audit:
+            audit_compact_tensor(
+                "attention.residual",
+                hidden_states,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # =====================================================================
         # Cross attention (if applicable)
@@ -429,6 +489,13 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # MLP with MoT (compact slicing)
         # =====================================================================
         output = self._forward_mlp_mot(hidden_states, Lund)
+        if alignment_audit:
+            audit_compact_tensor(
+                "layer_output",
+                output,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         return output, context
 
@@ -529,8 +596,15 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else self.input_layernorm
         )
 
-        und_normed = self.input_layernorm(local_und_h)
-        gen_normed = ln_gen(local_gen_h)
+        if local_und_h.shape[0] > 0:
+            und_normed = self.input_layernorm(local_und_h)
+        else:
+            und_normed = attach_zero_grad_dependency(local_und_h, self.input_layernorm)
+
+        if local_gen_h.shape[0] > 0:
+            gen_normed = ln_gen(local_gen_h)
+        else:
+            gen_normed = attach_zero_grad_dependency(local_gen_h, ln_gen)
         return torch.cat([und_normed, gen_normed], dim=0)
 
     def _forward_mlp_mot(self, hidden_states: Tensor, Lund: int) -> Tensor:
@@ -550,26 +624,72 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else self.pre_mlp_layernorm
         )
         mlp_gen = self.mlp_gen if not isinstance(self.mlp_gen, IdentityOp) else self.mlp
+        alignment_audit = layer_alignment_audit_enabled(self.layer_number)
 
         def _run_und():
-            x = self.pre_mlp_layernorm(und_h)
+            x = (
+                self.pre_mlp_layernorm(und_h)
+                if und_h.shape[0] > 0
+                else attach_zero_grad_dependency(und_h, self.pre_mlp_layernorm)
+            )
+            if alignment_audit:
+                audit_branch_tensor(
+                    "mlp.pre_norm",
+                    "und",
+                    x,
+                    layer_number=self.layer_number,
+                )
             nvtx_range_push(suffix="mlp_und")
-            y = self.mlp(x)
+            with audit_mlp_linears(
+                self.mlp,
+                branch="und",
+                layer_number=self.layer_number,
+            ):
+                y = self.mlp(x)
             nvtx_range_pop(suffix="mlp_und")
             if isinstance(y, tuple):
                 y = y[0]
+            if und_h.shape[0] == 0:
+                y = attach_zero_grad_dependency(y, self.mlp)
             if self.freeze_und:
                 y = y.detach()
             return y
 
         def _run_gen():
-            x = pre_mlp_ln_gen(gen_h)
+            x = (
+                pre_mlp_ln_gen(gen_h)
+                if gen_h.shape[0] > 0
+                else attach_zero_grad_dependency(gen_h, pre_mlp_ln_gen)
+            )
+            if alignment_audit:
+                audit_branch_tensor(
+                    "mlp.pre_norm",
+                    "gen",
+                    x,
+                    layer_number=self.layer_number,
+                )
             nvtx_range_push(suffix="mlp_gen")
-            y = mlp_gen(x)
+            with audit_mlp_linears(
+                mlp_gen,
+                branch="gen",
+                layer_number=self.layer_number,
+            ):
+                y = mlp_gen(x)
             nvtx_range_pop(suffix="mlp_gen")
             if isinstance(y, tuple):
                 y = y[0]
+            if gen_h.shape[0] == 0:
+                y = attach_zero_grad_dependency(y, mlp_gen)
             return y
+
+        def _skip_und():
+            output = attach_zero_grad_dependency(
+                und_h, self.pre_mlp_layernorm, self.mlp
+            )
+            return output.detach() if self.freeze_und else output
+
+        def _skip_gen():
+            return attach_zero_grad_dependency(gen_h, pre_mlp_ln_gen, mlp_gen)
 
         if self.mot_stream_overlap and Lund > 0 and gen_h.shape[0] > 0:
             with mot_overlap_region() as (und_s, gen_s):
@@ -578,8 +698,16 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 with torch.cuda.stream(gen_s):
                     gen_mlp_out = _run_gen()
         else:
-            und_mlp_out = _run_und()
-            gen_mlp_out = _run_gen()
+            und_mlp_out = (
+                _run_und()
+                if und_h.shape[0] > 0 or getattr(self, '_mlp_is_moe', False)
+                else _skip_und()
+            )
+            gen_mlp_out = (
+                _run_gen()
+                if gen_h.shape[0] > 0 or getattr(self, '_mlp_gen_is_moe', False)
+                else _skip_gen()
+            )
 
         output = torch.cat([und_mlp_out, gen_mlp_out], dim=0)
         output = output + residual

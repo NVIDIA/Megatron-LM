@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -21,9 +22,12 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
+from megatron.core.models.backends import LocalSpecProvider
+from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
@@ -34,9 +38,10 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import WrappedTensor, get_pg_rank, make_viewless_tensor
+from megatron.core.utils import WrappedTensor, get_pg_rank, get_pg_size, make_viewless_tensor
 
 from .attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
+from .mot_utils import attach_zero_grad_dependency
 from .transformer_mot_layer import MoTTransformerLayer, MoTTransformerLayerSubmodules
 
 try:
@@ -72,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 # Re-export for convenience
 __all__ = [
+    'BagelAlignmentColumnParallelLinear',
     'TransformerMoTBlock',
     'TransformerMoTBlockSubmodules',
     'MoTTransformerLayer',
@@ -134,10 +140,18 @@ def _get_mot_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage, pp_rank)
+            layer_submodules = spec.submodules
+            final_layer_norm = getattr(layer_submodules, 'input_layernorm', LayerNormImpl)
+            final_layer_norm_gen = getattr(
+                layer_submodules, 'input_layernorm_gen', final_layer_norm
+            )
             return TransformerMoTBlockSubmodules(
                 layer_specs=[spec] * num_layers,
-                layer_norm=LayerNormImpl,
-                layer_norm_gen=LayerNormImpl,
+                # The final norms must use the same backend as the layer spec.
+                # In particular, a local MoT spec must not silently fall back
+                # to TENorm merely because Transformer Engine is installed.
+                layer_norm=final_layer_norm,
+                layer_norm_gen=final_layer_norm_gen,
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
@@ -481,6 +495,8 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                     context=context,
                     context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
@@ -554,8 +570,22 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         Lund = packed_seq_params.padded_und_seqlen
         und_slice = hidden_states[:Lund]
         gen_slice = hidden_states[Lund:]
-        und_normed = apply_module(self.final_layernorm)(und_slice)
-        gen_normed = apply_module(self.final_layernorm_gen)(gen_slice)
+
+        if Lund > 0:
+            und_normed = apply_module(self.final_layernorm)(und_slice)
+        else:
+            und_normed = attach_zero_grad_dependency(und_slice, self.final_layernorm)
+
+        final_layernorm_gen = (
+            self.final_layernorm_gen
+            if self.final_layernorm_gen is not None
+            else self.final_layernorm
+        )
+        if gen_slice.shape[0] > 0:
+            gen_normed = apply_module(final_layernorm_gen)(gen_slice)
+        else:
+            gen_normed = attach_zero_grad_dependency(gen_slice, final_layernorm_gen)
+
         hidden_states = torch.cat([und_normed, gen_normed], dim=0)
 
         # Make viewless tensor
@@ -569,6 +599,8 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         context: Tensor,
         context_mask: Tensor,
         rotary_pos_emb: Tensor,
+        rotary_pos_cos: Tensor,
+        rotary_pos_sin: Tensor,
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
@@ -579,7 +611,14 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params is captured via closure in custom_forward (not a checkpoint arg)
         because it is a non-Tensor and checkpoint only supports Tensor positional args.
         freeze_und is handled by MoTTransformerLayer._forward_mlp_mot, not here.
+        Optional RoPE values use empty Tensor sentinels so cos/sin remain explicit
+        checkpoint inputs and are replayed during the recompute backward pass.
         """
+
+        empty_rope = hidden_states.new_empty((0,))
+        rotary_pos_emb_tensor = rotary_pos_emb if rotary_pos_emb is not None else empty_rope
+        rotary_pos_cos_tensor = rotary_pos_cos if rotary_pos_cos is not None else empty_rope
+        rotary_pos_sin_tensor = rotary_pos_sin if rotary_pos_sin is not None else empty_rope
 
         def custom(start: int, end: int):
             # attention_mask may be a flex-attention BlockMask (non-Tensor), so it
@@ -587,7 +626,22 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
             # through tensor_parallel.checkpoint (which calls ctx.save_for_backward
             # on all positional args and only accepts Tensors).
             # context_mask is likewise captured for consistency.
-            def custom_forward(hidden_states, context, rotary_pos_emb):
+            def custom_forward(
+                hidden_states,
+                context,
+                rotary_pos_emb_tensor,
+                rotary_pos_cos_tensor,
+                rotary_pos_sin_tensor,
+            ):
+                rotary_pos_emb = (
+                    None if rotary_pos_emb_tensor.numel() == 0 else rotary_pos_emb_tensor
+                )
+                rotary_pos_cos = (
+                    None if rotary_pos_cos_tensor.numel() == 0 else rotary_pos_cos_tensor
+                )
+                rotary_pos_sin = (
+                    None if rotary_pos_sin_tensor.numel() == 0 else rotary_pos_sin_tensor
+                )
                 for index in range(start, end):
                     layer = self._get_layer(index)
 
@@ -613,6 +667,8 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                             context=context,
                             context_mask=context_mask,  # from closure
                             rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
                             attention_bias=attention_bias,
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
@@ -632,7 +688,9 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                     self.pg_collection.tp,
                     hidden_states,
                     context,
-                    rotary_pos_emb,
+                    rotary_pos_emb_tensor,
+                    rotary_pos_cos_tensor,
+                    rotary_pos_sin_tensor,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -640,7 +698,9 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                     self.config.distribute_saved_activations,
                     hidden_states,
                     context,
-                    rotary_pos_emb,
+                    rotary_pos_emb_tensor,
+                    rotary_pos_cos_tensor,
+                    rotary_pos_sin_tensor,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -664,7 +724,11 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, context, rotary_pos_emb
+                        hidden_states,
+                        context,
+                        rotary_pos_emb_tensor,
+                        rotary_pos_cos_tensor,
+                        rotary_pos_sin_tensor,
                     )
         else:
             raise ValueError(f"Invalid recompute method: {self.config.recompute_method}")
@@ -837,25 +901,210 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
         return sharded_state_dict
 
 
-# copied from Bagel, only for alignment
-# class Qwen2RMSNorm(torch.nn.Module):
-#     def __init__(self, config: TransformerConfig, hidden_size: int, eps: float = 1e-6):
-#         """
-#         Qwen2RMSNorm is equivalent to T5LayerNorm
-#         """
-#         super().__init__()
-#         self.weight = torch.nn.Parameter(torch.ones(hidden_size))
-#         self.variance_epsilon = eps
+class Qwen2RMSNorm(torch.nn.Module):
+    """HF Qwen2 RMSNorm adapted to MCore's module-builder signature."""
 
-#     def forward(self, hidden_states):
-#         input_dtype = hidden_states.dtype
-#         hidden_states = hidden_states.to(torch.float32)
-#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-#         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-#         return self.weight * hidden_states.to(input_dtype)
+    def __init__(self, config: TransformerConfig, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.ones(hidden_size, dtype=config.params_dtype)
+        )
+        self.variance_epsilon = eps
 
-#     def extra_repr(self):
-#         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class BagelAlignmentColumnParallelLinear(ColumnParallelLinear):
+    """TP=1 projection that preserves fused parameters but mirrors HF GEMM boundaries.
+
+    Native Qwen evaluates Q, K, and V (and likewise the SwiGLU gate and up
+    projections) as independent linear operations.  MCore normally combines
+    each family into one larger GEMM.  Their forward and weight gradients are
+    bit-identical in BF16, but the input-gradient reduction order is not.
+
+    This opt-in module keeps the existing fused ``weight``/``bias`` parameters,
+    state-dict keys, and module call boundary.  Calling the module normally is
+    important: Megatron-FSDP's parameter all-gather and backward hooks remain
+    attached to this module while autograd accumulates the differentiable
+    parameter slices back into the one fused parameter.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        *,
+        config,
+        init_method,
+        bias=True,
+        gather_output=False,
+        stride=1,
+        keep_master_weight_for_test=False,
+        skip_bias_add=False,
+        skip_weight_param_allocation=False,
+        embedding_activation_buffer=None,
+        grad_output_buffer=None,
+        is_expert=False,
+        tp_comm_buffer_name=None,
+        disable_grad_reduce=False,
+        tp_group=None,
+        name=None,
+    ):
+        if config.tensor_model_parallel_size != 1:
+            raise ValueError(
+                "BAGEL split-linear alignment is intentionally limited to TP=1; "
+                f"got TP={config.tensor_model_parallel_size}"
+            )
+        if gather_output:
+            raise ValueError("BAGEL split-linear alignment does not support gather_output=True")
+        if getattr(config, "fp8", None):
+            raise ValueError("BAGEL split-linear alignment is a BF16/FP16-only reference path")
+        if getattr(config, "gradient_accumulation_fusion", False):
+            raise ValueError(
+                "BAGEL split-linear alignment requires gradient accumulation fusion disabled"
+            )
+        if getattr(config, "delay_wgrad_compute", False):
+            raise ValueError("BAGEL split-linear alignment does not support delayed wgrad")
+        if getattr(config, "defer_embedding_wgrad_compute", False):
+            raise ValueError("BAGEL split-linear alignment does not support deferred wgrad")
+        if skip_weight_param_allocation:
+            raise ValueError("BAGEL split-linear alignment requires an owned fused weight")
+
+        if tp_comm_buffer_name in ("qkv", "qkv_gen"):
+            projection_kind = "qkv"
+            if getattr(config, "attention_output_gate", False):
+                raise ValueError(
+                    "BAGEL split-QKV alignment does not support attention_output_gate"
+                )
+        elif tp_comm_buffer_name == "fc1":
+            projection_kind = "swiglu_fc1"
+            if stride != 2 or output_size != 2 * config.ffn_hidden_size:
+                raise ValueError(
+                    "BAGEL split-MLP alignment requires stride=2 and "
+                    f"output_size=2*ffn_hidden_size; got stride={stride}, "
+                    f"output_size={output_size}, ffn_hidden_size={config.ffn_hidden_size}"
+                )
+        else:
+            raise ValueError(
+                "BAGEL split-linear alignment only supports qkv/qkv_gen/fc1 modules, "
+                f"got tp_comm_buffer_name={tp_comm_buffer_name!r}"
+            )
+
+        super().__init__(
+            input_size,
+            output_size,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            gather_output=False,
+            stride=stride,
+            keep_master_weight_for_test=keep_master_weight_for_test,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=False,
+            embedding_activation_buffer=embedding_activation_buffer,
+            grad_output_buffer=grad_output_buffer,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            disable_grad_reduce=disable_grad_reduce,
+            tp_group=tp_group,
+            name=name,
+        )
+        if get_pg_size(self.tp_group) != 1:
+            raise ValueError(
+                "BAGEL split-linear alignment requires the actual TP process group size to be 1"
+            )
+        self._bagel_projection_kind = projection_kind
+
+    def _qkv_parts(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        num_query_groups = self.config.num_query_groups
+        num_attention_heads = self.config.num_attention_heads
+        head_dim = self.config.kv_channels
+        queries_per_group = num_attention_heads // num_query_groups
+        expected_rows = (num_attention_heads + 2 * num_query_groups) * head_dim
+        if tensor.shape[0] != expected_rows:
+            raise ValueError(
+                f"BAGEL fused QKV has {tensor.shape[0]} rows, expected {expected_rows}"
+            )
+
+        trailing_shape = tuple(tensor.shape[1:])
+        grouped = tensor.reshape(
+            num_query_groups, queries_per_group + 2, head_dim, *trailing_shape
+        )
+        query = grouped[:, :queries_per_group].reshape(
+            num_attention_heads * head_dim, *trailing_shape
+        )
+        key = grouped[:, queries_per_group : queries_per_group + 1].reshape(
+            num_query_groups * head_dim, *trailing_shape
+        )
+        value = grouped[:, queries_per_group + 1 :].reshape(
+            num_query_groups * head_dim, *trailing_shape
+        )
+        return query, key, value
+
+    def _qkv_forward(self, input_: Tensor, bias: Optional[Tensor]) -> Tensor:
+        query_weight, key_weight, value_weight = self._qkv_parts(self.weight)
+        if bias is None:
+            query_bias = key_bias = value_bias = None
+        else:
+            query_bias, key_bias, value_bias = self._qkv_parts(bias)
+
+        query = F.linear(input_, query_weight, query_bias)
+        key = F.linear(input_, key_weight, key_bias)
+        value = F.linear(input_, value_weight, value_bias)
+
+        prefix = query.shape[:-1]
+        num_query_groups = self.config.num_query_groups
+        queries_per_group = self.config.num_attention_heads // num_query_groups
+        head_dim = self.config.kv_channels
+        query = query.reshape(*prefix, num_query_groups, queries_per_group, head_dim)
+        key = key.reshape(*prefix, num_query_groups, 1, head_dim)
+        value = value.reshape(*prefix, num_query_groups, 1, head_dim)
+        return torch.cat((query, key, value), dim=-2).reshape(*prefix, -1)
+
+    def _swiglu_fc1_forward(self, input_: Tensor, bias: Optional[Tensor]) -> Tensor:
+        if self.weight.shape[0] % 2:
+            raise ValueError(
+                f"BAGEL fused SwiGLU FC1 needs an even row count, got {self.weight.shape[0]}"
+            )
+        gate_weight, up_weight = self.weight.chunk(2, dim=0)
+        if bias is None:
+            gate_bias = up_bias = None
+        else:
+            gate_bias, up_bias = bias.chunk(2, dim=0)
+        gate = F.linear(input_, gate_weight, gate_bias)
+        up = F.linear(input_, up_weight, up_bias)
+        return torch.cat((gate, up), dim=-1)
+
+    def forward(
+        self,
+        input_: Tensor,
+        weight: Optional[Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """Run split GEMMs while returning the standard column-linear tuple."""
+
+        if weight is not None and weight is not self.weight:
+            raise ValueError("BAGEL split-linear alignment does not accept a runtime weight")
+        if runtime_gather_output:
+            raise ValueError("BAGEL split-linear alignment cannot gather output")
+
+        fused_bias = self.bias
+        if fused_bias is not None and fused_bias.numel() == 0:
+            fused_bias = None
+        linear_bias = None if self.skip_bias_add else fused_bias
+        if self._bagel_projection_kind == "qkv":
+            output = self._qkv_forward(input_, linear_bias)
+        else:
+            output = self._swiglu_fc1_forward(input_, linear_bias)
+        return output, fused_bias if self.skip_bias_add else None
 
 
 def get_mot_layer_spec(
@@ -864,6 +1113,9 @@ def get_mot_layer_spec(
     qk_layernorm: bool = True,
     use_te: bool = True,
     use_flex_attention: bool = False,
+    split_qkv_for_alignment: bool = False,
+    split_mlp_for_alignment: bool = False,
+    native_rmsnorm_for_alignment: bool = False,
 ) -> ModuleSpec:
     """
     Get a default MoT transformer layer specification.
@@ -881,6 +1133,12 @@ def get_mot_layer_spec(
     from megatron.core.transformer.dot_product_attention import DotProductAttention
     from megatron.core.transformer.enums import AttnMaskType
 
+    if use_flex_attention:
+        from megatron.core.models.bagel.flex_attention import FlexAttention
+
+    if split_mlp_for_alignment and num_experts is not None:
+        raise ValueError("BAGEL split-MLP alignment currently supports dense Qwen MLPs only")
+
     if use_te and HAVE_TE:
         from megatron.core.extensions.transformer_engine import (
             TEColumnParallelLinear,
@@ -888,11 +1146,11 @@ def get_mot_layer_spec(
             TENorm,
             TERowParallelLinear,
         )
-        from megatron.core.models.bagel.flex_attention import FlexAttention
-
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
         linear_qkv = TEColumnParallelLinear
         linear_proj = TERowParallelLinear
         layernorm = TENorm
+        mlp_backend = TESpecProvider()
         # layernorm = Qwen2RMSNorm # only for alignment with Bagel
         if use_flex_attention:
             core_attention = FlexAttention
@@ -903,11 +1161,19 @@ def get_mot_layer_spec(
 
         linear_qkv = ColumnParallelLinear
         linear_proj = RowParallelLinear
-        layernorm = LayerNormImpl
+        layernorm = Qwen2RMSNorm
+        mlp_backend = LocalSpecProvider()
         if use_flex_attention:
             core_attention = FlexAttention
         else:
             core_attention = DotProductAttention
+
+    if split_qkv_for_alignment:
+        linear_qkv = BagelAlignmentColumnParallelLinear
+    if split_mlp_for_alignment or native_rmsnorm_for_alignment:
+        # Native Qwen evaluates every RMSNorm with an explicit FP32 variance
+        # reduction.  In particular, do not use TENorm for the alignment path.
+        layernorm = Qwen2RMSNorm
 
     # Self-attention submodules with MoT support
     self_attention_submodules = SelfAttentionMoTSubmodules(
@@ -923,15 +1189,35 @@ def get_mot_layer_spec(
         k_layernorm_gen=layernorm if qk_layernorm else None,
     )
 
-    # MLP submodules
-    from megatron.core.transformer.mlp import MLP, MLPSubmodules
-
-    mlp_spec = get_mlp_module_spec(
-        use_te=use_te,
+    # MLP submodules. TE's dense FC1 already fuses the pre-MLP RMSNorm;
+    # keeping an explicit norm as well would create a second trainable weight
+    # and normalize the activations twice.
+    mlp_spec = get_mlp_module_spec_for_backend(
+        backend=mlp_backend,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_op_fuser=False,  # TODO: support TE op fuser for MoE
     )
+    if split_mlp_for_alignment:
+        mlp_spec.keywords["submodules"].linear_fc1 = BagelAlignmentColumnParallelLinear
+    elif (
+        native_rmsnorm_for_alignment
+        and num_experts is None
+        and mlp_backend.fuse_layernorm_and_linear()
+    ):
+        # Keep TE's one combined gate/up GEMM, but detach RMSNorm from the
+        # LayerNormLinear kernel so it can use native Qwen FP32 semantics.
+        # This is independent from the split-MLP diagnostic path.
+        mlp_spec.keywords["submodules"].linear_fc1 = TEColumnParallelLinear
+
+    if split_mlp_for_alignment or native_rmsnorm_for_alignment:
+        pre_mlp_norm = Qwen2RMSNorm
+    else:
+        pre_mlp_norm = (
+            IdentityOp
+            if num_experts is None and mlp_backend.fuse_layernorm_and_linear()
+            else layernorm
+        )
 
     # MoT transformer layer submodules
     layer_submodules = MoTTransformerLayerSubmodules(
@@ -943,8 +1229,8 @@ def get_mot_layer_spec(
             submodules=self_attention_submodules,
         ),
         self_attn_bda=get_bias_dropout_add,
-        pre_mlp_layernorm=layernorm,
-        pre_mlp_layernorm_gen=layernorm,
+        pre_mlp_layernorm=pre_mlp_norm,
+        pre_mlp_layernorm_gen=pre_mlp_norm,
         # mlp=ModuleSpec(module=MLP, submodules=mlp_submodules),
         mlp=mlp_spec,
         # mlp_gen=ModuleSpec(module=MLP, submodules=mlp_submodules),

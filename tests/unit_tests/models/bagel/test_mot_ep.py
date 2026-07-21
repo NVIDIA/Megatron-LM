@@ -264,12 +264,22 @@ def test_mot_ep():
     loss = output.sum()
     loss.backward()
 
+    # EP peers can have asymmetric local MoT branch lengths. Every rank must
+    # still enter both MoE collectives even when its local branch is empty.
+    layer.zero_grad(set_to_none=True)
+    uneven_und = 0 if rank == 0 else 8
+    uneven_hidden = torch.randn(8, 1, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    uneven_output = layer._forward_mlp_mot(uneven_hidden, uneven_und)
+    assert uneven_output.shape == uneven_hidden.shape
+    uneven_output.float().sum().backward()
+    torch.distributed.barrier()
+
     if rank == 0:
         ep_size = mpu.get_expert_model_parallel_world_size()
         print(
             f"[PASS] test_mot_ep: EP={ep_size}, num_experts={NUM_EXPERTS}, "
             f"output_shape={tuple(output.shape)}, "
-            f"lb_loss={lb_values[0].item():.4f}"
+            f"lb_loss={lb_values[0].item():.4f}, asymmetric_empty_branches=PASS"
         )
 
     Utils.destroy_model_parallel()

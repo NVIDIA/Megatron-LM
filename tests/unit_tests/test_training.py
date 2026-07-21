@@ -3,10 +3,12 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+from megatron.training import training as training_module
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
 from megatron.training.training import build_train_valid_test_data_iterators
@@ -119,6 +121,97 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatch):
+    """The second per-step log must not include the first step's loss."""
+    args = SimpleNamespace(
+        consumed_train_samples=0,
+        data_parallel_size=1,
+        dsa_indexer_loss_coeff=None,
+        log_energy=False,
+        log_interval=1,
+        log_memory_interval=None,
+        log_throughput=False,
+        log_timers_to_tensorboard=False,
+        micro_batch_size=1,
+        mtp_num_layers=None,
+        num_experts=None,
+        perform_rl_step=False,
+        record_memory_history=False,
+        rl_profile=False,
+        rl_use_sequence_packing=False,
+        seq_length=1,
+        skipped_train_samples=0,
+        timing_log_level=0,
+        train_iters=2,
+        world_size=1,
+    )
+    timers = mock.MagicMock()
+    timers.return_value.elapsed.return_value = 1.0
+    log_lines = []
+
+    monkeypatch.setattr(training_module, "get_args", lambda: args)
+    monkeypatch.setattr(training_module, "get_timers", lambda: timers)
+    monkeypatch.setattr(training_module, "get_tensorboard_writer", lambda: None)
+    monkeypatch.setattr(training_module, "get_wandb_writer", lambda: None)
+    monkeypatch.setattr(training_module, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training_module, "get_energy_monitor", lambda: None)
+    monkeypatch.setattr(training_module, "get_num_microbatches", lambda: 1)
+    monkeypatch.setattr(
+        training_module, "reduce_max_stat_across_model_parallel_group", lambda value: value
+    )
+    monkeypatch.setattr(training_module, "num_floating_point_operations", lambda *a, **k: 0.0)
+    monkeypatch.setattr(training_module.one_logger_utils, "track_app_tag", lambda *a, **k: None)
+    monkeypatch.setattr(
+        training_module.one_logger_utils, "track_e2e_metrics", lambda *a, **k: None
+    )
+    monkeypatch.setattr(training_module, "print_rank_last", log_lines.append)
+
+    # training_log creates its accumulator tensors on CUDA. Keep this logging-only
+    # regression host-runnable by redirecting those tiny tensors to the CPU.
+    make_tensor = torch.tensor
+
+    def make_cpu_tensor(*tensor_args, **tensor_kwargs):
+        tensor_kwargs.pop("device", None)
+        return make_tensor(*tensor_args, **tensor_kwargs)
+
+    monkeypatch.setattr(training_module.torch, "tensor", make_cpu_tensor)
+
+    total_loss_dict = {}
+    common_kwargs = dict(
+        learning_rate=1.0e-4,
+        loss_scale=1.0,
+        report_memory_flag=False,
+        skipped_iter=0,
+        grad_norm=None,
+        params_norm=None,
+        num_zeros_in_grad=None,
+        max_attention_logit=None,
+    )
+    training_module.training_log(
+        {"alignment loss": make_tensor([2.0])},
+        total_loss_dict,
+        iteration=1,
+        is_first_iteration=True,
+        **common_kwargs,
+    )
+
+    assert total_loss_dict["alignment loss"].item() == 0.0
+    assert total_loss_dict["advanced iterations"] == 0
+    assert total_loss_dict["skipped iterations"] == 0
+    assert total_loss_dict["nan iterations"] == 0
+
+    training_module.training_log(
+        {"alignment loss": make_tensor([6.0])},
+        total_loss_dict,
+        iteration=2,
+        is_first_iteration=False,
+        **common_kwargs,
+    )
+
+    assert " alignment loss: 6.000000E+00 |" in log_lines[-1]
+    assert " alignment loss: 4.000000E+00 |" not in log_lines[-1]
 
 
 class TestGetModelBucketSizingPgCollection:

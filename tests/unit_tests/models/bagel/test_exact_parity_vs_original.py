@@ -15,8 +15,7 @@ Modality coverage
 -----------------
 T2I  — fully exact.  Single caption + image; no randomness.
 Edit — fully exact.  Chain images; random chain sampling controlled by fixed seed.
-VLM  — structural only (energon/original differ in how <image> tags in conversation
-        text are handled and whether EOS carries CE loss; documented limitation).
+VLM  — fully exact for supported image-placeholder and text-only conversations.
 
 Run (from repo root):
     PYTHONPATH=.:/workspace/megatron-lm-bagel/bagel-package:\
@@ -26,9 +25,11 @@ Run (from repo root):
 """
 import io
 import json
+import os
 import random
+import subprocess
+import sys
 import tarfile
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -88,19 +89,105 @@ def _make_transforms(vae_max=512, vae_min=256, vit_max=280, vit_min=112):
     return vae, vit
 
 
-def _make_data_config(dropout: float = 0.0):
-    from examples.mimo_bagel.data.energon_bagel_task_encoder import DataConfig
+def _make_packer(max_num_tokens: int, dropout: float = 0.0):
+    """Construct registry-backed BAGEL types under a scoped, valid data root."""
+    env_name = "BAGEL_EXAMPLE_PATH"
+    was_present = env_name in os.environ
+    previous_value = os.environ.get(env_name)
+    data_root = str(Path(__file__).resolve().parent)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setenv(env_name, data_root)
+        from examples.mimo_bagel.data.energon_bagel_task_encoder import BagelPacker, DataConfig
 
-    return DataConfig(
-        grouped_datasets=None,
-        text_cond_dropout_prob=dropout,
-        vit_cond_dropout_prob=dropout,
-        vae_cond_dropout_prob=dropout,
-        vae_image_downsample=16,
-        max_latent_size=32,
-        vit_patch_size=14,
-        max_num_patch_per_side=70,
+        data_config = DataConfig(
+            grouped_datasets=None,
+            text_cond_dropout_prob=dropout,
+            vit_cond_dropout_prob=dropout,
+            vae_cond_dropout_prob=dropout,
+            vae_image_downsample=16,
+            max_latent_size=32,
+            vit_patch_size=14,
+            max_num_patch_per_side=70,
+        )
+        packer = BagelPacker(
+            data_config=data_config,
+            special_token_ids=SPECIAL_TOKEN_IDS,
+            max_num_tokens=max_num_tokens,
+        )
+
+    assert (env_name in os.environ) == was_present
+    assert os.environ.get(env_name) == previous_value
+    return packer
+
+
+def _assert_adapter_import_is_clean_and_dataset_base_is_lazy() -> None:
+    """Check import isolation in a fresh interpreter without BAGEL data configuration."""
+    env = os.environ.copy()
+    env.pop("BAGEL_EXAMPLE_PATH", None)
+    script = """
+import os
+import sys
+import tempfile
+
+env_name = "BAGEL_EXAMPLE_PATH"
+was_present = env_name in os.environ
+previous_value = os.environ.get(env_name)
+import examples.mimo_bagel.data.energon_bagel_task_encoder as adapter
+
+assert (env_name in os.environ) == was_present
+assert os.environ.get(env_name) == previous_value
+assert "bagel.data.dataset_info" not in sys.modules
+
+adapter.BagelEditTaskEncoder(
+    tokenizer=object(), vae_transform=object(), vit_transform=object()
+)
+adapter.BagelVLMTaskEncoder(tokenizer=object(), vit_transform=object())
+assert "bagel.data.dataset_info" not in sys.modules
+
+operations = (
+    lambda: adapter.DataConfig(grouped_datasets=None),
+    lambda: adapter.BagelPacker(
+        data_config=object(),
+        special_token_ids={
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "start_of_image": 3,
+            "end_of_image": 4,
+        },
+        max_num_tokens=16,
+    ),
+)
+for operation in operations:
+    try:
+        operation()
+    except RuntimeError as error:
+        assert "BAGEL_EXAMPLE_PATH" in str(error)
+    else:
+        raise AssertionError("Dataset-base access must require BAGEL_EXAMPLE_PATH")
+
+assert (env_name in os.environ) == was_present
+assert os.environ.get(env_name) == previous_value
+assert "bagel.data.dataset_info" not in sys.modules
+
+with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+    os.environ[env_name] = first_root
+    adapter.DataConfig(grouped_datasets=None)
+    os.environ[env_name] = second_root
+    try:
+        adapter.DataConfig(grouped_datasets=None)
+    except RuntimeError as error:
+        assert "already loaded" in str(error)
+    else:
+        raise AssertionError("Changing a loaded BAGEL registry root must be rejected")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 SPECIAL_TOKEN_IDS = {"bos_token_id": 1, "eos_token_id": 2, "start_of_image": 3, "end_of_image": 4}
@@ -165,24 +252,38 @@ def _assert_packable_samples_equal(orig: dict, ene: dict, label: str = "") -> No
 
 
 def _assert_packed_tensors_equal(orig: dict, ene: dict, label: str = "") -> None:
-    """Assert all tensors in two packed-output dicts are bit-exact."""
+    """Assert every value in two packed-output dictionaries is bit-exact."""
     prefix = f"[{label}] " if label else ""
-    all_keys = set(orig) | set(ene)
-    # Ignore provenance
-    ignore = {"sample_lens", "split_lens", "attn_modes", "sequence_length"}
+    _assert_packed_value_equal(orig, ene, path=f"{prefix}packed output")
 
-    for k in sorted(all_keys - ignore):
-        in_orig = k in orig
-        in_ene = k in ene
-        assert in_orig == in_ene, f"{prefix}key '{k}' present in orig={in_orig}, ene={in_ene}"
-        o_v, e_v = orig[k], ene[k]
-        if isinstance(o_v, torch.Tensor):
-            assert o_v.shape == e_v.shape, f"{prefix}'{k}' shape: orig={o_v.shape}, ene={e_v.shape}"
-            assert torch.equal(o_v, e_v) or (
-                o_v.dtype == torch.float32 and (o_v - e_v).abs().max() < 1e-6
-            ), f"{prefix}'{k}' tensor values differ (max diff={(o_v - e_v).abs().max():.6f})"
-        elif isinstance(o_v, list):
-            assert o_v == e_v, f"{prefix}'{k}' list mismatch"
+
+def _assert_packed_value_equal(orig: Any, ene: Any, path: str) -> None:
+    """Recursively compare types, tensor metadata, and values."""
+    assert type(orig) is type(ene), (
+        f"{path} type: orig={type(orig).__name__}, ene={type(ene).__name__}"
+    )
+
+    if isinstance(orig, torch.Tensor):
+        assert orig.dtype == ene.dtype, f"{path} dtype: orig={orig.dtype}, ene={ene.dtype}"
+        assert orig.shape == ene.shape, f"{path} shape: orig={orig.shape}, ene={ene.shape}"
+        assert torch.equal(orig, ene), f"{path} tensor values differ"
+        return
+
+    if isinstance(orig, dict):
+        assert orig.keys() == ene.keys(), (
+            f"{path} keys: orig={sorted(orig)}, ene={sorted(ene)}"
+        )
+        for key in orig:
+            _assert_packed_value_equal(orig[key], ene[key], path=f"{path}[{key!r}]")
+        return
+
+    if isinstance(orig, (list, tuple)):
+        assert len(orig) == len(ene), f"{path} length: orig={len(orig)}, ene={len(ene)}"
+        for index, (orig_item, ene_item) in enumerate(zip(orig, ene)):
+            _assert_packed_value_equal(orig_item, ene_item, path=f"{path}[{index}]")
+        return
+
+    assert orig == ene, f"{path} mismatch: orig={orig!r}, ene={ene!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +549,7 @@ class TestT2IExactParity:
         )
 
     def test_prepacking_exact(self, t2i_setup):
+        _assert_adapter_import_is_clean_and_dataset_base_is_lazy()
         d = t2i_setup
         from examples.mimo_bagel.data.energon_bagel_task_encoder import BagelT2ITaskEncoder
 
@@ -463,19 +565,13 @@ class TestT2IExactParity:
     def test_packing_exact(self, t2i_setup):
         """Verify that BagelPacker produces identical packed tensors for both paths."""
         d = t2i_setup
-        from examples.mimo_bagel.data.energon_bagel_task_encoder import (
-            BagelPacker,
-            BagelT2ITaskEncoder,
-        )
+        from examples.mimo_bagel.data.energon_bagel_task_encoder import BagelT2ITaskEncoder
 
         encoder = BagelT2ITaskEncoder(tokenizer=d["tokenizer"], vae_transform=d["vae_t"])
         orig_sample = _orig_t2i_process(d["jpeg"], d["caption"], d["vae_t"], d["tokenizer"])
         ene_sample = encoder.encode_sample(d["wds_sample"])
 
-        data_config = _make_data_config(dropout=0.0)
-        packer = BagelPacker(
-            data_config=data_config, special_token_ids=SPECIAL_TOKEN_IDS, max_num_tokens=8192
-        )
+        packer = _make_packer(max_num_tokens=8192, dropout=0.0)
 
         np.random.seed(7)
         random.seed(7)
@@ -490,6 +586,27 @@ class TestT2IExactParity:
         out_ene = packer.to_tensor(ss_ene)
 
         _assert_packed_tensors_equal(out_orig, out_ene, label="T2I post-packing")
+
+        comparator_reference = {
+            "sample_lens": [1],
+            "split_lens": [1],
+            "attn_modes": ["causal"],
+            "sequence_length": 1,
+            "payload": torch.tensor([1], dtype=torch.int32),
+        }
+        comparator_regressions = (
+            {**comparator_reference, "sample_lens": [2]},
+            {**comparator_reference, "split_lens": [2]},
+            {**comparator_reference, "attn_modes": ["full"]},
+            {**comparator_reference, "sequence_length": 2},
+            {
+                **comparator_reference,
+                "payload": torch.tensor([1], dtype=torch.int64),
+            },
+        )
+        for mismatched in comparator_regressions:
+            with pytest.raises(AssertionError):
+                _assert_packed_tensors_equal(comparator_reference, mismatched)
 
     def test_prepacking_multiple_samples(self, tmp_path):
         """Three different T2I samples all match."""
@@ -569,20 +686,14 @@ class TestEditExactParity:
     @pytest.mark.parametrize("seed", [0, 1, 2, 5, 13, 42])
     def test_packing_exact(self, seed):
         """Verify packed tensors are bit-exact for a 4-image Edit chain."""
-        from examples.mimo_bagel.data.energon_bagel_task_encoder import (
-            BagelEditTaskEncoder,
-            BagelPacker,
-        )
+        from examples.mimo_bagel.data.energon_bagel_task_encoder import BagelEditTaskEncoder
 
         tokenizer = _MockTokenizer()
         vae_t, vit_t = _make_transforms()
         row = self._make_edit_row(num_images=4)
         orig_sample, ene_sample = self._run_one(row, seed, vae_t, vit_t, tokenizer)
 
-        data_config = _make_data_config(dropout=0.0)
-        packer = BagelPacker(
-            data_config=data_config, special_token_ids=SPECIAL_TOKEN_IDS, max_num_tokens=8192
-        )
+        packer = _make_packer(max_num_tokens=8192, dropout=0.0)
 
         np.random.seed(11)
         random.seed(11)
@@ -641,7 +752,6 @@ class TestMultiSamplePackingParity:
     def test_mixed_t2i_and_edit(self):
         from examples.mimo_bagel.data.energon_bagel_task_encoder import (
             BagelEditTaskEncoder,
-            BagelPacker,
             BagelT2ITaskEncoder,
         )
 
@@ -713,10 +823,7 @@ class TestMultiSamplePackingParity:
             _assert_packable_samples_equal(o, e, label=f"Edit {i}")
 
         # Pack all samples in the same order through BagelPacker and compare
-        data_config = _make_data_config(dropout=0.0)
-        packer = BagelPacker(
-            data_config=data_config, special_token_ids=SPECIAL_TOKEN_IDS, max_num_tokens=65536
-        )
+        packer = _make_packer(max_num_tokens=65536, dropout=0.0)
 
         all_orig = orig_t2i_samples + orig_edit_samples
         all_ene = ene_t2i_samples + ene_edit_samples
@@ -752,13 +859,65 @@ def _read_wds_tar_from_bytes(data: bytes) -> List[Dict[str, bytes]]:
 
 
 # ---------------------------------------------------------------------------
-# VLM structural comparison (not bit-exact due to <image> tag handling diff)
+# VLM exact parity
 # ---------------------------------------------------------------------------
 
 
-class TestVLMStructural:
-    """VLM: structural comparison only.  Energon/original differ in image placement
-    for conversations with <image> tags and in whether EOS carries CE loss."""
+def _orig_vlm_process(image_bytes_list, conversation, vit_transform, tokenizer) -> dict:
+    """Run upstream BAGEL VLM formatting and per-record processing."""
+    from bagel.data.data_utils import pil_img2rgb
+    from bagel.data.vlm_dataset import SftJSONLIterableDataset
+
+    parser = object.__new__(SftJSONLIterableDataset)
+    raw_images = [pil_img2rgb(Image.open(io.BytesIO(value))) for value in image_bytes_list]
+    image_tensor_list = [
+        vit_transform(image, img_num=len(raw_images)) for image in raw_images
+    ]
+    num_tokens = sum(
+        tensor.shape[1] * tensor.shape[2] // (vit_transform.stride**2)
+        for tensor in image_tensor_list
+    )
+
+    text_ids_list = []
+    sequence_plan = []
+    for element in parser.change_format({"conversations": conversation}, len(raw_images)):
+        if element["type"] == "text":
+            text_ids = tokenizer.encode(element["text"])
+            if not text_ids:
+                continue
+            text_ids_list.append(text_ids)
+            num_tokens += len(text_ids)
+            sequence_plan.append(
+                {
+                    "type": "text",
+                    "enable_cfg": 0,
+                    "loss": element["has_loss"],
+                    "special_token_loss": 0,
+                    "special_token_label": None,
+                }
+            )
+        elif element["type"] == "image":
+            sequence_plan.append(
+                {
+                    "type": "vit_image",
+                    "enable_cfg": 0,
+                    "loss": 0,
+                    "special_token_loss": 0,
+                    "special_token_label": None,
+                }
+            )
+
+    return {
+        "image_tensor_list": image_tensor_list,
+        "text_ids_list": text_ids_list,
+        "sequence_plan": sequence_plan,
+        "num_tokens": num_tokens,
+        "data_indexes": {"dataset_name": "vlm"},
+    }
+
+
+class TestVLMExactParity:
+    """VLM WDS encoding matches upstream BAGEL conversation formatting."""
 
     def test_text_only_vlm_exact(self):
         """For text-only (no image) single-turn Q&A, both paths produce identical output."""
@@ -781,48 +940,47 @@ class TestVLMStructural:
             tokenizer=tokenizer, vit_transform=vit_t, special_token_ids=SPECIAL_TOKEN_IDS
         )
         ene = encoder.encode_sample(wds_sample)
+        orig = _orig_vlm_process([], conversation, vit_t, tokenizer)
 
-        # Expected: no image tokens, two text entries
-        assert len(ene["image_tensor_list"]) == 0, "No image expected for text-only VLM"
-        assert len(ene["text_ids_list"]) == 2, "Expected 2 text entries (human + gpt)"
-        assert len(ene["sequence_plan"]) == 2
-
-        # Human turn: no loss; gpt turn: loss=1
-        assert ene["sequence_plan"][0]["loss"] == 0
-        assert ene["sequence_plan"][1]["loss"] == 1
+        _assert_packable_samples_equal(orig, ene, label="text-only VLM")
 
     def test_vlm_has_vit_token_for_image_sample(self):
-        """VLM sample with an image: energon encoder inserts VIT token at start."""
+        """VLM image placeholders preserve upstream text/image ordering exactly."""
         from examples.mimo_bagel.data.energon_bagel_task_encoder import BagelVLMTaskEncoder
 
         tokenizer = _MockTokenizer()
         _, vit_t = _make_transforms()
         jpeg = _make_jpeg((128, 128, 128), (280, 280))
 
+        conversation = [
+            {"from": "human", "value": "Before the image <image> describe what follows."},
+            {"from": "gpt", "value": "A grey square."},
+        ]
         wds_sample = {
             "jpg": jpeg,
-            "json": json.dumps(
-                {
-                    "id": "0",
-                    "conversations": [
-                        {"from": "human", "value": "Describe this image."},
-                        {"from": "gpt", "value": "A grey square."},
-                    ],
-                }
-            ).encode(),
+            "json": json.dumps({"id": "0", "conversations": conversation}).encode(),
         }
 
         encoder = BagelVLMTaskEncoder(
             tokenizer=tokenizer, vit_transform=vit_t, special_token_ids=SPECIAL_TOKEN_IDS
         )
         ene = encoder.encode_sample(wds_sample)
+        orig = _orig_vlm_process([jpeg], conversation, vit_t, tokenizer)
 
-        # Image is always inserted first
-        assert ene["sequence_plan"][0]["type"] == "vit_image"
-        assert len(ene["image_tensor_list"]) == 1
-        # Image tensor shape must be divisible by vit patch size (14)
-        t = ene["image_tensor_list"][0]
-        assert t.shape[1] % 14 == 0 and t.shape[2] % 14 == 0
+        _assert_packable_samples_equal(orig, ene, label="image-placeholder VLM")
+
+        unsupported = dict(wds_sample)
+        unsupported["json"] = json.dumps(
+            {
+                "id": "0",
+                "conversations": [
+                    {"from": "human", "value": "Describe the supplied image."},
+                    {"from": "gpt", "value": "A grey square."},
+                ],
+            }
+        ).encode()
+        with pytest.raises(ValueError, match="image placeholder"):
+            encoder.encode_sample(unsupported)
 
 
 # ---------------------------------------------------------------------------

@@ -13,33 +13,32 @@ import os
 from typing import Dict, Optional
 
 import torch
+from bagel.modeling.bagel import BagelConfig, Qwen2Config, SiglipVisionConfig
 from configs.bagel_configs import (
-    get_bagel_projection_config,
-    get_bagel_projection_layer_spec,
     get_bagel_language_layer_spec,
     get_bagel_language_model_config,
     get_bagel_language_model_config_qwen3_30b,
+    get_bagel_projection_config,
+    get_bagel_projection_layer_spec,
 )
+from configs.reference import apply_reference_llm_overrides
 
-from megatron.core.process_groups_config import ProcessGroupCollection
-
+from examples.mimo.utils.logging import print_mimo_structure
 from examples.mimo_bagel.diffusion.diffusion_modality_submodule import DiffusionModalitySubmodules
-from examples.mimo_bagel.diffusion.embeddings import TimestepEmbedder, PositionEmbedding
-
+from examples.mimo_bagel.diffusion.diffusion_wrapper import build_diffusion_wrapper
+from examples.mimo_bagel.diffusion.embeddings import PositionEmbedding, TimestepEmbedder
+from examples.mimo_bagel.runtime_state import set_diffusion_wrapper, set_mfu_tracker
+from examples.mimo_bagel.utils.model_helpers import load_submodule_ckpt, load_submodule_ckpt_for_mot
+from examples.mimo_bagel.utils.native_checkpoint import initialize_bagel_from_native_checkpoint
 from examples.mimo_bagel.vision.hf_bagel_vision_encoder import HFBagelVisionEncoderWrapper
+from examples.mimo_bagel.vision.vision_submodule import BagelVisionSubmodule
+from megatron.core.models.bagel.bagel_mimo import BagelMimoModel
 from megatron.core.models.bagel.hf_bagel_llm import BagelLLMHuggingFaceModel
 from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
-from megatron.core.models.bagel.bagel_mimo import BagelMimoModel
-from examples.mimo.utils.logging import print_mimo_structure
-from examples.mimo_bagel.utils.model_helpers import load_submodule_ckpt, load_submodule_ckpt_for_mot
 from megatron.core.models.mimo import MimoModelConfig
-from examples.mimo_bagel.vision.vision_submodule import BagelVisionSubmodule
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
-
-from bagel.modeling.bagel import Qwen2Config, SiglipVisionConfig, BagelConfig
-
-from examples.mimo_bagel.diffusion.diffusion_wrapper import build_diffusion_wrapper
 
 
 def _load_siglip_vision_config(vit_path: str) -> SiglipVisionConfig:
@@ -189,6 +188,9 @@ def model_provider_bagel(
     # MIMO path, therefore *add_encoder* and *add_decoder* are currently ignored.
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    from megatron.training import get_args
+
+    _args = get_args()
 
     finetune_from_hf = False
     if finetune_from_hf:
@@ -198,7 +200,7 @@ def model_provider_bagel(
         print("llm_path", llm_path, "vit_path", vit_path)
         llm_config = Qwen2Config.from_pretrained(llm_path)
         vit_config = _load_siglip_vision_config(vit_path)
-    llm_config.layer_module = decoder_layer_module
+    llm_config = apply_reference_llm_overrides(llm_config, decoder_layer_module)
     # vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + model_args.vit_select_layer
     vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 - 2
     vit_config.rope = False
@@ -208,6 +210,12 @@ def model_provider_bagel(
         llm_config=llm_config,
         vit_config=vit_config,
         vae_config=None,
+        latent_patch_size=_args.latent_patch_size,
+        max_latent_size=_args.max_latent_size,
+        vit_max_num_patch_per_side=_args.max_num_patch_per_side,
+        connector_act='gelu_pytorch_tanh',
+        interpolate_pos=_args.interpolate_pos,
+        timestep_shift=_args.timestep_shift,
     )
 
     # Language — dispatch to the right config builder based on model_type.
@@ -234,6 +242,8 @@ def model_provider_bagel(
         from megatron.training import get_args  # late import to avoid circular deps
 
         _args = get_args()
+        if getattr(_args, "seq_length", None) is not None:
+            language_config.seq_length = _args.seq_length
         if getattr(_args, "bf16", False):
             language_config.bf16 = True
             projection_config.bf16 = True
@@ -248,6 +258,45 @@ def model_provider_bagel(
         projection_config.pipeline_dtype = dtype
         language_config.params_dtype = dtype
         projection_config.params_dtype = dtype
+        language_config.transformer_impl = _args.transformer_impl
+        # These configs are built directly rather than through
+        # core_transformer_config_from_args, so propagate the standard fusion
+        # switches explicitly.  This also gives alignment runs a true
+        # single-variable eager-SwiGLU / eager-RoPE control.
+        language_config.bias_activation_fusion = _args.bias_swiglu_fusion
+        language_config.bias_dropout_fusion = _args.bias_dropout_fusion
+        language_config.apply_rope_fusion = _args.apply_rope_fusion
+        language_config.bagel_split_qkv_for_alignment = getattr(
+            _args, 'bagel_split_qkv_for_alignment', False
+        )
+        language_config.bagel_split_mlp_for_alignment = getattr(
+            _args, 'bagel_split_mlp_for_alignment', False
+        )
+        language_config.bagel_native_rmsnorm_for_alignment = getattr(
+            _args, 'bagel_native_rmsnorm_for_alignment', False
+        )
+        language_config.bagel_native_rope_for_alignment = getattr(
+            _args, 'bagel_native_rope_for_alignment', False
+        )
+        projection_config.bagel_native_connector_for_alignment = getattr(
+            _args, 'bagel_native_connector_for_alignment', False
+        )
+        if (
+            language_config.bagel_split_qkv_for_alignment
+            or language_config.bagel_split_mlp_for_alignment
+            or projection_config.bagel_native_connector_for_alignment
+        ) and getattr(_args, 'tensor_model_parallel_size', 1) != 1:
+            raise ValueError('BAGEL native alignment paths require tensor model parallel size 1')
+        if language_config.bagel_split_mlp_for_alignment:
+            # Native Qwen uses eager silu(gate) * up.  Keep this tied to the
+            # MLP split switch so QKV and MLP can still be isolated separately.
+            language_config.bias_activation_fusion = False
+            language_config.use_te_activation_func = False
+        if language_config.transformer_impl not in ('transformer_engine', 'local'):
+            raise ValueError(
+                'BAGEL MoT supports --transformer-impl transformer_engine or local, '
+                f'got {language_config.transformer_impl!r}'
+            )
         # MoT compact representation has [Lund+Lgen, 1, H] shape which varies
         # per microbatch — PP send/recv must negotiate tensor shapes at run
         # time instead of using args.seq_length/CP.
@@ -347,10 +396,12 @@ def model_provider_bagel(
     #we build diffusion wrapper here for bagel model needs latent channels.
     #but actually we don't want vae on all devices, so we will remove diffusion wrapper on the devices which
     #has no visual data.
-    _args.diffusion_wrapper = build_diffusion_wrapper()
-    latent_channels = _args.diffusion_wrapper.vae_params.z_channels
+    diffusion_wrapper = build_diffusion_wrapper()
+    latent_channels = diffusion_wrapper.vae_params.z_channels
+    _args.vae_image_downsample = diffusion_wrapper.latent_downsample
     if torch.distributed.get_rank(pg_collection.tp) != 0:
-        _args.diffusion_wrapper = None
+        diffusion_wrapper = None
+    set_diffusion_wrapper(diffusion_wrapper)
 
     ### Diffusion modality submodule
     timestep_embedder = ModuleSpec(
@@ -417,7 +468,11 @@ def model_provider_bagel(
         module=MultimodalProjector,
         params={
             "config": projection_config,
-            "submodules": get_bagel_projection_layer_spec().submodules,
+            "submodules": get_bagel_projection_layer_spec(
+                native_connector_for_alignment=(
+                    getattr(projection_config, 'bagel_native_connector_for_alignment', False)
+                )
+            ).submodules,
             "projector_type": "mlp",
             "input_size": vit_config.hidden_size,  # vision hidden size
         },
@@ -442,7 +497,11 @@ def model_provider_bagel(
             transformer_layer_spec = get_mot_layer_spec(num_experts=language_config.num_moe_experts, 
                                                         moe_grouped_gemm=language_config.moe_grouped_gemm, 
                                                         use_flex_attention=_args.use_flex_attention, 
-                                                        qk_layernorm=True
+                                                        qk_layernorm=True,
+                                                        use_te=(language_config.transformer_impl == 'transformer_engine'),
+                                                        split_qkv_for_alignment=language_config.bagel_split_qkv_for_alignment,
+                                                        split_mlp_for_alignment=language_config.bagel_split_mlp_for_alignment,
+                                                        native_rmsnorm_for_alignment=language_config.bagel_native_rmsnorm_for_alignment,
                                                         )
         else:
             transformer_layer_spec = get_bagel_language_layer_spec(num_experts=language_config.num_moe_experts, 
@@ -458,9 +517,10 @@ def model_provider_bagel(
                 "config": language_config,
                 "transformer_layer_spec": transformer_layer_spec,
                 "vocab_size": llm_config.vocab_size,
-                "max_sequence_length": 32768,
+                "max_sequence_length": _args.seq_length,
                 "pre_process": pre_process,
                 "post_process": post_process,
+                "share_embeddings_and_output_weights": llm_config.tie_word_embeddings,
                 "position_embedding_type": "rope",
                 "rotary_base": getattr(llm_config, 'rope_theta', 1000000),
                 "llm_config": llm_config,  # Bagel-specific config
@@ -520,35 +580,69 @@ def model_provider_bagel(
     _register_te_parallel_groups(mimo_model, pg_collection,
                                  submodule_pg_collections=submodule_pg_collections)
 
+    # Native BAGEL starts the diffusion output projection at exactly zero.
+    diffusion_output = mimo_model.modality_submodules.diffusion.output_projections[0]
+    torch.nn.init.zeros_(diffusion_output.weight)
+    if diffusion_output.bias is not None:
+        torch.nn.init.zeros_(diffusion_output.bias)
+
+    native_model_checkpoint = getattr(_args, 'native_model_checkpoint', None)
+    if native_model_checkpoint is not None:
+        if _args.language_model_checkpoint is not None:
+            raise ValueError(
+                '--native-model-checkpoint initializes the complete BAGEL model and cannot '
+                'be combined with --language-model-checkpoint'
+            )
+        if not language_use_mcore or not use_mo:
+            raise ValueError('--native-model-checkpoint requires the MCore MoT provider')
+        if (
+            getattr(_args, 'use_megatron_fsdp', False)
+            and _args.megatron_fsdp_main_params_dtype != torch.float32
+        ):
+            raise ValueError(
+                '--native-model-checkpoint requires '
+                '--megatron-fsdp-main-params-dtype fp32 for exact optimizer main weights'
+            )
+
     print("*" * 100)
     print(f"Using {'Megatron Core BagelMCoreModel' if language_use_mcore else 'HuggingFace BagelLLMHuggingFaceModel'}")
     print_mimo_structure(mimo_model)
     print("*" * 100)
 
-    # load the checkpoint
-    try:
-        from megatron.training import get_args  # late import to avoid circular deps
-
-        _args = get_args()
-        if _args.language_model_checkpoint is not None:
-            print(f"[model_provider_bagel] Attempting to load checkpoint from {_args.language_model_checkpoint}")
-            try:
-                if use_mo:
-                    # For MoT models, use the special loader that handles _gen parameters
-                    load_submodule_ckpt_for_mot(
-                        mimo_model.language_model,
-                        _args.language_model_checkpoint,
-                        init_gen_from_und=True
-                    )
-                    print(f"Successfully loaded checkpoint (MoT mode) from {_args.language_model_checkpoint}")
-                else:
-                    load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint)
-                    print(f"Successfully loaded checkpoint from {_args.language_model_checkpoint}")
-            except Exception as e:
-                print(f"[model_provider_bagel] WARNING: Failed to load checkpoint: {e}")
-                print("[model_provider_bagel] Continuing with randomly initialized weights.")
-    except (ModuleNotFoundError, AssertionError):
-        pass
+    # Load fail-fast: silently continuing with random weights invalidates an
+    # alignment run and can look like a legitimate optimizer divergence.
+    if native_model_checkpoint is not None:
+        reference_world_size = torch.distributed.get_world_size()
+        reference_seed = _args.seed * reference_world_size
+        print(
+            '[model_provider_bagel] Remapping complete native BAGEL initialization from '
+            f'{native_model_checkpoint} with reference seed {reference_seed}'
+        )
+        remap_report = initialize_bagel_from_native_checkpoint(
+            mimo_model,
+            native_model_checkpoint,
+            expected_model_seed=reference_seed,
+            expected_world_size=reference_world_size,
+            llm_config=llm_config,
+        )
+        print(
+            '[model_provider_bagel] Complete native BAGEL initialization remap verified: '
+            f'source={remap_report.source_tensors_consumed}, '
+            f'target={remap_report.target_tensors_verified}, '
+            f'fp32_main={remap_report.fp32_main_tensors_preserved}'
+        )
+    elif _args.language_model_checkpoint is not None:
+        print(f"[model_provider_bagel] Attempting to load checkpoint from {_args.language_model_checkpoint}")
+        if use_mo:
+            load_submodule_ckpt_for_mot(
+                mimo_model.language_model,
+                _args.language_model_checkpoint,
+                init_gen_from_und=True,
+            )
+            print(f"Successfully loaded checkpoint (MoT mode) from {_args.language_model_checkpoint}")
+        else:
+            load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint)
+            print(f"Successfully loaded checkpoint from {_args.language_model_checkpoint}")
 
     # Build a BagelMFUTracker so the training loop can report MFU.  Configs are
     # all in scope here: language_config (TransformerConfig), vit_config
@@ -558,7 +652,7 @@ def model_provider_bagel(
         from examples.mimo_bagel.utils.mfu import BagelMFUTracker, detect_peak_tflops
 
         _world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        _args.mfu_tracker = BagelMFUTracker(
+        mfu_tracker = BagelMFUTracker(
             language_config=language_config,
             vit_config=vit_config,
             vocab_size=llm_config.vocab_size,
@@ -569,9 +663,10 @@ def model_provider_bagel(
             latent_channels=latent_channels,
             log_interval=getattr(_args, 'log_interval', 10) or 10,
         )
+        set_mfu_tracker(mfu_tracker)
     except Exception as e:
         print(f"[model_provider_bagel] WARNING: Failed to build MFU tracker: {e}")
-        _args.mfu_tracker = None
+        set_mfu_tracker(None)
 
     # TODO: ykarnati make these configurable and have an API to freeze/unfreeze
     # freeze vision encoder and LLM parameters

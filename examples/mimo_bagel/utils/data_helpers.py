@@ -327,7 +327,12 @@ def bagel_process_gen_data(
     modality_inputs: dict = {}
 
     if "packed_timesteps" in batch_dict:
-        packed_timesteps = batch_dict['packed_timesteps'].cuda()
+        # Native BAGEL's mixed-precision input preparation casts floating
+        # model inputs to BF16 before sigmoid/timestep shifting.  Keep the
+        # diffusion arithmetic on that same dtype and rounding path.
+        packed_timesteps = batch_dict['packed_timesteps'].cuda().to(
+            dtype=diffusion_wrapper.dtype
+        )
         shifted_timesteps = diffusion_wrapper.shift_timesteps(packed_timesteps)
         shifted_timesteps.requires_grad = True  # for fsdp backward hook
         modality_inputs['shifted_timesteps'] = shifted_timesteps

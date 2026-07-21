@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn as nn
 
+from megatron.core.models.bagel.alignment_audit import (
+    audit_branch_tensor,
+    layer_alignment_audit_enabled,
+)
 from megatron.core.models.mimo.submodules.base import ModalitySubmodules
 
 # Initialize logger
@@ -81,10 +85,24 @@ class DiffusionModalitySubmodules(ModalitySubmodules):
         shifted_timesteps = encoders_data_batch['shifted_timesteps']
         packed_timestep_embeds = self.encoders['timestep'](shifted_timesteps)
         embeddings['timestep_emb'] = packed_timestep_embeds
+        if layer_alignment_audit_enabled(1):
+            audit_branch_tensor(
+                "diffusion.timestep_embedding",
+                "gen",
+                packed_timestep_embeds,
+                layer_number=1,
+            )
 
         latent_pos_ids = encoders_data_batch['latent_position_ids']
         latent_pos_emb = self.encoders['latent_position_ids'](latent_pos_ids)
         embeddings['pos_emb'] = latent_pos_emb
+        if layer_alignment_audit_enabled(1):
+            audit_branch_tensor(
+                "diffusion.position_embedding",
+                "gen",
+                latent_pos_emb,
+                layer_number=1,
+            )
 
         return embeddings
 
@@ -119,7 +137,21 @@ class DiffusionModalitySubmodules(ModalitySubmodules):
             Combined embedding tensor
         """
 
-        combined = self.input_projections[0](embeddings['latents'].to(self.dtype)) + embeddings['timestep_emb'] + embeddings['pos_emb']
+        latents = embeddings['latents'].to(self.dtype)
+        projected_latents = self.input_projections[0](latents)
+        if layer_alignment_audit_enabled(1):
+            audit_branch_tensor(
+                "diffusion.noisy_latents", "gen", latents, layer_number=1
+            )
+            audit_branch_tensor(
+                "diffusion.vae2llm", "gen", projected_latents, layer_number=1
+            )
+
+        combined = projected_latents + embeddings['timestep_emb'] + embeddings['pos_emb']
+        if layer_alignment_audit_enabled(1):
+            audit_branch_tensor(
+                "diffusion.combined_embedding", "gen", combined, layer_number=1
+            )
 
         logger.debug(f"Combined embeddings shape after concatenation: {combined.shape}")
         return combined

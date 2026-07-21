@@ -22,7 +22,11 @@ class DiffusionWrapper(torch.nn.Module):
 
     def init_vae(self, model_path: str, latent_patch_size: int, dtype: torch.dtype=torch.bfloat16):
         self.vae, self.vae_params = load_ae(model_path)
-        self.vae.to(dtype).cuda()
+        # Native BAGEL keeps the frozen VAE parameters in FP32 and relies on
+        # BF16 autocast for its encode kernels.  Pre-casting the parameters to
+        # BF16 changes GroupNorm/convolution numerics and therefore changes the
+        # sampled clean latents even when the CUDA RNG stream is identical.
+        self.vae.cuda()
         self.vae.eval()
         self.dtype = dtype
         self.latent_patch_size = latent_patch_size
@@ -50,21 +54,25 @@ class DiffusionWrapper(torch.nn.Module):
         assert padded_images.ndim == 4, "padded_images should be a 4D tensor"
         assert len(pachified_vae_latent_shapes) == padded_images.shape[0], "the number of padded images should be equal to the number of pachified vae latent shapes"
 
-        with torch.no_grad():
-            # print(padded_images.dtype)
-            # print(list(self.vae.parameters())[0].dtype)
-            padded_latents = self.vae.encode(padded_images.to(self.dtype))
+        with torch.no_grad(), torch.amp.autocast(
+            "cuda", enabled=True, dtype=self.dtype
+        ):
+            # Match native BAGEL's input semantics: images remain FP32 and
+            # autocast selects the compute dtype at each VAE kernel boundary.
+            # Native keeps this context active through the patchifying einsum;
+            # that einsum is what makes the packed latent BF16 when the VAE's
+            # final elementwise operation returns FP32.
+            padded_latents = self.vae.encode(padded_images)
+            packed_latents = []
+            for latent, hw in zip(padded_latents, pachified_vae_latent_shapes):
+                h, w = hw
+                p = self.latent_patch_size
+                c = self.vae_params.z_channels
+                latent = latent[..., :h*p, :w*p].reshape(c, h, p, w, p)
+                latent = torch.einsum('chpwq->hwpqc', latent).reshape(-1, c*p*p) #[s, c*p^2]
+                packed_latents.append(latent)
 
-        packed_latents = []
-        for latent, hw in zip(padded_latents, pachified_vae_latent_shapes):
-            h, w = hw
-            p = self.latent_patch_size
-            c = self.vae_params.z_channels
-            latent = latent[..., :h*p, :w*p].reshape(c, h, p, w, p)
-            latent = torch.einsum('chpwq->hwpqc', latent).reshape(-1, c*p*p) #[s, c*p^2]
-            packed_latents.append(latent)
-
-        packed_latents_clean = torch.cat(packed_latents, dim=0)
+            packed_latents_clean = torch.cat(packed_latents, dim=0)
             
         return packed_latents_clean #[packed_s,  c*p^2]
 

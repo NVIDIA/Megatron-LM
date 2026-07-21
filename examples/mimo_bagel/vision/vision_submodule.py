@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from megatron.core.models.bagel.alignment_audit import (
+    audit_branch_tensor,
+    layer_alignment_audit_enabled,
+)
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 
 # Initialize logger
@@ -119,6 +123,10 @@ class BagelVisionSubmodule(VisionModalitySubmodules):
         # Project embeddings through MLP connector (input_projection)
         projected = self.project_embeddings(embeddings, is_input=True)
         logger.debug(f"Projected vision embeddings shape: {projected.shape}")
+        if layer_alignment_audit_enabled(1):
+            audit_branch_tensor(
+                "vision.connector_output", "vision", projected, layer_number=1
+            )
         
         # Add position embeddings AFTER projection (Bagel style)
         # Position embeddings should already be in llm_hidden_size from the encoder
@@ -138,5 +146,10 @@ class BagelVisionSubmodule(VisionModalitySubmodules):
                     f"Position embedding shape {combined_pos_emb.shape} doesn't match "
                     f"projected shape {projected.shape}, skipping position embedding addition"
                 )
+
+        if layer_alignment_audit_enabled(1):
+            audit_branch_tensor(
+                "vision.position_added", "vision", projected, layer_number=1
+            )
         
         return projected  # [total_embeddings, hidden_dim]

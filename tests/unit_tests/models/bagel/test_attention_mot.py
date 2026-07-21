@@ -431,7 +431,10 @@ class TestSelfAttentionMoTAccuracy:
         psp = self._make_psp(und_idx, gen_idx)
         bm = _block_mask(seq_len, "cuda")
 
-        with torch.no_grad():
+        # The Bagel reference casts SDPA inputs to bf16 internally while its
+        # output projection remains fp16.  Its training path relies on autocast
+        # to reconcile those dtypes before the projection.
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
             bagel_out = bagel_attn.forward_train(
                 packed_sequence=packed_seq,
                 sample_lens=[seq_len],
@@ -470,7 +473,7 @@ class TestSelfAttentionMoTAccuracy:
         psp = self._make_psp(und_idx, gen_idx)
         bm = _block_mask(seq_len, "cuda")
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
             bagel_out = bagel_attn.forward_train(
                 packed_sequence=packed_seq,
                 sample_lens=[seq_len],
@@ -507,7 +510,7 @@ class TestSelfAttentionMoTAccuracy:
         psp = self._make_psp(und_idx, gen_idx)
         bm = _block_mask(seq_len, "cuda")
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
             bagel_out = bagel_attn.forward_train(
                 packed_sequence=packed_seq,
                 sample_lens=[seq_len],

@@ -2923,8 +2923,12 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # On the first iteration we normally keep the accumulator so the next
+    # regular interval still covers a full window.  With log_interval=1 the
+    # first iteration already is a complete window; retaining it would make
+    # iteration 2 report the average of iterations 1 and 2 instead of the
+    # current loss, which invalidates step-by-step alignment comparisons.
+    should_reset = not is_first_iteration or args.log_interval == 1
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
