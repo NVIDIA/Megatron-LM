@@ -232,6 +232,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        input_ids: Optional[Tensor] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -247,6 +248,8 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            input_ids (Tensor, optional): Token IDs forwarded to hash-routed
+                TransformerLayer instances. Defaults to None.
         Returns:
             Tensor: the output tensor.
         """
@@ -320,6 +323,7 @@ class HybridStack(MegatronModule):
                     attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
@@ -330,7 +334,7 @@ class HybridStack(MegatronModule):
                     )
                     with inner_quant_context:
                         if isinstance(layer, TransformerLayer):
-                            hidden_states, _ = layer(
+                            layer_kwargs = dict(
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
                                 inference_context=inference_context,
@@ -339,6 +343,9 @@ class HybridStack(MegatronModule):
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
                             )
+                            if input_ids is not None:
+                                layer_kwargs['input_ids'] = input_ids
+                            hidden_states, _ = layer(**layer_kwargs)
                         else:  # MambaLayer, Expert, or MLP
                             hidden_states = layer(
                                 hidden_states=hidden_states,

@@ -511,6 +511,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         #   be None, so this assert will succeed.
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
+        decoder_extra_block_kwargs = {}
+        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+            decoder_extra_block_kwargs['input_ids'] = input_ids
+
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
@@ -519,6 +523,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            **decoder_extra_block_kwargs,
         )
 
         output_weight = None
