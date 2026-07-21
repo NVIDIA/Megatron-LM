@@ -685,9 +685,9 @@ class TestMambaPrefixCachingE2E:
         # the state at this boundary is extracted and committed.
         assert len(seed.precomputed_block_hashes) == 3
         last_block_hash = seed.precomputed_block_hashes[2]
-        assert last_block_hash in ctx.mamba_slot_allocator.hash_to_block_id, (
-            "Mamba snapshot at the last block boundary (token 768) was not recorded."
-        )
+        assert (
+            last_block_hash in ctx.mamba_slot_allocator.hash_to_block_id
+        ), "Mamba snapshot at the last block boundary (token 768) was not recorded."
 
         # --- Reuse request: shares the full 768-token prefix, should restore the
         # cached Mamba state and skip those blocks entirely. ---

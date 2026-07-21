@@ -381,6 +381,9 @@ class DynamicInferenceRequest(InferenceRequest):
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
     num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
+    # Chunk-local Mamba blocks matched during prefill scheduling. Defaults to 0
+    # (no matches) and is overwritten by the context when the request is scheduled.
+    _mamba_num_matched_blocks: int = 0
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
