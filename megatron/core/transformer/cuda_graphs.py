@@ -69,6 +69,14 @@ _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
 
+def _set_te_param_grad_clone_policy(kwargs: Dict[str, Any]) -> None:
+    """Disable TE parameter-gradient clones when the public option is available."""
+    if 'clone_param_grads_on_return' in inspect.signature(make_graphed_callables).parameters:
+        # MCore consumes parameter gradients through its accumulation hooks during each replay,
+        # before TE can overwrite the static gradient buffers on a later replay.
+        kwargs['clone_param_grads_on_return'] = False
+
+
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
     """Toggle TE's FP8 "skip weight refresh" flag between microbatches.
 
@@ -2178,6 +2186,7 @@ class TECudaGraphHelper:
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
                 # by reusing input/output data buffers between graphs.
                 kwargs['_reuse_graph_input_output_buffers'] = True
+            _set_te_param_grad_clone_policy(kwargs)
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
