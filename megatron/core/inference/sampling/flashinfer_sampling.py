@@ -99,3 +99,20 @@ class FlashInferSampling(Sampling):
             )
         )
         return output
+
+    def log_probs_kernel(
+        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+    ) -> Tensor:
+        """Per-row log-probs of the FlashInfer top-k / top-p sampling distribution."""
+        temperature = temperature.clamp(min=1e-6)
+        probs = torch.softmax(logits / temperature.unsqueeze(1), dim=-1)
+
+        # Sentinel values disable filtering:
+        # top_k=vocab_size keeps all tokens, top_p=1.0 keeps the full probability mass.
+        top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
+        top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+
+        # Renormalize to the kept set (top-k first, then top-p) to match
+        renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
+        renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
+        return torch.log(renormed)

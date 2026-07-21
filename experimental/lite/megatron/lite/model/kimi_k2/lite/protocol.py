@@ -278,6 +278,12 @@ def export_hf_weights(chunks, model_cfg: KimiK2Config, ps: ParallelState, **kwar
     yield from export_impl(chunks, model_cfg, ps, **kwargs)
 
 
+def save_hf_weights(chunks, path: str, model_cfg: KimiK2Config, ps: ParallelState) -> None:
+    from megatron.lite.model.kimi_k2.lite.checkpoint import save_hf_weights as save_impl
+
+    save_impl(chunks, path, model_cfg, ps)
+
+
 def vocab_size(model_cfg) -> int | None:
     cfg = getattr(model_cfg, "text_config", model_cfg)
     return getattr(cfg, "vocab_size", None)
@@ -292,5 +298,6 @@ __all__ = [
     "export_hf_weights",
     "is_expert_param",
     "load_hf_weights",
+    "save_hf_weights",
     "vocab_size",
 ]

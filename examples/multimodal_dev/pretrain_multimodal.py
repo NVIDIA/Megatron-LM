@@ -162,7 +162,7 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         datasets_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider=model_provider,
     )

@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -105,6 +105,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
+    "experimental_attention_variant_loss_scale_func": None,
     "expert_model_parallel_size": 4,
     "expert_tensor_parallel_size": 1,
     "external_cuda_graph": False,
@@ -186,6 +187,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_expert_rank_capacity_factor": None,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
+    "moe_flex_dispatcher_num_sms": None,
     "moe_grad_scale_func": None,
     "moe_grouped_gemm": True,
     "moe_hybridep_num_sms": None,
@@ -197,6 +199,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_n_hash_layers": 0,
+    "moe_ncclep_static_shape": False,
+    "moe_ncclep_use_symm_mem": False,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_paged_stash": False,
@@ -222,7 +226,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shared_expert_gate": False,
+    "use_grouped_gemm_for_shared_expert": False,
     "moe_shared_expert_intermediate_size": 3712,
+    "moe_shared_expert_glu_interleave_size": None,
     "moe_shared_expert_overlap": False,
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",

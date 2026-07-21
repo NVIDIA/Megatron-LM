@@ -4,17 +4,13 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
-    _cast_export_tensor,
-    _resolve_export_dtype,
     parse_expert_idx,
-    to_global_layer_name,
     unwrap_model,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -343,6 +339,10 @@ class KimiK2WeightSpec:
         del native_name
         return hf_tensors[0]
 
+    @staticmethod
+    def is_export_buffer(native_name: str) -> bool:
+        return native_name.endswith(".moe.router.expert_bias")
+
     def native_to_hf(
         self, native_name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
@@ -617,37 +617,20 @@ def export_hf_weights(model, config: KimiK2Config, ps: ParallelState, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
     spec = KimiK2WeightSpec(config)
-    rank0_only = bool(kwargs.get("rank0_only", False))
-    export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
     yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank0_only and rank != 0:
-        return
-    chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
-    for chunk in chunks:
-        base_chunk = unwrap_model(chunk)
-        layer_map = (
-            {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
-            if hasattr(base_chunk, "layer_indices")
-            else {}
-        )
-        for name, buffer in base_chunk.named_buffers():
-            if not name.endswith(".moe.router.expert_bias"):
-                continue
-            global_name = to_global_layer_name(name, layer_map)
-            for hf_name, hf_tensor in spec.native_to_hf(global_name, buffer.detach().cpu()):
-                yield hf_name, _cast_export_tensor(hf_tensor, export_dtype)
 
 
-def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState) -> None:
-    from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
+def save_hf_weights(model, path: str, config: KimiK2Config, ps: ParallelState, **kwargs) -> None:
+    """Export + write sharded safetensors via ``stream_export_to_shards``."""
+    from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    out = dict(export_hf_weights(model, config, ps, rank0_only=True))
-    if rank == 0 and out:
-        save_safetensors(out, path)
-    if dist.is_initialized():
-        dist.barrier()
+    kwargs.pop("cpu", None)
+    shard_size_bytes = int(kwargs.pop("shard_size_bytes", 5 * 1024**3))
+    stream_export_to_shards(
+        export_hf_weights(model, config, ps, rank0_only=True, cpu=True, **kwargs),
+        path,
+        shard_size_bytes=shard_size_bytes,
+    )
 
 
 __all__ = [

@@ -54,8 +54,8 @@ def test_qwen35_protocol_registers_vllm_export_entrypoint() -> None:
 
 
 def test_qwen35_gdn_cp_mode_is_configurable() -> None:
-    assert ImplConfig().gdn_cp_mode == "replicated"
-    assert ImplConfig(gdn_cp_mode="sharded").gdn_cp_mode == "sharded"
+    assert ImplConfig().gdn_cp_mode == "headwise"
+    assert ImplConfig(gdn_cp_mode="replicated").gdn_cp_mode == "replicated"
 
 
 def test_qwen35_export_uses_hf_checkpoint_names_without_module_prefix() -> None:
@@ -154,24 +154,43 @@ def test_qwen35_export_preserves_runtime_parameter_dtype_by_default() -> None:
     )
 
 
+def test_qwen35_online_export_keeps_weights_on_the_source_device() -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.norm = nn.LayerNorm(8, device="meta")
+
+    exported = dict(
+        export_hf_weights(
+            TinyQwen35Module(),
+            _tiny_config(),
+            _single_rank_parallel_state(),
+            cpu=False,
+        )
+    )
+
+    assert exported["model.language_model.norm.weight"].device.type == "meta"
+
+
 def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
     class TinyQwen35Module(nn.Module):
         def __init__(self, config: Qwen35Config) -> None:
             super().__init__()
-            self.layers = nn.ModuleList([nn.Module()])
-            self.layers[0].moe = nn.Module()
-            self.layers[0].moe.experts = nn.Module()
-            self.layers[0].moe.experts.fc1 = nn.Module()
+            self.layers = nn.ModuleList([nn.Module(), nn.Module()])
 
             rows = config.moe_intermediate_size * 2
-            for local_idx in range(config.num_experts // 2):
-                tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
-                    rows, config.hidden_size
-                )
-                tensor = tensor + local_idx * 1000
-                self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{local_idx}", nn.Parameter(tensor)
-                )
+            for layer_idx, layer in enumerate(self.layers):
+                layer.moe = nn.Module()
+                layer.moe.experts = nn.Module()
+                layer.moe.experts.fc1 = nn.Module()
+                for local_idx in range(config.num_experts // 2):
+                    tensor = torch.arange(
+                        rows * config.hidden_size, dtype=torch.bfloat16
+                    ).reshape(rows, config.hidden_size)
+                    tensor = tensor + layer_idx * 10000 + local_idx * 1000
+                    layer.moe.experts.fc1.register_parameter(
+                        f"weight{local_idx}", nn.Parameter(tensor)
+                    )
 
     cfg = _tiny_config()
     cfg.num_experts = 16
@@ -187,24 +206,40 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
     )
     gather_calls = []
 
-    def fake_all_gather(outputs, tensor, group=None):
+    def fake_all_gather(output, tensor, group=None):
         del group
-        gather_calls.append(tensor.clone())
-        outputs[0].copy_(tensor)
-        outputs[1].copy_(tensor + 2000)
+        gather_calls.append(
+            tensor.clone().reshape(-1, cfg.moe_intermediate_size * 2, cfg.hidden_size)
+        )
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 2000)
 
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
+        fake_all_gather,
+    )
 
     exported = dict(export_hf_weights(model, cfg, ps))
 
-    assert len(gather_calls) == 2
-    assert all(call.shape[0] <= 4 for call in gather_calls)
+    assert len(gather_calls) == 4
+    assert all(call.shape[0] == 4 for call in gather_calls)
     local_tensors = [
         getattr(model.layers[0].moe.experts.fc1, f"weight{i}").detach()
         for i in range(cfg.num_experts // ps.ep_size)
     ]
     expected = torch.stack(local_tensors + [tensor + 2000 for tensor in local_tensors])
     assert torch.equal(exported["model.language_model.layers.0.mlp.experts.gate_up_proj"], expected)
+    layer1_tensors = [
+        getattr(model.layers[1].moe.experts.fc1, f"weight{i}").detach()
+        for i in range(cfg.num_experts // ps.ep_size)
+    ]
+    layer1_expected = torch.stack(
+        layer1_tensors + [tensor + 2000 for tensor in layer1_tensors]
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.1.mlp.experts.gate_up_proj"],
+        layer1_expected,
+    )
 
 
 def test_qwen35_export_uses_packed_expert_group_names(monkeypatch) -> None:
@@ -270,15 +305,18 @@ def test_qwen35_export_rank0_only_still_participates_in_ep_gather(monkeypatch) -
     )
     gather_calls = []
 
-    def fake_all_gather(outputs, tensor, group=None):
+    def fake_all_gather(output, tensor, group=None):
         del group
         gather_calls.append(tensor.clone())
-        outputs[0].copy_(tensor)
-        outputs[1].copy_(tensor + 2)
+        output[: tensor.numel()].copy_(tensor)
+        output[tensor.numel() :].copy_(tensor + 2)
 
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.is_initialized", lambda: True)
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.get_rank", lambda: 1)
-    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.all_gather", fake_all_gather)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
+        fake_all_gather,
+    )
 
     exported = list(export_hf_weights(TinyQwen35Module(cfg), cfg, ps, rank0_only=True))
 
@@ -451,14 +489,15 @@ def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:
     )
     gather_calls = []
 
-    def fake_all_gather(outputs, tensor, group=None):
+    def fake_all_gather(output, tensor, group=None):
         assert group is ps.tp_group
-        gather_calls.append(tensor.clone())
-        outputs[0].copy_(shards[0])
-        outputs[1].copy_(shards[1])
+        gather_calls.append(tensor.clone().reshape_as(shards[0]))
+        output[: tensor.numel()].copy_(shards[0].view(-1))
+        output[tensor.numel() :].copy_(shards[1].view(-1))
 
     monkeypatch.setattr(
-        "megatron.lite.model.qwen3_5.lite.checkpoint.dist.all_gather", fake_all_gather
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
+        fake_all_gather,
     )
 
     exported = dict(export_hf_weights(TinyQwen35Module(shards[0]), cfg, ps))

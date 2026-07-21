@@ -23,8 +23,14 @@ from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Se
 
 import torch
 import torch.distributed as dist
-import zstandard
 from torch.utils.data import get_worker_info
+
+try:
+    import zstandard
+
+    HAVE_ZSTANDARD = True
+except ImportError:
+    HAVE_ZSTANDARD = False
 
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training import get_args
@@ -330,6 +336,11 @@ def iter_logprobs_tar_entries(
 
 def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Decode one zstd-compressed cached-logits payload."""
+    if not HAVE_ZSTANDARD:
+        raise ImportError(
+            "zstandard is required to decode cached-logits payloads. "
+            "Install via `pip install zstandard`."
+        )
     data = zstandard.ZstdDecompressor().decompress(data)
     tensors = torch.load(io.BytesIO(data), weights_only=True)
     indices_list = [

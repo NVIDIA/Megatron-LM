@@ -477,11 +477,18 @@ def fused_qk_topk_naive_thd(
 
     topk_thd = torch.full((total_q, index_topk), -1, dtype=torch.int64, device=device)
 
+    # Copy the cumulative-sequence-length offsets to host once (two D2H
+    # syncs) rather than calling ``.item()`` four times per segment (4*B
+    # device->host syncs). The integer offsets are identical; only the
+    # number of GPU->CPU synchronisations changes.
+    cu_seqlens_q_host = cu_seqlens_q.tolist()
+    cu_seqlens_kv_host = cu_seqlens_kv.tolist()
+
     for b in range(B):
-        q_start = int(cu_seqlens_q[b].item())
-        q_end = int(cu_seqlens_q[b + 1].item())
-        k_start = int(cu_seqlens_kv[b].item())
-        k_end = int(cu_seqlens_kv[b + 1].item())
+        q_start = cu_seqlens_q_host[b]
+        q_end = cu_seqlens_q_host[b + 1]
+        k_start = cu_seqlens_kv_host[b]
+        k_end = cu_seqlens_kv_host[b + 1]
         sq_b = q_end - q_start
         sk_b = k_end - k_start
         if sq_b == 0 or sk_b == 0:
@@ -829,11 +836,18 @@ def fwd_fused_indexer_loss_naive_thd(
     topk_indices_thd = torch.full((total_q, topk), -1, dtype=torch.int32, device=device)
     weighted_losses = []
 
+    # Copy the cumulative-sequence-length offsets to host once (two D2H
+    # syncs) rather than calling ``.item()`` four times per segment (4*B
+    # device->host syncs). The integer offsets are identical; only the
+    # number of GPU->CPU synchronisations changes.
+    cu_seqlens_q_host = cu_seqlens_q.tolist()
+    cu_seqlens_compressed_idx_host = cu_seqlens_compressed_idx.tolist()
+
     for b in range(B):
-        q_start = int(cu_seqlens_q[b].item())
-        q_end = int(cu_seqlens_q[b + 1].item())
-        k_start = int(cu_seqlens_compressed_idx[b].item())
-        k_end = int(cu_seqlens_compressed_idx[b + 1].item())
+        q_start = cu_seqlens_q_host[b]
+        q_end = cu_seqlens_q_host[b + 1]
+        k_start = cu_seqlens_compressed_idx_host[b]
+        k_end = cu_seqlens_compressed_idx_host[b + 1]
         seqlen_q_b = q_end - q_start
         seqlen_k_b = k_end - k_start
         if seqlen_q_b == 0 or seqlen_k_b == 0:
@@ -933,11 +947,18 @@ def bwd_fused_indexer_loss_naive_thd(
     grad_weights = torch.zeros_like(weights)
     grad_k = torch.zeros_like(k)
 
+    # Copy the cumulative-sequence-length offsets to host once (two D2H
+    # syncs) rather than calling ``.item()`` four times per segment (4*B
+    # device->host syncs). The integer offsets are identical; only the
+    # number of GPU->CPU synchronisations changes.
+    cu_seqlens_q_host = cu_seqlens_q.tolist()
+    cu_seqlens_compressed_idx_host = cu_seqlens_compressed_idx.tolist()
+
     for b in range(B):
-        q_start = int(cu_seqlens_q[b].item())
-        q_end = int(cu_seqlens_q[b + 1].item())
-        k_start = int(cu_seqlens_compressed_idx[b].item())
-        k_end = int(cu_seqlens_compressed_idx[b + 1].item())
+        q_start = cu_seqlens_q_host[b]
+        q_end = cu_seqlens_q_host[b + 1]
+        k_start = cu_seqlens_compressed_idx_host[b]
+        k_end = cu_seqlens_compressed_idx_host[b + 1]
         seqlen_q_b = q_end - q_start
         seqlen_k_b = k_end - k_start
         if seqlen_q_b == 0 or seqlen_k_b == 0:

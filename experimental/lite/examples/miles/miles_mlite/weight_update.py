@@ -11,6 +11,7 @@ from collections.abc import Sequence
 import ray
 import torch
 import torch.distributed as dist
+from megatron.lite.primitive.ckpt.hf_weights import DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +184,13 @@ class RawHFWeightUpdater:
     def _export_weight_chunks(self):
         chunk = []
         chunk_bytes = 0
-        limit = int(getattr(self.args, "update_weight_buffer_size", 2**30))
+        limit = int(
+            getattr(
+                self.args,
+                "update_weight_buffer_size",
+                DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+            )
+        )
         export_kwargs = {}
         if getattr(self.args, "mlite_export_dtype", None):
             export_kwargs["export_dtype"] = self.args.mlite_export_dtype

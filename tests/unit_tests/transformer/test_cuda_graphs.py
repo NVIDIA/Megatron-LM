@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -98,6 +98,62 @@ class TestCudaGraphConfigAndArguments:
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+    def test_local_impl_allows_expert_activation_offload_scope(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+            fine_grained_activation_offloading=True,
+            offload_modules=['expert_fc1', 'moe_act'],
+            num_moe_experts=4,
+        )
+
+        assert cfg.cuda_graph_impl == 'local'
+        assert CudaGraphModule.attn in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_router in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_preprocess in cfg.cuda_graph_modules
+
+    def test_local_impl_rejects_unsupported_activation_offload_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['qkv_linear'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.attn],
+                fine_grained_activation_offloading=True,
+                offload_modules=['qkv_linear'],
+            )
+
+    def test_local_impl_rejects_full_layer_graph_with_activation_offload(self):
+        with pytest.raises(
+            AssertionError, match="not supported with whole-layer CUDA graph capture"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[],
+                fine_grained_activation_offloading=True,
+                offload_modules=['expert_fc1'],
+            )
+
+    def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['mlp_norm'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.moe_router],
+                fine_grained_activation_offloading=True,
+                offload_modules=['mlp_norm'],
+                num_moe_experts=4,
+            )
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -646,6 +702,9 @@ class TestLLaVACudaGraph:
 
         # Move model to CUDA
         self.llava_model.cuda()
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in self.llava_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         set_current_microbatch(self.llava_model.vision_model, 1)
         set_current_microbatch(self.llava_model.language_model, 1)
@@ -1179,6 +1238,12 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
+def is_nccl_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    return HAVE_TE_EP
+
+
 class TestPartialCudaGraph:
     """Test that CUDA graph outputs match non-CUDA graph outputs for various scopes."""
 
@@ -1339,7 +1404,7 @@ class TestPartialCudaGraph:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -1401,7 +1466,7 @@ class TestPartialCudaGraph:
     )
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep", "ncclep"])
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(
@@ -1423,11 +1488,20 @@ class TestPartialCudaGraph:
                 pytest.skip("Hybrid EP is not available")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
+        elif moe_dispatcher_type == "ncclep":
+            if not is_nccl_ep_available():
+                pytest.skip("NCCL EP is not available")
+            if ep_size < 2:
+                pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
+            # ncclep sizes a per-rank recv buffer from this and overflow hard-traps; size generously.
+            extra_kwargs["moe_expert_rank_capacity_factor"] = 8.0
         else:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
         if not moe_dropless_dispatcher:
-            if moe_dispatcher_type == "deepep":
-                pytest.skip("Deep EP doesn't support drop&pad MoE")
+            if moe_dispatcher_type in ("deepep", "ncclep"):
+                pytest.skip(f"{moe_dispatcher_type} doesn't support drop&pad MoE")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
@@ -1444,10 +1518,12 @@ class TestPartialCudaGraph:
                 CudaGraphModule.moe_preprocess,
             ],
         ]:
-            if (moe_dropless_dispatcher or moe_dispatcher_type == "hybridep") and (
+            if (moe_dropless_dispatcher or moe_dispatcher_type in ("hybridep", "ncclep")) and (
                 cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules
             ):
-                # Dropless MoE or Hybrid EP doesn't work with "moe" scope cudagraph. Skip.
+                # Dropless MoE or a dynamic-shape flex backend (Hybrid EP / NCCL EP) can't be
+                # captured at the "moe" scope (the dispatch does a device-to-host sync). Skip;
+                # the surrounding compute submodules are still graphed.
                 continue
             cuda_graph_warmup_steps = 3
             loss_list = self._run_test_helper(
@@ -1461,6 +1537,10 @@ class TestPartialCudaGraph:
 
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
+        if moe_dispatcher_type == "ncclep":
+            from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+
+            nccl_ep_finalize()
         Utils.destroy_model_parallel()
 
     @pytest.mark.flaky
