@@ -6,7 +6,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, clone_tensors_in_struct
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -16,6 +16,30 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_clone_tensors_in_nested_struct():
+    list_tensor = torch.zeros(2, device='cpu')
+    tuple_tensor = torch.zeros(2, device='cpu')
+    nested_tensor = torch.zeros(2, device='cpu')
+    target_list = [list_tensor, {'nested': nested_tensor}]
+    target = {'list': target_list, 'tuple': (tuple_tensor, 0)}
+    source = {
+        'list': [torch.ones(2, device='cpu'), {'nested': torch.full((2,), 2.0, device='cpu')}],
+        'tuple': (torch.full((2,), 3.0, device='cpu'), 4),
+    }
+
+    result = clone_tensors_in_struct(target, source)
+
+    assert result is target
+    assert result['list'] is target_list
+    assert result['list'][0] is list_tensor
+    assert result['list'][1]['nested'] is nested_tensor
+    assert result['tuple'][0] is tuple_tensor
+    assert result['tuple'][1] == 4
+    torch.testing.assert_close(result['list'][0], source['list'][0])
+    torch.testing.assert_close(result['list'][1]['nested'], source['list'][1]['nested'])
+    torch.testing.assert_close(result['tuple'][0], source['tuple'][0])
 
 
 @pytest.mark.skipif(
