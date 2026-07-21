@@ -1622,20 +1622,6 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
-    @torch.inference_mode()
-    def dummy_forward(self) -> None:
-        """Run the mode-specific dummy step used by idle expert-parallel ranks."""
-        context = self.inference_wrapped_model.inference_context
-        input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
-
-        if context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
-            self._run_dummy_legacy_step(input_ids, position_ids)
-        else:
-            self._run_dummy_async_sched_step(input_ids, position_ids)
-
-        # Clear temporary dummy state while preserving reusable prefix state.
-        context.reset(preserve_prefix_cache=True)
-
     def _run_dummy_base_forward(self, input_ids: Tensor, position_ids: Tensor) -> None:
         """Run the base-model portion of an expert-parallel dummy step.
 
@@ -1644,68 +1630,6 @@ class TextGenerationController:
             position_ids (Tensor): Dummy input position IDs.
         """
         self._dynamic_step_forward_logits(input_ids, position_ids)
-
-    def _run_dummy_legacy_step(self, input_ids: Tensor, position_ids: Tensor) -> None:
-        """Run a legacy dummy step in base-forward then MTP order.
-
-        Args:
-            input_ids (Tensor): Dummy input token IDs.
-            position_ids (Tensor): Dummy input position IDs.
-        """
-        context = self.inference_wrapped_model.inference_context
-        self._run_dummy_base_forward(input_ids, position_ids)
-
-        # Disable MoE padding for MTP computation, unless CUDA graphs
-        # are active (the graphs were captured with padding enabled).
-        if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-            if not context.using_cuda_graph_this_step():
-                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
-                set_decode_expert_padding(unwrapped_model, False)
-
-        self._run_dummy_serial_mtp_forward()
-
-    def _run_dummy_async_sched_step(self, input_ids: Tensor, position_ids: Tensor) -> None:
-        """Run an async-scheduling dummy step in MTP then base-forward order.
-
-        Args:
-            input_ids (Tensor): Dummy input token IDs.
-            position_ids (Tensor): Dummy input position IDs.
-        """
-        context = self.inference_wrapped_model.inference_context
-        if self.model_config.moe_pad_experts_for_cuda_graph_inference:
-            if not context.using_cuda_graph_this_step():
-                set_decode_expert_padding(self._unwrapped_model, False)
-
-        self._run_dummy_serial_mtp_forward()
-        self._run_dummy_base_forward(input_ids, position_ids)
-
-    def _run_dummy_async_sched_base_step(self) -> Optional[torch.cuda.Event]:
-        """Run the base-forward half of an async EP step after local work finishes.
-
-        Returns:
-            Optional[torch.cuda.Event]: Event marking dummy base-forward completion.
-        """
-        context = self.inference_wrapped_model.inference_context
-        saved_counters = (
-            context.step_count,
-            context.prefix_cache_lru_clock,
-            context.lifetime_prefill_token_count,
-            context.async_sched_step_count,
-            context.async_sched_compaction_step_count,
-        )
-
-        input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._run_dummy_base_forward(input_ids, position_ids)
-        forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
-        context.reset(preserve_prefix_cache=True)
-        (
-            context.step_count,
-            context.prefix_cache_lru_clock,
-            context.lifetime_prefill_token_count,
-            context.async_sched_step_count,
-            context.async_sched_compaction_step_count,
-        ) = saved_counters
-        return forward_done_event
 
     @torch.inference_mode()
     def _run_dummy_serial_mtp_forward(self) -> None:
@@ -1789,6 +1713,54 @@ class TextGenerationController:
                     pp_group=self.pp_group,
                 )
             nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
+
+    def _run_dummy_legacy_step(self, input_ids: Tensor, position_ids: Tensor) -> None:
+        """Run a legacy dummy step in base-forward then MTP order.
+
+        Args:
+            input_ids (Tensor): Dummy input token IDs.
+            position_ids (Tensor): Dummy input position IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
+        self._run_dummy_base_forward(input_ids, position_ids)
+
+        # Disable MoE padding for MTP computation, unless CUDA graphs
+        # are active (the graphs were captured with padding enabled).
+        if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+            if not context.using_cuda_graph_this_step():
+                unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                set_decode_expert_padding(unwrapped_model, False)
+
+        self._run_dummy_serial_mtp_forward()
+
+    def _run_dummy_async_sched_step(self, input_ids: Tensor, position_ids: Tensor) -> None:
+        """Run an async-scheduling dummy step in MTP then base-forward order.
+
+        Args:
+            input_ids (Tensor): Dummy input token IDs.
+            position_ids (Tensor): Dummy input position IDs.
+        """
+        context = self.inference_wrapped_model.inference_context
+        if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+            if not context.using_cuda_graph_this_step():
+                set_decode_expert_padding(self._unwrapped_model, False)
+
+        self._run_dummy_serial_mtp_forward()
+        self._run_dummy_base_forward(input_ids, position_ids)
+
+    @torch.inference_mode()
+    def dummy_forward(self) -> None:
+        """Run the mode-specific dummy step used by idle expert-parallel ranks."""
+        context = self.inference_wrapped_model.inference_context
+        input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
+
+        if context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
+            self._run_dummy_legacy_step(input_ids, position_ids)
+        else:
+            self._run_dummy_async_sched_step(input_ids, position_ids)
+
+        # Clear temporary dummy state while preserving reusable prefix state.
+        context.reset(preserve_prefix_cache=True)
 
     def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
         """Batch GPU-to-CPU transfer of sampled tokens.
@@ -2309,6 +2281,34 @@ class TextGenerationController:
         )
 
         # Return the forward-done event.
+        return forward_done_event
+
+    def _run_dummy_async_sched_base_step(self) -> Optional[torch.cuda.Event]:
+        """Run the base-forward half of an async EP step after local work finishes.
+
+        Returns:
+            Optional[torch.cuda.Event]: Event marking dummy base-forward completion.
+        """
+        context = self.inference_wrapped_model.inference_context
+        saved_counters = (
+            context.step_count,
+            context.prefix_cache_lru_clock,
+            context.lifetime_prefill_token_count,
+            context.async_sched_step_count,
+            context.async_sched_compaction_step_count,
+        )
+
+        input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
+        self._run_dummy_base_forward(input_ids, position_ids)
+        forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
+        context.reset(preserve_prefix_cache=True)
+        (
+            context.step_count,
+            context.prefix_cache_lru_clock,
+            context.lifetime_prefill_token_count,
+            context.async_sched_step_count,
+            context.async_sched_compaction_step_count,
+        ) = saved_counters
         return forward_done_event
 
     def _run_async_sched_forward_primer(self) -> Tuple[bool, Optional[torch.cuda.Event]]:
