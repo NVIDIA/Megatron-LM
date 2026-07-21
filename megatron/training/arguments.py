@@ -2488,6 +2488,14 @@ def _add_rl_args(parser):
                             'regardless of its length or how many sequences share its packed bin. '
                             'This reproduces the unpacked MBS=1 per-microbatch averaging exactly '
                             'under sequence packing. Requires --calculate-per-token-loss.')
+    group.add_argument('--rl-shared-prefix-log-metrics', action=argparse.BooleanOptionalAction,
+                       type=bool, default=False,
+                       help='OBSERVATIONAL ONLY (no behavior change): each update step, compute the '
+                            'per-group longest-common-prefix and log the shared-prefix planner '
+                            'metrics (prompt_fraction_f, dedup_fraction, predicted_linear_speedup, '
+                            'coverage). Measures the shared-prefix speedup OPPORTUNITY on the live '
+                            'workload (go/no-go for the feature) without packing or routing the '
+                            'forward. Safe to combine with any config.')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')

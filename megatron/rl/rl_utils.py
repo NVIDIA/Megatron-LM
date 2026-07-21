@@ -841,6 +841,11 @@ def get_environment_rollouts(
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
+                    if getattr(args, "rl_shared_prefix_log_metrics", False):
+                        # observational: measure the shared-prefix speedup opportunity (f) on the
+                        # live workload here, where rollouts are still GROUPED (before the flatten
+                        # in prepare_data_for_update). No behavior change.
+                        _log_shared_prefix_metrics(rollouts, args.curr_iteration)
                     if not args.rl_partial_rollouts:
                         while True:
                             try:
@@ -868,6 +873,82 @@ def get_environment_rollouts(
             json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
+
+
+def _longest_common_prefix_len(seqs: list) -> int:
+    """Number of leading tokens shared by ALL sequences in ``seqs`` (token-id lists)."""
+    if not seqs:
+        return 0
+    n = min(len(s) for s in seqs)
+    first = seqs[0]
+    for i in range(n):
+        tok = first[i]
+        for s in seqs[1:]:
+            if s[i] != tok:
+                return i
+    return n
+
+
+def _log_shared_prefix_metrics(rollouts: 'GroupedRollouts', iteration: int) -> None:
+    """OBSERVATIONAL shared-prefix speedup measurement (Phase A go/no-go), no behavior change.
+
+    From the INTACT grouped rollouts (must run before the group->flat expansion), compute each
+    group's longest-common-prefix (the genuinely shared tokens -- the GRPO prompt for single-turn,
+    the shared initial context for multi-turn) and the per-completion suffix lengths, then report
+    the shared-prefix planner's lengths-only metrics: prompt_fraction_f, dedup_fraction,
+    predicted_linear_speedup, coverage. The shared-prefix win is ~1/((1-f)+f/G); it is large only
+    when prompts are a big fraction of the sequence (agentic / multi-turn), ~0 for short-prompt /
+    long-CoT -- so we log overall AND per-env to see where the win lives.
+    """
+    from megatron.rl.shared_prefix_packing import plan_shared_prefix_bins
+
+    args = get_args()
+    max_per_bin = getattr(args, 'rl_sequence_packing_max_sequences_per_bin', 50)
+    groups, per_env = [], {}
+    for g in rollouts:
+        seqs = [
+            [t for turn in r.trajectory for t in turn]
+            for r in g
+            if isinstance(r, TokenRollout) and r.trajectory
+        ]
+        seqs = [s for s in seqs if s]
+        if len(seqs) < 2:
+            continue
+        lcp = _longest_common_prefix_len(seqs)
+        comp_lens = [len(s) - lcp for s in seqs]
+        if lcp >= 1 and all(c > 0 for c in comp_lens):
+            groups.append((lcp, comp_lens))
+            per_env.setdefault(g[0].env_id, []).append((lcp, comp_lens))
+    if not groups:
+        return
+
+    _, m = plan_shared_prefix_bins(groups, args.seq_length, max_per_bin)
+    print(
+        f"[shared-prefix-f] iter={iteration} groups={int(m['shared_prefix/num_groups'])} "
+        f"f={m['shared_prefix/prompt_fraction_f']:.3f} "
+        f"dedup={m['shared_prefix/dedup_fraction']:.3f} "
+        f"predicted_speedup={m['shared_prefix/predicted_linear_speedup']:.3f} "
+        f"coverage_groups={m['shared_prefix/coverage_groups']:.3f} "
+        f"avg_prefix={m['shared_prefix/avg_prefix_len']:.0f} "
+        f"avg_G={m['shared_prefix/avg_group_size']:.1f}",
+        flush=True,
+    )
+    for env, gs in sorted(per_env.items()):
+        _, me = plan_shared_prefix_bins(gs, args.seq_length, max_per_bin)
+        print(
+            f"[shared-prefix-f]   env={env} groups={int(me['shared_prefix/num_groups'])} "
+            f"f={me['shared_prefix/prompt_fraction_f']:.3f} "
+            f"predicted_speedup={me['shared_prefix/predicted_linear_speedup']:.3f} "
+            f"avg_prefix={me['shared_prefix/avg_prefix_len']:.0f}",
+            flush=True,
+        )
+    writer = get_tensorboard_writer()
+    wandb_writer = get_wandb_writer()
+    if writer:
+        for k, v in m.items():
+            writer.add_scalar(k, v, iteration)
+    if wandb_writer:
+        wandb_writer.log(m, step=iteration)
 
 
 def selective_log_softmax(logits, index):
