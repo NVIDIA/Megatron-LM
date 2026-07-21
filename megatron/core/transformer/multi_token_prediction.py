@@ -438,7 +438,7 @@ class MTPLossLoggingHelper:
 
         This compatibility path is used by tests and callers that already
         computed a normalized per-layer loss. Dynamic-CP code uses
-        ``save_loss_to_tracker`` to normalize each local contribution safely.
+        ``save_loss_to_tracker`` to track raw loss sums and token counts.
         """
         if layer_number is None:
             return
@@ -468,12 +468,13 @@ class MTPLossLoggingHelper:
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        """Normalize and accumulate a local MTP loss for logging.
+        """Accumulate a local MTP loss numerator and denominator for logging.
 
-        MTP is normalized independently for each microbatch. The tracker
-        accumulates those normalized losses, then reduction combines the sums
-        across ranks. This intentionally preserves sequence-packing semantics
-        instead of changing the metric to global ``sum(loss) / sum(tokens)``.
+        MTP loss logging follows the main LM loss reporting contract: accumulate
+        raw ``sum(loss)`` and valid-token counts, reduce both across ranks, then
+        compute ``global_sum(loss) / global_sum(tokens)``. This keeps packed
+        sequence and CP/DCP layouts from changing the metric when valid-token
+        counts differ by rank or microbatch.
 
         Args:
             loss_sum (torch.Tensor): Sum of per-element losses on this rank.
@@ -490,9 +491,13 @@ class MTPLossLoggingHelper:
 
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" not in tracker:
-            tracker["loss_sums"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-        loss_sum = (loss_sum * (num_tokens > 0).to(loss_sum.dtype)) / num_tokens.clamp(min=1)
-        tracker["loss_sums"][layer_number] += loss_sum.detach()
+            tracker["loss_sums"] = torch.zeros(num_layers, device=loss_sum.device)
+        if "loss_tokens" not in tracker:
+            tracker["loss_tokens"] = torch.zeros(num_layers, device=loss_sum.device)
+        loss_value = loss_sum.detach().float()
+        token_count = num_tokens.detach().to(device=loss_sum.device, dtype=torch.float32)
+        tracker["loss_sums"][layer_number] += loss_value * (token_count > 0).to(loss_value.dtype)
+        tracker["loss_tokens"][layer_number] += token_count
         if correct is not None and total is not None:
             if "correct_values" not in tracker:
                 tracker["correct_values"] = torch.zeros(
@@ -551,6 +556,8 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" in tracker:
             tracker["loss_sums"].zero_()
+        if "loss_tokens" in tracker:
+            tracker["loss_tokens"].zero_()
         if "values" in tracker:
             tracker["values"].zero_()
         if "correct_values" in tracker:
@@ -562,23 +569,25 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def reduce_loss_in_tracker():
-        """Collect and reduce the mtp losses across ranks.
-
-        Each element is already a sum of normalized microbatch losses. Sum
-        reductions preserve additive groups, while the DP+CP average keeps the
-        legacy logging contract.
-        """
+        """Collect and reduce the mtp loss numerators and denominators across ranks."""
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" not in tracker:
             return
-        values = tracker["loss_sums"]
+        assert "loss_tokens" in tracker, "MTP loss tracker must include token counts."
+        loss_sums = tracker["loss_sums"]
+        loss_tokens = tracker["loss_tokens"]
         if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker['reduce_group'])
+            torch.distributed.all_reduce(loss_sums, group=tracker['reduce_group'])
+            torch.distributed.all_reduce(loss_tokens, group=tracker['reduce_group'])
         if tracker.get('avg_group') is not None:
             torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                loss_sums, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
             )
-        tracker["values"] = values
+            torch.distributed.all_reduce(
+                loss_tokens, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
+            )
+        values = loss_sums / torch.clamp(loss_tokens, min=1)
+        tracker["values"] = values * (loss_tokens > 0).to(values.dtype)
 
     @staticmethod
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
@@ -587,7 +596,8 @@ class MTPLossLoggingHelper:
         MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         if "loss_sums" in tracker and "values" in tracker:
-            mtp_losses = tracker["values"] * loss_scale
+            # Raw loss sums have already been accumulated across all microbatches.
+            mtp_losses = tracker["values"].clone()
         elif "loss_values" in tracker:
             mtp_losses = tracker["loss_values"] * loss_scale
         else:
@@ -948,6 +958,23 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _scale_mtp_loss_for_backward(
+    mtp_loss: torch.Tensor,
+    mtp_loss_scale: Union[float, torch.Tensor],
+    num_tokens: torch.Tensor,
+    calculate_per_token_loss: bool,
+) -> torch.Tensor:
+    """Scale MTP loss before attaching it to the main hidden-state backward path."""
+    if calculate_per_token_loss:
+        # finalize_model_grads divides all parameter gradients by the global main-loss
+        # token count. Do not inject local MTP token ratios here: they depend on how
+        # samples are packed and make SBHD/THD layouts train different objectives.
+        return mtp_loss_scale * mtp_loss
+
+    safe_num_tokens = num_tokens.clamp(min=1)
+    return mtp_loss_scale * mtp_loss / safe_num_tokens
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -1023,11 +1050,6 @@ def process_mtp_loss(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
 
-    # Store the original number of tokens before rolling for proper normalization
-    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
-    # correctly scaled relative to the main loss gradients in finalize_model_grads.
-    original_num_tokens = loss_mask.sum()
-
     fuse_linear_cross_entropy = (
         config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
     )
@@ -1081,23 +1103,10 @@ def process_mtp_loss(
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        if config.calculate_per_token_loss:
-            # When calculate_per_token_loss is enabled, finalize_model_grads will
-            # divide all gradients by total_num_tokens (from main loss).
-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
-            # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
-            )
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
-        else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
-            )
+        mtp_loss_for_backward = _scale_mtp_loss_for_backward(
+            mtp_loss, mtp_loss_scale, num_tokens, config.calculate_per_token_loss
+        )
+        hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_for_backward)
 
     return hidden_states
 

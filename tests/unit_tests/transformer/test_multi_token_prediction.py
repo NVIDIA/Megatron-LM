@@ -28,6 +28,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     _mtp_logits_are_vocab_sharded,
+    _scale_mtp_loss_for_backward,
     process_mtp_loss,
     roll_tensor,
 )
@@ -1324,7 +1325,7 @@ class TestMTPLossLoggingHelper:
         assert tracker["avg_group"] is None
 
     def test_save_loss_to_tracker(self):
-        """Test saving a normalized loss to the tracker."""
+        """Test saving raw MTP loss sums and token counts to the tracker."""
         loss_sum = torch.tensor(1.3)
         num_tokens = torch.tensor(5.0)
         layer_number = 2
@@ -1340,7 +1341,12 @@ class TestMTPLossLoggingHelper:
         assert "loss_sums" in MTPLossLoggingHelper.tracker
         assert MTPLossLoggingHelper.tracker["loss_sums"].shape == (num_layers,)
         assert torch.isclose(
-            MTPLossLoggingHelper.tracker["loss_sums"][layer_number], loss_sum / num_tokens
+            MTPLossLoggingHelper.tracker["loss_sums"][layer_number], loss_sum
+        )
+        assert "loss_tokens" in MTPLossLoggingHelper.tracker
+        assert MTPLossLoggingHelper.tracker["loss_tokens"].shape == (num_layers,)
+        assert torch.isclose(
+            MTPLossLoggingHelper.tracker["loss_tokens"][layer_number], num_tokens
         )
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
@@ -1358,7 +1364,7 @@ class TestMTPLossLoggingHelper:
         assert _mtp_logits_are_vocab_sharded(DummyOutputLayer(gather_output=True), False) is True
 
     def test_track_mtp_metrics(self):
-        """Test tracking normalized MTP loss and acceptance rate."""
+        """Test tracking token-weighted MTP loss and acceptance rate."""
         loss_sum = torch.tensor(2.3)
         num_tokens = torch.tensor(1.0)
         num_layers = self.num_layers
@@ -1400,9 +1406,9 @@ class TestMTPLossLoggingHelper:
             total_loss_dict=total_loss_dict,
         )
 
-        # track_mtp_metrics reduces the tracker first, so per-layer log value
-        # equals (loss_sum / num_tokens) * loss_scale.
-        expected_loss = (loss_sum / num_tokens) * loss_scale
+        # Raw loss sums are accumulated across microbatches before logging, so
+        # the microbatch averaging scale is not applied on this path.
+        expected_loss = loss_sum / num_tokens
         expected_rate = (correct / total) * 100.0
         for i in range(num_layers):
             assert f"mtp_{i + 1} loss" in writer.scalars
@@ -1458,11 +1464,12 @@ class TestMTPLossLoggingHelper:
 
         # Verify tracker is cleaned
         assert torch.all(MTPLossLoggingHelper.tracker["loss_sums"] == 0)
+        assert torch.all(MTPLossLoggingHelper.tracker["loss_tokens"] == 0)
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
-    def test_microbatch_means_are_not_globally_token_weighted(self):
-        """MTP logging preserves the pre-#4226 microbatch-normalized semantics."""
+    def test_mtp_loss_is_globally_token_weighted(self):
+        """MTP loss logging matches the main LM loss token-weighted reporting contract."""
         MTPLossLoggingHelper.save_loss_to_tracker(
             loss_sum=torch.tensor(8.0), num_tokens=torch.tensor(2.0), layer_number=0, num_layers=1
         )
@@ -1485,8 +1492,8 @@ class TestMTPLossLoggingHelper:
         logged_loss = torch.as_tensor(writer.scalars["mtp_1 loss"])
         microbatch_mean_average = torch.tensor(((8.0 / 2.0) + (4.0 / 4.0)) / 2.0)
         global_token_weighted = torch.tensor((8.0 + 4.0) / (2.0 + 4.0))
-        assert torch.isclose(logged_loss, microbatch_mean_average)
-        assert not torch.isclose(logged_loss, global_token_weighted)
+        assert torch.isclose(logged_loss, global_token_weighted)
+        assert not torch.isclose(logged_loss, microbatch_mean_average)
 
     def test_track_mtp_loss_preserves_legacy_normalized_loss_semantics(self):
         """MTP loss logging should not become token-weighted when acceptance counters are added."""
@@ -1521,6 +1528,47 @@ class TestMTPLossLoggingHelper:
         token_weighted_loss = torch.tensor(40.0 / 12.0)
         assert torch.isclose(logged_loss, expected_legacy_loss)
         assert not torch.isclose(logged_loss, token_weighted_loss)
+
+
+class TestMTPLossBackwardScaling:
+    def test_per_token_backward_scaling_is_layout_invariant(self):
+        """Per-token loss mode must not depend on local MTP token counts."""
+        mtp_loss = torch.tensor([1.0, 2.0, 3.0])
+        mtp_loss_scale = torch.tensor(0.1)
+
+        sbhd_like = _scale_mtp_loss_for_backward(
+            mtp_loss, mtp_loss_scale, num_tokens=torch.tensor(2.0), calculate_per_token_loss=True
+        )
+        thd_like = _scale_mtp_loss_for_backward(
+            mtp_loss, mtp_loss_scale, num_tokens=torch.tensor(6.0), calculate_per_token_loss=True
+        )
+
+        expected = mtp_loss_scale * mtp_loss
+        assert torch.allclose(sbhd_like, expected)
+        assert torch.allclose(thd_like, expected)
+
+    def test_legacy_backward_scaling_uses_local_mtp_token_count(self):
+        """Legacy mean-loss mode keeps its local-token normalization semantics."""
+        mtp_loss = torch.tensor([1.0, 2.0, 3.0])
+        mtp_loss_scale = torch.tensor(0.1)
+
+        scaled = _scale_mtp_loss_for_backward(
+            mtp_loss, mtp_loss_scale, num_tokens=torch.tensor(2.0), calculate_per_token_loss=False
+        )
+
+        assert torch.allclose(scaled, mtp_loss_scale * mtp_loss / 2.0)
+
+    def test_legacy_backward_scaling_clamps_empty_token_count(self):
+        """Zero-token local MTP chunks should not introduce divide-by-zero values."""
+        mtp_loss = torch.zeros(3)
+        mtp_loss_scale = torch.tensor(0.1)
+
+        scaled = _scale_mtp_loss_for_backward(
+            mtp_loss, mtp_loss_scale, num_tokens=torch.tensor(0.0), calculate_per_token_loss=False
+        )
+
+        assert torch.all(torch.isfinite(scaled))
+        assert torch.allclose(scaled, torch.zeros_like(mtp_loss))
 
 
 class TestMultiTokenPredictionHybrid:
