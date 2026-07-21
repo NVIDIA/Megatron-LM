@@ -759,7 +759,7 @@ def _get_megatron_emerging_optimizer(
         use_layer_wise = True
 
     if isinstance(model_chunks[0], FullyShardedDataParallelV2):
-        raise ValueError("MFSDP v2 with emerging optimizers is not currently validated.")
+        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(

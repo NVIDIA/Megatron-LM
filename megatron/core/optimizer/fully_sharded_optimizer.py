@@ -42,7 +42,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             init_state_fn: Function used to initialize optimizer state.
             model_chunks: MFSDP v2 model chunks optimized by this wrapper.
         """
-        self.validate_config(config, model_chunks)
+        self._validate_config(config, model_chunks)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
         if grad_scaler is not None:
@@ -52,11 +52,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
-            assert self.ddp_config == model_chunk.ddp_config
+            if self.ddp_config != model_chunk.ddp_config:
+                raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
 
     @staticmethod
-    def validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
+    def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
         if len(model_chunks) != 1:
             raise ValueError("MFSDP v2 currently supports exactly one model chunk.")

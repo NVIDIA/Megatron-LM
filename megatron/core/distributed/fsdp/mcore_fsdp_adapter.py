@@ -506,7 +506,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
         self._validate_config(config, ddp_config, module, pg_collection, disable_bucketing)
 
         if has_config_logger_enabled(config):
@@ -518,7 +518,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
 
         log_single_rank(
-            logger, logging.INFO, f'Setting up DistributedDataParallel with config {ddp_config}'
+            logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
         )
         self.mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
@@ -528,13 +528,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         log_single_rank(
             logger,
             logging.INFO,
-            f'Setting up Megatron-FSDP MixedPrecisionPolicy with config {self.mp_policy}',
+            "Setting up Megatron-FSDP MixedPrecisionPolicy with config %s",
+            self.mp_policy,
         )
 
-        if device is None:
-            device = next(module.parameters()).device
         dp_group = pg_collection.dp_cp
-        mesh = DeviceMesh.from_group(dp_group, device_type=device.type, mesh_dim_names=("dp",))
+        device_type = device.type if device is not None else "cuda"
+        mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
         placements = Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         )
@@ -582,6 +582,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             )
 
+        # The config validates the requested topology, while these checks validate the
+        # materialized topology supplied by the caller's process-group collection.
         for group_name in ("tp", "pp", "cp", "ep"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
@@ -671,7 +673,11 @@ def FullyShardedDataParallel(
     device: Optional[torch.device] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> _BaseDataParallel:
-    """Construct the configured Megatron-FSDP implementation."""
+    """Construct the configured Megatron-FSDP implementation.
+
+    This is a factory function, not a wrapper type. Use the explicit V1 or V2
+    implementation classes for type checks.
+    """
     fsdp_class = (
         FullyShardedDataParallelV2
         if ddp_config.megatron_fsdp_version == 2

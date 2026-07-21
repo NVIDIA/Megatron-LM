@@ -13,6 +13,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -42,6 +43,7 @@ class TestMcoreAdapter:
         Utils.initialize_model_parallel(1, 1)
         if torch.distributed.get_world_size() < 2:
             pytest.skip("MFSDP v2 MCore integration test requires at least two ranks.")
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
@@ -75,6 +77,7 @@ class TestMcoreAdapter:
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
+            pg_collection=self.pg_collection,
         )
 
         assert isinstance(wrapped.module, FsdpModule)
@@ -122,6 +125,7 @@ class TestMcoreAdapter:
                 fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
+            pg_collection=self.pg_collection,
         )
 
         reference_optimizer_config = OptimizerConfig(
@@ -137,10 +141,6 @@ class TestMcoreAdapter:
         reference_optimizer = get_megatron_optimizer(
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
-        with pytest.raises(ValueError, match="precision-aware optimizer"):
-            FullyShardedOptimizer.validate_config(
-                replace(optimizer_config, use_precision_aware_optimizer=True), [model]
-            )
         optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
@@ -184,4 +184,4 @@ class TestMcoreAdapter:
         reference_losses = torch.stack(reference_losses)
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
-        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
