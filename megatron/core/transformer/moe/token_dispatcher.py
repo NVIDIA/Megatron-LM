@@ -1419,10 +1419,12 @@ class _StageDispatchBwdGrad(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, recv_tokens):  # type: ignore[override]
+        """Identity forward; returns ``recv_tokens`` unchanged."""
         return recv_tokens
 
     @staticmethod
     def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
         buf = _NCCLEPManager._zc_bwd_token_buf
         assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
         assert (
@@ -1512,7 +1514,8 @@ class _NCCLEPManager(_DispatchManager):
             if not (config.use_transformer_engine_op_fuser and config.moe_grouped_gemm):
                 raise ValueError(
                     "moe_ncclep_static_shape=True requires BOTH use_transformer_engine_op_fuser "
-                    "and moe_grouped_gemm (the fused grouped GEMM over device-side per-expert counts)."
+                    "and moe_grouped_gemm (the fused grouped GEMM over device-side "
+                    "per-expert counts)."
                 )
             if config.fp8 or config.fp4:
                 if torch.cuda.get_device_capability()[0] < 10:
@@ -1791,8 +1794,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # output_buffer (fc2 out / combine in) = _zc_fwd_token_buf; grad_input_buffer (fc1 dgrad /
         # dispatch-bwd scatter) = _zc_bwd_token_buf.
         # Under 1F1B overlap, feeding a symm grad_input_buffer is wasted: the overlap schedule's
-        # AccumulateGrad clones the fc1 dgrad into a plain buffer anyway. Return None so the op-fuser
-        # writes a plain dgrad;
+        # AccumulateGrad clones the fc1 dgrad into a plain buffer anyway. Return None so the
+        # op-fuser writes a plain dgrad;
         dispatch_grad_input = (
             None if self.config.overlap_moe_expert_parallel_comm else _detached("_zc_bwd_token_buf")
         )
