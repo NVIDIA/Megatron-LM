@@ -1688,6 +1688,17 @@ def wrap_model_chunks_with_ddp(
     return wrapped
 
 
+def _freeze_all_model_chunks(model_list):
+    """Freeze all parameters in a list of model chunks (for logits-saving runs)."""
+    for model_module in model_list:
+        model_module.requires_grad_(False)
+        # Additionally freeze expert biases of routers
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+    return model_list
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1761,12 +1772,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
-        for model_module in model:
-            model_module.requires_grad_(False)
-            # Additionally freeze expert biases of routers
-            for module in model_module.modules():
-                if hasattr(module, "frozen_expert_bias"):
-                    module.frozen_expert_bias = True
+        _freeze_all_model_chunks(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2029,6 +2035,12 @@ def setup_model_and_optimizer(
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
+
+            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
+            # and skips grad-buffer allocation for all params (matching get_model behavior).
+            if args.freeze_all_layers:
+                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -2043,9 +2055,11 @@ def setup_model_and_optimizer(
             return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
 
     model = _build_model_wrapper(wrap_with_ddp)
+
     unwrapped_model = unwrap_model(model)
 
-    if args.logits_save_dir is not None:
+    # output_layer only exists on the last PP stage (last VP chunk when VPP).
+    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -2057,7 +2071,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None:
+    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
