@@ -309,6 +309,21 @@ class TransformerLayerNode(ScheduleNode):
                 bwd_dw_callables if isinstance(bwd_dw_callables, list) else [bwd_dw_callables]
             )
 
+    def reset_for_recompute(self):
+        """Release the forward activation tensors held by this node while keeping the
+        node reusable for a later recompute forward.
+
+        Used by the VPP-stage full recompute path (EP A2A overlap): after the initial
+        (no-grad) forward, the layer node's activation tensors are freed so that only
+        the stage input tensor survives the forward->backward gap. The same node
+        object is later re-run (with grad enabled) to rebuild ``inputs``/``output``/
+        ``detached`` before the backward pass.
+        """
+        self.inputs = None
+        self.output = None
+        self.detached = tuple()
+        self.before_detached = tuple()
+
     def detach(self, t):
         """Detaches a tensor and stores it for backward computation."""
         detached = make_viewless(t).detach()
