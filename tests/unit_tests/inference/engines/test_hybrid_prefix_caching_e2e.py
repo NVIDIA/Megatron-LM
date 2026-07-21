@@ -676,9 +676,10 @@ class TestMambaPrefixCachingE2E:
         # --- Seed request: fills the cache, no prior matches. ---
         seed = self._make_request(0, prompt, enable_pc=True, num_tokens=4)
         engine._add_request(seed)
-        assert seed._mamba_num_matched_blocks == 0
         while engine.has_unfinished_requests():
             engine.step_modern()
+        # Seed has no prior cache, so no Mamba blocks are matched during its prefill.
+        assert seed._mamba_num_matched_blocks == 0
 
         # block index 2 == the boundary at token 768 (768 // 256 - 1). The final
         # chunk begins block-aligned at token 512, so (768 - 512) % 128 == 0 and
