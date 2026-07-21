@@ -242,6 +242,54 @@ def get_valid_flex_dispatcher_backend():
         return None
 
 
+def get_valid_flex_dispatcher_backends():
+    """Flex backends to sweep in the overlap tests.
+
+    Returns the primary available backend (hybridep preferred, else deepep) plus ``ncclep`` when
+    its TransformerEngine NCCL EP build is present, so each overlap test exercises ncclep alongside
+    the existing reference backend.
+    """
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    backends = []
+    primary = get_valid_flex_dispatcher_backend()
+    if primary is not None:
+        backends.append(primary)
+    if HAVE_TE_EP and "ncclep" not in backends:
+        backends.append("ncclep")
+    return backends
+
+
+def get_valid_dispatcher_configs():
+    """(moe_token_dispatcher_type, flex_backend) pairs to parametrize the overlap tests across.
+
+    Always includes ``("alltoall", None)``; adds one ``("flex", backend)`` entry per available
+    flex backend (see get_valid_flex_dispatcher_backends).
+    """
+    configs = [("alltoall", None)]
+    for backend in get_valid_flex_dispatcher_backends():
+        configs.append(("flex", backend))
+    return configs
+
+
+def apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend):
+    """Wire the dispatcher type + flex backend into a config kwargs dict.
+
+    For ncclep, also set moe_expert_rank_capacity_factor: ncclep sizes a per-rank receive buffer
+    from it and overflow hard-traps, so it must be set (2.0 gives ample headroom at test sizes).
+    """
+    extra_kwargs["moe_token_dispatcher_type"] = dispatcher_type
+    if dispatcher_type == "flex":
+        extra_kwargs["moe_flex_dispatcher_backend"] = flex_backend
+        if flex_backend == "ncclep":
+            # ncclep sizes a per-rank receive buffer from this and overflow hard-traps (the
+            # em_scan_kernel "padded slots > max_recv_tokens_per_rank" device check). These overlap
+            # tests use small token counts (high routing-imbalance variance), so use a generous
+            # factor to guarantee no overflow; the staging buffer is tiny at this model size.
+            extra_kwargs["moe_expert_rank_capacity_factor"] = 8.0
+    return extra_kwargs
+
+
 def build_gpt_model(config, vocab_size=512, max_seq_len=300):
     """Build and return a GPTModel on CUDA from the given config."""
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec

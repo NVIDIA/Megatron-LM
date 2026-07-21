@@ -1,10 +1,14 @@
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
+megatron/core/models/bert/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
+
 megatron/core/models/common/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
 megatron/core/models/gpt/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
 megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/multi-modal
+
+megatron/core/models/audio/ @NVIDIA/mcore-audio
 
 megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
@@ -22,7 +26,15 @@ megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/c
 
 megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
+megatron/core/optimizer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
+
 megatron/core/optimizer/distrib_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/layer_wise_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/param_layout.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+
+megatron/core/optimizer/emerging_optimizers.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers
+megatron/core/optimizer/muon.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers
+megatron/core/optimizer/qk_clip.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers @NVIDIA/transformer
 
 megatron/core/inference/modelopt_support @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
 

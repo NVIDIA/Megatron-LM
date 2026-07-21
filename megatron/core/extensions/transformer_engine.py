@@ -1749,8 +1749,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
         # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
+        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("tokens_per_sample")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1863,6 +1865,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
                 # Update Q K outside of TE Attention API
                 core_attn_out, batch_max_attention_logits = core_attn_out
+
+                # The max attention logit is only used as a statistic for qk-clip
+                # and logging, so it never needs gradients. Detach it from the
+                # autograd graph, otherwise accumulating it into
+                # current_max_attn_logits keeps every batch's attention forward
+                # graph alive and leaks memory (most visibly when only
+                # log_max_attention_logit is set and clip_qk() never resets it).
+                batch_max_attention_logits = batch_max_attention_logits.detach()
 
                 # Update QK_Clip balancing eta
                 if self.current_max_attn_logits is None:
