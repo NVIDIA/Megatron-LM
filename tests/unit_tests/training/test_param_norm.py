@@ -28,6 +28,7 @@ def _build_tiny_moe_gpt(
         ffn_hidden_size=16,
         num_moe_experts=2,
         moe_ffn_hidden_size=16,
+        moe_shared_expert_intermediate_size=16,
         moe_router_topk=1,
         moe_router_pre_softmax=True,
         tensor_model_parallel_size=tensor_parallel_size,
@@ -50,6 +51,7 @@ def _build_tiny_moe_gpt(
         max_sequence_length=8,
         position_embedding_type="rope",
     )
+    assert any(".shared_experts." in name for name, _ in model.named_parameters())
     return model.cuda()
 
 
