@@ -140,7 +140,7 @@ def _calc_params_l2_norm_or_raw_moments(
         else None
     )
 
-    # Seperate moe and dense params
+    # Separate expert and dense params because they use different parallel topologies.
     params_data = []
     moe_params_data = []
     sharded_params_data = []
@@ -152,6 +152,8 @@ def _calc_params_l2_norm_or_raw_moments(
     sharded_params_data_names = []
     sharded_moe_params_data_names = []
     data_parallel_group = None
+    tp_group = mpu.get_tensor_model_parallel_group()
+    expert_tp_group = mpu.get_expert_tensor_parallel_group()
 
     if raw_moments_by_param:
         named_params = (
@@ -166,11 +168,14 @@ def _calc_params_l2_norm_or_raw_moments(
 
     for param_name, param in named_params:
         data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+        is_expert = not getattr(param, 'allreduce', True)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
+            param, tp_group=tp_group, expert_tp_group=expert_tp_group
+        )
         if not is_not_tp_duplicate:
             continue
         assert is_not_tp_duplicate
-        if not getattr(param, 'allreduce', True):
+        if is_expert:
             assert param_is_not_shared(param)
             param = to_local_if_dtensor(param)
             if args.bf16:
@@ -190,26 +195,25 @@ def _calc_params_l2_norm_or_raw_moments(
             else:
                 moe_params_data.append(param.data)
                 moe_params_data_names.append(param_name)
-        else:
-            if param_is_not_shared(param):
-                param = to_local_if_dtensor(param)
-                if args.bf16:
-                    if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                        if getattr(param, 'main_param_sharded', False):
-                            if param.main_param is not None:
-                                sharded_params_data.append(param.main_param)
-                                sharded_params_data_names.append(param_name)
-                        else:
-                            params_data.append(param.main_param)
-                            params_data_names.append(param_name)
+        elif param_is_not_shared(param):
+            param = to_local_if_dtensor(param)
+            if args.bf16:
+                if not force_create_fp32_copy and hasattr(param, 'main_param'):
+                    if getattr(param, 'main_param_sharded', False):
+                        if param.main_param is not None:
+                            sharded_params_data.append(param.main_param)
+                            sharded_params_data_names.append(param_name)
                     else:
-                        # Fallback to original logic of making a fp32 copy of the
-                        # parameter if `.main_param` attribute is not available.
-                        params_data.append(param.data.float())
+                        params_data.append(param.main_param)
                         params_data_names.append(param_name)
                 else:
-                    params_data.append(param.data)
+                    # Fallback to original logic of making a fp32 copy of the
+                    # parameter if `.main_param` attribute is not available.
+                    params_data.append(param.data.float())
                     params_data_names.append(param_name)
+            else:
+                params_data.append(param.data)
+                params_data_names.append(param_name)
 
     # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
     dense_reduce_group = mpu.get_model_parallel_group()
@@ -272,7 +276,7 @@ def _calc_params_l2_norm_or_raw_moments(
     torch.distributed.all_reduce(
         sharded_norm_2,
         op=torch.distributed.ReduceOp.SUM,
-        group=mpu.get_data_parallel_group(with_context_parallel=True)
+        group=mpu.get_data_parallel_group(with_context_parallel=True),
     )
     norm_2 += sharded_norm_2
 
@@ -292,8 +296,9 @@ def _calc_params_l2_norm_or_raw_moments(
     else:
         moe_norm_2 = torch.zeros_like(norm_2)
 
+    # Distributed optimizer shards expert main parameters over expert DP rather than
+    # regular DP, so reduce their contribution separately before the model-parallel sum.
     if len(sharded_moe_params_data) > 0:
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
         sharded_moe_norm, _ = multi_tensor_applier(
             multi_tensor_l2norm,
             dummy_overflow_buf,
@@ -309,7 +314,6 @@ def _calc_params_l2_norm_or_raw_moments(
         group=mpu.get_expert_data_parallel_group(),
     )
     moe_norm_2 += sharded_moe_norm_2
-
     # Reduce norm across model parallel groups (dense and expert).
     ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
     ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
