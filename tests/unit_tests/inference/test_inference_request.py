@@ -284,18 +284,13 @@ def test_dynamic_inference_request_serialize_return_prompt_tokens(
     now relies on the saved prompt_len rather than self.prompt_tokens (which
     is temporarily None during the drop)."""
     sp = SamplingParams(
-        num_tokens_to_generate=5,
-        termination_id=0,
-        return_prompt_tokens=return_prompt_tokens,
+        num_tokens_to_generate=5, termination_id=0, return_prompt_tokens=return_prompt_tokens
     )
     prompt = torch.tensor([1, 2, 3, 4])
     # prompt_len=4 + generated=[10] → total_tokens=5 → routing_indices.shape[0] must be 4.
     routing = np.zeros((4, 2, 1), dtype=np.int32)
     req = _make_dynamic_request(
-        prompt_tokens=prompt,
-        sampling_params=sp,
-        generated_tokens=[10],
-        routing_indices=routing,
+        prompt_tokens=prompt, sampling_params=sp, generated_tokens=[10], routing_indices=routing
     )
 
     obj = req.serialize()

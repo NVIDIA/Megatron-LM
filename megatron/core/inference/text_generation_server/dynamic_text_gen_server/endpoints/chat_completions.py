@@ -586,7 +586,9 @@ try:
             # return_tokenized_data (implied by prevent_retokenization) needs the ids;
             # return_raw_text needs the ids to detokenize the prompt into raw_text.
             prevent_retokenization = req.get("prevent_retokenization", True)
-            return_tokenized_data = req.get("return_tokenized_data", False) or prevent_retokenization
+            return_tokenized_data = (
+                req.get("return_tokenized_data", False) or prevent_retokenization
+            )
             return_raw_text = req.get("return_raw_text", False)
             return_prompt_tokens = return_tokenized_data or return_raw_text
 
