@@ -50,9 +50,7 @@ from megatron.core.distributed import (
     finalize_model_grads,
 )
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallel as megatron_FSDP,
-)
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel,
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
@@ -1826,7 +1824,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
-            DP = megatron_FSDP
+            DP = FullyShardedDataParallel
         else:
             DP = DDP
 
