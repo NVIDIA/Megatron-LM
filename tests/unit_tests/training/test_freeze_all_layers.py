@@ -1,15 +1,20 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for the --freeze-all-layers helper in megatron.training.training.
+"""Unit tests for the --freeze-all-layers helpers in megatron.training.training.
 
-These exercise ``_freeze_all_model_chunks`` in isolation. The helper only calls
-``requires_grad_(False)`` and flips a plain python attribute, so it runs on CPU
-and needs neither CUDA nor a real Megatron model.
+These exercise ``_freeze_all_model_chunks`` and ``_forward_backward_grad_context``
+in isolation. Both operate on plain python objects (``requires_grad_``, an
+attribute flip, and a grad context), so they run on CPU and need neither CUDA nor
+a real Megatron model. The grad-context tests reproduce the PP>1 case that
+motivates the fix: a recv_prev input activation with ``requires_grad=True``.
 """
+
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import torch
 
-from megatron.training.training import _freeze_all_model_chunks
+from megatron.training.training import _forward_backward_grad_context, _freeze_all_model_chunks
 
 
 class _FakeRouter(torch.nn.Module):
@@ -94,3 +99,88 @@ def test_idempotent():
 
     assert _all_require_grad(chunk, False)
     assert chunk.router.frozen_expert_bias is True
+
+
+# ---------------------------------------------------------------------------
+# _forward_backward_grad_context
+#
+# Why this matters for PP>1: on a non-first pipeline stage the input activation
+# is received via ``create_tensor_recv_prev()``
+# (``megatron/core/pipeline_parallel/p2p_communication.py``), which allocates it
+# with ``requires_grad=True`` so gradients can flow back to the prior stage.
+# That means a fully *frozen* model still builds an autograd graph during forward
+# -- purely because its input requires grad -- retaining activations for a
+# backward that is never useful. Wrapping the step in ``torch.no_grad()`` is what
+# suppresses that graph on frozen (e.g. teacher logits dump) runs.
+# ---------------------------------------------------------------------------
+
+
+def _recv_prev_activation():
+    """A stand-in for the PP>1 stage input from ``create_tensor_recv_prev()``:
+    an activation tensor allocated with ``requires_grad=True``."""
+    return torch.ones(2, 4, requires_grad=True)
+
+
+def _forward_through_frozen_stage(chunk, recv_prev):
+    """Run a recv_prev activation through a frozen model chunk (Linear stack)."""
+    return chunk.output_layer(chunk.embedding(recv_prev))
+
+
+def test_grad_context_frozen_returns_no_grad():
+    """With --freeze-all-layers the train step runs under torch.no_grad()."""
+    args = SimpleNamespace(freeze_all_layers=True)
+
+    ctx = _forward_backward_grad_context(args)
+
+    assert isinstance(ctx, torch.no_grad)
+
+
+def test_grad_context_unfrozen_returns_nullcontext():
+    """Without --freeze-all-layers the context is a no-op."""
+    args = SimpleNamespace(freeze_all_layers=False)
+
+    ctx = _forward_backward_grad_context(args)
+
+    assert isinstance(ctx, nullcontext)
+
+
+def test_pp_gt1_frozen_forward_without_context_still_builds_graph():
+    """Regression: a frozen PP>1 stage builds a graph anyway, because the
+    recv_prev input requires grad. This is the situation the fix addresses."""
+    chunk = _FakeModelChunk()
+    _freeze_all_model_chunks([chunk])
+    assert _all_require_grad(chunk, False)  # every parameter is frozen
+
+    out = _forward_through_frozen_stage(chunk, _recv_prev_activation())
+
+    # Graph built despite all params frozen -- solely due to the recv_prev input.
+    assert out.requires_grad
+    assert out.grad_fn is not None
+
+
+def test_pp_gt1_frozen_forward_under_context_skips_graph():
+    """The fix: running the same frozen PP>1 forward under the freeze context
+    suppresses the autograd graph even though recv_prev requires grad."""
+    chunk = _FakeModelChunk()
+    _freeze_all_model_chunks([chunk])
+    args = SimpleNamespace(freeze_all_layers=True)
+
+    with _forward_backward_grad_context(args):
+        assert not torch.is_grad_enabled()
+        out = _forward_through_frozen_stage(chunk, _recv_prev_activation())
+
+    assert out.grad_fn is None  # no graph, no retained activations
+    assert torch.is_grad_enabled()  # grad state restored on exit
+
+
+def test_unfrozen_forward_builds_graph_normally():
+    """The no-op context leaves normal (trainable) training untouched: a forward
+    over a recv_prev input still builds its graph."""
+    chunk = _FakeModelChunk()  # params trainable
+    args = SimpleNamespace(freeze_all_layers=False)
+
+    with _forward_backward_grad_context(args):
+        assert torch.is_grad_enabled()
+        out = _forward_through_frozen_stage(chunk, _recv_prev_activation())
+
+    assert out.grad_fn is not None
