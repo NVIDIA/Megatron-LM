@@ -155,6 +155,7 @@ class EncoderPrefetchLoader:
         worker_join_timeout_s: float = 30.0,
         debug: bool = False,
     ) -> None:
+        """Initialize a bounded encoder-feature prefetch pipeline."""
         if depth <= 0:
             raise ValueError("encoder prefetch depth must be positive")
         if worker_join_timeout_s <= 0:
@@ -183,9 +184,11 @@ class EncoderPrefetchLoader:
         self._closed = False
 
     def __iter__(self):
+        """Return this loader as its own iterator."""
         return self
 
     def start(self) -> None:
+        """Initialize CUDA stream state and start the producer thread."""
         with self._condition:
             if self._worker is not None:
                 raise RuntimeError("encoder prefetch loader is already started")
@@ -203,6 +206,7 @@ class EncoderPrefetchLoader:
             self._worker.start()
 
     def _producer_main(self) -> None:
+        """Fetch, encode, and publish batches until exhaustion or shutdown."""
         staged_batch = None
         while True:
             with self._condition:
@@ -280,6 +284,7 @@ class EncoderPrefetchLoader:
     def _enqueue_batch(
         self, batch: dict[str, object]
     ) -> tuple[dict[str, object], torch.cuda.Event, torch.cuda.Event | None]:
+        """Move encoder inputs to CUDA and enqueue their feature computation."""
         if not isinstance(batch, dict):
             raise TypeError("encoder prefetch source must return a batch dictionary")
         modality_inputs = batch.get("modality_inputs")
@@ -302,6 +307,7 @@ class EncoderPrefetchLoader:
         return output_batch, completion_event, encode_start
 
     def __next__(self) -> dict[str, object]:
+        """Return the next feature batch, waiting on a pending encode if needed."""
         if self._worker is None:
             raise RuntimeError("encoder prefetch loader must be started before use")
         with self._condition:
@@ -354,10 +360,12 @@ class EncoderPrefetchLoader:
     def _queue_encoder_wait_timing(
         self, batch_id: int, start_event: torch.cuda.Event, end_event: torch.cuda.Event
     ) -> None:
+        """Queue a consumer encoder-wait timing for asynchronous logging."""
         with self._condition:
             self._encoder_wait_timings.append((batch_id, start_event, end_event))
 
     def _drain_encoder_wait_timings(self) -> None:
+        """Log completed consumer encoder-wait timings without synchronizing."""
         ready = []
         with self._condition:
             while self._encoder_wait_timings and self._encoder_wait_timings[0][2].query():
@@ -368,10 +376,12 @@ class EncoderPrefetchLoader:
     def _queue_projection_timing(
         self, batch_id: int, start_event: torch.cuda.Event, end_event: torch.cuda.Event
     ) -> None:
+        """Queue a projection timing for asynchronous logging."""
         with self._condition:
             self._projection_timings.append((batch_id, start_event, end_event))
 
     def _drain_projection_timings(self) -> None:
+        """Log completed projection timings without synchronizing."""
         ready = []
         with self._condition:
             while self._projection_timings and self._projection_timings[0][2].query():
@@ -380,6 +390,7 @@ class EncoderPrefetchLoader:
             _log_projection_debug(batch_id, start_event, end_event)
 
     def close(self) -> None:
+        """Stop the producer and discard buffered batches."""
         with self._condition:
             if self._closed:
                 return
