@@ -2461,6 +2461,9 @@ class TextGenerationController:
                 if not overlap:
                     self._synchronize_async_sched_event(self._async_sched_logits.ready_event)
 
+                # -------------------------------------------------------------------------
+                # Sample/MTP
+                # -------------------------------------------------------------------------
                 if self.num_speculative_tokens > 0:
                     sample_result = self._run_async_sched_sample_mtp()
                     self._run_async_sched_mtp_rewind(sample_result, overlap=overlap)
@@ -2468,6 +2471,10 @@ class TextGenerationController:
                     sample_result = self._run_async_sched_sample()
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
+
+                # -------------------------------------------------------------------------
+                # Resolve
+                # -------------------------------------------------------------------------
                 resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
 
                 self._async_sched_logits.clear()
@@ -2475,6 +2482,9 @@ class TextGenerationController:
                     sample_result, resolved_sequence_lengths, None, overlap
                 )
 
+                # -------------------------------------------------------------------------
+                # Prepare
+                # -------------------------------------------------------------------------
                 context.prepare_requests()
                 survivor_idxs = resolve_result.survivor_idxs
                 sampled_mtp_tokens_cpu = (
@@ -2486,10 +2496,16 @@ class TextGenerationController:
                     resolve_result.sampled_tokens_cpu[survivor_idxs], sampled_mtp_tokens_cpu
                 )
 
+            # -------------------------------------------------------------------------
+            # Admit
+            # -------------------------------------------------------------------------
             # This is the only async-scheduling admission mutation point.
             if schedule_waiting_requests is not None:
                 schedule_waiting_requests()
 
+            # -------------------------------------------------------------------------
+            # Forward
+            # -------------------------------------------------------------------------
             active_request_count = context.total_request_count - context.paused_request_count
             if active_request_count > 0:
                 if had_pending_forward:
