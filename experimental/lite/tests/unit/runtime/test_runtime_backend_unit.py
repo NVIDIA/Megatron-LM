@@ -225,6 +225,90 @@ def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     assert optimizer.calls == ["offload", "load"]
 
 
+def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
+    events = []
+
+    class Chunk:
+        def release_export_scratch(self):
+            events.append("release-scratch")
+
+    class Optimizer:
+        def offload_state_to_cpu(self):
+            events.append("offload-optimizer")
+
+        def load_state_to_device(self):
+            events.append("load-optimizer")
+
+    import megatron.lite.runtime.megatron_utils as megatron_utils
+
+    monkeypatch.setattr(
+        megatron_utils,
+        "offload_model_to_cpu",
+        lambda chunks: events.append("offload-model"),
+    )
+    monkeypatch.setattr(
+        megatron_utils,
+        "load_model_to_gpu",
+        lambda chunks, load_grad: events.append("load-model"),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(
+        "megatron.lite.runtime.backends.mlite.runtime.gc.collect",
+        lambda: events.append("collect"),
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty-cache"))
+    chunk = Chunk()
+    handle = ModelHandle(
+        model=chunk,
+        optimizer=Optimizer(),
+        _extras={"model_chunks": [chunk]},
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    runtime.to(handle, "cpu", model=True, optimizer=False, grad=True)
+    runtime.to(handle, "cuda", model=True, optimizer=False, grad=True)
+
+    assert events == [
+        "offload-model",
+        "offload-optimizer",
+        "release-scratch",
+        "synchronize",
+        "collect",
+        "empty-cache",
+        "load-model",
+        "load-optimizer",
+    ]
+
+
+def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch):
+    events = []
+
+    class Chunk:
+        def release_export_scratch(self):
+            events.append("release-scratch")
+
+    import megatron.lite.runtime.megatron_utils as megatron_utils
+
+    monkeypatch.setattr(
+        megatron_utils,
+        "offload_model_to_cpu",
+        lambda chunks: events.append("offload-model"),
+    )
+    chunk = Chunk()
+    handle = ModelHandle(
+        model=chunk,
+        optimizer=HookedOptimizer(),
+        _extras={"model_chunks": [chunk]},
+    )
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
+        handle, "cpu", model=True, optimizer=False, grad=False
+    )
+
+    assert events == ["offload-model"]
+
+
 class _FakeStorage:
     def __init__(self, size: int):
         self._size = size
@@ -368,6 +452,29 @@ def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
     load_model_to_gpu([model])
 
     assert model.calls == ["cpu", "cuda"]
+
+
+def test_native_model_offload_reshards_fsdp2_before_cpu_move(monkeypatch):
+    import megatron.lite.runtime.megatron_utils as megatron_utils
+
+    model = _FakeNativeModel()
+    events = []
+
+    monkeypatch.setattr(
+        megatron_utils,
+        "_reshard_fsdp2_modules",
+        lambda model_chunk: events.append(("reshard", model_chunk)),
+    )
+    original_to = model.to
+
+    def tracked_to(device):
+        events.append(("to", device))
+        return original_to(device)
+
+    model.to = tracked_to
+    megatron_utils.offload_model_to_cpu([model])
+
+    assert events == [("reshard", model), ("to", "cpu")]
 
 
 def test_model_handle_dp_defaults():

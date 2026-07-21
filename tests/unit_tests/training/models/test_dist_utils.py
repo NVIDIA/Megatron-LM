@@ -7,11 +7,13 @@ import torch
 import torch.nn as nn
 
 from megatron.core.enums import ModelType
+from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
     _ddp_wrap,
     _print_num_params,
     _wrap_with_mp_wrapper,
     build_virtual_pipeline_stages,
+    prepare_existing_model_chunks_for_distributed_training,
     to_empty_if_meta_device,
     unimodal_build_distributed_models,
 )
@@ -860,6 +862,27 @@ class TestUnimodalBuildDistributedModels:
                 self.pg,
                 self.transformer_config.virtual_pipeline_model_parallel_size,
                 ModelType.encoder_or_decoder,
+            )
+        finally:
+            self._stop_patches()
+
+    def test_prepare_existing_chunks_runs_lifecycle_without_building_stages(self):
+        param = Mock()
+        self.mock_model.parameters.return_value = [param]
+        mocks = self._standard_patches()
+        prebuilt_chunks = [self.mock_model]
+        try:
+            result = prepare_existing_model_chunks_for_distributed_training(
+                prebuilt_chunks, self.transformer_config, self.pg, wrap_with_ddp=False
+            )
+
+            assert result is prebuilt_chunks
+            mocks["bvps"].assert_not_called()
+            mocks["tp_attr"].assert_called_once_with(param)
+            mocks["print"].assert_called_once_with(prebuilt_chunks, pg_collection=self.pg)
+            self.mock_model.cuda.assert_called_once()
+            mocks["mp_wrap"].assert_called_once_with(
+                prebuilt_chunks, self.transformer_config, Float16Module
             )
         finally:
             self._stop_patches()

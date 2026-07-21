@@ -12,6 +12,7 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
 
@@ -1032,3 +1033,90 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
+
+
+def test_shared_param_grad_buffer_requires_matching_cpu_backup_disable_flags():
+    Utils.initialize_model_parallel()
+    group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    param = torch.nn.Parameter(torch.empty(group.size(), dtype=torch.bfloat16))
+    pg_collection = ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(), dp_cp=group
+    )
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        disable_grad_buffers_cpu_backup=True,
+        disable_param_buffers_cpu_backup=False,
+    )
+
+    try:
+        with (
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.HAVE_TORCH_MEMORY_SAVER', True
+            ),
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.is_mxfp8tensor', return_value=True
+            ),
+            pytest.raises(ValueError, match="must match"),
+        ):
+            _ParamAndGradBuffer(
+                ddp_config=ddp_config,
+                param_dtype=torch.bfloat16,
+                grad_dtype=torch.bfloat16,
+                params_with_names=[(param, "weight")],
+                data_parallel_group=group,
+                bucket_size=None,
+                param_to_name={param: "weight"},
+                gradient_scaling_factor=1.0,
+                param_indices=[0],
+                nccl_ub=False,
+                pg_collection=pg_collection,
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_cpu_backup_disable_flags_are_ignored_without_tms():
+    Utils.initialize_model_parallel()
+    group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    param = torch.nn.Parameter(torch.empty(group.size(), dtype=torch.bfloat16))
+    pg_collection = ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(), dp_cp=group
+    )
+    ddp_config = DistributedDataParallelConfig(disable_grad_buffers_cpu_backup=True)
+    original_zeros = torch.zeros
+
+    def _cpu_zeros(*args, **kwargs):
+        kwargs.pop("device", None)
+        return original_zeros(*args, **kwargs)
+
+    try:
+        with (
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.HAVE_TORCH_MEMORY_SAVER', False
+            ),
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.torch.cuda.current_device',
+                return_value=0,
+            ),
+            mock.patch(
+                'megatron.core.distributed.param_and_grad_buffer.torch.zeros',
+                side_effect=_cpu_zeros,
+            ),
+        ):
+            buffer = _ParamAndGradBuffer(
+                ddp_config=ddp_config,
+                param_dtype=torch.bfloat16,
+                grad_dtype=torch.bfloat16,
+                params_with_names=[(param, "weight")],
+                data_parallel_group=group,
+                bucket_size=None,
+                param_to_name={param: "weight"},
+                gradient_scaling_factor=1.0,
+                param_indices=[0],
+                nccl_ub=False,
+                pg_collection=pg_collection,
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+    assert buffer.grad_data.device.type == "cpu"

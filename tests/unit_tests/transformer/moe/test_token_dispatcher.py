@@ -168,6 +168,7 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
@@ -500,6 +501,12 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
+def is_nccl_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    return HAVE_TE_EP
+
+
 def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
     if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
         pytest.skip("Deep EP is not available")
@@ -507,6 +514,8 @@ def skip_if_flex_backend_unavailable(moe_flex_dispatcher_backend):
         pytest.skip("Deep EP v2 is not available")
     if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
         pytest.skip("Hybrid EP is not available")
+    if moe_flex_dispatcher_backend == "ncclep" and not is_nccl_ep_available():
+        pytest.skip("NCCL EP is not available")
 
 
 @pytest.mark.skipif(
@@ -525,7 +534,9 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "deepepv2", "hybridep"])
+    @pytest.mark.parametrize(
+        "moe_flex_dispatcher_backend", ["deepep", "deepepv2", "hybridep", "ncclep"]
+    )
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_forward_backward(
         self,
@@ -555,6 +566,13 @@ class TestFlexDispatcher:
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
+            # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS (device-side
+            # em_scan check -> CUDA launch failure), so size it generously: small token counts have
+            # high routing-imbalance variance and a tight factor traps. The staging buffer is tiny
+            # at this model size, so a large factor costs little.
+            moe_expert_rank_capacity_factor=(
+                8.0 if moe_flex_dispatcher_backend == "ncclep" else None
+            ),
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()

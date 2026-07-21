@@ -242,7 +242,7 @@ class TestMuonDecoupleFP8ParamGather:
         set_args(args)
         torch.manual_seed(_SEED)
         model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, model_provider_func=self.model_provider
         )
         assert len(model) == 1
         assert isinstance(optimizer.chained_optimizers[0], LayerWiseDistributedOptimizer), (
