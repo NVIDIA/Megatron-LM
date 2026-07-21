@@ -517,7 +517,10 @@ class TestPackedSeqCudagraphs:
         packed_seq_params = self._build_packed_seq_params(torch.device('cuda'))
         # Each CP rank holds its 1/cp_size share of the bin's tokens.
         hidden_states = torch.randn(
-            (self.BIN_SIZE // cp_size, 1, config.hidden_size), dtype=torch.bfloat16, device='cuda'
+            (self.BIN_SIZE // cp_size, 1, config.hidden_size),
+            dtype=torch.bfloat16,
+            device='cuda',
+            requires_grad=True,
         )
 
         eager_out = block(
