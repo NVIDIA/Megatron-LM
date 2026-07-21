@@ -981,6 +981,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    moe_use_norm_before_up_proj: bool = False
+    """Apply normalization before the latent MoE up-projection. Requires moe_latent_size."""
+
     gtp_remat_opt_in_modules: list[str] = field(default_factory=list)
     """Extra modules to apply GTP_remat weight sharding to, beyond the default set (attention,
     Mamba, MLP, expert linears, embeddings). Allowed values:

@@ -67,9 +67,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TENorm, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -299,6 +299,12 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 gtp_remat_group=gtp_remat_group,
             )
+            if self.config.moe_use_norm_before_up_proj:
+                self.fc2_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
@@ -694,6 +700,8 @@ class MoELayer(BaseMoELayer):
             # combine so we can apply the vector gate below instead of a plain sum.
             shared_expert_output = deferred_shared_expert_output
         if self.config.moe_latent_size:
+            if self.config.moe_use_norm_before_up_proj:
+                output = self.fc2_norm(output)
             output, _ = self.fc2_latent_proj(output)
 
         # Normalize routed path before combining. output_norm: legacy routed-only norm.
@@ -744,6 +752,8 @@ class MoELayer(BaseMoELayer):
         """Return modules and standalone parameters used by shortcut postprocess."""
         modules = []
         if self.config.moe_latent_size:
+            if self.config.moe_use_norm_before_up_proj:
+                modules.append(self.fc2_norm)
             modules.append(self.fc2_latent_proj)
         modules.extend(
             module
