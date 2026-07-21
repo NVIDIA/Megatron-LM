@@ -347,6 +347,11 @@ class TEGroupedMLP(MegatronModule):
             return False
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return False
+        if (
+            self.linear_fc2.use_bias
+            and "scale_bias" not in inspect.signature(GroupedLinear.__init__).parameters
+        ):
+            return False  # Older TE op-fuser versions cannot scale FC2 bias by router probabilities
 
         # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
         # Use config.activation_func instead of self.activation_func because when
