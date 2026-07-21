@@ -12,6 +12,7 @@ Protocol convention (what runtime calls):
   Optional (in ModelBundle.extras or module-level):
     load_hf_weights(chunk, hf_path, model_cfg, ps)  — HF weight loading
     export_hf_weights(chunks, model_cfg, ps)         — HF weight export
+    save_hf_weights(chunks, path, model_cfg, ps)     — HF checkpoint writing
     vocab_size(model_cfg) -> int                     — benchmark metadata
   Escape hatch:
     create_runtime(hf_path, cfg) -> Runtime          — fully override runtime
@@ -57,6 +58,7 @@ __all__ = [
     "build_model_config",
     "export_hf_weights",
     "load_hf_weights",
+    "save_hf_weights",
     "vocab_size",
 ]
 
@@ -319,6 +321,17 @@ def export_hf_weights(
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
+
+
+def save_hf_weights(
+    chunks: list[nn.Module],
+    path: str,
+    model_cfg: Qwen3MoEConfig,
+    ps: ParallelState,
+) -> None:
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import save_hf_weights as _save
+
+    _save(chunks, path, model_cfg, ps)
 
 
 # ---------------------------------------------------------------------------

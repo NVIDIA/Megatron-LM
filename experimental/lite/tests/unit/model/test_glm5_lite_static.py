@@ -1,9 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Static and CPU smoke tests for native GLM-5 lite."""
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
 
 
 def _make_train_config(ps):
@@ -391,11 +394,11 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     state = model.state_dict()
 
     assert torch.equal(
-        exported["model.layers.1.mlp.experts.2.gate_proj.weight"],
+        exported["model.layers.1.mlp.experts.2.gate_proj.weight"].detach().cpu(),
         state["layers.1.moe.experts.fc1.weight2"][: cfg.moe_intermediate_size].detach().cpu(),
     )
     assert torch.equal(
-        exported["model.layers.1.mlp.gate.e_score_correction_bias"],
+        exported["model.layers.1.mlp.gate.e_score_correction_bias"].detach().cpu(),
         state["layers.1.moe.router.expert_bias"].detach().cpu(),
     )
     assert "model.layers.1.mlp.experts.gate_up_proj" not in exported
@@ -445,6 +448,14 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
         .to(torch.bfloat16)
         .to(torch.float32),
     )
+
+
+def test_glm5_hf_export_rejects_missing_model_config():
+    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights
+    from megatron.lite.primitive.parallel import ParallelState
+
+    with pytest.raises(ValueError, match="non-null model config"):
+        next(export_hf_weights(None, None, ParallelState()))
 
 
 def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
