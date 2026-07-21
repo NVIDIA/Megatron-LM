@@ -13,7 +13,7 @@ from collections.abc import Callable
 
 import torch
 
-from examples.mimo.training.batch import map_batch_tensors, move_batch_to_cuda
+from examples.mimo.training.batch import move_batch_to_cuda
 
 PREFETCHED_FEATURES_KEY = "_mimo_prefetched_encoder_features"
 PROJECTION_TIMER_KEY = "_mimo_encoder_prefetch_projection_timer"
@@ -71,13 +71,10 @@ def prefetch_frozen_features(
         return module.combine_embeddings(module.encode(encoder_inputs))
 
 
-def _record_batch_stream(value, stream: torch.cuda.Stream) -> None:
-    def record(tensor: torch.Tensor) -> torch.Tensor:
+def _record_feature_streams(features: dict[str, torch.Tensor], stream: torch.cuda.Stream) -> None:
+    for tensor in features.values():
         if tensor.is_cuda:
             tensor.record_stream(stream)
-        return tensor
-
-    map_batch_tensors(value, record)
 
 
 def _log_producer_debug(
@@ -174,7 +171,6 @@ class EncoderPrefetchLoader:
         self._condition = threading.Condition()
         self._ready: deque[dict[str, object]] = deque()
         self._pending: tuple[dict[str, object], torch.cuda.Event] | None = None
-        self._in_flight = False
         self._encoder_wait_timings: deque[tuple[int, torch.cuda.Event, torch.cuda.Event]] = deque()
         self._projection_timings: deque[tuple[int, torch.cuda.Event, torch.cuda.Event]] = deque()
         self._produced_batches = 0
@@ -210,15 +206,10 @@ class EncoderPrefetchLoader:
         staged_batch = None
         while True:
             with self._condition:
-                self._condition.wait_for(
-                    lambda: self._stop
-                    or self._producer_error is not None
-                    or self._source_exhausted
-                    or (not self._in_flight and len(self._ready) < self._depth)
-                )
-                if self._stop or self._producer_error is not None or self._source_exhausted:
+                # Refill when the completed-feature FIFO has room, or wake for shutdown.
+                self._condition.wait_for(lambda: self._stop or len(self._ready) < self._depth)
+                if self._stop:
                     return
-                self._in_flight = True
 
             source_exhausted = False
             source_error = None
@@ -254,20 +245,17 @@ class EncoderPrefetchLoader:
             except StopIteration:
                 with self._condition:
                     self._source_exhausted = True
-                    self._in_flight = False
                     self._condition.notify_all()
                 return
             except BaseException as error:
                 with self._condition:
                     if not self._stop:
                         self._producer_error = error
-                    self._in_flight = False
                     self._pending = None
                     self._condition.notify_all()
                 return
 
             with self._condition:
-                self._in_flight = False
                 if self._stop:
                     return
                 if self._pending is not None:
@@ -355,7 +343,7 @@ class EncoderPrefetchLoader:
             if wait_end_event is not None:
                 wait_end_event.record(current_stream)
                 self._queue_encoder_wait_timing(batch_id, wait_start_event, wait_end_event)
-        _record_batch_stream(item, current_stream)
+        _record_feature_streams(item[PREFETCHED_FEATURES_KEY], current_stream)
         if self._debug:
             item[PROJECTION_TIMER_KEY] = _ProjectionTimer(self, batch_id)
             _log_consumer_debug(

@@ -225,7 +225,6 @@ def test_pending_encode_can_be_claimed_while_cpu_read_ahead_blocks(fake_cuda, ca
         assert batch[PREFETCHED_FEATURES_KEY][ENCODER].item() == 0
         assert fake_cuda.current.waited_events[-1] is completion_event
         assert loader._pending is None
-        assert loader._in_flight
     finally:
         release_read_ahead.set()
         loader.close()

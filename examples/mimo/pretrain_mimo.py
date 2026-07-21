@@ -91,13 +91,11 @@ def main() -> None:
     if args.mimo_encoder_prefetch and len(provider.encoder_module_names) != 1:
         raise ValueError("encoder prefetch requires exactly one encoder")
 
-    captured_model = {} if args.mimo_encoder_prefetch else None
+    captured_model = {}
     hooks = []
-    if captured_model is not None:
+    if args.mimo_encoder_prefetch:
 
         def capture_model(models):
-            if len(models) != 1:
-                raise ValueError("encoder prefetch requires exactly one outer model")
             captured_model["model"] = models[0]
             return models
 
@@ -112,18 +110,13 @@ def main() -> None:
         if not args.mimo_encoder_prefetch or loaders[0] is None:
             return iterators
 
-        assert captured_model is not None
         mimo_model = unwrap_model(captured_model["model"])
         if not mimo_model.role.has_modality_modules:
             return iterators
         if prefetch_loader is not None:
             raise RuntimeError("encoder prefetch loader was already built")
 
-        active_encoders = tuple(mimo_model.role.modality_module_names)
-        if active_encoders != (encoder_name,):
-            raise ValueError(f"encoder prefetch expected {(encoder_name,)}, got {active_encoders}")
-        installed = mimo_model.modality_submodules[encoder_name]
-        encoder_module = unwrap_model(installed)
+        encoder_module = unwrap_model(mimo_model.modality_submodules[encoder_name])
         prefetch_loader = EncoderPrefetchLoader(
             source=iter(loaders[0]),
             encoder_name=encoder_name,
@@ -132,8 +125,7 @@ def main() -> None:
             debug=args.mimo_encoder_prefetch_debug,
         )
         prefetch_loader.start()
-        iterators = (prefetch_loader, *iterators[1:])
-        return iterators
+        return (prefetch_loader, *iterators[1:])
 
     train_valid_test_data_provider.is_distributed = True
     pretrain(
