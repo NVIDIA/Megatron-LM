@@ -375,6 +375,40 @@ def create_empty_bins(
         empty_packing_info_entries,
     )
 
+def compute_sequence_norm_weights(
+    loss_mask: torch.Tensor,
+    seq_starts: List[int],
+    seq_lengths: List[int],
+) -> torch.Tensor:
+    """Per-token weights that normalize each packed sequence's loss by its own token count.
+
+    Uses the same span convention as the advantage map in calculate_grpo_loss: loss_mask is
+    logprob-aligned (index t masks token t+1) and sequence (start, seq_len) owns logprob
+    indices [start, start + seq_len - 1).
+
+    Args:
+        loss_mask: Logprob-aligned loss mask for one packed bin, [bin_size - 1].
+        seq_starts: Start position of each sequence in the bin.
+        seq_lengths: Original (prompt + generation) length of each sequence.
+
+    Returns:
+        Tensor shaped like loss_mask where every unmasked token of sequence i carries weight
+        1 / (unmasked tokens of sequence i), so a weighted loss sum over the bin equals the
+        sum of the per-sequence token-mean losses. Empty bins yield all zeros.
+    """
+    flat_mask = loss_mask.reshape(-1).float()
+    weights = torch.zeros_like(flat_mask)
+    logprob_len = flat_mask.shape[0]
+    for start, seq_len in zip(seq_starts, seq_lengths):
+        end = min(start + seq_len - 1, logprob_len)
+        if end <= start:
+            continue
+        span = flat_mask[start:end]
+        span_tokens = span.sum()
+        if span_tokens > 0:
+            weights[start:end] = span / span_tokens
+    return weights.reshape(loss_mask.shape)
+
 def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, device: torch.device) -> PackedSeqParams:
     """Create a default PackedSeqParams that acts as no-op for a single sequence.
 

@@ -543,6 +543,15 @@ def validate_args(args, defaults={}):
                 "syncs vary across bins, so a captured whole-iteration graph would "
                 "replay bin-0 metadata for every bin."
             )
+        if args.rl_per_sequence_loss_norm:
+            assert args.calculate_per_token_loss, (
+                "--rl-per-sequence-loss-norm requires --calculate-per-token-loss: the loss "
+                "numerator is a sum of per-trajectory token-mean losses and the returned "
+                "token count is the trajectory count, so gradients must be scaled by the "
+                "global trajectory count in finalize_model_grads. Without the flag the core "
+                "loop instead averages per microbatch, and a trajectory's weight would still "
+                "depend on how many sequences share its bin."
+            )
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -2471,6 +2480,14 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
+    group.add_argument('--rl-per-sequence-loss-norm', action=argparse.BooleanOptionalAction, type=bool,
+                       default=False,
+                       help='Normalize the GRPO loss per trajectory instead of per microbatch: each '
+                            'trajectory contributes its token-mean loss and gradients are scaled by '
+                            'the global trajectory count, so every trajectory gets equal weight '
+                            'regardless of its length or how many sequences share its packed bin. '
+                            'This reproduces the unpacked MBS=1 per-microbatch averaging exactly '
+                            'under sequence packing. Requires --calculate-per-token-loss.')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')

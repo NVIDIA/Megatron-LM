@@ -13,6 +13,7 @@ from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
@@ -22,14 +23,15 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
+from megatron.rl.sequence_packing_utils import (
+    compute_sequence_norm_weights,
+    get_default_packed_seq_params,
+)
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.utils import is_hybrid_model
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.utils import is_hybrid_model
 from model_provider import model_provider
-
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
 stimer = StragglerDetector()
 
@@ -85,6 +87,8 @@ SPIKY_LOSS_PERC = 0.2
 
 def loss_func(
     loss_mask: torch.Tensor,
+    seq_norm_weights: torch.Tensor,
+    num_seqs: int,
     kl_term: torch.Tensor,
     ratios: torch.Tensor,
     entropy_term: torch.Tensor,
@@ -96,6 +100,10 @@ def loss_func(
 
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
+        seq_norm_weights (torch.Tensor): Per-token weights of 1/(tokens in the token's
+            trajectory), shaped like loss_mask. Only set with --rl-per-sequence-loss-norm.
+        num_seqs (int): Number of real trajectories in this microbatch (0 for empty
+            padding bins). Only used with --rl-per-sequence-loss-norm.
         kl_term (torch.Tensor): KL term of the loss. Used for logging.
         ratios (torch.Tensor): pi/pi_{old} ratios. Used for logging.
         entropy (torch.Tensor): Current policy entropy on the trajectories. Used for logging.
@@ -105,7 +113,8 @@ def loss_func(
 
     Returns:
         the loss scalar for this micro-batch
-        the number of non-padded tokens in this microbatch
+        the count the core loop divides by: non-padded tokens, or trajectories when
+            --rl-per-sequence-loss-norm is set
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
@@ -126,6 +135,18 @@ def loss_func(
     if total_tokens == 0:
         total_tokens = torch.tensor(1.0, device=loss_mask_flat.device)
     loss = torch.cat([torch.sum(losses_flat * loss_mask_flat).view(1), total_tokens.view(1)])
+
+    if args.rl_per_sequence_loss_norm:
+        # Sequence-mean estimator: the numerator is the sum of per-trajectory token-mean
+        # losses and the count is the trajectory count, so with --calculate-per-token-loss
+        # every trajectory ends up with gradient weight 1/(global trajectory count) —
+        # matching unpacked MBS=1 per-microbatch averaging regardless of bin packing.
+        seq_weights_flat = seq_norm_weights.float().reshape(-1).to(losses_flat.device)
+        train_loss = torch.sum(losses_flat * seq_weights_flat)
+        train_count = torch.tensor(num_seqs, dtype=torch.int32, device=losses_flat.device)
+    else:
+        train_loss = loss[0]
+        train_count = total_tokens.int()
 
     # Ensure all tensors are on the same device as losses
     device = losses.device
@@ -149,7 +170,7 @@ def loss_func(
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=train_loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
             tolerance=0.0,  # forward pass calculations are determinisic
@@ -158,7 +179,7 @@ def loss_func(
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=train_loss,
             rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
             message="Spiky loss",
             tolerance=0.0,  # forward pass calculations are determinisic
@@ -185,12 +206,19 @@ def loss_func(
         'rl/truncated_from_below': reporting_truncated_from_below,
     }
 
+    if args.rl_per_sequence_loss_norm:
+        # 'lm loss' above stays token-normalized so curves remain comparable across runs;
+        # this reports the actual trained objective (mean of per-trajectory mean losses).
+        output_dict['rl/seq_mean_loss'] = torch.cat(
+            [train_loss.clone().detach().view(1), train_count.float().view(1)]
+        )
+
     # Add metadata about number of sequences processed in this batch
     # This is crucial for correct sample counting with sequence packing
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0], total_tokens.int(), output_dict)
+    return (train_loss, train_count, output_dict)
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
@@ -332,10 +360,25 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
             output_tensor = loss
 
+    # Per-sequence loss normalization: weight each token by 1/(tokens in its trajectory)
+    # so loss_func can hand the core loop a per-trajectory-mean numerator and a
+    # trajectory count instead of a token count.
+    seq_norm_weights = None
+    num_seqs = 0
+    if args.rl_per_sequence_loss_norm:
+        if args.rl_use_sequence_packing:
+            seq_norm_weights = compute_sequence_norm_weights(loss_mask, seq_starts, seq_lengths)
+            num_seqs = len(seq_indices)
+        else:
+            seq_norm_weights = loss_mask / loss_mask.sum(dim=1, keepdim=True).clamp(min=1)
+            num_seqs = tokens.shape[0]
+
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
     return output_tensor, partial(
         loss_func,
         loss_mask,
+        seq_norm_weights,
+        num_seqs,
         kl_term,
         ratios,
         entropy_term,

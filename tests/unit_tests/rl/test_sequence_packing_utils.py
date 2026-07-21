@@ -533,3 +533,95 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
 
     # Iterator is local, batch size is global
     assert expected_bs == actual_bs
+
+
+def test_compute_sequence_norm_weights_basic():
+    # Bin layout (logprob coords, length 11): seq A (start 0, len 5) owns [0, 4),
+    # seq B (start 5, len 5) owns [5, 9) — same span convention as the advantage map
+    # in calculate_grpo_loss. A has 2 masked tokens, B has 3.
+    loss_mask = torch.tensor([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+    seq_starts = [0, 5]
+    seq_lengths = [5, 5]
+
+    weights = sequence_packing_utils.compute_sequence_norm_weights(
+        loss_mask, seq_starts, seq_lengths
+    )
+
+    third = 1 / 3
+    expected = torch.tensor([0.0, 0.0, 0.5, 0.5, 0.0, 0.0, third, third, third, 0.0, 0.0])
+    assert torch.allclose(weights, expected)
+
+    # A weighted loss sum equals the sum of per-sequence token-mean losses.
+    losses = torch.arange(11, dtype=torch.float)
+    per_seq_means = losses[2:4].mean() + losses[6:9].mean()
+    assert torch.allclose((losses * weights).sum(), per_seq_means)
+
+
+def test_compute_sequence_norm_weights_empty_bin():
+    loss_mask = torch.zeros(8)
+
+    weights = sequence_packing_utils.compute_sequence_norm_weights(loss_mask, [], [])
+
+    assert torch.equal(weights, torch.zeros(8))
+
+
+def test_compute_sequence_norm_weights_truncated_and_unmasked_seqs():
+    # Seq A [0, 3) fully masked out (e.g. prompt-only): zero weights, no NaN/inf.
+    # Seq B starts at 4 with length 10 but the bin ends at 8: span clamps to [4, 8).
+    loss_mask = torch.tensor([0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+    seq_starts = [0, 4]
+    seq_lengths = [4, 10]
+
+    weights = sequence_packing_utils.compute_sequence_norm_weights(
+        loss_mask, seq_starts, seq_lengths
+    )
+
+    expected = torch.tensor([0.0, 0.0, 0.0, 0.0, 1 / 3, 0.0, 1 / 3, 1 / 3])
+    assert torch.allclose(weights, expected)
+    assert torch.isfinite(weights).all()
+
+
+def test_sequence_norm_weights_packing_parity_with_unpacked():
+    # The per-sequence-normalized numerator/count pairs must aggregate to the same global
+    # loss whether trajectories are packed into bins or fed one per microbatch (the
+    # unpacked MBS=1 reference weighting), regardless of bin arrangement.
+    torch.manual_seed(0)
+    traj_masked_lens = [2, 7, 3, 5]
+    traj_losses = [torch.randn(n) for n in traj_masked_lens]
+
+    # Unpacked MBS=1 reference: each microbatch contributes (traj token-mean, 1).
+    unpacked_numerator = sum(l.mean() for l in traj_losses)
+    unpacked_count = len(traj_losses)
+
+    # Packed: trajs 0+1 share a dense bin, 2+3 share another; gaps between seqs unmasked.
+    def build_bin(trajs, bin_len):
+        loss_mask = torch.zeros(bin_len)
+        losses = torch.zeros(bin_len)
+        seq_starts, seq_lengths = [], []
+        pos = 0
+        for t in trajs:
+            n = t.shape[0]
+            # One leading unmasked (prompt) token per sequence inside the span.
+            seq_starts.append(pos)
+            seq_lengths.append(n + 2)  # prompt token + n gen tokens + 1 (logprob offset)
+            loss_mask[pos + 1 : pos + 1 + n] = 1.0
+            losses[pos + 1 : pos + 1 + n] = t
+            pos += n + 2
+        return losses, loss_mask, seq_starts, seq_lengths
+
+    packed_numerator = torch.tensor(0.0)
+    packed_count = 0
+    for trajs in (traj_losses[:2], traj_losses[2:]):
+        losses, loss_mask, seq_starts, seq_lengths = build_bin(trajs, bin_len=32)
+        weights = sequence_packing_utils.compute_sequence_norm_weights(
+            loss_mask, seq_starts, seq_lengths
+        )
+        packed_numerator = packed_numerator + (losses * weights).sum()
+        packed_count += len(seq_starts)
+
+    # Plus an empty padding bin: contributes nothing to either numerator or count.
+    empty_weights = sequence_packing_utils.compute_sequence_norm_weights(torch.zeros(32), [], [])
+    packed_numerator = packed_numerator + empty_weights.sum()
+
+    assert packed_count == unpacked_count
+    assert torch.allclose(packed_numerator / packed_count, unpacked_numerator / unpacked_count)
