@@ -126,8 +126,10 @@ if os.environ.get('PK3_TRACE') == '1' and os.environ.get('SLURM_PROCID') is not 
     sys.unraisablehook = _unraisable_hook
 
     # Flight recorder: signal-safe stack dumps + all-thread stacks every 30 s.
+    # Per-pid file: every python process on the rank (trainer, burn daemon, gym
+    # helpers) imports this hook, and a shared file interleaves their dumps.
     try:
-        _fr = open(os.path.join(_DIR, f'pk3_flight_r{_RANK}.log'), 'a')
+        _fr = open(os.path.join(_DIR, f'pk3_flight_r{_RANK}_p{os.getpid()}.log'), 'a')
         faulthandler.enable(file=_fr, all_threads=True)
         faulthandler.dump_traceback_later(30, repeat=True, file=_fr)
     except Exception:
