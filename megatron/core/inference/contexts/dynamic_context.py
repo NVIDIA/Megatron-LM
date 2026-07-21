@@ -603,7 +603,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # budget accounting agree. Bounded both by the token budget (one block
         # boundary per block_size_tokens) and by the request budget
         # (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST per request);
-        token_based_count = math.ceil(self.max_tokens / self.block_size_tokens) 
+        token_based_count = math.ceil(self.max_tokens / self.block_size_tokens)
         request_based_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
         self.max_mamba_intermediate_states_per_step = min(token_based_count, request_based_count)
 
