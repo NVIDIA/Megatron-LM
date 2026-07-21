@@ -404,19 +404,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
         self.block_size_tokens = inference_config.block_size_tokens
-
-        # Mamba prefix caching extracts intermediate SSM states at KV block
-        # boundaries, but the chunked-scan kernel only materializes those states
-        # at multiples of mamba_chunk_size. A block boundary is therefore only a
-        # valid extraction point when block_size_tokens is a multiple of
-        # mamba_chunk_size; otherwise most/all boundaries are silently skipped.
-        if self.is_hybrid_model:
-            assert self.block_size_tokens % self.mamba_chunk_size == 0, (
-                f"block_size_tokens ({self.block_size_tokens}) must be a multiple "
-                f"of mamba_chunk_size ({self.mamba_chunk_size}) so that KV block "
-                "boundaries coincide with Mamba SSM chunk boundaries."
-            )
-
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
             self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
@@ -614,9 +601,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Per-step upper bound on Mamba intermediate-state extractions, shared with
         # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
         # budget accounting agree. Bounded both by the token budget (one block
-        # boundary per block_size_tokens, +1 margin) and by the request budget
-        # (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST per request); the tighter wins.
-        token_based_count = math.ceil(self.max_tokens / self.block_size_tokens) + 1
+        # boundary per block_size_tokens) and by the request budget
+        # (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST per request);
+        token_based_count = math.ceil(self.max_tokens / self.block_size_tokens) 
         request_based_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
         self.max_mamba_intermediate_states_per_step = min(token_based_count, request_based_count)
 
