@@ -1,8 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 
 import torch
@@ -182,6 +182,11 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
+        # When True, the forward function runs under torch.no_grad() so no autograd
+        # graph / saved activations are retained. Used by the VPP-stage full recompute
+        # path (EP A2A overlap): the initial forward keeps only the stage input tensor
+        # and the whole stage is recomputed with grad enabled at backward time.
+        self.forward_no_grad = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -213,7 +218,12 @@ class ScheduleNode:
                     input.requires_grad = inputs[i].requires_grad
 
             data = tuple(self.inputs)
-            data = self.forward_func(*data)
+            # Under the VPP-stage full recompute path, the initial forward runs
+            # without building an autograd graph; the graph is rebuilt at backward
+            # time by re-running this same forward with grad enabled.
+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
+            with grad_ctx:
+                data = self.forward_func(*data)
 
             if not isinstance(data, tuple):
                 data = make_viewless(data)
