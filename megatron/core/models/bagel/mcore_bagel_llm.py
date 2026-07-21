@@ -285,7 +285,7 @@ class BagelMCoreModel(GPTModel):
         # For non-MoT: ce_loss_indexes index into global last_hidden_state as before.
         # Always compute CE so output_layer participates in backward (FSDP correctness).
         # labels/loss_mask are always tensors from the dataloader; zero loss_mask means
-        # CE contributes 0 to loss but output_layer.weight is still in the autograd graph.
+        # CE contributes 0 to loss but the effective LM-head weight is still in the graph.
         # Return raw per-token CE here. The training loss function applies
         # ce_loss_weights only when --ce-loss-reweighting is enabled, matching HF BAGEL.
         actual_Lund = len(packed_seq_params.local_und_token_indexes)
@@ -293,7 +293,10 @@ class BagelMCoreModel(GPTModel):
         logits_hidden_states = last_hidden_state[:actual_Lund][mask]
         # Keep the LM head on the standard GPTModel path so MCore FSDP/TP
         # hooks observe it and its FP32 main-weight initialization.
-        logits, _ = self.output_layer(logits_hidden_states)
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+        logits, _ = self.output_layer(logits_hidden_states, weight=output_weight)
         # can not use full logits for ce calc would cause a OOM when Lund is large.
         # output_layer is column-parallel: at TP>1 each rank holds vocab/TP
         # columns, so use vocab_parallel_cross_entropy which all-reduces
@@ -310,14 +313,16 @@ class BagelMCoreModel(GPTModel):
         ):
             audit_step = getattr(self, '_lm_head_alignment_audit_step', 0)
             self._lm_head_alignment_audit_step = audit_step + 1
-            output_weight = self.output_layer.weight
+            effective_output_weight = (
+                output_weight if output_weight is not None else self.output_layer.weight
+            )
             print(
                 '[BAGEL_LM_HEAD_ALIGNMENT_AUDIT] '
                 f'step={audit_step} ce_tokens={ce.numel()} '
                 f'hidden_sum={logits_hidden_states.float().sum().item():.9g} '
                 f'hidden_first10={logits_hidden_states.flatten()[:10].float().tolist()} '
-                f'weight_dtype={output_weight.dtype} '
-                f'weight_sum={output_weight.float().sum().item():.9g} '
+                f'weight_dtype={effective_output_weight.dtype} '
+                f'weight_sum={effective_output_weight.float().sum().item():.9g} '
                 f'logits_sum={logits.float().sum().item():.9g} '
                 f'ce_sum={ce.float().sum().item():.9g}',
                 flush=True,

@@ -344,7 +344,9 @@ class SelfAttentionMoT(MegatronModule):
         assert Lund + Lgen == seq_len, (
             f"MoT branch lengths ({Lund} + {Lgen}) must match sequence length {seq_len}"
         )
-        alignment_audit = layer_alignment_audit_enabled(self.layer_number)
+        # Keep the opt-in audit inert for lightweight helper-only test doubles.
+        # Fully constructed attention modules always carry a 1-based layer number.
+        alignment_audit = layer_alignment_audit_enabled(getattr(self, 'layer_number', 0))
 
         # =====================================================================
         # QKV projection with MoT (separate for und/gen)

@@ -387,7 +387,9 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         assert packed_seq_params is not None, "packed_seq_params required for MoT training"
         Lund = packed_seq_params.padded_und_seqlen
-        alignment_audit = layer_alignment_audit_enabled(self.layer_number)
+        # Keep the opt-in audit inert for lightweight helper-only test doubles.
+        # Fully constructed transformer layers always carry a 1-based layer number.
+        alignment_audit = layer_alignment_audit_enabled(getattr(self, 'layer_number', 0))
         if alignment_audit:
             audit_compact_tensor(
                 "layer_input",
@@ -624,7 +626,10 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else self.pre_mlp_layernorm
         )
         mlp_gen = self.mlp_gen if not isinstance(self.mlp_gen, IdentityOp) else self.mlp
-        alignment_audit = layer_alignment_audit_enabled(self.layer_number)
+        # Helper-focused tests construct this module without running __init__.
+        # Layer zero is not auditable, so it is a safe sentinel in that case.
+        audit_layer_number = getattr(self, 'layer_number', 0)
+        alignment_audit = layer_alignment_audit_enabled(audit_layer_number)
 
         def _run_und():
             x = (
@@ -643,7 +648,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             with audit_mlp_linears(
                 self.mlp,
                 branch="und",
-                layer_number=self.layer_number,
+                layer_number=audit_layer_number,
             ):
                 y = self.mlp(x)
             nvtx_range_pop(suffix="mlp_und")
@@ -672,7 +677,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             with audit_mlp_linears(
                 mlp_gen,
                 branch="gen",
-                layer_number=self.layer_number,
+                layer_number=audit_layer_number,
             ):
                 y = mlp_gen(x)
             nvtx_range_pop(suffix="mlp_gen")
