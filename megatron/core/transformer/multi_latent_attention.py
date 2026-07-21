@@ -143,6 +143,7 @@ class MultiLatentAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ) -> None:
         # TODO(nschank): Restructure so that the Attention initializer knows which specific
@@ -155,6 +156,7 @@ class MultiLatentAttention(Attention):
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
         self.config: MLATransformerConfig
@@ -482,6 +484,7 @@ class MLASelfAttention(MultiLatentAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
         name: str | None = None,
     ):
         if pg_collection is None:
@@ -496,6 +499,7 @@ class MLASelfAttention(MultiLatentAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
 
@@ -1232,6 +1236,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
@@ -1247,6 +1252,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
             pp_layer_offset=pp_layer_offset,
             name=name,
         )

@@ -146,6 +146,7 @@ class AbsorbedMLASelfAttention(Attention):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -160,6 +161,7 @@ class AbsorbedMLASelfAttention(Attention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"

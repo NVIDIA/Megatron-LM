@@ -323,6 +323,15 @@ def no_rope_freq_type(x):
         # it's a single int but in str
         return int(x)
 
+
+def compress_ratios_type(x):
+    """Parse per-layer compression ratios for compressed sparse attention."""
+    if isinstance(x, list):
+        return x
+    assert isinstance(x, str)
+    return _eval_pattern(x)
+
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -2071,6 +2080,7 @@ def _add_network_size_args(parser):
         "no_rope_freq",
         "moe_layer_freq",
         "linear_attention_freq",
+        "csa_compress_ratios",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -3245,6 +3255,11 @@ def _add_mla_args(parser):
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--o-groups', type=int, default=8,
+                       help="Number of groups for grouped low-rank output projection (wo_a).")
+    group.add_argument('--o-lora-rank', type=int, default=1024,
+                       help="Low-rank dimension per group for grouped output (wo_a). "
+                            "Used when o-groups > 0.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
     group.add_argument(
@@ -3269,6 +3284,15 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument(
+        '--csa-compress-ratios',
+        type=compress_ratios_type,
+        default=None,
+        help='Per-layer compress ratios for compressed sparse attention. '
+             'Accepts a Python list expression such as "[0,0,4,128,4,128]" or '
+             '"([0]+[4,128]*2)*3". Valid values are 0, 4, and 128, and the '
+             'list length must equal num_layers plus mtp_num_layers.',
+    )
     return parser
 
 def _add_heterogeneous_args(parser):

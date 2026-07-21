@@ -368,6 +368,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
             attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
+        if is_mtp_layer:
+            attention_optional_kwargs["is_mtp_layer"] = True
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
