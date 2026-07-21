@@ -323,22 +323,6 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
-def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
-    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
-
-    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
-    Before applying the chat template, we must inline those tags back into content.
-    """
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        reasoning_content = message.pop("reasoning_content", None)
-        if reasoning_content is not None:
-            content = message.get("content") or ""
-            message["content"] = f"<think>{reasoning_content}</think>{content}"
-    return messages
-
-
 def _replace_prefix_tokens(
     eos_token_id,
     previous_turn_token_ids,
@@ -410,7 +394,9 @@ try:
 
     bp = Blueprint('chat_completions_api', __name__)
 
-    def apply_parsers(message_text, tools, parsers_list, tools_requested):
+    def apply_parsers(
+        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
+    ):
         """Runs CPU-intensive text parsing."""
         meta = {}
         for parser in parsers_list:
@@ -418,7 +404,9 @@ try:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
             prev_text = message_text
-            parsed_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=tools)
+            parsed_text, new_info = PARSER_MAPPING[parser].parse(
+                message_text, tools=tools, chat_template_kwargs=chat_template_kwargs
+            )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
                     new_info.get("tool_calls", []), tools=tools
@@ -462,7 +450,6 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
-        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
@@ -592,6 +579,7 @@ try:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
+            ignore_eos = bool(req.get("ignore_eos", False))
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -602,6 +590,7 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                termination_id=-1 if ignore_eos else None,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
@@ -662,7 +651,16 @@ try:
         choices = []
         total_completion_tokens = 0
         prompt_tokens_counts = []
+        cached_tokens_counts = []
 
+        prevent_retokenization = req.get("prevent_retokenization", True)
+        # return_tokenized_data controls whether prompt/generation token ids are
+        # included in the response. It is independent of prevent_retokenization
+        # (a client may want token ids without prevent_retokenization, or vice versa),
+        # but prevent_retokenization implicitly requires token ids so the client
+        # can echo them back next turn.
+        return_tokenized_data = req.get("return_tokenized_data", False) or prevent_retokenization
+        return_raw_text = req.get("return_raw_text", False)
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
@@ -671,6 +669,7 @@ try:
             text_output = result["generated_text"]
             prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
+            cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
             logprobs_content = None
             if sampling_params.return_log_probs:
@@ -711,7 +710,11 @@ try:
 
             if parsers:
                 message_text, metadata = apply_parsers(
-                    message_text, tools, parsers, tools_requested
+                    message_text,
+                    tools,
+                    parsers,
+                    tools_requested,
+                    chat_template_kwargs=chat_template_kwargs,
                 )
 
             normalized_tool_calls = metadata.get("tool_calls", [])
@@ -736,9 +739,14 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            # Replicate data in the message field for compatibility.
-            message["prompt_token_ids"] = result["prompt_tokens"]
-            message["generation_token_ids"] = result["generated_tokens"]
+            if return_tokenized_data:
+                message["prompt_token_ids"] = result["prompt_tokens"]
+                message["generation_token_ids"] = result["generated_tokens"]
+            if return_raw_text:
+                prompt_str = tokenizer.detokenize(result["prompt_tokens"])
+                message["raw_text"] = prompt_str + text_output
+            # Small RL/debug scalars (a few bytes each); harmless to keep for
+            # NeMo-RL compatibility.
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             message["policy_epoch"] = result["policy_epoch"]
             message["kv_cache_epoch"] = result["kv_cache_epoch"]
@@ -759,15 +767,13 @@ try:
             else:
                 finish_reason = "stop"
 
+            # Choice-level prompt/generation_token_ids, generation_log_probs and
+            # raw_text were duplicates of message-level data (or reconstructable);
+            # dropped to match vLLM's response shape and cut payload size.
             choice_data = {
                 "index": request_idx,
                 "message": message,
-                "prompt_token_ids": result["prompt_tokens"],
-                "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
-                "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
-                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
@@ -782,7 +788,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if choice_data["generation_log_probs"] is None:
+            if result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),
@@ -791,6 +797,7 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
+        cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "created": int(time.time()),
@@ -801,6 +808,7 @@ try:
                 "prompt_tokens": prompt_token_count,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": prompt_token_count + total_completion_tokens,
+                "prompt_tokens_details": {"cached_tokens": cached_token_count},
             },
         }
 
