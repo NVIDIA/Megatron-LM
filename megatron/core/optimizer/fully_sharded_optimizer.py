@@ -76,7 +76,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         if config.use_precision_aware_optimizer:
             raise ValueError("MFSDP v2 does not currently support precision-aware optimizer.")
         if config.use_layer_wise_distributed_optimizer:
-            raise ValueError("MFSDP v2 does not currently support layer-wise distributed optimizer.")
+            raise ValueError(
+                "MFSDP v2 does not currently support layer-wise distributed optimizer."
+            )
         if config.optimizer_cuda_graph:
             raise ValueError("MFSDP v2 does not currently support optimizer CUDA graphs.")
 

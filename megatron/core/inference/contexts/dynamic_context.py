@@ -662,12 +662,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
-        # capped at max_requests * (num_speculative_tokens + 1) inside the helper; this
-        # only widens the prefill/mixed range when `cuda_graph_all_prefills` is set.
+        # capped at max_requests * (num_speculative_tokens + 1) inside the helper. By
+        # default the prefill/mixed range is bounded by `cuda_graph_max_tokens`, clamped
+        # to never fall below that decode bound nor exceed `max_tokens`; setting
+        # `cuda_graph_all_prefills` widens the range to the full `max_tokens`.
+        decode_bound = self.max_requests * (self.num_speculative_tokens + 1)
         cuda_graph_max_tokens = (
             self.max_tokens
             if inference_config.cuda_graph_all_prefills
-            else self.max_requests * (self.num_speculative_tokens + 1)
+            else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
         )
 
         # CUDA graph config list.
@@ -1281,6 +1284,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+        self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -2166,7 +2170,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
-    ) -> None:
+        transfer_bookkeeping_to_gpu: bool = True,
+        record_bookkeeping_done_event: bool = False,
+    ) -> Optional[torch.cuda.Event]:
         """Initialize attention state so that every layer can use it.
 
         Args:
@@ -2174,8 +2180,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 The graph config to use for constructing the cuda graphs.
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
-        Return:
-            None.
+            transfer_bookkeeping_to_gpu (bool): Whether to publish the prepared
+                CPU bookkeeping snapshot to GPU before returning. Legacy
+                callers publish immediately; async scheduling binds the GPU
+                views here and publishes their values later.
+            record_bookkeeping_done_event (bool): Whether to record an event
+                after the bookkeeping H2D transfer.
+
+        Returns:
+            Optional[torch.cuda.Event]: Event marking bookkeeping H2D
+                completion, or `None` when no event was requested or no
+                transfer was performed.
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
@@ -2420,12 +2435,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             construct_graph_dimensions is not None or is_expert_parallel_dummy_cuda_graph_step
         )
 
-        # Run the H2D transfer here so callers that bypass the controller
-        # (e.g. unit tests that call `model.forward()` directly after
-        # `initialize_attention_state()`) see populated GPU bookkeeping. The
-        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
-        # explicitly; that second call is a cheap idempotent re-copy.
-        self.transfer_bookkeeping_to_gpu()
+        # Preserve the existing behavior for callers that do not publish explicitly.
+        if transfer_bookkeeping_to_gpu:
+            return self.transfer_bookkeeping_to_gpu(record_done_event=record_bookkeeping_done_event)
+        return None
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2451,18 +2464,33 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(
+        self, skip_token_input_ids: bool = False, record_done_event: bool = False
+    ) -> Optional[torch.cuda.Event]:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
-        Called after initialize_attention_state() and before the forward pass.
-        All copies use non_blocking=True with pinned CPU memory. CUDA stream
-        ordering guarantees the forward pass sees completed transfers.
+        Legacy steps call this from initialize_attention_state(). Async
+        scheduling instead delays publication until after preparation and the
+        GPU sample-to-input copy. Legacy transfers block because the pinned CPU
+        source is re-staged in place. Async scheduling requests an event-tracked
+        non-blocking copy and synchronizes that event before reusing the source.
 
         The bookkeeping fields are backed by one contiguous pinned CPU buffer
-        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
-        Request-level staging slots are refreshed from the persistent CPU
-        tensors immediately before the H2D (GPU reads them at `[:n_active]`
+        and one contiguous GPU buffer; a single memcpy covers the whole
+        transfer. Request-level staging slots are refreshed from the persistent
+        CPU tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+
+        Args:
+            skip_token_input_ids (bool): If true, leave
+                `gpu_view.token_to_input_ids` unchanged while copying the rest
+                of the bookkeeping buffer.
+            record_done_event (bool): Whether to record and return an event after
+                an asynchronous bookkeeping transfer.
+
+        Returns:
+            Optional[torch.cuda.Event]: Event marking H2D completion, or `None`
+                when no event was requested.
         """
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -2505,11 +2533,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             0 if self._bookkeeping_no_real_work else self.batch_dimensions.token_count
         )
 
-        # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
+        # Coalesced H2D: one copy for the entire bookkeeping buffer.
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
-        # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        # redundant launch overheads vs. per-field copies. Async scheduling
+        # decode steps skip token_to_input_ids here because sampled tokens are
+        # already GPU-resident and copied directly into the GPU input buffer.
+        if skip_token_input_ids:
+            token_to_input_ids_offset = (
+                self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
+            )
+        else:
+            token_to_input_ids_offset = 0
+        # Only event-tracked callers may leave the copy in flight; legacy callers
+        # block before the pinned CPU source can be re-staged.
+        self.gpu_view._buf[token_to_input_ids_offset:].copy_(
+            self._cpu_bookkeeping_buf[token_to_input_ids_offset:], non_blocking=record_done_event
+        )
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -2519,6 +2559,35 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+        done_event = None
+        if record_done_event:
+            done_event = self._bookkeeping_h2d_done_event
+            done_event.record(torch.cuda.current_stream())
+
+        return done_event
+
+    def copy_async_sched_sample_to_forward(self, sampled_tokens_cuda: Tensor) -> None:
+        """Populate GPU input token IDs from sampled CUDA tokens for async scheduled decode.
+
+        Async scheduling keeps sampled tokens GPU-resident for the next decode
+        forward. CPU bookkeeping is prepared independently and published later;
+        this direct GPU copy populates the live input-ID view without waiting
+        for the sample's CPU copy.
+
+        Args:
+            sampled_tokens_cuda (Tensor): 1D CUDA tensor containing one sampled
+                token per active decode request.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+
+        self.gpu_view.token_to_input_ids[:active_request_count].copy_(
+            sampled_tokens_cuda, non_blocking=True
+        )
+        if active_request_count < self.padded_active_token_count:
+            self.gpu_view.token_to_input_ids[
+                active_request_count : self.padded_active_token_count
+            ].zero_()
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
@@ -2956,10 +3025,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # Track prefix cache hits.
+        # Track prefix cache hits. num_cached_tokens accumulates across prefill
+        # chunks: each chunk matches a disjoint block range (start advances with
+        # finished_chunk_token_count), so a long cached prefix is discovered
+        # incrementally and must be summed, not overwritten.
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
+            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
@@ -3441,20 +3514,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
-    def prepare_requests(self, new_tokens: Tensor) -> None:
+    def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
 
         Async scheduling only supports decode-only steps with no pause,
         evict, or resume lifecycle changes. If preparing the next token would
         require one of those lifecycle changes, this method raises and the caller
         should treat async scheduling as unsupported for that workload.
-
-        Args:
-            new_tokens (Tensor): Newly sampled token for each active request.
         """
-        if new_tokens.is_cuda:
-            new_tokens = new_tokens.cpu()
-
         active_request_count = self.total_request_count - self.paused_request_count
         if self.num_speculative_tokens != 0:
             raise RuntimeError("Async scheduling does not support speculative tokens.")
@@ -3462,10 +3529,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
-        if new_tokens.numel() != active_request_count:
-            raise RuntimeError(
-                f"Expected {active_request_count} new tokens, got {new_tokens.numel()}."
-            )
 
         if active_request_count == 0:
             self.active_token_count = 0
@@ -3499,7 +3562,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) % self.block_size_tokens
 
         self.active_token_count = active_request_count
-        self.token_to_input_ids[:active_request_count] = new_tokens
         self.token_to_pos_ids[:active_request_count] = self.request_kv_length_offsets[active_slice]
         self.token_to_request_idx[:active_request_count] = torch.arange(
             active_request_count, device='cpu'
@@ -3511,6 +3573,28 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_pos_ids[:active_request_count] % self.block_size_tokens
         )
         self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
+
+    def commit_sampled_tokens(self, sampled_tokens_cpu: Tensor) -> None:
+        """Commit sampled CPU token IDs to the prepared request state.
+
+        This updates the CPU source of truth used by resolution. Async
+        scheduling has already copied the same samples into the live GPU input
+        view for the speculative forward.
+
+        Args:
+            sampled_tokens_cpu (Tensor): Sampled CPU token for each active request.
+        """
+        assert sampled_tokens_cpu.device == torch.device(
+            'cpu'
+        ), "Sampled tokens must be on the CPU before they are committed."
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        if sampled_tokens_cpu.numel() != active_request_count:
+            raise RuntimeError(
+                f"Expected {active_request_count} new tokens, got {sampled_tokens_cpu.numel()}."
+            )
+
+        self.token_to_input_ids[:active_request_count] = sampled_tokens_cpu
 
     def resolve_requests(self, active_requests_mask: Tensor) -> Tensor:
         """Resolve finished requests after an async scheduling forward pass.
