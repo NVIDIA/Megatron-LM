@@ -54,7 +54,7 @@ for p in [_ROOT, _BAGEL_PKG, _BAGEL_SRC]:
         sys.path.insert(0, p)
 
 from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
-from megatron.core.models.bagel.bagel_mimo import align_bagel_embeddings
+from megatron.core.models.bagel.bagel_mimo import align_bagel_embeddings, gather_pad_to_length
 from megatron.core.models.bagel.flex_attention import FlexAttention
 from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
@@ -102,15 +102,15 @@ def _align_and_shard(
     Lund = psp.padded_und_seqlen
     Lgen = psp.padded_gen_seqlen
 
-    def _gp(src, idx, tlen):
-        g = src[idx]
-        n = tlen - len(g)
-        return torch.cat([g, g[-1:].expand(n)]) if n > 0 else g
-
     aligned['labels'] = labels_full[und] if labels_full is not None else None
     aligned['loss_mask'] = loss_mask_full[und] if loss_mask_full is not None else None
     aligned['packed_position_ids'] = (
-        torch.cat([_gp(packed_position_ids, und, Lund), _gp(packed_position_ids, gen, Lgen)])
+        torch.cat(
+            [
+                gather_pad_to_length(packed_position_ids, und, Lund),
+                gather_pad_to_length(packed_position_ids, gen, Lgen),
+            ]
+        )
         if packed_position_ids is not None
         else None
     )
@@ -278,7 +278,7 @@ def _restore_cp_groups(saved):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BagelMatchingAttention — identical to test_transformer_mot_block.py
-# Used for accurate Qwen2 comparison (SDPA-based, fp16).
+# Used for accurate Qwen2 comparison (SDPA-based, bf16 kernel with fp16 output).
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -315,13 +315,13 @@ class BagelMatchingAttention(MegatronModule):
             n_groups = num_heads // num_kv_heads
             key = key.repeat_interleave(n_groups, dim=2)
             value = value.repeat_interleave(n_groups, dim=2)
-        q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
-        k = key.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
-        v = value.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
-        mask = torch.zeros(1, 1, seq_len, seq_len, dtype=torch.float16, device=query.device)
+        q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+        k = key.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+        v = value.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+        mask = torch.zeros(1, 1, seq_len, seq_len, dtype=torch.bfloat16, device=query.device)
         with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
             out = F_sdpa(q, k, v, mask)
-        out = out.squeeze(0).permute(1, 0, 2).contiguous()
+        out = out.to(query.dtype).squeeze(0).permute(1, 0, 2).contiguous()
         return out.reshape(seq_len, batch_size, num_heads * head_dim)
 
 
@@ -642,7 +642,10 @@ def _check_vs_qwen2(T: int, V: int, G: int, label: str):
     _, mcore_rope, bagel_cos_sin = _identity_rope(seq_len)
     _patch_bagel_rope(bagel_model, bagel_cos_sin)
 
-    with torch.no_grad():
+    # The Bagel reference casts SDPA inputs to bf16 internally while its
+    # output projection remains fp16. Its training path relies on autocast to
+    # reconcile those dtypes before the projection.
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         bagel_out = bagel_model.forward_train(
             packed_sequence=compact,
             sample_lens=[seq_len],
@@ -651,6 +654,7 @@ def _check_vs_qwen2(T: int, V: int, G: int, label: str):
             packed_und_token_indexes=und_idx,
             packed_gen_token_indexes=gen_idx,
         )
+    with torch.no_grad():
         mcore_out, _ = mcore_block.forward_train(
             hidden_states=compact.unsqueeze(1),
             attention_mask=None,
@@ -703,36 +707,42 @@ def run_cp2_parity(
     local_und_idx = und_idx[rank * Lund : rank * Lund + actual_lund]
     local_gen_idx = gen_idx[rank * Lgen : rank * Lgen + actual_lgen]
 
-    # Pad to Lund / Lgen if last rank has fewer tokens
-    def _pad_idx(idx, target_len):
-        n_pad = target_len - len(idx)
-        if n_pad > 0:
-            idx = torch.cat([idx, idx[-1:].expand(n_pad)])
-        return idx
-
-    local_und_idx_pad = _pad_idx(local_und_idx, Lund)
-    local_gen_idx_pad = _pad_idx(local_gen_idx, Lgen)
-
     psp_cp1 = _make_psp(und_idx, gen_idx)
     psp_cpN = _make_psp(
         und_idx,
         gen_idx,
-        local_und_idx=local_und_idx_pad,
-        local_gen_idx=local_gen_idx_pad,
+        local_und_idx=local_und_idx,
+        local_gen_idx=local_gen_idx,
         Lund=Lund,
         Lgen=Lgen,
     )
 
-    full_3d = packed_seq.unsqueeze(1)  # [S, 1, H]
+    # _forward_decoder consumes the compact, already CP-sharded layout.
+    compact_cp1 = torch.cat([packed_seq[und_idx], packed_seq[gen_idx]], dim=0).unsqueeze(1)
+    compact_pos_cp1 = torch.cat([pos_ids[und_idx], pos_ids[gen_idx]])
+    compact_cpN = torch.cat(
+        [
+            gather_pad_to_length(packed_seq, local_und_idx, Lund),
+            gather_pad_to_length(packed_seq, local_gen_idx, Lgen),
+        ],
+        dim=0,
+    ).unsqueeze(1)
+    compact_pos_cpN = torch.cat(
+        [
+            gather_pad_to_length(pos_ids, local_und_idx, Lund),
+            gather_pad_to_length(pos_ids, local_gen_idx, Lgen),
+        ],
+        dim=0,
+    )
 
     # ── CP=1 reference: temporarily null out CP groups (no A2A) ─────────────
     saved = _swap_cp_groups(model_cpN, cp_group=None, cp_size=1)
     with torch.no_grad():
         ref_out = model_cpN._forward_decoder(
-            decoder_input=full_3d,
+            decoder_input=compact_cp1,
             position_ids=None,
             attention_mask=block_mask,
-            packed_position_ids=pos_ids,
+            packed_position_ids=compact_pos_cp1,
             packed_seq_params=psp_cp1,
         )
     _restore_cp_groups(saved)
@@ -743,10 +753,10 @@ def run_cp2_parity(
     # ── CP=N run (restore cp_group, run with A2A) ─────────────────────────
     with torch.no_grad():
         cpN_out = model_cpN._forward_decoder(
-            decoder_input=full_3d,
+            decoder_input=compact_cpN,
             position_ids=None,
             attention_mask=block_mask,
-            packed_position_ids=pos_ids,
+            packed_position_ids=compact_pos_cpN,
             packed_seq_params=psp_cpN,
         )
     if isinstance(cpN_out, tuple):
@@ -796,11 +806,11 @@ def run_cp2_parity(
 # Interface (Phase 6): forward() receives full-sequence labels [S] / loss_mask [S]
 # and slices internally by local_und_token_indexes.
 #
-# Three sub-checks:
-#   a. Values match:  ce[ce_mask] == F.cross_entropy(logits[ce_mask], packed_labels)
-#                     and ce == 0 at non-CE positions.
-#   b. None when no labels/loss_mask are supplied.
-#   c. Zero CE when loss_mask is all-zero.
+# Two sub-checks:
+#   a. Values match: ce == F.cross_entropy(logits[ce_mask], packed_labels).
+#   b. The sparse CE output is empty when loss_mask is all-zero.  Labels and
+#      loss_mask are required inputs so the LM head always participates in the
+#      graph, including batches without active CE tokens.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -906,14 +916,10 @@ def _check_ce_loss(model: BagelMCoreModel, T: int, V: int, G: int, L_ce: int, la
             msg=lambda m: f"[ce_loss/{label}] CE at active positions: {m}",
         )
 
-    # ── (b) CE is None when labels / loss_mask not supplied ──────────────────
-    assert _run(None, None)["ce"] is None, f"[{label}] ce should be None with no labels"
-
-    # ── (c) All-zero CE when loss_mask is all zeros ───────────────────────────
+    # ── (b) Empty sparse CE when loss_mask is all zeros ───────────────────────
     zero_lm = torch.zeros(S, dtype=torch.float16, device=device)
-    assert torch.all(
-        _run(labels_full, zero_lm)["ce"] == 0
-    ), f"[{label}] ce should be zero when loss_mask=0"
+    zero_ce = _run(labels_full, zero_lm)["ce"]
+    assert zero_ce.shape == (0,), f"[{label}] ce should be empty when loss_mask=0"
 
     print(
         f"  [ce_loss  {label:12s}] PASS  U={U} G={len(gen_idx)} L_ce={L_ce}"
@@ -964,16 +970,14 @@ def run_ce_cp2_parity(
     actual_lund = min(Lund, max(0, U - rank * Lund))
     actual_lgen = min(Lgen, max(0, Gsize - rank * Lgen))
 
-    def _pad_idx(idx, tlen):
-        n = tlen - len(idx)
-        return torch.cat([idx, idx[-1:].expand(n)]) if n > 0 else idx
-
+    local_und_idx = und_idx[rank * Lund : rank * Lund + actual_lund]
+    local_gen_idx = gen_idx[rank * Lgen : rank * Lgen + actual_lgen]
     psp_cp1 = _make_psp(und_idx, gen_idx)
     psp_cpN = _make_psp(
         und_idx,
         gen_idx,
-        local_und_idx=_pad_idx(und_idx[rank * Lund : rank * Lund + actual_lund], Lund),
-        local_gen_idx=_pad_idx(gen_idx[rank * Lgen : rank * Lgen + actual_lgen], Lgen),
+        local_und_idx=local_und_idx,
+        local_gen_idx=local_gen_idx,
         Lund=Lund,
         Lgen=Lgen,
     )
@@ -1027,7 +1031,7 @@ def run_ce_cp2_parity(
             loss_mask=aligned_cp1['loss_mask'],
         )
     _restore_cp_groups(saved)
-    ref_ce = ref_out["ce"]  # [U]: non-zero only at CE positions
+    ref_ce = ref_out["ce"]  # Sparse CE values in global und-token order.
 
     # ── CP=N run ─────────────────────────────────────────────────────────────
     aligned_cpN = _align_and_shard(psp=psp_cpN, **embed_kwargs)
@@ -1040,14 +1044,18 @@ def run_ce_cp2_parity(
             labels=aligned_cpN['labels'],
             loss_mask=aligned_cpN['loss_mask'],
         )
-    local_ce = cpN_out["ce"]  # [actual_lund]: this rank's CE slice
+    local_ce = cpN_out["ce"]  # Sparse CE values for this rank's und-token slice.
 
     dist.barrier()
 
-    # ── Check i: per-rank CE matches the same slice of the CP=1 reference ────
-    # ref_ce[r*Lund : r*Lund + actual_lund] corresponds to this rank's real tokens.
-    ref_slice = ref_ce[rank * Lund : rank * Lund + actual_lund]  # [actual_lund]
-    local_slice = local_ce[:actual_lund]  # [actual_lund]
+    # ── Check i: per-rank sparse CE matches the CP=1 active-token subset ─────
+    active_und_positions = torch.nonzero(loss_mask_full[und_idx] > 0, as_tuple=False).flatten()
+    shard_start = rank * Lund
+    shard_end = shard_start + actual_lund
+    active_on_rank = (active_und_positions >= shard_start) & (active_und_positions < shard_end)
+    ref_slice = ref_ce[active_on_rank]
+    local_slice = local_ce
+    assert local_slice.shape == ref_slice.shape
     torch.testing.assert_close(
         local_slice.float(),
         ref_slice.float(),
@@ -1068,7 +1076,7 @@ def run_ce_cp2_parity(
         msg=lambda m: f"[ce_cp2/{label} rank={rank}] total CE: {m}",
     )
 
-    err = (local_slice - ref_slice).abs().max().item()
+    err = (local_slice - ref_slice).abs().max().item() if local_slice.numel() else 0.0
     print(
         f"  [ce_cp2   {label:8s} rank={rank}] PASS  "
         f"U={U} G={Gsize} L_ce={L_ce}  Lund={Lund}  "

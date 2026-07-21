@@ -180,6 +180,13 @@ class _BagelMimoTestModel(BagelMimoModel):
         self.cp_size = parallel_state.get_context_parallel_world_size()
         self.cp_rank = parallel_state.get_context_parallel_rank()
         self.cp_group = parallel_state.get_context_parallel_group()
+        # This test compares the hidden-state path, not the last-stage CE/MSE
+        # heads. Use the pipeline intermediate-output contract so forward()
+        # returns the compact [seq, 1, hidden] activation directly.
+        self.pre_process = True
+        self.post_process = False
+        self.vp_stage = None
+        self.language_model.post_process = False
 
         submodules = {}
         if diffusion_submodule is not None:
@@ -315,11 +322,23 @@ def _copy_mlp_weights(hf_mlp, mc_mlp):
     mc_mlp.linear_fc2.weight.data.copy_(hf_mlp.down_proj.weight.data)
 
 
+def _mcore_pre_mlp_norm_weight(mcore_layer, branch):
+    explicit_norm = getattr(mcore_layer, f"pre_mlp_layernorm{branch}")
+    if hasattr(explicit_norm, "weight"):
+        return explicit_norm.weight
+    mcore_mlp = getattr(mcore_layer, f"mlp{branch}")
+    if hasattr(mcore_mlp.linear_fc1, "layer_norm_weight"):
+        return mcore_mlp.linear_fc1.layer_norm_weight
+    raise AttributeError(f"Cannot locate the{branch or ' understanding'} pre-MLP norm weight")
+
+
 def _copy_layer_weights(hf_layer, mc_layer):
     mc_layer.input_layernorm.weight.data.copy_(hf_layer.input_layernorm.weight.data)
     mc_layer.input_layernorm_gen.weight.data.copy_(hf_layer.input_layernorm_moe_gen.weight.data)
-    mc_layer.pre_mlp_layernorm.weight.data.copy_(hf_layer.post_attention_layernorm.weight.data)
-    mc_layer.pre_mlp_layernorm_gen.weight.data.copy_(
+    _mcore_pre_mlp_norm_weight(mc_layer, "").data.copy_(
+        hf_layer.post_attention_layernorm.weight.data
+    )
+    _mcore_pre_mlp_norm_weight(mc_layer, "_gen").data.copy_(
         hf_layer.post_attention_layernorm_moe_gen.weight.data
     )
     _copy_attn_weights(hf_layer.self_attn, mc_layer.self_attention)
@@ -488,6 +507,7 @@ def _check_text_only_parity(T: int, label: str):
         return out
 
     mimo_batch = _to_cuda(mimo_batch)
+    mimo_batch = get_packed_seq_params(mimo_batch)
 
     # Move packed_seq_params tensors to CUDA
     psp = mimo_batch["packed_seq_params"]
@@ -505,7 +525,7 @@ def _check_text_only_parity(T: int, label: str):
     mimo_model = _BagelMimoTestModel(mcore_llm)
 
     with torch.no_grad():
-        lm_output, _ = mimo_model.forward(
+        lm_output = mimo_model.forward(
             input_ids=mimo_batch["input_ids"],
             packed_position_ids=mimo_batch["packed_position_ids"],
             sequence_length=mimo_batch["sequence_length"],
@@ -515,8 +535,8 @@ def _check_text_only_parity(T: int, label: str):
             packed_seq_params=psp,
         )
 
-    # last_hidden_state is compact [Lund+Lgen=T, H] for text-only CP=1
-    got = lm_output["last_hidden_state"]  # [T, H]
+    # Intermediate output is compact [Lund+Lgen=T, 1, H] for text-only CP=1.
+    got = lm_output.squeeze(1)
 
     # ── 6. Compare ────────────────────────────────────────────────────────────
     text_idx = packed_batch["packed_text_indexes"].to(device)
@@ -589,7 +609,7 @@ def _check_text_and_gen_parity(T: int, G: int, label: str):
         _sparse, B=1, H=NUM_HEADS, Q_LEN=S, KV_LEN=S, device=device, BLOCK_SIZE=128, _compile=True
     )
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         ref_hidden = hf_qwen.forward_train(
             packed_sequence=packed_seq,
             sample_lens=packed_batch["sample_lens"],
@@ -605,10 +625,9 @@ def _check_text_and_gen_parity(T: int, G: int, label: str):
     mimo_batch = bagel_packed_batch_to_mimo_batch(text_only_batch)
 
     # Extend mimo_batch with gen token indexes so packed_seq_params includes them
-    psp = get_packed_seq_params(
-        packed_text_indexes=packed_batch["packed_text_indexes"],
-        packed_vit_token_indexes=None,
-        packed_vae_token_indexes=packed_batch["packed_vae_token_indexes"],
+    psp = _build_packed_seq_params(
+        packed_batch["packed_text_indexes"],
+        vae_indexes=packed_batch["packed_vae_token_indexes"],
     )
 
     def _to_cuda(batch):
@@ -637,7 +656,7 @@ def _check_text_and_gen_parity(T: int, G: int, label: str):
     mimo_model = _BagelMimoTestModel(mcore_llm, diffusion_submodule=mock_diffusion)
 
     with torch.no_grad():
-        lm_output, _ = mimo_model.forward(
+        lm_output = mimo_model.forward(
             input_ids=mimo_batch["input_ids"],
             packed_position_ids=torch.cat(
                 [pos_ids[text_idx], pos_ids[vae_idx]]
@@ -650,7 +669,7 @@ def _check_text_and_gen_parity(T: int, G: int, label: str):
             packed_seq_params=psp,
         )
 
-    got = lm_output["last_hidden_state"]  # [T+G, H] compact
+    got = lm_output.squeeze(1)  # [T+G, H] compact
 
     # ── 6. Compare at text positions (und) and gen positions ──────────────────
     atol = rtol = 1e-2
@@ -729,6 +748,16 @@ def _move_psp_to_device(psp, device):
         if t is not None:
             setattr(psp, attr, t.to(device))
     return psp
+
+
+def _build_packed_seq_params(text_indexes, vit_indexes=None, vae_indexes=None):
+    """Build MoT metadata through the current Bagel data-preparation API."""
+    index_batch = {"packed_text_indexes": text_indexes}
+    if vit_indexes is not None:
+        index_batch["packed_vit_token_indexes"] = vit_indexes
+    if vae_indexes is not None:
+        index_batch["packed_vae_token_indexes"] = vae_indexes
+    return get_packed_seq_params(index_batch)["packed_seq_params"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -829,7 +858,7 @@ def _check_diffusion_module_parity(T: int, G: int, label: str):
     pos_ids = packed_batch["packed_position_ids"].to(device)
     block_mask = _build_block_mask(packed_batch, S, device)
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         ref_hidden = hf_qwen.forward_train(
             packed_sequence=packed_seq,
             sample_lens=packed_batch["sample_lens"],
@@ -840,17 +869,16 @@ def _check_diffusion_module_parity(T: int, G: int, label: str):
         )  # [S, H]
 
     # ── 6. BagelMimoModel with _TestDiffusionSubmodule ────────────────────────
-    psp = get_packed_seq_params(
-        packed_text_indexes=packed_batch["packed_text_indexes"],
-        packed_vit_token_indexes=None,
-        packed_vae_token_indexes=packed_batch["packed_vae_token_indexes"],
+    psp = _build_packed_seq_params(
+        packed_batch["packed_text_indexes"],
+        vae_indexes=packed_batch["packed_vae_token_indexes"],
     )
     _move_psp_to_device(psp, device)
 
     mimo_model = _BagelMimoTestModel(mcore_llm, diffusion_submodule=test_diff)
 
     with torch.no_grad():
-        lm_output, _ = mimo_model.forward(
+        lm_output = mimo_model.forward(
             input_ids=packed_batch["packed_text_ids"].unsqueeze(0).to(device),
             packed_position_ids=pos_ids,
             sequence_length=S,
@@ -867,7 +895,7 @@ def _check_diffusion_module_parity(T: int, G: int, label: str):
             packed_seq_params=psp,
         )
 
-    got = lm_output["last_hidden_state"]  # [T+G, H] compact
+    got = lm_output.squeeze(1)  # [T+G, H] compact
 
     # ── 7. Compare ────────────────────────────────────────────────────────────
     atol = rtol = 1e-2
@@ -980,7 +1008,7 @@ def _check_vit_module_parity(T: int, V: int, label: str):
     block_mask = _build_block_mask(packed_batch, S, device)
     und_idx = torch.cat([text_idx, vit_idx])  # [T+V] all und tokens
 
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         ref_hidden = hf_qwen.forward_train(
             packed_sequence=packed_seq,
             sample_lens=packed_batch["sample_lens"],
@@ -991,17 +1019,16 @@ def _check_vit_module_parity(T: int, V: int, label: str):
         )  # [S, H]
 
     # ── 6. BagelMimoModel with _TestVitSubmodule ──────────────────────────────
-    psp = get_packed_seq_params(
-        packed_text_indexes=packed_batch["packed_text_indexes"],
-        packed_vit_token_indexes=packed_batch["packed_vit_token_indexes"],
-        packed_vae_token_indexes=None,
+    psp = _build_packed_seq_params(
+        packed_batch["packed_text_indexes"],
+        vit_indexes=packed_batch["packed_vit_token_indexes"],
     )
     _move_psp_to_device(psp, device)
 
     mimo_model = _BagelMimoTestModel(mcore_llm, images_submodule=test_vit)
 
     with torch.no_grad():
-        lm_output, _ = mimo_model.forward(
+        lm_output = mimo_model.forward(
             input_ids=packed_batch["packed_text_ids"].unsqueeze(0).to(device),
             packed_position_ids=pos_ids,
             sequence_length=S,
@@ -1017,7 +1044,7 @@ def _check_vit_module_parity(T: int, V: int, label: str):
             packed_seq_params=psp,
         )
 
-    got = lm_output["last_hidden_state"]  # [T+V, H] compact (all und, no gen)
+    got = lm_output.squeeze(1)  # [T+V, H] compact (all und, no gen)
 
     # ── 7. Compare at text positions and ViT positions ────────────────────────
     atol = rtol = 1e-2

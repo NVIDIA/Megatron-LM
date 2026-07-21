@@ -9,18 +9,20 @@ from typing import Optional
 
 import torch
 
-from megatron.core.extensions.transformer_engine import (
-    TEColumnParallelLinear,
-    TERowParallelLinear,
-)
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+from megatron.core.models.bagel.flex_attention import FlexAttention
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.bagel.flex_attention import FlexAttention
+
 # from bagel.modeling.bagel import Qwen2Config
+
+
+def gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
+    """Apply the tanh-approximated GELU used by native BAGEL connectors."""
+
+    return torch.nn.functional.gelu(x, approximate="tanh")
 
 
 def get_bagel_language_model_config(
@@ -46,6 +48,7 @@ def get_bagel_language_model_config(
     # Normalisation – RMSNorm
     cfg.normalization = "RMSNorm"
     cfg.rms_norm_eps = hf_config.rms_norm_eps
+    cfg.layernorm_epsilon = hf_config.rms_norm_eps
 
     # Positional embeddings – RoPE.
     cfg.position_embedding_type = "rope"
@@ -53,7 +56,7 @@ def get_bagel_language_model_config(
     cfg.rotary_percent = 1.0
 
     # Sequence length.
-    cfg.seq_length = 4096
+    cfg.seq_length = 36864
     cfg.max_position_embeddings = 32768
 
     # Attention / dropout.
@@ -68,7 +71,7 @@ def get_bagel_language_model_config(
     cfg.add_qkv_bias = True
 
     # Weight sharing.
-    cfg.untie_embeddings_and_output_weights = hf_config.tie_word_embeddings
+    cfg.untie_embeddings_and_output_weights = not hf_config.tie_word_embeddings
 
     # Kernel / TE fusions.
     cfg.bias_activation_fusion = True
@@ -141,6 +144,7 @@ def get_bagel_language_model_config_qwen3_30b(
     # Normalisation – RMSNorm.
     cfg.normalization = "RMSNorm"
     cfg.rms_norm_eps = hf_config.rms_norm_eps
+    cfg.layernorm_epsilon = hf_config.rms_norm_eps
 
     # Positional embeddings – RoPE.
     # Qwen3 uses rope_theta=10_000_000 (10× larger than Qwen2's 1_000_000).
@@ -164,7 +168,7 @@ def get_bagel_language_model_config_qwen3_30b(
     cfg.add_qkv_bias = False
 
     # Weight sharing.
-    cfg.untie_embeddings_and_output_weights = hf_config.tie_word_embeddings
+    cfg.untie_embeddings_and_output_weights = not hf_config.tie_word_embeddings
 
     # Kernel / TE fusions.
     cfg.bias_activation_fusion = True
@@ -231,9 +235,9 @@ def get_bagel_projection_config(
 
     cfg = TransformerConfig(num_layers=1, hidden_size=hidden_size, num_attention_heads=1)
     cfg.ffn_hidden_size = ffn_hidden_size
-    cfg.bias_activation_fusion = True
+    cfg.bias_activation_fusion = False
     cfg.add_bias_linear = True
-    cfg.activation_func = torch.nn.functional.gelu
+    cfg.activation_func = gelu_pytorch_tanh
 
     cfg.bf16 = True
 
@@ -257,13 +261,27 @@ def get_bagel_language_layer_spec(num_experts: Optional[int] = None,
     return spec
 
 
-def get_bagel_projection_layer_spec() -> ModuleSpec:
+def get_bagel_projection_layer_spec(
+    native_connector_for_alignment: bool = False,
+) -> ModuleSpec:
     """Layer spec for the vision-projection MLP."""
+
+    if native_connector_for_alignment:
+        from examples.mimo_bagel.vision.native_connector import (
+            BagelNativeColumnParallelLinear,
+            BagelNativeRowParallelLinear,
+        )
+
+        linear_fc1 = BagelNativeColumnParallelLinear
+        linear_fc2 = BagelNativeRowParallelLinear
+    else:
+        linear_fc1 = TEColumnParallelLinear
+        linear_fc2 = TERowParallelLinear
 
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear,
-            linear_fc2=TERowParallelLinear,
+            linear_fc1=linear_fc1,
+            linear_fc2=linear_fc2,
         ),
     )

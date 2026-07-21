@@ -11,6 +11,15 @@ from typing import Any, Dict, Iterator
 
 import torch
 
+# from model_providers.mock import model_provider_mock_vlm_single_encoder
+from model_providers.bagel import model_provider_bagel
+from utils.data_helpers import broadcast_nested_data_batch, get_packed_seq_params, shard_data_for_cp
+
+from examples.mimo_bagel.configs.reference import (
+    get_reference_data_seed,
+    validate_reference_training_args,
+)
+
 # Add the parent directory to the path to import from megatron
 # sys.path.append(
 #     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -19,13 +28,15 @@ import torch
 #     train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
 # )
 from examples.mimo_bagel.data.hf_dataloader import bagel_dataloader_provider
+from examples.mimo_bagel.runtime_state import (
+    get_diffusion_wrapper,
+    get_mfu_tracker,
+    seed_reference_training_rng_once,
+)
+
 # from examples.mimo_bagel.data.energon_dataloader_provider import bagel_energon_dataloader_provider
 from examples.mimo_bagel.utils.data_helpers import bagel_packed_batch_to_mimo_batch
 from examples.mimo_bagel.utils.model_helpers import get_pg_collection
-# from model_providers.mock import model_provider_mock_vlm_single_encoder
-from model_providers.bagel import model_provider_bagel
-from utils.data_helpers import broadcast_nested_data_batch, shard_data_for_cp, get_packed_seq_params
-
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -48,7 +59,7 @@ def add_mimo_args(parser):
     group = parser.add_argument_group('MIMO', 'MIMO specific arguments')
 
     # MIMO-specific parameters
-    group.add_argument('--dataset-provider', type=str, default='bagel_energon', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm, bagel, bagel_energon]')
+    group.add_argument('--dataset-provider', type=str, default='bagel', help='Dataset provider to choose from [bagel]')
     group.add_argument('--model-provider', type=str, default='bagel_mot', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm, bagel]')
     group.add_argument('--model-path', type=str, default=None, help='Path to model checkpoint to load')
 
@@ -71,20 +82,36 @@ def add_mimo_args(parser):
     )
     # checkpoint related args
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
+    group.add_argument(
+        '--native-model-checkpoint',
+        type=str,
+        default=None,
+        help='Complete native BAGEL pre-FSDP initialization checkpoint. The MCore '
+             'loader remaps QKV and gated-MLP tensors into their fused layouts.',
+    )
     # energon dataloader related args
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
 
     # Bagel-specific args
     group.add_argument('--text-cond-dropout-prob', type=float, default=0.1, help='Text conditional dropout probability')
-    group.add_argument('--vit-cond-dropout-prob', type=float, default=0.4, help='VIT conditional dropout probability')
+    group.add_argument('--vit-cond-dropout-prob', type=float, default=0.3, help='VIT conditional dropout probability')
     group.add_argument('--vae-cond-dropout-prob', type=float, default=0.3, help='VAE conditional dropout probability')
     # group.add_argument('--vae-image-downsample', type=int, default=16, help='VAE image downsample factor')
-    group.add_argument('--max-latent-size', type=int, default=32, help='Maximum latent grid size (patches per side) for the VAE latent tensor.')
+    group.add_argument('--max-latent-size', type=int, default=64, help='Maximum latent grid size (patches per side) for the VAE latent tensor.')
     group.add_argument('--vit-patch-size', type=int, default=14, help='VIT patch size')
     group.add_argument('--max-num-patch-per-side', type=int, default=70, help='Max number of patches per side')
     group.add_argument('--max-num-tokens-per-sample', type=int, default=16384, help='Max number of tokens per sample')
+    group.add_argument('--expected-num-tokens', type=int, default=32768, help='Packed token target before yielding a batch')
     group.add_argument('--max-num-tokens', type=int, default=36864, help='Max number of tokens')
     group.add_argument('--prefer-buffer-before', type=int, default=16384, help='Prefer buffer before this number of tokens')
+    group.add_argument('--data-seed', type=int, default=42, help='PackedDataset epoch seed')
+    group.add_argument(
+        '--reset-reference-training-rng',
+        action='store_true',
+        help="Reset Python/NumPy/Torch RNG to native BAGEL's rank-local seed immediately "
+             'before the first training batch. Intended for fresh checkpoint parity runs.',
+    )
+    group.add_argument('--prefetch-factor', type=int, default=2, help='BAGEL DataLoader prefetch factor')
     group.add_argument('--interpolate-pos', action='store_true', help='Whether to interpolate position embeddings')
     group.add_argument('--use-flex-attention', action='store_true', help='Whether to use flex attention')
     group.add_argument('--mot-stream-overlap', action='store_true',
@@ -94,6 +121,36 @@ def add_mimo_args(parser):
                             'Worth enabling when the gen branch is a MoE layer (its '
                             'all-to-all latency can hide under und compute) or when '
                             'TP/CP collectives are running on a separate comm stream.')
+    group.add_argument(
+        '--bagel-split-qkv-for-alignment',
+        action='store_true',
+        help='TP=1 BAGEL alignment mode: keep each fused QKV parameter but evaluate '
+             'Q/K/V as three independent F.linear operations, matching native Qwen.',
+    )
+    group.add_argument(
+        '--bagel-split-mlp-for-alignment',
+        action='store_true',
+        help='TP=1 BAGEL alignment mode: use explicit Qwen RMSNorm, evaluate the fused '
+             'FC1 gate/up parameter as two F.linear operations, and disable fused SwiGLU.',
+    )
+    group.add_argument(
+        '--bagel-native-connector-for-alignment',
+        action='store_true',
+        help='TP=1 BAGEL alignment mode: evaluate the vision connector with the same '
+             'bias-fused torch.nn.functional.linear calls as native BAGEL.',
+    )
+    group.add_argument(
+        '--bagel-native-rmsnorm-for-alignment',
+        action='store_true',
+        help='BAGEL alignment mode: use explicit HF Qwen FP32-variance RMSNorm for '
+             'input, Q/K, pre-MLP, and final norms without splitting GEMMs.',
+    )
+    group.add_argument(
+        '--bagel-native-rope-for-alignment',
+        action='store_true',
+        help='BAGEL alignment mode: construct inv_freq on CPU and use native HF Qwen2 '
+             'cos/sin generation plus batch-1 RoPE operation ordering.',
+    )
 
     # Bagel loss-balance knobs (match original BAGEL `--ce-weight` / `--mse-weight`).
     # See plan/M4_support_for_bagel.md "Loss-aggregation mismatch" for the
@@ -147,6 +204,24 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection):
     """
     args = get_args()
 
+    if args.reset_reference_training_rng:
+        # Native and MCore construction consume different random streams even
+        # when both subsequently load the same initialization. Reset once,
+        # after model/optimizer setup and immediately before the first batch.
+        dp_rank = torch.distributed.get_rank(pg_collection.dp)
+        dp_size = torch.distributed.get_world_size(pg_collection.dp)
+        reference_training_seed = get_reference_data_seed(
+            args.seed,
+            data_parallel_world_size=dp_size,
+            data_parallel_rank=dp_rank,
+        )
+        if seed_reference_training_rng_once(reference_training_seed):
+            print(
+                '[bagel-alignment] Training RNG reset to native rank seed '
+                f'{reference_training_seed}',
+                flush=True,
+            )
+
     # Pipeline parallelism: Phase C wires pre_process/post_process gating in
     # BagelMimoModel and BagelMCoreModel.  PP stages within the same DP coord
     # MUST consume identical data so that packed_seq_params (computed locally
@@ -179,8 +254,9 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection):
             else:
                 # PP-determinism: scope numpy / random state to a
                 # dp-rank-keyed seed for the duration of this iterator step.
-                import numpy as _np
                 import random as _random
+
+                import numpy as _np
 
                 _global_step = getattr(args, 'curr_iteration', 0) or 0
                 _data_seed = (
@@ -203,7 +279,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection):
     else:
         has_data = torch.empty(1, dtype=torch.uint8, device='cuda')
         data = None
-        diffusion_wrapper = getattr(args, 'diffusion_wrapper', None)
+        diffusion_wrapper = get_diffusion_wrapper()
         if diffusion_wrapper is not None:
             diffusion_wrapper.remove_vae()
 
@@ -239,7 +315,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection):
     # Check if this is bagel dataset (PackedDataset or energon-packed format)
     if args.dataset_provider in ('bagel', 'bagel_energon') and data is not None:
         # Convert bagel packed batch to MIMO format
-        diffusion_wrapper = getattr(args, 'diffusion_wrapper', None)
+        diffusion_wrapper = get_diffusion_wrapper()
         if diffusion_wrapper is not None:
             diffusion_wrapper.cuda()
         # Phase E2: VAE re-run on first/last PP stage only.
@@ -269,7 +345,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection):
 
     data = get_packed_seq_params(data)
 
-    diffusion_wrapper = getattr(args, 'diffusion_wrapper', None)
+    diffusion_wrapper = get_diffusion_wrapper()
     vae_dim = None
     if diffusion_wrapper is not None:
         vae_dim = diffusion_wrapper.vae_params.z_channels * diffusion_wrapper.latent_patch_size ** 2
@@ -320,19 +396,27 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
     from megatron.core import parallel_state as mpu
     dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     dp_cp_world_size = torch.distributed.get_world_size(dp_cp_group)
+    loss_alignment_audit = os.environ.get('BAGEL_LOSS_ALIGNMENT_AUDIT', '0') == '1'
 
     loss = torch.tensor(0.0, device='cuda')
 
     # ── CE term: match HF BAGEL's ce_loss_reweighting switch ──────────────
     ce_sum_local = torch.tensor(0.0, device='cuda')
     ce_denominator_local = torch.tensor(0.0, device='cuda')
+    ce_weight_sum_local = torch.tensor(0.0, device='cuda')
     ce_term = None
     if ce_loss is not None:
         ce_loss = ce_loss.float()
         ce_weights = loss_mask.view(-1)[loss_mask.view(-1) > 0].to(torch.float)
+        if ce_loss.numel() != ce_weights.numel():
+            raise RuntimeError(
+                'BAGEL CE loss/weight cardinality mismatch: '
+                f'{ce_loss.numel()} losses versus {ce_weights.numel()} weights'
+            )
+        ce_weight_sum_local = ce_weights.sum()
         if ce_loss_reweighting:
             ce_sum_local = (ce_loss * ce_weights).sum()
-            ce_denominator_local = ce_weights.sum()
+            ce_denominator_local = ce_weight_sum_local
         else:
             ce_sum_local = ce_loss.sum()
             ce_denominator_local = torch.tensor(ce_loss.numel(), dtype=torch.float, device='cuda')
@@ -384,6 +468,43 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
         ]
     )
 
+    # Opt-in diagnostic for exact native-BAGEL comparisons.  This performs a
+    # single extra DP/CP collective and does not touch RNG state.  Keeping the
+    # raw numerator, denominator, and configured weights together prevents a
+    # close-looking reported loss from hiding a different backward weighting.
+    if loss_alignment_audit:
+        audit_values = torch.stack(
+            [
+                ce_sum_local.detach(),
+                ce_denominator_local.detach(),
+                ce_weight_sum_local.detach(),
+                mse_sum_local.detach(),
+                mse_tokens_local.detach(),
+            ]
+        ).float()
+        torch.distributed.all_reduce(
+            audit_values,
+            op=torch.distributed.ReduceOp.SUM,
+            group=dp_cp_group,
+        )
+        if torch.distributed.get_rank() == 0:
+            ce_sum_global, ce_den_global, ce_weight_sum_global, mse_sum_global, mse_den_global = (
+                audit_values.tolist()
+            )
+            ce_mean = ce_sum_global / max(ce_den_global, 1.0)
+            mse_mean = mse_sum_global / max(mse_den_global, 1.0)
+            print(
+                '[BAGEL_LOSS_ALIGNMENT_AUDIT] '
+                f'iteration={getattr(args, "iteration", 0) + 1} '
+                f'ce_sum={ce_sum_global:.9g} ce_tokens={ce_den_global:.9g} '
+                f'ce_weight_sum={ce_weight_sum_global:.9g} ce_mean={ce_mean:.9g} '
+                f'mse_sum={mse_sum_global:.9g} mse_tokens={mse_den_global:.9g} '
+                f'mse_mean={mse_mean:.9g} ce_weight={ce_weight:.9g} '
+                f'mse_weight={mse_weight:.9g} ce_reweight={ce_loss_reweighting} '
+                f'weighted_total={ce_mean * ce_weight + mse_mean * mse_weight:.9g}',
+                flush=True,
+            )
+
     # num_tokens=1 makes Megatron's `output_tensor /= clamp(num_tokens, min=1)`
     # a no-op (we have already normalised). The /num_microbatches divide that
     # follows is the gradient-accumulation scaling — keep it.
@@ -406,6 +527,11 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
 
 
 _mem_log_done = False
+
+# Full CUDA allocation history records Python stacks for up to one million
+# events and is far too expensive for normal training.  Keep the legacy OOM
+# profiler available for targeted debugging, but make it explicitly opt-in.
+_MEM_PROFILE_ENABLED = os.environ.get('BAGEL_MEMORY_PROFILE', '0') == '1'
 
 # --------------------------------------------------------------------------
 # Per-iteration memory profiling (ranks 0 and 24, first 3 iterations).
@@ -460,7 +586,8 @@ def _oom_snapshot_hook(exc_type, exc_val, exc_tb):
     sys.__excepthook__(exc_type, exc_val, exc_tb)
 
 
-sys.excepthook = _oom_snapshot_hook
+if _MEM_PROFILE_ENABLED:
+    sys.excepthook = _oom_snapshot_hook
 
 
 def forward_step(data_iterator, model):
@@ -486,7 +613,7 @@ def forward_step(data_iterator, model):
     # Enable memory-history recording on all snapshot-target ranks from the
     # very first forward so snapshots (dumped either on OOM or at a scheduled
     # point) contain Python call-stack info for every block.
-    if rank in _MEM_SNAPSHOT_RANKS and _fwd_call_count == 1:
+    if _MEM_PROFILE_ENABLED and rank in _MEM_SNAPSHOT_RANKS and _fwd_call_count == 1:
         torch.cuda.memory._record_memory_history(
             max_entries=1_000_000,
             context='all',
@@ -498,7 +625,8 @@ def forward_step(data_iterator, model):
     # peak (forward + backward + optimizer step) — the metric Megatron's
     # built-in per-rank log shows only for ranks 0-3.
     if (
-        rank in _MEM_TARGET_RANKS
+        _MEM_PROFILE_ENABLED
+        and rank in _MEM_TARGET_RANKS
         and is_first_micro
         and 2 <= iter_num <= _MEM_MAX_ITERS + 1
     ):
@@ -512,7 +640,12 @@ def forward_step(data_iterator, model):
         )
 
     # Per-iteration memory: log before-forward static allocation and peak.
-    if rank in _MEM_TARGET_RANKS and is_first_micro and iter_num <= _MEM_MAX_ITERS:
+    if (
+        _MEM_PROFILE_ENABLED
+        and rank in _MEM_TARGET_RANKS
+        and is_first_micro
+        and iter_num <= _MEM_MAX_ITERS
+    ):
         torch.cuda.reset_peak_memory_stats()
         alloc = torch.cuda.memory_allocated() / 1e9
         res = torch.cuda.memory_reserved() / 1e9
@@ -567,7 +700,12 @@ def forward_step(data_iterator, model):
         _mem_log_done = True
 
     # Per-iteration memory: log peak after forward pass.
-    if rank in _MEM_TARGET_RANKS and is_first_micro and iter_num <= _MEM_MAX_ITERS:
+    if (
+        _MEM_PROFILE_ENABLED
+        and rank in _MEM_TARGET_RANKS
+        and is_first_micro
+        and iter_num <= _MEM_MAX_ITERS
+    ):
         peak = torch.cuda.max_memory_allocated() / 1e9
         print(
             f"[MEM2 rank{rank} iter{iter_num}] After forward peak: {peak:.2f} GB",
@@ -600,7 +738,7 @@ def forward_step(data_iterator, model):
 
     # Per-step MFU tracking (timing, DP all-reduce, and logging all handled
     # inside the tracker — no state kept in this module).
-    tracker = getattr(get_args(), 'mfu_tracker', None)
+    tracker = get_mfu_tracker()
     if tracker is not None:
         tracker.step_and_log(data_batch)
 
@@ -711,12 +849,12 @@ if __name__ == "__main__":
 
     train_valid_test_datasets_provider.is_distributed = True
     import megatron
-    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-    from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
     from examples.mimo_bagel.vision.hf_bagel_vision_encoder import HFBagelVisionEncoderWrapper
-    # from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+    from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+    from megatron.core.transformer.transformer_layer import TransformerLayer
 
+    # from megatron.core.models.vision.multimodal_projector import MultimodalProjector
     # Subclass so we can set default fsdp_unit_modules without using partial().
     # training.py uses isinstance(module, megatron_FSDP), so megatron_FSDP must be a class.
     #
@@ -747,6 +885,7 @@ if __name__ == "__main__":
 
     megatron.training.training.megatron_FSDP = BagelFullyShardedDataParallel
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
+    validate_reference_training_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,

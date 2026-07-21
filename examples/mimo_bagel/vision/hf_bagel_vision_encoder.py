@@ -59,24 +59,13 @@ class HFBagelVisionEncoderWrapper(torch.nn.Module):
             self._enable_vit_activation_checkpointing()
 
     def _enable_vit_activation_checkpointing(self):
-        """Wrap the entire ``SiglipEncoder.forward`` (all transformer layers)
-        as a single ``torch.utils.checkpoint`` block — "full-ViT" recompute.
+        """Checkpoint every SigLIP encoder layer independently.
 
-        During forward: only the encoder's input tensor is retained; all
-        per-layer boundary activations and internal activations are freed.
-        During backward: the whole SigLIP encoder is re-executed once to
-        regenerate the full activation graph, then gradients flow back.
-
-        Trade-off vs. per-layer checkpointing:
-          • Forward peak:  full-encoder is ~N× smaller (only input retained,
-            instead of N layer-boundary tensors).
-          • Backward peak: full-encoder is larger — briefly holds ALL N
-            layers' intermediates simultaneously during recompute. This is
-            acceptable here because the ViT backward happens AFTER the LLM
-            backward has already freed most of its activations.
-
-        Since rank 24's OOM is driven by iter-2 FORWARD peak (not backward),
-        full-encoder recompute is the more effective lever.
+        Native BAGEL applies a non-reentrant checkpoint wrapper to each
+        ``SiglipEncoderLayer``. Matching that boundary is important for both
+        memory lifetime and the order in which FlashAttention is recomputed
+        during backward. Directly wrapping each bound ``forward`` keeps the
+        existing parameter and state-dict names unchanged.
         """
         from torch.utils.checkpoint import checkpoint as _checkpoint
 
@@ -92,27 +81,33 @@ class HFBagelVisionEncoderWrapper(torch.nn.Module):
         if getattr(siglip_encoder, '_ckpt_wrapped', False):
             return
 
-        orig_forward = siglip_encoder.forward
+        def _checkpoint_layer_forward(original_forward):
+            # A factory is required here: otherwise every closure would call
+            # the final layer's bound method.
+            def _forward(*args, **kwargs):
+                if torch.is_grad_enabled():
+                    return _checkpoint(
+                        original_forward, *args, use_reentrant=False, **kwargs
+                    )
+                return original_forward(*args, **kwargs)
 
-        def _ckpt_encoder_forward(*args, **kwargs):
-            # Skip checkpointing during eval / inference (no grad needed).
-            if torch.is_grad_enabled():
-                return _checkpoint(
-                    orig_forward, *args, use_reentrant=False, **kwargs
-                )
-            return orig_forward(*args, **kwargs)
+            return _forward
 
-        siglip_encoder._ckpt_original_forward = orig_forward
-        siglip_encoder.forward = _ckpt_encoder_forward
+        for layer in siglip_encoder.layers:
+            if getattr(layer, '_ckpt_wrapped', False):
+                continue
+            original_forward = layer.forward
+            layer._ckpt_original_forward = original_forward
+            layer.forward = _checkpoint_layer_forward(original_forward)
+            layer._ckpt_wrapped = True
+
         siglip_encoder._ckpt_wrapped = True
 
         n_layers = len(siglip_encoder.layers)
         print(
-            f"[HFBagelVisionEncoder] Full-ViT activation checkpointing enabled "
-            f"— wrapping all {n_layers} SigLIP encoder layers as a single "
-            f"checkpoint block"
+            f"[HFBagelVisionEncoder] Per-layer ViT activation checkpointing "
+            f"enabled for {n_layers} SigLIP encoder layers"
         )
-
 
     def forward(
         self,

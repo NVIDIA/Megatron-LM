@@ -19,7 +19,10 @@ from megatron.core.utils import divide, get_pg_size
 
 logger = logging.getLogger(__name__)
 
+from .alignment_audit import audit_compact_tensor, layer_alignment_audit_enabled
+from .bagel_rope import apply_qwen2_rotary_pos_emb
 from .mot_packed_seq_params import MoTPackedSeqParams
+from .mot_utils import attach_zero_grad_dependency
 
 
 @dataclass
@@ -338,6 +341,10 @@ class SelfAttentionMoT(MegatronModule):
         ), "packed_seq_params must be provided for MoT with packed sequence"
         Lund = getattr(packed_seq_params, 'padded_und_seqlen', 0)
         Lgen = getattr(packed_seq_params, 'padded_gen_seqlen', 0)
+        assert Lund + Lgen == seq_len, (
+            f"MoT branch lengths ({Lund} + {Lgen}) must match sequence length {seq_len}"
+        )
+        alignment_audit = layer_alignment_audit_enabled(self.layer_number)
 
         # =====================================================================
         # QKV projection with MoT (separate for und/gen)
@@ -346,27 +353,29 @@ class SelfAttentionMoT(MegatronModule):
         # Reshape for token-level indexing: [s, b, h] -> [s*b, h]
         hidden_states_flat = hidden_states.view(-1, hidden_size)
 
-        # Process understanding tokens
-        und_qkv = None
+        # Process understanding tokens. Empty branches must not enter tensor-parallel
+        # modules, but their parameters still need explicit zero gradients.
         und_hidden = hidden_states_flat[:Lund]
-        und_qkv, _ = self.linear_qkv(und_hidden)
+        if Lund > 0:
+            und_qkv, _ = self.linear_qkv(und_hidden)
+        else:
+            und_qkv = und_hidden.new_empty((0, self.linear_qkv_out_dim_per_partition))
+            und_qkv = attach_zero_grad_dependency(und_qkv, self.linear_qkv)
 
         if self.freeze_und:
             und_qkv = und_qkv.detach()
 
         # Process generation tokens
-        gen_qkv = None
         gen_hidden = hidden_states_flat[Lund:]
-        if self.linear_qkv_gen is not None:
+        if self.linear_qkv_gen is None:
+            raise ValueError("linear_qkv_gen is None")
+        if gen_hidden.shape[0] > 0:
             gen_qkv, _ = self.linear_qkv_gen(gen_hidden)
         else:
-            raise ValueError("linear_qkv_gen is None")
+            gen_qkv = gen_hidden.new_empty((0, self.linear_qkv_out_dim_per_partition))
+            gen_qkv = attach_zero_grad_dependency(gen_qkv, self.linear_qkv_gen)
 
-        assert (
-            und_qkv is not None or gen_qkv is not None
-        ), "und_qkv and gen_qkv cannot be None at the same time"
-        parts = [x for x in (und_qkv, gen_qkv) if x is not None]
-        qkv_output_flat = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        qkv_output_flat = torch.cat((und_qkv, gen_qkv), dim=0)
 
         # Reshape back
         qkv_output = qkv_output_flat.view(
@@ -377,15 +386,70 @@ class SelfAttentionMoT(MegatronModule):
         # Split QKV and apply layernorms
         # =====================================================================
         query, key, value = self._split_qkv(qkv_output)
+        if alignment_audit:
+            audit_compact_tensor(
+                "attention.q_linear",
+                query,
+                Lund,
+                layer_number=self.layer_number,
+            )
+            audit_compact_tensor(
+                "attention.k_linear",
+                key,
+                Lund,
+                layer_number=self.layer_number,
+            )
+            audit_compact_tensor(
+                "attention.v_linear",
+                value,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # Apply Q/K layernorms with MoT
-        if self.q_layernorm is not None or self.k_layernorm is not None:
+        if any(
+            norm is not None
+            for norm in (
+                self.q_layernorm,
+                self.k_layernorm,
+                self.q_layernorm_gen,
+                self.k_layernorm_gen,
+            )
+        ):
             query, key = self._apply_qk_layernorm_mot(query, key, Lund, Lgen)
+        if alignment_audit:
+            audit_compact_tensor(
+                "attention.q_after_qk_norm",
+                query,
+                Lund,
+                layer_number=self.layer_number,
+            )
+            audit_compact_tensor(
+                "attention.k_after_qk_norm",
+                key,
+                Lund,
+                layer_number=self.layer_number,
+            )
+            audit_compact_tensor(
+                "attention.v_after_qk_norm",
+                value,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # =====================================================================
         # Apply rotary positional embeddings to query and key
         # =====================================================================
-        if rotary_pos_emb is not None:
+        native_qwen_rope = getattr(self.config, 'bagel_native_rope_for_alignment', False)
+        if native_qwen_rope and (rotary_pos_cos is not None or rotary_pos_sin is not None):
+            if rotary_pos_cos is None or rotary_pos_sin is None:
+                raise ValueError(
+                    "BAGEL native Qwen RoPE requires both rotary_pos_cos and rotary_pos_sin"
+                )
+            query, key = apply_qwen2_rotary_pos_emb(
+                query, key, rotary_pos_cos, rotary_pos_sin
+            )
+        elif rotary_pos_emb is not None:
 
             if isinstance(rotary_pos_emb, tuple):
                 q_pos_emb, k_pos_emb = rotary_pos_emb
@@ -397,6 +461,25 @@ class SelfAttentionMoT(MegatronModule):
                 query = apply_rotary_pos_emb(query, q_pos_emb, config=self.config)
             if k_pos_emb is not None:
                 key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config)
+        if alignment_audit:
+            audit_compact_tensor(
+                "attention.q_after_rope",
+                query,
+                Lund,
+                layer_number=self.layer_number,
+            )
+            audit_compact_tensor(
+                "attention.k_after_rope",
+                key,
+                Lund,
+                layer_number=self.layer_number,
+            )
+            audit_compact_tensor(
+                "attention.v_after_rope",
+                value,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # # =====================================================================
         # # Core attention (with flex_attention support)
@@ -421,11 +504,25 @@ class SelfAttentionMoT(MegatronModule):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
             )
+        if alignment_audit:
+            audit_compact_tensor(
+                "attention.kernel_output",
+                core_attn_out,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         # =====================================================================
         # Output projection with MoT
         # =====================================================================
         output = self._apply_output_projection_mot(core_attn_out, Lund, Lgen)
+        if alignment_audit:
+            audit_compact_tensor(
+                "attention.o_proj",
+                output[0] if isinstance(output, tuple) else output,
+                Lund,
+                layer_number=self.layer_number,
+            )
 
         return output
 
@@ -478,8 +575,20 @@ class SelfAttentionMoT(MegatronModule):
         if k_layernorm is not None:
             key = k_layernorm(key)
 
-        # Apply rotary positional embeddings to query and key
-        if rotary_pos_emb is not None:
+        # Apply rotary positional embeddings to query and key.  The native
+        # alignment generator returns pre-rounded BF16 cos/sin instead of the
+        # generic frequency tensor, so inference must consume the same pair as
+        # training rather than silently running without RoPE.
+        native_qwen_rope = getattr(self.config, 'bagel_native_rope_for_alignment', False)
+        if native_qwen_rope and (rotary_pos_cos is not None or rotary_pos_sin is not None):
+            if rotary_pos_cos is None or rotary_pos_sin is None:
+                raise ValueError(
+                    "BAGEL native Qwen RoPE requires both rotary_pos_cos and rotary_pos_sin"
+                )
+            query, key = apply_qwen2_rotary_pos_emb(
+                query, key, rotary_pos_cos, rotary_pos_sin
+            )
+        elif rotary_pos_emb is not None:
             # rotary_pos_emb can be a tuple (q_pos_emb, k_pos_emb) or a single tensor
             if isinstance(rotary_pos_emb, tuple):
                 q_pos_emb, k_pos_emb = rotary_pos_emb
@@ -553,24 +662,29 @@ class SelfAttentionMoT(MegatronModule):
         # Flatten for token-level indexing
         query_flat = query.view(-1, num_heads, head_dim)
         key_flat = key.view(-1, key.shape[2], head_dim)
+        assert padded_und_seqlen + padded_gen_seqlen == query_flat.shape[0], (
+            "MoT Q/K branch lengths must match the flattened query length"
+        )
 
-        query_out = query_flat.clone()
-        key_out = key_flat.clone()
+        def apply_norm(branch: Tensor, norm: Optional[torch.nn.Module]) -> Tensor:
+            if norm is None:
+                return branch
+            if branch.shape[0] == 0:
+                return attach_zero_grad_dependency(branch, norm)
+            return norm(branch)
 
         # Apply layernorms to understanding tokens
-        if self.q_layernorm is not None:
-            query_out[:padded_und_seqlen] = self.q_layernorm(query_flat[:padded_und_seqlen])
-        if self.k_layernorm is not None:
-            key_out[:padded_und_seqlen] = self.k_layernorm(key_flat[:padded_und_seqlen])
+        und_query = apply_norm(query_flat[:padded_und_seqlen], self.q_layernorm)
+        und_key = apply_norm(key_flat[:padded_und_seqlen], self.k_layernorm)
 
         # Apply layernorms to generation tokens
         q_norm = self.q_layernorm_gen if self.q_layernorm_gen is not None else self.q_layernorm
         k_norm = self.k_layernorm_gen if self.k_layernorm_gen is not None else self.k_layernorm
+        gen_query = apply_norm(query_flat[padded_und_seqlen:], q_norm)
+        gen_key = apply_norm(key_flat[padded_und_seqlen:], k_norm)
 
-        if q_norm is not None:
-            query_out[padded_und_seqlen:] = q_norm(query_flat[padded_und_seqlen:])
-        if k_norm is not None:
-            key_out[padded_und_seqlen:] = k_norm(key_flat[padded_und_seqlen:])
+        query_out = torch.cat((und_query, gen_query), dim=0)
+        key_out = torch.cat((und_key, gen_key), dim=0)
 
         # Reshape back
         query = query_out.view(seq_len, batch_size, num_heads, head_dim)
@@ -586,26 +700,29 @@ class SelfAttentionMoT(MegatronModule):
 
         # Flatten for token-level indexing
         attn_output_flat = attn_output.view(-1, hidden_size)
-        # output_flat = attn_output_flat.new_zeros(
-        #     attn_output_flat.shape[0], self.config.hidden_size
-        # )
-
+        assert padded_und_seqlen + padded_gen_seqlen == attn_output_flat.shape[0], (
+            "MoT projection branch lengths must match the flattened attention output length"
+        )
         # Process understanding tokens
-        und_output = None
-        und_output, _ = self.linear_proj(attn_output_flat[:padded_und_seqlen])
+        und_input = attn_output_flat[:padded_und_seqlen]
+        if padded_und_seqlen > 0:
+            und_output, _ = self.linear_proj(und_input)
+        else:
+            und_output = und_input.new_empty((0, self.config.hidden_size))
+            und_output = attach_zero_grad_dependency(und_output, self.linear_proj)
         if self.freeze_und:
             und_output = und_output.detach()
 
         # Process generation tokens
-        gen_output = None
         linear_proj = self.linear_proj_gen if self.linear_proj_gen is not None else self.linear_proj
-        gen_output, _ = linear_proj(attn_output_flat[padded_und_seqlen:])
+        gen_input = attn_output_flat[padded_und_seqlen:]
+        if gen_input.shape[0] > 0:
+            gen_output, _ = linear_proj(gen_input)
+        else:
+            gen_output = gen_input.new_empty((0, self.config.hidden_size))
+            gen_output = attach_zero_grad_dependency(gen_output, linear_proj)
 
-        assert (
-            und_output is not None or gen_output is not None
-        ), "und_output and gen_output cannot be None at the same time"
-        parts = [x for x in (und_output, gen_output) if x is not None]
-        output_flat = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        output_flat = torch.cat((und_output, gen_output), dim=0)
 
         # Reshape back
         output = output_flat.view(seq_len, batch_size, self.config.hidden_size)

@@ -7,7 +7,7 @@ Tests run in three groups:
 
   1. get_packed_seq_params correctness (CP=1 and CP=2):
        Verify that Lund/Lgen, local slices, and padding produced by
-       BagelMimoModel.get_packed_seq_params match manual computation.
+       the Bagel data-preparation helper match manual computation.
 
   2. Forward accuracy vs Qwen2Model (CP=1):
        BagelMimoModel.forward with identity-RoPE matches
@@ -51,7 +51,7 @@ for p in [_ROOT, _BAGEL_PKG, _BAGEL_SRC]:
         sys.path.insert(0, p)
 
 from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAttentionMoTSubmodules
-from megatron.core.models.bagel.bagel_mimo import BagelMimoModel
+from megatron.core.models.bagel.bagel_mimo import BagelMimoModel, gather_pad_to_length
 from megatron.core.models.bagel.flex_attention import FlexAttention
 from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
@@ -80,6 +80,7 @@ try:
 except ImportError:
     HAVE_WRAPPED_NORM = False
 
+from examples.mimo_bagel.utils.data_helpers import get_packed_seq_params
 from megatron.core import parallel_state
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -170,6 +171,13 @@ def _make_llm_config():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class _PassthroughDiffusion(torch.nn.Module):
+    """Return precomputed visual latents through the production modality path."""
+
+    def forward(self, encoder_inputs):
+        return encoder_inputs
+
+
 class _TestBagelMimoModel(BagelMimoModel):
     """BagelMimoModel that accepts a pre-built BagelMCoreModel directly."""
 
@@ -179,10 +187,14 @@ class _TestBagelMimoModel(BagelMimoModel):
         torch.nn.Module.__init__(self)
         self.config = language_model.config  # required by MegatronModule
         self.language_model = language_model
-        self.modality_submodules = torch.nn.ModuleDict()
+        self.modality_submodules = torch.nn.ModuleDict({"diffusion": _PassthroughDiffusion()})
         self.special_token_ids = {}
+        self.pre_process = True
+        # Keep the production forward orchestration, but skip its diffusion loss
+        # head so this decoder-parity test can inspect last_hidden_state.
+        self.post_process = False
 
-    def forward(
+    def forward_with_test_latents(
         self,
         input_ids,
         position_ids=None,
@@ -202,37 +214,52 @@ class _TestBagelMimoModel(BagelMimoModel):
         vis_gen_target=None,
         split_lens=None,
         attn_modes=None,
-        # Extra param for testing: inject visual_latents directly
         visual_latents=None,
+        packed_seq_params=None,
     ):
-        """Forward pass that allows injecting visual_latents directly for testing."""
-        packed_seq_params = None
+        """Prepare current packed inputs, then call ``BagelMimoModel.forward``."""
         if self.language_model.use_mo and packed_text_indexes is not None:
-            packed_seq_params = self.get_packed_seq_params(
-                packed_text_indexes=packed_text_indexes,
-                packed_vit_token_indexes=packed_vit_token_indexes,
-                packed_vae_token_indexes=packed_vae_token_indexes,
-            )
+            if packed_seq_params is None:
+                packed_seq_params = _build_packed_seq_params(
+                    packed_text_indexes,
+                    packed_vit_token_indexes,
+                    packed_vae_token_indexes,
+                )
 
-        lm_output = self.language_model(
+        compact_position_ids = torch.cat(
+            [
+                gather_pad_to_length(
+                    packed_position_ids,
+                    packed_seq_params.local_und_token_indexes,
+                    packed_seq_params.padded_und_seqlen,
+                ),
+                gather_pad_to_length(
+                    packed_position_ids,
+                    packed_seq_params.local_gen_token_indexes,
+                    packed_seq_params.padded_gen_seqlen,
+                ),
+            ]
+        )
+        actual_lund = len(packed_seq_params.local_und_token_indexes)
+        labels = torch.zeros(actual_lund, dtype=torch.long, device=input_ids.device)
+        loss_mask = torch.ones(actual_lund, dtype=torch.float32, device=input_ids.device)
+
+        lm_output = super().forward(
             input_ids=input_ids,
             position_ids=position_ids,
+            modality_inputs=(
+                {"diffusion": visual_latents} if visual_latents is not None else None
+            ),
+            sequence_length=sequence_length,
             sample_lens=sample_lens,
             attention_mask=attention_mask,
-            packed_position_ids=packed_position_ids,
-            ce_loss_indexes=ce_loss_indexes,
-            packed_label_ids=packed_label_ids,
-            sequence_length=sequence_length,
-            packed_text_indexes=packed_text_indexes,
-            packed_vit_token_indexes=packed_vit_token_indexes,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            vision_embeddings=None,
-            visual_latents=visual_latents,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_position_ids=compact_position_ids,
             split_lens=split_lens,
             attn_modes=attn_modes,
             packed_seq_params=packed_seq_params,
         )
-        lm_output['mse'] = None
         return lm_output, loss_mask
 
 
@@ -260,18 +287,6 @@ def _build_bagel_mcore_model(mcore_cfg: TransformerConfig) -> BagelMCoreModel:
         use_flex_attention=True,
     )
     return model.cuda().half()
-
-
-def _build_packed_seq(model_cp, input_ids, text_idx, vae_idx, gen_emb, S, device):
-    """Build packed_sequence [S, H] with text and gen embeddings placed at their indexes."""
-    with torch.no_grad():
-        text_emb = model_cp.embedding(input_ids=input_ids, position_ids=None).squeeze(1)  # [T, H]
-    H = text_emb.shape[-1]
-    packed_seq = torch.zeros(S, H, dtype=text_emb.dtype, device=device)
-    packed_seq[text_idx] = text_emb.detach()
-    if gen_emb is not None and vae_idx is not None and len(vae_idx) > 0:
-        packed_seq[vae_idx] = gen_emb
-    return packed_seq
 
 
 def _swap_cp_groups(model: BagelMCoreModel, cp_group, cp_size: int):
@@ -366,15 +381,25 @@ def _copy_mlp_weights(bagel_mlp, mcore_mlp):
     mcore_mlp.linear_fc2.weight.data.copy_(bagel_mlp.down_proj.weight.data)
 
 
+def _mcore_pre_mlp_norm_weight(mcore_layer, branch):
+    explicit_norm = getattr(mcore_layer, f"pre_mlp_layernorm{branch}")
+    if hasattr(explicit_norm, "weight"):
+        return explicit_norm.weight
+    mcore_mlp = getattr(mcore_layer, f"mlp{branch}")
+    if hasattr(mcore_mlp.linear_fc1, "layer_norm_weight"):
+        return mcore_mlp.linear_fc1.layer_norm_weight
+    raise AttributeError(f"Cannot locate the{branch or ' understanding'} pre-MLP norm weight")
+
+
 def _copy_layer_weights(bagel_layer, mcore_layer):
     mcore_layer.input_layernorm.weight.data.copy_(bagel_layer.input_layernorm.weight.data)
     mcore_layer.input_layernorm_gen.weight.data.copy_(
         bagel_layer.input_layernorm_moe_gen.weight.data
     )
-    mcore_layer.pre_mlp_layernorm.weight.data.copy_(
+    _mcore_pre_mlp_norm_weight(mcore_layer, "").data.copy_(
         bagel_layer.post_attention_layernorm.weight.data
     )
-    mcore_layer.pre_mlp_layernorm_gen.weight.data.copy_(
+    _mcore_pre_mlp_norm_weight(mcore_layer, "_gen").data.copy_(
         bagel_layer.post_attention_layernorm_moe_gen.weight.data
     )
     _copy_attn_weights(bagel_layer.self_attn, mcore_layer.self_attention)
@@ -458,6 +483,16 @@ def _make_test_data(T: int, G: int, seed: int = 42):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _build_packed_seq_params(text_idx, vit_idx=None, vae_idx=None):
+    """Build MoT metadata through the current Bagel data-preparation API."""
+    batch = {"packed_text_indexes": text_idx}
+    if vit_idx is not None:
+        batch["packed_vit_token_indexes"] = vit_idx
+    if vae_idx is not None:
+        batch["packed_vae_token_indexes"] = vae_idx
+    return get_packed_seq_params(batch)["packed_seq_params"]
+
+
 def _check_packed_seq_params(cp_size: int, T: int, G: int, label: str):
     """Verify MoTPackedSeqParams fields match manual computation."""
     device = "cuda"
@@ -466,19 +501,7 @@ def _check_packed_seq_params(cp_size: int, T: int, G: int, label: str):
 
     cp_rank = parallel_state.get_context_parallel_rank()
 
-    # Build a minimal mimo model (no language model needed for this test)
-    class _MinimalMimo(BagelMimoModel):
-        def __init__(self):
-            torch.nn.Module.__init__(self)
-            self.modality_submodules = torch.nn.ModuleDict()
-            self.special_token_ids = {}
-
-    mimo = _MinimalMimo()
-    psp = mimo.get_packed_seq_params(
-        packed_text_indexes=text_idx,
-        packed_vit_token_indexes=None,
-        packed_vae_token_indexes=vae_idx,
-    )
+    psp = _build_packed_seq_params(text_idx, vae_idx=vae_idx)
 
     U = T  # no ViT in this test
     Lund_expected = math.ceil(U / cp_size) if U > 0 else 0
@@ -580,7 +603,7 @@ def _check_forward_vs_qwen2(T: int, G: int, label: str):
     # ── BagelMimoModel: build mimo wrapper and call forward ───────────────────
     mimo = _TestBagelMimoModel(mcore_llm)
     with torch.no_grad():
-        lm_output, _ = mimo.forward(
+        lm_output, _ = mimo.forward_with_test_latents(
             input_ids=input_ids,
             position_ids=None,
             attention_mask=block_mask,
@@ -612,7 +635,7 @@ def _check_forward_vs_qwen2(T: int, G: int, label: str):
 # Test 3 — CP=2 parity through BagelMimoModel (requires 2 processes)
 #
 # Each rank calls BagelMimoModel.forward with the full (shared) inputs.
-# BagelMimoModel.get_packed_seq_params() automatically shards for this rank.
+# Bagel data preparation constructs the rank-local packed metadata.
 # Per-rank output is compared against slices of the CP=1 reference.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -640,6 +663,9 @@ def run_cp2_parity_mimo(
     # psp_cp1: full sequence (Lund=U, Lgen=G), used for the reference
     psp_cp1 = MoTPackedSeqParams(
         qkv_format="thd",
+        packed_text_indexes=text_idx,
+        packed_vit_token_indexes=None,
+        packed_vae_token_indexes=vae_idx if G > 0 else None,
         packed_und_token_indexes=und_idx,
         packed_gen_token_indexes=gen_idx,
         local_und_token_indexes=und_idx,
@@ -648,22 +674,14 @@ def run_cp2_parity_mimo(
         padded_gen_seqlen=G,
     )
 
-    # psp_cpN: this rank's local slice (built by mimo.get_packed_seq_params)
+    # psp_cpN: this rank's local slice (built by data preparation)
     mimo = _TestBagelMimoModel(model_cp)
-    psp_cpN = mimo.get_packed_seq_params(
-        packed_text_indexes=text_idx,
-        packed_vit_token_indexes=None,
-        packed_vae_token_indexes=vae_idx if G > 0 else None,
-    )
+    psp_cpN = _build_packed_seq_params(text_idx, vae_idx=vae_idx if G > 0 else None)
 
     # ── CP=1 reference: call model directly with psp_cp1, no A2A ─────────────
-    # Build the packed_sequence (same as mcore_bagel_llm.forward would build it)
-    packed_seq = _build_packed_seq(
-        model_cp, input_ids, text_idx, vae_idx, gen_emb if G > 0 else None, S, device
-    )
     saved = _swap_cp_groups(model_cp, cp_group=None, cp_size=1)
     with torch.no_grad():
-        ref_lm = model_cp.forward(
+        ref_lm, _ = mimo.forward_with_test_latents(
             input_ids=input_ids,
             packed_position_ids=pos_ids,
             sequence_length=S,
@@ -679,7 +697,7 @@ def run_cp2_parity_mimo(
 
     # ── CP=N run (A2A active via cp_group) ────────────────────────────────────
     with torch.no_grad():
-        cpN_lm = model_cp.forward(
+        cpN_lm, _ = mimo.forward_with_test_latents(
             input_ids=input_ids,
             packed_position_ids=pos_ids,
             sequence_length=S,
@@ -690,34 +708,36 @@ def run_cp2_parity_mimo(
             attention_mask=block_mask,
             packed_seq_params=psp_cpN,
         )
-    cpN_hs = cpN_lm['last_hidden_state']  # [S, H] — only local positions filled
+    cpN_hs = cpN_lm['last_hidden_state']  # [Lund+Lgen, H] compact local output
 
     dist.barrier()
 
     # ── Compare at this rank's local token positions ──────────────────────────
-    local_und = text_idx[rank * Lund : rank * Lund + actual_lund]
-    local_gen = gen_idx[rank * Lgen : rank * Lgen + actual_lgen]
+    und_ref = ref_hs[rank * Lund : rank * Lund + actual_lund]
+    gen_ref = ref_hs[U + rank * Lgen : U + rank * Lgen + actual_lgen]
+    und_got = cpN_hs[:actual_lund]
+    gen_got = cpN_hs[Lund : Lund + actual_lgen]
 
     atol = rtol = 1e-2
     und_err = gen_err = 0.0
     if actual_lund > 0:
         torch.testing.assert_close(
-            cpN_hs[local_und],
-            ref_hs[local_und],
+            und_got,
+            und_ref,
             atol=atol,
             rtol=rtol,
             msg=lambda m: f"[cp2_mimo/{label} rank={rank}] UND: {m}",
         )
-        und_err = (cpN_hs[local_und] - ref_hs[local_und]).abs().max().item()
+        und_err = (und_got - und_ref).abs().max().item()
     if actual_lgen > 0:
         torch.testing.assert_close(
-            cpN_hs[local_gen],
-            ref_hs[local_gen],
+            gen_got,
+            gen_ref,
             atol=atol,
             rtol=rtol,
             msg=lambda m: f"[cp2_mimo/{label} rank={rank}] GEN: {m}",
         )
-        gen_err = (cpN_hs[local_gen] - ref_hs[local_gen]).abs().max().item()
+        gen_err = (gen_got - gen_ref).abs().max().item()
 
     print(
         f"  [cp2_mimo {label:8s} rank={rank}] PASS  "

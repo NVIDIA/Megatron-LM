@@ -3,15 +3,18 @@
 Utility helpers for mimo models.
 """
 
-import re
 import os
+import re
 from typing import Union
 
 import torch
+
 from megatron.core import dist_checkpointing
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+from .native_checkpoint import initialize_bagel_auxiliary_from_native
 
 
 def get_pg_collection(model: Union[MegatronModule, list[MegatronModule]]) -> ProcessGroupCollection:
@@ -95,9 +98,10 @@ def _load_fused_layer_checkpoint_pytorch(module: torch.nn.Module, ckpt_dir: str,
     This checkpoint format stores all layers merged into single tensors.
     We load them and then split them back into per-layer tensors.
     """
-    import torch.distributed.checkpoint as dcp
-    import pickle
     import glob
+    import pickle
+
+    import torch.distributed.checkpoint as dcp
 
     # Load checkpoint metadata to understand structure
     with open(os.path.join(ckpt_dir, ".metadata"), 'rb') as f:

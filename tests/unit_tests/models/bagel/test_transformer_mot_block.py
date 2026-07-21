@@ -6,7 +6,9 @@ Unit test for TransformerMoTBlock (Megatron Core) vs Qwen2Model (Bagel reference
 Tests that TransformerMoTBlock produces numerically equivalent outputs to the
 reference Qwen2Model implementation from bagel-package/bagel/modeling/bagel/qwen2_navit.py.
 
-Target accuracy: abs error < 1e-3, rel error < 1e-3, tensors in float16.
+Target accuracy: abs/rel error < 5e-3. The Bagel reference runs SDPA in
+bfloat16 before returning to the float16 projection path, so its outputs have
+bfloat16-scale quantization differences from the MCore float16 path.
 RoPE is used as rotary_pos_emb input for both transformers.
 
 Run with:
@@ -15,6 +17,7 @@ Run with:
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -39,8 +42,13 @@ from megatron.core.models.bagel.attention_mot import SelfAttentionMoT, SelfAtten
 from megatron.core.models.bagel.flex_attention import FlexAttention
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.models.bagel.transformer_mot_block import (
+    HAVE_TE,
+    BagelAlignmentColumnParallelLinear,
+    Qwen2RMSNorm,
     TransformerMoTBlock,
     TransformerMoTBlockSubmodules,
+    _get_mot_block_submodules,
+    get_mot_layer_spec,
 )
 from megatron.core.models.bagel.transformer_mot_layer import (
     MoTTransformerLayer,
@@ -67,6 +75,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -84,6 +93,207 @@ HEAD_DIM = HIDDEN_SIZE // NUM_HEADS  # 64
 SEQ_LEN = 64
 NUM_LAYERS = 2
 ROPE_THETA = 10000.0  # Qwen2 default
+
+
+def _mlp_submodules(layer_spec: ModuleSpec):
+    """Return the MLP submodule spec captured by the backend builder."""
+
+    return layer_spec.submodules.mlp.keywords["submodules"]
+
+
+def test_local_spec_uses_local_linears_and_qwen2_rms_norm():
+    """The local route must not retain any TE language-layer modules."""
+
+    local_spec = get_mot_layer_spec(
+        num_experts=None, use_te=False, use_flex_attention=True
+    )
+    layer_submodules = local_spec.submodules
+    attention_submodules = layer_submodules.self_attention.submodules
+
+    assert attention_submodules.linear_qkv is ColumnParallelLinear
+    assert attention_submodules.linear_qkv_gen is ColumnParallelLinear
+    assert attention_submodules.linear_proj is RowParallelLinear
+    assert attention_submodules.linear_proj_gen is RowParallelLinear
+    assert attention_submodules.core_attention is FlexAttention
+
+    for mlp_builder in (layer_submodules.mlp, layer_submodules.mlp_gen):
+        mlp_submodules = mlp_builder.keywords["submodules"]
+        assert mlp_submodules.linear_fc1 is ColumnParallelLinear
+        assert mlp_submodules.linear_fc2 is RowParallelLinear
+
+    for norm_builder in (
+        layer_submodules.input_layernorm,
+        layer_submodules.input_layernorm_gen,
+        layer_submodules.pre_mlp_layernorm,
+        layer_submodules.pre_mlp_layernorm_gen,
+        attention_submodules.q_layernorm,
+        attention_submodules.k_layernorm,
+        attention_submodules.q_layernorm_gen,
+        attention_submodules.k_layernorm_gen,
+    ):
+        assert norm_builder is Qwen2RMSNorm
+
+
+def test_alignment_spec_selects_split_linears_without_changing_other_local_modules():
+    """The opt-in alignment route only replaces QKV/FC1 projection kernels."""
+
+    alignment_spec = get_mot_layer_spec(
+        num_experts=None,
+        use_te=False,
+        use_flex_attention=True,
+        split_qkv_for_alignment=True,
+        split_mlp_for_alignment=True,
+    )
+    layer_submodules = alignment_spec.submodules
+    attention_submodules = layer_submodules.self_attention.submodules
+    mlp_submodules = _mlp_submodules(alignment_spec)
+
+    assert attention_submodules.linear_qkv.__name__ == "BagelAlignmentColumnParallelLinear"
+    assert attention_submodules.linear_qkv_gen is attention_submodules.linear_qkv
+    assert mlp_submodules.linear_fc1 is attention_submodules.linear_qkv
+    assert attention_submodules.linear_proj is RowParallelLinear
+    assert mlp_submodules.linear_fc2 is RowParallelLinear
+    assert layer_submodules.input_layernorm is Qwen2RMSNorm
+    assert layer_submodules.pre_mlp_layernorm is Qwen2RMSNorm
+
+
+def test_local_spec_drives_qwen2_final_norm_inference():
+    """A local layer spec must also select local Qwen2 final norms."""
+
+    config = _make_mcore_config()
+    config.transformer_impl = "local"
+    local_spec = get_mot_layer_spec(num_experts=None, use_te=False)
+
+    block_submodules = _get_mot_block_submodules(config, local_spec, pp_rank=0)
+
+    assert block_submodules.layer_norm is Qwen2RMSNorm
+    assert block_submodules.layer_norm_gen is Qwen2RMSNorm
+    assert len(block_submodules.layer_specs) == config.num_layers
+    assert all(layer_spec is local_spec for layer_spec in block_submodules.layer_specs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for bf16 parity")
+def test_qwen2_rms_norm_matches_hf_formula_forward_and_backward():
+    """The MCore adapter must preserve HF Qwen2's explicit fp32 reduction."""
+
+    dtype = torch.bfloat16
+    eps = 1e-6
+    config = SimpleNamespace(params_dtype=dtype)
+    norm = Qwen2RMSNorm(config=config, hidden_size=8, eps=eps).cuda()
+    with torch.no_grad():
+        norm.weight.copy_(
+            torch.tensor(
+                [0.75, 1.25, -0.5, 2.0, 0.125, -1.5, 0.625, 1.75],
+                dtype=dtype,
+                device="cuda",
+            )
+        )
+
+    actual_input = torch.tensor(
+        [[0.3, -1.7, 2.1, -0.2, 4.0, -3.3, 0.7, 1.1]],
+        dtype=dtype,
+        device="cuda",
+        requires_grad=True,
+    )
+    reference_input = actual_input.detach().clone().requires_grad_(True)
+    reference_weight = norm.weight.detach().clone().requires_grad_(True)
+
+    actual = norm(actual_input)
+    reference_float = reference_input.to(torch.float32)
+    variance = reference_float.pow(2).mean(-1, keepdim=True)
+    reference = reference_weight * (
+        reference_float * torch.rsqrt(variance + eps)
+    ).to(reference_input.dtype)
+
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    output_grad = torch.tensor(
+        [[-0.5, 1.0, 0.25, -2.0, 1.5, -0.75, 0.125, 0.625]],
+        dtype=dtype,
+        device="cuda",
+    )
+    actual.backward(output_grad)
+    reference.backward(output_grad)
+    torch.testing.assert_close(actual_input.grad, reference_input.grad, rtol=0, atol=0)
+    torch.testing.assert_close(norm.weight.grad, reference_weight.grad, rtol=0, atol=0)
+
+
+def test_te_spec_keeps_te_linears_norms_and_fused_pre_mlp_norm():
+    """Selecting TE must retain its projections, norms, and fused FC1 layout."""
+
+    if not HAVE_TE:
+        pytest.skip("Transformer Engine is required for the fused dense MLP spec")
+
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
+
+    te_spec = get_mot_layer_spec(num_experts=None, use_te=True, use_flex_attention=False)
+    layer_submodules = te_spec.submodules
+    attention_submodules = layer_submodules.self_attention.submodules
+    mlp_submodules = _mlp_submodules(te_spec)
+
+    assert attention_submodules.linear_qkv is TEColumnParallelLinear
+    assert attention_submodules.linear_qkv_gen is TEColumnParallelLinear
+    assert attention_submodules.linear_proj is TERowParallelLinear
+    assert attention_submodules.linear_proj_gen is TERowParallelLinear
+    assert attention_submodules.core_attention is TEDotProductAttention
+    assert mlp_submodules.linear_fc1 is TELayerNormColumnParallelLinear
+    assert mlp_submodules.linear_fc2 is TERowParallelLinear
+
+    assert layer_submodules.input_layernorm is TENorm
+    assert layer_submodules.input_layernorm_gen is TENorm
+    assert layer_submodules.pre_mlp_layernorm is IdentityOp
+    assert layer_submodules.pre_mlp_layernorm_gen is IdentityOp
+    for norm_builder in (
+        attention_submodules.q_layernorm,
+        attention_submodules.k_layernorm,
+        attention_submodules.q_layernorm_gen,
+        attention_submodules.k_layernorm_gen,
+    ):
+        assert norm_builder is TENorm
+
+    block_submodules = _get_mot_block_submodules(_make_mcore_config(), te_spec, pp_rank=0)
+    assert block_submodules.layer_norm is TENorm
+    assert block_submodules.layer_norm_gen is TENorm
+
+
+def test_te_alignment_switches_are_independent():
+    """QKV-only and MLP-only experiments must each leave the other TE seam intact."""
+
+    if not HAVE_TE:
+        pytest.skip("Transformer Engine is required for the TE alignment spec")
+
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+    )
+
+    qkv_spec = get_mot_layer_spec(
+        num_experts=None, use_te=True, split_qkv_for_alignment=True
+    )
+    qkv_layer = qkv_spec.submodules
+    assert (
+        qkv_layer.self_attention.submodules.linear_qkv
+        is BagelAlignmentColumnParallelLinear
+    )
+    assert _mlp_submodules(qkv_spec).linear_fc1 is TELayerNormColumnParallelLinear
+    assert qkv_layer.input_layernorm is TENorm
+    assert qkv_layer.pre_mlp_layernorm is IdentityOp
+
+    mlp_spec = get_mot_layer_spec(
+        num_experts=None, use_te=True, split_mlp_for_alignment=True
+    )
+    mlp_layer = mlp_spec.submodules
+    assert mlp_layer.self_attention.submodules.linear_qkv is TEColumnParallelLinear
+    assert _mlp_submodules(mlp_spec).linear_fc1 is BagelAlignmentColumnParallelLinear
+    assert mlp_layer.input_layernorm is Qwen2RMSNorm
+    assert mlp_layer.pre_mlp_layernorm is Qwen2RMSNorm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,7 +329,7 @@ def _make_psp(n_und: int, n_gen: int) -> MoTPackedSeqParams:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BagelMatchingAttention — identical to test_transformer_mot_layer.py
-# Uses EFFICIENT_ATTENTION + fp16 cast to match PackedAttentionMoT exactly.
+# Uses EFFICIENT_ATTENTION + bf16 SDPA to match PackedAttentionMoT exactly.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -162,16 +372,17 @@ class BagelMatchingAttention(MegatronModule):
             key = key.repeat_interleave(num_groups, dim=2)
             value = value.repeat_interleave(num_groups, dim=2)
 
-        # Reformat to bagel layout: [1, num_heads, seq, head_dim] in fp16
-        q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
-        k = key.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
-        v = value.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.float16)
-        mask = torch.zeros(1, 1, seq_len, seq_len, dtype=torch.float16, device=query.device)
+        # The reference runs SDPA in bf16, then autocast converts its result
+        # back to the fp16 output-projection dtype.
+        q = query.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+        k = key.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+        v = value.squeeze(1).permute(1, 0, 2).unsqueeze(0).to(torch.bfloat16)
+        mask = torch.zeros(1, 1, seq_len, seq_len, dtype=torch.bfloat16, device=query.device)
 
         with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
             attn_out = F_sdpa(q, k, v, mask)
 
-        attn_out = attn_out.squeeze(0).permute(1, 0, 2).contiguous()
+        attn_out = attn_out.to(query.dtype).squeeze(0).permute(1, 0, 2).contiguous()
         return attn_out.reshape(seq_len, batch_size, num_heads * head_dim)
 
 
@@ -222,6 +433,187 @@ def _make_mcore_config() -> TransformerConfig:
         use_cpu_initialization=True,
         apply_rope_fusion=False,  # unfused RoPE for format compatibility
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for BF16 GEMM parity")
+def test_alignment_split_linears_match_independent_hf_parameters_forward_and_backward():
+    """Fused storage plus split GEMMs must be bit-exact to native independent linears."""
+
+    hidden_size = 32
+    ffn_hidden_size = 64
+    num_heads = 4
+    num_query_groups = 2
+    head_dim = 8
+    queries_per_group = num_heads // num_query_groups
+    qkv_size = (num_heads + 2 * num_query_groups) * head_dim
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=hidden_size,
+        ffn_hidden_size=ffn_hidden_size,
+        num_attention_heads=num_heads,
+        num_query_groups=num_query_groups,
+        kv_channels=head_dim,
+        add_bias_linear=False,
+        add_qkv_bias=True,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-6,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_dropout_fusion=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        use_cpu_initialization=False,
+    )
+
+    def unpack_qkv(tensor):
+        trailing_shape = tuple(tensor.shape[1:])
+        grouped = tensor.reshape(
+            num_query_groups, queries_per_group + 2, head_dim, *trailing_shape
+        )
+        query = grouped[:, :queries_per_group].reshape(
+            num_heads * head_dim, *trailing_shape
+        )
+        key = grouped[:, queries_per_group : queries_per_group + 1].reshape(
+            num_query_groups * head_dim, *trailing_shape
+        )
+        value = grouped[:, queries_per_group + 1 :].reshape(
+            num_query_groups * head_dim, *trailing_shape
+        )
+        return query, key, value
+
+    def pack_qkv(query, key, value):
+        prefix = query.shape[:-1]
+        query = query.reshape(
+            *prefix, num_query_groups, queries_per_group, head_dim
+        )
+        key = key.reshape(*prefix, num_query_groups, 1, head_dim)
+        value = value.reshape(*prefix, num_query_groups, 1, head_dim)
+        return torch.cat((query, key, value), dim=-2).reshape(*prefix, -1)
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(1234)
+        qkv = BagelAlignmentColumnParallelLinear(
+            hidden_size,
+            qkv_size,
+            config=config,
+            init_method=config.init_method,
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name="qkv",
+        )
+        assert set(dict(qkv.named_parameters())) == {"weight", "bias"}
+        assert set(qkv.state_dict()) == {"weight", "bias", "_extra_state"}
+        with torch.no_grad():
+            qkv.weight.normal_(mean=0.0, std=0.02)
+            qkv.bias.normal_(mean=0.0, std=0.02)
+
+        actual_input = torch.randn(
+            17, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        reference_input = actual_input.detach().clone().requires_grad_(True)
+        query_weight, key_weight, value_weight = [
+            tensor.detach().clone().requires_grad_(True) for tensor in unpack_qkv(qkv.weight)
+        ]
+        query_bias, key_bias, value_bias = [
+            tensor.detach().clone().requires_grad_(True) for tensor in unpack_qkv(qkv.bias)
+        ]
+
+        actual_packed, actual_bias = qkv(actual_input)
+        assert actual_bias is None
+        actual_query, actual_key, actual_value = unpack_qkv(actual_packed.transpose(0, 1))
+        actual_query = actual_query.transpose(0, 1)
+        actual_key = actual_key.transpose(0, 1)
+        actual_value = actual_value.transpose(0, 1)
+        reference_query = F.linear(reference_input, query_weight, query_bias)
+        reference_key = F.linear(reference_input, key_weight, key_bias)
+        reference_value = F.linear(reference_input, value_weight, value_bias)
+        for actual, reference in zip(
+            (actual_query, actual_key, actual_value),
+            (reference_query, reference_key, reference_value),
+        ):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+        query_grad = torch.randn_like(reference_query)
+        key_grad = torch.randn_like(reference_key)
+        value_grad = torch.randn_like(reference_value)
+        actual_grads = torch.autograd.grad(
+            actual_packed,
+            (actual_input, qkv.weight, qkv.bias),
+            pack_qkv(query_grad, key_grad, value_grad),
+        )
+        reference_grads = torch.autograd.grad(
+            (reference_query, reference_key, reference_value),
+            (
+                reference_input,
+                query_weight,
+                key_weight,
+                value_weight,
+                query_bias,
+                key_bias,
+                value_bias,
+            ),
+            (query_grad, key_grad, value_grad),
+        )
+        torch.testing.assert_close(actual_grads[0], reference_grads[0], rtol=0, atol=0)
+        for actual, reference in zip(unpack_qkv(actual_grads[1]), reference_grads[1:4]):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+        for actual, reference in zip(unpack_qkv(actual_grads[2]), reference_grads[4:7]):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+        fc1 = BagelAlignmentColumnParallelLinear(
+            hidden_size,
+            2 * ffn_hidden_size,
+            config=config,
+            init_method=config.init_method,
+            gather_output=False,
+            bias=False,
+            skip_bias_add=True,
+            is_expert=False,
+            stride=2,
+            tp_comm_buffer_name="fc1",
+        )
+        assert set(dict(fc1.named_parameters())) == {"weight"}
+        assert set(fc1.state_dict()) == {"weight", "_extra_state"}
+        with torch.no_grad():
+            fc1.weight.normal_(mean=0.0, std=0.02)
+
+        actual_input = torch.randn(
+            17, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        reference_input = actual_input.detach().clone().requires_grad_(True)
+        gate_weight, up_weight = [
+            tensor.detach().clone().requires_grad_(True) for tensor in fc1.weight.chunk(2, dim=0)
+        ]
+        actual_fc1, actual_bias = fc1(actual_input)
+        assert actual_bias is None
+        reference_gate = F.linear(reference_input, gate_weight)
+        reference_up = F.linear(reference_input, up_weight)
+        reference_fc1 = torch.cat((reference_gate, reference_up), dim=-1)
+        torch.testing.assert_close(actual_fc1, reference_fc1, rtol=0, atol=0)
+
+        output_grad = torch.randn_like(reference_fc1)
+        actual_grads = torch.autograd.grad(
+            actual_fc1, (actual_input, fc1.weight), output_grad
+        )
+        reference_grads = torch.autograd.grad(
+            reference_fc1,
+            (reference_input, gate_weight, up_weight),
+            output_grad,
+        )
+        torch.testing.assert_close(actual_grads[0], reference_grads[0], rtol=0, atol=0)
+        torch.testing.assert_close(
+            actual_grads[1][:ffn_hidden_size], reference_grads[1], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            actual_grads[1][ffn_hidden_size:], reference_grads[2], rtol=0, atol=0
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,7 +955,10 @@ class TestTransformerMoTBlockAccuracy:
         position_ids, mcore_rope, bagel_cos_sin = _compute_rope()
         _patch_bagel_rope(bagel_model, bagel_cos_sin)
 
-        with torch.no_grad():
+        # The Bagel reference casts SDPA inputs to bf16 internally while its
+        # output projection remains fp16.  Its training path relies on autocast
+        # to reconcile those dtypes before the projection.
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
             bagel_out = bagel_model.forward_train(
                 packed_sequence=packed_seq,
                 sample_lens=[SEQ_LEN],
@@ -572,6 +967,7 @@ class TestTransformerMoTBlockAccuracy:
                 packed_und_token_indexes=und_idx,
                 packed_gen_token_indexes=gen_idx,
             )
+        with torch.no_grad():
             mcore_out, _ = mcore_block.forward_train(
                 hidden_states=hidden_states,
                 attention_mask=None,
@@ -583,7 +979,7 @@ class TestTransformerMoTBlockAccuracy:
         assert not torch.any(torch.isnan(mcore_out_flat)), "MCore output contains NaN"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel output contains NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3, msg=lambda m: f"[und-only] {m}"
+            mcore_out_flat, bagel_out, atol=5e-3, rtol=5e-3, msg=lambda m: f"[und-only] {m}"
         )
 
     def test_forward_train_gen_only(self):
@@ -596,7 +992,7 @@ class TestTransformerMoTBlockAccuracy:
         position_ids, mcore_rope, bagel_cos_sin = _compute_rope()
         _patch_bagel_rope(bagel_model, bagel_cos_sin)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
             bagel_out = bagel_model.forward_train(
                 packed_sequence=packed_seq,
                 sample_lens=[SEQ_LEN],
@@ -605,6 +1001,7 @@ class TestTransformerMoTBlockAccuracy:
                 packed_und_token_indexes=und_idx,
                 packed_gen_token_indexes=gen_idx,
             )
+        with torch.no_grad():
             mcore_out, _ = mcore_block.forward_train(
                 hidden_states=hidden_states,
                 attention_mask=None,
@@ -616,7 +1013,7 @@ class TestTransformerMoTBlockAccuracy:
         assert not torch.any(torch.isnan(mcore_out_flat)), "MCore output contains NaN"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel output contains NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3, msg=lambda m: f"[gen-only] {m}"
+            mcore_out_flat, bagel_out, atol=5e-3, rtol=5e-3, msg=lambda m: f"[gen-only] {m}"
         )
 
     def test_forward_train_mixed(self):
@@ -627,7 +1024,7 @@ class TestTransformerMoTBlockAccuracy:
         position_ids, mcore_rope, bagel_cos_sin = _compute_rope()
         _patch_bagel_rope(bagel_model, bagel_cos_sin)
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
             bagel_out = bagel_model.forward_train(
                 packed_sequence=packed_seq,
                 sample_lens=[SEQ_LEN],
@@ -636,6 +1033,7 @@ class TestTransformerMoTBlockAccuracy:
                 packed_und_token_indexes=und_idx,
                 packed_gen_token_indexes=gen_idx,
             )
+        with torch.no_grad():
             mcore_out, _ = mcore_block.forward_train(
                 hidden_states=hidden_states,
                 attention_mask=None,
@@ -647,7 +1045,7 @@ class TestTransformerMoTBlockAccuracy:
         assert not torch.any(torch.isnan(mcore_out_flat)), "MCore output contains NaN"
         assert not torch.any(torch.isnan(bagel_out)), "Bagel output contains NaN"
         torch.testing.assert_close(
-            mcore_out_flat, bagel_out, atol=1e-3, rtol=1e-3, msg=lambda m: f"[mixed] {m}"
+            mcore_out_flat, bagel_out, atol=5e-3, rtol=5e-3, msg=lambda m: f"[mixed] {m}"
         )
 
     def test_final_layernorm_separate(self):

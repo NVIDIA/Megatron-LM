@@ -15,6 +15,7 @@ Run with:
 import os
 import sys
 import types
+from functools import partial
 
 import pytest
 import torch
@@ -42,6 +43,7 @@ from megatron.core.models.bagel.attention_mot import (  # noqa: E402
 )
 from megatron.core.models.bagel.flex_attention import FlexAttention  # noqa: E402
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams  # noqa: E402
+from megatron.core.models.bagel.transformer_mot_block import TransformerMoTBlock  # noqa: E402
 from megatron.core.models.bagel.transformer_mot_layer import (  # noqa: E402
     MoTTransformerLayer,
     MoTTransformerLayerSubmodules,
@@ -77,8 +79,9 @@ except ImportError:
 
 
 class _PGC:
-    def __init__(self, tp, cp=None):
+    def __init__(self, tp, cp=None, pp=None):
         self.tp = tp
+        self.pp = pp
         if cp is not None:
             self.cp = cp
 
@@ -148,6 +151,186 @@ def _make_mcore_config() -> TransformerConfig:
         fp16=True,
         params_dtype=torch.float16,
         use_cpu_initialization=True,
+    )
+
+
+def _build_test_mlp(*, branch, config, pg_collection, is_mtp_layer, layer_number=None):
+    """Build a lightweight MLP stand-in through the TransformerLayer builder protocol."""
+    module = torch.nn.Identity()
+    module.branch = branch
+    module.builder_args = (config, pg_collection, is_mtp_layer, layer_number)
+    return module
+
+
+def test_mlp_builders_follow_transformer_layer_protocol():
+    """MoT layers accept the same callable MLP builders as standard TransformerLayer."""
+    config = _make_mcore_config()
+    pg_collection = _PGC(tp=None)
+    submodules = MoTTransformerLayerSubmodules(
+        mlp=partial(_build_test_mlp, branch="und"),
+        mlp_gen=partial(_build_test_mlp, branch="gen"),
+    )
+
+    layer = MoTTransformerLayer(
+        config=config, submodules=submodules, layer_number=3, pg_collection=pg_collection
+    )
+
+    assert layer.mlp.branch == "und"
+    assert layer.mlp_gen.branch == "gen"
+    assert layer.mlp.builder_args == (config, pg_collection, False, 3)
+    assert layer.mlp_gen.builder_args == (config, pg_collection, False, 3)
+
+
+class _EmptySensitiveOp(torch.nn.Module):
+    """Parameterized differentiable op that rejects zero-length token dimensions."""
+
+    def __init__(self, *, expand=1, return_bias=False):
+        super().__init__()
+        self.expand = expand
+        self.return_bias = return_bias
+        self.calls = 0
+        self.scale = torch.nn.Parameter(torch.ones(()))
+        self.empty_shard = torch.nn.Parameter(torch.empty(0))
+
+    def forward(self, x, *args, **kwargs):
+        assert x.shape[0] > 0, "empty token branch reached an empty-sensitive op"
+        self.calls += 1
+        output = x * self.scale + self.empty_shard.sum()
+        output = torch.cat([output] * self.expand, dim=-1) if self.expand > 1 else output
+        return (output, None) if self.return_bias else output
+
+
+class _IdentityCoreAttention(torch.nn.Module):
+    def forward(self, query, key, value, *args, **kwargs):
+        output = (query + key + value) / 3
+        return output.reshape(output.shape[0], output.shape[1], -1)
+
+
+def _assert_branch_gradients(module_pairs, *, und_active):
+    for und_module, gen_module in module_pairs:
+        active_module = und_module if und_active else gen_module
+        inactive_module = gen_module if und_active else und_module
+        assert active_module.scale.grad is not None
+        assert torch.count_nonzero(active_module.scale.grad) > 0
+        assert inactive_module.scale.grad is not None
+        torch.testing.assert_close(
+            inactive_module.scale.grad, torch.zeros_like(inactive_module.scale.grad)
+        )
+        assert active_module.empty_shard.grad is not None
+        assert inactive_module.empty_shard.grad is not None
+        assert active_module.empty_shard.grad.numel() == 0
+        assert inactive_module.empty_shard.grad.numel() == 0
+
+
+@pytest.mark.parametrize("Lund", [0, 4])
+def test_transformer_mot_helpers_keep_empty_branches_in_autograd(Lund):
+    """Layernorm and MLP helpers give inactive parameters explicit zero gradients."""
+    layer = MoTTransformerLayer.__new__(MoTTransformerLayer)
+    torch.nn.Module.__init__(layer)
+    layer.input_layernorm = _EmptySensitiveOp()
+    layer.input_layernorm_gen = _EmptySensitiveOp()
+    layer.pre_mlp_layernorm = _EmptySensitiveOp()
+    layer.pre_mlp_layernorm_gen = _EmptySensitiveOp()
+    layer.mlp = _EmptySensitiveOp(return_bias=True)
+    layer.mlp_gen = _EmptySensitiveOp(return_bias=True)
+    layer.freeze_und = False
+    layer.mot_stream_overlap = False
+
+    hidden_states = torch.randn(4, 1, 8, requires_grad=True)
+    normed = layer._apply_input_layernorm_mot(hidden_states, Lund)
+    output = layer._forward_mlp_mot(normed, Lund)
+
+    assert normed.shape == hidden_states.shape
+    assert output.shape == hidden_states.shape
+    torch.testing.assert_close(normed, hidden_states)
+    torch.testing.assert_close(output, 2 * hidden_states)
+
+    modules = (
+        (layer.input_layernorm, layer.input_layernorm_gen),
+        (layer.pre_mlp_layernorm, layer.pre_mlp_layernorm_gen),
+        (layer.mlp, layer.mlp_gen),
+    )
+    for und_module, gen_module in modules:
+        assert und_module.calls == int(Lund > 0)
+        assert gen_module.calls == int(Lund == 0)
+
+    output.square().sum().backward()
+    assert torch.count_nonzero(hidden_states.grad) > 0
+    _assert_branch_gradients(modules, und_active=Lund > 0)
+
+
+@pytest.mark.parametrize("Lund", [0, 4])
+def test_attention_mot_helpers_keep_empty_branches_in_autograd(Lund):
+    """Attention helpers give inactive projection and norm parameters zero gradients."""
+    hidden_size = 8
+    attention = SelfAttentionMoT.__new__(SelfAttentionMoT)
+    torch.nn.Module.__init__(attention)
+    attention.config = types.SimpleNamespace(hidden_size=hidden_size)
+    attention.linear_qkv = _EmptySensitiveOp(expand=3, return_bias=True)
+    attention.linear_qkv_gen = _EmptySensitiveOp(expand=3, return_bias=True)
+    attention.linear_proj = _EmptySensitiveOp(return_bias=True)
+    attention.linear_proj_gen = _EmptySensitiveOp(return_bias=True)
+    attention.q_layernorm = _EmptySensitiveOp()
+    attention.k_layernorm = _EmptySensitiveOp()
+    attention.q_layernorm_gen = _EmptySensitiveOp()
+    attention.k_layernorm_gen = _EmptySensitiveOp()
+    attention.core_attention = _IdentityCoreAttention()
+    attention.linear_qkv_out_dim_per_partition = 3 * hidden_size
+    attention.num_attention_heads_per_partition = 1
+    attention.num_query_groups_per_partition = 1
+    attention.hidden_size_per_attention_head = hidden_size
+    attention.freeze_und = False
+    attention.checkpoint_core_attention = False
+    attention.attn_mask_type = None
+
+    hidden_states = torch.randn(4, 1, hidden_size, requires_grad=True)
+    packed_seq_params = types.SimpleNamespace(
+        padded_und_seqlen=Lund, padded_gen_seqlen=hidden_states.shape[0] - Lund
+    )
+    output, bias = attention._forward_train(
+        hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+    )
+
+    assert bias is None
+    assert output.shape == hidden_states.shape
+    torch.testing.assert_close(output, hidden_states)
+
+    modules = (
+        (attention.linear_qkv, attention.linear_qkv_gen),
+        (attention.linear_proj, attention.linear_proj_gen),
+        (attention.q_layernorm, attention.q_layernorm_gen),
+        (attention.k_layernorm, attention.k_layernorm_gen),
+    )
+    for und_module, gen_module in modules:
+        assert und_module.calls == int(Lund > 0)
+        assert gen_module.calls == int(Lund == 0)
+
+    output.square().sum().backward()
+    assert torch.count_nonzero(hidden_states.grad) > 0
+    _assert_branch_gradients(modules, und_active=Lund > 0)
+
+
+@pytest.mark.parametrize("Lund", [0, 4])
+def test_transformer_mot_block_final_norm_keeps_empty_branch_in_autograd(Lund):
+    """Block final norms preserve layout and give inactive parameters zero gradients."""
+    block = TransformerMoTBlock.__new__(TransformerMoTBlock)
+    torch.nn.Module.__init__(block)
+    block.final_layernorm = _EmptySensitiveOp()
+    block.final_layernorm_gen = _EmptySensitiveOp()
+
+    hidden_states = torch.randn(4, 1, 8, requires_grad=True)
+    packed_seq_params = types.SimpleNamespace(padded_und_seqlen=Lund)
+    output = block._apply_final_layernorm_mot(hidden_states, packed_seq_params)
+
+    assert output.shape == hidden_states.shape
+    torch.testing.assert_close(output, hidden_states)
+    assert block.final_layernorm.calls == int(Lund > 0)
+    assert block.final_layernorm_gen.calls == int(Lund == 0)
+
+    output.square().sum().backward()
+    assert torch.count_nonzero(hidden_states.grad) > 0
+    _assert_branch_gradients(
+        ((block.final_layernorm, block.final_layernorm_gen),), und_active=Lund > 0
     )
 
 

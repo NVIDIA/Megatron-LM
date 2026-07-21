@@ -8,12 +8,17 @@ input/output formats while leveraging Megatron Core's efficient implementation.
 """
 
 import logging
+import os
 from typing import List, Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.models.bagel.alignment_audit import (
+    audit_branch_tensor,
+    layer_alignment_audit_enabled,
+)
 from megatron.core.models.bagel.bagel_rope import BagelRotaryEmbedding
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
 from megatron.core.models.bagel.transformer_mot_block import (
@@ -54,6 +59,9 @@ class BagelMCoreModel(GPTModel):
         self.num_heads = kwargs.get('config').num_attention_heads if 'config' in kwargs else 28
 
         # use bagel rope
+        self.bagel_native_rope_for_alignment = getattr(
+            self.config, 'bagel_native_rope_for_alignment', False
+        )
         self.rotary_pos_emb = BagelRotaryEmbedding(
             kv_channels=self.config.kv_channels,
             rotary_percent=self.rotary_percent,
@@ -64,6 +72,7 @@ class BagelMCoreModel(GPTModel):
             rope_scaling_factor=kwargs.get('rope_scaling_factor', 8.0),
             use_cpu_initialization=self.config.use_cpu_initialization,
             cp_group=self.pg_collection.cp,
+            native_qwen_for_alignment=self.bagel_native_rope_for_alignment,
         )
 
         # Check if model uses MoT (Mixture of Transformers)
@@ -104,10 +113,16 @@ class BagelMCoreModel(GPTModel):
             else:
                 # Convert standard spec to MoT spec using helper function
                 mot_spec = get_mot_layer_spec(
-                    use_flex_attention=use_flex_attention, qk_layernorm=True
+                    use_flex_attention=use_flex_attention,
+                    qk_layernorm=True,
+                    use_te=(config.transformer_impl == 'transformer_engine'),
                 )
         else:
-            mot_spec = get_mot_layer_spec(use_flex_attention=use_flex_attention, qk_layernorm=True)
+            mot_spec = get_mot_layer_spec(
+                use_flex_attention=use_flex_attention,
+                qk_layernorm=True,
+                use_te=(config.transformer_impl == 'transformer_engine'),
+            )
 
         # Replace decoder with TransformerMoTBlock
         self.decoder = TransformerMoTBlock(
@@ -276,8 +291,9 @@ class BagelMCoreModel(GPTModel):
         actual_Lund = len(packed_seq_params.local_und_token_indexes)
         mask = loss_mask > 0
         logits_hidden_states = last_hidden_state[:actual_Lund][mask]
-        output_weight = self.output_layer.weight
-        logits = F.linear(logits_hidden_states, output_weight)
+        # Keep the LM head on the standard GPTModel path so MCore FSDP/TP
+        # hooks observe it and its FP32 main-weight initialization.
+        logits, _ = self.output_layer(logits_hidden_states)
         # can not use full logits for ce calc would cause a OOM when Lund is large.
         # output_layer is column-parallel: at TP>1 each rank holds vocab/TP
         # columns, so use vocab_parallel_cross_entropy which all-reduces
@@ -287,6 +303,25 @@ class BagelMCoreModel(GPTModel):
             ce = vocab_parallel_cross_entropy(logits, labels[mask])
         else:
             ce = F.cross_entropy(logits, labels[mask], reduction="none")
+
+        if (
+            os.environ.get('BAGEL_LM_HEAD_ALIGNMENT_AUDIT', '0') == '1'
+            and torch.distributed.get_rank() == 0
+        ):
+            audit_step = getattr(self, '_lm_head_alignment_audit_step', 0)
+            self._lm_head_alignment_audit_step = audit_step + 1
+            output_weight = self.output_layer.weight
+            print(
+                '[BAGEL_LM_HEAD_ALIGNMENT_AUDIT] '
+                f'step={audit_step} ce_tokens={ce.numel()} '
+                f'hidden_sum={logits_hidden_states.float().sum().item():.9g} '
+                f'hidden_first10={logits_hidden_states.flatten()[:10].float().tolist()} '
+                f'weight_dtype={output_weight.dtype} '
+                f'weight_sum={output_weight.float().sum().item():.9g} '
+                f'logits_sum={logits.float().sum().item():.9g} '
+                f'ce_sum={ce.float().sum().item():.9g}',
+                flush=True,
+            )
 
         return dict(
             last_hidden_state=last_hidden_state,
@@ -358,7 +393,61 @@ class BagelMCoreModel(GPTModel):
                     f"packed_position_ids shape mismatch, expected {Lund + Lgen}, "
                     f"got {packed_position_ids.shape}"
                 )
-                rotary_pos_emb = self.rotary_pos_emb.forward_with_position_ids(packed_position_ids)
+                if layer_alignment_audit_enabled(1):
+                    audit_branch_tensor(
+                        "rope.position_ids",
+                        "und",
+                        packed_position_ids[:Lund],
+                        layer_number=1,
+                    )
+                    audit_branch_tensor(
+                        "rope.position_ids",
+                        "gen",
+                        packed_position_ids[Lund:],
+                        layer_number=1,
+                    )
+                if self.bagel_native_rope_for_alignment:
+                    rope_reference = decoder_input
+                    if rope_reference is None:
+                        rope_reference = torch.empty(
+                            (),
+                            dtype=self.config.params_dtype,
+                            device=packed_position_ids.device,
+                        )
+                    rotary_pos_cos, rotary_pos_sin = (
+                        self.rotary_pos_emb.forward_qwen_with_position_ids(
+                            rope_reference, packed_position_ids
+                        )
+                    )
+                    if layer_alignment_audit_enabled(1):
+                        audit_branch_tensor(
+                            "rope.inv_freq",
+                            "all",
+                            self.rotary_pos_emb.inv_freq,
+                            layer_number=1,
+                        )
+                        print(
+                            "[BAGEL_ROPE_ALIGNMENT_AUDIT] "
+                            f"native_flag={self.bagel_native_rope_for_alignment} "
+                            "inv_freq_initialized_on_cpu="
+                            f"{self.rotary_pos_emb.native_qwen_for_alignment} "
+                            f"inv_freq_idx9={self.rotary_pos_emb.inv_freq[9].item():.17g}",
+                            flush=True,
+                        )
+                        for stage, tensor in (
+                            ("rope.cos", rotary_pos_cos),
+                            ("rope.sin", rotary_pos_sin),
+                        ):
+                            audit_branch_tensor(
+                                stage, "und", tensor[:Lund], layer_number=1
+                            )
+                            audit_branch_tensor(
+                                stage, "gen", tensor[Lund:], layer_number=1
+                            )
+                else:
+                    rotary_pos_emb = self.rotary_pos_emb.forward_with_position_ids(
+                        packed_position_ids
+                    )
 
         # Call decoder based on type
         hidden_states = self.decoder(

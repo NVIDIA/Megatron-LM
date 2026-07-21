@@ -50,6 +50,7 @@ sys.path.insert(0, _BAGEL_SRC)
 
 from megatron.core.models.bagel.mcore_bagel_llm import BagelMCoreModel
 from megatron.core.models.bagel.mot_packed_seq_params import MoTPackedSeqParams
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 # Tiny config — keeps the model construction cheap. Same scale as
@@ -113,6 +114,10 @@ def _make_mcore_config() -> TransformerConfig:
         bf16=True,
         params_dtype=torch.bfloat16,
         use_cpu_initialization=True,
+        # The unit-test fixture disables all Transformer Engine attention
+        # backends.  This test uses the local GPT spec, so select the matching
+        # backend explicitly instead of leaving the config at ``auto``.
+        attention_backend=AttnBackend.local,
     )
 
 
