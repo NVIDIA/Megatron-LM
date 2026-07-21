@@ -1425,9 +1425,9 @@ class _StageDispatchBwdGrad(torch.autograd.Function):
     def backward(ctx, grad):  # type: ignore[override]
         buf = _NCCLEPManager._zc_bwd_token_buf
         assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
-        assert buf.shape == grad.shape, (
-            f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
-        )
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
         buf.copy_(grad)
         return buf
 
@@ -1794,9 +1794,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # AccumulateGrad clones the fc1 dgrad into a plain buffer anyway. Return None so the op-fuser
         # writes a plain dgrad;
         dispatch_grad_input = (
-            None
-            if self.config.overlap_moe_expert_parallel_comm
-            else _detached("_zc_bwd_token_buf")
+            None if self.config.overlap_moe_expert_parallel_comm else _detached("_zc_bwd_token_buf")
         )
         return _detached("_zc_fwd_token_buf"), dispatch_grad_input
 
