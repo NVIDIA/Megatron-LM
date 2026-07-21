@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from functools import partial
@@ -1161,7 +1161,11 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    tensor_shape = [
+        seq_length,
+        micro_batch_size,
+        _get_pipeline_hidden_size(config, pp_group=p2p_communicator.pp_group),
+    ]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
@@ -2100,11 +2104,17 @@ def get_tensor_shapes(
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    is_recv: bool = True,
 ):
     """Determine tensor shapes for pipeline communication.
 
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
+
+    ``pp_group`` and ``is_recv`` distinguish the two mHC boundary shapes. The
+    first stage has no forward receive and the last stage has no forward send;
+    all communication between stages carries the expanded residual streams.
     """
     tensor_shapes = []
 
@@ -2120,8 +2130,33 @@ def get_tensor_shapes(
     if config.sequence_parallel:
         effective_seq_length = effective_seq_length // tp_group.size()
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
+    hidden_size = _get_pipeline_hidden_size(config, pp_group=pp_group, is_recv=is_recv)
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
+
+
+def _get_pipeline_hidden_size(
+    config, *, pp_group: Optional[torch.distributed.ProcessGroup], is_recv: Optional[bool] = None
+) -> int:
+    """Return the hidden dimension used by a pipeline communication edge."""
+    hidden_size = config.hidden_size
+    if not getattr(config, 'enable_hyper_connections', False) or pp_group is None:
+        return hidden_size
+
+    pp_rank = pp_group.rank()
+    pp_size = pp_group.size()
+    if pp_size == 1:
+        return hidden_size
+
+    # The interleaved schedule uses one shape for all P2P operations. Its only
+    # active communication edges are between stages, so all of them carry n*C.
+    if is_recv is None:
+        return hidden_size * config.num_residual_streams
+
+    is_inactive_boundary = (is_recv and pp_rank == 0) or (not is_recv and pp_rank == pp_size - 1)
+    if is_inactive_boundary:
+        return hidden_size
+    return hidden_size * config.num_residual_streams
 
 
 def forward_backward_pipelining_without_interleaving(
@@ -2287,6 +2322,9 @@ def forward_backward_pipelining_without_interleaving(
     else:
         backward_func = backward_step
 
+    # Multi-module pipelines exchange variable shapes and do not expose one
+    # pipeline group for the full topology.
+    pp_group = getattr(p2p_communicator, 'pp_group', None)
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -2294,6 +2332,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=pp_group,
+        is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
@@ -2302,6 +2342,8 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
+        pp_group=pp_group,
+        is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
