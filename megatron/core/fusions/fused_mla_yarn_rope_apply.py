@@ -198,6 +198,8 @@ def rotary_bwd_q_kernel(
     x_left = tl.load(DO + x_left_off, mask=mask)
     x_right = tl.load(DO + x_right_off, mask=mask)
 
+    # The input and output layouts alias. Finish all loads before any warp stores.
+    tl.debug_barrier()
     x_1 = x_left * cos_left + x_right * sin_right
     x_2 = -x_left * sin_left + x_right * cos_right
 

@@ -18,10 +18,12 @@ try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_apply_mla_rope_for_kv,
         fused_apply_mla_rope_for_q,
+        rotary_bwd_q_kernel,
     )
 except:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
+    rotary_bwd_q_kernel = None
 
 
 def dtype_tols(dtype):
@@ -300,9 +302,76 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_rotary_bwd_q_block_h2_loads_before_stores() -> None:
+    """Exercise the cross-warp in-place conversion without the autotuner."""
+    import triton
+
+    num_heads = 32
+    q_dim = 128
+    emb_dim = 64
+    max_seqlen = 128
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+    freqs, mscale = yarn_rope(max_seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(torch.bfloat16)
+    sin = (torch.sin(freqs) * mscale).to(torch.bfloat16)
+    generator = torch.Generator(device="cuda").manual_seed(617)
+    before = torch.randn(
+        (128, num_heads, q_dim + emb_dim), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+
+    torch_reference = before.clone()
+    rotary = before[..., q_dim:].float()
+    half = emb_dim // 2
+    cos_float = cos.view(max_seqlen, 1, emb_dim).float()
+    sin_float = sin.view(max_seqlen, 1, emb_dim).float()
+    left, right = rotary[..., :half], rotary[..., half:]
+    x_1 = left * cos_float[..., :half] + right * sin_float[..., half:]
+    x_2 = -left * sin_float[..., :half] + right * cos_float[..., half:]
+    converted = torch.empty_like(rotary)
+    converted[..., 0::2] = x_1
+    converted[..., 1::2] = x_2
+    torch_reference[..., q_dim:] = converted.to(before.dtype)
+
+    def launch(block_h: int) -> torch.Tensor:
+        result = before.clone()
+        rotary_bwd_q_kernel.fn[(result.shape[0], triton.cdiv(num_heads, block_h))](
+            result,
+            cos,
+            sin,
+            q_dim,
+            emb_dim,
+            num_heads,
+            1,
+            None,
+            None,
+            result.stride(0),
+            result.stride(1),
+            0,
+            1,
+            BLOCK_H=block_h,
+            num_warps=4,
+            num_stages=3,
+        )
+        return result
+
+    expected = launch(block_h=1)
+    torch.testing.assert_close(
+        expected.float(), torch_reference.float(), **dtype_tols(before.dtype)
+    )
+    for _ in range(100):
+        actual = launch(block_h=2)
+        assert torch.equal(actual, expected)
+        torch.testing.assert_close(
+            actual.float(), torch_reference.float(), **dtype_tols(before.dtype)
+        )
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
 class TestFusedApplyMLARope:
-    @pytest.mark.flaky_in_dev
     def test_forward_backward_for_q(self, input_format):
         _test_fused_apply_mla_rope_for_q(input_format)
 
