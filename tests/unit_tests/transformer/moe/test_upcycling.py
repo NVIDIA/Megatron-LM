@@ -75,7 +75,7 @@ def model_provider(
         transformer_layer_spec=layer_spec_fn(
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
         ),
-        vocab_size=args.vocal_size,
+        vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
