@@ -17,6 +17,7 @@ class MambaMetadata:
         self,
         max_requests: int,
         max_tokens: int,
+        *,
         max_intermediate_count: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
@@ -391,6 +392,12 @@ class MambaMetadata:
             intermediate_counts_gpu: [real_prefill_count] int32 GPU tensor of
                 per-request offset counts (0-3), or None.
             real_prefill_count: Number of real (non-padding) prefill requests.
+            padded_prefill_count: Prefill request count after batch padding
+                (equals the captured graph bucket under CUDA graphs, or the
+                round-up-padded count in eager mode; always >= real_prefill_count).
+                Bounds the exposed/padded extent of the intermediate views via
+                ``max_count`` so CUDA graph replay always touches a fixed-size
+                region within the scratch buffers.
             cu_seqlens_gpu: GPU cu_seqlens tensor to read from. Defaults to
                 the legacy standalone ``_cu_seqlens_buffer`` used by
                 :meth:`update`; the coalesced production path passes the

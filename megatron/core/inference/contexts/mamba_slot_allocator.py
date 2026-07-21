@@ -432,8 +432,10 @@ class MambaSlotAllocator:
         last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
         penultimate_abs = (overall_required_blocks - 1) * bs
 
-        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
-        mamba_chunk_size = 128
+        # SSM chunk size the mamba kernel actually runs with. States can only be
+        # extracted at multiples of this value, and it must match the value used
+        # in MambaMetadata (offset -> chunk-index conversion) to stay consistent.
+        mamba_chunk_size = ctx.mamba_chunk_size
 
         # Keep only boundaries that land inside this chunk's computed tokens and on
         # a mamba-chunk boundary (required for mid-sequence state extraction).
