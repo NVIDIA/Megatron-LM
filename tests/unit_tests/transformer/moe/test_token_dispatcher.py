@@ -184,9 +184,10 @@ class MoEModelTestContainer:
         parity. Runs the real op-fuser experts so fc2-out/fc1-dgrad are written straight into the
         symm combine/dispatch buffers (verified via is_symm_backed) -- the pure permute/unpermute
         harness cannot exercise this path."""
+        from transformer_engine.pytorch.ep import is_symm_backed
+
         from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
         from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
-        from transformer_engine.pytorch.ep import is_symm_backed
 
         torch.manual_seed(42)
         x = torch.randn((32, 8, self.config.hidden_size), dtype=self.test_dtype).cuda()
