@@ -55,13 +55,57 @@ class _FeatureFlag:
 MultiStorageClientFeature = _FeatureFlag(default=False)
 
 
-def open_file(*args, **kwargs):
-    """Open a file with the appropriate method based on whether MSC is enabled."""
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        return msc.open(*args, **kwargs)
-    else:
-        return open(*args, **kwargs)
+class MaybeMultiStorageClient:
+    """
+    Helper class to use MultiStorageClient
+    """
+
+    def path_isdir(self, path, strict: bool = True):
+        """
+        Check if a path is an existing directory.
+        :param path: path to check
+        :param strict: if True, use only committed metadata for MSC
+        """
+        if MultiStorageClientFeature.is_enabled():
+            pkg = MultiStorageClientFeature.import_package()
+            return pkg.os.path.isdir(path, strict=strict)
+        else:
+            import os
+
+            return os.path.isdir(path)
+
+    def __getattr__(self, name):
+        if MultiStorageClientFeature.is_enabled():
+            pkg = MultiStorageClientFeature.import_package()
+            if hasattr(pkg, name):
+                return getattr(pkg, name)
+
+        if name == "open":
+            return open
+        if name == "os":
+            import os
+
+            return os
+        if name == "Path":
+            from pathlib import Path
+
+            return Path
+        if name == "torch":
+            import torch
+
+            return torch
+        raise AttributeError(f"{self.__class__.__name__!s} has no attribute {name!s}")
+
+    def __dir__(self):
+        attrs = {"open", "os", "Path", "torch"}
+        if MultiStorageClientFeature.is_enabled():
+            try:
+                pkg = MultiStorageClientFeature.import_package()
+                attrs.update(dir(pkg))
+            except RuntimeError:
+                pass
+        return sorted(attrs)
 
 
-__all__ = ['MultiStorageClientFeature', 'open_file']
+maybe_msc = MaybeMultiStorageClient()
+__all__ = ['MultiStorageClientFeature', 'maybe_msc']
