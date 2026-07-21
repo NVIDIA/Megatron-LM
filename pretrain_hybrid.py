@@ -17,7 +17,6 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
-import contextlib
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
 
@@ -67,8 +66,6 @@ from model_provider import model_provider
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
-    from megatron.post_training.model_builder import ModelOptHybridModelConfig
-    from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -324,14 +321,11 @@ def forward_step(data_iterator, model: HybridModel):
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
             total_tokens=int(cu_seqlens_for_params[-1].item()),
-            tokens_per_sample=args.seq_length,
         )
 
     timers('batch-generator').stop()
 
-    # Frozen teacher (--freeze-all-layers) runs forward-only for logit saving: disable grad
-    grad_ctx = torch.no_grad() if get_args().freeze_all_layers else contextlib.nullcontext()
-    with stimer, grad_ctx:
+    with stimer:
         output_tensor = model(
             tokens,
             position_ids,
@@ -455,12 +449,7 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
-    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
-        model_cfg = hybrid_config_from_args(args, model_config_cls=ModelOptHybridModelConfig)
-    else:
-        model_cfg = hybrid_config_from_args(args)
+    model_cfg = hybrid_config_from_args(args)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,
