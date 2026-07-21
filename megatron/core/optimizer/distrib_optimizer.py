@@ -3013,6 +3013,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # In this mode the params given to self.optimizer are views onto the model
+            # params, which the caller has already refreshed, so no shard copy is needed
+            # here. A HybridDeviceOptimizer, however, additionally keeps detached CPU
+            # clones and FP32 working copies of those params, which nothing else refreshes;
+            # re-seed them before returning. Note that `optimizer_cpu_offload` forces this
+            # branch to be taken whenever `use_precision_aware_optimizer` is set (see
+            # OptimizerConfig), so this is the path CPU offloading takes in practice.
+            if isinstance(self.optimizer, HybridDeviceOptimizer):
+                self.optimizer.reload_model_params()
             return
 
         if state_dict is not None:

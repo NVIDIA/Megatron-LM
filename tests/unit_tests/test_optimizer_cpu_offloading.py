@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import random
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -17,6 +19,7 @@ except:
     from torch.optim import Adam as GPUAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 
 class Net(nn.Module):
@@ -236,6 +239,42 @@ def test_reload_model_params_reseeds_internal_copies(offload_fraction, param_upd
         assert _matches_param(cpu_copy, orig_param), "CPU clone not re-seeded on reload"
     for orig_param, fp32_param in hdo.param_to_fp32_param.items():
         assert _matches_param(fp32_param, orig_param), "FP32 copy not re-seeded on reload"
+
+
+@pytest.mark.parametrize('use_precision_aware_optimizer', [True, False])
+def test_distributed_optimizer_reloads_hybrid_optimizer(use_precision_aware_optimizer):
+    """``DistributedOptimizer`` must reach ``HybridDeviceOptimizer.reload_model_params``.
+
+    ``_copy_model_params_to_main_params`` returns early when
+    ``use_precision_aware_optimizer_no_fp8_or_ds_fp8`` is set, and
+    ``optimizer_cpu_offload`` forces that flag on (see ``OptimizerConfig`` and the
+    ``--optimizer-cpu-offload`` assertion in ``megatron/training/arguments.py``), so
+    that early-return path is the one CPU offloading actually takes. Both branches
+    must re-seed the optimizer's internal copies.
+    """
+    # `spec` makes `isinstance` succeed and pins the method name: renaming
+    # `reload_model_params` turns this into an AttributeError rather than a
+    # silently passing test.
+    hdo = MagicMock(spec=HybridDeviceOptimizer)
+
+    # Minimal stand-in for a DistributedOptimizer: the method under test only
+    # reads these attributes, and the empty param groups make the shard copies
+    # a no-op, so no distributed initialization or GPU is required.
+    stub = SimpleNamespace(
+        ddp_config=SimpleNamespace(use_megatron_fsdp=False),
+        config=SimpleNamespace(
+            use_precision_aware_optimizer_no_fp8_or_ds_fp8=use_precision_aware_optimizer
+        ),
+        optimizer=hdo,
+        model_float16_groups=[],
+        model_fp32_groups=[],
+        shard_fp32_from_float16_groups=[],
+        shard_fp32_groups=[],
+    )
+
+    DistributedOptimizer._copy_model_params_to_main_params(stub)
+
+    hdo.reload_model_params.assert_called_once_with()
 
 
 @pytest.mark.skipif(
