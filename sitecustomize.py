@@ -125,17 +125,21 @@ if os.environ.get('PK3_TRACE') == '1' and os.environ.get('SLURM_PROCID') is not 
 
     sys.unraisablehook = _unraisable_hook
 
-    # Flight recorder: signal-safe stack dumps + all-thread stacks every 30 s.
-    # Per-pid file: every python process on the rank (trainer, burn daemon, gym
-    # helpers) imports this hook, and a shared file interleaves their dumps.
+    # Fatal-signal stack dumps (SIGSEGV/SIGABRT/...). Per-pid file: every python
+    # process on the rank (trainer, burn daemon, gym helpers) imports this hook,
+    # and a shared file interleaves dumps.
+    # NOTE: no faulthandler.dump_traceback_later here — its watchdog thread walks
+    # frames without the GIL and segfaulted ranks mid-Triton-JIT (pk3 attempts
+    # 1+2: tasks 16/30 then 1, all during create_cuda_graphs compile). The
+    # periodic flight recorder below uses sys._current_frames under the GIL.
     try:
         _fr = open(os.path.join(_DIR, f'pk3_flight_r{_RANK}_p{os.getpid()}.log'), 'a')
         faulthandler.enable(file=_fr, all_threads=True)
-        faulthandler.dump_traceback_later(30, repeat=True, file=_fr)
     except Exception:
         pass
 
     def _mem_sampler():
+        tick = 0
         while True:
             try:
                 avail = rss = '?'
@@ -150,6 +154,14 @@ if os.environ.get('PK3_TRACE') == '1' and os.environ.get('SLURM_PROCID') is not 
                             rss = line.split()[1]
                             break
                 _write('pk3_mem', f'{time.time():.1f} avail_kb={avail} rss_kb={rss}\n', sync=False)
+                tick += 1
+                if tick % 3 == 0:
+                    # GIL-safe periodic flight recorder (replaces dump_traceback_later).
+                    try:
+                        _fr.write(f'=== flight t={time.time():.1f} ===\n{_stacks()}')
+                        _fr.flush()
+                    except Exception:
+                        pass
             except Exception:
                 pass
             time.sleep(10)
