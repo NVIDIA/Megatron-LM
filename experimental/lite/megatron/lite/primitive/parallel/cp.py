@@ -173,14 +173,25 @@ def zigzag_to_contiguous_chunks(
     tensor: torch.Tensor,
     cp_group: dist.ProcessGroup | None,
     seq_dim: int = 1,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Swap a CP-local tensor from Megatron zigzag layout to contiguous chunks.
 
     Zigzag CP layout assigns rank ``r`` global chunks ``[r, 2*cp-r-1]``.
     Linear-attention all-gather CP kernels expect rank ``r`` to hold chunks
-    ``[2*r, 2*r+1]``. The conversion is a chunk-level all-to-all and preserves
-    the local tensor shape.
+    ``[2*r, 2*r+1]``.
+
+    SBHD tensors (``cu_seqlens is None``) hold exactly two equal chunks per rank
+    and use a chunk-level all-to-all that preserves the local tensor shape. Packed
+    THD tensors pass the *global* (pre-CP-split) ``cu_seqlens`` and use a single
+    packed-token all-to-all whose routing is packing-aware, so per-sequence zigzag
+    chunk boundaries are honoured even when sequences do not evenly divide the CP
+    size. Mirrors upstream Megatron ``context_parallel_layout``.
     """
+    if cu_seqlens is not None:
+        return _zigzag_contiguous_thd_swap(
+            tensor, cp_group, seq_dim, cu_seqlens, source_layout="zigzag", target_layout="contiguous"
+        )
     return _zigzag_contiguous_chunk_swap(tensor, cp_group, seq_dim, to_contiguous=True)
 
 
@@ -188,8 +199,13 @@ def contiguous_to_zigzag_chunks(
     tensor: torch.Tensor,
     cp_group: dist.ProcessGroup | None,
     seq_dim: int = 1,
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Inverse of :func:`zigzag_to_contiguous_chunks`."""
+    if cu_seqlens is not None:
+        return _zigzag_contiguous_thd_swap(
+            tensor, cp_group, seq_dim, cu_seqlens, source_layout="contiguous", target_layout="zigzag"
+        )
     return _zigzag_contiguous_chunk_swap(tensor, cp_group, seq_dim, to_contiguous=False)
 
 
@@ -281,6 +297,188 @@ def _zigzag_contiguous_chunk_swap(
     return out.contiguous()
 
 
+def get_thd_context_parallel_rank_indices(
+    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, layout: str
+) -> torch.Tensor:
+    """Return global THD token indices owned by one CP rank in a layout.
+
+    Args:
+        cu_seqlens: Global packed-sequence cumulative lengths before CP partitioning.
+        cp_size: Context-parallel group size.
+        cp_rank: Context-parallel rank.
+        layout: Either ``"zigzag"`` or ``"contiguous"``.
+
+    The returned indices are ordered exactly as the rank-local THD tensor is stored.
+    ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order; ``"contiguous"``
+    partitions the flattened packed THD buffer into rank-contiguous spans. Mirrors upstream
+    Megatron ``context_parallel_layout.get_thd_context_parallel_rank_indices``.
+    """
+    if layout not in ("zigzag", "contiguous"):
+        raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
+    if cu_seqlens.dim() != 1:
+        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
+
+    cu = cu_seqlens.to(dtype=torch.long)
+    if cu.numel() == 0 or cu[0].item() != 0:
+        raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
+
+    if torch.any(torch.diff(cu) < 0):
+        raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
+
+    nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+    nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+    cu = cu[nonduplicate_boundaries]
+
+    total_tokens = int(cu[-1].item())
+    positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
+    if total_tokens == 0:
+        return positions
+
+    seq_lens = torch.diff(cu)
+    chunk_divisor = 2 * cp_size
+    if torch.any(seq_lens % chunk_divisor != 0):
+        raise ValueError(
+            "All packed sequence lengths must be divisible by "
+            f"2 * cp_size ({chunk_divisor}) for zigzag/contiguous CP layout conversion, "
+            f"got {seq_lens}."
+        )
+
+    if layout == "contiguous":
+        part_len = total_tokens // cp_size
+        rank_start = cp_rank * part_len
+        return positions[rank_start : rank_start + part_len]
+
+    seq_idx = torch.bucketize(positions, cu[1:], right=True)
+    global_starts = cu[:-1]
+    pos_in_seq = positions - global_starts[seq_idx]
+    chunk_lens = (seq_lens // chunk_divisor)[seq_idx]
+    chunk = pos_in_seq // chunk_lens
+    offset = pos_in_seq - chunk * chunk_lens
+
+    owner = torch.where(chunk < cp_size, chunk, 2 * cp_size - chunk - 1)
+    local_slot = torch.where(chunk < cp_size, torch.zeros_like(chunk), torch.ones_like(chunk))
+
+    local_starts = (global_starts // cp_size)[seq_idx]
+    local_pos = local_starts + local_slot * chunk_lens + offset
+
+    rank_mask = owner == cp_rank
+    rank_positions = positions[rank_mask]
+    rank_local_pos = local_pos[rank_mask]
+    return rank_positions[torch.argsort(rank_local_pos)]
+
+
+def _zigzag_contiguous_thd_swap(
+    tensor: torch.Tensor,
+    cp_group: Optional[dist.ProcessGroup],
+    seq_dim: int,
+    cu_seqlens: torch.Tensor,
+    *,
+    source_layout: str,
+    target_layout: str,
+) -> torch.Tensor:
+    """Single-all-to-all THD permutation between zigzag and contiguous layouts.
+
+    The packed THD tensor stays packed: we first group local tokens by their target
+    CP rank, exchange those groups once, then scatter received tokens back into the
+    target rank-local order. Mirrors upstream Megatron
+    ``context_parallel_layout._zigzag_contiguous_thd_swap`` (packing-aware routing
+    from the *global* ``cu_seqlens``).
+    """
+    cp_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+    if cp_size <= 1:
+        return tensor
+    cp_rank = dist.get_rank(cp_group)
+
+    if seq_dim != 0:
+        tensor = tensor.movedim(seq_dim, 0)
+    tensor = tensor.contiguous()
+
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    source_by_rank = [
+        get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_layout)
+        for rank in range(cp_size)
+    ]
+    target_by_rank = [
+        get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_layout)
+        for rank in range(cp_size)
+    ]
+
+    local_source_indices = source_by_rank[cp_rank]
+    local_target_indices = target_by_rank[cp_rank]
+    if tensor.size(0) != local_source_indices.numel():
+        raise ValueError(
+            f"Local THD tensor length ({tensor.size(0)}) does not match {source_layout} "
+            f"rank-{cp_rank} partition length ({local_source_indices.numel()})."
+        )
+
+    total_tokens = int(cu[-1].item())
+    target_owner = torch.empty(total_tokens, device=tensor.device, dtype=torch.long)
+    target_local_pos = torch.empty(total_tokens, device=tensor.device, dtype=torch.long)
+    for rank, indices in enumerate(target_by_rank):
+        target_owner[indices] = rank
+        target_local_pos[indices] = torch.arange(indices.numel(), device=tensor.device)
+
+    local_target_owner = target_owner[local_source_indices]
+    local_target_pos = target_local_pos[local_source_indices]
+
+    send_parts: list[torch.Tensor] = []
+    input_split_sizes: list[int] = []
+    for dst_rank in range(cp_size):
+        dst_mask = local_target_owner == dst_rank
+        dst_rows = dst_mask.nonzero(as_tuple=False).flatten()
+        if dst_rows.numel() > 0:
+            dst_rows = dst_rows[torch.argsort(local_target_pos[dst_rows])]
+            send_part = tensor.index_select(0, dst_rows)
+        else:
+            send_part = tensor.narrow(0, 0, 0)
+        send_parts.append(send_part)
+        input_split_sizes.append(send_part.size(0))
+    send_buf = torch.cat(send_parts, dim=0).contiguous()
+
+    output_split_sizes: list[int] = []
+    recv_target_positions: list[torch.Tensor] = []
+    for src_rank in range(cp_size):
+        src_indices = source_by_rank[src_rank]
+        src_to_this_rank = target_owner[src_indices] == cp_rank
+        recv_global_indices = src_indices[src_to_this_rank]
+        if recv_global_indices.numel() > 0:
+            recv_positions = target_local_pos[recv_global_indices]
+            recv_positions = recv_positions[torch.argsort(recv_positions)]
+        else:
+            recv_positions = local_target_indices.narrow(0, 0, 0)
+        recv_target_positions.append(recv_positions)
+        output_split_sizes.append(int(recv_positions.numel()))
+
+    recv_shape = (sum(output_split_sizes), *send_buf.shape[1:])
+    recv_buf = torch.empty(recv_shape, dtype=send_buf.dtype, device=send_buf.device)
+    from torch.distributed.nn.functional import all_to_all_single
+
+    recv_buf = all_to_all_single(
+        recv_buf,
+        send_buf,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+        group=cp_group,
+    )
+
+    out_shape = (local_target_indices.numel(),) + tuple(tensor.shape[1:])
+    out = tensor.new_empty(out_shape)
+    offset = 0
+    for recv_positions in recv_target_positions:
+        recv_len = int(recv_positions.numel())
+        if recv_len > 0:
+            out[recv_positions] = recv_buf[offset : offset + recv_len]
+            offset += recv_len
+
+    if seq_dim != 0:
+        out = out.movedim(0, seq_dim)
+    return out.contiguous()
+
+
 def zigzag_position_ids_for_cp(
     seq_len: int,
     cp_rank: int,
@@ -350,10 +548,101 @@ def split_packed_for_cp(
     return new_ids, new_pos, new_cu, max(new_lengths)
 
 
+def build_headwise_section_perm(
+    split_sections: tuple[int, ...] | list[int],
+    cp_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Permutation over the hidden dim so a single contiguous ``1/cp`` slice equals
+    the concatenation of each section's ``k``-th contiguous block.
+
+    ``qkvzba`` is a concatenation of independently-headed sections (q, k, v, z,
+    beta, alpha). Head-parallel CP wants each rank to own ``1/cp`` heads of *every*
+    section. Applying this permutation before a plain hidden-scatter all-to-all makes
+    rank ``k``'s contiguous hidden shard hold section-block ``k`` of each section, so
+    the per-section split downstream (and the matching parameter slicing) is exact.
+
+    Mirrors upstream Megatron ``_build_head_perm_for_split_sections``.
+    """
+    assert all(
+        s % cp_size == 0 for s in split_sections
+    ), f"split_sections {tuple(split_sections)} must each be divisible by cp_size={cp_size}."
+    offset = 0
+    parts = []
+    for s in split_sections:
+        parts.append(
+            torch.arange(offset, offset + s, device=device, dtype=torch.long).view(cp_size, -1)
+        )
+        offset += s
+    return torch.cat(parts, dim=-1).view(-1)
+
+
+def get_parameter_local_cp_headwise(
+    param: torch.Tensor,
+    dim: int,
+    cp_size: int,
+    cp_rank: int,
+    split_sections: Optional[list[int]] = None,
+) -> torch.Tensor:
+    """Return this CP rank's head-wise slice of a parameter.
+
+    With ``split_sections`` the parameter is first split into sections along ``dim``,
+    each section is sliced to its rank-``cp_rank`` contiguous block, and the blocks are
+    re-concatenated — matching :func:`build_headwise_section_perm`. Slicing happens in
+    the forward path so gradients flow back to the full (cp_size=1) parameter.
+
+    Mirrors upstream Megatron ``get_parameter_local_cp_headwise``.
+    """
+    if cp_size <= 1:
+        return param
+    if split_sections is not None:
+        pieces = torch.split(param, split_sections, dim=dim)
+        return torch.cat(
+            [get_parameter_local_cp_headwise(p, dim, cp_size, cp_rank) for p in pieces],
+            dim=dim,
+        )
+    dim_size = param.size(dim)
+    assert (
+        dim_size % cp_size == 0
+    ), f"parameter dim {dim} size {dim_size} not divisible by cp_size={cp_size}."
+    slices: list[slice] = [slice(None)] * param.dim()
+    block = dim_size // cp_size
+    slices[dim] = slice(cp_rank * block, (cp_rank + 1) * block)
+    return param[tuple(slices)]
+
+
+def all_to_all_hidden_shards(
+    send_parts: list[torch.Tensor],
+    cp_group: dist.ProcessGroup | None,
+) -> list[torch.Tensor]:
+    """Even all-to-all over a CP group: ``send_parts[j]`` is delivered to rank ``j``;
+    the returned ``recv[i]`` is the tensor rank ``i`` sent to this rank.
+
+    All parts must share the same shape and dtype. Autograd-aware via
+    ``torch.distributed.nn.functional.all_to_all_single``.
+    """
+    cp_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+    if cp_size <= 1:
+        return [send_parts[0]]
+    assert len(send_parts) == cp_size, (len(send_parts), cp_size)
+    ref = send_parts[0]
+    send = torch.stack([p.contiguous() for p in send_parts], dim=0)  # [cp, *shape]
+    flat = send.reshape(cp_size, -1).contiguous()
+    from torch.distributed.nn.functional import all_to_all_single
+
+    recv_flat = all_to_all_single(torch.empty_like(flat), flat, group=cp_group)
+    recv = recv_flat.reshape(cp_size, *ref.shape)
+    return [recv[i] for i in range(cp_size)]
+
+
 __all__ = [
+    "all_to_all_hidden_shards",
+    "build_headwise_section_perm",
     "contiguous_position_ids_for_cp",
     "contiguous_slice_for_cp",
     "contiguous_to_zigzag_chunks",
+    "get_parameter_local_cp_headwise",
+    "get_thd_context_parallel_rank_indices",
     "split_packed_for_cp",
     "zigzag_to_contiguous_chunks",
     "zigzag_reconstruct_from_cp_parts",

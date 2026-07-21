@@ -307,6 +307,17 @@ class Qwen35WeightSpec:
             return _merge_gate_up_tp_shards(_allgather_tp_shards(tensor, ps))
         return None
 
+    def merge_dense_shards(
+        self, native_name: str, shards: list[torch.Tensor]
+    ) -> torch.Tensor | None:
+        if native_name.endswith(".linear_attn.in_proj.linear.weight"):
+            return _merge_linear_attn_in_proj_tp_shards(shards, cfg=self.config)
+        if native_name.endswith(".linear_attn.conv1d.weight"):
+            return _merge_linear_attn_conv1d_tp_shards(shards, cfg=self.config)
+        if native_name.endswith(".moe.shared_expert.gate_up.linear.weight"):
+            return _merge_gate_up_tp_shards(shards)
+        return None
+
     def packed_expert_group_name(self, native_name: str) -> str | None:
         if re.fullmatch(r"layers\.\d+\.moe\.experts\.fc[12]\.weight\d+", native_name) is None:
             return None

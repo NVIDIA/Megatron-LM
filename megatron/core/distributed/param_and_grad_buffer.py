@@ -49,6 +49,14 @@ from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accu
 logger = logging.getLogger(__name__)
 
 try:
+    from torch_memory_saver import torch_memory_saver
+
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
+_LOGGED_MISSING_TMS_FLAGS: set[str] = set()
+
+try:
     if is_torch_min_version("1.13.0"):
         dist_all_gather_func = torch.distributed.all_gather_into_tensor
         dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
@@ -675,6 +683,18 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
 
+        # Local CUDA graph replay is asynchronous with respect to the outer
+        # autograd hooks. Wait before reading, scaling, or reducing gradients
+        # accumulated by a replay into this bucket.
+        current_stream = torch.cuda.current_stream()
+        waited_event_ids = set()
+        for bucket in self.buckets:
+            for param in bucket.params_list:
+                event = getattr(param, "_cudagraph_wgrad_ready_event", None)
+                if event is not None and id(event) not in waited_event_ids:
+                    current_stream.wait_event(event)
+                    waited_event_ids.add(id(event))
+
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local
         # gradient accumulation in a higher precision).
@@ -1121,6 +1141,12 @@ class _ParamAndGradBuffer:
         ):
             self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
 
+        disable_grad_buffers_cpu_backup = self.ddp_config.disable_grad_buffers_cpu_backup
+        disable_param_buffers_cpu_backup = (
+            self.ddp_config.disable_param_buffers_cpu_backup
+            and self.ddp_config.use_distributed_optimizer
+        )
+
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
@@ -1204,9 +1230,28 @@ class _ParamAndGradBuffer:
         self.grad_data = None
         self.extra_main_grads = []
         self.nccl_mem_pool = None
+        shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
+            is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
+        )
+        if (
+            HAVE_TORCH_MEMORY_SAVER
+            and shared_param_grad_buffer
+            and disable_grad_buffers_cpu_backup != disable_param_buffers_cpu_backup
+        ):
+            raise ValueError(
+                "disable_grad_buffers_cpu_backup and disable_param_buffers_cpu_backup must "
+                "match when the param and grad "
+                "buffers share the same allocation."
+            )
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
+            assert not (
+                HAVE_TORCH_MEMORY_SAVER and disable_grad_buffers_cpu_backup
+            ), "disable_grad_buffers_cpu_backup is not supported with nccl_ub=True"
+            assert not (
+                HAVE_TORCH_MEMORY_SAVER and disable_param_buffers_cpu_backup
+            ), "disable_param_buffers_cpu_backup is not supported with nccl_ub=True"
             nccl_allocator.init()
             pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
@@ -1225,22 +1270,49 @@ class _ParamAndGradBuffer:
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
         else:
-            # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
+
+        def _make_no_backup_context(tag, disable, flag_name):
+            if disable:
+                if not HAVE_TORCH_MEMORY_SAVER:
+                    if flag_name not in _LOGGED_MISSING_TMS_FLAGS:
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            f"{flag_name}=True ignored because "
+                            "torch_memory_saver is not installed.",
+                        )
+                        _LOGGED_MISSING_TMS_FLAGS.add(flag_name)
+                    return nullcontext
+
+                return partial(torch_memory_saver.region, tag=tag, enable_cpu_backup=False)
+
+            return nullcontext
+
+        grad_mem_alloc_context = _make_no_backup_context(
+            "grad_buffer", disable_grad_buffers_cpu_backup, "disable_grad_buffers_cpu_backup"
+        )
+        param_mem_alloc_context = _make_no_backup_context(
+            "param_buffer", disable_param_buffers_cpu_backup, "disable_param_buffers_cpu_backup"
+        )
+        shared_mem_alloc_context = _make_no_backup_context(
+            "shared_param_grad_buffer",
+            disable_grad_buffers_cpu_backup,
+            "disable_grad_buffers_cpu_backup/disable_param_buffers_cpu_backup",
+        )
 
         with mem_alloc_context():
             # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
             # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
             # It can be temporarily reused by param AG.
-            if self.ddp_config.use_distributed_optimizer and any(
-                is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
-            ):
-                self.shared_buffer = torch.zeros(
-                    self.numel,
-                    dtype=self.grad_dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
+            if shared_param_grad_buffer:
+                with shared_mem_alloc_context():
+                    self.shared_buffer = torch.zeros(
+                        self.numel,
+                        dtype=self.grad_dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
                 # For FP32 weight grads, only half of the buffer is used to store params in bf16.
                 if self.grad_dtype == torch.float32:
                     self.param_data = self.shared_buffer[: math.ceil(self.numel / 2)].view(
@@ -1253,18 +1325,20 @@ class _ParamAndGradBuffer:
                 # Only re-map param tensors if using distributed optimizer.
                 if self.ddp_config.use_distributed_optimizer:
                     numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
-                    self.param_data = torch.zeros(
-                        numel,
-                        dtype=self.param_dtype,
+                    with param_mem_alloc_context():
+                        self.param_data = torch.zeros(
+                            numel,
+                            dtype=self.param_dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
+                with grad_mem_alloc_context():
+                    self.grad_data = torch.zeros(
+                        self.numel,
+                        dtype=self.grad_dtype,
                         device=torch.cuda.current_device(),
                         requires_grad=False,
                     )
-                self.grad_data = torch.zeros(
-                    self.numel,
-                    dtype=self.grad_dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
 
         self.grad_data_size = 0
         self.param_data_size = 0

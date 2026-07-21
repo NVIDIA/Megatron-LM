@@ -79,6 +79,7 @@ class Runtime(ABC):
         *,
         num_microbatches: int = 1,
         forward_only: bool = False,
+        router_replay: Any = None,
     ) -> ForwardResult:
         """Forward + backward pass over data.
 

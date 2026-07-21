@@ -10,10 +10,12 @@ import pytest
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
     _normalize_dsv4_hybrid_csa_compress_ratios,
+    hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.config import PretrainConfigContainer
@@ -714,6 +716,60 @@ class TestDsv4HybridCsaCompressRatioNormalization:
             _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, "-W|EC/H-")
 
 
+class TestHybridConfigFromArgs:
+    """Test static and config-aware hybrid stack spec resolution."""
+
+    @staticmethod
+    def _args():
+        return Namespace(
+            spec=["test_module", "test_spec"],
+            fp16_lm_cross_entropy=False,
+            hybrid_layer_pattern="M",
+            position_embedding_type="none",
+            rotary_percent=1.0,
+            rotary_base=10000,
+            make_vocab_size_divisible_by=128,
+            rotary_seq_len_interpolation_factor=None,
+            max_position_embeddings=1024,
+            untie_embeddings_and_output_weights=False,
+            padded_vocab_size=128,
+        )
+
+    @staticmethod
+    def _transformer_config():
+        config = MagicMock()
+        config.transformer_impl = "transformer_engine"
+        config.inference_fuse_tp_communication = False
+        return config
+
+    @patch(
+        "megatron.training.argument_utils.HybridModelConfig", side_effect=lambda **kwargs: kwargs
+    )
+    @patch("megatron.training.argument_utils.import_module")
+    def test_preserves_static_module_spec(self, mock_import_module, _mock_model_config):
+        static_spec = ModuleSpec(module=object)
+        mock_import_module.return_value = static_spec
+
+        config = hybrid_config_from_args(self._args(), config=self._transformer_config())
+
+        assert config["hybrid_stack_spec"] is static_spec
+
+    @patch(
+        "megatron.training.argument_utils.HybridModelConfig", side_effect=lambda **kwargs: kwargs
+    )
+    @patch("megatron.training.argument_utils.import_module")
+    def test_resolves_config_aware_spec_factory(self, mock_import_module, _mock_model_config):
+        static_spec = ModuleSpec(module=object)
+        spec_factory = MagicMock(return_value=static_spec)
+        mock_import_module.return_value = spec_factory
+        transformer_config = self._transformer_config()
+
+        config = hybrid_config_from_args(self._args(), config=transformer_config)
+
+        spec_factory.assert_called_once_with(transformer_config)
+        assert config["hybrid_stack_spec"] is static_spec
+
+
 # ---------------------------------------------------------------------------
 # Tests for pretrain_cfg_container_from_args
 # ---------------------------------------------------------------------------
@@ -738,6 +794,29 @@ def _make_args(**overrides):
         "profile": False,
         # RerunStateMachineConfig: field is check_for_nan_in_loss, CLI flag is check_for_nan_in_loss_and_grad
         "check_for_nan_in_loss_and_grad": True,
+    }
+    defaults.update(overrides)
+    return Namespace(**defaults)
+
+
+def _make_ddp_args(**overrides):
+    """Build the minimum Namespace required by get_megatron_ddp_config."""
+    defaults = {
+        "accumulate_allreduce_grads_in_fp32": False,
+        "check_for_nan_in_loss_and_grad": False,
+        "check_for_large_grads": False,
+        "ddp_num_buckets": None,
+        "ddp_bucket_size": None,
+        "ddp_pad_buckets_for_high_nccl_busbw": False,
+        "ddp_reduce_scatter_with_fp32_accumulation": False,
+        "ddp_param_name_patterns_for_fp32_local_accumulation": [],
+        "ddp_average_in_collective": False,
+        "megatron_fsdp_main_params_dtype": None,
+        "megatron_fsdp_main_grads_dtype": None,
+        "megatron_fsdp_grad_comm_dtype": None,
+        "use_precision_aware_optimizer": False,
+        "use_megatron_fsdp": False,
+        "cuda_graph_impl": "none",
     }
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -796,6 +875,37 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(args)
         mock_ddp.assert_called_once_with(args)
         assert result.ddp is mock_ddp_instance
+
+
+class TestDDPConfigMapping:
+    """Test argparse Namespace → DistributedDataParallelConfig mapping."""
+
+    def test_cpu_backup_disable_fields_map_from_args(self):
+        from megatron.training.training import get_megatron_ddp_config
+
+        args = _make_ddp_args(
+            disable_grad_buffers_cpu_backup=True, disable_param_buffers_cpu_backup=True
+        )
+
+        config = get_megatron_ddp_config(args)
+
+        assert config.disable_grad_buffers_cpu_backup is True
+        assert config.disable_param_buffers_cpu_backup is True
+
+    def test_cpu_backup_disable_cli_flags_map_to_ddp_config(self):
+        from megatron.training.arguments import _add_distributed_args
+        from megatron.training.training import get_megatron_ddp_config
+
+        parser = _add_distributed_args(ArgumentParser())
+        parsed_args = parser.parse_args(
+            ["--disable-grad-buffers-cpu-backup", "--disable-param-buffers-cpu-backup"]
+        )
+        args = _make_ddp_args(**vars(parsed_args))
+
+        config = get_megatron_ddp_config(args)
+
+        assert config.disable_grad_buffers_cpu_backup is True
+        assert config.disable_param_buffers_cpu_backup is True
 
 
 class TestCheckpointConfigMapping:

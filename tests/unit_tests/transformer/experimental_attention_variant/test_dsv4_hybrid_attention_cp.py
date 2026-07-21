@@ -150,6 +150,8 @@ def _assert_cp_tensor_match(actual: torch.Tensor, expected: torch.Tensor, label:
     ), f"{label}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
     assert torch.isfinite(actual).all(), f"{label}: actual has non-finite values"
     assert torch.isfinite(expected).all(), f"{label}: expected has non-finite values"
+    if torch.equal(actual, expected):
+        return
 
     diff = (actual - expected).abs()
     max_abs = diff.max().item() if diff.numel() else 0.0
@@ -642,6 +644,34 @@ class TestDSv4HybridAttentionTHDCP:
             )
 
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
+        _clear_cuda_test_state()
+
+    def test_thd_cp_zero_indexer_loss_keeps_indexer_grads(self):
+        """Zero indexer loss must still mark indexer grads ready for overlapped DDP."""
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
+
+        torch.manual_seed(_SEED + 1400)
+        model_parallel_cuda_manual_seed(_SEED + 1400)
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=0.0,
+            apply_dsa_kernel_fusion=False,
+            apply_rope_fusion=False,
+        )
+        attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
+        attn.train()
+
+        full_hidden, full_grad = _make_hidden_and_grad(padded_tokens, config.hidden_size)
+        hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        grad = full_grad.index_select(0, local_idx)
+        _run_dsv4_attention_forward_backward(attn, hidden, grad, packed, collect_result=False)
+
+        assert attn.core_attention.indexer is not None
+        for name, param in attn.core_attention.indexer.named_parameters():
+            assert param.grad is not None, f"Missing zero indexer grad for {name}"
+            torch.testing.assert_close(param.grad, torch.zeros_like(param.grad), rtol=0, atol=0)
+
+        del attn, full_hidden, full_grad, hidden, grad
         _clear_cuda_test_state()
 
     @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused", "unfused"])
