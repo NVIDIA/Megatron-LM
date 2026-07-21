@@ -186,6 +186,7 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
+    muon_scalar_optimizer='adam',
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -227,10 +228,13 @@ def setup_model_and_optimizer(
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
+        muon_scalar_optimizer=muon_scalar_optimizer,
     )
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    elif optimizer_type == 'lion':
+        config.lr = 1e-4
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
@@ -256,11 +260,15 @@ def setup_model_and_optimizer(
     if isinstance(optimizer, ChainedOptimizer):
         _init_states(optimizer)
     else:
+        if hasattr(optimizer, 'optimizer_state_keys'):
+            state_keys = optimizer.optimizer_state_keys
+        else:
+            state_keys = ("exp_avg", "exp_avg_sq")
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
                 if len(optimizer.optimizer.state[p]) == 0:
-                    optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+                    for key in state_keys:
+                        optimizer.optimizer.state[p][key] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
     CachedMetadataFileSystemReader.clear_metadata_cache()
