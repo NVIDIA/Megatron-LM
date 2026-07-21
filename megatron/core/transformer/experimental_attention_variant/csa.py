@@ -592,10 +592,10 @@ def unfused_compressed_sparse_attn(
     rows, np_, hn = q_flat.shape
 
     safe_indices = global_indices.clamp(min=0).long()
-    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, hn)
-    kv_gathered = torch.gather(
-        kv_flat.unsqueeze(0).expand(rows, -1, -1), dim=1, index=safe_indices_exp
-    )  # (rows, topk, hn)
+    # Advanced indexing instead of gather-on-expanded: GatherBackward0 materializes
+    # zeros for the expanded (rows, n_kv, hn) input (~73 GiB at 48k seq); indexing's
+    # backward scatter-adds into zeros_like(kv_flat) instead. Forward is identical.
+    kv_gathered = kv_flat[safe_indices]  # (rows, topk, hn)
 
     q_f = q_flat.float()
     kv_g = kv_gathered.float()
