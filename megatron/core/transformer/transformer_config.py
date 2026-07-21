@@ -536,7 +536,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+             "shared_experts", "gdn_norm_out", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -546,7 +546,11 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+           CheckpointWithoutOutput + CheckpointManager. Requires
+           enable_hyper_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", and "mhc" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1072,6 +1076,35 @@ class TransformerConfig(ModelParallelConfig):
     migrated to cuda_graph_modules in __post_init__. Will be removed in a future release.
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
+
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointManager is created for subsequent layers
+
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
 
     ####################
     # miscellaneous
@@ -1747,6 +1780,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1817,6 +1851,55 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for "mhc" in recompute_modules
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "'mhc' is in recompute_modules."
+                )
+            if self.fine_grained_activation_offloading and self.offload_modules:
+                # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
+                # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
+                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # the backward chunk, so tensor_pop hits a None chunk for these modules.
+                # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
+                # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
+                # checkpoints, so they are safe to use with mHC recompute.
+                _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
+                conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
+                if conflicting:
+                    raise ValueError(
+                        f"'mhc' in recompute_modules is incompatible with "
+                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"before the offloading backward chunk is initialized for these "
+                        f"modules, causing tensor_pop on a None chunk. Remove "
+                        f"{conflicting} from offload_modules or remove 'mhc' from "
+                        f"recompute_modules."
+                    )
+
+        if self.enable_hyper_connections and not (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        ):
+            warnings.warn(
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
+            )
 
         if self.fine_grained_activation_offloading:
             assert (
