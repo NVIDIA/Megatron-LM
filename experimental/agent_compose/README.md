@@ -41,6 +41,9 @@ backends. Primitive code must remain model-agnostic.
 ```text
 experimental/agent_compose/
   README.md
+  docs/
+    architecture.md
+    model.md
   megatron/
     lite/
       primitive/
@@ -61,8 +64,23 @@ For local source-tree use:
 export PYTHONPATH=/path/to/Megatron-LM/experimental/agent_compose:$PYTHONPATH
 ```
 
-The skeleton is intentionally import-only. Public runtime, model, and primitive
-APIs will be added in separate reviewable PRs.
+The skeleton exposes the stable runtime interface and shared runtime contracts,
+but contains no built-in runtime backend, model, or primitive implementation.
+Those implementations will be added in separate reviewable PRs.
+
+```python
+from megatron.lite.runtime import Runtime, RuntimeConfig, create_runtime, register_runtime
+```
+
+Backends subclass `Runtime` and register a module-level factory before
+`create_runtime` is called. The skeleton intentionally registers no built-in
+backend.
+
+## Documentation
+
+- [Three-layer architecture](docs/architecture.md)
+- [Runtime interface](docs/runtime.md)
+- [Model layer and protocol](docs/model.md)
 
 ## Skills
 

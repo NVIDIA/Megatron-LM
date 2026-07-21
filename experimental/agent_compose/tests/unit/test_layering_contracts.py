@@ -14,9 +14,9 @@ LAYER_ROOTS = {
     "runtime": PACKAGE_ROOT / "runtime",
 }
 DENIED_IMPORTS = {
-    "primitive": ("megatron.lite.model", "megatron.lite.runtime"),
-    "model": ("megatron.lite.runtime",),
-    "runtime": (),
+    "primitive": ("experimental.lite", "megatron.lite.model", "megatron.lite.runtime"),
+    "model": ("experimental.lite", "megatron.lite.runtime"),
+    "runtime": ("experimental.lite",),
 }
 SHARED_CONTRACTS = ("megatron.lite.runtime.contracts",)
 

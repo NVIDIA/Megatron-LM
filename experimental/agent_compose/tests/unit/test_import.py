@@ -17,3 +17,40 @@ def test_three_layer_skeleton_imports() -> None:
     for module in modules:
         imported = importlib.import_module(module)
         assert imported.__name__ == module
+
+
+def test_runtime_public_surface_imports() -> None:
+    from megatron.lite.runtime import (
+        Batch,
+        ForwardResult,
+        LossContext,
+        ModelHandle,
+        ModelOutputs,
+        OptimizerConfig,
+        PackedBatch,
+        ParallelConfig,
+        Runtime,
+        RuntimeConfig,
+        TrainBatch,
+        create_runtime,
+        register_runtime,
+    )
+
+    assert all(
+        value is not None
+        for value in (
+            Batch,
+            ForwardResult,
+            LossContext,
+            ModelHandle,
+            ModelOutputs,
+            OptimizerConfig,
+            PackedBatch,
+            ParallelConfig,
+            Runtime,
+            RuntimeConfig,
+            TrainBatch,
+            create_runtime,
+            register_runtime,
+        )
+    )

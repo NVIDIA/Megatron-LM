@@ -19,6 +19,8 @@ def validate(task, runtime_config, model_spec, primitives, reference, budget):
     base = basic.constitution(task, layer="runtime", reference=reference)
     if not base.done:
         return blocked("runtime constitution failed", evidence=base)
+    if not conforms_to_runtime_interface(runtime_config.backend):
+        return blocked("backend does not implement the public Runtime interface")
 
     composed = model.compose(
         task,
