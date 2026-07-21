@@ -6,6 +6,7 @@ import logging
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -13,8 +14,11 @@ from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
+    Partial,
     Placements,
+    Replicate,
     fully_shard,
+    fully_shard_optimizer,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -100,6 +104,18 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
+def _hsdp_placements() -> Placements:
+    """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
+    DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
+    all-reduced to [Replicate, Flat] on the last microbatch."""
+    return Placements(
+        dp_axes=[0, 1],
+        parameter=[Replicate(), Flat()],
+        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
+        optimizer=[Replicate(), Flat()],
+    )
+
+
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
@@ -111,8 +127,19 @@ def _events_overlap(first, second) -> bool:
     )
 
 
+def _nccl_events(cuda_events, *name_fragments):
+    """CUDA NCCL events whose name contains any of ``name_fragments`` (case-insensitive)."""
+    return [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower()
+        and event.activity_type == "kernel"
+        and any(fragment in event.name.lower() for fragment in name_fragments)
+    ]
+
+
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
+def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatches):
     """Minimal per-module FSDP training should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -165,6 +192,147 @@ def test_fully_shard_losses_match_baseline(distributed_setup, num_microbatches):
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
         msg="Sharded losses did not match baseline losses.",
+    )
+
+
+@pytest.mark.parametrize("set_to_none", [True, False])
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
+    """HSDP (DP-outer replicated, DP-inner sharded) training should match single-rank SGD.
+
+    Gradients reduce-scatter within DP-inner every backward and accumulate into
+    main_grad; the DP-outer all-reduce runs only on the last microbatch, scoped
+    via ``microbatch(...)``. Every rank sees identical data, so the averaged
+    gradient equals the single-rank gradient and losses must match. Both
+    ``zero_grad`` modes are covered: ``set_to_none=True`` overwrites main_grad,
+    ``set_to_none=False`` accumulates into a zeroed main_grad.
+    """
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
+
+    outer_size = 2
+    inner_size = world_size // outer_size
+    mesh = init_device_mesh(
+        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    torch.manual_seed(1234)
+    dim = 8
+    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
+    model = MultiChildModel(dim=dim, num_children=2).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    # Shard the child layers, then the model, so the children share a root context
+    # and reduce through the overlap path instead of as independent roots.
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+        losses = []
+        for step in range(5):
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                is_last = microbatch_index == num_microbatches - 1
+                with microbatch(model, is_last=is_last):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    (loss / num_microbatches).backward()
+                losses.append(loss.detach())
+                logger.debug(
+                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
+                    log_prefix,
+                    rank,
+                    step,
+                    microbatch_index,
+                    loss,
+                )
+
+            optimizer.step()
+        return losses
+
+    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
+    sharded_losses = train(model, optimizer, "HSDP")
+
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg="HSDP losses did not match baseline losses.",
+    )
+
+
+def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
+    """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
+
+    ``fully_shard(model)`` makes the child units share a root context so their
+    reductions run through the overlap path rather than as independent roots.
+    Counting NCCL events over a multi-microbatch step, the DP-inner reduce-scatter
+    fires once per microbatch per group while the DP-outer all-reduce that
+    finalizes main_grad fires only on the last microbatch, so the reduce-scatter
+    count is exactly ``num_microbatches`` times the all-reduce count. This asserts
+    on event counts only, not numerics.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
+
+    outer_size = 2
+    inner_size = world_size // outer_size
+    mesh = init_device_mesh(
+        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    torch.manual_seed(1234)
+    dim = 8
+    num_children = 2
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    num_microbatches = 3
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train_one_step() -> None:
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+            is_last = microbatch_index == num_microbatches - 1
+            with microbatch(model, is_last=is_last):
+                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                (loss / num_microbatches).backward()
+        optimizer.step()
+
+    train_one_step()
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        train_one_step()
+        torch.cuda.synchronize(device)
+
+    cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
+    reduce_scatter_events = _nccl_events(cuda_events, "reducescatter", "reduce_scatter")
+    all_reduce_events = _nccl_events(cuda_events, "allreduce")
+    # One DP-outer all-reduce per parameter group -- each child layer plus the
+    # root unit's bias -- fired only on the last microbatch. Plain DP fires none.
+    assert len(all_reduce_events) == num_children + 1, [event.name for event in cuda_events]
+    # DP-inner reduce-scatter runs every microbatch; the DP-outer all-reduce runs
+    # only on the last, so the counts differ by exactly the microbatch factor.
+    assert len(reduce_scatter_events) == len(all_reduce_events) * num_microbatches, (
+        f"Expected reduce-scatter ({len(reduce_scatter_events)}) to be {num_microbatches}x "
+        f"the DP-outer all-reduce count ({len(all_reduce_events)})."
     )
 
 
@@ -311,15 +479,22 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-def test_overlaps_all_gather_and_compute(distributed_setup):
-    """A shared root context should let child all-gathers overlap GEMM compute."""
+def test_overlaps_communication_and_compute(distributed_setup):
+    """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
-    dim = 8192
+    # A large hidden size keeps the per-layer GEMMs long enough that the
+    # collectives reliably overlap them. The overlap count is otherwise
+    # launch-bound: the host issues kernels with gaps (amplified by CI's
+    # `coverage run` wrapper), so with short GEMMs a collective can land in a
+    # gap between GEMMs instead of running alongside one, making the count jitter
+    # run to run. At dim=16384 the GEMMs dominate that launch jitter and the
+    # overlap becomes deterministic. (dim=8192 was flaky under coverage.)
+    dim = 16384
     num_children = 4
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
@@ -347,11 +522,8 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
         torch.cuda.synchronize(device)
 
     cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
-    all_gather_events = [
-        event
-        for event in cuda_events
-        if "nccl" in event.name.lower() and "allgather" in event.name.lower()
-    ]
+    all_gather_events = _nccl_events(cuda_events, "allgather")
+    reduce_scatter_events = _nccl_events(cuda_events, "reducescatter", "reduce_scatter")
     # GEMM device-kernel names vary across CUDA/cuBLAS versions and GPU archs
     # (e.g. "*gemm*", "cutlass*", "cublas*", and cuBLASLt's Hopper "nvjet_sm90_*").
     gemm_events = [
@@ -359,31 +531,72 @@ def test_overlaps_all_gather_and_compute(distributed_setup):
         for event in cuda_events
         if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas", "nvjet"))
     ]
-    assert all_gather_events, [event.name for event in cuda_events]
+    # Each of the num_children children plus the root all-gathers in forward and
+    # again in backward, and each reduce-scatters once in backward.
+    assert len(all_gather_events) == 2 * (num_children + 1), (
+        f"Expected {2 * (num_children + 1)} all-gather kernels, "
+        f"got {[event.name for event in all_gather_events]}."
+    )
+    assert len(reduce_scatter_events) == num_children + 1, (
+        f"Expected {num_children + 1} reduce-scatter kernels, "
+        f"got {[event.name for event in reduce_scatter_events]}."
+    )
     assert gemm_events, [event.name for event in cuda_events]
 
     all_gather_streams = {event.device_resource_id for event in all_gather_events}
+    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
     gemm_streams = {event.device_resource_id for event in gemm_events}
     assert len(all_gather_streams) == 1
+    assert len(reduce_scatter_streams) == 1
+    assert all_gather_streams.isdisjoint(reduce_scatter_streams)
     assert all_gather_streams.isdisjoint(gemm_streams)
+    assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
-    overlap_count = sum(
+    all_gather_overlap_count = sum(
         any(_events_overlap(all_gather_event, gemm_event) for gemm_event in gemm_events)
         for all_gather_event in all_gather_events
     )
-    # This profiles a full forward/backward iteration, so backward all-gathers are
-    # included in all_gather_events. The expected overlap count is from the forward
-    # child pipeline: each child after the first can all-gather while the previous
-    # child computes, giving num_children - 1 overlaps. Backward does not overlap
-    # in this all-gather-only path because gradient reduction is not delayed:
-    # each module synchronously reduces gradients in post_backward before autograd
-    # reaches the next module's pre_backward all-gather. The next PR addresses
-    # this by delaying gradient reduction.
-    expected_overlap_count = num_children - 1
-    assert overlap_count >= expected_overlap_count, (
-        f"Expected at least {expected_overlap_count} all-gather events to overlap compute, "
-        f"got {overlap_count}/{len(all_gather_events)}."
+    reduce_scatter_overlap_count = sum(
+        any(_events_overlap(reduce_scatter_event, gemm_event) for gemm_event in gemm_events)
+        for reduce_scatter_event in reduce_scatter_events
     )
+    # With dim large enough for the GEMMs to dominate launch jitter (see above),
+    # the prefetched collectives overlap compute deterministically, so assert the
+    # theoretical maxima (2*(num_children - 1) all-gathers across forward and
+    # backward, num_children - 1 reduce-scatters in backward) rather than a loose
+    # floor.
+    assert all_gather_overlap_count >= 2 * (num_children - 1), (
+        f"Expected all-gather to overlap compute, "
+        f"got {all_gather_overlap_count}/{len(all_gather_events)}."
+    )
+    assert reduce_scatter_overlap_count >= num_children - 1, (
+        f"Expected reduce-scatter to overlap compute, "
+        f"got {reduce_scatter_overlap_count}/{len(reduce_scatter_events)}."
+    )
+
+
+def test_parameterless_parent_with_child_modules_trains(distributed_setup):
+    """A parent with no unowned parameters should still root trainable child FsdpModules."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(5678)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False)).to(device)
+
+    fully_shard(model[0], mesh=mesh, placements=_flat_placements())
+    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    assert model.parameter_groups == ()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    x = torch.randn(3, 4, device=device)
+
+    optimizer.zero_grad(set_to_none=True)
+    loss = model(x).sum()
+    loss.backward()
+    optimizer.step()
 
 
 def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
@@ -466,6 +679,41 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
+def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setup):
+    """Mixed-precision FSDP Adam should track an unsharded Adam baseline."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(2026)
+    baseline = TinyModel().to(device=device, dtype=torch.bfloat16)
+    model = TinyModel().to(device=device, dtype=torch.bfloat16)
+    model.load_state_dict(baseline.state_dict())
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+
+    baseline_optimizer = torch.optim.Adam(baseline.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+
+    x = torch.randn(3, 8, device=device, dtype=torch.bfloat16)
+    target = torch.randn(3, 4, device=device, dtype=torch.bfloat16)
+
+    for _ in range(3):
+        baseline_optimizer.zero_grad()
+        optimizer.zero_grad()
+
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x).float(), target.float())
+        loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+        torch.testing.assert_close(loss, baseline_loss, rtol=0, atol=3e-3)
+
+        baseline_loss.backward()
+        loss.backward()
+        baseline_optimizer.step()
+        optimizer.step()
+
+
 def test_microbatch_scopes_child_contexts(distributed_setup):
     """microbatch() should scope FSDP child contexts under an unwrapped parent."""
     world_size = distributed_setup.world_size
@@ -485,24 +733,30 @@ def test_microbatch_scopes_child_contexts(distributed_setup):
 
 
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
-    """CPU-initialized parameters should be sharded with their real values."""
+    """A CPU model should support sharding a child before moving the full model to CUDA."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Linear(4, 4, bias=False)
+    model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
     with torch.no_grad():
-        model.weight.fill_(3.0)
-    expected_weight = model.weight.detach().to(device)
+        model[0].weight.fill_(2.0)
+        model[1].weight.fill_(3.0)
+    x = torch.ones(1, 4)
+    expected_output = model(x).to(device)
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    # Shard the second layer's parameters onto the mesh device; the unwrapped
+    # first layer's parameters remain on CPU until model.to(device) below.
+    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
 
-    (group,) = model.parameter_groups
-    full_weight = group.model_weight.allgather(0).get_local_tensor(0)
-    assert full_weight.device.type == device.type
-    torch.testing.assert_close(full_weight, expected_weight)
+    assert model[0].weight.device.type == "cpu"
+    assert isinstance(model[1].weight, DTensor)
+    assert model[1].weight.device == device
+
+    model.to(device)
+
+    output = model(x.to(device))
+    torch.testing.assert_close(output, expected_output)
 
 
 def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):

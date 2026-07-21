@@ -1915,6 +1915,13 @@ def _add_inference_args(parser):
                        help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
                        'By default, all graphs are limited by the decode limit of '
                        '`max_requests * (num_speculative_tokens + 1)`.')
+    group.add_argument('--inference-cuda-graph-max-tokens', type=int, default=512,
+                       dest='inference_cuda_graph_max_tokens',
+                       help='Token ceiling for the largest captured prefill/mixed CUDA '
+                       'graph (default: 512). Clamped to at least the decode limit '
+                       '`max_requests * (num_speculative_tokens + 1)` and at most '
+                       '`max_tokens`. Ignored when --inference-cuda-graph-all-prefills '
+                       'is set (which extends capture to the full `max_tokens`).')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
@@ -1993,11 +2000,13 @@ def _add_inference_args(parser):
                             'is requested but the package is not installed.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='legacy',
-                       choices=['legacy', 'serial'],
+                       choices=['legacy', 'serial', 'overlap'],
                        help='Async scheduling mode for dynamic batching. '
                             '"legacy" (default) preserves the existing resolve-before-prepare '
                             'path. "serial" speculatively prepares and forwards decode-only '
-                            'steps before resolving finished requests.')
+                            'steps before resolving finished requests. "overlap" uses the same '
+                            'async scheduling path while overlapping prepare/sample and '
+                            'forward/resolve phases.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
