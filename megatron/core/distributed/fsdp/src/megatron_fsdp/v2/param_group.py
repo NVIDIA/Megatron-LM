@@ -80,11 +80,7 @@ class ParameterGroup:
             world_ranks = torch.arange(
                 torch.distributed.get_world_size(torch.distributed.group.WORLD)
             ).reshape(1, -1)
-            mesh = DeviceMesh(
-                self.device.type,
-                world_ranks,
-                mesh_dim_names=("dp_outer", "dp"),
-            )
+            mesh = DeviceMesh(self.device.type, world_ranks, mesh_dim_names=("dp_outer", "dp"))
         mesh = _prepare_fsdp_mesh(mesh)
         self.mesh = mesh
         self.outer_dp_group = self.mesh.get_group(mesh_dim=0)
@@ -272,17 +268,9 @@ class ParameterGroup:
                 # outer=optim copies only the local optimizer shard into the
                 # replicated model buffer, so mesh dim 0 must refresh that
                 # replica before the inner-DP gather consumes it.
-                weight_buffer.unshard(
-                    unshard_dim=0,
-                    bind_params=False,
-                    stream=stream,
-                )
+                weight_buffer.unshard(unshard_dim=0, bind_params=False, stream=stream)
             # mesh dim 1 is inner-DP.
-            weight_buffer.unshard(
-                unshard_dim=1,
-                bind_params=bind_params,
-                stream=stream,
-            )
+            weight_buffer.unshard(unshard_dim=1, bind_params=bind_params, stream=stream)
         self.post_unshard(bwd_pass=bwd_pass)
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:
@@ -317,9 +305,7 @@ class ParameterGroup:
         )
 
     def reduce_grad(
-        self,
-        is_last_backward: bool = False,
-        stream: Optional[torch.cuda.Stream] = None,
+        self, is_last_backward: bool = False, stream: Optional[torch.cuda.Stream] = None
     ):
         """
         Reduce gradients across DP ranks.
@@ -339,18 +325,11 @@ class ParameterGroup:
         # consumed below on every microbatch.
         self._full_grad_buffer_has_accumulated_grad = True
 
-        reduce_inner = self.sharding_strategy in (
-            "optim_grads",
-            "optim_grads_params",
-        ) or (
+        reduce_inner = self.sharding_strategy in ("optim_grads", "optim_grads_params") or (
             is_last_backward and self.sharding_strategy in ("no_shard", "optim")
         )
-        reduce_outer = self.outer_dp_sharding_strategy in (
-            "optim_grads",
-            "optim_grads_params",
-        ) or (
-            is_last_backward
-            and self.outer_dp_sharding_strategy in ("no_shard", "optim")
+        reduce_outer = self.outer_dp_sharding_strategy in ("optim_grads", "optim_grads_params") or (
+            is_last_backward and self.outer_dp_sharding_strategy in ("no_shard", "optim")
         )
         if reduce_inner:
             reduce_scatter = self.sharding_strategy != "no_shard"
@@ -476,16 +455,9 @@ class ParameterGroup:
                 param_shape = param.shape
 
             dist_data = make_uneven_dtensor(
-                data,
-                param_shape,
-                self.mesh,
-                optim_placements,
-                post_process_uneven=True,
+                data, param_shape, self.mesh, optim_placements, post_process_uneven=True
             )
-            dist_param = torch.nn.Parameter(
-                dist_data,
-                requires_grad=param.requires_grad,
-            )
+            dist_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
             # ``torch.nn.Parameter(DTensor)`` wraps the DTensor and creates a
             # fresh local tensor object, so Python-side uneven-DTensor metadata
             # attached by ``post_process_uneven=True`` is not preserved
@@ -496,7 +468,9 @@ class ParameterGroup:
             # Mark as FSDP parameter for special handling
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
-            assert hasattr(dist_param._local_tensor, "__create_chunk_list__"), "DTensor must have chunk metadata for FSDP"
+            assert hasattr(
+                dist_param._local_tensor, "__create_chunk_list__"
+            ), "DTensor must have chunk metadata for FSDP"
             self.dist_params.append(dist_param)
             self.dist_grads.append(None)  # placeholder, will be set in _init_dist_grads
 
@@ -543,11 +517,7 @@ class ParameterGroup:
                 continue
             if dist_grad is None:
                 dist_grad = make_uneven_dtensor(
-                    grad_data,
-                    p.shape,
-                    self.mesh,
-                    placements,
-                    copy_chunk_meta_from=dist_param,
+                    grad_data, p.shape, self.mesh, placements, copy_chunk_meta_from=dist_param
                 )
                 self._dist_grad_cache[index] = dist_grad
             else:
@@ -605,13 +575,10 @@ class ParameterGroup:
                 if dist_grad is not None:
                     # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner, (0, 0) full.
                     shard_layout = (
-                        (1, 1)
-                        if is_outer_optim_shard
-                        else (0, 1) if is_grad_shard else (0, 0)
+                        (1, 1) if is_outer_optim_shard else (0, 1) if is_grad_shard else (0, 0)
                     )
                     grad_data = self.main_grad_buffer.get_item(
-                        self.param_idx[param],
-                        shard_layout=shard_layout,
+                        self.param_idx[param], shard_layout=shard_layout
                     )
                     object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
 

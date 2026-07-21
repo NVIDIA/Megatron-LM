@@ -87,9 +87,7 @@ def fully_shard(
     }
     for arg_name, arg_value in unsupported_args.items():
         if arg_value is not None:
-            raise NotImplementedError(
-                f"Megatron FSDP v2 does not support `{arg_name}` yet."
-            )
+            raise NotImplementedError(f"Megatron FSDP v2 does not support `{arg_name}` yet.")
 
     if isinstance(module, FSDPModule):
         raise ValueError(

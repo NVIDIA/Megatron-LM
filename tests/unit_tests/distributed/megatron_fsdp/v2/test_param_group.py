@@ -214,8 +214,7 @@ def test_init_buffers(strategy):
 def test_unshard_reshard(strategy):
     if strategy not in ("no_shard", "optim_grads_params"):
         pytest.skip(
-            "This test currently covers no_shard and optim_grads_params, "
-            f"skipping {strategy}."
+            "This test currently covers no_shard and optim_grads_params, " f"skipping {strategy}."
         )
 
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
@@ -341,12 +340,8 @@ def test_zero_grad_set_to_none_false_reuses_dist_grads(strategy):
     ],
 )
 @pytest.mark.parametrize("main_grad_dtype", [None, torch.float32])
-def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(
-    strategy, outer_strategy, main_grad_dtype
-):
-    device = torch.device(
-        f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}"
-    )
+def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy, outer_strategy, main_grad_dtype):
+    device = torch.device(f"cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}")
     mesh = _build_hsdp_mesh(device) if outer_strategy == "optim" else None
     groups, _, _, _, _, _ = _build_groups(
         strategy,
@@ -393,9 +388,7 @@ def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(
                 assert hasattr(after._local_tensor, "__create_chunk_list__")
         assert all(
             validated
-            for cached, validated in zip(
-                pg._dist_grad_cache, pg._dist_grad_cache_validated
-            )
+            for cached, validated in zip(pg._dist_grad_cache, pg._dist_grad_cache_validated)
             if cached is not None
         )
 
@@ -484,17 +477,13 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
         gbuf.data.zero_()
         full_batch_grad = torch.zeros_like(gbuf.data)
         for microbatch in range(num_micro_batches):
-            micro_grad = torch.full_like(
-                gbuf.data, float((microbatch + 1) * (rank + 1))
-            )
+            micro_grad = torch.full_like(gbuf.data, float((microbatch + 1) * (rank + 1)))
             gbuf.data.add_(micro_grad)
             full_batch_grad.add_(micro_grad)
             is_last_backward = microbatch == num_micro_batches - 1
             pg.reduce_grad(is_last_backward=is_last_backward)
             if is_last_backward:
-                assert pg._full_grad_buffer_has_accumulated_grad == (
-                    strategy == "no_shard"
-                )
+                assert pg._full_grad_buffer_has_accumulated_grad == (strategy == "no_shard")
                 assert pg._reduced_grad_buffer_has_accumulated_grad
             else:
                 assert pg._full_grad_buffer_has_accumulated_grad

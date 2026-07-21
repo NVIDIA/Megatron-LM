@@ -122,9 +122,7 @@ class TestFullyShardedDataParallel:
     def test_fsdp_v2_rejects_average_in_collective(self):
         """Test that FSDP v2 fails clearly instead of silently mis-scaling gradients."""
         fsdp_config = DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            use_megatron_fsdp_v2=True,
-            average_in_collective=True,
+            use_megatron_fsdp=True, use_megatron_fsdp_v2=True, average_in_collective=True
         )
         transformer_config = TransformerConfig(
             num_attention_heads=1, num_layers=1, context_parallel_size=1

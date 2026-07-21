@@ -33,6 +33,7 @@ def _is_activation_recompute(module: FSDPModule) -> bool:
         return True
     try:
         from megatron.core.tensor_parallel.random import is_checkpointing
+
         MCORE_CHECKPOINTING = is_checkpointing()
     except ImportError:
         MCORE_CHECKPOINTING = False
@@ -108,11 +109,7 @@ def mfsdp_forward_pre_hook(hook_module: nn.Module, args: Any, kwargs: Any):
     # ---- unshard parameters for this module -------------------------------
     if is_recompute:
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
-        target.unshard(
-            async_op=ctx.enable_unshard_prefetch,
-            bwd_pass=False,
-            prefetch=False,
-        )
+        target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False, prefetch=False)
     else:
         target.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 

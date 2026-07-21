@@ -143,16 +143,10 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def set_item(
-        self,
-        item_id: int,
-        item_data: torch.Tensor,
-        *,
-        shard_layout: Optional[Iterable[int]] = None,
+        self, item_id: int, item_data: torch.Tensor, *, shard_layout: Optional[Iterable[int]] = None
     ) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
-        requested_layout = (
-            shard_layout if shard_layout is not None else self.storage_shard_layout
-        )
+        requested_layout = shard_layout if shard_layout is not None else self.storage_shard_layout
         source_slice, local_slice = self.buffer_index.local_slice_for(
             self.buffer_index._get_item_global_range(item_id),
             requested_layout,
@@ -166,9 +160,7 @@ class DataParallelBuffer:
         self, item_id: int, *, shard_layout: Optional[Iterable[int]] = None
     ) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
-        requested_layout = (
-            shard_layout if shard_layout is not None else self.storage_shard_layout
-        )
+        requested_layout = shard_layout if shard_layout is not None else self.storage_shard_layout
         _, local_slice = self.buffer_index.local_slice_for(
             self.buffer_index._get_item_global_range(item_id),
             requested_layout,
@@ -249,9 +241,7 @@ class DataParallelBuffer:
         else:
             with torch.cuda.stream(stream):
                 torch.distributed.all_gather_into_tensor(
-                    output_tensor=output_buffer,
-                    input_tensor=input_buffer,
-                    group=group,
+                    output_tensor=output_buffer, input_tensor=input_buffer, group=group
                 )
 
         setattr(self, "_outer_dirty" if unshard_dim == 0 else "_inner_dirty", False)
@@ -288,13 +278,9 @@ class DataParallelBuffer:
     def get_shard_view(self, shard_layout: Optional[Iterable[int]] = None) -> torch.Tensor:
         """Return a shard view inside the persistent data buffer."""
         assert self.data is not None, "DataParallelBuffer data not initialized"
-        requested_layout = (
-            shard_layout if shard_layout is not None else self.storage_shard_layout
-        )
+        requested_layout = shard_layout if shard_layout is not None else self.storage_shard_layout
         _, local_slice = self.buffer_index.local_slice_for(
-            (0, self.buffer_index.bucket_meta.size),
-            requested_layout,
-            self.storage_shard_layout,
+            (0, self.buffer_index.bucket_meta.size), requested_layout, self.storage_shard_layout
         )
         return self.data[:0] if local_slice is None else self.data[local_slice]
 
@@ -388,10 +374,7 @@ class DataParallelBuffer:
 
         # Inner reduce consumes fresh full grads: (0, 0) -> (0, 1).
         # Outer reduce consumes the inner-reduced view: (0, 1) -> (1, 1).
-        input_shard_layout = (
-            0,
-            0 if reduce_dim == 1 else self.storage_shard_layout[1],
-        )
+        input_shard_layout = (0, 0 if reduce_dim == 1 else self.storage_shard_layout[1])
         # AR keeps the same shard view; RS shards the reduced dimension.
         output_shard_layout = (
             1 if reduce_scatter and reduce_dim == 0 else input_shard_layout[0],
@@ -422,10 +405,7 @@ class DataParallelBuffer:
         if grad_comm_dtype != self.dtype:
             input_key = (self.alloc_key, "grad_reduce_input", reduce_dim)
             input_bucket = self.allocator.allocate(
-                key=input_key,
-                size=input_buffer.numel(),
-                dtype=grad_comm_dtype,
-                device=self.device,
+                key=input_key, size=input_buffer.numel(), dtype=grad_comm_dtype, device=self.device
             )
             comm_input = input_bucket.data
             with torch.cuda.stream(stream):
@@ -453,10 +433,7 @@ class DataParallelBuffer:
 
         with torch.cuda.stream(stream):
             torch.distributed.reduce_scatter_tensor(
-                output=comm_output,
-                input=comm_input,
-                group=group,
-                op=op,
+                output=comm_output, input=comm_input, group=group, op=op
             )
 
             if output_buffer.data_ptr() != comm_output.data_ptr():

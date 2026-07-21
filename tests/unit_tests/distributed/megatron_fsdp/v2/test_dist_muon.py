@@ -47,13 +47,11 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.tensor import DTensor, DeviceMesh
+from torch.distributed.tensor import DeviceMesh, DTensor
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    MixedPrecisionPolicy,
-)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 from megatron.core.optimizer.fully_shard_v2_muon import (
@@ -66,10 +64,7 @@ from megatron.core.optimizer.fully_shard_v2_muon import (
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 if HAVE_EMERGING_OPTIMIZERS:
-    from megatron.core.optimizer.fully_shard_v2_muon import (
-        get_muon_scale_factor,
-        newton_schulz_tp,
-    )
+    from megatron.core.optimizer.fully_shard_v2_muon import get_muon_scale_factor, newton_schulz_tp
 
 STRATEGIES = ["optim", "optim_grads", "optim_grads_params"]
 MESH_CASES = [
@@ -87,9 +82,7 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 SHAPE_SETS = [
     pytest.param([(5, 8), (9, 8), (8, 6), (7, 8), (8,)], id="small"),  # dims < 10
     pytest.param([(200, 256), (400, 256), (256, 300), (256, 128), (256,)], id="medium"),
-    pytest.param(
-        [(1500, 2048), (3000, 2048), (2048, 1200), (2048, 2600), (2048,)], id="large"
-    ),
+    pytest.param([(1500, 2048), (3000, 2048), (2048, 1200), (2048, 2600), (2048,)], id="large"),
 ]
 
 
@@ -314,9 +307,7 @@ def test_dist_muon_matches_reference(strategy, nesterov, mesh_case, shapes):
             # Mirror step()'s exact ops so the comparison can be bit-exact: the
             # nesterov look-ahead is a single alpha-add (g + m*buf), not g + (m*buf).
             pre_ns = (
-                full_grads[i].add(ref_buf[i], alpha=momentum)
-                if nesterov
-                else ref_buf[i].clone()
+                full_grads[i].add(ref_buf[i], alpha=momentum) if nesterov else ref_buf[i].clone()
             )
             orth = _reference_orthogonalize(opt, pre_ns)
             if weight_decay != 0.0:

@@ -350,7 +350,9 @@ class TestFullyShardBasic:
 
         values = [2.0, 3.0]
         for i, value in enumerate(values):
-            sample = torch.full((2, 4), value, device=_device(), dtype=model_dtype, requires_grad=True)
+            sample = torch.full(
+                (2, 4), value, device=_device(), dtype=model_dtype, requires_grad=True
+            )
             if i == len(values) - 1:
                 model.set_is_last_backward(True)
             model(sample).sum().backward()
@@ -359,14 +361,11 @@ class TestFullyShardBasic:
                     sharding_strategy == "optim" and i < len(values) - 1
                 )
                 assert param_group._full_grad_buffer_has_accumulated_grad == expect_full_grad
-                expect_reduced_grad = sharding_strategy in (
-                    "optim_grads",
-                    "optim_grads_params",
-                ) or i == len(values) - 1
-                assert (
-                    param_group._reduced_grad_buffer_has_accumulated_grad
-                    == expect_reduced_grad
+                expect_reduced_grad = (
+                    sharding_strategy in ("optim_grads", "optim_grads_params")
+                    or i == len(values) - 1
                 )
+                assert param_group._reduced_grad_buffer_has_accumulated_grad == expect_reduced_grad
         model.finish_grad_sync()
 
         for param_names, param_group in model._named_param_groups:
@@ -455,33 +454,24 @@ class TestFullyShardBasic:
         captured_run_dtypes = []
 
         def capture_unshard(
-            outer_dp_group,
-            inner_dp_group,
-            weight_buffers,
-            *,
-            async_op,
-            stream,
-            caller_stream,
+            outer_dp_group, inner_dp_group, weight_buffers, *, async_op, stream, caller_stream
         ):
             del outer_dp_group, inner_dp_group, async_op, caller_stream
             captured_run_dtypes.append(
                 tuple(weight_buffer.dtype for weight_buffer in weight_buffers)
             )
             for weight_buffer in weight_buffers:
-                weight_buffer.unshard(
-                    unshard_dim=1,
-                    bind_params=True,
-                    stream=stream,
-                )
+                weight_buffer.unshard(unshard_dim=1, bind_params=True, stream=stream)
 
         monkeypatch.setattr(fsdp_module_mod, "_unshard_weight_buffers", capture_unshard)
 
         try:
             model.unshard(async_op=True)
             assert captured_run_dtypes
-            assert {
-                dtype for run_dtypes in captured_run_dtypes for dtype in run_dtypes
-            } == {torch.float32, torch.uint8}
+            assert {dtype for run_dtypes in captured_run_dtypes for dtype in run_dtypes} == {
+                torch.float32,
+                torch.uint8,
+            }
             assert len(captured_run_dtypes) >= 2
             for run_dtypes in captured_run_dtypes:
                 assert len(set(run_dtypes)) == 1, (
@@ -539,16 +529,12 @@ class TestFullyShardBasic:
             layer.reshard()
 
     @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
-    def test_weight_unshard_coalesces_outer_before_inner(
-        self, monkeypatch, outer_strategy
-    ):
+    def test_weight_unshard_coalesces_outer_before_inner(self, monkeypatch, outer_strategy):
         """Outer runs should finish before inner AGs; no_shard outer is a no-op."""
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import (
             fsdp_module as fsdp_module_mod,
         )
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import (
-            DataParallelBuffer,
-        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import DataParallelBuffer
 
         torch.manual_seed(42)
         model = SimpleMLP(16).to(_device())
@@ -600,9 +586,7 @@ class TestFullyShardBasic:
 
         def capture_unshard(buffer, *args, **kwargs):
             unshard_dim = kwargs.get("unshard_dim", args[0] if args else 1)
-            active_group = (
-                active_manager_groups[-1] if active_manager_groups else None
-            )
+            active_group = active_manager_groups[-1] if active_manager_groups else None
             unshard_calls.append((id(buffer), unshard_dim, active_group))
             return original_unshard(buffer, *args, **kwargs)
 
@@ -611,26 +595,15 @@ class TestFullyShardBasic:
             return original_all_gather(*args, **kwargs)
 
         monkeypatch.setattr(DataParallelBuffer, "unshard", capture_unshard)
-        monkeypatch.setattr(
-            fsdp_module_mod,
-            "_coalescing_manager",
-            capture_coalescing_manager,
-        )
-        monkeypatch.setattr(
-            torch.distributed,
-            "all_gather_into_tensor",
-            capture_all_gather,
-        )
+        monkeypatch.setattr(fsdp_module_mod, "_coalescing_manager", capture_coalescing_manager)
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", capture_all_gather)
 
         try:
             model.unshard(async_op=True)
             assert len(manager_groups) == 2
             assert all(
                 actual is expected
-                for actual, expected in zip(
-                    manager_groups,
-                    [outer_dp_group, inner_dp_group],
-                )
+                for actual, expected in zip(manager_groups, [outer_dp_group, inner_dp_group])
             )
             expected_unshard_calls = [
                 (id(first_buffer), 0, outer_dp_group),
@@ -650,18 +623,13 @@ class TestFullyShardBasic:
                 ) in zip(unshard_calls, expected_unshard_calls)
             )
             expected_collective_groups = (
-                [outer_dp_group, outer_dp_group]
-                if outer_strategy == "optim"
-                else []
+                [outer_dp_group, outer_dp_group] if outer_strategy == "optim" else []
             )
             expected_collective_groups.extend([inner_dp_group, inner_dp_group])
             assert len(collective_groups) == len(expected_collective_groups)
             assert all(
                 actual is expected
-                for actual, expected in zip(
-                    collective_groups,
-                    expected_collective_groups,
-                )
+                for actual, expected in zip(collective_groups, expected_collective_groups)
             )
             assert all(not weight_buffer._outer_dirty for weight_buffer in weight_buffers)
         finally:
@@ -716,9 +684,7 @@ class TestFullyShardBasic:
             for _ in range(torch.distributed.get_world_size(model_buffer.outer_dp_group))
         ]
         torch.distributed.all_gather(
-            outer_replicas,
-            model_buffer.data,
-            group=model_buffer.outer_dp_group,
+            outer_replicas, model_buffer.data, group=model_buffer.outer_dp_group
         )
         assert all(torch.equal(replica, outer_replicas[0]) for replica in outer_replicas[1:])
 
@@ -1064,9 +1030,7 @@ class TestLifecycle:
 
         assert param_group.main_grad_buffer.data is not None
 
-    def test_root_forward_releases_optimizer_cleared_grad_storage_before_unshard(
-        self, monkeypatch
-    ):
+    def test_root_forward_releases_optimizer_cleared_grad_storage_before_unshard(self, monkeypatch):
         """Plain optimizer zero-grad must not overlap stale grads with next unshard."""
         torch.manual_seed(42)
         model = TinyLLM(vocab=32, hidden=16, num_layers=2).to(_device())
@@ -1310,18 +1274,14 @@ class TestActivationCheckpointing:
                 super().__init__()
                 self.layers = nn.ModuleList(
                     [
-                        nn.Sequential(
-                            nn.Linear(32, 32), nn.GELU(), nn.Linear(32, 32)
-                        )
+                        nn.Sequential(nn.Linear(32, 32), nn.GELU(), nn.Linear(32, 32))
                         for _ in range(2)
                     ]
                 )
 
             def forward(self, x):
                 for layer in self.layers:
-                    x = torch.utils.checkpoint.checkpoint(
-                        layer, x, use_reentrant=False
-                    )
+                    x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
                 return x
 
         model = TwoLayerCheckpointModel().to(device=device, dtype=torch.bfloat16)
@@ -1364,14 +1324,10 @@ class TestActivationCheckpointing:
         assert torch.equal(model_buffer.data, main_buffer.data.to(model_buffer.dtype))
 
         expected_full = torch.empty(
-            model_buffer.buffer_index.bucket_meta.size,
-            dtype=model_buffer.dtype,
-            device=device,
+            model_buffer.buffer_index.bucket_meta.size, dtype=model_buffer.dtype, device=device
         )
         torch.distributed.all_gather_into_tensor(
-            expected_full,
-            model_buffer.data,
-            group=model_buffer.inner_dp_group,
+            expected_full, model_buffer.data, group=model_buffer.inner_dp_group
         )
 
         observed_full = []
@@ -1391,10 +1347,7 @@ class TestActivationCheckpointing:
         for item_id in range(len(param_group.params)):
             start, end = model_buffer.buffer_index._get_item_global_range(item_id)
             torch.testing.assert_close(
-                observed_full[0][start:end],
-                expected_full[start:end],
-                rtol=0,
-                atol=0,
+                observed_full[0][start:end], expected_full[start:end], rtol=0, atol=0
             )
 
     def test_recompute_forward_self_unshard_disables_prefetch(self, monkeypatch):
@@ -1402,16 +1355,8 @@ class TestActivationCheckpointing:
         torch.manual_seed(42)
         model = TinyLLM(vocab=32, hidden=16, num_layers=1).to(_device())
         target = model.layers[0]
-        fully_shard(
-            target,
-            enable_unshard_prefetch=True,
-            enable_async_reduce_grad=False,
-        )
-        fully_shard(
-            model,
-            enable_unshard_prefetch=True,
-            enable_async_reduce_grad=False,
-        )
+        fully_shard(target, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
+        fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=False)
 
         assert not target._fsdp_state._is_root
         ctx = model._fsdp_root_context
@@ -1420,20 +1365,13 @@ class TestActivationCheckpointing:
 
         calls = []
 
-        def capture_unshard(
-            async_op=False,
-            bwd_pass=False,
-            prefetch=True,
-        ):
+        def capture_unshard(async_op=False, bwd_pass=False, prefetch=True):
             calls.append((async_op, bwd_pass, prefetch))
 
         monkeypatch.setattr(target, "unshard", capture_unshard)
         mfsdp_forward_pre_hook(target, (), {})
 
-        assert calls == [
-            (True, True, True),
-            (True, False, False),
-        ]
+        assert calls == [(True, True, True), (True, False, False)]
 
     def test_activation_checkpointing_forward_backward(self):
         """Forward + backward with activation checkpointing should produce finite loss."""
@@ -1735,8 +1673,7 @@ class TestCheckpoint:
                 sharding_strategy="optim_grads_params",
                 outer_dp_sharding_strategy="optim",
                 mp_policy=MixedPrecisionPolicy(
-                    main_params_dtype=torch.float32,
-                    main_grads_dtype=torch.float32,
+                    main_params_dtype=torch.float32, main_grads_dtype=torch.float32
                 ),
                 enable_async_reduce_grad=False,
             )

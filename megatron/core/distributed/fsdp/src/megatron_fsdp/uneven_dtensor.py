@@ -404,7 +404,7 @@ def split_dtensor(
     full tensor is large.
 
     Chunk metadata assignment strategy
-    ------------------------------------
+    ====================================
     For each split window ``[split_start, split_end)`` along *dim*:
 
     * The rank's local chunk covers the global interval

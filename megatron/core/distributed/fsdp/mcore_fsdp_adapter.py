@@ -358,11 +358,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                         isinstance(m, TransformerLayer) and "transformer" in cuda_graph_on,
                         isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
                         isinstance(m, Attention) and "attn" in cuda_graph_on,
-                        isinstance(m, MLP)
-                        and m not in moe_submodules
-                        and "mlp" in cuda_graph_on,
-                        isinstance(m, (TEGroupedMLP, SequentialMLP))
-                        and "moe" in cuda_graph_on,
+                        isinstance(m, MLP) and m not in moe_submodules and "mlp" in cuda_graph_on,
+                        isinstance(m, (TEGroupedMLP, SequentialMLP)) and "moe" in cuda_graph_on,
                         isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
                     ]
                 ):
@@ -749,13 +746,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
 
 def _build_hsdp_dp_mesh(
-    outer_group,
-    inner_group,
-    tp_group,
-    flatten_group,
-    *,
-    inner_dim_name,
-    ep_size=1,
+    outer_group, inner_group, tp_group, flatten_group, *, inner_dim_name, ep_size=1
 ):
     ranks = _get_hsdp_tp_mesh(outer_group, inner_group, tp_group, ep_size=ep_size)
     ranks = ranks[:, :, tp_group.rank()]

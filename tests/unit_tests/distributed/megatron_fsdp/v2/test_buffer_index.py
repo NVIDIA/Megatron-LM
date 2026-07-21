@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import BufferIndex
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
-
 CANONICAL_LAYOUTS = ((0, 0), (0, 1), (1, 0), (1, 1))
 
 
@@ -52,11 +51,7 @@ class TestBufferIndex:
         self.param_shapes = [torch.Size([16]), torch.Size([8]), torch.Size([40])]
         self.chunk_size_factor = 4
 
-        self.ref_item_ranges = {
-            0: (0, 16),
-            1: (16, 24),
-            2: (24, 64),
-        }
+        self.ref_item_ranges = {0: (0, 16), 1: (16, 24), 2: (24, 64)}
         layout_size = 64
         shard_grid = int(self.mesh.size(0) * self.mesh.size(1) * self.chunk_size_factor)
         self.ref_bucket_size = ((layout_size + shard_grid - 1) // shard_grid) * shard_grid
@@ -74,18 +69,8 @@ class TestBufferIndex:
         outer_inner_offset = outer_rank * outer_inner_shard_size
 
         full_meta = (0, 0, 0, self.ref_bucket_size)
-        outer_meta = (
-            outer_full_global_start,
-            0,
-            outer_full_global_start,
-            outer_full_shard_size,
-        )
-        inner_meta = (
-            inner_global_start,
-            0,
-            inner_global_start,
-            inner_shard_size,
-        )
+        outer_meta = (outer_full_global_start, 0, outer_full_global_start, outer_full_shard_size)
+        inner_meta = (inner_global_start, 0, inner_global_start, inner_shard_size)
         outer_inner_meta = (
             inner_global_start + outer_inner_offset,
             0,
@@ -108,20 +93,7 @@ class TestBufferIndex:
             (1, 1): outer_inner_meta,
         }
 
-    @pytest.mark.parametrize(
-        "shard_layout",
-        [
-            (),
-            0,
-            1,
-            (0,),
-            (1,),
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (1, 1),
-        ],
-    )
+    @pytest.mark.parametrize("shard_layout", [(), 0, 1, (0,), (1,), (0, 0), (0, 1), (1, 0), (1, 1)])
     def test_shard_meta_matches_ref(self, shard_layout):
         index = BufferIndex(
             param_shapes=self.param_shapes,
@@ -153,9 +125,7 @@ class TestBufferIndex:
             chunk_size_factor=self.chunk_size_factor,
         )
         item_start, item_end = self.ref_item_ranges[item_id]
-        shard_global_start, shard_local_start, _, shard_size = self.ref_shard_metas[
-            shard_layout
-        ]
+        shard_global_start, shard_local_start, _, shard_size = self.ref_shard_metas[shard_layout]
         range_start = max(item_start, shard_global_start)
         range_end = min(item_end, shard_global_start + shard_size)
 
@@ -185,15 +155,9 @@ class TestBufferIndex:
     def _expected_local_slices(self, global_range, requested_layout, storage_layout):
         global_start, global_end = global_range
         requested_start, _, _, requested_size = self.ref_shard_metas[requested_layout]
-        storage_start, storage_local_start, _, storage_size = self.ref_shard_metas[
-            storage_layout
-        ]
+        storage_start, storage_local_start, _, storage_size = self.ref_shard_metas[storage_layout]
         start = max(global_start, requested_start, storage_start)
-        end = min(
-            global_end,
-            requested_start + requested_size,
-            storage_start + storage_size,
-        )
+        end = min(global_end, requested_start + requested_size, storage_start + storage_size)
         if start >= end:
             return None, None
 
@@ -215,9 +179,7 @@ class TestBufferIndex:
 
         assert index.local_slice_for(
             global_range, requested_layout, storage_layout
-        ) == self._expected_local_slices(
-            global_range, requested_layout, storage_layout
-        )
+        ) == self._expected_local_slices(global_range, requested_layout, storage_layout)
 
     @pytest.mark.parametrize("requested_layout", CANONICAL_LAYOUTS)
     @pytest.mark.parametrize("storage_layout", CANONICAL_LAYOUTS)
@@ -232,20 +194,11 @@ class TestBufferIndex:
 
         assert index.local_slice_for(
             global_range, requested_layout, storage_layout
-        ) == self._expected_local_slices(
-            global_range, requested_layout, storage_layout
-        )
+        ) == self._expected_local_slices(global_range, requested_layout, storage_layout)
 
     @pytest.mark.parametrize(
         ("legacy_layout", "canonical_layout"),
-        [
-            (None, (0, 0)),
-            (0, (0, 0)),
-            (1, (0, 1)),
-            ((), (0, 0)),
-            ((0,), (0, 0)),
-            ((1,), (0, 1)),
-        ],
+        [(None, (0, 0)), (0, (0, 0)), (1, (0, 1)), ((), (0, 0)), ((0,), (0, 0)), ((1,), (0, 1))],
     )
     def test_local_slice_for_legacy_layout(self, legacy_layout, canonical_layout):
         index = BufferIndex(
@@ -256,13 +209,9 @@ class TestBufferIndex:
         )
         global_range = (0, self.ref_bucket_size)
 
-        assert index.local_slice_for(
-            global_range, legacy_layout, (0, 0)
-        ) == index.local_slice_for(
+        assert index.local_slice_for(global_range, legacy_layout, (0, 0)) == index.local_slice_for(
             global_range, canonical_layout, (0, 0)
         )
-        assert index.local_slice_for(
-            global_range, (0, 0), legacy_layout
-        ) == index.local_slice_for(
+        assert index.local_slice_for(global_range, (0, 0), legacy_layout) == index.local_slice_for(
             global_range, (0, 0), canonical_layout
         )

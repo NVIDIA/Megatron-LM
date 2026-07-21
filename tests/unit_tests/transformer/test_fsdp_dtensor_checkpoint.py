@@ -346,12 +346,10 @@ class TestTorchDistToMegatronFSDPV2Map:
 
     def test_direct_mtp_transformer_layer_key_matches_v2_mtp_model_layer(self):
         td_key = (
-            "language_model.mtp.layers.0.transformer_layer."
-            "mlp.shared_experts.linear_fc1.weight"
+            "language_model.mtp.layers.0.transformer_layer." "mlp.shared_experts.linear_fc1.weight"
         )
         v2_key = (
-            "language_model.mtp.layers.0.mtp_model_layer."
-            "mlp.shared_experts.linear_fc1.weight"
+            "language_model.mtp.layers.0.mtp_model_layer." "mlp.shared_experts.linear_fc1.weight"
         )
 
         tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
@@ -372,13 +370,9 @@ class TestTorchDistToMegatronFSDPV2Map:
 
     def test_mtp_grouped_mlp_per_layer_key_preserves_transformer_layer_prefix(self):
         td_key = (
-            "language_model.mtp.layers.0.transformer_layer."
-            "mlp.experts.experts.linear_fc1.weight"
+            "language_model.mtp.layers.0.transformer_layer." "mlp.experts.experts.linear_fc1.weight"
         )
-        v2_key = (
-            "language_model.mtp.layers.0.mtp_model_layer."
-            "mlp.experts.linear_fc1.weight7"
-        )
+        v2_key = "language_model.mtp.layers.0.mtp_model_layer." "mlp.experts.linear_fc1.weight7"
 
         tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
 
@@ -631,14 +625,10 @@ class TestMegatronFSDPV2GDNKeyMatching:
         }
 
         in_proj = _match_gdn_key_v2(
-            "module.decoder.layers.0.self_attention.in_proj.weight",
-            torch.empty(16, 4),
-            gdn_info,
+            "module.decoder.layers.0.self_attention.in_proj.weight", torch.empty(16, 4), gdn_info
         )
         conv1d = _match_gdn_key_v2(
-            "module.decoder.layers.0.self_attention.conv1d.weight",
-            torch.empty(8, 1, 4),
-            gdn_info,
+            "module.decoder.layers.0.self_attention.conv1d.weight", torch.empty(8, 1, 4), gdn_info
         )
 
         assert in_proj == ([2, 2, 4, 4, 2, 2], ["query", "key", "value", "z", "beta", "alpha"], 0)
@@ -654,9 +644,7 @@ class TestMegatronFSDPV2GDNKeyMatching:
 
         assert (
             _match_gdn_key_v2(
-                "decoder.layers.0.self_attention.linear_qkv.weight",
-                torch.empty(16, 4),
-                gdn_info,
+                "decoder.layers.0.self_attention.linear_qkv.weight", torch.empty(16, 4), gdn_info
             )
             is None
         )

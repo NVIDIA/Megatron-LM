@@ -998,14 +998,13 @@ def _build_megatron_fsdp_v2_muon_optimizer(
     checkpointing, and passing full FSDP buffers to an Adam built over only the
     non-matrix param subset).
     """
-    from .fully_shard_v2_muon import FullyShardV2MuonOptimizer
-
     # Tag params and route non-linear/embedding params to Adam (same mechanism
     # as the non-FSDP emerging path in _get_megatron_emerging_optimizer).
     # _default_param_overrides_factory is defined regardless of whether the
     # emerging_optimizers package is installed (FullyShardV2Muon has a built-in
     # Newton-Schulz fallback), so we don't index _EMERGING_OPTIMIZERS here.
     from .emerging_optimizers import _default_param_overrides_factory
+    from .fully_shard_v2_muon import FullyShardV2MuonOptimizer
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -1184,10 +1183,7 @@ def get_megatron_optimizer(
         if ddp_config.data_parallel_sharding_strategy == 'no_shard':
             fsdp_grad_stats_parallel_group = mp_group
         # FSDP v2 already builds dp_cp as the flattened outer x inner HSDP group.
-        elif (
-            ddp_config.use_megatron_fsdp_v2
-            and ddp_config.outer_dp_sharding_strategy == 'optim'
-        ):
+        elif ddp_config.use_megatron_fsdp_v2 and ddp_config.outer_dp_sharding_strategy == 'optim':
             fsdp_grad_stats_parallel_group = dp_cp_group
         else:
             fsdp_grad_stats_parallel_group = intra_dist_opt_group

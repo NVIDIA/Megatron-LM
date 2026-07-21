@@ -3,6 +3,11 @@
 # See LICENSE for license information.
 
 """Standalone TE-compatible CUDA graph callable runtime."""
+
+# This file is adapted from Transformer Engine's vendored runtime. Keep its
+# upstream helper signatures and documentation formatting intact.
+# pylint: disable=missing-function-docstring,line-too-long
+
 from __future__ import annotations
 
 import contextlib
@@ -488,10 +493,7 @@ def _get_static_grad_buffers(inputs):
 
 
 def _returned_param_grad_clone_slots(
-    static_grad_inputs,
-    module_params,
-    static_grad_buffers,
-    clone_param_grads_on_return,
+    static_grad_inputs, module_params, static_grad_buffers, clone_param_grads_on_return
 ):
     """Select parameter gradients that Graphed.backward must clone.
 
@@ -1958,7 +1960,7 @@ def make_graphed_callables(
        Use arguments 'enabled', 'calibrating', 'recipe', 'amax_reduction_group', and 'cache_quantized_params' instead.
 
     Graphing parameters
-    -------------------
+    ===================
     modules: (tuple of) callable
              Callable or callables to graph.
     sample_args: (tuple of) tuple of torch.Tensor
@@ -2013,7 +2015,7 @@ def make_graphed_callables(
                         ``hook(module, grad_input, grad_output)``.
 
     Quantization parameters
-    -----------------------
+    =======================
     enabled: (tuple of) bool, default = False
              whether or not to enable low precision quantization (FP8/FP4).
              If tuple, the length must match the number of modules.

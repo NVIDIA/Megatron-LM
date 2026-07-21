@@ -87,15 +87,10 @@ def test_capture_backward_post_hook_releases_reusable_trace_pool_grad_slot():
     allocator.plan()
     assert allocator._key_to_slot[first_key] == allocator._key_to_slot[second_key]
 
-    allocator.allocate(
-        key=first_key, size=16, dtype=torch.float32, device=torch.device("cpu")
-    )
+    allocator.allocate(key=first_key, size=16, dtype=torch.float32, device=torch.device("cpu"))
     module = SimpleNamespace(
         _fsdp_param_groups=[
-            SimpleNamespace(
-                params=[],
-                release_grad_buffer=lambda: allocator.free(key=first_key),
-            )
+            SimpleNamespace(params=[], release_grad_buffer=lambda: allocator.free(key=first_key))
         ],
         reshard=lambda: None,
     )
@@ -103,9 +98,7 @@ def test_capture_backward_post_hook_releases_reusable_trace_pool_grad_slot():
 
     # Without the capture-time grad release this raises the same slot
     # collision seen when QwenImage captures its next transformer block.
-    allocator.allocate(
-        key=second_key, size=16, dtype=torch.float32, device=torch.device("cpu")
-    )
+    allocator.allocate(key=second_key, size=16, dtype=torch.float32, device=torch.device("cpu"))
 
 
 def test_returned_param_grad_clone_slots_reuses_capture_binding_without_refetch():

@@ -81,9 +81,7 @@ def _prepare_fsdp_mesh(mesh: DeviceMesh) -> DeviceMesh:
     inner_dim_name = dim_names[0] if dim_names else "dp"
     outer_dim_name = "dp_outer" if inner_dim_name != "dp_outer" else "outer"
     return DeviceMesh(
-        mesh.device_type,
-        mesh.mesh.reshape(1, -1),
-        mesh_dim_names=(outer_dim_name, inner_dim_name),
+        mesh.device_type, mesh.mesh.reshape(1, -1), mesh_dim_names=(outer_dim_name, inner_dim_name)
     )
 
 
@@ -99,8 +97,4 @@ def _init_default_fully_shard_mesh() -> DeviceMesh:
     world_ranks = torch.arange(
         torch.distributed.get_world_size(torch.distributed.group.WORLD)
     ).reshape(1, -1)
-    return DeviceMesh(
-        device.type,
-        world_ranks,
-        mesh_dim_names=("dp_outer", "dp"),
-    )
+    return DeviceMesh(device.type, world_ranks, mesh_dim_names=("dp_outer", "dp"))

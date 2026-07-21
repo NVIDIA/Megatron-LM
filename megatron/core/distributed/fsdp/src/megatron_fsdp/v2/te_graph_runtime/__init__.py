@@ -1,3 +1,7 @@
+# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# See LICENSE for license information.
+
 """TE-compatible CUDA graph callable runtime.
 
 Vendored from https://github.com/buptzyb/te-graph-runtime

@@ -72,10 +72,7 @@ class BufferIndex:
 
     @classmethod
     def _build_layout(
-        cls,
-        param_shapes: List[torch.Size],
-        layout_world_size: int,
-        chunk_size_factor: int,
+        cls, param_shapes: List[torch.Size], layout_world_size: int, chunk_size_factor: int
     ) -> Tuple[Dict[int, "BufferIndex.ItemIndex"], "BufferIndex.BucketMeta"]:
         """
         Compute global buffer layout for a list of parameter shapes.
@@ -216,10 +213,7 @@ class BufferIndex:
 
     @classmethod
     def _build_shard_meta(
-        cls,
-        parent_meta,
-        num_shards: int,
-        shard_id: int,
+        cls, parent_meta, num_shards: int, shard_id: int
     ) -> "BufferIndex.ShardMeta":
         if parent_meta.size % num_shards != 0:
             raise ValueError(
@@ -238,10 +232,7 @@ class BufferIndex:
 
     def _refresh_shard_metas(self) -> None:
         full_meta = self.ShardMeta(
-            global_data_index=0,
-            local_data_index=0,
-            bucket_data_index=0,
-            size=self.bucket_meta.size,
+            global_data_index=0, local_data_index=0, bucket_data_index=0, size=self.bucket_meta.size
         )
         inner_meta = self._build_shard_meta(self.bucket_meta, self.dp_world_size, self.dp_rank)
         outer_full_meta = self._build_shard_meta(
@@ -254,10 +245,7 @@ class BufferIndex:
         # ``shard_layout`` follows PyTorch DeviceMesh dim order:
         # mesh_dim 0 is outer-DP, mesh_dim 1 is inner-DP.
         # The cache keys below use 0/1 flags to mean unsharded/sharded.
-        self.inner_shard_metas = {
-            0: full_meta,
-            1: inner_meta,
-        }
+        self.inner_shard_metas = {0: full_meta, 1: inner_meta}
         # Outer has four views: outer flag x inner flag, matching mesh dim order.
         self.outer_shard_metas = {
             (0, 0): full_meta,
@@ -352,11 +340,7 @@ class BufferIndex:
         global_start, global_end = global_range
         requested_meta = self._get_shard_meta(requested_layout)
         storage_meta = self._get_shard_meta(storage_layout)
-        start = max(
-            global_start,
-            requested_meta.global_data_index,
-            storage_meta.global_data_index,
-        )
+        start = max(global_start, requested_meta.global_data_index, storage_meta.global_data_index)
         end = min(
             global_end,
             requested_meta.global_data_index + requested_meta.size,
@@ -366,9 +350,7 @@ class BufferIndex:
             return None, None
 
         source_slice = slice(start - global_start, end - global_start)
-        local_start = (
-            storage_meta.local_data_index + start - storage_meta.global_data_index
-        )
+        local_start = storage_meta.local_data_index + start - storage_meta.global_data_index
         local_slice = slice(local_start, local_start + end - start)
         return source_slice, local_slice
 
@@ -378,10 +360,7 @@ class BufferIndex:
         return (idx.global_data_index, idx.global_data_index + idx.size)
 
     def _get_item_self_range(
-        self,
-        item_id: int,
-        *,
-        shard_layout: Iterable[int] | None = (0, 1),
+        self, item_id: int, *, shard_layout: Iterable[int] | None = (0, 1)
     ) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
 
@@ -405,10 +384,7 @@ class BufferIndex:
         return (range_start - idx.global_data_index, range_end - idx.global_data_index)
 
     def _get_item_local_range(
-        self,
-        item_id: int,
-        *,
-        shard_layout: Iterable[int] | None = (0, 0),
+        self, item_id: int, *, shard_layout: Iterable[int] | None = (0, 0)
     ) -> Tuple[int, int]:
         """Return item coordinates relative to the selected shard layout.
 

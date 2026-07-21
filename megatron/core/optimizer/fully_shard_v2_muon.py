@@ -68,6 +68,7 @@ class MuonGradPackage:
 
     @torch.no_grad()
     def update_momentum(self, opt, coef):
+        """Update local momentum shards and apply Nesterov correction when enabled."""
         for param_idx in self.param_ids:
             grad = opt._main_grads[param_idx]
             if grad is None:
@@ -107,9 +108,7 @@ class MuonGradPackage:
                 main_weight = opt._main_weights[param_idx]
                 momentum = opt._momentum_buffers[param_idx]
                 full_grad = torch.empty(
-                    main_weight.shape.numel(),
-                    dtype=momentum.dtype,
-                    device=momentum.device,
+                    main_weight.shape.numel(), dtype=momentum.dtype, device=momentum.device
                 )
                 full_grads[param_idx] = full_grad
                 if this_size > 0:
@@ -117,20 +116,20 @@ class MuonGradPackage:
                 for src, offset, size in ranges:
                     if size == 0 or src == this_rank:
                         continue
-                    ops.append(
-                        dist.P2POp(dist.irecv, full_grad[offset : offset + size], src)
-                    )
+                    ops.append(dist.P2POp(dist.irecv, full_grad[offset : offset + size], src))
             elif this_size > 0:
                 ops.append(dist.P2POp(dist.isend, ns_input_shard, root))
         return dist.batch_isend_irecv(ops) if ops else []
 
     @torch.no_grad()
     def finish_gather(self, requests):
+        """Wait for all asynchronous gradient-gather requests."""
         for request in requests:
             request.wait()
 
     @torch.no_grad()
     def orthogonalize(self, opt, requests, full_grads):
+        """Orthogonalize the gathered gradients assigned to this rank."""
         self.finish_gather(requests)
         orths = {}
         this_rank = dist.get_rank()
@@ -155,9 +154,7 @@ class MuonGradPackage:
                     partition_dim=None,
                     tp_mode="duplicated",
                 )
-                scale = get_muon_scale_factor(
-                    grad.size(-2), grad.size(-1), mode=opt._scale_mode
-                )
+                scale = get_muon_scale_factor(grad.size(-2), grad.size(-1), mode=opt._scale_mode)
             else:
                 orth = _vanilla_newton_schulz(grad, steps=opt._num_ns_steps)
                 scale = _vanilla_muon_scale(grad.size(-2), grad.size(-1))
@@ -190,15 +187,14 @@ class MuonGradPackage:
                 if this_size > 0:
                     ops.append(
                         dist.P2POp(
-                            dist.irecv,
-                            opt._main_grads[param_idx].to_local().reshape(-1),
-                            root,
+                            dist.irecv, opt._main_grads[param_idx].to_local().reshape(-1), root
                         )
                     )
         return dist.batch_isend_irecv(ops) if ops else []
 
     @torch.no_grad()
     def finish_scatter(self, requests):
+        """Wait for all asynchronous gradient-scatter requests."""
         for request in requests:
             request.wait()
 
@@ -311,9 +307,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         self._roots = self._assign_roots()
 
         self._ns_costs = [
-            main_weight.shape.numel() * min(main_weight.shape)
-            if len(main_weight.shape) == 2
-            else 0
+            main_weight.shape.numel() * min(main_weight.shape) if len(main_weight.shape) == 2 else 0
             for main_weight in self._main_weights
         ]
         self._packages = self._build_packages()
@@ -419,9 +413,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             for ns_cost, param_idx in sorted(work, key=lambda e: (-e[0], e[1])):
                 ranges = self._shard_ranges[param_idx]
                 param_numel = self._main_weights[param_idx].shape.numel()
-                full_holders = [
-                    rank for rank, _offset, size in ranges if size == param_numel
-                ]
+                full_holders = [rank for rank, _offset, size in ranges if size == param_numel]
                 holders = [rank for rank, _offset, size in ranges if size > 0]
                 size_by_rank = {rank: size for rank, _offset, size in ranges}
 
@@ -446,9 +438,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         for param_idx in range(len(self._main_weights)):
             root = self._roots[param_idx]
             has_comm = any(
-                rank != root
-                for rank, _offset, size in self._shard_ranges[param_idx]
-                if size > 0
+                rank != root for rank, _offset, size in self._shard_ranges[param_idx] if size > 0
             )
             (comm_params if has_comm else comm_free_params).append(param_idx)
 
@@ -462,15 +452,13 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             for start in range(0, len(params_in_group), package_size):
                 comm_packages.append(
                     MuonGradPackage(
-                        param_ids=params_in_group[start : start + package_size],
-                        has_comm=True,
+                        param_ids=params_in_group[start : start + package_size], has_comm=True
                     )
                 )
 
         no_comm_packages = [
             MuonGradPackage(
-                param_ids=comm_free_params[start : start + package_size],
-                has_comm=False,
+                param_ids=comm_free_params[start : start + package_size], has_comm=False
             )
             for start in range(0, len(comm_free_params), package_size)
         ]
@@ -516,7 +504,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         # Phase 2: consume packages in NS order, run root NS, then launch package
         # scatter for the orthogonalized shards.
         scatter_reqs = []  # in-flight scatter requests per communication package
-        owned_orths = {}   # param_idx -> full orth this rank rooted (read by Phase 3b)
+        owned_orths = {}  # param_idx -> full orth this rank rooted (read by Phase 3b)
 
         for package_idx, package in enumerate(self._packages):
             orths = package.orthogonalize(self, gather_reqs[package_idx], full_grads)
@@ -584,9 +572,7 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
                         ):
                             params.append(dist_param)
                             grads.append(dist_grad)
-                            full_name = (
-                                f"{module_name}.{param_name}" if module_name else param_name
-                            )
+                            full_name = f"{module_name}.{param_name}" if module_name else param_name
                             if full_name in seen_names:
                                 raise ValueError(
                                     f"Duplicate Muon parameter name for checkpointing: {full_name}"
@@ -622,6 +608,7 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
         return []
 
     def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
+        """Return no gradients because Muon is excluded from chained grad norms."""
         return []
 
     def count_zeros(self) -> float:

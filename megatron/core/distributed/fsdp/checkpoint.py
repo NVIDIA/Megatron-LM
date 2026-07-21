@@ -39,8 +39,10 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.parallel_state as mpu
 from megatron.core import dist_checkpointing
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_chunk_meta_source
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    copy_chunk_metadata,
+    get_chunk_meta_source,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict as _get_state_dict,
 )
@@ -171,7 +173,10 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
                 "Identity transform for non-local expert key '%s' (expert_index=%d, "
                 "local_expert_start=%d). This expert does not belong to EP rank %d "
                 "but survived in the state dict. Consider removing it instead.",
-                key, expert_index, local_expert_start, ep_rank,
+                key,
+                expert_index,
+                local_expert_start,
+                ep_rank,
             )
         # GroupedMLP: 'mlp.experts.linear_fc1.weight0', 'mlp.experts.linear_fc2.weight0'
         if 'mlp.experts.linear_fc1.weight' in key or 'mlp.experts.linear_fc2.weight' in key:
@@ -404,12 +409,7 @@ def handle_swiglu_in_state_dict_v2(
         return _swiglu_detector(key, dtensor, _model, layer_glu)
 
     return _split_fused_params_v2(
-        model,
-        model_state_dict,
-        optimizer_state_dict,
-        detector,
-        lambda k, s: f"{k}_{s}",
-        "SwiGLU",
+        model, model_state_dict, optimizer_state_dict, detector, lambda k, s: f"{k}_{s}", "SwiGLU"
     )
 
 
@@ -457,15 +457,15 @@ def _match_gdn_key(key: str, dtensor: DTensor, gdn_info: Optional[dict] = None):
         rel = norm[len(gdn_path) + 1 :]
         if rel == "in_proj.weight":
             expected = sum(info["in_proj_sizes"])
-            assert dtensor.shape[0] == expected, (
-                f"Expected GDN in_proj size {expected}, got {dtensor.shape[0]} for key {key}"
-            )
+            assert (
+                dtensor.shape[0] == expected
+            ), f"Expected GDN in_proj size {expected}, got {dtensor.shape[0]} for key {key}"
             return info["in_proj_sizes"], GDN_IN_PROJ_NAMES, 0
         if rel in ("conv1d.weight", "conv1d.bias"):
             expected = sum(info["conv1d_sizes"])
-            assert dtensor.shape[0] == expected, (
-                f"Expected GDN conv1d size {expected}, got {dtensor.shape[0]} for key {key}"
-            )
+            assert (
+                dtensor.shape[0] == expected
+            ), f"Expected GDN conv1d size {expected}, got {dtensor.shape[0]} for key {key}"
             return info["conv1d_sizes"], GDN_CONV1D_NAMES, 0
     return None
 
@@ -485,12 +485,7 @@ def handle_gdn_in_state_dict_v2(
         return _match_gdn_key(key, dtensor, gdn_info)
 
     return _split_fused_params_v2(
-        model,
-        model_state_dict,
-        optimizer_state_dict,
-        detector,
-        lambda k, s: f"{k}.{s}",
-        "GDN v2",
+        model, model_state_dict, optimizer_state_dict, detector, lambda k, s: f"{k}.{s}", "GDN v2"
     )
 
 
@@ -539,7 +534,7 @@ def _mamba_mixer_detector(key, dtensor, model, mixer_map):
             # Strip module. prefix and retry
             alt = prefix
             while alt.startswith(_MODULE_PREFIX):
-                alt = alt[len(_MODULE_PREFIX):]
+                alt = alt[len(_MODULE_PREFIX) :]
                 mixer_module = mixer_map.get(alt)
                 if mixer_module is not None:
                     break
@@ -736,11 +731,7 @@ def sync_module_states_after_load(module: nn.Module) -> None:
 
 
 def load_torch_dist_checkpoint_into_megatron_fsdp_v2(
-    args,
-    checkpoint_name,
-    model,
-    v2_state_dict,
-    strict=True,
+    args, checkpoint_name, model, v2_state_dict, strict=True
 ):
     """Load a torch_dist checkpoint into a Megatron FSDP v2 state-dict skeleton.
 
@@ -749,11 +740,7 @@ def load_torch_dist_checkpoint_into_megatron_fsdp_v2(
     the MFSDP-specific online conversion stays in this module.
     """
     return _load_torch_dist_into_megatron_fsdp_v2(
-        args,
-        checkpoint_name,
-        model=model,
-        v2_state_dict=v2_state_dict,
-        strict=strict,
+        args, checkpoint_name, model=model, v2_state_dict=v2_state_dict, strict=strict
     )
 
 
@@ -802,14 +789,12 @@ def _verify_chunk_metadata(flattened_sd: dict) -> None:
 
     if failures:
         logger.error(
-            "[chunk_metadata_verify] %d DTensor(s) have invalid chunk metadata:",
-            len(failures),
+            "[chunk_metadata_verify] %d DTensor(s) have invalid chunk metadata:", len(failures)
         )
         for msg in failures:
             logger.error("  %s", msg)
         raise AssertionError(
-            f"{len(failures)} DTensor(s) have invalid chunk metadata. "
-            "See log above for details."
+            f"{len(failures)} DTensor(s) have invalid chunk metadata. " "See log above for details."
         )
 
 
@@ -1502,11 +1487,7 @@ def _canonicalize_td_key(td_key, *, strip_model_prefix=True):
 
 
 def _load_torch_dist_into_megatron_fsdp_v2(
-    args,
-    checkpoint_name,
-    model,
-    v2_state_dict,
-    strict=True,
+    args, checkpoint_name, model, v2_state_dict, strict=True
 ):
     """Load a torch_dist checkpoint into a Megatron FSDP v2 skeleton via DCP.
 
@@ -1636,9 +1617,7 @@ def _load_torch_dist_into_megatron_fsdp_v2(
             len(first_entry) >= 4 and first_entry[-1] == "grouped_mlp_per_layer"
         )
         is_grouped_mlp = (
-            len(first_entry) >= 4
-            and first_entry[-1] == "grouped_mlp_fused"
-            and not is_seq_mlp
+            len(first_entry) >= 4 and first_entry[-1] == "grouped_mlp_fused" and not is_seq_mlp
         )
 
         entries.sort(key=lambda x: x[2])  # sort by layer_idx / local_expert_idx
@@ -1671,10 +1650,7 @@ def _load_torch_dist_into_megatron_fsdp_v2(
             placements = [Replicate()] * device_mesh.ndim
             placements[-1] = Shard(0)
             flat = torch.distributed.tensor.empty(
-                fused_shape,
-                dtype=example_val.dtype,
-                device_mesh=device_mesh,
-                placements=placements,
+                fused_shape, dtype=example_val.dtype, device_mesh=device_mesh, placements=placements
             )
         else:
             flat = torch.empty(fused_shape, dtype=example_val.dtype, device=example_val.device)

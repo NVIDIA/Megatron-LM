@@ -29,9 +29,7 @@ class _MetaChild(nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(3, device="meta", dtype=torch.bfloat16))
-        self.register_buffer(
-            "running_mean", torch.empty(1, device="meta", dtype=torch.float32)
-        )
+        self.register_buffer("running_mean", torch.empty(1, device="meta", dtype=torch.float32))
         self.reset_calls = 0
         self.weight_id_after_reset = None
         self.buffer_id_after_reset = None
@@ -49,9 +47,7 @@ class _MetaBufferOnly(nn.Module):
     def __init__(self):
         super().__init__()
         self.register_buffer(
-            "indices",
-            torch.empty(3, device="meta", dtype=torch.int64),
-            persistent=False,
+            "indices", torch.empty(3, device="meta", dtype=torch.int64), persistent=False
         )
         self.reset_calls = 0
         self.buffer_id_after_reset = None
@@ -94,15 +90,7 @@ def test_materialize_meta_module_is_non_recursive_and_skips_buffer_only_modules(
 
     FSDPModule._materialize_meta_module(model, ignored_modules=set())
 
-    assert [
-        model.reset_calls,
-        model.child.reset_calls,
-        model.buffer_only.reset_calls,
-    ] == [
-        1,
-        1,
-        0,
-    ]
+    assert [model.reset_calls, model.child.reset_calls, model.buffer_only.reset_calls] == [1, 1, 0]
     assert all(not tensor.is_meta for tensor in model.parameters())
     assert all(tensor.device.type == "cpu" for tensor in model.parameters())
     assert not model.scale.is_meta and model.scale.device.type == "cpu"
@@ -126,7 +114,5 @@ def test_materialize_meta_module_is_non_recursive_and_skips_buffer_only_modules(
 
     torch.testing.assert_close(model.weight, torch.full((2,), 3.0, dtype=torch.float64))
     assert torch.equal(model.scale, torch.tensor([8, 9], dtype=torch.int32))
-    torch.testing.assert_close(
-        model.child.weight, torch.full((3,), 2.0, dtype=torch.bfloat16)
-    )
+    torch.testing.assert_close(model.child.weight, torch.full((3,), 2.0, dtype=torch.bfloat16))
     torch.testing.assert_close(model.child.running_mean, torch.tensor([4.0]))

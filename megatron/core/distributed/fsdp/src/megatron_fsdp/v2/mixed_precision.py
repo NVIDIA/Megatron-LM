@@ -136,9 +136,11 @@ if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
         except ImportError:
 
             def local_multi_tensor_applier(op, noop_flag_buffer, tensor_lists, *args):
+                """Apply an operation using the Apex-compatible fallback signature."""
                 return op(2048 * 32, noop_flag_buffer, tensor_lists, *args)
 
             def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
+                """Scale tensor lists when fused multi-tensor kernels are unavailable."""
                 for src, dst in zip(tensor_lists[0], tensor_lists[1]):
                     dst.copy_(src * scale)
 
@@ -571,7 +573,9 @@ class MixedPrecisionPolicy:
 
         if self.is_nvfp4_param(params[0]):
             if outer_optim:
-                raise NotImplementedError("HSDP outer optimizer sharding is not supported for NVFP4.")
+                raise NotImplementedError(
+                    "HSDP outer optimizer sharding is not supported for NVFP4."
+                )
             quantize_main_weights_to_nvfp4(
                 params, param_idx, inner_dp_group, model_weight_buffer, main_weight_buffer
             )
@@ -622,7 +626,8 @@ class MixedPrecisionPolicy:
                 else:
                     start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(
                         # shard_layout=(outer, inner): (1, 1) outer+inner, (0, 1) inner.
-                        item_id, shard_layout=(1, 1) if outer_optim else (0, 1)
+                        item_id,
+                        shard_layout=(1, 1) if outer_optim else (0, 1),
                     )
                 fp8_params.append(param)
                 main_params.append(main_weight)
@@ -633,11 +638,7 @@ class MixedPrecisionPolicy:
             if outer_optim:
                 amax_reduce_group = mesh._flatten("_".join(mesh.mesh_dim_names)).get_group()
             quantize_main_weights_to_fp8(
-                fp8_params,
-                main_params,
-                start_offsets,
-                amax_reduce_group,
-                model_param_shards,
+                fp8_params, main_params, start_offsets, amax_reduce_group, model_param_shards
             )
 
         # Refresh updated local shards before the next compute unshard.

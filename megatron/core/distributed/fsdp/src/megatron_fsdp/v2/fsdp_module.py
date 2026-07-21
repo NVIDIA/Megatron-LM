@@ -33,26 +33,19 @@ def _unshard_weight_buffers(
 ) -> None:
     """Unshard one communication-compatible buffer run by mesh dimension."""
     # Allocate on the caller stream before entering the communication stream.
-    full_buffers = [
-        weight_buffer.fetch_buffer((0, 0)) for weight_buffer in weight_buffers
-    ]
+    full_buffers = [weight_buffer.fetch_buffer((0, 0)) for weight_buffer in weight_buffers]
     if async_op:
         stream.wait_stream(caller_stream)
 
     def unshard_dimension(group, unshard_dim: int) -> None:
         cm = (
             _coalescing_manager(group, async_ops=async_op)
-            if len(weight_buffers) > 1
-            and torch.distributed.get_world_size(group) > 1
+            if len(weight_buffers) > 1 and torch.distributed.get_world_size(group) > 1
             else nullcontext()
         )
         with cm as coalescing_event:
             for weight_buffer in weight_buffers:
-                weight_buffer.unshard(
-                    unshard_dim=unshard_dim,
-                    bind_params=False,
-                    stream=stream,
-                )
+                weight_buffer.unshard(unshard_dim=unshard_dim, bind_params=False, stream=stream)
         if async_op and coalescing_event is not None:
             coalescing_event.wait()
 
@@ -549,7 +542,9 @@ class FSDPModule:
             # meta modules may intentionally keep lazy state initialized in forward.
             if any(p.is_meta for p in m.parameters(recurse=False)):
                 m._apply(
-                    lambda t: torch.empty_like(t, device=materialization_device) if t.is_meta else t,
+                    lambda t: (
+                        torch.empty_like(t, device=materialization_device) if t.is_meta else t
+                    ),
                     recurse=False,
                 )
                 init_context = (
@@ -569,10 +564,7 @@ class FSDPModule:
             # separately, so it is moved only after its own materialization and reset.
             # Buffer-only modules may intentionally keep lazy meta state for forward.
             # Move materialized tensors, but do not initialize those buffers here.
-            m._apply(
-                lambda t: t if t.is_meta else t.to(materialization_device),
-                recurse=False,
-            )
+            m._apply(lambda t: t if t.is_meta else t.to(materialization_device), recurse=False)
 
         if mesh is not None and mesh.size() > 1:
             for param in self.parameters():
@@ -695,12 +687,7 @@ class FSDPModule:
         if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
             root_context.enable_cuda_graph = True
 
-    def unshard(
-        self,
-        async_op: bool = False,
-        bwd_pass: bool = False,
-        prefetch: bool = True,
-    ):
+    def unshard(self, async_op: bool = False, bwd_pass: bool = False, prefetch: bool = True):
         """
         Unshard parameters by all-gathering from the sharded buffer.
 
@@ -956,10 +943,7 @@ class FSDPModule:
             if async_op:
                 # ---- Overlapped path ----
                 # Switch to rs_stream for the reduce-scatter kernel
-                param_group.reduce_grad(
-                    is_last_backward=ctx.is_last_backward,
-                    stream=stream,
-                )
+                param_group.reduce_grad(is_last_backward=ctx.is_last_backward, stream=stream)
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
@@ -1211,9 +1195,9 @@ class FSDPModule:
                         param_data = wbuf.get_item(
                             param_group.param_idx[param], shard_layout=(0, 0)
                         )
-                        assert not torch.isnan(param_data).any(), (
-                            "NaN detected in model weight buffer"
-                        )
+                        assert not torch.isnan(
+                            param_data
+                        ).any(), "NaN detected in model weight buffer"
 
     def get_root_module(self):
         """Return the root FSDP module associated with this module."""

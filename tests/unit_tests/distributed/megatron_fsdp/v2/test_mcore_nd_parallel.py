@@ -56,9 +56,7 @@ class TestMegatronFSDPE2E:
             required_pgs = ["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
             if outer_dp_size > 1:
                 required_pgs.extend(["intra_dp_cp", "intra_expt_dp", "inter_dist_opt"])
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=required_pgs
-            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
             ddp_config = DistributedDataParallelConfig(
                 num_distributed_optimizer_instances=outer_dp_size
             )
@@ -89,9 +87,7 @@ class TestMegatronFSDPE2E:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(
                 required_pgs=["tp", "expt_tp", "ep", "dp_cp", "expt_dp"]
             )
-            mesh = _init_dp_mesh(
-                pg_collection, DistributedDataParallelConfig(), edp=True
-            )
+            mesh = _init_dp_mesh(pg_collection, DistributedDataParallelConfig(), edp=True)
             assert mesh.size(0) == mesh.size(1) == 1
 
             device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -144,8 +140,7 @@ class TestMegatronFSDPE2E:
                 optimizer_grad = param_group.dist_params[item_id].grad
                 assert optimizer_grad is not None
                 torch.testing.assert_close(
-                    optimizer_grad._local_tensor,
-                    torch.full_like(optimizer_grad._local_tensor, 2.0),
+                    optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
                 )
                 assert param.grad_added_to_main_grad is False
                 assert not param_group._full_grad_buffer_has_accumulated_grad
@@ -167,8 +162,7 @@ class TestMegatronFSDPE2E:
                 optimizer_grad = param_group.dist_params[item_id].grad
                 assert optimizer_grad is not None
                 torch.testing.assert_close(
-                    optimizer_grad._local_tensor,
-                    torch.full_like(optimizer_grad._local_tensor, 2.0),
+                    optimizer_grad._local_tensor, torch.full_like(optimizer_grad._local_tensor, 2.0)
                 )
             finally:
                 drain_pending()
@@ -238,7 +232,9 @@ class TestMegatronFSDPE2E:
                             torch.empty_like(buffer.data)
                             for _ in range(torch.distributed.get_world_size(param_group.dp_group))
                         ]
-                        torch.distributed.all_gather(gathered, buffer.data, group=param_group.dp_group)
+                        torch.distributed.all_gather(
+                            gathered, buffer.data, group=param_group.dp_group
+                        )
                         for group_rank, replica in enumerate(gathered):
                             assert torch.equal(buffer.data, replica), (
                                 f"Replicated {buffer_name} mismatch for "
@@ -297,9 +293,7 @@ class TestMegatronFSDPE2E:
         ETP = kwargs.pop("ETP", 1)
         OUTER_DP = kwargs.pop("OUTER_DP", 1)
         capture_param_snapshots = kwargs.pop("capture_param_snapshots", False)
-        verify_replicated_weight_buffers = kwargs.pop(
-            "verify_replicated_weight_buffers", False
-        )
+        verify_replicated_weight_buffers = kwargs.pop("verify_replicated_weight_buffers", False)
         return_dict = kwargs.pop("return_dict", capture_param_snapshots)
 
         # Initialize model parallel groups
@@ -380,9 +374,7 @@ class TestMegatronFSDPE2E:
                 )
                 torch.cuda.reset_peak_memory_stats()
             if capture_param_snapshots:
-                param_snapshots.append(
-                    TestMegatronFSDPE2E._capture_named_params(model_chunks)
-                )
+                param_snapshots.append(TestMegatronFSDPE2E._capture_named_params(model_chunks))
 
         Utils.destroy_model_parallel()
 
@@ -659,9 +651,7 @@ class TestMegatronFSDPE2E:
             return
 
         assert len(actual["outputs"]) == len(reference["outputs"])
-        for step, (output, ref_output) in enumerate(
-            zip(actual["outputs"], reference["outputs"])
-        ):
+        for step, (output, ref_output) in enumerate(zip(actual["outputs"], reference["outputs"])):
             loss = output["lm loss"]
             ref_loss = ref_output["lm loss"]
             assert_close(
@@ -684,9 +674,9 @@ class TestMegatronFSDPE2E:
             zip(actual["param_snapshots"], reference["param_snapshots"])
         ):
             missing = sorted(set(ref_params) ^ set(params))
-            assert not missing, (
-                f"Parameter key mismatch at step {step}, strategy={strategy}: {missing[:20]}"
-            )
+            assert (
+                not missing
+            ), f"Parameter key mismatch at step {step}, strategy={strategy}: {missing[:20]}"
             for name in sorted(ref_params):
                 assert_close(
                     params[name],
@@ -725,9 +715,7 @@ class TestMegatronFSDPE2E:
             for strategy in ("optim", "optim_grads")
         ],
     )
-    def test_zero_strategy_non_equivalent_precision_paths_run(
-        self, strategy, precision_configs
-    ):
+    def test_zero_strategy_non_equivalent_precision_paths_run(self, strategy, precision_configs):
         """Exercise valid ZeRO paths that intentionally lack a strict reference.
 
         MXFP8 ZeRO-1/2 refreshes replicated quantized compute buffers after
