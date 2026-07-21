@@ -499,6 +499,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
+        input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -535,6 +536,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 which to extract intermediate hidden states. If
                 non-empty, the forward pass will collect hidden_states
                 after each specified layer.
+            input_ids (Tensor, optional): Input token IDs with shape [batch, sequence].
+                Required by hash-routed MoE layers.
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
@@ -635,6 +638,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
                     layer_offset=layer_offset,
+                    input_ids=input_ids,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
@@ -660,6 +664,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    hash_routing_kwargs = {"input_ids": input_ids} if input_ids is not None else {}
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -675,6 +680,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            **hash_routing_kwargs,
                         )
 
                     if (

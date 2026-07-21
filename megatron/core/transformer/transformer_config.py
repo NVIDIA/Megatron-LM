@@ -24,6 +24,7 @@ from megatron.core.transformer.enums import (
     CudaGraphModule,
     CudaGraphScope,
     InferenceCudaGraphScope,
+    LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -809,6 +810,15 @@ class TransformerConfig(ModelParallelConfig):
     If positive, generates new random bias each forward pass.
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
+
+    moe_n_hash_layers: int = 0
+    """Number of leading transformer layers that use hash-based MoE routing.
+    Layers with ``layer_number <= moe_n_hash_layers`` select experts from a
+    token-to-expert lookup table instead of learned top-k routing."""
+
+    actual_vocab_size: Optional[int] = None
+    """Vocabulary size of the token-to-expert lookup table.
+    Required when ``moe_n_hash_layers > 0``."""
 
     use_grouped_gemm_for_dense_mlp: bool = False
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
@@ -2262,6 +2272,37 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
+            )
+
+        if self.moe_n_hash_layers > 0:
+            assert (
+                self.actual_vocab_size is not None and self.actual_vocab_size > 0
+            ), "actual_vocab_size must be positive when moe_n_hash_layers > 0."
+            assert (
+                self.num_moe_experts is not None
+            ), "num_moe_experts must be set when moe_n_hash_layers > 0."
+            if self.pipeline_model_parallel_size > 1:
+                assert self.pipeline_model_parallel_layout is not None, (
+                    "pipeline_model_parallel_layout must be set when using hash MoE "
+                    "layers with pipeline parallelism (PP > 1)."
+                )
+                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
+                    "All hash MoE layers must currently share the virtual pipeline stage "
+                    "that owns the embedding. The embedding stage has "
+                    f"{n_decoders_with_embedding} decoder layers, but "
+                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                )
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm does not support hash MoE layers yet."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Hash MoE initialized with a placeholder round-robin token-to-expert table. "
+                "Load a trained table from a checkpoint or provide a workload-aware "
+                "initialization before training.",
             )
 
         if self.num_moe_experts and self.fp8:
