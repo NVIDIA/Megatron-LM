@@ -611,6 +611,80 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
+    def test_roll_tensor_with_packed_sequences_contiguous_cp(self):
+        """Contiguous THD CP rolls across rank boundaries without crossing sequence boundaries."""
+        cp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+
+        # Full padded layout:
+        #   seq1: [1,2,3,4,5,6,7,0]
+        #   seq2: [11,12,13,14,15,16,17,18,19,20,21,0]
+        # Contiguous CP rank 0 owns global rows [0, 10), rank 1 owns [10, 20).
+        if cp_rank == 0:
+            tensor = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 0, 11, 12]], dtype=torch.float32).cuda()
+            expected = torch.tensor([[2, 3, 4, 5, 6, 7, 0, 0, 12, 13]], dtype=torch.float32).cuda()
+            padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, True, False, False]]
+            ).cuda()
+            expected_padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, True, True, False, False]]
+            ).cuda()
+        else:
+            tensor = torch.tensor(
+                [[13, 14, 15, 16, 17, 18, 19, 20, 21, 0]], dtype=torch.float32
+            ).cuda()
+            expected = torch.tensor(
+                [[14, 15, 16, 17, 18, 19, 20, 21, 0, 0]], dtype=torch.float32
+            ).cuda()
+            padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, False, False, True]]
+            ).cuda()
+            expected_padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, False, True, True]]
+            ).cuda()
+
+        cu_seqlens = torch.tensor([0, 7, 18], dtype=torch.int32).cuda()
+        cu_seqlens_padded = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=11,
+            max_seqlen_kv=11,
+            qkv_format='thd',
+        )
+        # The partition-mode field is introduced by the dynamic-CP stack. Keep this
+        # focused fix independently reviewable on top of #4495 by exercising the
+        # same duck-typed contract used in production.
+        packed_seq_params.cp_partition_mode = 'contiguous'
+
+        rolled, sum_val = roll_tensor(
+            tensor, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        rolled_padding_mask, _ = roll_tensor(
+            padding_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            fill_value=True,
+        )
+
+        assert torch.equal(rolled, expected), (
+            f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n"
+            f"{rolled - expected}"
+        )
+        assert torch.equal(rolled_padding_mask, expected_padding_mask), (
+            f"CP Rank {cp_rank}: Expected padding mask\n{expected_padding_mask}\nbut got\n"
+            f"{rolled_padding_mask}"
+        )
+        assert sum_val.numel() == 1, "Sum should be a scalar"
+
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences_odd_seqlen(self, cp):
         """Test roll_tensor with ODD packed seqlens.

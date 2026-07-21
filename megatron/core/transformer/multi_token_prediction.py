@@ -130,7 +130,7 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None, fill_value=0):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -153,17 +153,21 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
                                falls back to standard rolling behavior.
         packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
                                             If provided, respects sequence boundaries.
+        fill_value: Value to fill at sequence boundaries where no source token exists.
+                    Defaults to 0; padding masks should pass ``True``.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
     # Handle packed sequences cases
     if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+        return _roll_tensor_packed_seq(
+            tensor, shifts, dims, packed_seq_params, cp_group, fill_value=fill_value
+        )
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        rolled_tensor.select(dims, shifts).fill_(0)
+        rolled_tensor.select(dims, shifts).fill_(fill_value)
         return rolled_tensor, rolled_tensor.sum()
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
@@ -200,8 +204,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
         ops.append(req_recv_second_part)
     else:
-        # Inserted elements are set to be 0.0.
-        tensor_recv_list[1] = 0
+        tensor_recv_list[1] = fill_value
     if local_rank != len(global_ranks) - 1:
         req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
         ops.append(req_recv_first_part)
@@ -228,7 +231,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     return rolled_tensor, rolled_tensor.sum()
 
 
-def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None):
+def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None, fill_value=0):
     """Roll tensor with packed sequence support.
     This function handles rolling for packed sequences by respecting sequence boundaries
     """
@@ -251,20 +254,37 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     )
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
 
-    rolled_tensor = tensor.clone()
-
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
+        rolled_tensor = tensor.clone()
         # CP disabled: roll each packed sequence independently within its boundaries
         for i in range(len(cu_seqlens) - 1):
             start_idx = cu_seqlens[i]
             end_idx = cu_seqlens[i + 1]
             seq_slice = tensor[..., start_idx:end_idx]
             rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
-            # Zero out the last position(s) that would cross sequence boundaries
-            rolled_seq[..., shifts:] = 0
+            rolled_seq[..., shifts:] = fill_value
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
         return rolled_tensor, rolled_tensor.sum()
+
+    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+    if cp_partition_mode == 'zigzag':
+        rolled_tensor = _roll_tensor_packed_seq_zigzag_cp(
+            tensor, shifts, dims, cu_seqlens, cp_group, fill_value=fill_value
+        )
+        return rolled_tensor, rolled_tensor.sum()
+    if cp_partition_mode == 'contiguous':
+        rolled_tensor = _roll_tensor_packed_seq_contiguous_cp(
+            tensor, dims, cu_seqlens, cp_group, fill_value=fill_value
+        )
+        return rolled_tensor, rolled_tensor.sum()
+    raise ValueError(f"Unsupported packed sequence CP partition mode: {cp_partition_mode}")
+
+
+def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0):
+    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries."""
+    cp_size = cp_group.size()
+    rolled_tensor = tensor.clone()
 
     # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
     local_rank = torch.distributed.get_rank(group=cp_group)
@@ -314,7 +334,7 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
             ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
         else:
-            tensor_recv_list[1].zero_()
+            tensor_recv_list[1].fill_(fill_value)
 
         if local_rank != cp_size - 1:
             ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
@@ -338,7 +358,55 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # update the rolled tensor
         rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
-    return rolled_tensor, rolled_tensor.sum()
+    return rolled_tensor
+
+
+def _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group, fill_value=0):
+    """Roll a contiguous-CP THD shard without crossing packed sequence boundaries."""
+    local_seq_len = tensor.size(dims)
+    rolled_tensor = torch.roll(tensor, shifts=-1, dims=dims)
+    if local_seq_len == 0:
+        return rolled_tensor
+
+    cp_size = cp_group.size()
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    if cu.numel() > 1:
+        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+        cu = cu[nonduplicate_boundaries]
+    if cu.numel() <= 1:
+        rolled_tensor.fill_(fill_value)
+        return rolled_tensor
+
+    global_start = local_rank * local_seq_len
+    global_positions = global_start + torch.arange(local_seq_len, device=tensor.device)
+    seq_idx = torch.bucketize(global_positions, cu[1:], right=True).clamp(max=cu.numel() - 2)
+    seq_ends = cu[1:][seq_idx]
+    valid_next = (global_positions < cu[-1]) & (global_positions + 1 < seq_ends)
+
+    invalid_next = ~valid_next
+    rolled_tensor[..., invalid_next] = fill_value
+
+    recv_next_first = torch.empty_like(tensor.select(dims, 0))
+    ops = []
+    if local_rank < cp_size - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(torch.distributed.irecv(tensor=recv_next_first, src=next_rank))
+    if local_rank > 0:
+        prev_rank = global_ranks[local_rank - 1]
+        send_first = tensor.select(dims, 0).contiguous()
+        ops.append(torch.distributed.isend(tensor=send_first, dst=prev_rank))
+    for op in ops:
+        op.wait()
+
+    if local_rank < cp_size - 1:
+        last = rolled_tensor.select(dims, -1)
+        last.copy_(torch.where(valid_next[-1], recv_next_first, last))
+
+    return rolled_tensor
 
 
 class MTPLossLoggingHelper:
