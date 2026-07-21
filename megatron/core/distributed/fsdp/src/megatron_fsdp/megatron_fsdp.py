@@ -103,25 +103,6 @@ def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
             param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
 
 
-_MEGATRON_PARAMETER_STATE_ATTRS = (
-    "requires_grad",
-    "sequence_parallel",
-    "shared",
-    "shared_embedding",
-    "tensor_model_parallel",
-    "partition_dim",
-    "partition_stride",
-    "is_embedding_or_output_parameter",
-    "is_embedding_parameter",
-    "zero_out_wgrad",
-    "skip_backward_post_hook",
-    "_tensor_parallel_mode",
-    "grad_added_to_main_grad",
-    "__fsdp_param__",
-    "overwrite_main_grad",
-)
-
-
 def _dtensor_placement_signature(param):
     placements = getattr(param, "placements", None)
     if placements is None and hasattr(param, "_spec"):
@@ -134,6 +115,21 @@ def _dtensor_placement_signature(param):
     if placements is None:
         return None
     return tuple(repr(placement) for placement in placements)
+
+
+def _dtensor_mesh_signature(param):
+    mesh = getattr(param, "device_mesh", None)
+    if mesh is None and hasattr(param, "_spec"):
+        mesh = getattr(param._spec, "mesh", None)
+    if mesh is None:
+        return None
+    mesh_tensor = mesh.mesh
+    return (
+        mesh.device_type,
+        tuple(mesh_tensor.shape),
+        tuple(mesh_tensor.flatten().tolist()),
+        tuple(mesh.mesh_dim_names or ()),
+    )
 
 
 class MegatronFSDP(torch.nn.Module):
@@ -316,6 +312,7 @@ class MegatronFSDP(torch.nn.Module):
         self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
         self._fsdp_optimizer_initialized = False
+        self._fsdp_first_forward_completed = False
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
         # If not provided, Megatron-FSDP will default to a simple data parallel index
@@ -1408,19 +1405,6 @@ class MegatronFSDP(torch.nn.Module):
     def _current_parameters_by_fqn(self) -> Dict[str, torch.nn.Parameter]:
         return dict(self.module.named_parameters(remove_duplicate=False))
 
-    def _module_contains_external_parameters(
-        self, current_by_fqn: Dict[str, torch.nn.Parameter]
-    ) -> bool:
-        fsdp_params = dict(self.param_and_grad_buffer.optimizer_named_parameters)
-        for name, canonical_name in self._parameter_fqn_to_canonical.items():
-            current_param = current_by_fqn.get(name)
-            expected_param = fsdp_params.get(canonical_name)
-            if current_param is None or expected_param is None:
-                continue
-            if current_param is not expected_param:
-                return True
-        return False
-
     def _logical_raw_parameters_by_fqn(
         self, current_by_fqn: Dict[str, torch.nn.Parameter]
     ) -> Dict[str, torch.nn.Parameter]:
@@ -1442,27 +1426,22 @@ class MegatronFSDP(torch.nn.Module):
 
     def _parameter_spec(self, param: torch.nn.Parameter) -> Dict[str, Any]:
         device = getattr(param, "device", None)
+        local_param = to_local_if_dtensor(param)
         return {
             "shape": tuple(param.shape),
             "dtype": param.dtype,
             "device": (device.type, device.index) if device is not None else None,
+            "tensor_type": type(param),
+            "layout": param.layout,
+            "stride": tuple(local_param.stride()),
+            "mesh": _dtensor_mesh_signature(param),
             "placements": _dtensor_placement_signature(param),
         }
-
-    def _capture_parameter_state_attrs(self, param: torch.nn.Parameter) -> Dict[str, Any]:
-        attrs: Dict[str, Any] = {}
-        for attr_name in _MEGATRON_PARAMETER_STATE_ATTRS:
-            if attr_name == "requires_grad":
-                attrs[attr_name] = param.requires_grad
-            elif hasattr(param, attr_name):
-                attrs[attr_name] = getattr(param, attr_name)
-        return attrs
 
     def _initialize_parameter_registry(self):
         """Record Megatron-FSDP-owned parameter state by fully-qualified name."""
         all_named_params = list(self.module.named_parameters(remove_duplicate=False))
         names_by_param_id: Dict[int, List[str]] = {}
-        params_by_name = dict(all_named_params)
         for name, param in all_named_params:
             names_by_param_id.setdefault(id(param), []).append(name)
 
@@ -1482,168 +1461,56 @@ class MegatronFSDP(torch.nn.Module):
         self._parameter_specs = {
             name: self._parameter_spec(param) for name, param in self.raw_param.items()
         }
-        self._parameter_state_attrs = {
-            name: self._capture_parameter_state_attrs(params_by_name[name])
-            for name in self._parameter_canonical_fqns
-        }
 
-    def _validate_registered_parameter(
-        self, name: str, param: torch.nn.Parameter, strict: bool
-    ) -> None:
+    def _validate_registered_parameter(self, name: str, param: torch.nn.Parameter) -> None:
         spec = self._parameter_specs[name]
         current_spec = self._parameter_spec(param)
-        if current_spec["shape"] != spec["shape"]:
-            raise RuntimeError(
-                f"[Megatron-FSDP] reregister_parameters(strict={strict}) shape mismatch "
-                f"for {name}: expected {spec['shape']}, got {current_spec['shape']}."
-            )
-        if strict:
-            for spec_key, label in [
-                ("dtype", "dtype"),
-                ("device", "device"),
-                ("placements", "DTensor placement"),
-            ]:
-                if current_spec[spec_key] != spec[spec_key]:
-                    raise RuntimeError(
-                        f"[Megatron-FSDP] reregister_parameters(strict=True) {label} "
-                        f"mismatch for {name}: expected {spec[spec_key]}, "
-                        f"got {current_spec[spec_key]}."
-                    )
+        for spec_key, label in [
+            ("shape", "shape"),
+            ("dtype", "dtype"),
+            ("device", "device"),
+            ("layout", "layout"),
+            ("stride", "stride"),
+            ("mesh", "DTensor mesh"),
+            ("placements", "DTensor placement"),
+            ("tensor_type", "tensor subclass"),
+        ]:
+            if current_spec[spec_key] != spec[spec_key]:
+                expected = spec[spec_key]
+                actual = current_spec[spec_key]
+                if spec_key == "tensor_type":
+                    expected = expected.__name__
+                    actual = actual.__name__
+                raise RuntimeError(
+                    f"[Megatron-FSDP] reregister_parameters() {label} mismatch "
+                    f"for {name}: expected {expected}, got {actual}."
+                )
 
-    def _apply_registered_parameter_state(self, name: str, param: torch.nn.Parameter) -> None:
-        attrs = self._parameter_state_attrs.get(name, {})
-        if "requires_grad" in attrs:
-            param.requires_grad_(attrs["requires_grad"])
-        for attr_name, attr_value in attrs.items():
-            if attr_name == "requires_grad":
-                continue
-            setattr(param, attr_name, attr_value)
+    def _parameter_alias_topology(
+        self, parameters_by_fqn: Dict[str, torch.nn.Parameter]
+    ) -> set[frozenset[str]]:
+        names_by_parameter: Dict[int, List[str]] = {}
+        for name, param in parameters_by_fqn.items():
+            names_by_parameter.setdefault(id(param), []).append(name)
+        return {frozenset(names) for names in names_by_parameter.values()}
 
-        param._megatron_fsdp_model = self
-        param.orig_param = param
-        param.megatron_fsdp_dist_index = self.dist_index
-        param.__fsdp_param__ = True
-        if not hasattr(param, "grad_added_to_main_grad"):
-            param.grad_added_to_main_grad = False
-        param.overwrite_main_grad = True
-        if any(group[0] == name and len(group) > 1 for group in self._parameter_alias_groups):
-            param._is_shared = True
-
-    def _bind_main_grad_getter(
-        self, param: torch.nn.Parameter, group: Any, item_id: int
+    def _restore_module_parameter_snapshot(
+        self, parameters_by_fqn: Dict[str, torch.nn.Parameter]
     ) -> None:
-        gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
-        if gbuf is None:
-            return
-        param._gbuf = gbuf
-        param._item_id = item_id
+        for name, param in parameters_by_fqn.items():
+            _replace_module_parameter(self.module, name, param)
 
-        def main_grad_getter(p):
-            gbuf = p._gbuf
-            item_id = p._item_id
-            p._megatron_fsdp_model.grad_reduce_pipeline._enforce_double_buffer_limit(
-                [gbuf.bucket_id]
-            )
-            bucket = gbuf.fetch_bucket(
-                dtype=(self.mp_policy.grad_comm_dtype if p._gbuf.is_data_distributed else None)
-            )
-            return gbuf.get_item_from_bucket(bucket, item_id).view(to_local_if_dtensor(p).shape)
+    def _install_owned_parameter_presentation(self, distributed: bool) -> None:
+        if distributed:
+            owned_parameters = dict(self.param_and_grad_buffer.optimizer_named_parameters)
+        else:
+            owned_parameters = self.raw_param
+        for name in self._parameter_canonical_fqns:
+            _replace_module_parameter(self.module, name, owned_parameters[name])
+        self._reestablish_shared_weights(self.raw_param, owned_parameters)
+        self.is_param_fsdp_distributed = distributed
 
-        param.get_main_grad = main_grad_getter.__get__(param)
-
-    def _refresh_optimizer_named_parameter(
-        self, name: str, raw_param: torch.nn.Parameter
-    ) -> None:
-        def set_param_attribute_closure(param, orig_param):
-            def set_param_attribute():
-                for attr_name in [
-                    "requires_grad",
-                    "sequence_parallel",
-                    "shared",
-                    "tensor_model_parallel",
-                    "partition_dim",
-                    "partition_stride",
-                    "is_embedding_or_output_parameter",
-                    "is_embedding_parameter",
-                    "_tensor_parallel_mode",
-                    "_megatron_fsdp_model",
-                ]:
-                    if hasattr(orig_param, attr_name):
-                        setattr(param, attr_name, getattr(orig_param, attr_name))
-
-            return set_param_attribute
-
-        for _, (param_name, dist_param) in enumerate(
-            self.param_and_grad_buffer.optimizer_named_parameters
-        ):
-            if param_name != name:
-                continue
-            dist_param.orig_param = raw_param
-            dist_param.megatron_fsdp_dist_index = self.dist_index
-            dist_param.reset_attribute = set_param_attribute_closure(dist_param, raw_param)
-            dist_param.reset_attribute()
-            break
-
-    def _replace_registered_parameter(
-        self, name: str, new_param: torch.nn.Parameter
-    ) -> None:
-        old_param = self.raw_param.get(name)
-        self._apply_registered_parameter_state(name, new_param)
-
-        if old_param is new_param:
-            self._refresh_optimizer_named_parameter(name, new_param)
-            return
-
-        self.raw_param[name] = new_param
-        if old_param in self.param_to_name:
-            del self.param_to_name[old_param]
-        self.param_to_name[new_param] = name
-
-        pg_buffer = self.param_and_grad_buffer
-        if old_param in pg_buffer.param_to_name:
-            del pg_buffer.param_to_name[old_param]
-        pg_buffer.param_to_name[new_param] = name
-
-        if old_param in pg_buffer.param_to_param_group:
-            pg_buffer.param_to_param_group[new_param] = pg_buffer.param_to_param_group[old_param]
-            del pg_buffer.param_to_param_group[old_param]
-
-        if hasattr(pg_buffer, "param_to_direct_module") and old_param in pg_buffer.param_to_direct_module:
-            pg_buffer.param_to_direct_module[new_param] = pg_buffer.param_to_direct_module[old_param]
-            del pg_buffer.param_to_direct_module[old_param]
-
-        for item_id, param in enumerate(pg_buffer.params):
-            if param is old_param:
-                pg_buffer.params[item_id] = new_param
-
-        for group in pg_buffer.parameter_groups:
-            for item_id, param in enumerate(group.params):
-                if param is not old_param:
-                    continue
-                group.params[item_id] = new_param
-                for buffer in [
-                    group.model_weight_buffer,
-                    group.transpose_weight_buffer,
-                    group.main_weight_buffer,
-                    group.main_grad_buffer,
-                    group.hfsdp_helper_wbuf,
-                    group.hfsdp_helper_wtbuf,
-                    group.hfsdp_helper_gbuf,
-                ]:
-                    if buffer is not None and old_param in buffer.param_idx:
-                        buffer.param_idx[new_param] = buffer.param_idx[old_param]
-                        del buffer.param_idx[old_param]
-                self._bind_main_grad_getter(new_param, group, item_id)
-                break
-
-        self._refresh_optimizer_named_parameter(name, new_param)
-        pg_buffer.dist_main_grad.pop(name, None)
-        if self.data_parallel_sharding_strategy == "optim_grads_params":
-            override_sharded_param_methods_with_safety_checks([new_param], self.all_gather_pipeline)
-
-    def _register_megatron_grad_acc_hook(
-        self, name: str, param: torch.nn.Parameter
-    ) -> None:
+    def _register_megatron_grad_acc_hook(self, name: str, param: torch.nn.Parameter) -> None:
         if not hasattr(self, "grad_acc_hooks"):
             return
         hook_key = f"grad_acc and reduce for {name}"
@@ -1656,100 +1523,77 @@ class MegatronFSDP(torch.nn.Module):
             self._make_grad_acc_hook(param)
         )
 
-    def reregister_parameters(self, strict: bool = True):
-        """Reapply Megatron-FSDP state after external Parameter replacement.
+    def reregister_parameters(self):
+        """Reconcile pre-optimizer replacement values with Megatron-FSDP storage.
 
-        This is intended for rebuild events such as ``module.to(...)`` or
-        ``load_state_dict(assign=True)`` followed by restoring tied weights. The
-        method is idempotent and only manages Megatron-FSDP-owned state. It does
-        not copy parameter or gradient tensor contents and it does not remove
-        user-registered hooks.
+        The supported flow is fully_shard_model() followed by same-layout
+        load_state_dict(assign=True), restoration of the original alias topology,
+        and this method before the first forward and before fully_shard_optimizer().
+        Replacement objects are temporary value sources: Megatron-FSDP keeps its
+        original raw and distributed Parameter identities, hooks, and ownership state.
 
-        If a Megatron-FSDP optimizer has already been created, replacing raw
-        Parameters is rejected in this first implementation because optimizer
-        parameter groups and optimizer state are already bound to the previous
-        distributed Parameter objects.
+        Shape, dtype, device, tensor subclass, stride, DTensor mesh and placements,
+        the exact FQN set, and the complete alias topology must match the wrapped
+        model. Optimizer-state migration, dtype/device conversion, FP8/transpose
+        storage, delayed-wgrad parameters, and HSDP helper storage are not supported.
         """
+        if self._fsdp_optimizer_initialized:
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() must run before "
+                "fully_shard_optimizer() successfully initializes the optimizer."
+            )
+        if self._fsdp_first_forward_completed:
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() must run before the first forward."
+            )
+
         was_distributed = self.is_param_fsdp_distributed
         current_by_fqn = self._current_parameters_by_fqn()
-        has_external_parameters = (
-            was_distributed and self._module_contains_external_parameters(current_by_fqn)
-        )
-        if has_external_parameters and self._fsdp_optimizer_initialized:
+        expected_fqns = set(self._parameter_fqn_to_canonical)
+        current_fqns = set(current_by_fqn)
+        missing_fqns = sorted(expected_fqns - current_fqns)
+        extra_fqns = sorted(current_fqns - expected_fqns)
+        if missing_fqns or extra_fqns:
             raise RuntimeError(
-                "[Megatron-FSDP] reregister_parameters() cannot replace Parameters after "
-                "fully_shard_optimizer() has initialized optimizer parameter groups. "
-                "Rebuild Parameters before creating the optimizer, or recreate the optimizer."
-            )
-        if has_external_parameters:
-            self.is_param_fsdp_distributed = False
-            current_by_fqn = self._logical_raw_parameters_by_fqn(current_by_fqn)
-        elif was_distributed:
-            self._replace_param_with_raw_if_needed()
-            current_by_fqn = self._current_parameters_by_fqn()
-        missing_fqns = [
-            name for name in self._parameter_fqn_to_canonical if name not in current_by_fqn
-        ]
-        if missing_fqns and strict:
-            raise RuntimeError(
-                "[Megatron-FSDP] reregister_parameters(strict=True) FQN missing: "
-                f"{missing_fqns}."
+                "[Megatron-FSDP] reregister_parameters() FQN set mismatch: "
+                f"missing={missing_fqns}, extra={extra_fqns}."
             )
 
-        for alias_group in self._parameter_alias_groups:
-            present_names = [name for name in alias_group if name in current_by_fqn]
-            if not present_names:
-                continue
-            canonical_name = alias_group[0]
-            if canonical_name not in current_by_fqn:
-                if strict:
-                    raise RuntimeError(
-                        "[Megatron-FSDP] reregister_parameters(strict=True) FQN missing: "
-                        f"{canonical_name}."
-                    )
-                continue
-            canonical_param = current_by_fqn[canonical_name]
-            changed_aliases = [
-                name for name in present_names if current_by_fqn[name] is not canonical_param
-            ]
-            if changed_aliases:
-                if strict:
-                    raise RuntimeError(
-                        "[Megatron-FSDP] reregister_parameters(strict=True) alias topology "
-                        f"changed for group {alias_group}."
-                    )
-                for alias_name in alias_group[1:]:
-                    if alias_name in current_by_fqn:
-                        _replace_module_parameter(self.module, alias_name, canonical_param)
-                current_by_fqn = self._current_parameters_by_fqn()
+        expected_alias_topology = {
+            frozenset(alias_group) for alias_group in self._parameter_alias_groups
+        }
+        current_alias_topology = self._parameter_alias_topology(current_by_fqn)
+        if current_alias_topology != expected_alias_topology:
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() alias topology mismatch: "
+                f"expected={expected_alias_topology}, got={current_alias_topology}."
+            )
+
+        logical_by_fqn = (
+            self._logical_raw_parameters_by_fqn(current_by_fqn)
+            if was_distributed
+            else current_by_fqn
+        )
+        planned_parameters = {name: logical_by_fqn[name] for name in self._parameter_canonical_fqns}
+        for name, param in planned_parameters.items():
+            self._validate_registered_parameter(name, param)
 
         replacements = {
-            name: current_by_fqn[name]
-            for name in self._parameter_canonical_fqns
-            if name in current_by_fqn
+            name: param
+            for name, param in planned_parameters.items()
+            if param is not self.raw_param[name]
         }
-        changed_parameters = any(self.raw_param.get(name) is not param for name, param in replacements.items())
-        if changed_parameters and self._fsdp_optimizer_initialized:
-            raise RuntimeError(
-                "[Megatron-FSDP] reregister_parameters() cannot replace Parameters after "
-                "fully_shard_optimizer() has initialized optimizer parameter groups. "
-                "Rebuild Parameters before creating the optimizer, or recreate the optimizer."
-            )
+        if not replacements:
+            return self
 
-        for name, param in replacements.items():
-            self._validate_registered_parameter(name, param, strict=strict)
-        for name, param in replacements.items():
-            self._replace_registered_parameter(name, param)
-            self._register_megatron_grad_acc_hook(name, param)
-
-        self._reestablish_shared_weights(self.raw_param, self.raw_param)
-        if was_distributed:
-            self._replace_param_with_distributed_if_needed()
+        try:
+            self.param_and_grad_buffer._reconcile_parameter_values(replacements)
+            self._install_owned_parameter_presentation(distributed=was_distributed)
+        except Exception:
+            self._restore_module_parameter_snapshot(current_by_fqn)
+            self.is_param_fsdp_distributed = was_distributed
+            raise
         return self
-
-    def reapply_parameter_state(self, strict: bool = True):
-        """Alias for :meth:`reregister_parameters`."""
-        return self.reregister_parameters(strict=strict)
 
     def _replace_param_with_distributed_if_needed(self):
         if self.is_param_fsdp_distributed:
@@ -1867,6 +1711,7 @@ class MegatronFSDP(torch.nn.Module):
         with torch.autograd.profiler.record_function("CustomFSDP.forward"):
             # Call the forward pass of the wrapped module.
             output = self.module(*inputs, **kwargs)
+            self._fsdp_first_forward_completed = True
             return output
 
 

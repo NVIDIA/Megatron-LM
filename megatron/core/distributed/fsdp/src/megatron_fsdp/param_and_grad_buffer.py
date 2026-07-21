@@ -3340,6 +3340,119 @@ class ParamAndGradBuffer:
 
         return named_parameters
 
+    @torch.no_grad()
+    def _reconcile_parameter_values(self, replacements: Dict[str, torch.nn.Parameter]) -> None:
+        """Copy validated replacement values into Megatron-FSDP-owned storage.
+
+        Callers must validate the module FQN, alias, and tensor-layout contract
+        before invoking this helper. This method performs a complete storage
+        support check before copying any values.
+        """
+        parameters_by_name = {self.param_to_name[param]: param for param in self.params}
+        parameter_locations = {
+            param: (group, item_id)
+            for group in self.parameter_groups
+            for item_id, param in enumerate(group.params)
+        }
+        copy_plan = []
+
+        for name, replacement in replacements.items():
+            if name not in parameters_by_name:
+                raise RuntimeError(
+                    f"[Megatron-FSDP] Cannot reconcile unknown Parameter FQN {name}."
+                )
+            original = parameters_by_name[name]
+            group, item_id = parameter_locations[original]
+            replacement_local = to_local_if_dtensor(replacement).detach()
+            original_local = to_local_if_dtensor(original)
+
+            if (
+                is_float8tensor(original_local)
+                or is_blockwise_float8tensor(original_local)
+                or is_float8tensor(replacement_local)
+                or is_blockwise_float8tensor(replacement_local)
+                or group.transpose_weight_buffer is not None
+            ):
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() does not support "
+                    f"FP8 or transpose weight storage ({name})."
+                )
+            if self.dist_index.use_hybrid_fsdp or any(
+                buffer is not None
+                for buffer in (
+                    group.hfsdp_helper_wbuf,
+                    group.hfsdp_helper_wtbuf,
+                    group.hfsdp_helper_gbuf,
+                )
+            ):
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() does not support "
+                    f"HSDP helper storage ({name})."
+                )
+            if getattr(original, "skip_backward_post_hook", False):
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() does not support "
+                    f"delayed-wgrad Parameters ({name})."
+                )
+            if replacement_local.numel() != original_local.numel():
+                raise RuntimeError(
+                    "[Megatron-FSDP] Replacement local size mismatch for "
+                    f"{name}: expected {original_local.numel()}, "
+                    f"got {replacement_local.numel()}."
+                )
+
+            model_weight_buffer = group.model_weight_buffer
+            main_weight_buffer = group.main_weight_buffer
+            if model_weight_buffer is None:
+                storage_nbytes = original_local.untyped_storage().nbytes()
+                required_nbytes = (
+                    original_local.storage_offset() + original_local.numel()
+                ) * original_local.element_size()
+                if storage_nbytes < required_nbytes:
+                    raise RuntimeError(
+                        "[Megatron-FSDP] Raw authoritative storage is not materialized "
+                        f"for {name}."
+                    )
+            for buffer_name, buffer in (
+                ("model weight", model_weight_buffer),
+                ("main weight", main_weight_buffer),
+            ):
+                if buffer is not None and not hasattr(buffer, "data"):
+                    raise RuntimeError(
+                        f"[Megatron-FSDP] {buffer_name} storage is not initialized for {name}."
+                    )
+
+            copy_plan.append(
+                (
+                    name,
+                    original_local,
+                    replacement_local,
+                    group,
+                    item_id,
+                    model_weight_buffer,
+                    main_weight_buffer,
+                )
+            )
+
+        for (
+            name,
+            original_local,
+            replacement_local,
+            group,
+            item_id,
+            model_weight_buffer,
+            main_weight_buffer,
+        ) in copy_plan:
+            if model_weight_buffer is None:
+                original_local.copy_(replacement_local)
+            else:
+                model_weight_buffer.set_item(item_id, replacement_local)
+            if main_weight_buffer is not None:
+                main_weight_buffer.set_item(item_id, replacement_local)
+            if group.main_grad_buffer is not None:
+                group.main_grad_buffer.get_item(item_id).zero_()
+            self.dist_main_grad.pop(name, None)
+
     def update_main_grads(self):
         """
         Update the gradients in the model parameters with the main gradients
