@@ -398,17 +398,34 @@ if __name__ == "__main__":
         # aiohttp session finalizers raise cross-event-loop errors and leave
         # non-daemon threads blocking Py_Finalize, so the step sits "running"
         # on all nodes until preemption. Print and exit without finalizers.
+        import time
         import traceback
 
         # os._exit can beat srun's async IO forwarding and drop the printed
-        # traceback entirely (observed on rp1s2p), so persist it to a file
-        # first — the write completes before _exit.
-        try:
-            rank = os.environ.get('SLURM_PROCID', os.environ.get('RANK', 'x'))
-            with open(f'crash_rank{rank}.log', 'a') as f:
-                traceback.print_exception(exc_type, exc, tb, file=f)
-        except Exception:
-            pass
+        # traceback entirely (observed on rp1s2p), so persist it to files
+        # first — fsync'd, at absolute paths (the previous CWD-relative path
+        # pointed the pk2 crash files at whatever tree the launcher happened
+        # to cd into), with a /dev/shm fallback so a Lustre write failure
+        # cannot silence the record either.
+        rank = os.environ.get('SLURM_PROCID', os.environ.get('RANK', 'x'))
+        text = f'=== crash rank={rank} t={time.time():.3f} ===\n' + ''.join(
+            traceback.format_exception(exc_type, exc, tb)
+        )
+        crash_dir = os.environ.get('MRL_CRASH_DIR') or os.getcwd()
+        write_errs = []
+        for path in (
+            os.path.join(crash_dir, f'crash_rank{rank}.log'),
+            f'/dev/shm/crash_rank{rank}.log',
+        ):
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                try:
+                    os.write(fd, (text + ''.join(write_errs)).encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except Exception as e:
+                write_errs.append(f'[crash-file write to {path} failed: {e!r}]\n')
         traceback.print_exception(exc_type, exc, tb)
         sys.stdout.flush()
         sys.stderr.flush()

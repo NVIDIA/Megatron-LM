@@ -108,6 +108,31 @@ if HAVE_TORCH_MEMORY_SAVER:
 
 logger = logging.getLogger(__name__)
 
+
+def _pk3_beacon(tag):
+    """Diagnostic progress beacon (PK3_BEACONS=1 only): fsync'd per-rank marker.
+
+    Brackets the silent packed-path exit(1) (pk2 adversarial event) to a single
+    statement window; logging/stderr are useless there because non-rank-0 ranks
+    die without flushing any stream. No-op unless PK3_BEACONS=1.
+    """
+    if os.environ.get('PK3_BEACONS') != '1':
+        return
+    try:
+        import time as _time
+
+        rank = os.environ.get('SLURM_PROCID', '?')
+        path = os.path.join(os.environ.get('PK3_DIR', '/dev/shm'), f'pk3_beacon_r{rank}.log')
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, f'{_time.time():.3f} {tag}\n'.encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
 
@@ -2303,7 +2328,9 @@ def prepare_trajectories(
         )
 
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
+    _pk3_beacon('tensorize_begin')
     trajs = torch.tensor(trajs, device='cpu')
+    _pk3_beacon('tensorize_done')
 
     if trajs.ndim == 1:
         # trajs is 1D (shape (0,)) when every rollout had trajectory=[] — i.e. all inference
@@ -2605,6 +2632,7 @@ def prepare_data_for_update(
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
             with nvtx_range("rl/sequence-packing", time=True):
+                _pk3_beacon('pack_begin')
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs,
                     generation_masks,
@@ -2622,6 +2650,7 @@ def prepare_data_for_update(
                 dataset = TensorDataset(torch.arange(len(compute_trajs)))
                 data_loader = DataLoader(dataset, batch_size=1)
                 logprobs_batch_size = 1
+                _pk3_beacon('pack_done')
 
             my_real_tokens = sum(
                 packing_context.packing_info.seq_lengths[idx]
@@ -2631,6 +2660,7 @@ def prepare_data_for_update(
             real_tokens_tensor = torch.tensor([my_real_tokens], dtype=torch.long, device='cuda')
             torch.distributed.all_reduce(real_tokens_tensor, group=mpu.get_data_parallel_group())
             global_real_tokens = real_tokens_tensor.item()
+            _pk3_beacon('real_tokens_synced')
             try:
                 from megatron.training.mfu_tracker import get_mfu_tracker
                 get_mfu_tracker().set_iter_real_training_tokens(global_real_tokens)
@@ -2706,11 +2736,14 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
+            _pk3_beacon('statedict_copy_begin')
             cur_st_dict = {
                 k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
             }
+            _pk3_beacon('statedict_copy_done')
             with torch.no_grad(), nvtx_range("rl/compute-old-logprobs", time=True):
                 model.load_state_dict(prox_pi_state_dict)
+                _pk3_beacon('prox_loaded_first_fwd_next')
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
