@@ -293,7 +293,7 @@ def finetune(
 
     # Build model, optimizer and learning rate scheduler.
     timers('model and optimizer', log_level=0).start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider, model_type)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_type, model_provider)
     timers('model and optimizer').stop()
 
     # If pretrained checkpoint is provided and we have not trained for

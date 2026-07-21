@@ -138,6 +138,37 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.impl_cfg["deterministic"] is False
 
 
+def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
+    engine = _engine(engine_config=_engine_config(export_dtype="bfloat16"))
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured["handle"] = handle
+            captured["kwargs"] = kwargs
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param(limit=3)
+
+    assert list(weights) == []
+    assert metadata is None
+    assert captured == {
+        "handle": engine.handle,
+        "kwargs": {
+            "buffer_max_size_bytes": 2 * 1024**3,
+            "cpu": False,
+            "export_dtype": "bfloat16",
+            "limit": 3,
+            "target": "vllm",
+        },
+    }
+
+
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
     optimizer = SimpleNamespace(param_groups=[{"lr": 0.0, "weight_decay": 0.1}])
     opt = SimpleNamespace(

@@ -96,6 +96,30 @@ def _is_megatron_ddp(model_chunk: Any) -> bool:
     )
 
 
+def _reshard_fsdp2_modules(model_chunk: Any) -> None:
+    """Return nested FSDP2 modules to their sharded state before offload.
+
+    ``reshard_after_forward`` controls the normal forward/backward schedule,
+    but it is not a context-switch barrier: prefetch, export, or an exception
+    can leave one or more units materialized when VERL asks us to offload the
+    model.  Calling ``Module.to("cpu")`` in that state moves full parameters
+    and can also make FSDP2 reset a partially materialized plain Parameter as
+    though it were a sharded DTensor.  Reshard children before parents so only
+    local shards cross the device boundary.
+    """
+    try:
+        from torch.distributed.fsdp import FSDPModule
+    except ImportError:
+        return
+
+    modules = getattr(model_chunk, "modules", None)
+    if not callable(modules):
+        return
+    for module in reversed(list(modules())):
+        if isinstance(module, FSDPModule):
+            module.reshard()
+
+
 def offload_model_to_cpu(model_list: list) -> None:
     """Offload DDP model to CPU via buffer-resize (zero-copy on GPU side)."""
     for model_chunk in model_list:
@@ -116,6 +140,7 @@ def offload_model_to_cpu(model_list: list) -> None:
                 if not param.requires_grad and param.device.type != "cpu":
                     param.data = param.data.to("cpu", non_blocking=True)
         else:
+            _reshard_fsdp2_modules(model_chunk)
             model_chunk.to("cpu")
 
 

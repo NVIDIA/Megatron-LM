@@ -133,6 +133,16 @@ class CudaGraphSizingDistribution(str, Enum):
     LINEAR = "linear"
 
 
+class AsyncScheduleMode(str, Enum):
+    """Async scheduling mode for dynamic inference."""
+
+    LEGACY = "legacy"
+    """Resolve requests before preparing the next forward pass."""
+
+    SERIAL = "serial"
+    """Prepare and forward speculatively before resolving the sampled requests."""
+
+
 @dataclass
 class InferenceConfig:
     """
@@ -338,6 +348,12 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    """Mode used to schedule dynamic batching inference work."""
+
+    logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
+    """Whether returned log-probs are modified by the sampling parameters or not."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
@@ -375,10 +391,24 @@ class InferenceConfig:
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
+        self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+
+        if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
+                "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        # The speculative log-probs path does not yet apply processed-logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
+                "(num_speculative_tokens > 0)."
             )
 
         if self.sampling_backend == 'flashinfer':
