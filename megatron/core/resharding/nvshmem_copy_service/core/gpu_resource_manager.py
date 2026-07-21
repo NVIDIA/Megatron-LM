@@ -86,9 +86,7 @@ class GPUResourceManager:
         )
         try:
             nvshmem_pkg_version = metadata.version("nvidia-nvshmem-cu12")
-            version_parts = tuple(
-                int(part) for part in nvshmem_pkg_version.split(".")[:3]
-            )
+            version_parts = tuple(int(part) for part in nvshmem_pkg_version.split(".")[:3])
             if version_parts < min_nvshmem_version:
                 version_msg = (
                     f"Installed nvidia-nvshmem-cu12=={nvshmem_pkg_version} is older than "
@@ -241,12 +239,8 @@ class GPUResourceManager:
             tuple: (pack_events, unpack_events, barrier_events) lists of torch.cuda.Event
         """
         pack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
-        unpack_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(num_events)
-        ]
-        barrier_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(num_events)
-        ]
+        unpack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
+        barrier_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
         return pack_events, unpack_events, barrier_events
 
     def finalize(self) -> None:

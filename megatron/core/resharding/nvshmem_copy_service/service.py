@@ -30,12 +30,7 @@ from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
 from .logger import PELogger
 from .memory import DoubleBufferManager
 from .nvshmem_types import ReceiveRequest, ScheduledBatch, SendRequest, WorkloadSummary
-from .planning import (
-    CommunicationScheduler,
-    GPUExecutionPlanner,
-    TaskSegmenter,
-    WorkloadPacker,
-)
+from .planning import CommunicationScheduler, GPUExecutionPlanner, TaskSegmenter, WorkloadPacker
 
 
 class RemoteCopyService:
@@ -269,9 +264,7 @@ class RemoteCopyService:
         workloads = self.workload_packer.pack_workloads(self.send_requests, self.n_pes)
         total_batches = sum(len(batches) for batches in workloads.values())
         active_pes = sum(1 for batches in workloads.values() if batches)
-        PELogger.info(
-            f"Packed: {total_batches} batches across {active_pes} destination PEs"
-        )
+        PELogger.info(f"Packed: {total_batches} batches across {active_pes} destination PEs")
 
         # Step 3: Schedule workloads to iterations
         PELogger.debug("Step 3: Building communication schedule...")
@@ -280,9 +273,7 @@ class RemoteCopyService:
         )
 
         self.num_iterations = self.comm_scheduler.num_iterations
-        PELogger.info(
-            f"Scheduled: {total_batches} batches → {self.num_iterations} iterations"
-        )
+        PELogger.info(f"Scheduled: {total_batches} batches → {self.num_iterations} iterations")
 
         # Step 4: Prepare iteration schedules
         PELogger.debug("Step 4: Preparing iteration schedules...")
@@ -304,9 +295,7 @@ class RemoteCopyService:
         self.pack_events, self.unpack_events, self.barrier_events = (
             self.gpu_resources.create_events(num_events=2)
         )
-        self.pipeline_executor.set_events(
-            self.pack_events, self.unpack_events, self.barrier_events
-        )
+        self.pipeline_executor.set_events(self.pack_events, self.unpack_events, self.barrier_events)
 
         PELogger.info(
             f"Schedule complete: {self.num_iterations} iterations ready "
@@ -345,9 +334,7 @@ class RemoteCopyService:
         # Execute pipelined communication
         nvtx_range_push("execute_pipeline")
         phase_start = time.perf_counter()
-        self.pipeline_executor.execute_pipeline(
-            self.iter_schedules, self.num_iterations
-        )
+        self.pipeline_executor.execute_pipeline(self.iter_schedules, self.num_iterations)
         pipeline_seconds = time.perf_counter() - phase_start
         nvtx_range_pop("execute_pipeline")
 
@@ -356,9 +343,7 @@ class RemoteCopyService:
         nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
 
         # Process same-PE transfers
-        self.pipeline_executor.process_self_moves(
-            self.send_requests, self.receive_requests
-        )
+        self.pipeline_executor.process_self_moves(self.send_requests, self.receive_requests)
 
         # End timing range
         nvtx_range_pop("RemoteCopyService.run_total")
@@ -453,8 +438,7 @@ class RemoteCopyService:
                     # Skip same-PE transfers (handled separately by process_self_moves)
                     if b.src_pe == b.dest_pe:
                         PELogger.debug(
-                            f"  Iter {i}: Skipping same-PE batch "
-                            f"({b.src_pe} → {b.dest_pe})"
+                            f"  Iter {i}: Skipping same-PE batch " f"({b.src_pe} → {b.dest_pe})"
                         )
                         continue
 
