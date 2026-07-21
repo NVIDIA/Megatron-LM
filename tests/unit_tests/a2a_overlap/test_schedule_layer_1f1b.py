@@ -16,15 +16,19 @@ from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stre
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyState,
+    apply_flex_backend_kwargs,
     build_data,
     compare_captures,
     deterministic_mode,
     get_test_config,
+    get_valid_dispatcher_configs,
     get_valid_fp8_flags,
-    get_valid_token_dispatcher_types,
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
+
+# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
+pytestmark = pytest.mark.flaky_in_dev
 
 
 def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
@@ -399,17 +403,15 @@ class TestA2AOverlap:
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
-    def test_transformer_layer_overlap(self, dispatcher_type, fp8_flag):
+    def test_transformer_layer_overlap(self, dispatcher_type, flex_backend, fp8_flag):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
         """
-
-        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
-        if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+        extra_kwargs = {}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
@@ -444,21 +446,15 @@ class TestA2AOverlap:
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
-    def test_mtp_layer_overlap(self, dispatcher_type, fp8_flag):
+    def test_mtp_layer_overlap(self, dispatcher_type, flex_backend, fp8_flag):
         """
         Verifies all-to-all overlap optimization in MTP layer produces
         the same results as the reference implementation.
         """
-
-        extra_kwargs = {
-            "moe_token_dispatcher_type": dispatcher_type,
-            "mtp_num_layers": 1,
-            "mtp_loss_scaling_factor": 1.1,
-        }
-        if dispatcher_type == "flex":
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+        extra_kwargs = {"mtp_num_layers": 1, "mtp_loss_scaling_factor": 1.1}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
             extra_kwargs["fp8"] = fp8_flag[0]
