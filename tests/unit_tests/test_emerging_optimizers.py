@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import os
 
 import pytest
@@ -152,7 +153,11 @@ class TestMuonOptimizerMultiRank:
     @pytest.fixture(autouse=True)
     def setup_and_teardown(self):
         """Setup and teardown for each test."""
-        Utils.initialize_model_parallel()
+        tp_size = int(os.getenv('MIXED_OPTIMIZER_TP_SIZE', '1'))
+        pp_size = int(os.getenv('MIXED_OPTIMIZER_PP_SIZE', '1'))
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, pipeline_model_parallel_size=pp_size
+        )
         yield
         Utils.destroy_model_parallel()
 
@@ -265,6 +270,298 @@ class TestMuonOptimizerMultiRank:
 
         # Load state dict should not raise error
         optimizer.load_state_dict(state_dict)
+
+    def run_configured_optimizer_arm(self, arm_name, treatment_count, num_steps, tp_size):
+        """Run one deterministic optimizer-routing arm and return its final observables."""
+        torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+        model = Net().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        selected_optimizers = {
+            'fc1': 'muon' if treatment_count >= 1 else 'adam',
+            'fc2': 'soap' if treatment_count >= 2 else 'adam',
+            'fc3': 'lion' if treatment_count >= 3 else 'adam',
+        }
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            adam_beta1=0.9,
+            adam_beta2=0.95,
+            adam_eps=1.0e-12,
+            lion_beta1=0.92,
+            lion_beta2=0.98,
+            muon_momentum=0.95,
+            muon_nesterov=True,
+            muon_fp32_matmul_prec="medium",
+            muon_num_ns_steps=5,
+            muon_scale_mode="spectral",
+            muon_tp_mode="duplicated",
+            soap_shampoo_beta=0.95,
+            soap_precondition_frequency=1,
+            soap_use_kl_shampoo=True,
+            overrides_config={
+                "optimizers": {
+                    optimizer_name: {
+                        "type": optimizer_name,
+                        "kwargs": {},
+                        "param_groups": {
+                            "default": {"eps": 1.0e-12} if optimizer_name == "adam" else {}
+                        },
+                    }
+                    for optimizer_name in {"adam", *selected_optimizers.values()}
+                },
+                "default": {"optimizer": "adam", "param_group": "default"},
+                "matchers": {
+                    name: {
+                        "type": "glob",
+                        "pattern": f"*{name}.weight",
+                        "optimizer": optimizer_name,
+                        "param_group": "default",
+                        "enabled": True,
+                    }
+                    for name, optimizer_name in selected_optimizers.items()
+                },
+            },
+        )
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        expected_optimizers = {'adam', *selected_optimizers.values()}
+        actual_optimizers = {
+            group.get('optimizer', optimizer_config.optimizer) for group in optimizer.param_groups
+        }
+        assert actual_optimizers == expected_optimizers
+        assert len(optimizer.chained_optimizers) == len(expected_optimizers)
+
+        for step in range(num_steps):
+            torch.manual_seed(1000 + step)
+            torch.cuda.manual_seed_all(1000 + step)
+            input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+            loss = model(input_tensor).float().square().mean()
+            loss.backward()
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+            optimizer.zero_grad()
+
+        squared_parameter_norms = [
+            param.detach().float().square().sum() for param in model.parameters()
+        ]
+        parameter_norm = torch.sqrt(torch.stack(squared_parameter_norms).sum())
+        result = torch.stack((loss.detach(), parameter_norm))
+        gathered_results = [
+            torch.empty_like(result) for _ in range(torch.distributed.get_world_size())
+        ]
+        torch.distributed.all_gather(gathered_results, result)
+        assert all(torch.equal(result, other) for other in gathered_results)
+
+        final_loss = loss.detach().item()
+        final_parameter_norm = parameter_norm.item()
+        if torch.distributed.get_rank() == 0:
+            print(
+                "MIXED_OPTIMIZER_RESULT "
+                f"tp={tp_size} arm={arm_name} steps={num_steps} "
+                f"loss={final_loss:.17g} parameter_norm={final_parameter_norm:.17g} "
+                f"optimizers={','.join(sorted(actual_optimizers))}"
+            )
+
+        del optimizer, model
+        torch.cuda.empty_cache()
+        return final_loss, final_parameter_norm
+
+    def test_get_megatron_optimizer_configured_adam_determinism(self):
+        """Two independently initialized Adam runs must have identical final observables."""
+        num_steps = int(os.getenv('MIXED_OPTIMIZER_TEST_STEPS', '1'))
+        tp_size = int(os.getenv('MIXED_OPTIMIZER_TP_SIZE', '1'))
+        deterministic_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+
+        try:
+            adam_a = self.run_configured_optimizer_arm('adam_a', 0, num_steps, tp_size)
+            adam_b = self.run_configured_optimizer_arm('adam_b', 0, num_steps, tp_size)
+            assert adam_a == adam_b
+        finally:
+            torch.use_deterministic_algorithms(deterministic_algorithms_enabled)
+
+    def test_get_megatron_optimizer_configured_mixed_optimizers(self):
+        """Each cumulative Adam/Muon/SOAP/Lion routing change must affect training."""
+        num_steps = int(os.getenv('MIXED_OPTIMIZER_TEST_STEPS', '1'))
+        tp_size = int(os.getenv('MIXED_OPTIMIZER_TP_SIZE', '1'))
+        deterministic_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+
+        try:
+            results = {
+                arm_name: self.run_configured_optimizer_arm(
+                    arm_name, treatment_count, num_steps, tp_size
+                )
+                for arm_name, treatment_count in (
+                    ('adam', 0),
+                    ('muon', 1),
+                    ('soap', 2),
+                    ('lion', 3),
+                )
+            }
+            for previous_arm, current_arm in (('adam', 'muon'), ('muon', 'soap'), ('soap', 'lion')):
+                assert results[current_arm] != results[previous_arm]
+        finally:
+            torch.use_deterministic_algorithms(deterministic_algorithms_enabled)
+
+    def test_configured_optimizer_kwargs_checkpoint_resume(self, request):
+        """Constructor buckets and arbitrary group kwargs survive checkpoint resume."""
+        deterministic_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        request.addfinalizer(
+            lambda: torch.use_deterministic_algorithms(deterministic_algorithms_enabled)
+        )
+
+        def make_model():
+            return self.create_ddp_model(Net().bfloat16().cuda().requires_grad_(True))
+
+        def make_optimizer(model):
+            config = OptimizerConfig(
+                optimizer='adam',
+                lr=0.01,
+                weight_decay=0.01,
+                bf16=True,
+                use_distributed_optimizer=False,
+                overrides_config={
+                    "optimizers": {
+                        "muon_three": {
+                            "type": "muon",
+                            "kwargs": {"num_ns_steps": 3},
+                            "param_groups": {
+                                "default": {"newon_scale": 0.5},
+                                "secondary": {"newon_scale": 0.6},
+                            },
+                        },
+                        "muon_five": {
+                            "type": "muon",
+                            "kwargs": {"num_ns_steps": 5},
+                            "param_groups": {"default": {"newon_scale": 0.75}},
+                        },
+                        "lion": {
+                            "type": "lion",
+                            "kwargs": {"betas": [0.92, 0.98]},
+                            "param_groups": {"default": {}},
+                        },
+                        "adam": {
+                            "type": "adam",
+                            "kwargs": {},
+                            "param_groups": {"default": {"eps": 1.0e-12}},
+                        },
+                    },
+                    "default": {"optimizer": "adam", "param_group": "default"},
+                    "matchers": {
+                        "fc1": {
+                            "type": "glob",
+                            "pattern": "*fc1.weight",
+                            "optimizer": "muon_three",
+                            "param_group": "default",
+                            "enabled": True,
+                        },
+                        "fc2": {
+                            "type": "glob",
+                            "pattern": "*fc2.weight",
+                            "optimizer": "muon_five",
+                            "param_group": "default",
+                            "enabled": True,
+                        },
+                        "fc3": {
+                            "type": "glob",
+                            "pattern": "*fc3.weight",
+                            "optimizer": "lion",
+                            "param_group": "default",
+                            "enabled": True,
+                        },
+                        "fc4": {
+                            "type": "glob",
+                            "pattern": "*fc4.weight",
+                            "optimizer": "muon_three",
+                            "param_group": "secondary",
+                            "enabled": True,
+                        },
+                    },
+                },
+            )
+            optimizer = get_megatron_optimizer(
+                config=config, model_chunks=[model], use_gloo_process_groups=True
+            )
+            return optimizer
+
+        def train_step(model, optimizer, input_tensor):
+            loss = model(input_tensor).float().square().mean()
+            loss.backward()
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+            optimizer.zero_grad()
+            return loss.detach()
+
+        def assert_nested_state_equal(expected, actual):
+            if isinstance(expected, torch.Tensor):
+                assert isinstance(actual, torch.Tensor)
+                assert torch.equal(expected, actual)
+            elif isinstance(expected, dict):
+                assert expected.keys() == actual.keys()
+                for key in expected:
+                    assert_nested_state_equal(expected[key], actual[key])
+            elif isinstance(expected, (list, tuple)):
+                assert len(expected) == len(actual)
+                for expected_item, actual_item in zip(expected, actual):
+                    assert_nested_state_equal(expected_item, actual_item)
+            else:
+                assert expected == actual
+
+        torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+        model = make_model()
+        optimizer = make_optimizer(model)
+        muon_groups = [
+            group for group in optimizer.param_groups if group.get("optimizer") == "muon"
+        ]
+        assert sorted(group["optimizer_kwargs"]["num_ns_steps"] for group in muon_groups) == [
+            3,
+            3,
+            5,
+        ]
+        assert sorted(group["newon_scale"] for group in muon_groups) == [0.5, 0.6, 0.75]
+        assert {(group["optimizer_instance"], group["param_group"]) for group in muon_groups} == {
+            ("muon_three", "default"),
+            ("muon_three", "secondary"),
+            ("muon_five", "default"),
+        }
+        assert len(optimizer.chained_optimizers) == 4
+
+        first_input = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        train_step(model, optimizer, first_input)
+        model_state = copy.deepcopy(model.state_dict())
+        optimizer_state = copy.deepcopy(optimizer.state_dict())
+
+        torch.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+        resumed_model = make_model()
+        resumed_model.load_state_dict(model_state)
+        resumed_optimizer = make_optimizer(resumed_model)
+        resumed_optimizer.load_state_dict(optimizer_state)
+
+        assert_nested_state_equal(optimizer_state, resumed_optimizer.state_dict())
+        for original_param, resumed_param in zip(model.parameters(), resumed_model.parameters()):
+            assert torch.equal(original_param, resumed_param)
+
+        params_before_resumed_step = [
+            param.detach().clone() for param in resumed_model.parameters()
+        ]
+        second_input = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        train_step(resumed_model, resumed_optimizer, second_input)
+        assert any(
+            not torch.equal(before, after)
+            for before, after in zip(params_before_resumed_step, resumed_model.parameters())
+        )
 
     def test_get_megatron_optimizer_validation(self):
         """Test validation logic for get_megatron_optimizer."""

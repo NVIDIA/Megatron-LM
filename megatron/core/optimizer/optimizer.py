@@ -47,6 +47,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
+from ..optimizer_param_scheduler import canonicalize_optimizer_config_value
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -95,29 +96,9 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-# Per-group keys used to uniquely identify a param_group during save/load matching.
-# Used by ``DistributedOptimizer.load_state_dict`` and
-# ``MegatronOptimizer._filter_and_reorder_param_groups`` to map saved param_groups
-# onto current param_groups by behavioral equivalence.
-#
-# This MUST cover every per-group field that influences scheduler or optimizer behavior;
-# otherwise two groups that differ only in a missing key (e.g. ``max_lr``) will collide
-# in the matching dict and one will silently overwrite the other on load. That's a
-# correctness bug: the load returns silently but the LR/WD applied at the next
-# optimizer step is wrong, leading to loss explosion on a converged-enough model.
-#
-# Source of truth for the user-overridable fields is
-# :class:`megatron.core.optimizer_param_scheduler.ParamGroupOverride` (the keys the
-# scheduler reads from each param_group via ``param_group.get(...)``):
-# ``max_lr``, ``min_lr``, ``start_wd``, ``end_wd``, ``wd_mult``, ``optimizer``.
-# We pull those keys directly from that TypedDict's annotations so future
-# additions to ``ParamGroupOverride`` automatically extend the identifier.
-#
-# The remaining keys (``lr_mult``, ``is_expert_parallel``, ``is_decoupled_lr``) are
-# structural flags set by ``_get_param_groups`` (in this module's ``__init__.py``)
-# on every param_group at construction time. They aren't part of ``ParamGroupOverride``
-# (users don't override them directly; they're implied by ``decoupled_lr`` config and
-# expert-parallel sharding), so we list them explicitly.
+# Save/load identity must cover every behavior-affecting per-group field to prevent
+# distinct groups from colliding during checkpoint restore. ``ParamGroupOverride`` is
+# the source of truth for user overrides; structural keys are listed explicitly below.
 def _param_group_override_keys() -> tuple[str, ...]:
     """Return every field declared on ``ParamGroupOverride``.
 
@@ -608,12 +589,13 @@ class MegatronOptimizer(ABC):
             for key in param_group_identifier_keys:
                 # NeMo aliases ``wd_mult``/``lr_mult`` as ``pre_wd_mult``/``pre_lr_mult``.
                 if key in group:
-                    out.append(group[key])
+                    value = group[key]
                 elif f"pre_{key}" in group:
-                    out.append(group[f"pre_{key}"])
+                    value = group[f"pre_{key}"]
                 else:
                     # Treat missing and explicit None identifier values as equivalent.
-                    out.append(None)
+                    value = None
+                out.append(canonicalize_optimizer_config_value(value))
             return tuple(out)
 
         needed_groups = [_identifier_for(g) for g in current_groups]

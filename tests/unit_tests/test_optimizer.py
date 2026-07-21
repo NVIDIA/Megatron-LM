@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -24,9 +26,16 @@ from megatron.core.optimizer import (
     _get_param_groups,
     check_config_overrides_consistency,
     get_megatron_optimizer,
+    get_mup_config_overrides,
+    get_optimizer_overrides_from_config,
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.emerging_optimizers import (
+    _EMERGING_OPTIMIZERS,
+    EmergingOptimizerEntry,
+    _create_emerging_optimizer,
+)
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -127,6 +136,503 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     assert wd_mults == {1.0, 0.0}
 
 
+def test_get_optimizer_overrides_from_config_mapping():
+    config = OptimizerConfig(
+        overrides_config={
+            "optimizers": {
+                "soap_main": {
+                    "type": "soap",
+                    "kwargs": {"precondition_frequency": 10},
+                    "param_groups": {
+                        "expert": {
+                            "max_lr": 2.5e-4,
+                            "min_lr": 2.5e-6,
+                            "eps": 1.0e-12,
+                            "wd_mult": 4.0,
+                            "normalize_grads": True,
+                        }
+                    },
+                },
+                "adam_main": {
+                    "type": "adam",
+                    "kwargs": {},
+                    "param_groups": {"default": {}, "norm": {"max_lr": 1.0e-3, "wd_mult": 0.0}},
+                },
+            },
+            "default": {"optimizer": "adam_main", "param_group": "default"},
+            "matchers": {
+                "expert_output": {
+                    "type": "glob",
+                    "pattern": "*.experts.*.linear_fc2.weight",
+                    "optimizer": "soap_main",
+                    "param_group": "expert",
+                    "enabled": True,
+                },
+                "input_norm": {
+                    "type": "glob",
+                    "pattern": "*.input_layernorm.weight",
+                    "optimizer": "adam_main",
+                    "param_group": "norm",
+                    "enabled": True,
+                },
+                "disabled_qk_norm": {
+                    "type": "glob",
+                    "pattern": "*.*_layernorm.weight",
+                    "optimizer": "adam_main",
+                    "param_group": "norm",
+                    "enabled": False,
+                },
+            },
+        }
+    )
+
+    overrides = get_optimizer_overrides_from_config(config)
+    assert len(overrides.matchers) == 2
+    expert_key = next(
+        key for key in overrides.matchers if key.name == "*.experts.*.linear_fc2.weight"
+    )
+    norm_key = next(key for key in overrides.matchers if key.name == "*.input_layernorm.weight")
+    parameter = torch.nn.Parameter(torch.empty(4))
+    assert expert_key.matches(parameter, "decoder.experts.0.linear_fc2.weight")
+    assert not expert_key.matches(parameter, "decoder.linear_fc2.weight")
+    assert norm_key.matches(parameter, "decoder.input_layernorm.weight")
+    assert not norm_key.matches(parameter, "decoder.q_layernorm.weight")
+    assert overrides.resolve(overrides.matchers[expert_key]) == {
+        "max_lr": 2.5e-4,
+        "min_lr": 2.5e-6,
+        "eps": 1.0e-12,
+        "wd_mult": 4.0,
+        "optimizer": "soap",
+        "optimizer_instance": "soap_main",
+        "optimizer_kwargs": {"precondition_frequency": 10},
+        "param_group": "expert",
+        "param_group_kwargs": {"normalize_grads": True},
+    }
+
+
+def test_get_optimizer_overrides_from_config_falls_back_to_standard_overrides():
+    config = OptimizerConfig()
+
+    assert get_optimizer_overrides_from_config(config) == get_standard_config_overrides(config)
+
+
+def test_get_optimizer_overrides_from_config_parsed_namespace():
+    config = OptimizerConfig(
+        overrides_config=SimpleNamespace(
+            optimizers=SimpleNamespace(
+                adam_main=SimpleNamespace(
+                    type="adam",
+                    kwargs={},
+                    param_groups=SimpleNamespace(
+                        default=SimpleNamespace(), hidden=SimpleNamespace(max_lr=1.0e-3)
+                    ),
+                )
+            ),
+            default=SimpleNamespace(optimizer="adam_main", param_group="default"),
+            matchers=SimpleNamespace(
+                fc1=SimpleNamespace(
+                    type="glob",
+                    pattern="*.linear_fc1.weight",
+                    optimizer="adam_main",
+                    param_group="hidden",
+                    enabled=True,
+                )
+            ),
+        )
+    )
+
+    overrides = get_optimizer_overrides_from_config(config)
+    key, target = next(iter(overrides.matchers.items()))
+    assert key.name == "*.linear_fc1.weight"
+    assert overrides.resolve(target) == {
+        "max_lr": 1.0e-3,
+        "optimizer": "adam",
+        "optimizer_instance": "adam_main",
+        "optimizer_kwargs": {},
+        "param_group": "hidden",
+    }
+
+
+def test_get_optimizer_overrides_from_yaml_file(tmp_path):
+    pytest.importorskip("yaml")
+    config_path = tmp_path / "optimizer_overrides.yaml"
+    config_path.write_text(
+        """
+optimizers:
+  adam_main:
+    type: adam
+    kwargs: {}
+    param_groups:
+      default: {}
+      hidden:
+        max_lr: 0.001
+default:
+  optimizer: adam_main
+  param_group: default
+matchers:
+  fc1:
+    type: glob
+    pattern: "*.linear_fc1.weight"
+    optimizer: adam_main
+    param_group: hidden
+    enabled: true
+""",
+        encoding="utf-8",
+    )
+
+    overrides = get_optimizer_overrides_from_config(
+        OptimizerConfig(overrides_config=str(config_path))
+    )
+    key, target = next(iter(overrides.matchers.items()))
+    assert key.name == "*.linear_fc1.weight"
+    assert overrides.resolve(target)["max_lr"] == 1.0e-3
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_optimizer_overrides_from_config_applies_group_values(mock_get_world_size):
+    model = torch.nn.Module()
+    model.expert_output = torch.nn.Linear(4, 4, bias=False)
+    model.layernorm = torch.nn.LayerNorm(4)
+    config = OptimizerConfig(
+        lr=1.0e-3,
+        min_lr=1.0e-5,
+        overrides_config={
+            "optimizers": {
+                "soap_main": {
+                    "type": "soap",
+                    "kwargs": {"precondition_frequency": 10},
+                    "param_groups": {
+                        "expert": {
+                            "max_lr": 2.5e-4,
+                            "min_lr": 2.5e-6,
+                            "eps": 1.0e-12,
+                            "wd_mult": 4.0,
+                            "normalize_grads": True,
+                            "newon_options": {"mode": "spectral", "steps": [3, 5]},
+                        }
+                    },
+                },
+                "adam_main": {
+                    "type": "adam",
+                    "kwargs": {},
+                    "param_groups": {"default": {}, "layernorm": {"wd_mult": 2.0}},
+                },
+            },
+            "default": {"optimizer": "adam_main", "param_group": "default"},
+            "matchers": {
+                "expert_output": {
+                    "type": "glob",
+                    "pattern": "*expert_output.weight",
+                    "optimizer": "soap_main",
+                    "param_group": "expert",
+                    "enabled": True,
+                },
+                "layernorm_gain": {
+                    "type": "glob",
+                    "pattern": "*layernorm.weight",
+                    "optimizer": "adam_main",
+                    "param_group": "layernorm",
+                    "enabled": True,
+                },
+            },
+        },
+    )
+    overrides = get_optimizer_overrides_from_config(config)
+
+    param_groups = _get_param_groups([model], config, overrides)
+    expert_group = next(
+        group
+        for group in param_groups
+        if any(param is model.expert_output.weight for param in group["params"])
+    )
+
+    assert expert_group["max_lr"] == 2.5e-4
+    assert expert_group["min_lr"] == 2.5e-6
+    assert expert_group["eps"] == 1.0e-12
+    assert expert_group["wd_mult"] == 4.0
+    assert expert_group["optimizer"] == "soap"
+    assert expert_group["optimizer_instance"] == "soap_main"
+    assert expert_group["optimizer_kwargs"] == {"precondition_frequency": 10}
+    assert expert_group["param_group"] == "expert"
+    assert expert_group["param_group_kwargs"] == {
+        "normalize_grads": True,
+        "newon_options": {"mode": "spectral", "steps": [3, 5]},
+    }
+    assert expert_group["normalize_grads"] is True
+    assert expert_group["newon_options"] == {"mode": "spectral", "steps": [3, 5]}
+    layernorm_group = next(
+        group
+        for group in param_groups
+        if any(param is model.layernorm.weight for param in group["params"])
+    )
+    assert layernorm_group["wd_mult"] == 2.0
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_configured_matchers_must_resolve_to_one_target(mock_get_world_size):
+    model = torch.nn.Module()
+    model.left = torch.nn.Linear(4, 4, bias=False)
+    base_recipe = {
+        "optimizers": {
+            "adam_main": {
+                "type": "adam",
+                "kwargs": {},
+                "param_groups": {"default": {}, "left": {"eps": 1.0e-8}, "right": {"eps": 1.0e-12}},
+            }
+        },
+        "default": {"optimizer": "adam_main", "param_group": "default"},
+        "matchers": {
+            "all_weights": {
+                "type": "glob",
+                "pattern": "*.weight",
+                "optimizer": "adam_main",
+                "param_group": "left",
+                "enabled": True,
+            },
+            "left_weight": {
+                "type": "glob",
+                "pattern": "left.weight",
+                "optimizer": "adam_main",
+                "param_group": "left",
+                "enabled": True,
+            },
+        },
+    }
+
+    config = OptimizerConfig(lr=1.0e-3, overrides_config=base_recipe)
+    groups = _get_param_groups([model], config, get_optimizer_overrides_from_config(config))
+    assert len(groups) == 1
+    assert groups[0]["param_group"] == "left"
+
+    conflicting_recipe = copy.deepcopy(base_recipe)
+    conflicting_recipe["matchers"]["left_weight"]["param_group"] = "right"
+    config = OptimizerConfig(lr=1.0e-3, overrides_config=conflicting_recipe)
+    with pytest.raises(ValueError, match="matches conflicting optimizer parameter groups"):
+        _get_param_groups([model], config, get_optimizer_overrides_from_config(config))
+
+
+@pytest.mark.parametrize(
+    ("overrides_config", "message"),
+    [
+        ({"bad": {}}, "unsupported fields"),
+        (
+            {
+                "optimizers": {
+                    "bad": {
+                        "type": "adam",
+                        "kwargs": {},
+                        "param_groups": {"default": {}},
+                        "not_an_optimizer_field": 1.0,
+                    }
+                },
+                "default": {"optimizer": "bad", "param_group": "default"},
+                "matchers": {},
+            },
+            "unsupported fields",
+        ),
+        (
+            {
+                "optimizers": {
+                    "bad": {
+                        "type": "adam",
+                        "kwargs": ["not", "a", "mapping"],
+                        "param_groups": {"default": {}},
+                    }
+                },
+                "default": {"optimizer": "bad", "param_group": "default"},
+                "matchers": {},
+            },
+            "kwargs must be a mapping",
+        ),
+        (
+            {
+                "optimizers": {
+                    "bad": {
+                        "type": "adam",
+                        "kwargs": {},
+                        "param_groups": {"default": {"params": "protected"}},
+                    }
+                },
+                "default": {"optimizer": "bad", "param_group": "default"},
+                "matchers": {},
+            },
+            "cannot override protected fields",
+        ),
+        (
+            {
+                "optimizers": {
+                    "valid": {"type": "adam", "kwargs": {}, "param_groups": {"default": {}}}
+                },
+                "default": {"optimizer": "valid", "param_group": "default"},
+                "matchers": {
+                    "bad": {
+                        "type": "glob",
+                        "pattern": "*.weight",
+                        "optimizer": "missing",
+                        "param_group": "default",
+                        "enabled": True,
+                    }
+                },
+            },
+            "unknown optimizer",
+        ),
+        (
+            {
+                "optimizers": {
+                    "valid": {"type": "adam", "kwargs": {}, "param_groups": {"default": {}}}
+                },
+                "default": {"optimizer": "valid", "param_group": "default"},
+                "matchers": {
+                    "bad": {
+                        "type": "regex",
+                        "pattern": ".*weight",
+                        "optimizer": "valid",
+                        "param_group": "default",
+                        "enabled": True,
+                    }
+                },
+            },
+            "type must be 'glob'",
+        ),
+        (
+            {
+                "optimizers": {
+                    "muon_main": {
+                        "type": "muon",
+                        "kwargs": {},
+                        "param_groups": {"bad": {"num_ns_steps": 3}},
+                    }
+                },
+                "default": {"optimizer": "muon_main", "param_group": "bad"},
+                "matchers": {},
+            },
+            "Constructor-only optimizer arguments.*num_ns_steps",
+        ),
+    ],
+)
+def test_get_optimizer_overrides_from_config_rejects_invalid_config(overrides_config, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        get_optimizer_overrides_from_config(OptimizerConfig(overrides_config=overrides_config))
+
+
+def test_emerging_optimizer_supports_config_only_constructor_kwargs():
+    """A newly registered optimizer can receive new kwargs without OptimizerConfig fields."""
+
+    class NewOn(torch.optim.Optimizer):
+        def __init__(self, params, lr, new_config_kwarg):
+            self.new_config_kwarg = new_config_kwarg
+            super().__init__(params, {"lr": lr})
+
+    entry = EmergingOptimizerEntry(
+        optimizer_cls=NewOn,
+        init_state_fn=lambda optimizer, config=None: None,
+        config_to_kwargs=lambda config, model_chunks, pg_collection: {"lr": config.lr},
+        default_param_overrides={},
+        constructor_only_kwargs=frozenset({"new_config_kwarg"}),
+    )
+    parameter = torch.nn.Parameter(torch.ones(2))
+
+    with patch.dict(_EMERGING_OPTIMIZERS, {"newon": entry}):
+        recipe = get_optimizer_overrides_from_config(
+            OptimizerConfig(
+                overrides_config={
+                    "optimizers": {
+                        "newon_fast": {
+                            "type": "newon",
+                            "kwargs": {"new_config_kwarg": "configured-only-in-yaml"},
+                            "param_groups": {"default": {"new_group_kwarg": 0.75}},
+                        }
+                    },
+                    "default": {"optimizer": "newon_fast", "param_group": "default"},
+                    "matchers": {},
+                }
+            )
+        )
+        resolved_group = recipe.resolve(recipe.default)
+        param_groups = [
+            {"params": [parameter], **resolved_group, **resolved_group["param_group_kwargs"]}
+        ]
+        optimizer, _ = _create_emerging_optimizer(
+            SimpleNamespace(lr=1.0e-3),
+            param_groups,
+            "newon",
+            [],
+            None,
+            optimizer_kwargs=param_groups[0]["optimizer_kwargs"],
+        )
+
+    assert optimizer.new_config_kwarg == "configured-only-in-yaml"
+    assert optimizer.param_groups[0]["new_group_kwarg"] == 0.75
+    assert optimizer.state_dict()["param_groups"][0]["optimizer_kwargs"] == {
+        "new_config_kwarg": "configured-only-in-yaml"
+    }
+
+
+def test_emerging_optimizer_rejects_unknown_constructor_kwargs():
+    class NewOn(torch.optim.Optimizer):
+        def __init__(self, params, lr):
+            super().__init__(params, {"lr": lr})
+
+    entry = EmergingOptimizerEntry(
+        optimizer_cls=NewOn,
+        config_to_kwargs=lambda config, model_chunks, pg_collection: {"lr": config.lr},
+        default_param_overrides={},
+    )
+    with patch.dict(_EMERGING_OPTIMIZERS, {"newon": entry}):
+        with pytest.raises(ValueError, match="Unsupported optimizer_kwargs for newon"):
+            _create_emerging_optimizer(
+                SimpleNamespace(lr=1.0e-3),
+                [{"params": [torch.nn.Parameter(torch.ones(2))]}],
+                "newon",
+                [],
+                None,
+                optimizer_kwargs={"unknown_kwarg": True},
+            )
+
+
+def test_legacy_optimizer_overrides_are_deprecated():
+    with pytest.warns(DeprecationWarning, match="superseded"):
+        get_standard_config_overrides(OptimizerConfig())
+
+    with pytest.warns(DeprecationWarning, match="superseded"):
+        get_mup_config_overrides(OptimizerConfig(), mup_width_mult=1.0)
+
+
+def test_optimizer_override_apis_are_mutually_exclusive():
+    overrides_config = {
+        "optimizers": {
+            "adam_main": {
+                "type": "adam",
+                "kwargs": {},
+                "param_groups": {"default": {}, "weights": {"wd_mult": 0.0}},
+            }
+        },
+        "default": {"optimizer": "adam_main", "param_group": "default"},
+        "matchers": {
+            "weights": {
+                "type": "glob",
+                "pattern": "*.weight",
+                "optimizer": "adam_main",
+                "param_group": "weights",
+                "enabled": True,
+            }
+        },
+    }
+    config = OptimizerConfig(overrides_config=overrides_config)
+    legacy_config_overrides = {ParamKey(name="*.bias"): ParamGroupOverride(wd_mult=0.0)}
+
+    with pytest.raises(AssertionError, match="layernorm-weight-decay and MuP.*None"):
+        get_optimizer_overrides_from_config(config, legacy_config_overrides=legacy_config_overrides)
+    with pytest.raises(AssertionError, match="layernorm-weight-decay and MuP.*None"):
+        get_megatron_optimizer(config, [Net()], config_overrides=legacy_config_overrides)
+
+
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
@@ -180,6 +686,41 @@ def test_get_param_groups_multiple_matches(mock_get_world_size):
     param_groups2 = _get_param_groups([net], opt_config, config_overrides)
     assert len(param_groups) == 2
     assert param_groups == param_groups2
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_composes_namespaced_kwargs(mock_get_world_size):
+    model = torch.nn.Module()
+    model.left = torch.nn.Linear(4, 4)
+    overrides = {
+        ParamKey(name="*.weight"): ParamGroupOverride(
+            optimizer_kwargs={"new_config_kwarg": "first"},
+            param_group_kwargs={"new_group_kwarg": 0.5},
+        ),
+        ParamKey(name="left.*"): ParamGroupOverride(
+            optimizer_kwargs={"second_config_kwarg": 3},
+            param_group_kwargs={"second_group_kwarg": True},
+        ),
+    }
+
+    groups = _get_param_groups([model], OptimizerConfig(lr=1.0e-3), overrides)
+    weight_group = next(
+        group for group in groups if any(param is model.left.weight for param in group["params"])
+    )
+
+    assert weight_group["optimizer_kwargs"] == {
+        "new_config_kwarg": "first",
+        "second_config_kwarg": 3,
+    }
+    assert weight_group["param_group_kwargs"] == {
+        "new_group_kwarg": 0.5,
+        "second_group_kwarg": True,
+    }
+    assert weight_group["new_group_kwarg"] == 0.5
+    assert weight_group["second_group_kwarg"] is True
 
 
 @patch('torch.distributed.get_world_size', return_value=1)

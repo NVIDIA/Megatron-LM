@@ -17,6 +17,15 @@ keys that aren't present on every group (e.g. ``start_wd``/``end_wd``/
 explicitly override them).
 """
 
+from unittest.mock import patch
+
+import torch
+
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    _get_param_groups,
+    get_optimizer_overrides_from_config,
+)
 from megatron.core.optimizer.optimizer import MegatronOptimizer, param_group_identifier_keys
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 
@@ -179,6 +188,124 @@ def test_filter_reorder_distinguishes_groups_by_max_lr():
     # current[1] has max_lr=5e-4 → must match the saved group with max_lr=5e-4.
     assert reordered[1]["max_lr"] == 5e-4
     assert reordered[1]["_tag"] == "from_projector"
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_configured_eps_groups_remain_distinct_during_checkpoint_reorder(mock_get_world_size):
+    """Configured groups that differ only by epsilon must not collide on checkpoint load."""
+    model = torch.nn.Module()
+    model.left = torch.nn.Linear(4, 4, bias=False)
+    model.right = torch.nn.Linear(4, 4, bias=False)
+    config = OptimizerConfig(
+        lr=1.0e-3,
+        min_lr=1.0e-5,
+        overrides_config={
+            "optimizers": {
+                "adam_main": {
+                    "type": "adam",
+                    "kwargs": {},
+                    "param_groups": {
+                        "default": {},
+                        "left": {"eps": 1.0e-8},
+                        "right": {"eps": 1.0e-12},
+                    },
+                }
+            },
+            "default": {"optimizer": "adam_main", "param_group": "default"},
+            "matchers": {
+                "left": {
+                    "type": "glob",
+                    "pattern": "left.weight",
+                    "optimizer": "adam_main",
+                    "param_group": "left",
+                    "enabled": True,
+                },
+                "right": {
+                    "type": "glob",
+                    "pattern": "right.weight",
+                    "optimizer": "adam_main",
+                    "param_group": "right",
+                    "enabled": True,
+                },
+            },
+        },
+    )
+    current = _get_param_groups([model], config, get_optimizer_overrides_from_config(config))
+    assert {group["eps"] for group in current} == {1.0e-8, 1.0e-12}
+
+    saved = []
+    for group in reversed(current):
+        saved_group = dict(group)
+        saved_group["_tag"] = f"saved_eps_{group['eps']}"
+        saved.append(saved_group)
+
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
+    assert [group["_tag"] for group in reordered] == [
+        f"saved_eps_{group['eps']}" for group in current
+    ]
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_nested_optimizer_kwargs_survive_checkpoint_reorder(mock_get_world_size):
+    """Nested constructor and group kwargs form stable checkpoint identities."""
+    model = torch.nn.Module()
+    model.left = torch.nn.Linear(4, 4, bias=False)
+    model.right = torch.nn.Linear(4, 4, bias=False)
+    config = OptimizerConfig(
+        lr=1.0e-3,
+        overrides_config={
+            "optimizers": {
+                "muon_left": {
+                    "type": "muon",
+                    "kwargs": {
+                        "num_ns_steps": 3,
+                        "coefficients": {"type": "polar_express", "values": [1.0, 2.0]},
+                    },
+                    "param_groups": {"default": {"newon_scale": 0.5}},
+                },
+                "muon_right": {
+                    "type": "muon",
+                    "kwargs": {
+                        "num_ns_steps": 5,
+                        "coefficients": {"type": "polar_express", "values": [1.0, 2.0]},
+                    },
+                    "param_groups": {"default": {"newon_scale": 0.75}},
+                },
+            },
+            "default": {"optimizer": "muon_left", "param_group": "default"},
+            "matchers": {
+                name: {
+                    "type": "glob",
+                    "pattern": f"{name}.weight",
+                    "optimizer": f"muon_{name}",
+                    "param_group": "default",
+                    "enabled": True,
+                }
+                for name in ("left", "right")
+            },
+        },
+    )
+    current = _get_param_groups([model], config, get_optimizer_overrides_from_config(config))
+    assert {group["newon_scale"] for group in current} == {0.5, 0.75}
+
+    saved = []
+    for group in reversed(current):
+        saved_group = dict(group)
+        saved_group["_tag"] = f"saved_ns_{group['optimizer_kwargs']['num_ns_steps']}"
+        saved.append(saved_group)
+
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
+    assert [group["_tag"] for group in reordered] == [
+        f"saved_ns_{group['optimizer_kwargs']['num_ns_steps']}" for group in current
+    ]
 
 
 def test_filter_reorder_tolerates_missing_optional_keys():

@@ -3,6 +3,7 @@ import copy
 import logging
 import warnings
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import astuple
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -51,6 +52,7 @@ from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.optimizer_param_scheduler import (
     ParamGroupOverride,
+    canonicalize_optimizer_config_value,
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
@@ -81,6 +83,9 @@ from .optimizer import (
 from .optimizer_config import (
     AdamOptimizerConfig,
     OptimizerConfig,
+    OptimizerInstanceConfig,
+    OptimizerOverrideRecipe,
+    OptimizerParamGroupTarget,
     ParamKey,
     ParamPredicate,
     ParamWithNamePredicate,
@@ -88,6 +93,13 @@ from .optimizer_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
 
 
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
@@ -99,6 +111,13 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
+    warnings.warn(
+        "get_standard_config_overrides is deprecated and superseded by "
+        "OptimizerConfig.overrides_config.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
     # First, figure out how we are going to do wd skipping. The two main approaches are:
     #  1. The classic megatron approach of skipping all len 1 and bias parameters.
@@ -126,6 +145,245 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
         config_overrides[decoupled_param_key] = decoupled_lr_config
 
     return config_overrides
+
+
+def get_optimizer_overrides_from_config(
+    config: OptimizerConfig,
+    legacy_config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
+) -> Union[Dict[ParamKey, ParamGroupOverride], OptimizerOverrideRecipe]:
+    """Build optimizer overrides from ``OptimizerConfig.overrides_config``.
+
+    When ``overrides_config`` is unset, this returns :func:`get_standard_config_overrides`.
+    Otherwise, the configured mapping is authoritative. Like the quantization recipe, named
+    optimizer instances own named parameter groups, while enabled matchers select a parameter
+    group by optimizer alias and group name. Unmatched parameters use the explicit default target.
+
+    Example::
+
+        overrides_config = {
+            "optimizers": {
+                "adam": {
+                    "type": "adam",
+                    "kwargs": {},
+                    "param_groups": {"default": {"eps": 1.0e-12}},
+                },
+                "newon_fast": {
+                    "type": "newon",
+                    "kwargs": {"new_mode": "fast"},
+                    "param_groups": {
+                        "hidden": {
+                            "max_lr": 1.0e-3,
+                            "min_lr": 1.0e-5,
+                            "wd_mult": 1.0,
+                            "new_scale": 0.5,
+                        }
+                    },
+                }
+            },
+            "default": {"optimizer": "adam", "param_group": "default"},
+            "matchers": {
+                "fc1": {
+                    "type": "glob",
+                    "pattern": "*.linear_fc1.weight",
+                    "optimizer": "newon_fast",
+                    "param_group": "hidden",
+                    "enabled": True,
+                }
+            },
+        }
+
+    Args:
+        config (OptimizerConfig): Optimizer configuration containing parsed override data.
+        legacy_config_overrides (Optional[Dict[ParamKey, ParamGroupOverride]]): Deprecated standard
+            layernorm-weight-decay overrides, optionally composed with MuP overrides.
+
+    Returns:
+        Union[Dict[ParamKey, ParamGroupOverride], OptimizerOverrideRecipe]: Legacy programmatic
+            overrides or the parsed optimizer recipe.
+    """
+
+    def as_mapping(value: Any, path: str) -> Mapping[str, Any]:
+        if isinstance(value, Mapping):
+            return value
+        if hasattr(value, "__dict__"):
+            return vars(value)
+        raise TypeError(f"{path} must be a mapping, got {type(value).__name__}")
+
+    if config.overrides_config is None:
+        if legacy_config_overrides is not None:
+            return legacy_config_overrides
+        return get_standard_config_overrides(config)
+
+    assert legacy_config_overrides is None, (
+        "OptimizerConfig.overrides_config requires standard layernorm-weight-decay and MuP "
+        "config overrides to be None."
+    )
+
+    if isinstance(config.overrides_config, str):
+        if not HAVE_YAML:
+            raise ImportError(
+                "PyYAML is required to load optimizer overrides from a YAML file. "
+                "Install it with `pip install pyyaml`."
+            )
+        with open(config.overrides_config, "r", encoding="utf-8") as config_file:
+            raw_recipe = yaml.load(config_file, Loader=yaml.SafeLoader)
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Loaded optimizer overrides from path '{config.overrides_config}'.",
+        )
+    else:
+        raw_recipe = config.overrides_config
+
+    recipe = as_mapping(raw_recipe, "overrides_config")
+    unknown_recipe_fields = set(recipe) - {"optimizers", "default", "matchers"}
+    if unknown_recipe_fields:
+        raise ValueError(
+            f"overrides_config has unsupported fields: {sorted(unknown_recipe_fields)}"
+        )
+
+    optimizers = as_mapping(recipe.get("optimizers", {}), "overrides_config.optimizers")
+    if not optimizers:
+        raise ValueError("overrides_config.optimizers must not be empty")
+    matchers = as_mapping(recipe.get("matchers", {}), "overrides_config.matchers")
+    protected_param_group_fields = {
+        "params",
+        "optimizer",
+        "optimizer_instance",
+        "optimizer_kwargs",
+        "param_group",
+        "param_group_kwargs",
+        "default_config",
+        "is_expert_parallel",
+    }
+    parsed_optimizers: Dict[str, OptimizerInstanceConfig] = {}
+
+    for optimizer_name, raw_optimizer in optimizers.items():
+        optimizer_path = f"overrides_config.optimizers.{optimizer_name}"
+        if not isinstance(optimizer_name, str) or not optimizer_name:
+            raise TypeError("overrides_config.optimizers keys must be non-empty strings")
+        optimizer = as_mapping(raw_optimizer, optimizer_path)
+        unknown_optimizer_fields = set(optimizer) - {"type", "kwargs", "param_groups"}
+        if unknown_optimizer_fields:
+            raise ValueError(
+                f"{optimizer_path} has unsupported fields: {sorted(unknown_optimizer_fields)}"
+            )
+        optimizer_type = optimizer.get("type")
+        if not isinstance(optimizer_type, str) or not optimizer_type:
+            raise TypeError(f"{optimizer_path}.type must be a non-empty string")
+        kwargs = as_mapping(optimizer.get("kwargs", {}), f"{optimizer_path}.kwargs")
+        if any(not isinstance(key, str) for key in kwargs):
+            raise TypeError(f"{optimizer_path}.kwargs keys must be strings")
+        if "params" in kwargs:
+            raise ValueError(
+                f"{optimizer_path}.kwargs cannot override the protected 'params' argument"
+            )
+        raw_param_groups = as_mapping(
+            optimizer.get("param_groups", {}), f"{optimizer_path}.param_groups"
+        )
+        if not raw_param_groups:
+            raise ValueError(f"{optimizer_path}.param_groups must not be empty")
+        parsed_param_groups: Dict[str, Dict[str, Any]] = {}
+        for param_group_name, raw_param_group in raw_param_groups.items():
+            param_group_path = f"{optimizer_path}.param_groups.{param_group_name}"
+            if not isinstance(param_group_name, str) or not param_group_name:
+                raise TypeError(f"{optimizer_path}.param_groups keys must be non-empty strings")
+            param_group = as_mapping(raw_param_group, param_group_path)
+            if any(not isinstance(key, str) for key in param_group):
+                raise TypeError(f"{param_group_path} keys must be strings")
+            protected_fields = set(param_group) & protected_param_group_fields
+            if protected_fields:
+                raise ValueError(
+                    f"{param_group_path} cannot override protected fields: "
+                    f"{sorted(protected_fields)}"
+                )
+            parsed_param_groups[param_group_name] = copy.deepcopy(dict(param_group))
+
+        parsed_optimizers[optimizer_name] = OptimizerInstanceConfig(
+            optimizer_type=optimizer_type,
+            kwargs=copy.deepcopy(dict(kwargs)),
+            param_groups=parsed_param_groups,
+        )
+
+    def parse_target(raw_target: Any, path: str) -> OptimizerParamGroupTarget:
+        target = as_mapping(raw_target, path)
+        unknown_target_fields = set(target) - {"optimizer", "param_group"}
+        if unknown_target_fields:
+            raise ValueError(f"{path} has unsupported fields: {sorted(unknown_target_fields)}")
+        optimizer_name = target.get("optimizer")
+        if not isinstance(optimizer_name, str):
+            raise TypeError(f"{path}.optimizer must be a string")
+        if optimizer_name not in parsed_optimizers:
+            raise ValueError(f"{path}.optimizer references unknown optimizer {optimizer_name!r}")
+        param_group_name = target.get("param_group")
+        if not isinstance(param_group_name, str):
+            raise TypeError(f"{path}.param_group must be a string")
+        if param_group_name not in parsed_optimizers[optimizer_name].param_groups:
+            raise ValueError(
+                f"{path}.param_group references unknown parameter group "
+                f"{optimizer_name}.{param_group_name}"
+            )
+        return OptimizerParamGroupTarget(optimizer_name, param_group_name)
+
+    if "default" not in recipe:
+        raise ValueError("overrides_config.default is required")
+    default_target = parse_target(recipe["default"], "overrides_config.default")
+    parsed_matchers: Dict[ParamKey, OptimizerParamGroupTarget] = {}
+
+    for matcher_name, raw_matcher in matchers.items():
+        matcher_path = f"overrides_config.matchers.{matcher_name}"
+        if not isinstance(matcher_name, str):
+            raise TypeError("overrides_config.matchers keys must be strings")
+        matcher = as_mapping(raw_matcher, matcher_path)
+        unknown_matcher_fields = set(matcher) - {
+            "type",
+            "pattern",
+            "optimizer",
+            "param_group",
+            "enabled",
+        }
+        if unknown_matcher_fields:
+            raise ValueError(
+                f"{matcher_path} has unsupported fields: {sorted(unknown_matcher_fields)}"
+            )
+        if not matcher.get("enabled", False):
+            continue
+
+        match_type = matcher.get("type")
+        if match_type != "glob":
+            raise ValueError(f"{matcher_path}.type must be 'glob', got {match_type!r}")
+        pattern = matcher.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            raise TypeError(f"{matcher_path}.pattern must be a non-empty string")
+        target = parse_target(
+            {"optimizer": matcher.get("optimizer"), "param_group": matcher.get("param_group")},
+            matcher_path,
+        )
+
+        param_key = ParamKey(name=pattern)
+        if param_key in parsed_matchers:
+            raise ValueError(f"{matcher_path}.pattern duplicates an earlier enabled matcher")
+        parsed_matchers[param_key] = target
+
+    parsed_recipe = OptimizerOverrideRecipe(
+        optimizers=parsed_optimizers, matchers=parsed_matchers, default=default_target
+    )
+    for optimizer_name, optimizer in parsed_recipe.optimizers.items():
+        if optimizer.optimizer_type not in _EMERGING_OPTIMIZERS:
+            continue
+        constructor_only_kwargs = _EMERGING_OPTIMIZERS[
+            optimizer.optimizer_type
+        ].constructor_only_kwargs
+        for param_group_name, param_group in optimizer.param_groups.items():
+            invalid_group_kwargs = set(param_group) & constructor_only_kwargs
+            if invalid_group_kwargs:
+                raise ValueError(
+                    "Constructor-only optimizer arguments cannot be set on parameter group "
+                    f"{optimizer_name}.{param_group_name}: {sorted(invalid_group_kwargs)}. "
+                    f"Move them to overrides_config.optimizers.{optimizer_name}.kwargs or "
+                    "define another optimizer alias."
+                )
+    return parsed_recipe
 
 
 def get_mup_config_overrides(
@@ -162,6 +420,13 @@ def get_mup_config_overrides(
     Returns:
         Dict[ParamKey, ParamGroupOverride]: MuP optimizer overrides.
     """
+    warnings.warn(
+        "get_mup_config_overrides is deprecated and superseded by "
+        "OptimizerConfig.overrides_config.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     optimizer_type_lower = optimizer_type.lower()
     is_sgd_optimizer = optimizer_type_lower == 'sgd'
     is_adam_optimizer = 'adam' in optimizer_type_lower
@@ -300,16 +565,15 @@ def get_mup_config_overrides(
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    config_overrides: Optional[Union[Dict[ParamKey, ParamGroupOverride], OptimizerOverrideRecipe]],
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
     Creates parameter groups from provided optimizer config object.
 
-    NOTE There can be more than one match between a ParamKey and a parameter.
-        What we do is merge all of the matching ParamKey overrides into a single ParamGroupOverride
-        for that parameter and use that as the key for that parameter. Any parameters that get
-        the same set of merged overrides will be mapped into the same parameter group.
+    Programmatic ``ParamKey`` overrides retain their historical composition behavior. A serialized
+    optimizer recipe instead resolves every parameter to exactly one named parameter group. Multiple
+    recipe matchers may match only when they select the same target.
 
     Args:
         model_chunks (List[MegatronModule]): model chunks to create parameter
@@ -323,28 +587,47 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (canonical pg_overrides, is_expert_parallel) to params and the original override.
     params_map = {}
+    param_overrides_map = {}
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
 
-            uses_default_config = False
             # Get optimizer config overrides for this parameter.
-            param_overrides_list: list[ParamGroupOverride] = []
-            if config_overrides is not None:
-                for param_key, param_override in config_overrides.items():
-                    if param_key.matches(param, name):
-                        param_overrides_list.append(param_override)
-
-            if param_overrides_list:
-                param_override: ParamGroupOverride | None = combine_param_group_overrides(
-                    param_overrides_list
+            if isinstance(config_overrides, OptimizerOverrideRecipe):
+                matching_targets = {
+                    target
+                    for param_key, target in config_overrides.matchers.items()
+                    if param_key.matches(param, name)
+                }
+                if len(matching_targets) > 1:
+                    formatted_targets = sorted(
+                        f"{target.optimizer}.{target.param_group}" for target in matching_targets
+                    )
+                    raise ValueError(
+                        f"Parameter {name!r} matches conflicting optimizer parameter groups: "
+                        f"{formatted_targets}"
+                    )
+                target = (
+                    next(iter(matching_targets)) if matching_targets else config_overrides.default
+                )
+                param_override: ParamGroupOverride | None = ParamGroupOverride(
+                    **config_overrides.resolve(target)
                 )
             else:
-                param_override = None
+                param_overrides_list: list[ParamGroupOverride] = []
+                if config_overrides is not None:
+                    for param_key, candidate_override in config_overrides.items():
+                        if param_key.matches(param, name):
+                            param_overrides_list.append(candidate_override)
+
+                if param_overrides_list:
+                    param_override = combine_param_group_overrides(param_overrides_list)
+                else:
+                    param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
@@ -355,28 +638,26 @@ def _get_param_groups(
             key = (param_override_tuple, is_expert_parallel)
             if key not in params_map:
                 params_map[key] = []
+                param_overrides_map[key] = copy.deepcopy(param_override)
             params_map[key].append(param)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
     # runtime error when loading the checkpoint or numerical error when resuming training.
-    params_key = list(params_map.keys())
-    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather_object(gathered_params_key, params_key)
-    for keys in gathered_params_key:
-        for key in keys:
-            if key not in params_key:
-                params_key.append(key)
-    # Need to pick one of the param_override_tuples to use for the param group.
+    local_param_group_specs = list(param_overrides_map.items())
+    gathered_param_group_specs = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_param_group_specs, local_param_group_specs)
+    param_group_specs = {}
+    for rank_specs in gathered_param_group_specs:
+        for key, param_override in rank_specs:
+            param_group_specs.setdefault(key, param_override)
+
     param_groups = []
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
+    for key in sorted(param_group_specs, key=lambda x: (x[0] is not None, x[0], x[1])):
         param_override_tuple, is_expert_parallel = key
         params = params_map[key] if key in params_map else []
-        if param_override_tuple is None:
-            param_override: ParamGroupOverride = {}
-        else:
-            param_override: ParamGroupOverride = {k: v for (k, v) in param_override_tuple}
+        param_override: ParamGroupOverride = copy.deepcopy(param_group_specs[key] or {})
 
         # False if param_group_override is None or empty tuple or if we do not modify the
         #  LR schedule.
@@ -401,12 +682,24 @@ def _get_param_groups(
         assert (
             "params" not in param_override
         ), "'params' should not be in param_override, this is a protected key"
+        param_group_kwargs = param_override.get("param_group_kwargs", {})
+        protected_fields = set(param_group_kwargs) & (
+            set(ParamGroupOverride.__annotations__)
+            | set(default_config)
+            | {"params", "default_config", "is_expert_parallel"}
+        )
+        if protected_fields:
+            raise ValueError(
+                "param_group_kwargs cannot override protected parameter-group fields: "
+                f"{sorted(protected_fields)}"
+            )
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
             'default_config': uses_default_lr_schedule,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
+            **param_group_kwargs,
         }
         param_groups.append(param_group)
 
@@ -417,7 +710,7 @@ def _get_param_groups_and_buffers(
     model_chunks: List[MegatronModule],
     model_chunk_offset: int,
     config: OptimizerConfig,
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    config_overrides: Optional[Union[Dict[ParamKey, ParamGroupOverride], OptimizerOverrideRecipe]],
     filter_fn: Callable,
     buffer_name: str,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
@@ -696,17 +989,15 @@ def _get_megatron_optimizer_based_on_param_groups(
 
 
 def check_config_overrides_consistency(
-    config: OptimizerConfig, config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]]
+    config: OptimizerConfig,
+    config_overrides: Optional[Union[Dict[ParamKey, ParamGroupOverride], OptimizerOverrideRecipe]],
 ):
     """Check if the config overrides are consistent with the config."""
 
-    # TODO: Remove `optimizer` from this eventually (e.g., if we use Muon for some layers and
-    # Adam for other layers). This would need some more refactoring to work though (param_groups
-    # filtered by optimizer passed into _get_megatron_optimizer_based_on_param_groups).
+    # Only fields that cannot vary across chained optimizers remain global consistency checks.
     if config_overrides is not None:
         fields_to_check_for_consistency = [
             'overlap_param_gather_with_optimizer_step',
-            'optimizer',
             'optimizer_cpu_offload',
         ]
         for field_name in fields_to_check_for_consistency:
@@ -725,10 +1016,10 @@ def check_config_overrides_consistency(
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
-    config_overrides: Optional[Dict[ParamKey, Any]] = None,
+    config_overrides: Optional[Union[Dict[ParamKey, Any], OptimizerOverrideRecipe]] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
-    """Build an emerging optimizer (e.g. Muon) for the given model chunks.
+    """Build a mixed or emerging optimizer for the given model chunks.
 
     Parameter separation (e.g., linear weights -> Muon, rest -> Adam) is expressed as a
     config_override, the same mechanism used for weight-decay and learning-rate overrides.
@@ -740,6 +1031,11 @@ def _get_megatron_emerging_optimizer(
     """
     eopt_name = config.optimizer
     use_layer_wise = config.use_layer_wise_distributed_optimizer
+    if config_overrides is None:
+        config_overrides = {}
+    configured_optimizer_names = {
+        override['optimizer'] for override in config_overrides.values() if 'optimizer' in override
+    }
 
     # Handle legacy "dist_*" optimizer names (e.g. "dist_muon" → "muon" + layer-wise).
     if eopt_name.startswith('dist_'):
@@ -753,9 +1049,15 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if not HAVE_EMERGING_OPTIMIZERS:
+    builtin_optimizer_names = {'adam', 'sgd'}
+    selected_optimizer_names = (
+        configured_optimizer_names
+        if isinstance(config_overrides, OptimizerOverrideRecipe)
+        else configured_optimizer_names | {eopt_name}
+    )
+    if not HAVE_EMERGING_OPTIMIZERS and selected_optimizer_names - builtin_optimizer_names:
         raise ImportError(
-            f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
+            "emerging-optimizers package is required for configured optimizer routing. "
             "Install it with: pip install emerging-optimizers"
         )
     assert not (use_layer_wise and config.overlap_param_gather_with_optimizer_step), (
@@ -764,15 +1066,20 @@ def _get_megatron_emerging_optimizer(
         "split model_chunks into (first, rest) groups, so the per-chunk param-gather "
         "dispatch never fires. Disable one of the two flags."
     )
-    if eopt_name not in _EMERGING_OPTIMIZERS:
-        raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
-    if config.fp16:
+    supported_optimizer_names = builtin_optimizer_names | set(_EMERGING_OPTIMIZERS)
+    unsupported_optimizer_names = selected_optimizer_names - supported_optimizer_names
+    if unsupported_optimizer_names:
+        raise ValueError(
+            f"Unsupported per-parameter optimizers: {sorted(unsupported_optimizer_names)}. "
+            f"Supported optimizers: {sorted(supported_optimizer_names)}"
+        )
+    if config.fp16 and selected_optimizer_names - builtin_optimizer_names:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-    log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
+    log_single_rank(logger, logging.INFO, f'Setting up mixed optimizer with config {config}')
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
@@ -797,25 +1104,53 @@ def _get_megatron_emerging_optimizer(
                         f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
                     )
 
-    # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
-    # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
-    # deep-copy the registry defaults before rewriting so we never mutate shared state.
-    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
-    if eopt_name in ('muon', 'adaptive_muon'):
-        for override in default_param_overrides.values():
-            if override.get('optimizer') in ('adam', 'lion'):
-                override['optimizer'] = config.muon_scalar_optimizer
-    config_overrides.update(default_param_overrides)
+    # Apply optimizer-specific routing defaults only when the caller has not supplied routing.
+    # Once any group selects an optimizer, the configured routing is authoritative and unmatched
+    # parameters use its explicit default. Copy registry defaults before rewriting the Muon scalar
+    # optimizer so shared registry state remains unchanged.
+    if (
+        not isinstance(config_overrides, OptimizerOverrideRecipe)
+        and not configured_optimizer_names
+        and eopt_name in _EMERGING_OPTIMIZERS
+    ):
+        default_param_overrides = copy.deepcopy(
+            _EMERGING_OPTIMIZERS[eopt_name].default_param_overrides
+        )
+        if eopt_name in ('muon', 'adaptive_muon'):
+            for override in default_param_overrides.values():
+                if override.get('optimizer') in ('adam', 'lion'):
+                    override['optimizer'] = config.muon_scalar_optimizer
+        config_overrides.update(default_param_overrides)
 
-    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
-    # Layer-wise distributed optimizer handles expert params internally so we skip that split.
+    # Build param groups and bucket by configured optimizer instance and expert status. A recipe
+    # creates one runtime optimizer per alias; legacy programmatic overrides continue to distinguish
+    # constructor-kwargs buckets implicitly.
     all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
     grouped_param_groups = defaultdict(list)
+    configured_instance_kwargs = {}
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
+        optimizer_kwargs = group.get("optimizer_kwargs", {})
+        if optimizer_kwargs and opt_name not in _EMERGING_OPTIMIZERS:
+            raise ValueError(
+                f"optimizer_kwargs is only supported for emerging optimizers, got {opt_name!r}"
+            )
+        optimizer_instance = group.get("optimizer_instance")
+        optimizer_kwargs_key = canonicalize_optimizer_config_value(optimizer_kwargs)
+        if optimizer_instance is not None:
+            instance_key = ("configured", optimizer_instance)
+            previous_descriptor = configured_instance_kwargs.setdefault(
+                instance_key, (opt_name, optimizer_kwargs_key)
+            )
+            if previous_descriptor != (opt_name, optimizer_kwargs_key):
+                raise ValueError(
+                    f"Optimizer instance {optimizer_instance!r} resolves to inconsistent "
+                    "optimizer types or constructor kwargs"
+                )
+        else:
+            instance_key = ("legacy", opt_name, optimizer_kwargs_key)
         is_expert = group['is_expert_parallel'] and not use_layer_wise
-        grouped_param_groups[(opt_name, is_expert)].append(group)
+        grouped_param_groups[(instance_key, opt_name, is_expert)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
@@ -843,7 +1178,7 @@ def _get_megatron_emerging_optimizer(
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
         # e.g., Muon). This includes scalar optimizers like Adam or Lion.
         not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
-        for (opt_name, _), groups in grouped_param_groups.items()
+        for (_, opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
         # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
@@ -868,25 +1203,33 @@ def _get_megatron_emerging_optimizer(
             if non_layer_wise_buffers:
                 distopt_per_model_buffers[model_chunk_idx] = non_layer_wise_buffers
 
-    # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
+    # Build an optimizer for each (optimizer_instance, is_expert) bucket and combine.
     # In layer-wise mode, emerging-optimizer (Muon) groups feed into LayerWise,
     # while non-emerging (Adam) groups are managed by a separate DistributedOptimizer
     # — that is, the LayerWise optimizer only owns Muon-managed matrix parameters,
     # and the rest go through DistOpt's standard byte-level shard machinery.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
-    for (opt_name, is_expert), groups in grouped_param_groups.items():
+    for (_, opt_name, is_expert), groups in grouped_param_groups.items():
         if not groups:
             continue
 
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
-        # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
-        # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
-        # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
-        if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
+        # Non-layer-wise recipes may construct any registered emerging optimizer. Layer-wise
+        # mode retains the existing primary-optimizer split: scalar optimizers such as Lion use
+        # the DistributedOptimizer fallback instead of joining the Muon layer-wise optimizer.
+        use_emerging_factory = opt_name in _EMERGING_OPTIMIZERS and (
+            not use_layer_wise or opt_name == eopt_name
+        )
+        if use_emerging_factory:
             optimizer, init_state_fn = _create_emerging_optimizer(
-                config, groups, eopt_name, model_chunks, pg_collection
+                config,
+                groups,
+                opt_name,
+                model_chunks,
+                pg_collection,
+                optimizer_kwargs=groups[0].get("optimizer_kwargs"),
             )
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
@@ -1027,16 +1370,23 @@ def get_megatron_optimizer(
         ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
 
-    # None → apply standard defaults. To extend defaults with custom overrides,
-    # start from get_standard_config_overrides(config) and merge yours in.
-    if config_overrides is None:
-        config_overrides = get_standard_config_overrides(config)
+    config_overrides = get_optimizer_overrides_from_config(
+        config, legacy_config_overrides=config_overrides
+    )
 
     check_config_overrides_consistency(config, config_overrides)
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    has_mixed_optimizer_routing = any(
+        override.get('optimizer', config.optimizer) != config.optimizer
+        for override in config_overrides.values()
+    )
+    if (
+        isinstance(config_overrides, OptimizerOverrideRecipe)
+        or config.optimizer not in ('adam', 'sgd')
+        or has_mixed_optimizer_routing
+    ):
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,

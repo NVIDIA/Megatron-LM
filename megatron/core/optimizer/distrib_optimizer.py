@@ -54,6 +54,7 @@ from ..distributed.param_and_grad_buffer import (
 )
 from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..optimizer_param_scheduler import canonicalize_optimizer_config_value
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -927,7 +928,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 else:
                     # Treat missing and explicit None identifier values as equivalent.
                     value = None
-                needed_groups.append(value)
+                needed_groups.append(canonicalize_optimizer_config_value(value))
             return tuple(needed_groups)
 
         # Duplicate identifiers here silently clobber: two saved groups with the same tuple
