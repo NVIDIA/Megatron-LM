@@ -4,6 +4,7 @@ import warnings
 
 import msgpack
 import numpy as np
+import pytest
 import torch
 
 from megatron.core.inference.inference_request import (
@@ -261,3 +262,64 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
     rec_out = DynamicInferenceRequestRecord.deserialize(rec.serialize())
     assert rec_out.latency == 1.0
     assert rec_out.requests[0].request_id == 7
+
+
+@pytest.mark.parametrize(
+    ("return_prompt_tokens", "expected_prompt_field"),
+    [
+        (False, None),  # default: prompt_tokens dropped from payload
+        (True, ("tensor", [1, 2, 3, 4])),  # opt-in: prompt_tokens preserved
+    ],
+)
+def test_dynamic_inference_request_serialize_return_prompt_tokens(
+    return_prompt_tokens, expected_prompt_field
+):
+    """DynamicInferenceRequest.serialize() reports prompt_length unconditionally
+    (the API uses it for `usage.prompt_tokens` on the response) and drops the
+    prompt_tokens tensor from the wire payload unless
+    SamplingParams.return_prompt_tokens is True. This is the load-bearing
+    wire-cost optimization for long agentic-RL prompts. The same call must
+    (a) leave self.prompt_tokens intact on the local instance — the drop is
+    wire-only — and (b) keep the routing_indices shape check honest, which
+    now relies on the saved prompt_len rather than self.prompt_tokens (which
+    is temporarily None during the drop)."""
+    sp = SamplingParams(
+        num_tokens_to_generate=5,
+        termination_id=0,
+        return_prompt_tokens=return_prompt_tokens,
+    )
+    prompt = torch.tensor([1, 2, 3, 4])
+    # prompt_len=4 + generated=[10] → total_tokens=5 → routing_indices.shape[0] must be 4.
+    routing = np.zeros((4, 2, 1), dtype=np.int32)
+    req = _make_dynamic_request(
+        prompt_tokens=prompt,
+        sampling_params=sp,
+        generated_tokens=[10],
+        routing_indices=routing,
+    )
+
+    obj = req.serialize()
+
+    # prompt_length is always populated (independent of the drop).
+    assert obj["prompt_length"] == 4
+    # Payload either preserves the tensor wrapper or drops it (present but None).
+    assert obj["prompt_tokens"] == expected_prompt_field
+    # Local instance is unaffected — the drop is wire-only.
+    assert torch.equal(req.prompt_tokens, prompt)
+    # routing_indices survives the drop path (shape check would have crashed on
+    # the temporarily-None self.prompt_tokens if the fix used self.prompt_tokens).
+    assert isinstance(obj["routing_indices"], tuple) and obj["routing_indices"][0] == "ndarray"
+
+
+def test_dynamic_inference_request_serialize_prompt_length_absent():
+    """When prompt_tokens is None on the request, serialize() must not crash
+    (the drop path is guarded on `prompt_tokens is not None`) and prompt_length
+    must be reported as None. The DP coordinator can dispatch error/finish
+    records without prompt_tokens, so this path is real."""
+    sp = SamplingParams(num_tokens_to_generate=1, termination_id=0)
+    req = DynamicInferenceRequest(request_id=99, prompt_tokens=None, sampling_params=sp)
+
+    obj = req.serialize()
+
+    assert obj["prompt_length"] is None
+    assert obj["prompt_tokens"] is None
