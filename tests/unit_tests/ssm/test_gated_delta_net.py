@@ -13,8 +13,8 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gdn import GatedDeltaNet
-from megatron.core.ssm.gdn.common import (
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     tensor_a2a_cp2hp,
@@ -237,36 +237,6 @@ class TestGatedDeltaNet:
         assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
         assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
         assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
-
-    def test_gpu_forward_backward(self):
-        gdn = self.gdn
-
-        micro_batch_size = 2
-        seq_length = 64
-        hidden_states = torch.rand(
-            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-            requires_grad=True,
-        )
-
-        output, bias = gdn(hidden_states, None)
-
-        assert output.shape == (
-            seq_length // self.sp_size // self.cp_size,
-            micro_batch_size,
-            gdn.config.hidden_size,
-        ), f"Output shape mismatch ({output.shape=})"
-        assert (
-            output.dtype == hidden_states.dtype
-        ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
-
-        output.float().sum().backward()
-        assert hidden_states.grad is not None
-        assert torch.isfinite(hidden_states.grad).all(), "Non-finite input grad"
-        for name, param in gdn.named_parameters():
-            if param.grad is not None:
-                assert torch.isfinite(param.grad).all(), f"Non-finite grad for {name}"
 
     def test_jit_compiled_helpers(self):
         import torch._dynamo

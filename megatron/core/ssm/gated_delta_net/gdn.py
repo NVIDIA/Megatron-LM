@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.ssm.gdn.common import (
+from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     _GDNBase,
@@ -71,7 +71,7 @@ class GatedDeltaNet(_GDNBase):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Perform a forward pass through the GDN module.
 

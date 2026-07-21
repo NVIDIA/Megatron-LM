@@ -22,7 +22,7 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
 )
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.core.post_training.modelopt.layers import Linear, Norm
-from megatron.core.ssm.gdn import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig

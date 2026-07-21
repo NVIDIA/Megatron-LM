@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.ssm.gdn.common import _split_tensor_factory as gated_delta_split_tensor_factory
+from megatron.core.ssm.gated_delta_net.common import (
+    _split_tensor_factory as gated_delta_split_tensor_factory,
+)
 from megatron.core.ssm.mamba_mixer import _split_tensor_factory as mamba_split_tensor_factory
 
 
