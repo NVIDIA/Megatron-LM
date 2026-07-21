@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -53,6 +53,9 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
+
+# These callbacks are currently consumed only by the Dynamo frontend.
+KVEventListener = Callable[[str, dict[str, Any]], None]
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -557,8 +560,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
         )
-        self._kv_event_listeners: list = []
-        self._pending_kv_stored_events: list[dict] = []
+        self._kv_event_listeners: list[KVEventListener] = []
+        self._pending_kv_stored_events: list[dict[str, Any]] = []
         self.kv_block_allocator.add_blocks_deregistered_observer(self._on_kv_blocks_deregistered)
 
         # Track request metadata.
@@ -2613,11 +2616,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def add_kv_event_listener(self, listener) -> None:
-        """Register a lightweight listener for prefix-cache lifecycle events."""
+    def add_kv_event_listener(self, listener: KVEventListener) -> None:
+        """Register a lightweight listener for prefix-cache lifecycle events.
+
+        Currently used only by the Dynamo frontend.
+        """
         self._kv_event_listeners.append(listener)
 
-    def _emit_kv_event(self, kind: str, payload: dict) -> None:
+    def _emit_kv_event(self, kind: str, payload: dict[str, Any]) -> None:
         for listener in tuple(self._kv_event_listeners):
             try:
                 listener(kind, payload)
@@ -2634,7 +2640,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Discard registrations left by an interrupted or failed forward pass."""
         self._pending_kv_stored_events.clear()
 
-    def _on_kv_blocks_deregistered(self, _block_ids, hashes) -> None:
+    def _on_kv_blocks_deregistered(self, _block_ids: list[int], hashes: set[int]) -> None:
         if hashes:
             self._emit_kv_event("removed", {"block_hashes": list(hashes)})
 

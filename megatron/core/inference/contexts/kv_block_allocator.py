@@ -9,6 +9,9 @@ from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
+# These callbacks are currently consumed only by the Dynamo frontend.
+BlocksDeregisteredObserver = Callable[[list[int], set[int]], None]
+
 
 class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
@@ -40,7 +43,7 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
-        self._blocks_deregistered_observers: list[Callable] = []
+        self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -279,7 +282,7 @@ class KVBlockAllocator:
         self.block_hashes[id_tensor] = hash_tensor
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
-    def add_blocks_deregistered_observer(self, observer: Callable) -> None:
+    def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
         """Register a callback invoked when cached blocks are deregistered.
 
         Currently used only by the Dynamo frontend.

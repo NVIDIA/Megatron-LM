@@ -27,6 +27,7 @@ from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementM
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
+    KVEventListener,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
 )
@@ -303,7 +304,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
-    def add_kv_event_listener(self, listener) -> None:
+    def add_kv_event_listener(self, listener: KVEventListener) -> None:
         """Register a prefix-cache lifecycle listener on the context.
 
         Currently used only by the Dynamo frontend.
