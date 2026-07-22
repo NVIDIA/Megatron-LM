@@ -1160,6 +1160,7 @@ class TestDynamicContext:
         [
             ([1, 1, 1], [], [10, 11, 12], [0, 1, 2]),
             ([1, 0, 1], [11], [10, 12], [0, 2]),
+            ([0, 1, 1], [10], [12, 11], [2, 1]),
             ([0, 0, 0], [10, 11, 12], [], []),
         ],
     )
@@ -1179,6 +1180,16 @@ class TestDynamicContext:
         if torch.cuda.is_available():
             active_mask = active_mask.cuda()
 
+        token_tensors = (
+            ctx.token_to_input_ids,
+            ctx.token_to_pos_ids,
+            ctx.token_to_block_idx,
+            ctx.token_to_local_position_within_kv_block,
+            ctx.token_to_request_idx,
+            ctx.token_to_position_in_request,
+        )
+        token_state = tuple(tensor.clone() for tensor in token_tensors)
+
         finished_request_ids, survivor_idxs = ctx.resolve_requests(active_mask)
 
         assert torch.equal(
@@ -1191,17 +1202,15 @@ class TestDynamicContext:
             ctx.request_ids[: len(expected_request_ids)],
             torch.tensor(expected_request_ids, dtype=torch.int32),
         )
-        assert torch.equal(
-            ctx.token_to_request_idx[: len(expected_request_ids)],
-            torch.arange(len(expected_request_ids), dtype=torch.int32),
-        )
+        for tensor, expected in zip(token_tensors, token_state):
+            assert torch.equal(tensor, expected)
         if not expected_request_ids:
             assert torch.all(ctx.request_to_kv_block_ids == -1)
 
     @pytest.mark.internal
     @rounder_override(8)
     def test_async_sched_mtp_prepare_commit_and_resolve(self):
-        """MTP rows remain grouped while preparation, commit, and compaction run."""
+        """MTP survivor tokens are committed after request resolution."""
         ctx = self._get_async_sched_context(num_speculative_tokens=2)
         self._setup_async_sched_decode_rows(
             ctx,
@@ -1212,10 +1221,9 @@ class TestDynamicContext:
         )
 
         ctx.prepare_requests()
-        ctx.commit_sampled_tokens(torch.tensor([100, 200]), torch.tensor([[101, 201], [102, 202]]))
+        prepared_input_ids = ctx.token_to_input_ids.clone()
 
         assert ctx.active_token_count == 6
-        assert torch.equal(ctx.token_to_input_ids[:6], torch.tensor([100, 101, 102, 200, 201, 202]))
         assert torch.equal(ctx.token_to_pos_ids[:6], torch.tensor([4, 5, 6, 6, 7, 8]))
 
         finished_request_ids, survivor_idxs = ctx.resolve_requests(torch.tensor([0, 1]))
@@ -1224,6 +1232,14 @@ class TestDynamicContext:
         assert survivor_idxs.tolist() == [1]
         assert ctx.request_ids[0] == 11
         assert ctx.active_token_count == 3
+        assert torch.equal(ctx.token_to_input_ids, prepared_input_ids)
+
+        sampled_tokens = torch.tensor([100, 200])
+        sampled_mtp_tokens = torch.tensor([[101, 201], [102, 202]])
+        ctx.commit_sampled_tokens(
+            sampled_tokens[survivor_idxs], sampled_mtp_tokens[:, survivor_idxs]
+        )
+
         assert torch.equal(ctx.token_to_input_ids[:3], torch.tensor([200, 201, 202]))
 
     @pytest.mark.internal

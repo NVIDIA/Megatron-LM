@@ -3617,9 +3617,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> None:
         """Commit sampled CPU token IDs to the prepared request state.
 
-        This updates the CPU source of truth used by resolution. Async
-        scheduling has already copied the same samples into the live GPU input
-        view for the speculative forward.
+        This populates the CPU input-ID staging rows after resolution has
+        established the survivor order. Overlapped async scheduling has already
+        copied the same samples into the live GPU input view for the speculative
+        forward.
 
         Args:
             sampled_tokens_cpu (Tensor): Sampled CPU token for each active request.
@@ -3671,10 +3672,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Prefill requests transition to decode during resolution. Request rows use
         the same hole-filling order as ``update_requests`` so seeded sampling stays
-        consistent with legacy scheduling. Decode input token IDs follow the same
-        survivor order; prepare rebuilds all derived token metadata. Prefill token
-        rows are left untouched because prepare and commit rebuild them after
-        resolution.
+        consistent with legacy scheduling. Token tensors are left untouched;
+        prepare rebuilds derived token metadata and the controller commits sampled
+        input IDs after resolution.
 
         Args:
             active_requests_mask (Tensor): 1D mask marking requests that remain active.
@@ -3742,18 +3742,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             ]
             for metadata_tensor in self.request_metadata.values():
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
-
-            if not had_prefill_requests:
-                token_offsets = self._async_sched_token_offsets
-                survivor_token_idxs = (
-                    survivor_idxs[:, None] * tokens_per_request + token_offsets[None, :]
-                ).flatten()
-                dst_token_idxs = torch.arange(
-                    active_request_count * tokens_per_request, device='cpu'
-                )
-                self.token_to_input_ids[dst_token_idxs] = self.token_to_input_ids[
-                    survivor_token_idxs
-                ]
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
         self.total_request_count = active_request_count

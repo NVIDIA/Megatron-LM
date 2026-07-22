@@ -2526,15 +2526,18 @@ class TextGenerationController:
             # -------------------------------------------------------------------------
             # Resolve
             # -------------------------------------------------------------------------
-            # Resolution reads the CPU sample and mutates the H2D source buffer.
+            # Wait for the CPU sample and the published bookkeeping snapshot.
             self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
             self._synchronize_async_sched_event(bookkeeping_done_event)
-
-            context.commit_sampled_tokens(sample_result.sampled_tokens_cpu_view)
 
             # Resolve N while forward N+1 continues unless finished resources are needed.
             resolve_result = self._run_async_sched_resolve(
                 sample_result, resolved_sequence_lengths, next_forward_done_event
+            )
+
+            # Commit CPU input IDs in the resolved survivor order.
+            context.commit_sampled_tokens(
+                resolve_result.sampled_tokens_cpu[resolve_result.survivor_idxs]
             )
 
         result = self._build_async_sched_step_result(
@@ -2594,15 +2597,23 @@ class TextGenerationController:
             # -------------------------------------------------------------------------
             # Resolve
             # -------------------------------------------------------------------------
-            # Resolution reads CPU samples and may reuse the bookkeeping source buffer.
+            # Wait for the CPU samples and the published bookkeeping snapshot.
             self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
             self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            context.commit_sampled_tokens(
-                sample_result.sampled_tokens_cpu_view, sample_result.sampled_mtp_tokens_cpu_view
-            )
             resolve_result = self._run_async_sched_resolve(
                 sample_result, resolved_sequence_lengths, next_forward_done_event
+            )
+
+            # Commit CPU input IDs in the resolved survivor order.
+            survivor_idxs = resolve_result.survivor_idxs
+            sampled_mtp_tokens_cpu = (
+                sample_result.sampled_mtp_tokens_cpu_view[:, survivor_idxs]
+                if sample_result.sampled_mtp_tokens_cpu_view is not None
+                else None
+            )
+            context.commit_sampled_tokens(
+                resolve_result.sampled_tokens_cpu[survivor_idxs], sampled_mtp_tokens_cpu
             )
 
         result = self._build_async_sched_step_result(
