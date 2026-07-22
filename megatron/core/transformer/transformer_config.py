@@ -832,16 +832,22 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
+    moe_grouped_gemm_backend: Literal["legacy", "grouped_tensor"] = "legacy"
+    """Grouped GEMM execution backend. ``legacy`` uses per-expert weights and host split
+    metadata. ``grouped_tensor`` uses Transformer Engine GroupedTensor kernels with CUDA split
+    metadata. The TE operation fuser selects ``grouped_tensor`` for grouped MoE MLPs.
+    """
+
     moe_single_grouped_weight: bool = False
     """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
     parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True`` and
-    ``use_transformer_engine_op_fuser=True``.
+    ``moe_grouped_gemm_backend='grouped_tensor'``.
     """
 
     moe_single_grouped_bias: bool = False
     """When using TE GroupedLinear for MoE experts, store expert biases as a single grouped
-    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
-    and ``add_bias_linear=True``."""
+    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``,
+    ``moe_grouped_gemm_backend='grouped_tensor'``, and ``add_bias_linear=True``."""
 
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
@@ -1289,6 +1295,14 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+            self.moe_grouped_gemm_backend = "grouped_tensor"
+
+        if self.moe_grouped_gemm_backend == "grouped_tensor" and not self.moe_grouped_gemm:
+            raise ValueError(
+                "moe_grouped_gemm_backend='grouped_tensor' requires moe_grouped_gemm=True."
+            )
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1567,15 +1581,18 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight is currently supported with high-precision "
                     "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
                 )
-            if not self.use_transformer_engine_op_fuser:
+            if self.moe_grouped_gemm_backend != "grouped_tensor":
                 raise ValueError(
                     "moe_single_grouped_weight requires "
-                    "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
-                    "path splits the grouped parameter into per-expert tensors and does not "
-                    "support single-grouped-weight training."
+                    "moe_grouped_gemm_backend='grouped_tensor'."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
+        if self.moe_single_grouped_bias and self.moe_grouped_gemm_backend != "grouped_tensor":
+            raise ValueError(
+                "moe_single_grouped_bias requires "
+                "moe_grouped_gemm_backend='grouped_tensor'."
+            )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":

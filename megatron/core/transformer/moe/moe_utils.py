@@ -1403,22 +1403,36 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
-    # CUTLASS kernel for grouped GEMM assumes 256 alignment.
-    if config.use_transformer_engine_op_fuser:
+    # TE's grouped-tensor and fused grouped-MLP kernels require 256-token alignment.
+    if (
+        config.use_transformer_engine_op_fuser
+        or config.moe_grouped_gemm_backend == "grouped_tensor"
+    ):
         return 256
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    # Only FP8 or FP4 requires padding. Defaults to 0.
+    # Legacy high-precision grouped GEMM does not require padding. Defaults to 0.
     return 0
+
+
+def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
+    """Whether DeepEP fused permutation pads input for TE grouped-tensor GEMM."""
+    return (
+        config.moe_grouped_gemm_backend == "grouped_tensor"
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "deepep"
+        and config.moe_permute_fusion
+        and fused_permute_and_pad_with_probs is not None
+    )
 
 
 def skip_routed_expert_padding(config: TransformerConfig) -> bool:
     """Whether the expert module should skip quantization padding.
 
-    Returns True when padding is already applied by the router or the
-    HybridEP / NCCL-EP dispatcher.
+    Returns True when padding is already applied by the router, the HybridEP / NCCL-EP
+    dispatcher, or DeepEP's fused permutation kernel.
     """
     if config.moe_router_padding_for_quantization:
         return True
@@ -1426,6 +1440,8 @@ def skip_routed_expert_padding(config: TransformerConfig) -> bool:
         "hybridep",
         "ncclep",
     ):
+        return True
+    if _deepep_permute_pads_grouped_tensor_input(config):
         return True
     return False
 
