@@ -75,44 +75,33 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
 
 @dataclass
 class AsyncScheduleLogitsState:
-    """Track logits submitted for the next async-scheduling sample.
-
-    When ``is_valid`` is true, ``ready_event`` marks when the logits are
-    sampleable. The event may represent either forward completion or survivor
-    compaction completion.
-    """
+    """Track logits submitted for the next async-scheduling sample."""
 
     is_valid: bool = False
     cuda_graph_request_count: Optional[int] = None
-    ready_event: Optional[torch.cuda.Event] = None
     token_row_indices: Optional[Tensor] = None
 
     def set_pending(
         self,
         cuda_graph_request_count: Optional[int],
-        ready_event: Optional[torch.cuda.Event] = None,
         token_row_indices: Optional[Tensor] = None,
     ) -> None:
-        """Record logits that become sampleable when their event completes.
+        """Record logits submitted for the next sample.
 
         Args:
             cuda_graph_request_count (Optional[int]): CUDA graph request count
                 for the pending logits, or `None` when CUDA graphs were not used.
-            ready_event (Optional[torch.cuda.Event]): Event marking completion
-                of the forward or survivor compaction producing the logits.
             token_row_indices (Optional[Tensor]): Original GPU input row for each
                 logical token row in the pending forward.
         """
         self.is_valid = True
         self.cuda_graph_request_count = cuda_graph_request_count
-        self.ready_event = ready_event
         self.token_row_indices = token_row_indices
 
     def clear(self) -> None:
         """Clear the pending logits state."""
         self.is_valid = False
         self.cuda_graph_request_count = None
-        self.ready_event = None
         self.token_row_indices = None
 
 
@@ -152,7 +141,6 @@ class _AsyncScheduleResolveResult:
     active_request_ids: Tensor
     finished_request_ids: Tensor
     survivor_idxs: Tensor
-    compaction_done_event: Optional[torch.cuda.Event]
 
 
 # pylint: disable=line-too-long
@@ -1898,20 +1886,16 @@ class TextGenerationController:
         if context.chunked_prefill_request_id != -1:
             raise RuntimeError("Async scheduling does not support chunked prefill.")
 
-    def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> Optional[torch.cuda.Event]:
+    def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
         """Compact cached logits from old active-row order into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
                 active after async scheduling.
-
-        Returns:
-            Optional[torch.cuda.Event]: Event marking compaction completion, or
-                `None` when no GPU compaction was needed.
         """
         if survivor_idxs.numel() == 0:
             self._async_sched_logits.clear()
-            return None
+            return
 
         tokens_per_request = self.num_speculative_tokens + 1
         pending_token_row_indices = self._async_sched_logits.token_row_indices
@@ -1925,10 +1909,9 @@ class TextGenerationController:
             )
             self._async_sched_logits.set_pending(
                 self._async_sched_logits.cuda_graph_request_count,
-                self._async_sched_logits.ready_event,
                 survivor_token_row_indices,
             )
-            return None
+            return
 
         token_offsets = torch.arange(tokens_per_request, device=survivor_idxs.device)
         survivor_token_idxs = (
@@ -1947,22 +1930,19 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = compacted_logits
 
-        compaction_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
         self._async_sched_logits.set_pending(
             self._async_sched_logits.cuda_graph_request_count,
-            compaction_done_event,
             survivor_token_row_indices,
         )
-        return compaction_done_event
 
     def _record_fresh_async_sched_event(
         self, reference_tensor: Optional[Tensor] = None
     ) -> Optional[torch.cuda.Event]:
         """Record a fresh event on the current CUDA stream when CUDA work is active.
 
-        Forward and compaction events can remain in the logits state across
-        controller steps, so each operation owns a fresh event. Transfer events
-        are reused separately because they are synchronized within each step.
+        Forward completion events can remain in flight while resolution runs,
+        so each overlapping forward owns a fresh event. Transfer events are
+        reused separately because they are synchronized within each step.
 
         Args:
             reference_tensor (Optional[Tensor]): Tensor used to determine whether
@@ -2244,16 +2224,12 @@ class TextGenerationController:
 
     def _run_async_sched_forward(
         self, input_ids_gpu_view: Tensor, position_ids_gpu_view: Tensor
-    ) -> Optional[torch.cuda.Event]:
+    ) -> None:
         """Run one dynamic forward pass and cache logits for async scheduling.
 
         Args:
             input_ids_gpu_view (Tensor): Live GPU view of the input token IDs.
             position_ids_gpu_view (Tensor): Live GPU view of the position IDs.
-
-        Returns:
-            Optional[torch.cuda.Event]: Event marking forward completion, or
-                `None` when no CUDA work was recorded.
         """
         context = self.inference_wrapped_model.inference_context
         cuda_graph_request_count = (
@@ -2265,28 +2241,16 @@ class TextGenerationController:
         self._dynamic_step_forward_logits(input_ids_gpu_view, position_ids_gpu_view)
         range_pop()
 
-        # Record forward completion.
-        forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
-
         # Record the logits and identity mapping for this forward's input rows.
         token_row_indices = None
         if self._async_sched_mtp_token_row_indices is not None:
             token_row_indices = self._async_sched_mtp_token_row_indices[
                 : context.active_token_count
             ]
-        self._async_sched_logits.set_pending(
-            cuda_graph_request_count, forward_done_event, token_row_indices
-        )
+        self._async_sched_logits.set_pending(cuda_graph_request_count, token_row_indices)
 
-        # Return the forward-done event.
-        return forward_done_event
-
-    def _run_dummy_async_sched_base_step(self) -> Optional[torch.cuda.Event]:
-        """Run the base-forward half of an async EP step after local work finishes.
-
-        Returns:
-            Optional[torch.cuda.Event]: Event marking dummy base-forward completion.
-        """
+    def _run_dummy_async_sched_base_step(self) -> None:
+        """Run the base-forward half of an async EP step after local work finishes."""
         context = self.inference_wrapped_model.inference_context
         saved_counters = (
             context.step_count,
@@ -2298,7 +2262,6 @@ class TextGenerationController:
 
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
         self._run_dummy_base_forward(input_ids, position_ids)
-        forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
         context.reset(preserve_prefix_cache=True)
         (
             context.step_count,
@@ -2307,7 +2270,6 @@ class TextGenerationController:
             context.async_sched_step_count,
             context.async_sched_compaction_step_count,
         ) = saved_counters
-        return forward_done_event
 
     def _run_async_sched_forward_primer(self) -> Tuple[bool, Optional[torch.cuda.Event]]:
         """Launch the initial forward when no valid logits state exists.
@@ -2347,7 +2309,7 @@ class TextGenerationController:
 
         Returns:
             _AsyncScheduleResolveResult: Sampled tokens, resolved request row
-                sets, and any logits-compaction completion event.
+                sets, and survivor indices.
         """
         context = self.inference_wrapped_model.inference_context
 
@@ -2376,11 +2338,8 @@ class TextGenerationController:
         assert torch.equal(finished_request_ids, resolved_finished_request_ids)
 
         # Compact pending successor logits only while the async chain continues.
-        compaction_done_event = (
+        if next_forward_done_event is not None:
             self._compact_async_sched_logits(survivor_idxs)
-            if next_forward_done_event is not None
-            else None
-        )
 
         # Return the resolution result.
         return _AsyncScheduleResolveResult(
@@ -2389,7 +2348,6 @@ class TextGenerationController:
             active_request_ids=active_request_ids,
             finished_request_ids=finished_request_ids,
             survivor_idxs=survivor_idxs,
-            compaction_done_event=compaction_done_event,
         )
 
     def _build_async_sched_step_result(
@@ -2561,9 +2519,8 @@ class TextGenerationController:
             range_pop()
 
             range_push("async_sched_forward_pass")
-            next_forward_done_event = self._run_async_sched_forward(
-                input_ids_gpu_view, position_ids_gpu_view
-            )
+            self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
+            next_forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
             range_pop()
 
             # -------------------------------------------------------------------------
@@ -2630,9 +2587,8 @@ class TextGenerationController:
             range_pop()
 
             range_push("async_sched_forward_pass")
-            next_forward_done_event = self._run_async_sched_forward(
-                input_ids_gpu_view, position_ids_gpu_view
-            )
+            self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
+            next_forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
             range_pop()
 
             # -------------------------------------------------------------------------
