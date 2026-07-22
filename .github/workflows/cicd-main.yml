@@ -359,6 +359,25 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@main
 
+      - name: Validate updated golden values
+        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        env:
+          BASE_REF: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}
+        run: |
+          git fetch origin "$BASE_REF"
+          mapfile -t GOLDEN_VALUES_FILES < <(
+            git diff --name-only --diff-filter=ACMR \
+              --merge-base "origin/$BASE_REF" -- \
+              ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
+          )
+
+          if (( ${#GOLDEN_VALUES_FILES[@]} == 0 )); then
+            echo "No golden value files were updated; skipping validation."
+            exit 0
+          fi
+
+          python3 tools/check_golden_values.py "${GOLDEN_VALUES_FILES[@]}"
+
       - name: Run linting
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         run: |
