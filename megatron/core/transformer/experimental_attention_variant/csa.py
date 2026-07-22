@@ -31,6 +31,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     FusedIndexerSparseAttnFromTopkFunc,
     batch_of_row,
     build_flat_topk_idxs,
+    defer_reduce_scatter_wait,
     dsa_sparse_attn,
     fused_indexer_sparse_attn,
     indexer_topk,
@@ -2297,6 +2298,8 @@ class CompressedSparseAttention(MegatronModule):
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         training_with_grad = self.training and torch.is_grad_enabled()
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        local_compressed_kv_grad_edge = None
+        compressed_kv_rs_state = None
         if self.compressor is not None and ratio > 1:
             # ---- Step 3: build fixed-capacity compressor input ----------------
 
@@ -2333,40 +2336,52 @@ class CompressedSparseAttention(MegatronModule):
                     raise RuntimeError(
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
-                q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)
-                q_indexer_cp = q_indexer_cp.reshape(
-                    l_local, indexer.index_n_heads, indexer.index_head_dim
+
+                defer_compressed_kv_consumer_wait = (
+                    training_with_grad and indexer_loss_coeff > 0 and self.apply_dsa_kernel_fusion
                 )
-                if self.config.apply_rope_fusion:
-                    rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
-                        max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+
+                def compute_local_indexer_q_weights():
+                    nvtx_range_push("dsv4_cp_indexer_q_weights")
+                    q_indexer, _ = indexer.linear_wq_b(indexer_qr)
+                    q_indexer = q_indexer.reshape(
+                        l_local, indexer.index_n_heads, indexer.index_head_dim
                     )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
-                        q_indexer_cp,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                    )
-                else:
-                    rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
-                    rotary_pos_emb = (
-                        rope_result[0] if isinstance(rope_result, tuple) else rope_result
-                    )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
-                        q_indexer_cp,
-                        rotary_pos_emb,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                        self.config,
-                    )
-                q_indexer_cp = rotate_activation(q_indexer_cp)
-                weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
-                weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
+                    if self.config.apply_rope_fusion:
+                        rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
+                            max_seqlen_q, dtype=q_indexer.dtype, packed_seq=True, mscale=1.0
+                        )
+                        q_indexer = cp_utils.apply_thd_cp_local_rope_fused(
+                            q_indexer,
+                            rotary_pos_cos,
+                            rotary_pos_sin,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                        )
+                    else:
+                        rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+                        rotary_pos_emb = (
+                            rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                        )
+                        q_indexer = cp_utils.apply_thd_cp_local_rope_unfused(
+                            q_indexer,
+                            rotary_pos_emb,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                            self.config,
+                        )
+                    q_indexer = rotate_activation(q_indexer)
+                    weights_indexer, _ = indexer.linear_weights_proj(indexer_x)
+                    weights_indexer = weights_indexer.squeeze(1) * (indexer.index_n_heads**-0.5)
+                    nvtx_range_pop("dsv4_cp_indexer_q_weights")
+                    return q_indexer, weights_indexer
+
+                if not defer_compressed_kv_consumer_wait:
+                    q_indexer_cp, weights_indexer_cp = compute_local_indexer_q_weights()
 
                 nvtx_range_push("dsv4_cp_indexer_k_compressor")
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
@@ -2376,8 +2391,8 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_group_ids=compressed_group_ids,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_k_compressor")
-                # Launch the rank-major indexer-K gather before computing the
-                # attention compressor so NCCL can overlap with that work.
+                # Launch before the attention compressor and local indexer
+                # projections so NCCL can overlap with both independent paths.
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_launch")
                 k_indexer_gather = async_gather_from_sequence_parallel_region(
                     indexer_compressed_local.squeeze(1), group=cp_group
@@ -2394,18 +2409,30 @@ class CompressedSparseAttention(MegatronModule):
             )
             nvtx_range_pop("dsv4_cp_attention_kv_compressor")
             if indexer is not None:
-                # Queue the second AG on the same communicator in the same
-                # order on every rank. Its communication can overlap indexer
-                # top-k after the first AG becomes available.
-                nvtx_range_push("dsv4_cp_attention_kv_all_gather_launch")
-                compressed_kv_gather = async_gather_from_sequence_parallel_region(
-                    compressed_kv_local.squeeze(1), group=cp_group
-                )
-                nvtx_range_pop("dsv4_cp_attention_kv_all_gather_launch")
+                if defer_compressed_kv_consumer_wait:
+                    # Create this edge before the independent indexer projection
+                    # nodes. Autograd then executes those newer backward nodes
+                    # before this edge waits for the compressed-KV RS.
+                    local_compressed_kv_grad_edge, compressed_kv_rs_state = (
+                        defer_reduce_scatter_wait(compressed_kv_local.squeeze(1))
+                    )
+                    q_indexer_cp, weights_indexer_cp = compute_local_indexer_q_weights()
 
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_wait")
                 k_indexer_rank_major = k_indexer_gather.wait()
                 nvtx_range_pop("dsv4_cp_indexer_k_all_gather_wait")
+
+                compressed_kv_gather = None
+
+                def launch_compressed_kv_gather_after_score_init():
+                    nonlocal compressed_kv_gather
+                    if compressed_kv_gather is not None:
+                        raise RuntimeError("Compressed-KV all-gather was launched more than once")
+                    nvtx_range_push("dsv4_cp_attention_kv_all_gather_launch")
+                    compressed_kv_gather = async_gather_from_sequence_parallel_region(
+                        compressed_kv_local.squeeze(1), group=cp_group
+                    )
+                    nvtx_range_pop("dsv4_cp_attention_kv_all_gather_launch")
 
                 # Indexer top-k consumes sequence-major K rows. Capacity-tail
                 # map entries are unused by cu_seqlens_compressed.
@@ -2427,9 +2454,13 @@ class CompressedSparseAttention(MegatronModule):
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
                     use_fused=self.apply_dsa_kernel_fusion,
+                    after_score_init=launch_compressed_kv_gather_after_score_init,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
+                if compressed_kv_gather is None:
+                    # Empty top-k layouts bypass score initialization.
+                    launch_compressed_kv_gather_after_score_init()
                 nvtx_range_push("dsv4_cp_attention_kv_all_gather_wait")
                 compressed_kv_rank_major = compressed_kv_gather.wait()
                 nvtx_range_pop("dsv4_cp_attention_kv_all_gather_wait")
@@ -2511,6 +2542,8 @@ class CompressedSparseAttention(MegatronModule):
                 q_padding_mask = positions >= real_seqlens[batch_ids]
             loss_divisor = 1 if self.config.calculate_per_token_loss else l_local * cp_size
             if overlap_cp_backward:
+                if local_compressed_kv_grad_edge is None or compressed_kv_rs_state is None:
+                    raise RuntimeError("Compressed-KV RS consumer edge was not initialized")
                 output, indexer_loss = FusedIndexerSparseAttnFromTopkFunc.apply(
                     query,
                     kv_full_thd,
@@ -2531,10 +2564,11 @@ class CompressedSparseAttention(MegatronModule):
                     indexer_layout,
                     q_padding_mask,
                     indexer_compressed_local.squeeze(1),
-                    compressed_kv_local.squeeze(1),
+                    local_compressed_kv_grad_edge,
                     cp_group,
                     d_window + l_local,
                     seq_to_rank_row if not sparse_indexer_loss else None,
+                    compressed_kv_rs_state,
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(

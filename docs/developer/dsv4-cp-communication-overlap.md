@@ -17,14 +17,19 @@ Boundary-token P2P exchange is separate from the two collectives described here.
 The two local compressor outputs are gathered in a fixed order on the CP group:
 
 ```text
-compute: indexer-K compressor | attention-KV compressor | indexer top-k | sparse attention
-comm:                          | AG(indexer K)           | AG(attention KV)
+compute: indexer-K compressor | attention-KV compressor + local Q/weight projections
+comm:                          | AG(indexer K)
+
+compute: score-buffer init | indexer score + top-k | sparse attention
+comm:                       | AG(attention KV)
 ```
 
 `AG(indexer K)` is launched before the attention-KV compressor and waited on
-before top-k. `AG(attention KV)` is then launched and waited on only after
-top-k. This makes the first gather eligible to overlap the second compressor
-and the second gather eligible to overlap top-k. All ranks enqueue the
+before top-k. In the fused training path, the local indexer Q and weight
+projections are also placed between this launch and wait. `AG(attention KV)` is
+launched after the indexer score buffer is initialized and waited on only after
+top-k. This avoids overlapping NCCL with the score-buffer fill and makes the
+gather eligible to overlap score computation and top-k. All ranks enqueue the
 collectives in the same order.
 
 ## Backward
@@ -34,18 +39,20 @@ backward entry, the global indexer-K gradient is therefore ready before sparse
 attention backward produces the global compressed-KV gradient.
 
 ```text
-compute:        sparse-attention backward | local indexer-gradient preparation
-comm:    RS(indexer K)                     | RS(attention KV)
-                                              wait -> KV compressor backward
-                    wait -> indexer-K compressor backward
+compute:        sparse-attention backward | local Q/weight projection backward
+comm:    RS(indexer K)                     | RS(attention KV) -----------------> wait
+                    wait -> indexer-K compressor backward       KV compressor backward
 ```
 
 The fused autograd function owns both CP gradient reductions. It launches
 `RS(indexer K)` first and runs sparse-attention backward before waiting. Once
-the global attention-KV gradient is available, it launches `RS(attention KV)`,
-prepares the independent local Q/weight gradients, and waits at the first local
-gradient consumer. The gathered forward tensors are detached from the generic
-gather backward so each gradient is reduced exactly once.
+the global attention-KV gradient is available, it launches `RS(attention KV)`
+and returns its output through a deferred branch-local wait. That edge is
+created before the independent local Q and weight projection nodes, so PyTorch
+schedules those newer backward nodes before the wait. The KV compressor consumes
+the reduced gradient only after the wait completes. The gathered forward
+tensors are detached from the generic gather backward so each gradient is
+reduced exactly once.
 
 Both reduce-scatters use the same CP communicator and are enqueued in the same
 order on every rank. The unfused and no-indexer-loss paths keep the standard
@@ -64,5 +71,6 @@ ranges. The backward path emits these dedicated ranges:
 - `dsv4_cp_sparse_attention_backward`
 - `dsv4_cp_attention_kv_reduce_scatter_launch`
 - `dsv4_cp_local_indexer_grads`
+- `dsv4_cp_attention_kv_reduce_scatter_consumer_wait`
 
 The ranges are enabled by Megatron's `--nvtx-ranges` profiler option.

@@ -23,8 +23,9 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import inspect
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -39,6 +40,71 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 _flash_mla_sparse_fwd = None
 _DSA = None
+
+
+class _DeferredReduceScatterState:
+    """Carry one asynchronous reduce-scatter into its gradient consumer."""
+
+    def __init__(self):
+        self.handle = None
+
+
+class _WaitForDeferredReduceScatter(torch.autograd.Function):
+    """Wait only on the autograd branch that consumes the reduced gradient."""
+
+    @staticmethod
+    def forward(ctx, input_: Tensor, state: _DeferredReduceScatterState) -> Tensor:
+        ctx.state = state
+        return input_.view_as(input_)
+
+    @staticmethod
+    def backward(ctx, _grad_output: Tensor):
+        handle = ctx.state.handle
+        if handle is None:
+            raise RuntimeError("Deferred reduce-scatter was not launched before consumption")
+        nvtx_range_push("dsv4_cp_attention_kv_reduce_scatter_consumer_wait")
+        try:
+            reduced_gradient = handle.wait()
+        finally:
+            nvtx_range_pop("dsv4_cp_attention_kv_reduce_scatter_consumer_wait")
+        return reduced_gradient, None
+
+
+def defer_reduce_scatter_wait(input_: Tensor):
+    """Return a gradient edge whose backward waits for an attached collective."""
+    state = _DeferredReduceScatterState()
+    return _WaitForDeferredReduceScatter.apply(input_, state), state
+
+
+@lru_cache(maxsize=None)
+def _supports_post_output_init_callback(wrapper) -> bool:
+    """Return whether a cuDNN indexer wrapper exposes the output-init hook."""
+    try:
+        return "post_output_init_callback" in inspect.signature(wrapper).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_indexer_forward(
+    q: Tensor,
+    k: Tensor,
+    w: Tensor,
+    *,
+    post_output_init_callback: Optional[Callable[[], None]] = None,
+    **kwargs,
+):
+    """Run indexer forward and invoke the overlap hook at the best supported boundary."""
+    wrapper = _DSA.indexer_forward_wrapper
+    if post_output_init_callback is not None and _supports_post_output_init_callback(wrapper):
+        kwargs["post_output_init_callback"] = post_output_init_callback
+        return wrapper(q, k, w, **kwargs)
+
+    result = wrapper(q, k, w, **kwargs)
+    if post_output_init_callback is not None:
+        # Older cuDNN Frontend releases have no post-fill hook. Launching here
+        # still avoids the score-buffer fill and overlaps with radix top-k.
+        post_output_init_callback()
+    return result
 
 
 def _ensure_flash_mla():
@@ -483,6 +549,7 @@ def _indexer_topk_core(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
     q_causal_offsets: Optional[Tensor] = None,
+    after_score_init: Optional[Callable[[], None]] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Layout-agnostic core for :func:`indexer_topk`.
 
@@ -541,7 +608,14 @@ def _indexer_topk_core(
         )
         if q_causal_offsets is not None:
             forward_kwargs["q_causal_offsets"] = q_causal_offsets
-        scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(1), w, ratio=ratio, **forward_kwargs)[
+        scores = _call_indexer_forward(
+            q,
+            k.unsqueeze(1),
+            w,
+            ratio=ratio,
+            post_output_init_callback=after_score_init,
+            **forward_kwargs,
+        )[
             "scores"
         ]  # (total_q, max_seqlen_kv) fp32, -inf on masked positions
         # Defensive contiguify (wrapper may return a stride-padded slice).
@@ -567,7 +641,9 @@ def _indexer_topk_core(
 
         _ensure_dsa_namespace()
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
-        scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
+        scores = _call_indexer_forward(
+            q, k.unsqueeze(2), w, ratio=ratio, post_output_init_callback=after_score_init
+        )[
             "scores"
         ]  # (b, sq, sk) fp32, -inf on masked positions
         b, sq = q.shape[:2]
@@ -622,6 +698,7 @@ def indexer_topk(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
     q_causal_offsets: Optional[Tensor] = None,
+    after_score_init: Optional[Callable[[], None]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -645,6 +722,9 @@ def indexer_topk(
         max_seqlen_kv: THD only — per-batch max KV length.
         q_causal_offsets: THD only — optional ``(B,)`` int32 CUDA tensor. Entry
             ``b`` is the sequence-relative position of that segment's first Q.
+        after_score_init: optional callback invoked after the dense score
+            output is initialized and before score computation. Older cuDNN
+            Frontend releases invoke it after score computation instead.
 
     Returns:
         SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
@@ -688,6 +768,7 @@ def indexer_topk(
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
         q_causal_offsets=q_causal_offsets,
+        after_score_init=after_score_init,
     )
     return topk_indices, topk_length
 
@@ -1533,6 +1614,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         cp_group=None,
         compressed_kv_start: int = 0,
         indexer_rank_map: Optional[Tensor] = None,
+        compressed_kv_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -1694,6 +1776,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         ctx.cp_group = cp_group
         ctx.compressed_kv_start = int(compressed_kv_start)
+        ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
         ctx.indexer_grad_is_sequence_major = cp_group is not None and not sparse_loss
         ctx.save_for_backward(
             query,
@@ -1785,9 +1868,13 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 grad_compressed_kv, group=cp_group
             )
             nvtx_range_pop("dsv4_cp_attention_kv_reduce_scatter_launch")
+            if ctx.compressed_kv_reduce_scatter_state is not None:
+                ctx.compressed_kv_reduce_scatter_state.handle = compressed_kv_reduce_scatter
+                grad_local_compressed_kv = compressed_kv_reduce_scatter.tensor
 
         # These local branches do not consume either reduce-scatter result.
-        # Queue their kernels before waiting for the compressed-KV gradient.
+        # Queue them before the Indexer-K wait. The compressed-KV wait can be
+        # deferred further to its branch-local consumer edge.
         nvtx_range_push("dsv4_cp_local_indexer_grads")
         grad_q_indexer = saved_grad_q_indexer * grad_loss
         grad_weights = saved_grad_weights * grad_loss
@@ -1795,7 +1882,8 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
 
         if cp_group is not None:
             grad_local_k_indexer = indexer_reduce_scatter.wait()
-            grad_local_compressed_kv = compressed_kv_reduce_scatter.wait()
+            if ctx.compressed_kv_reduce_scatter_state is None:
+                grad_local_compressed_kv = compressed_kv_reduce_scatter.wait()
             grad_k_indexer = None
 
         return (
@@ -1819,6 +1907,7 @@ class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             grad_local_k_indexer,
             grad_local_compressed_kv,
+            None,
             None,
             None,
             None,

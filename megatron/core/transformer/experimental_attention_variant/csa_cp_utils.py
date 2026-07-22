@@ -7,7 +7,7 @@ retained compaction kernel; ``csa.py`` calls final-index lowering directly.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -312,6 +312,7 @@ def compute_cp_indexer_topk(
     indexer_softmax_scale: float,
     max_seqlen_q: int,
     use_fused: bool,
+    after_score_init: Optional[Callable[[], None]] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
     """Return local top-k and its local-Q/full-K packed layout."""
     topk_width = int(topk_width)
@@ -364,6 +365,8 @@ def compute_cp_indexer_topk(
         output = torch.full(
             (l_local, topk_width), -1, dtype=torch.int32, device=q_indexer_local.device
         )
+        if after_score_init is not None:
+            after_score_init()
         selected_width = min(topk_width, k_indexer_seq_major.shape[0])
         for start in range(0, l_local, 128):
             end = min(start + 128, l_local)
@@ -395,5 +398,6 @@ def compute_cp_indexer_topk(
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_kv=int(max_seqlen_kv),
         q_causal_offsets=q_causal_offsets,
+        after_score_init=after_score_init,
     )
     return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)

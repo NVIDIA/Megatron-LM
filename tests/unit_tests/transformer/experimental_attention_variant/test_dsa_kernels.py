@@ -658,6 +658,96 @@ class TestIndexerTopk:
     in a single fixture; sub-block names appear in failure messages.
     """
 
+    def test_indexer_forward_score_init_callback_uses_best_available_boundary(
+        self, reset_lazy_kernel_state
+    ):
+        q = torch.empty(1)
+        events = []
+
+        def callback():
+            events.append("callback")
+
+        def hooked_wrapper(q, k, w, *, post_output_init_callback=None, **kwargs):
+            events.append("hooked_enter")
+            post_output_init_callback()
+            events.append("hooked_exit")
+            return {"scores": q}
+
+        dk._DSA = types.SimpleNamespace(indexer_forward_wrapper=hooked_wrapper)
+        result = dk._call_indexer_forward(q, q, q, ratio=4, post_output_init_callback=callback)
+        assert result["scores"] is q
+        assert events == ["hooked_enter", "callback", "hooked_exit"]
+
+        events.clear()
+
+        def legacy_wrapper(q, k, w, **kwargs):
+            assert "post_output_init_callback" not in kwargs
+            events.append("legacy")
+            return {"scores": q}
+
+        dk._DSA = types.SimpleNamespace(indexer_forward_wrapper=legacy_wrapper)
+        result = dk._call_indexer_forward(q, q, q, ratio=4, post_output_init_callback=callback)
+        assert result["scores"] is q
+        assert events == ["legacy", "callback"]
+
+    def test_deferred_reduce_scatter_wait_is_branch_local(self):
+        source = torch.ones(4, requires_grad=True)
+        edge, state = dk.defer_reduce_scatter_wait(source)
+        events = []
+
+        class FakeHandle:
+            tensor = torch.full_like(source, 3.0)
+
+            def wait(self):
+                events.append("wait")
+                return self.tensor
+
+        state.handle = FakeHandle()
+        (edge * 2.0).sum().backward()
+
+        assert events == ["wait"]
+        assert torch.equal(source.grad, torch.full_like(source, 3.0))
+
+    def test_deferred_reduce_scatter_wait_runs_after_newer_branch(self):
+        events = []
+
+        class FakeHandle:
+            tensor = torch.ones(1)
+
+            def wait(self):
+                events.append("consumer_wait")
+                return self.tensor
+
+        class RecordBranch(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, input_):
+                return input_.view_as(input_)
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                events.append("independent_branch")
+                return grad_output
+
+        class JoinBranches(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, delayed, independent):
+                return delayed + independent
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                events.append("fused")
+                return grad_output, grad_output
+
+        source = torch.ones(1, requires_grad=True)
+        independent = torch.ones(1, requires_grad=True)
+        delayed, state = dk.defer_reduce_scatter_wait(source)
+        state.handle = FakeHandle()
+        newer_branch = RecordBranch.apply(independent)
+
+        JoinBranches.apply(delayed, newer_branch).sum().backward()
+
+        assert events == ["fused", "independent_branch", "consumer_wait"]
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_indexer_topk_wrapper(self, reset_lazy_kernel_state):
         """Combined assertions for:
