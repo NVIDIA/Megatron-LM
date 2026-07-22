@@ -9,7 +9,6 @@ Sharding the experts must be numerically transparent (matches an unsharded basel
 and must place each expert weight on the size-2 expert-DP sub-mesh (ep excluded).
 """
 
-import logging
 
 import pytest
 import torch
@@ -23,27 +22,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
 )
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_submodules,
-)
-from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.spec_utils import get_submodules
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
-
-logger = logging.getLogger(__name__)
-
-try:
-    import transformer_engine  # noqa: F401
-
-    HAVE_TE = True
-except Exception:  # pragma: no cover - import guard
-    HAVE_TE = False
-
-try:
-    from megatron.training.initialize import _set_random_seed
-except Exception:  # pragma: no cover
-    _set_random_seed = None
 
 EP_SIZE = 4
 FSDP_SIZE = 2
@@ -75,13 +58,10 @@ def _moe_config() -> TransformerConfig:
 
 
 def _build_moe_layer(config: TransformerConfig) -> MoELayer:
-    submodules = get_submodules(
-        get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=NUM_MOE_EXPERTS, moe_grouped_gemm=True
-        ).mlp
-    )
-    assert isinstance(submodules, MoESubmodules)
-    return MoELayer(config, submodules)
+    # get_moe_module_spec builds the MoE submodules directly (the hybrid-model path);
+    # avoid get_gpt_layer_with_transformer_engine_submodules, which is GPT-layer-specific.
+    moe_builder = get_moe_module_spec(use_te=True, num_experts=NUM_MOE_EXPERTS, moe_grouped_gemm=True)
+    return moe_builder(config)
 
 
 def _build_expert_dp_mesh(device: torch.device):
@@ -99,7 +79,6 @@ def _build_expert_dp_mesh(device: torch.device):
     return mesh
 
 
-@pytest.mark.skipif(not HAVE_TE, reason="TransformerEngine is required.")
 def test_moe_layer_experts_shard_over_expert_dp(distributed_setup):
     """Sharding a MoELayer's experts with mFSDP v2 is transparent and uses expert-DP."""
     world_size = distributed_setup.world_size
@@ -108,8 +87,6 @@ def test_moe_layer_experts_shard_over_expert_dp(distributed_setup):
         pytest.skip(f"This test requires exactly {WORLD_SIZE} ranks (ep={EP_SIZE}, fsdp={FSDP_SIZE}).")
     if device.type != "cuda":
         pytest.skip("MoE GroupedMLP requires CUDA.")
-    if _set_random_seed is None:
-        pytest.skip("megatron.training is required for RNG setup.")
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
@@ -150,34 +127,38 @@ def test_moe_layer_experts_shard_over_expert_dp(distributed_setup):
         baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.02, foreach=False)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.02, foreach=False)
 
-        # Identical input on every rank so FSDP's expert-DP averaging is a no-op and
-        # the sharded layer must match the unsharded baseline exactly.
+        # Identical input on every rank. mFSDP shards only the experts, so with matching
+        # data the expert-DP gradient reduction is a no-op and the sharded layer must
+        # reproduce the unsharded one exactly. This checks that mFSDP's all-gather /
+        # reduce-scatter / DTensor plumbing is numerically transparent inside a real MoE
+        # layer (router + all-to-all dispatch + TEGroupedMLP). The expert-DP averaging
+        # *correctness* is covered separately, against a distinct-data baseline, in
+        # test_expert_parallel.py.
         torch.manual_seed(4321)
         x = torch.randn(SEQ, BATCH, HIDDEN, device=device)
         target = torch.randn(SEQ, BATCH, HIDDEN, device=device)
 
-        def train(layer, layer_optimizer, log_prefix) -> list[torch.Tensor]:
+        def train(layer, layer_optimizer) -> list[torch.Tensor]:
             losses = []
-            for step in range(5):
+            for _ in range(5):
                 layer_optimizer.zero_grad()
                 output = layer(x)
                 output = output[0] if isinstance(output, tuple) else output
                 loss = torch.nn.functional.mse_loss(output, target)
                 losses.append(loss.detach())
-                logger.debug("%s parity: step=%s, loss=%s", log_prefix, step, loss)
                 loss.backward()
                 layer_optimizer.step()
             return losses
 
-        baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-        sharded_losses = train(model, optimizer, "EP-FSDP")
+        baseline_losses = train(baseline, baseline_optimizer)
+        sharded_losses = train(model, optimizer)
 
         torch.testing.assert_close(
             torch.stack(sharded_losses),
             torch.stack(baseline_losses),
             rtol=1e-4,
             atol=1e-5,
-            msg="MoELayer expert-sharded losses did not match the unsharded baseline.",
+            msg="MoELayer expert sharding was not numerically transparent vs the unsharded layer.",
         )
     finally:
         Utils.destroy_model_parallel()

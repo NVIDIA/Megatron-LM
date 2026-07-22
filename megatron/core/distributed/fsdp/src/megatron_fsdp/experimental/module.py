@@ -367,32 +367,19 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
 def _select_dp_mesh(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> DeviceMesh:
     """Return the data-parallel sub-mesh that FSDP shards and communicates over.
 
-    ``dp_axes`` names the data-parallel axes of ``mesh``; FSDP shards over exactly
-    those axes and ignores the rest (for example an expert-parallel axis). When
-    ``dp_axes`` already spans the whole mesh in order, ``mesh`` is returned as-is so
-    plain-FSDP and HSDP behavior is unchanged. Otherwise the named sub-mesh is
-    selected, which requires ``mesh`` to carry ``mesh_dim_names``.
+    ``dp_axes`` names the mesh axes FSDP shards over; any others (for example an
+    expert-parallel axis) are left untouched. When ``dp_axes`` spans the whole mesh,
+    ``mesh`` is returned unchanged -- this preserves plain-FSDP and HSDP behavior and
+    covers meshes without dim names. Otherwise the named sub-mesh is selected.
     """
     axis_indices = tuple(_axis_index(mesh, axis) for axis in dp_axes)
-    if len(set(axis_indices)) != len(axis_indices):
-        raise ValueError(
-            f"Placements.dp_axes must reference distinct mesh axes, got {list(dp_axes)}."
-        )
-    if list(axis_indices) != sorted(axis_indices):
-        raise ValueError(
-            f"Placements.dp_axes must be in ascending mesh-axis order, got {list(dp_axes)}."
-        )
     if axis_indices == tuple(range(mesh.ndim)):
         return mesh
-
     dim_names = mesh.mesh_dim_names
     if dim_names is None:
-        raise ValueError(
-            "Selecting a data-parallel sub-mesh from a subset of mesh axes requires a "
-            "DeviceMesh with mesh_dim_names."
-        )
-    selected_names = tuple(dim_names[index] for index in axis_indices)
-    return mesh[selected_names] if len(selected_names) > 1 else mesh[selected_names[0]]
+        raise ValueError("Sharding over a subset of mesh axes requires a named DeviceMesh.")
+    # DeviceMesh sub-selection is by dim name only (integer indexing is unsupported).
+    return mesh[tuple(dim_names[index] for index in axis_indices)]
 
 
 def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:

@@ -8,16 +8,16 @@ data-parallel (``fsdp``) axis. FSDP must shard and communicate over the ``fsdp``
 axis alone, leaving the expert-parallel (``ep``) axis untouched.
 
 The expert module is a real per-expert TransformerEngine ``GroupedLinear`` (one
-weight tensor per local expert). Experts are distinct across ep groups and
-identical within each fsdp pair, so single-rank SGD parity is the discriminating
-check: if FSDP reduced gradients over the ``ep`` axis instead of ``fsdp``, the
-distinct-per-ep data would make training diverge from the per-group baseline.
+weight tensor per local expert), sharded over the ``fsdp`` sub-mesh. Each fsdp rank
+in a pair gets a distinct microbatch, so FSDP's expert-DP gradient averaging is
+exercised for real; the sharded model is checked against an unsharded baseline that
+trains on both microbatches with gradient averaging -- the true data-parallel
+equivalent.
 """
-
-import logging
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
@@ -26,16 +26,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
 )
-
-logger = logging.getLogger(__name__)
-
-try:
-    import transformer_engine.pytorch as te
-
-    HAVE_TE = True
-except Exception:  # pragma: no cover - import guard
-    te = None
-    HAVE_TE = False
 
 EP_SIZE = 4
 FSDP_SIZE = 2
@@ -81,10 +71,8 @@ def _grouped_forward(layer: "te.GroupedLinear", x: torch.Tensor) -> torch.Tensor
     return out[0] if isinstance(out, tuple) else out
 
 
-@pytest.mark.skipif(not HAVE_TE, reason="TransformerEngine is required.")
 def test_expert_parallel_grouped_linear_matches_baseline(distributed_setup):
-    """FSDP over the fsdp axis of an (ep, fsdp) mesh must match single-rank SGD."""
-    rank = distributed_setup.rank
+    """FSDP over the fsdp axis of an (ep, fsdp) mesh must match a data-parallel baseline."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size != WORLD_SIZE:
@@ -93,8 +81,8 @@ def test_expert_parallel_grouped_linear_matches_baseline(distributed_setup):
         pytest.skip("TransformerEngine GroupedLinear requires CUDA.")
 
     mesh = init_device_mesh(device.type, (EP_SIZE, FSDP_SIZE), mesh_dim_names=("ep", "fsdp"))
-    # Experts (and data) are keyed by ep index: distinct across ep groups, identical
-    # within an fsdp pair (both fsdp ranks share the same ep index).
+    # Experts are keyed by ep index: distinct across ep groups, identical within an
+    # fsdp pair (both fsdp ranks host the same experts, which FSDP shards over fsdp).
     ep_index = mesh["ep"].get_local_rank()
 
     torch.manual_seed(1000 + ep_index)
@@ -118,33 +106,58 @@ def test_expert_parallel_grouped_linear_matches_baseline(distributed_setup):
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
+    fsdp_index = mesh["fsdp"].get_local_rank()
     total_tokens = TOKENS_PER_EXPERT * NUM_LOCAL_EXPERTS
-    torch.manual_seed(2000 + ep_index)
-    # TE's grouped GEMM only builds the wgrad graph when the input requires grad
-    # (as activations from prior layers do in a real model).
-    x = torch.randn(total_tokens, IN_FEATURES, device=device, requires_grad=True)
-    target = torch.randn(total_tokens, OUT_FEATURES, device=device)
+    # One DISTINCT microbatch per fsdp rank in the pair, so FSDP's expert-DP AVG
+    # gradient reduction is exercised for real (not a no-op over identical data).
+    # Both ranks generate the whole set deterministically from ep_index. The FSDP
+    # model trains on this rank's microbatch; the unsharded baseline trains on the
+    # whole set with gradient averaging -- the true data-parallel equivalent. Because
+    # both apply the same averaged gradient every step, their weights stay in lockstep,
+    # so the FSDP loss on this rank's microbatch must equal the baseline's loss on the
+    # same microbatch. TE's grouped GEMM needs the input to require grad.
+    microbatch_inputs, microbatch_targets = [], []
+    for microbatch in range(FSDP_SIZE):
+        torch.manual_seed(2000 + ep_index * FSDP_SIZE + microbatch)
+        microbatch_inputs.append(
+            torch.randn(total_tokens, IN_FEATURES, device=device, requires_grad=True)
+        )
+        microbatch_targets.append(torch.randn(total_tokens, OUT_FEATURES, device=device))
 
-    def train(module, module_optimizer, log_prefix) -> list[torch.Tensor]:
+    def loss_on(module, x, target):
+        return torch.nn.functional.mse_loss(_grouped_forward(module, x), target)
+
+    def train_sharded() -> list[torch.Tensor]:
+        x, target = microbatch_inputs[fsdp_index], microbatch_targets[fsdp_index]
         losses = []
-        for step in range(5):
-            module_optimizer.zero_grad()
-            loss = torch.nn.functional.mse_loss(_grouped_forward(module, x), target)
+        for _ in range(5):
+            optimizer.zero_grad()
+            loss = loss_on(model, x, target)
             losses.append(loss.detach())
-            logger.debug(
-                "%s parity: rank=%s, ep=%s, step=%s, loss=%s", log_prefix, rank, ep_index, step, loss
-            )
-            loss.backward()
-            module_optimizer.step()
+            loss.backward()  # FSDP AVG-reduces the gradient across the fsdp pair.
+            optimizer.step()
         return losses
 
-    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "EP-FSDP")
+    def train_baseline() -> list[torch.Tensor]:
+        losses = []
+        for _ in range(5):
+            baseline_optimizer.zero_grad()
+            step_losses = []
+            for x, target in zip(microbatch_inputs, microbatch_targets):
+                loss = loss_on(baseline, x, target)
+                step_losses.append(loss.detach())
+                (loss / FSDP_SIZE).backward()  # accumulate, scaled to a mean.
+            losses.append(step_losses[fsdp_index])
+            baseline_optimizer.step()
+        return losses
+
+    sharded_losses = train_sharded()
+    baseline_losses = train_baseline()
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
         rtol=1e-4,
         atol=1e-5,
-        msg="EP+FSDP per-expert sharded losses did not match single-rank baseline losses.",
+        msg="EP+FSDP sharded losses did not match the data-parallel unsharded baseline.",
     )
