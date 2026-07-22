@@ -114,7 +114,9 @@ def test_block_usage_counts_no_prefix_caching(
 )
 def test_prefix_caching_state_layout(policy, expect_timestamps):
     """Prefix-caching mode allocates block_hashes (initially -1) and ref_counts
-    (initially 0). LRU policy also allocates timestamps; REF_ZERO does not."""
+    (initially 0). LRU policy also allocates timestamps and the persisted
+    prefix-forest bookkeeping (block_parent_id / block_child_count); REF_ZERO
+    does not."""
     a = KVBlockAllocator(
         _make_context(),
         total_count=8,
@@ -124,9 +126,13 @@ def test_prefix_caching_state_layout(policy, expect_timestamps):
     )
     assert (a.block_hashes == -1).all().item()
     assert (a.block_ref_counts == 0).all().item()
-    assert (a.block_parent_hashes == 0).all().item()
     assert a.kv_hash_to_block_id == {}
     assert hasattr(a, "block_timestamps") is expect_timestamps
+    assert hasattr(a, "block_parent_id") is expect_timestamps
+    assert hasattr(a, "block_child_count") is expect_timestamps
+    if expect_timestamps:
+        assert (a.block_parent_id == -1).all().item()
+        assert (a.block_child_count == 0).all().item()
 
 
 def test_prefix_caching_allocate_and_hash_registration():
@@ -147,20 +153,18 @@ def test_prefix_caching_allocate_and_hash_registration():
     assert (a.block_ref_counts[ids] == 1).all().item()
 
     # Hash registration populates both the tensor and the dict. Parent hashes are
-    # optional and default to 0 (root) when omitted.
+    # ignored under REF_ZERO (they only drive LRU eviction ordering), so this mode
+    # keeps no per-block parent bookkeeping.
     a.register_kv_block_hashes(block_ids=[1, 3], block_hashes=[111, 333])
     assert a.block_hashes[1].item() == 111
     assert a.block_hashes[3].item() == 333
-    assert a.block_parent_hashes[1].item() == 0
-    assert a.block_parent_hashes[3].item() == 0
+    assert not hasattr(a, "block_parent_id")
     assert a.kv_hash_to_block_id == {111: 1, 333: 3}
 
-    # When supplied, parent hashes are recorded per block.
+    # Supplying parent hashes is accepted (and ignored) under REF_ZERO.
     a.register_kv_block_hashes(block_ids=[2, 4], block_hashes=[222, 444], parent_hashes=[111, 222])
-    assert a.block_parent_hashes[2].item() == 111
-    assert a.block_parent_hashes[4].item() == 222
 
-    # Mismatched parent-hash length is rejected.
+    # Mismatched parent-hash length is rejected regardless of policy.
     with pytest.raises(AssertionError):
         a.register_kv_block_hashes(block_ids=[5], block_hashes=[555], parent_hashes=[1, 2])
 
@@ -237,13 +241,13 @@ def _seed_cached_chain(a, block_ids, hashes, parents, timestamps):
 def _assert_prefix_invariant(a):
     """Every cached block must have its parent cached too (or be a root). This is
     exactly the invariant _find_kv_match_count relies on."""
-    present = set(a.kv_hash_to_block_id.keys())
+    cached_ids = set(a.kv_hash_to_block_id.values())
     for block_hash, block_id in a.kv_hash_to_block_id.items():
-        parent = a.block_parent_hashes[block_id].item()
-        if parent != 0:
-            assert parent in present, (
+        parent_id = a.block_parent_id[block_id].item()
+        if parent_id >= 0:
+            assert parent_id in cached_ids, (
                 f"dangling child: block {block_id} (hash {block_hash}) parent "
-                f"{parent} not cached"
+                f"block {parent_id} not cached"
             )
 
 
@@ -261,7 +265,9 @@ def test_evict_lru_never_orphans_a_child():
     # The leaf (b2, hash 30) is evicted, not the older parent b1 (hash 20).
     assert a.kv_hash_to_block_id == {10: 0, 20: 1}
     assert a.block_hashes[2].item() == -1
-    assert a.block_parent_hashes[2].item() == 0
+    assert a.block_parent_id[2].item() == -1
+    # Evicting the leaf drops it from its parent's child count.
+    assert a.block_child_count[1].item() == 0
     _assert_prefix_invariant(a)
 
 
@@ -508,9 +514,7 @@ def test_evict_lru_preserves_invariant_under_random_chains():
         _seed_cached_chain(a, block_ids, hashes, parents, timestamps)
 
         k_evict = int(torch.randint(1, n + 1, (1,)).item())
-        expected_evicted = _reference_leaf_peel(
-            block_ids, hashes, parents, timestamps, k_evict
-        )
+        expected_evicted = _reference_leaf_peel(block_ids, hashes, parents, timestamps, k_evict)
 
         assert a.evict_lru_blocks(k_evict) is True
         retained = set(a.kv_hash_to_block_id.values())

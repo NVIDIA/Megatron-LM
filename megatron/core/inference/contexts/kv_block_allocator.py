@@ -59,15 +59,6 @@ class KVBlockAllocator:
             # Hash-to-block mapping for O(1) prefix lookup
             self.kv_hash_to_block_id: Dict[int, int] = {}
 
-            # Parent hash per block for prefix-chain bookkeeping: 0 = no parent
-            # (root block or unregistered). Block hashes are parent-chained, so a
-            # cached block whose hash is some other cached block's parent must not
-            # be evicted before its child (see evict_lru_blocks). Valid hashes are
-            # in [1, 2^63-1], so 0 is a safe "no parent" sentinel.
-            self.block_parent_hashes = torch.zeros(
-                (self.total_count,), dtype=torch.int64, device='cpu'
-            )
-
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
                 (self.total_count,), dtype=torch.int32, device='cpu'
@@ -77,6 +68,24 @@ class KVBlockAllocator:
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps = torch.zeros(
+                    (self.total_count,), dtype=torch.int64, device='cpu'
+                )
+
+                # Persisted prefix-chain bookkeeping for LRU eviction, maintained
+                # incrementally on register/deregister. Block hashes are
+                # parent-chained: a cached block that is another cached block's
+                # parent must not be evicted before its child (see evict_lru_blocks).
+                #
+                # block_parent_id[b] = block id of b's parent in the prefix chain,
+                #   or -1 when b is a root block or its parent is not registered.
+                self.block_parent_id = torch.full(
+                    (self.total_count,), -1, dtype=torch.int64, device='cpu'
+                )
+                # block_child_count[b] = number of currently-registered children of b.
+                # For a cached block all of its children are cached too, so this
+                # equals its cached-child count and b is an evictable leaf exactly
+                # when it reaches 0.
+                self.block_child_count = torch.zeros(
                     (self.total_count,), dtype=torch.int64, device='cpu'
                 )
 
@@ -270,10 +279,11 @@ class KVBlockAllocator:
 
             # Reset prefix caching state
             self.kv_hash_to_block_id.clear()
-            self.block_parent_hashes.fill_(0)
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
+                self.block_parent_id.fill_(-1)
+                self.block_child_count.fill_(0)
 
         # Clear per-block routing storage
         self.block_routing.clear()
@@ -305,10 +315,30 @@ class KVBlockAllocator:
         self.block_hashes[id_tensor] = hash_tensor
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
-            self.block_parent_hashes[id_tensor] = torch.tensor(
-                parent_hashes, dtype=torch.int64, device=self.block_hashes.device
-            )
+        # Add the new blocks to the hash map first so that a block whose parent is
+        # elsewhere in this same batch (block k's parent is block k-1) resolves.
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            # Persist the resolved parent block id and bump each parent's child count.
+            # Parents are earlier in the prefix chain and already registered
+            # (a matched block or a prior chunk / earlier entry in this batch),
+            # so a valid parent hash resolves; 0 marks a root and an unknown hash
+            # falls back to -1.
+            if parent_hashes is None:
+                parent_hashes = [0] * len(block_ids)
+            parent_ids = [
+                self.kv_hash_to_block_id.get(ph, -1) if ph != 0 else -1 for ph in parent_hashes
+            ]
+            parent_id_tensor = torch.tensor(parent_ids, dtype=torch.int64, device=id_tensor.device)
+            self.block_parent_id[id_tensor] = parent_id_tensor
+            has_parent = parent_id_tensor >= 0
+            if has_parent.any():
+                self.block_child_count.scatter_add_(
+                    0,
+                    parent_id_tensor[has_parent],
+                    torch.ones(int(has_parent.sum()), dtype=torch.int64),
+                )
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -338,11 +368,23 @@ class KVBlockAllocator:
             self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
-        self.block_hashes[block_ids] = -1
-        self.block_parent_hashes[block_ids] = 0
-        self.block_ref_counts[block_ids] = 0
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+            # Drop these blocks from their parents' child counts before clearing
+            # their own bookkeeping, keeping block_child_count in sync so a parent
+            # becomes an evictable leaf once its last child is deregistered.
+            parent_ids = self.block_parent_id[block_ids_i64]
+            has_parent = parent_ids >= 0
+            if has_parent.any():
+                self.block_child_count.scatter_add_(
+                    0,
+                    parent_ids[has_parent],
+                    torch.full((int(has_parent.sum()),), -1, dtype=torch.int64),
+                )
+            self.block_parent_id[block_ids] = -1
+            self.block_child_count[block_ids] = 0
             self.block_timestamps[block_ids] = 0
+        self.block_hashes[block_ids] = -1
+        self.block_ref_counts[block_ids] = 0
 
         # Return blocks to free pool
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
@@ -411,6 +453,12 @@ class KVBlockAllocator:
         (ref_count == 0) block can only have cached children, and considering the
         cached set alone is sufficient to avoid dangling children.
 
+        The parent block id of each block and its live child count are maintained
+        incrementally on register/deregister (``block_parent_id`` /
+        ``block_child_count``), so this method reads the prefix forest directly
+        rather than rebuilding it from hashes with a per-eviction sort. Only the
+        inherently-sequential leaf peel below is per-element.
+
         The parent graph is assumed acyclic (a forest), which holds for any hashes
         produced by the prefix-chain builder; an assertion guards against a
         pathological hash collision wedging the peel.
@@ -431,32 +479,16 @@ class KVBlockAllocator:
         if num_blocks_needed <= 0:
             return True
 
-        own_ts = self.block_timestamps[cached_block_ids]
-        hashes = self.block_hashes[cached_block_ids]
-        parents = self.block_parent_hashes[cached_block_ids]
-
-        # Resolve each block's parent hash to the local index of the parent block,
-        # or -1 when the parent is not cached (root block with parent hash 0, or a
-        # parent still in use). Hashes are unique per cached block, so a single
-        # sorted lookup suffices. This O(num_cached log num_cached) setup stays
-        # vectorized; only the inherently-sequential peel below is per-element.
-        sorted_hashes, sort_order = torch.sort(hashes)
-        pos = torch.searchsorted(sorted_hashes, parents).clamp(max=num_cached - 1)
-        found = sorted_hashes[pos] == parents
-        parent_idx = torch.where(found, sort_order[pos], torch.full_like(pos, -1))
-        has_parent = parent_idx >= 0
-
-        # Number of cached children per block; a block is an evictable leaf once
-        # this reaches 0.
-        child_count = torch.zeros(num_cached, dtype=torch.int64)
-        child_count.scatter_add_(
-            0, parent_idx[has_parent], torch.ones(int(has_parent.sum()), dtype=torch.int64)
-        )
-
-        parent_local = parent_idx.tolist()
-        child_count = child_count.tolist()
-        ts = own_ts.tolist()
+        ts = self.block_timestamps[cached_block_ids].tolist()
         bid = cached_block_ids.tolist()
+        parent_global = self.block_parent_id[cached_block_ids].tolist()
+        child_count = self.block_child_count[cached_block_ids].tolist()
+
+        # Map a cached block's global id to its local index so the peel can find a
+        # parent's slot to decrement. Parents that are not cached (root, or a
+        # parent still in use) are absent and are simply treated as peel roots.
+        global_to_local = {bid[i]: i for i in range(num_cached)}
+        parent_local = [global_to_local.get(p, -1) for p in parent_global]
 
         # Min-heap of currently-evictable leaves keyed by (own timestamp, block
         # id). Block ids are unique, so the tie-break is total and deterministic.

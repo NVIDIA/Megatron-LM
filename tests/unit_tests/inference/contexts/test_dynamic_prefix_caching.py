@@ -492,8 +492,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_hashes[s0].item() == h0
         assert alloc.block_hashes[s1].item() == h1
         assert alloc.block_hashes[sx].item() == h2
-        assert alloc.block_parent_hashes[s1].item() == h0
-        assert alloc.block_parent_hashes[sx].item() == h1
+        # Parent bookkeeping is stored as resolved block ids: S1's parent is S0
+        # and SX's parent is S1 along the H0 -> H1 -> H2 chain.
+        assert alloc.block_parent_id[s1].item() == s0
+        assert alloc.block_parent_id[sx].item() == s1
         assert alloc.kv_hash_to_block_id[h1] == s1
 
     @pytest.mark.internal
