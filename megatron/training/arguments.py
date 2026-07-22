@@ -1978,7 +1978,7 @@ def _add_inference_args(parser):
                        'covers both the durable cache (the ssm_states/conv_states '
                        'slots reused across requests) and the per-step extraction '
                        'scratch (the intermediate_ssm_out/intermediate_conv_out '
-                       'buffers, sized to min(ceil(max_tokens / block_size) + 1, '
+                       'buffers, sized to min(ceil(max_tokens / block_size), '
                        '3 * max_requests) slots); the scratch is reserved first, so a '
                        'smaller max_tokens (or max_requests) shrinks the scratch and '
                        'leaves more durable slots.')
