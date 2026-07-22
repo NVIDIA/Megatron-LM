@@ -14,11 +14,14 @@
 
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpModule
+from .module import FsdpContext, FsdpModule
 from .placement import Placements
 
 
@@ -29,13 +32,13 @@ def fully_shard(
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     use_symm_mem: bool = False,
 ) -> None:
-    """Shard one module as a per-module FSDP unit.
+    """Apply FSDP to a module in place.
 
     This attaches the FSDP mixin to the original module instance, so parent
     modules do not need to replace existing child-module references.
 
     Args:
-        module: Module whose currently unowned parameters become this FSDP unit.
+        module: Module whose currently unowned parameters are managed by FSDP.
         mesh: Device mesh used for sharding.
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
@@ -63,9 +66,40 @@ def fully_shard(
         raise
 
 
+@contextmanager
+def microbatch(module: nn.Module, is_last: bool) -> Iterator[None]:
+    """Scope FSDP state to one microbatch.
+
+    Args:
+        module: Module tree whose FSDP roots should use this microbatch state.
+        is_last: Whether forwards in this scope are for the last microbatch.
+    """
+    contexts: list[FsdpContext] = []
+    _collect_fsdp_contexts(module, contexts)
+    previous_states = [(context, context.is_last_microbatch) for context in contexts]
+    for context in contexts:
+        context.is_last_microbatch = is_last
+
+    try:
+        yield
+    finally:
+        for context, is_last_microbatch in previous_states:
+            context.is_last_microbatch = is_last_microbatch
+
+
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
     module_cls = module.__class__
     fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
     module.__class__ = fsdp_cls
+
+
+def _collect_fsdp_contexts(module: nn.Module, contexts: list[FsdpContext]) -> None:
+    if isinstance(module, FsdpModule):
+        module._lazy_init_context()
+        contexts.append(module.context)
+        return
+
+    for child in module.children():
+        _collect_fsdp_contexts(child, contexts)

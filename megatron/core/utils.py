@@ -2492,7 +2492,9 @@ def get_batch_on_this_tp_rank(
         local_cp_size = None
 
         if has_cu_seqlens or is_hybrid_cp:
-            max_seqlen = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
+            max_seqlen = torch.empty(
+                micro_batch_size, dtype=torch.int32, device=torch.cuda.current_device()
+            )
         if create_attention_mask_in_dataloader:
             attention_mask = torch.empty(
                 (micro_batch_size, 1, seq_length, seq_length),
@@ -2514,13 +2516,21 @@ def get_batch_on_this_tp_rank(
                 return None
 
             # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim
-            # throughout (mbs=1 for packed sequences). Allocate (1, n) so the
-            # shape on receiving ranks matches the (1, n) tensor TP rank 0 sent.
-            cu_seqlens = torch.empty((1, n), dtype=torch.int32, device=dev)
+            # (micro_batch_size, padded_len) after default_collate. Preserve
+            # the 2-D layout so flatten_batch_for_packed_sequences can merge
+            # samples correctly when micro_batch_size > 1.
+            assert n % micro_batch_size == 0, (
+                f"cu_seqlens numel ({n}) is not divisible by "
+                f"micro_batch_size ({micro_batch_size})"
+            )
+            cu_seqlens = torch.empty(
+                (micro_batch_size, n // micro_batch_size), dtype=torch.int32, device=dev
+            )
             _broadcast(cu_seqlens)
-            assert (
-                cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-            ), f"Expected cu_seqlens shape (1, n), got {tuple(cu_seqlens.shape)}"
+            assert cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == micro_batch_size, (
+                f"Expected cu_seqlens shape ({micro_batch_size}, "
+                f"{n // micro_batch_size}), got {tuple(cu_seqlens.shape)}"
+            )
             assert (
                 cu_seqlens.dtype == torch.int32
             ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
