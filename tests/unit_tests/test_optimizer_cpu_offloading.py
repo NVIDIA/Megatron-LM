@@ -245,12 +245,12 @@ def test_reload_model_params_reseeds_internal_copies(offload_fraction, param_upd
 def test_distributed_optimizer_reloads_hybrid_optimizer(use_precision_aware_optimizer):
     """``DistributedOptimizer`` must reach ``HybridDeviceOptimizer.reload_model_params``.
 
-    ``_copy_model_params_to_main_params`` returns early when
-    ``use_precision_aware_optimizer_no_fp8_or_ds_fp8`` is set, and
+    ``_copy_model_params_to_main_params`` used to call ``update_fp32_param_by_new_param``
+    here, which refreshes the FP32 working copies but leaves the pinned CPU clones stale.
+    The re-seed must not be gated on ``use_precision_aware_optimizer_no_fp8_or_ds_fp8``:
     ``optimizer_cpu_offload`` forces that flag on (see ``OptimizerConfig`` and the
     ``--optimizer-cpu-offload`` assertion in ``megatron/training/arguments.py``), so
-    that early-return path is the one CPU offloading actually takes. Both branches
-    must re-seed the optimizer's internal copies.
+    gating on it either way is easy to get wrong. Both settings must re-seed.
     """
     # `spec` makes `isinstance` succeed and pins the method name: renaming
     # `reload_model_params` turns this into an AttributeError rather than a
@@ -275,6 +275,45 @@ def test_distributed_optimizer_reloads_hybrid_optimizer(use_precision_aware_opti
     DistributedOptimizer._copy_model_params_to_main_params(stub)
 
     hdo.reload_model_params.assert_called_once_with()
+
+
+def _distopt_stub(optimizer, use_megatron_fsdp=False, use_precision_aware_optimizer=True):
+    """Minimal stand-in for ``DistributedOptimizer``; see the test above."""
+    return SimpleNamespace(
+        ddp_config=SimpleNamespace(use_megatron_fsdp=use_megatron_fsdp),
+        config=SimpleNamespace(
+            use_precision_aware_optimizer_no_fp8_or_ds_fp8=use_precision_aware_optimizer
+        ),
+        optimizer=optimizer,
+        model_float16_groups=[],
+        model_fp32_groups=[],
+        shard_fp32_from_float16_groups=[],
+        shard_fp32_groups=[],
+    )
+
+
+def test_megatron_fsdp_with_hybrid_optimizer_reloads():
+    """Megatron-FSDP + CPU offload must keep working, not raise.
+
+    The ``HybridDeviceOptimizer`` branch sits above the Megatron-FSDP
+    ``NotImplementedError``, so this combination returns early and never raises.
+    Reordering the two would start failing a configuration that works today.
+    """
+    hdo = MagicMock(spec=HybridDeviceOptimizer)
+
+    DistributedOptimizer._copy_model_params_to_main_params(
+        _distopt_stub(hdo, use_megatron_fsdp=True)
+    )
+
+    hdo.reload_model_params.assert_called_once_with()
+
+
+def test_megatron_fsdp_without_hybrid_optimizer_still_raises():
+    """Megatron-FSDP without CPU offload keeps raising, as before."""
+    with pytest.raises(NotImplementedError, match="Megatron-FSDP"):
+        DistributedOptimizer._copy_model_params_to_main_params(
+            _distopt_stub(MagicMock(spec=Adam), use_megatron_fsdp=True)
+        )
 
 
 @pytest.mark.skipif(
