@@ -15,19 +15,46 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 import torch
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule
-from .placement import MeshAxis, Placements
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
+
+MeshAxis = int | str
+
+
+@dataclasses.dataclass(frozen=True)
+class Placements:
+    """Per-data-parallel-axis placements for MFSDP buffers.
+
+    ``dp_axes`` identifies the parent-mesh axes that form MFSDP's data-parallel
+    mesh. Placement sequences are ordered to match those axes.
+    """
+
+    dp_axes: Sequence[MeshAxis]
+    parameter: Sequence[Placement]
+    gradient: Sequence[Placement]
+    optimizer: Sequence[Placement]
+
+    def __post_init__(self) -> None:
+        """Validate placement sequence lengths."""
+        axis_count = len(self.dp_axes)
+        for name, placements in (
+            ("parameter", self.parameter),
+            ("gradient", self.gradient),
+            ("optimizer", self.optimizer),
+        ):
+            if len(placements) != axis_count:
+                raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
 @contextmanager
@@ -88,7 +115,7 @@ def fully_shard(
 
     Args:
         module: Module whose currently unowned parameters are managed by FSDP.
-        mesh: Device mesh used for sharding.
+        mesh: Parent device mesh containing the data-parallel axes.
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
@@ -116,7 +143,7 @@ def fully_shard(
                 "fully_shard_context."
             )
 
-    placements = _normalize_placements(mesh, placements)
+    _validate_dp_axes(mesh, placements.dp_axes)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
     original_cls = module.__class__
     _attach_mixin(module)
@@ -126,7 +153,9 @@ def fully_shard(
             module,
             context=context,
             mesh=mesh,
-            placements=placements,
+            model_weight_placements=tuple(placements.parameter),
+            main_grad_placements=tuple(placements.gradient),
+            main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
@@ -136,10 +165,17 @@ def fully_shard(
         raise
 
 
-def _normalize_placements(mesh: DeviceMesh, placements: Placements) -> Placements:
-    """Return a copy with data-parallel mesh axes normalized to integer indices."""
-    dp_axes = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-    return dataclasses.replace(placements, dp_axes=dp_axes)
+def _validate_dp_axes(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> None:
+    """Validate the parent mesh's data-parallel axes."""
+    normalized_dp_axes = tuple(_axis_index(mesh, axis) for axis in dp_axes)
+    if len(set(normalized_dp_axes)) != len(normalized_dp_axes):
+        raise ValueError(f"Data-parallel axes must be distinct, got {dp_axes!r}.")
+    if normalized_dp_axes != tuple(sorted(normalized_dp_axes)):
+        raise ValueError(f"Data-parallel axes must be in mesh-axis order, got {dp_axes!r}.")
+    if normalized_dp_axes != tuple(range(mesh.ndim)):
+        raise NotImplementedError(
+            "MFSDP currently requires dp_axes to match every mesh axis in mesh order."
+        )
 
 
 def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
