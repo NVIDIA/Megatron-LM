@@ -911,6 +911,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         """Execute weight gradient computation"""
         self._backward_kv_proj()
         self._backward_q_proj()
+        # core_attention is always CompressedSparseAttention for the dsv4_hybrid
+        # variant; its compressor/indexer linears defer their wgrads under
+        # delay_wgrad_compute and must be flushed here as well.
+        self.core_attention.backward_dw()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
