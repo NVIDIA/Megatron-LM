@@ -46,6 +46,9 @@ _BRANCH_B_PIPELINE_COMPUTE_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {
 _BRANCH_B_DUAL_SECTION_BWD_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
 _BRANCH_B_DEFERRED_PHASE_EVENTS: list[dict[str, object]] = []
 _BRANCH_B_DEFERRED_FORWARD_DETAIL_EVENTS: list[dict[str, object]] = []
+_BRANCH_B_FA4_MASKS: dict[tuple[int, int, int], object] = {}
+_BRANCH_B_FA4_PREWARMED: set[tuple] = set()
+_BRANCH_B_FA4_BLOCK_SPARSE: dict[tuple, tuple] = {}
 
 
 class NvshmemCpFaOwnerError(RuntimeError):
@@ -1733,19 +1736,6 @@ def _branch_b_fa4_global_backward(
                     int(prefix1),
                     int(prefix2),
                     softmax_scale=softmax_scale,
-                    tail_dq_recompute=two_section_tail_dq,
-                    overlap_dkv_recompute=(
-                        os.getenv(
-                            "MEGATRON_NVSHMEM_CP_BRANCH_B_FA4_TWO_SECTION_OVERLAP_DKV_RECOMPUTE"
-                        )
-                        == "1"
-                    ),
-                    compact_grad_recompute=(
-                        os.getenv(
-                            "MEGATRON_NVSHMEM_CP_BRANCH_B_FA4_TWO_SECTION_COMPACT_GRAD_RECOMPUTE"
-                        )
-                        == "1"
-                    ),
                 )
                 dq_fa4 = torch.cat((dq1, dq2), dim=1)
                 global_seq = int(peer_keys[cp_rank].shape[0]) * 4
@@ -2187,19 +2177,25 @@ class _BlockReadyNativeFusedOwnerAutograd(torch.autograd.Function):
             deferred_forward_start = torch.cuda.Event(enable_timing=True)
             deferred_forward_end = torch.cuda.Event(enable_timing=True)
             deferred_forward_start.record()
+        fa4_global = os.getenv("MEGATRON_NVSHMEM_CP_BRANCH_B_FA4_GLOBAL") == "1"
         try:
             tex = _import_te_for_native_fused_owner()
         except ImportError as exc:
             raise NvshmemCpFaOwnerError(
                 "MEGATRON_NVSHMEM_CP_FA_OWNER_IO_V1_BACKWARD_IMPL="
-                "block_ready_native_fused requires transformer_engine_torch with "
-                "nvshmem_cp_block_ready_fused_owner_execute and "
-                "nvshmem_cp_block_ready_fused_owner_backward_execute."
+                "block_ready_native_fused requires transformer_engine_torch with the "
+                "selected backend primitives."
             ) from exc
 
         native_owner = getattr(tex, "nvshmem_cp_block_ready_fused_owner_execute", None)
         native_backward = getattr(tex, "nvshmem_cp_block_ready_fused_owner_backward_execute", None)
-        if native_owner is None or native_backward is None:
+        global_grad_return = getattr(tex, "nvshmem_cp_global_grad_return_execute", None)
+        if fa4_global and global_grad_return is None:
+            raise NvshmemCpFaOwnerError(
+                "FA4-global Branch-B requires transformer_engine_torch."
+                "nvshmem_cp_global_grad_return_execute."
+            )
+        if not fa4_global and (native_owner is None or native_backward is None):
             raise NvshmemCpFaOwnerError(
                 "MEGATRON_NVSHMEM_CP_FA_OWNER_IO_V1_BACKWARD_IMPL="
                 "block_ready_native_fused requires native fused Branch-B owner symbols "
@@ -2217,7 +2213,7 @@ class _BlockReadyNativeFusedOwnerAutograd(torch.autograd.Function):
         if not bool(is_causal):
             raise NvshmemCpFaOwnerError("block_ready_native_fused currently targets causal CP attention.")
 
-        if os.getenv("MEGATRON_NVSHMEM_CP_BRANCH_B_FA4_GLOBAL") == "1":
+        if fa4_global:
             from megatron.core import parallel_state
 
             _branch_b_fa4_prewarm(
@@ -2352,9 +2348,6 @@ class _BlockReadyNativeFusedOwnerAutograd(torch.autograd.Function):
             torch.cuda.current_stream().synchronize()
             _branch_b_fa4_trace(cp_rank, "F02 after_peer_stage")
 
-        fa4_global = (
-            os.getenv("MEGATRON_NVSHMEM_CP_BRANCH_B_FA4_GLOBAL") == "1"
-        )
         fa4_state = None
         if fa4_global:
             _branch_b_fa4_trace(cp_rank, "F03 enter_fa4_branch")

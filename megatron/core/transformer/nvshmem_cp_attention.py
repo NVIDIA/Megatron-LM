@@ -23,8 +23,6 @@ _NVSHMEM_WORKSPACES_FROZEN = False
 _WORKSPACES: Dict[Tuple[object, ...], "NvshmemCpWorkspace"] = {}
 
 _NVSHMEM_CP_BRANCH_B_PROFILE = {
-    "FLASH_ATTN_TWO_SECTION_DIRECT_OWNER_DKV": "1",
-    "FLASH_ATTN_UNSAFE_TWO_SECTION_CAUSAL_BWD": "1",
     "MEGATRON_NVSHMEM_CP_BLOCK_READY_PROTOCOL": "1",
     "MEGATRON_NVSHMEM_CP_BLOCK_READY_STREAM_WAIT": "0",
     "MEGATRON_NVSHMEM_CP_BRANCH_B_FA4_GLOBAL": "1",
@@ -62,6 +60,7 @@ def configure_nvshmem_cp_backend() -> dict[str, str]:
     return dict(_NVSHMEM_CP_BRANCH_B_PROFILE)
 
 
+@dataclass
 class NvshmemCpWorkspace:
     key: torch.Tensor
     value: torch.Tensor

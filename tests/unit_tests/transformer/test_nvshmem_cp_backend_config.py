@@ -1,8 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from dataclasses import is_dataclass
+
 import pytest
 
-from megatron.core.transformer.nvshmem_cp_attention import configure_nvshmem_cp_backend
+from megatron.core.transformer.nvshmem_cp_attention import (
+    NvshmemCpWorkspace,
+    configure_nvshmem_cp_backend,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -27,6 +32,10 @@ def test_nvshmem_cp_backend_accepts_validated_contract():
     config = _valid_config()
 
     assert config.context_parallel_attention_backend == "nvshmem"
+
+
+def test_nvshmem_cp_workspace_has_generated_constructor():
+    assert is_dataclass(NvshmemCpWorkspace)
 
 
 @pytest.mark.parametrize(
