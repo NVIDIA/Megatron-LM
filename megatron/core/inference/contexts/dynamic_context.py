@@ -3671,9 +3671,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Prefill requests transition to decode during resolution. Request rows use
         the same hole-filling order as ``update_requests`` so seeded sampling stays
-        consistent with legacy scheduling. Decode token rows are moved in the same
-        order when prepare has already built the successor input; prefill token rows
-        are left untouched because prepare rebuilds them after resolution.
+        consistent with legacy scheduling. Decode input token IDs follow the same
+        survivor order; prepare rebuilds all derived token metadata. Prefill token
+        rows are left untouched because prepare and commit rebuild them after
+        resolution.
 
         Args:
             active_requests_mask (Tensor): 1D mask marking requests that remain active.
@@ -3728,16 +3729,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         tokens_per_request = self.num_speculative_tokens + 1
         dst_idxs = torch.arange(active_request_count, device='cpu')
-        token_offsets = self._async_sched_token_offsets
-        survivor_token_idxs = (
-            survivor_idxs[:, None] * tokens_per_request + token_offsets[None, :]
-        ).flatten()
-        dst_token_idxs = torch.arange(active_request_count * tokens_per_request, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
-            self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
-                survivor_idxs
-            ]
             self.request_query_lengths[dst_idxs] = self.request_query_lengths[survivor_idxs]
             self.request_output_lengths[dst_idxs] = self.request_output_lengths[survivor_idxs]
             self.request_ids[dst_idxs] = self.request_ids[survivor_idxs]
@@ -3751,24 +3744,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
 
             if not had_prefill_requests:
+                token_offsets = self._async_sched_token_offsets
+                survivor_token_idxs = (
+                    survivor_idxs[:, None] * tokens_per_request + token_offsets[None, :]
+                ).flatten()
+                dst_token_idxs = torch.arange(
+                    active_request_count * tokens_per_request, device='cpu'
+                )
                 self.token_to_input_ids[dst_token_idxs] = self.token_to_input_ids[
                     survivor_token_idxs
                 ]
-                self.token_to_pos_ids[dst_token_idxs] = self.token_to_pos_ids[survivor_token_idxs]
-                self.token_to_block_idx[dst_token_idxs] = self.token_to_block_idx[
-                    survivor_token_idxs
-                ]
-                self.token_to_local_position_within_kv_block[dst_token_idxs] = (
-                    self.token_to_local_position_within_kv_block[survivor_token_idxs]
-                )
-                self.token_to_position_in_request[dst_token_idxs] = (
-                    self.token_to_position_in_request[survivor_token_idxs]
-                )
-
-        if not had_prefill_requests:
-            self.token_to_request_idx[: active_request_count * tokens_per_request] = (
-                dst_idxs.repeat_interleave(tokens_per_request)
-            )
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
         self.total_request_count = active_request_count
