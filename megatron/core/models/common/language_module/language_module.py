@@ -15,7 +15,6 @@ try:
 except:
     te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-from megatron.core.fusions.liger_cross_entropy import liger_vocab_parallel_cross_entropy
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -181,6 +180,10 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
             elif self.config.cross_entropy_fusion_impl == 'liger':
+                from megatron.core.fusions.liger_cross_entropy import (
+                    liger_vocab_parallel_cross_entropy,
+                )
+
                 loss = liger_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(

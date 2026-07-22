@@ -100,3 +100,22 @@ def test_liger_ce_missing_package_raises(monkeypatch):
     target = torch.zeros(1, 1, dtype=torch.long)
     with pytest.raises(ImportError, match="Liger-Kernel"):
         module.liger_vocab_parallel_cross_entropy(logits, target, tp_group=None)
+
+
+def test_language_module_import_does_not_import_liger():
+    """Importing ``LanguageModule`` must not eagerly import the optional liger CE
+    wrapper. Runs in a fresh interpreter so it reflects a clean import graph:
+    ``native``/``te`` users must be unaffected even if liger-kernel init would fail.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "import megatron.core.models.common.language_module  # noqa: F401\n"
+        "assert 'megatron.core.fusions.liger_cross_entropy' not in sys.modules, (\n"
+        "    'liger_cross_entropy was imported eagerly by language_module'\n"
+        ")\n"
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

@@ -31,6 +31,15 @@ layer_spec = get_gpt_layer_local_spec(
 `normalization` is anything other than `"RMSNorm"`, the layer-norm slot falls
 through to the default `LocalSpecProvider` builder.
 
+> **Note — per-layer vs. the decoder's final norm.**
+> `get_gpt_layer_local_spec` returns a *per-layer* spec, so `use_liger=True`
+> there only swaps the **per-layer** input/pre-MLP norms. A model's
+> block-level `decoder.final_layernorm` is selected separately by the block
+> builder. To make the final norm use Liger too, build the block spec with
+> `get_gpt_decoder_block_spec(config, use_transformer_engine=False,
+> normalization="RMSNorm", use_liger=True)` and pass that as
+> `transformer_layer_spec` (see the Combined Example below).
+
 ## Enabling Cross-Entropy
 
 Liger's vocab-parallel cross-entropy plugs into the existing
@@ -51,9 +60,13 @@ explicitly by Megatron at call time.
 
 ## Combined Example
 
+Build the decoder **block** spec with `use_liger=True` so that both the
+per-layer norms *and* the block-level `decoder.final_layernorm` use Liger's
+RMSNorm:
+
 ```python
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 config = TransformerConfig(
@@ -67,7 +80,9 @@ config = TransformerConfig(
 
 model = GPTModel(
     config=config,
-    transformer_layer_spec=get_gpt_layer_local_spec(
+    transformer_layer_spec=get_gpt_decoder_block_spec(
+        config,
+        use_transformer_engine=False,
         normalization="RMSNorm",
         use_liger=True,
     ),
@@ -82,6 +97,7 @@ model = GPTModel(
 |---|---|
 | RMSNorm (`normalization="RMSNorm"`) | yes |
 | Other norm types (`LayerNorm`, etc.) | falls through to default |
+| Decoder final norm (`decoder.final_layernorm`) | yes, when built via `get_gpt_decoder_block_spec(..., use_liger=True)` (a bare per-layer spec cannot carry the block norm) |
 | Cross-entropy at TP=1 | yes |
 | Cross-entropy at TP>1 | yes (kernel performs the in-vocab AllReduce) |
 | `deterministic_mode=True` | no — blocks all `cross_entropy_loss_fusion` modes |

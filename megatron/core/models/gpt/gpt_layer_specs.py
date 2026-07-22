@@ -580,11 +580,15 @@ def get_gpt_decoder_layer_specs(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
+    use_liger: bool = False,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     assert config.experimental_attention_variant is None, (
         "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
         f"but got {config.experimental_attention_variant=}."
+    )
+    assert not (config.use_kitchen and use_liger), (
+        "use_kitchen and use_liger are mutually exclusive."
     )
 
     if use_transformer_engine:
@@ -640,6 +644,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_liger=use_liger,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -651,6 +656,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_liger=use_liger,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -693,10 +699,18 @@ def get_gpt_decoder_block_spec(
     qk_l2_norm: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
+    use_liger: bool = False,
 ) -> TransformerBlockSubmodules:
-    """GPT block spec."""
+    """GPT block spec.
+
+    Args:
+        use_liger (bool, optional): Use Liger-Kernel Triton ops where supported
+            (currently RMSNorm) for both the per-layer norms and the decoder's
+            block-level (final) norm. Local backend only; mutually exclusive with
+            ``config.use_kitchen``. Defaults to False.
+    """
     layer_specs = get_gpt_decoder_layer_specs(
-        config, use_transformer_engine, normalization, qk_l2_norm
+        config, use_transformer_engine, normalization, qk_l2_norm, use_liger=use_liger
     )
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
@@ -722,6 +736,10 @@ def get_gpt_decoder_block_spec(
         layer_norm_impl = TENorm
     elif config.transformer_impl == "inference_optimized":
         layer_norm_impl = TENorm
+    elif use_liger and normalization == "RMSNorm":
+        from megatron.core.extensions.liger_kernel_spec_provider import LigerSpecProvider
+
+        layer_norm_impl = LigerSpecProvider().layer_norm(rms_norm=True)
     else:
         layer_norm_impl = LNImpl
     # Block spec.
