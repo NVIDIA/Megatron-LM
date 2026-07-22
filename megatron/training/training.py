@@ -3254,9 +3254,14 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        # Sequence-packing schedulers may change the number of microbatches for
-        # this step, so scale by the count returned from train_step.
-        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
+        if args.calculate_per_token_loss:
+            # The tracker already reduces raw loss sums and token counts into a
+            # per-token loss, matching the main loss normalization path.
+            mtp_loss_scale = 1.0
+        else:
+            # Legacy mode accumulates microbatch-normalized losses, so average
+            # by the scheduled microbatch count for this step.
+            mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
