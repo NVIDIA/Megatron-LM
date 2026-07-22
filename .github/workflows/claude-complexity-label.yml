@@ -26,8 +26,12 @@ jobs:
       - name: Run Claude Complexity Analysis
         id: analyze
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ github.token }}
           prompt: |
             REPO: ${{ env.REPO }}
@@ -53,6 +57,7 @@ jobs:
             Do NOT post comments, edit the PR, modify labels, or run any write operation.
           claude_args: |
             --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --model "${{ vars.CLAUDE_MODEL }}"
             --json-schema '{"type":"object","properties":{"label":{"type":"string","enum":["docs-only","complexity: low","complexity: medium","complexity: high"]}},"required":["label"],"additionalProperties":false}'
 
   apply-complexity-label:

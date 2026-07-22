@@ -81,8 +81,12 @@ jobs:
 
       - name: Run Claude Copy to Main
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           trigger_phrase: "/claude copy"
           github_token: ${{ github.token }}
           prompt: |
@@ -129,7 +133,7 @@ jobs:
             - When resolving merge conflicts, favor `main` over the non-main branch. Do not override changes already on main.
           claude_args: |
             --allowedTools "Bash(git:*),Bash(gh pr view:*),Read,Edit"
-            --model "claude-opus-4-6"
+            --model "${{ vars.CLAUDE_MODEL }}"
 
       - name: Export copy patch
         run: |

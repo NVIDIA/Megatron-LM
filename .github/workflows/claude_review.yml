@@ -44,13 +44,17 @@ jobs:
 
       - name: Run Claude Light Review
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ github.token }}
           trigger_phrase: "/claude review"
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read"
-            --model "claude-opus-4-6"
+            --model "${{ vars.CLAUDE_MODEL }}"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
@@ -142,13 +146,17 @@ jobs:
 
       - name: Run Claude Strict Review
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ github.token }}
           trigger_phrase: "/claude strict-review"
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read"
-            --model "claude-opus-4-6"
+            --model "${{ vars.CLAUDE_MODEL }}"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}

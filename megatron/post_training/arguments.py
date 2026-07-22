@@ -94,6 +94,26 @@ def add_modelopt_args(parser):
         "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
     )
 
+    # MTP / base train-target selection for QAD and MTP QAT.
+    group.add_argument(
+        '--qad-train-target',
+        type=str,
+        default=None,
+        choices=['base', 'mtp', 'both'],
+        help='Which side of an MTP model to train during QAD / MTP QAT. '
+        '"mtp": train MTP heads only, freeze the base (post-QAD two-phase recipe); '
+        '"base": train the base only, freeze the MTP heads; '
+        '"both": co-train the base and MTP heads together. '
+        'Routers on the frozen side also have their expert_bias update skipped.',
+    )
+    group.add_argument(
+        '--freeze-base-for-mtp',
+        action='store_true',
+        default=False,
+        help='Deprecated alias for --qad-train-target mtp: freeze all base model '
+        'parameters and only train MTP heads.',
+    )
+
     # Special model architecture option
     group.add_argument(
         '--export-qk-l2-norm',
