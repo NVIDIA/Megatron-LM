@@ -3542,7 +3542,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Async scheduling only supports decode-only steps with no pause,
         evict, or resume lifecycle changes. If preparation cannot allocate the
-        required KV blocks without a lifecycle change, this method raises.
+        required KV blocks without a lifecycle change, this method raises. The
+        prepared decode layout establishes the active token count.
         """
         active_request_count = self.total_request_count - self.paused_request_count
         if self.num_prefill_requests != 0:
@@ -3617,10 +3618,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> None:
         """Commit sampled CPU token IDs to the prepared request state.
 
-        This populates the CPU input-ID staging rows after resolution has
-        established the survivor order. Overlapped async scheduling has already
-        copied the same samples into the live GPU input view for the speculative
-        forward.
+        This establishes the post-resolution active token count and populates
+        the CPU input-ID staging rows in survivor order. Overlapped async
+        scheduling has already copied the same samples into the live GPU input
+        view for the speculative forward.
 
         Args:
             sampled_tokens_cpu (Tensor): Sampled CPU token for each active request.
@@ -3660,7 +3661,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
         tokens_per_request = self.num_speculative_tokens + 1
-        grouped_tokens = self.token_to_input_ids[: self.active_token_count].view(
+        active_token_count = active_request_count * tokens_per_request
+        self.active_token_count = active_token_count
+        grouped_tokens = self.token_to_input_ids[:active_token_count].view(
             active_request_count, tokens_per_request
         )
         grouped_tokens[:, 0] = sampled_tokens_cpu
@@ -3672,9 +3675,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Prefill requests transition to decode during resolution. Request rows use
         the same hole-filling order as ``update_requests`` so seeded sampling stays
-        consistent with legacy scheduling. Token tensors are left untouched;
-        prepare rebuilds derived token metadata and the controller commits sampled
-        input IDs after resolution.
+        consistent with legacy scheduling. Token tensors and the active token
+        count are left untouched; prepare rebuilds derived token metadata and the
+        controller commits sampled input IDs after resolution.
 
         Args:
             active_requests_mask (Tensor): 1D mask marking requests that remain active.
@@ -3696,7 +3699,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"got {active_requests_mask.numel()}."
             )
 
-        had_prefill_requests = self.num_prefill_requests != 0
         self.num_prefill_requests = 0
         self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
 
@@ -3723,11 +3725,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if active_request_count == 0:
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
-            self.active_token_count = 0
             self.reset_mamba_state()
             return finished_request_ids, survivor_idxs
 
-        tokens_per_request = self.num_speculative_tokens + 1
         dst_idxs = torch.arange(active_request_count, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
@@ -3745,9 +3745,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
         self.total_request_count = active_request_count
-        self.active_token_count = (
-            0 if had_prefill_requests else active_request_count * tokens_per_request
-        )
         return finished_request_ids, survivor_idxs
 
     def update_requests(

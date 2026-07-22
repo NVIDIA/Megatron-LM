@@ -1118,12 +1118,19 @@ class TestDynamicContext:
         if torch.cuda.is_available():
             with pytest.raises(AssertionError, match="must be on the CPU"):
                 ctx.commit_sampled_tokens(sampled_tokens_cpu.cuda())
+        ctx.active_token_count = 5
         ctx.commit_sampled_tokens(sampled_tokens_cpu)
 
+        assert ctx.active_token_count == 2
         assert torch.equal(ctx.token_to_input_ids[:2], sampled_tokens_cpu)
 
         with pytest.raises(RuntimeError, match="Expected 2 new tokens"):
             ctx.commit_sampled_tokens(torch.tensor([90], dtype=torch.int64))
+
+        ctx.total_request_count = 0
+        ctx.active_token_count = 2
+        ctx.commit_sampled_tokens(torch.empty(0, dtype=torch.int64))
+        assert ctx.active_token_count == 0
 
     @pytest.mark.internal
     @rounder_override(8)
@@ -1188,6 +1195,7 @@ class TestDynamicContext:
             ctx.token_to_request_idx,
             ctx.token_to_position_in_request,
         )
+        active_token_count = ctx.active_token_count
         token_state = tuple(tensor.clone() for tensor in token_tensors)
 
         finished_request_ids, survivor_idxs = ctx.resolve_requests(active_mask)
@@ -1197,7 +1205,7 @@ class TestDynamicContext:
         )
         assert torch.equal(survivor_idxs, torch.tensor(expected_survivor_idxs))
         assert ctx.total_request_count == len(expected_request_ids)
-        assert ctx.active_token_count == len(expected_request_ids)
+        assert ctx.active_token_count == active_token_count
         assert torch.equal(
             ctx.request_ids[: len(expected_request_ids)],
             torch.tensor(expected_request_ids, dtype=torch.int32),
@@ -1231,7 +1239,7 @@ class TestDynamicContext:
         assert finished_request_ids.tolist() == [10]
         assert survivor_idxs.tolist() == [1]
         assert ctx.request_ids[0] == 11
-        assert ctx.active_token_count == 3
+        assert ctx.active_token_count == 6
         assert torch.equal(ctx.token_to_input_ids, prepared_input_ids)
 
         sampled_tokens = torch.tensor([100, 200])
@@ -1240,6 +1248,7 @@ class TestDynamicContext:
             sampled_tokens[survivor_idxs], sampled_mtp_tokens[:, survivor_idxs]
         )
 
+        assert ctx.active_token_count == 3
         assert torch.equal(ctx.token_to_input_ids[:3], torch.tensor([200, 201, 202]))
 
     @pytest.mark.internal
@@ -1260,6 +1269,8 @@ class TestDynamicContext:
         ctx.active_token_count = 5
 
         _, survivor_idxs = ctx.resolve_requests(torch.tensor([1, 1]))
+        assert ctx.active_token_count == 5
+
         ctx.prepare_requests()
 
         assert survivor_idxs.tolist() == [0, 1]
