@@ -347,6 +347,11 @@ class TEGroupedMLP(MegatronModule):
             return False
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return False
+        if (
+            self.linear_fc2.use_bias
+            and "scale_bias" not in inspect.signature(GroupedLinear.__init__).parameters
+        ):
+            return False  # Older TE op-fuser versions cannot scale FC2 bias by router probabilities
 
         # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
         # Use config.activation_func instead of self.activation_func because when
@@ -500,6 +505,7 @@ class TEGroupedMLP(MegatronModule):
         ops.append(op)
 
         # FC2
+        fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
         op = te.pytorch.ops.GroupedLinear(
             self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
@@ -511,6 +517,8 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
+            # Preserve p * (FC2(x) + bias) after the scaled activation moves p before FC2.
+            **fc2_bias_kwargs,
         )
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
@@ -622,11 +630,16 @@ class TEGroupedMLP(MegatronModule):
             )
             with stash_context:
                 # Call fused impl
+                fc2_extra_inputs = (
+                    (tokens_per_expert, permuted_probs)
+                    if self.linear_fc2.use_bias
+                    else (tokens_per_expert,)
+                )
                 output = ops(
                     permuted_local_hidden_states,
                     tokens_per_expert,  # FC1
                     permuted_probs,  # Scaled activation
-                    tokens_per_expert,  # FC2
+                    *fc2_extra_inputs,  # FC2 splits and, for bias, its per-token scale
                 )
         output = fused_group_mlp_manager.group_offload(
             output, forced_released_tensors=forced_released_tensors
