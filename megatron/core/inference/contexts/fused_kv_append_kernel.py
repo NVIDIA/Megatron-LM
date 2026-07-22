@@ -1,8 +1,21 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import triton
-import triton.language as tl
 from torch import Tensor
+
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    from megatron.core.utils import null_decorator
+
+    triton = MagicMock()
+    triton.jit = null_decorator
+    tl = MagicMock()
+    HAVE_TRITON = False
 
 
 @triton.jit
@@ -119,8 +132,8 @@ def triton_append_key_value_cache(
 
     _, num_heads, h_dim = key.shape
 
-    key_cache = memory_buffer[0, layer_number - 1]
-    value_cache = memory_buffer[1, layer_number - 1]
+    key_cache = memory_buffer[0, layer_number]
+    value_cache = memory_buffer[1, layer_number]
 
     key_to_cache = key[:n_tokens]
     value_to_cache = value[:n_tokens]

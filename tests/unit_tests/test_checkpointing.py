@@ -9,6 +9,8 @@ import pytest
 import torch
 import torch.distributed.checkpoint
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -23,6 +25,7 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_checkpoint,
+    read_metadata,
     save_checkpoint,
 )
 from megatron.training.global_vars import set_args
@@ -50,6 +53,9 @@ class MockState:
         self._state_dict = state_dict
         self.is_stub_optimizer = False
         self._called_metadata = []
+
+        # Optimizers are expected to have this attribute for checkpointing.
+        self.param_groups = []
 
     def state_dict(self, is_loading=False):
         return self._state_dict
@@ -97,6 +103,7 @@ def create_args():
     args.non_persistent_save_interval = None
     args.exit_on_missing_checkpoint = True
     args.async_save = False
+    args.async_strategy = "mcore"
     args.data_parallel_random_init = False
     args.no_save_optim = False
     args.no_save_rng = False
@@ -104,13 +111,14 @@ def create_args():
     args.no_load_rng = False
     args.log_progress = False
     args.ckpt_fully_parallel_save = False
-    args.dist_ckpt_save_pre_mcore_014 = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.auto_detect_ckpt_format = False
-    args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
+    args.swiglu = True
+    args.num_experts = 1
+    args.verify_integrity = False
 
     yield args
 
@@ -133,9 +141,11 @@ def create_ckpt_load_args(create_args):
     args.ckpt_assume_constant_structure = False
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
+    args.phase_transition_iterations = None
 
     yield args
 
@@ -144,7 +154,9 @@ def create_ckpt_load_args(create_args):
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
-    init_num_microbatches_calculator(0, None, 1, 1, 1)
+    init_num_microbatches_calculator(
+        rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+    )
     model_parallel_cuda_manual_seed(123)
     yield  # Run the actual test.
     Utils.destroy_model_parallel()
@@ -191,7 +203,7 @@ def test_load_base_checkpoint(
     assert ckpt_type == expected_ckpt_type
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp"])
+@pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
 def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format):
     """Test save_checkpoint."""
     args = create_args
@@ -207,6 +219,15 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
     config = TransformerConfig(num_layers=1, kv_channels=1)
     model = MockModel(config)
     optimizer = MockState({"optimizer": "optimizer_state"})
+    if ckpt_format == "fsdp_dtensor":
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_distributed_optimizer=True, use_megatron_fsdp=True
+            ),
+            module=model,
+        )
+        optimizer = MockState({"state": {}})
     opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
     num_floating_point_operations_so_far = 456
 
@@ -226,7 +247,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
         expected_ckpt_path = None
         if ckpt_format == "torch":
             expected_ckpt_path = ckpt_dir / "mp_rank_00" / "model_optim_rng.pt"
-        elif ckpt_format == "torch_dcp":
+        elif ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
@@ -337,3 +358,95 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             first_job_mock_metadata,
             second_job_mock_metadata,
         ]
+
+
+@pytest.mark.parametrize(
+    "metadata_content,expected_iter,expected_release",
+    [
+        ("456", 456, False),  # Normal iteration
+        ("release", 0, True),  # Release checkpoint should return iteration=1
+        ("123", 123, False),  # Another normal iteration
+    ],
+)
+def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter, expected_release):
+    """Test read_metadata without torch.distributed initialized."""
+    test_dir = tmp_path / "test_read_metadata_non_distributed"
+    test_dir.mkdir(parents=True, exist_ok=True)
+    tracker_file = test_dir / "latest_checkpointed_iteration.txt"
+
+    with open(tracker_file, "w") as f:
+        f.write(metadata_content)
+
+    with mock.patch('torch.distributed.is_initialized', return_value=False):
+        max_iter, release = read_metadata(str(tracker_file))
+
+    assert max_iter == expected_iter, f"Expected iteration {expected_iter}, got {max_iter}"
+    assert release == expected_release, f"Expected release={expected_release}, got {release}"
+
+
+def _make_metadata_args(
+    use_distributed_optimizer=False,
+    use_layer_wise_distributed_optimizer=False,
+    ckpt_format='torch_dist',
+    dist_ckpt_optim_fully_reshardable=False,
+    distrib_optim_fully_reshardable_mem_efficient=False,
+):
+    args = SimpleNamespace()
+    args.use_distributed_optimizer = use_distributed_optimizer
+    args.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
+    args.ckpt_format = ckpt_format
+    args.dist_ckpt_optim_fully_reshardable = dist_ckpt_optim_fully_reshardable
+    args.distrib_optim_fully_reshardable_mem_efficient = (
+        distrib_optim_fully_reshardable_mem_efficient
+    )
+    return args
+
+
+class TestBuildShardedStateDictMetadata:
+    """``_build_sharded_state_dict_metadata`` must set ``distrib_optim_sharding_type``
+    whenever a real :class:`DistributedOptimizer` instance will be used at save
+    time -- otherwise the DistOpt path falls through to the deprecated
+    ``fully_sharded_model_space`` default whose ``flattened_range`` usage is
+    rejected by ``ShardedTensor.validate_metadata_integrity`` post commit
+    5ab481cb45.
+    """
+
+    DUMMY_GROUP = object()
+
+    def test_distributed_optimizer_sets_dp_reshardable_default(self):
+        args = _make_metadata_args(use_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
+
+    def test_distributed_optimizer_fully_reshardable_flag(self):
+        args = _make_metadata_args(
+            use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+        )
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
+        assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
+
+    def test_distributed_optimizer_fsdp_dtensor(self):
+        args = _make_metadata_args(use_distributed_optimizer=True, ckpt_format='fsdp_dtensor')
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
+
+    def test_layer_wise_only_still_sets_sharding_type(self):
+        # Arg parser flips ``use_distributed_optimizer`` off when Muon is in
+        # use, but the LayerWise + DistOpt split path still has a DistOpt
+        # sub-optimizer for non-Muon params, so the metadata is required.
+        args = _make_metadata_args(use_layer_wise_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
+
+    def test_layer_wise_with_fully_reshardable(self):
+        args = _make_metadata_args(
+            use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+        )
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
+
+    def test_no_distributed_optimizer_no_sharding_type(self):
+        args = _make_metadata_args()
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert 'distrib_optim_sharding_type' not in metadata

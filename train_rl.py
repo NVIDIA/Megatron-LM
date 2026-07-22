@@ -8,21 +8,35 @@ from functools import partial
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
-from megatron.rl.rl_utils import calculate_grpo_loss, get_logprobs, get_rl_runtime_state
+from megatron.rl.rl_utils import (
+    calculate_grpo_loss,
+    get_logprobs,
+    get_rl_runtime_state,
+    load_packed_data_by_index,
+)
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.utils import is_hybrid_model
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
 from model_provider import model_provider
+
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
 stimer = StragglerDetector()
 
+import logging
 
-def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
+logging.basicConfig(level=logging.INFO, force=True)
+
+def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
     # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
     if config is None:
@@ -54,7 +68,14 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             )
 
     with build_model_context(**build_model_context_args):
-        return gpt_builder(args, pre_process, post_process, vp_stage=vp_stage, config=config)
+        return gpt_builder(
+            args,
+            pre_process,
+            post_process,
+            vp_stage=vp_stage,
+            config=config,
+            pg_collection=pg_collection,
+        )
 
 
 # define spiky loss as a variation of 20% or more
@@ -177,7 +198,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
     """
-
+    runtime_state = get_rl_runtime_state()
     args = get_args()
     timers = get_timers()
 
@@ -187,55 +208,24 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
-    seq_starts = None
-    seq_lengths = None
-    attention_mask = None
-
-    if args.use_sequence_packing:
+    if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
-        bin_idx = bin_tensor.item()
 
-        # Get packing context (should always be available in packed mode)
-        runtime_state = get_rl_runtime_state()
-        packing_context = runtime_state.packing_context
+        (
+            tokens,
+            advantages,
+            old_logprobs,
+            loss_mask,
+            position_ids,
+            ref_logprobs,
+            inference_logprobs,
+            seq_starts,
+            seq_lengths,
+            seq_indices,
+            packed_seq_params,
+        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
 
-        idx = slice(bin_idx, bin_idx + 1)
-        # Extract packed data for this bin (already on GPU)
-        tokens = packing_context['packed_trajs'][idx]
-        position_ids = packing_context['packed_position_ids'][idx]
-        attention_mask = (
-            packing_context['packed_attention_mask'][idx]
-            if packing_context['packed_attention_mask'] is not None
-            else None
-        )
-        old_logprobs = packing_context['old_logprobs'][idx]
-        ref_logprobs = packing_context['ref_logprobs'][idx]
-        loss_mask = packing_context['packed_loss_mask'][idx, 1:]
-
-        # Get sequence-level data for this bin
-        packing_info = packing_context['packing_info']
-        seq_starts = packing_info['seq_starts'][bin_idx]
-        seq_indices = packing_info['bin_seq_indices'][bin_idx]
-
-        # Handle empty bins (used for padding to ensure all ranks have same iterations)
-        if not seq_indices:
-            seq_lengths = []
-            advantages = torch.tensor([], device='cuda')
-        else:
-            seq_lengths = [packing_info['seq_lengths'][idx] for idx in seq_indices]
-            advantages = packing_context['bin_advantages'][bin_idx]
-
-        # Extract packed inference_logprobs if available
-        if (
-            'packed_inference_logprobs' in packing_context
-            and args.rl_inference_logprobs_is_correction
-        ):
-            inference_logprobs = packing_context['packed_inference_logprobs'][idx]
-        else:
-            inference_logprobs = None
-
-        runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(len(seq_indices))
     else:
         # Extract unpacked data
@@ -249,6 +239,10 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs,
         ) = batch_data
 
+        seq_starts = None
+        seq_lengths = None
+        packed_seq_params = None
+
         # Move to CUDA
         tokens = tokens.cuda()
         position_ids = position_ids.cuda()
@@ -260,11 +254,28 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             inference_logprobs.cuda() if args.rl_inference_logprobs_is_correction else None
         )
 
-        runtime_state = get_rl_runtime_state()
         runtime_state.increment_sequences(tokens.shape[0])
 
     # Common logic for both paths
     model_to_use = model[0] if isinstance(model, list) else model
+
+    if packed_seq_params is None:
+        if args.rl_use_sequence_packing:
+            packed_seq_params = get_default_packed_seq_params(
+                seq_length=tokens.shape[1],
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                device=tokens.device,
+            )
+        else:
+            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=tokens.shape[1],
+                max_seqlen_kv=tokens.shape[1],
+                total_tokens=tokens.shape[1],
+            )
 
     # Clear RoPE cache to avoid inference tensor errors
     try:
@@ -278,30 +289,43 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
-        current_logprobs = get_logprobs(
-            model_to_use, tokens, position_ids, attention_mask, no_grad=False
+        logprobs_or_hidden_states = get_logprobs(
+            model_to_use, tokens, position_ids, no_grad=False,
+            packed_seq_params=packed_seq_params
         )
 
-        # Calculate loss using unified function
-        loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
-            calculate_grpo_loss(
-                current_logprobs=current_logprobs,
-                old_logprobs=old_logprobs,
-                ref_logprobs=ref_logprobs,
-                advantages=advantages,
-                clamp_eps_lower=args.grpo_clamp_eps_lower,
-                clamp_eps_upper=args.grpo_clamp_eps_upper,
-                kl_beta=args.grpo_kl_beta,
-                entropy_weight=args.grpo_entropy_term_weight,
-                inference_logprobs=inference_logprobs,
-                is_truncation_coef=args.rl_importance_sampling_truncation_coef,
-                seq_starts=seq_starts,
-                seq_lengths=seq_lengths,
+        if not is_pipeline_last_stage():
+            output_tensor = logprobs_or_hidden_states
+            kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                None,
+                None,
+                None,
+                None,
+                None,
             )
-        )
+        else:
+            # Calculate loss using unified function
+            current_logprobs = logprobs_or_hidden_states
+            loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
+                calculate_grpo_loss(
+                    current_logprobs=current_logprobs,
+                    old_logprobs=old_logprobs,
+                    ref_logprobs=ref_logprobs,
+                    advantages=advantages,
+                    clamp_eps_lower=args.grpo_clamp_eps_lower,
+                    clamp_eps_upper=args.grpo_clamp_eps_upper,
+                    kl_beta=args.grpo_kl_beta,
+                    entropy_weight=args.grpo_entropy_term_weight,
+                    inference_logprobs=inference_logprobs,
+                    is_truncation_coef=args.rl_importance_sampling_truncation_coef,
+                    seq_starts=seq_starts,
+                    seq_lengths=seq_lengths,
+                )
+            )
+            output_tensor = loss
 
     # loss_mask will not be applied to 0th token as we do not have a logprob for it.
-    return loss, partial(
+    return output_tensor, partial(
         loss_func,
         loss_mask,
         kl_term,
@@ -360,19 +384,46 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
+    from megatron.inference.utils import add_inference_args
+
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    def _model_builder(args, pre_process, post_process, vp_stage=None):
-        if getattr(args, "is_hybrid_model", False):
-            return mamba_builder(args, pre_process, post_process, vp_stage)
+    def _model_builder(
+        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
+    ):
+        if is_hybrid_model(args):
+            return hybrid_builder(
+                args,
+                pre_process,
+                post_process,
+                vp_stage,
+                config=config,
+                pg_collection=pg_collection,
+            )
         else:
-            return _gpt_builder(args, pre_process, post_process, vp_stage)
+            return _gpt_builder(
+                args,
+                pre_process,
+                post_process,
+                vp_stage,
+                config=config,
+                pg_collection=pg_collection,
+            )
 
+    args = parse_and_validate_args(
+        extra_args_provider=add_inference_args,
+        args_defaults={},
+    )
+    if is_hybrid_model(args):
+        model_cfg = hybrid_config_from_args(args)
+    else:
+        model_cfg = gpt_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
-        train_valid_test_datasets_provider,  # This is currently a mock dataset that will be overriden inside of the train_step call for rl.
-        partial(model_provider, _model_builder),
+        full_config,
+        None,  # we don't need to build any datasets for RL training
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        partial(model_provider, _model_builder),
     )

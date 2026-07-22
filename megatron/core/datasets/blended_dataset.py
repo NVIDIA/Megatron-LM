@@ -14,6 +14,7 @@ import torch
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import normalize
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -86,9 +87,23 @@ class BlendedDataset(torch.utils.data.Dataset):
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
     def __len__(self) -> int:
+        if self.config.defer_npy_index_mmap:
+            size = sum(self.weights)
+            if self.size is not None:
+                size = self.size
+            return size
+
         return self.dataset_index.shape[0]
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
+        if self.dataset_index is None:
+            self.dataset_index = safe_numpy_load(
+                self.path_to_dataset_index, allow_pickle=True, mmap_mode="r"
+            )
+            self.dataset_sample_index = safe_numpy_load(
+                self.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
+            )
+
         dataset_id = self.dataset_index[idx]
         dataset_sample_id = self.dataset_sample_index[idx]
         return {"dataset_id": dataset_id, **self.datasets[dataset_id][dataset_sample_id]}
@@ -103,6 +118,15 @@ class BlendedDataset(torch.utils.data.Dataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray]: The dataset index and the dataset sample index
         """
+        if self.config.defer_npy_index_mmap:
+            # NOTE(asolergi-nv): Direct path to lazy memmap the indexes
+            get_path_to = lambda suffix: os.path.join(
+                self.config.path_to_cache,
+                f"{self.unique_description_hash}-{type(self).__name__}-{self.split.name}-{suffix}",
+            )
+            self.path_to_dataset_index = get_path_to("dataset_index.npy")
+            self.path_to_dataset_sample_index = get_path_to("dataset_sample_index.npy")
+            return None, None
 
         path_to_cache = self.config.path_to_cache
 
@@ -114,16 +138,23 @@ class BlendedDataset(torch.utils.data.Dataset):
             path_to_description = get_path_to("description.txt")
             path_to_dataset_index = get_path_to("dataset_index.npy")
             path_to_dataset_sample_index = get_path_to("dataset_sample_index.npy")
-            cache_hit = all(
-                map(
-                    os.path.isfile,
-                    [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
+            cache_hit = (
+                True
+                if self.config.fast_cache_load
+                else all(
+                    map(
+                        os.path.isfile,
+                        [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
+                    )
                 )
             )
         else:
             cache_hit = False
 
-        if not path_to_cache or (not cache_hit and torch.distributed.get_rank() == 0):
+        if not path_to_cache or (
+            not cache_hit
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+        ):
             log_single_rank(
                 logger, logging.INFO, f"Build and save the {type(self).__name__} indices"
             )
@@ -193,7 +224,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             logger, logging.INFO, f"\tLoad the dataset index from {path_to_dataset_index}"
         )
         t_beg = time.time()
-        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
+        dataset_index = safe_numpy_load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -203,7 +234,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             f"\tLoad the dataset sample index from {path_to_dataset_sample_index}",
         )
         t_beg = time.time()
-        dataset_sample_index = numpy.load(
+        dataset_sample_index = safe_numpy_load(
             path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
         )
         t_end = time.time()

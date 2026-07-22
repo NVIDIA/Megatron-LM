@@ -1,20 +1,26 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from functools import partial
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
 
 import torch
 
+from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
+    CachedMetadataFileSystemReader,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
@@ -24,6 +30,11 @@ NUM_ATTENTION_HEADS = 8
 def initialize_gpt_model(
     pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -61,6 +72,11 @@ def initialize_moe_model(
     use_grouped_mlp=False,
     **config_kwargs,
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     expert_num = 8
@@ -134,6 +150,7 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.no_save_optim = False
     args.no_save_rng = False
     args.ckpt_assume_constant_structure = False
+    args.ckpt_load_validate_sharding_integrity = True
     args.log_progress = False
     args.auto_detect_ckpt_format = False
     args.exit_on_missing_checkpoint = False
@@ -141,7 +158,6 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.consumed_train_samples = 0
     args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
-    args.retro_add_retriever = False
     args.no_load_optim = False
     args.no_load_rng = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
@@ -152,9 +168,12 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.num_attention_heads = NUM_ATTENTION_HEADS
     args.ckpt_step = None
     args.use_megatron_fsdp = False
-    args.dist_ckpt_save_pre_mcore_014 = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
+    # Clear the metadata cache to avoid contamination between tests
+
+    CachedMetadataFileSystemReader.clear_metadata_cache()
 
 
 def setup_model_and_optimizer(
@@ -164,11 +183,33 @@ def setup_model_and_optimizer(
     initialize_fn=initialize_gpt_model,
     bf16=True,
     dist_opt=True,
-    data_parallel_sharding_strategy="optim_grads_params",
+    optimizer='adam',
+    use_param_layout=False,
+    muon_scalar_optimizer='adam',
 ):
+    optimizer_type = optimizer
+    use_layer_wise = False
+    if optimizer_type == 'dist_muon':
+        optimizer = 'muon'
+        use_layer_wise = True
+    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+        use_layer_wise = True
+
+    # When use_layer_wise is True and use_param_layout is False, route DDP
+    # construction through the legacy path (no precomputed param layout, no
+    # ``use_distributed_optimizer=True`` flip). LayerWiseDistributedOptimizer
+    # then syncs via its legacy ``allgather_params()`` codepath rather than
+    # ``start_param_sync``.
+    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
+    ddp_use_layer_wise = use_layer_wise and use_param_layout
+
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        if ddp_use_layer_wise:
+            mock_args.optimizer = optimizer
         model = get_model(
             partial(
                 initialize_fn,
@@ -183,21 +224,53 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=ddp_use_dist_opt,
+        use_layer_wise_distributed_optimizer=use_layer_wise,
+        optimizer=optimizer,
+        muon_scalar_optimizer=muon_scalar_optimizer,
     )
+
+    if optimizer_type in ('muon', 'dist_muon'):
+        config.lr = 0.0
+    elif optimizer_type == 'lion':
+        config.lr = 1e-4
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    for group in optimizer.optimizer.param_groups:
-        for p in group['params']:
-            if len(optimizer.optimizer.state[p]) == 0:
-                optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    def _init_states(optimizer):
+        # In hybrid LayerWise + DistOpt mode the top-level ChainedOptimizer
+        # wraps another ChainedOptimizer (LayerWise) alongside DistOpt; recurse
+        # so the Muon Float16 sub-optimizers inside LayerWise still get their
+        # state seeded. Optimizers without ``init_state_fn`` (DistOpt) seed
+        # their state elsewhere and are skipped here.
+        if isinstance(optimizer, ChainedOptimizer):
+            for child_optimizer in optimizer.chained_optimizers:
+                _init_states(child_optimizer)
+            return
+        if not hasattr(optimizer, 'init_state_fn'):
+            return
+        if not hasattr(optimizer, 'optimizer'):
+            optimizer.init_state_fn(optimizer)
+        else:
+            optimizer.init_state_fn(optimizer.optimizer)
+
+    if isinstance(optimizer, ChainedOptimizer):
+        _init_states(optimizer)
+    else:
+        if hasattr(optimizer, 'optimizer_state_keys'):
+            state_keys = optimizer.optimizer_state_keys
+        else:
+            state_keys = ("exp_avg", "exp_avg_sq")
+        for group in optimizer.optimizer.param_groups:
+            for p in group['params']:
+                if len(optimizer.optimizer.state[p]) == 0:
+                    for key in state_keys:
+                        optimizer.optimizer.state[p][key] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
 
 
@@ -237,10 +310,28 @@ def setup_moe_model_and_optimizer(
     use_te=False,
     use_grouped_mlp=False,
     use_glu=False,
+    optimizer='adam',
+    use_param_layout=False,
 ):
+    optimizer_type = optimizer
+    use_layer_wise = False
+    if optimizer_type == 'dist_muon':
+        optimizer = 'muon'
+        use_layer_wise = True
+    if optimizer_type in ('muon', 'dist_muon') and dist_opt:
+        use_layer_wise = True
+
+    # See setup_model_and_optimizer for the use_param_layout semantics.
+    ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
+    ddp_use_layer_wise = use_layer_wise and use_param_layout
+
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.use_distributed_optimizer = ddp_use_dist_opt
+        mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
+        if ddp_use_layer_wise:
+            mock_args.optimizer = optimizer
         model = get_model(
             partial(
                 initialize_fn,
@@ -260,20 +351,32 @@ def setup_moe_model_and_optimizer(
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=ddp_use_dist_opt,
+        use_layer_wise_distributed_optimizer=use_layer_wise,
+        optimizer=optimizer,
     )
+
+    if optimizer_type in ('muon', 'dist_muon'):
+        config.lr = 0.0
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    for opt in optimizer.chained_optimizers:
-        for group in opt.param_groups:
-            for p in group['params']:
-                if len(opt.state[p]) == 0:
-                    opt.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if optimizer_type in ('muon', 'dist_muon'):
+        for opt in optimizer.chained_optimizers:
+            if not hasattr(opt, 'optimizer'):
+                opt.init_state_fn(opt)
+            else:
+                opt.init_state_fn(opt.optimizer)
+    else:
+        for opt in optimizer.chained_optimizers:
+            for group in opt.param_groups:
+                for p in group['params']:
+                    if len(opt.state[p]) == 0:
+                        opt.state[p]['exp_avg'] = torch.rand_like(p.data)
+                        opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-
+    CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer

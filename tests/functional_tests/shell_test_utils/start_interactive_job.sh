@@ -87,6 +87,7 @@ SRUN_CMD="srun \
     --container-image=$IMAGE \
     --container-workdir=/opt/megatron-lm \
     --container-mounts=$CONTAINER_MOUNTS \
+    --no-container-mount-home \
     --nodes=1 \
     $(if [ "$NO_GPUS_PER_TASK" = "FALSE" ]; then echo "--gpus-per-task=8"; fi) \
     --time=$TIME \

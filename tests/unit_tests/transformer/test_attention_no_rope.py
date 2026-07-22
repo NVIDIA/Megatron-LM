@@ -3,7 +3,9 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -30,7 +32,7 @@ class TestParallelAttentionWithNoRope:
         )
         self.parallel_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -176,7 +178,7 @@ class TestParallelAttentionWithNoRope:
 
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )

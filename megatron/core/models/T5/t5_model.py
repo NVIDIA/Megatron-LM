@@ -56,7 +56,11 @@ class T5LMHead(MegatronModule):
             config.hidden_size,
             vocab_size,
             config=config,
-            init_method=config.init_method,
+            init_method=(
+                config.embedding_init_method
+                if config.use_mup and not share_embeddings_and_output_weights
+                else config.init_method
+            ),
             bias=share_embeddings_and_output_weights,
             skip_bias_add=not share_embeddings_and_output_weights,
             gather_output=not self.parallel_output,

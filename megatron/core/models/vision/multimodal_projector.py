@@ -4,11 +4,12 @@ from typing import Optional
 import torch
 
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.utils import get_tensor_model_parallel_group_if_none, make_viewless_tensor
 
 
 class MultimodalProjector(MegatronModule):
@@ -32,9 +33,12 @@ class MultimodalProjector(MegatronModule):
         projector_type: str,
         input_size: int,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         self.projector_type = projector_type
+        tp_group = pg_collection.tp if pg_collection is not None else tp_group
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 
         assert submodules is not None, "MLPSubmodules must be provided"
 
@@ -45,12 +49,11 @@ class MultimodalProjector(MegatronModule):
                     config=config, submodules=submodules, input_size=input_size, tp_group=tp_group
                 )
             elif self.projector_type == "affine":
-                self.encoder = build_module(
-                    submodules.linear_fc1,
+                self.encoder = submodules.linear_fc1(
                     input_size,
                     config.hidden_size,
                     config=config,
-                    init_method=config.init_method,
+                    init_method=not_none(config.init_method),
                     gather_output=True,
                     bias=config.add_bias_linear,
                     skip_bias_add=True,
@@ -73,7 +76,7 @@ class MultimodalProjector(MegatronModule):
         fp8_context = get_fp8_context(self.config)
         with fp8_context:
             # Run encoder.
-            encoder_output, encoder_output_bias = self.encoder(hidden_states)
+            encoder_output, encoder_output_bias = apply_module(self.encoder)(hidden_states)
 
             if encoder_output_bias is not None:
                 encoder_output = encoder_output + encoder_output_bias

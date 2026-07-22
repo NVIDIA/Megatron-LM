@@ -90,7 +90,7 @@ class TRTLLMLayers(Enum):
         map the original layer name to equivalent trtllm layer name and add layer number back.
         CPU Conversion will pass in model state dict without layer numbers
         (i.e decoder.layers.mlp.linear_fc1.weight of shape [num_layers, hidden_dim, 4 * hidden_dim]) .
-        GPU conversion will pass model state dict with each layer seperated
+        GPU conversion will pass model state dict with each layer separated
         (i.e decoder.layers.2.mlp.linear_fc1.weight of shape [hidden_dim, 4 * hidden_dim]).
 
         Args:

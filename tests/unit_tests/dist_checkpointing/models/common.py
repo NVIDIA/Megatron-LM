@@ -6,13 +6,13 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
+)
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
 )
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -81,7 +81,7 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=src_tp_pp[1],
             **src_model_init_kwargs,
         )
-        save_strategy = get_default_save_sharded_strategy()
+        save_strategy = TorchDistSaveShardedStrategy()
         if use_fpsl:
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,
@@ -91,7 +91,8 @@ def common_test_parallel_reconfiguration_e2e(
         save(gpt_model_A.sharded_state_dict(metadata=metadata), ckpt_dir_A, save_strategy)
         regular_state_dict_A = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
-
+        if metadata is not None:
+            metadata.pop("dp_cp_group")
         # Load checkpoint A with different TP/PP and save as checkpoint B
         # No FPS this time, only FPL
         Utils.initialize_model_parallel(*dest_tp_pp, **(dst_tp_pp_kwargs or {}), order=store_order)
@@ -103,7 +104,7 @@ def common_test_parallel_reconfiguration_e2e(
             **dst_model_init_kwargs,
         )
         if use_fpsl:
-            load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+            load_strategy = TorchDistLoadShardedStrategy()
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         else:
             load_strategy = None

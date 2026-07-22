@@ -8,6 +8,7 @@ else
 fi
 
 MODEL_ARGS=" \
+    --trust-remote-code \
     --save-interval 100000 \
     --micro-batch-size 1 \
     --bf16 \

@@ -50,7 +50,7 @@ def get_gpt_modelopt_spec(
         config: model's transformer config
         local_core_attention: whether to use local DotProductAttention or TEDotProductAttention
         remap_te_layernorm: whether to perform sharded state_dict prefix mapping on layernorm
-        real_quant_cfg: TensorRT Model Optimizer real quantization config
+        real_quant_cfg: Model Optimizer real quantization config
         qk_l2_norm: whether to use Llama4 L2 norm for Q and K
         use_arbitrary_attention_mask: whether to use arbitrary attention mask instead of causal
     """

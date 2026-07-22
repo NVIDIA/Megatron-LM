@@ -1,8 +1,8 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 
 def add_modelopt_args(parser):
-    """Add additional arguments for using TensorRT Model Optimizer (modelopt) features."""
+    """Add additional arguments for using Model Optimizer (modelopt) features."""
     group = parser.add_argument_group(title="modelopt-generic")
 
     # Model and Checkpoint Compatibility
@@ -10,8 +10,9 @@ def add_modelopt_args(parser):
         "--export-model-type",
         type=str,
         default="GPTModel",
-        choices=["GPTModel", "MambaModel"],
-        help="Model type to use in model_provider.",
+        choices=["GPTModel", "HybridModel", "MambaModel"],
+        help='Model type to use in model_provider. Use "HybridModel" for hybrid models '
+        '(formerly MambaModel). "MambaModel" is accepted for backward compatibility but deprecated.',
     )
     group.add_argument(
         "--export-legacy-megatron",
@@ -21,19 +22,29 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Export a megatron-core transformer-engine checkpoint.",
+        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
+        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
+        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
+        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
+    )
+    group.add_argument(
+        "--export-default-te-spec",
+        action="store_true",
+        help="Use the full Transformer-Engine layer spec for model building. "
+        "This builds the model with TELayerNormColumnParallelLinear, TERowParallelLinear, "
+        "TEGroupedMLP, TEDotProductAttention, etc., matching the canonical TE specs.",
     )
     group.add_argument(
         "--export-force-local-attention",
         action="store_true",
         help="Forcing local DotProductAttention; otherwise TEDotProductAttention is used.",
     )
-
     # Quantization
     group.add_argument(
         "--export-kv-cache-quant",
-        action="store_true",
-        help="Whether or not to perform KV-cache quantization.",
+        help="Type of KV cache quantization to perform.",
+        choices=["none", "fp8", "fp8_affine", "nvfp4", "nvfp4_affine", "nvfp4_rotate"],
+        default="none",
     )
     group.add_argument(
         "--export-real-quant-cfg",
@@ -46,47 +57,33 @@ def add_modelopt_args(parser):
         "--export-quant-cfg",
         type=str,
         default=None,
-        choices=[
-            "int8_sq",
-            "fp8",
-            "fp8_real_quant",
-            "fp8_blockwise",
-            "fp8_blockwise_real_quant",
-            "fp8_blockwise_32",
-            "int4_awq",
-            "w4a8_awq",
-            "nvfp4",
-            "None",
-        ],
-        help="Specify a quantization config from the supported choices.",
+        # TODO replace choices with mtq.config.choices after deprecating the shorter aliases
+        help="Specify a quantization config from mtq.config.choices.",
     )
-
     # Knowledge Distillation
-    group.add_argument(
-        '--export-kd-cfg',
-        type=str,
-        default=None,
-        help='Path to distillation configuration yaml file.',
-    )
-
-    group.add_argument(
-        '--teacher-model-config',
-        type=str,
-        default=None,
-        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
-    )
-
     group.add_argument(
         '--export-kd-teacher-load',
         type=str,
-        help='Path to checkpoint to load as distillation teacher.',
+        help='Path to checkpoint to load as distillation teacher. (Enables distillation mode automatically)',
+    )
+    group.add_argument(
+        '--export-kd-teacher-model-config',
+        type=str,
+        default=None,
+        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
     )
     group.add_argument(
         '--export-kd-teacher-ckpt-format',
         type=str,
         default=None,
-        choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
+        choices=['torch', 'torch_dist', 'torch_dcp'],
         help="Checkpoint format of teacher model, if different from student's.",
+    )
+    group.add_argument(
+        '--export-kd-cfg',
+        type=str,
+        default=None,
+        help='Path to distillation configuration yaml file, in order to use non-default settings.',
     )
 
     # Finetuning
@@ -95,6 +92,26 @@ def add_modelopt_args(parser):
     )
     group.add_argument(
         "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
+    )
+
+    # MTP / base train-target selection for QAD and MTP QAT.
+    group.add_argument(
+        '--qad-train-target',
+        type=str,
+        default=None,
+        choices=['base', 'mtp', 'both'],
+        help='Which side of an MTP model to train during QAD / MTP QAT. '
+        '"mtp": train MTP heads only, freeze the base (post-QAD two-phase recipe); '
+        '"base": train the base only, freeze the MTP heads; '
+        '"both": co-train the base and MTP heads together. '
+        'Routers on the frozen side also have their expert_bias update skipped.',
+    )
+    group.add_argument(
+        '--freeze-base-for-mtp',
+        action='store_true',
+        default=False,
+        help='Deprecated alias for --qad-train-target mtp: freeze all base model '
+        'parameters and only train MTP heads.',
     )
 
     # Special model architecture option
@@ -122,7 +139,7 @@ def add_modelopt_args(parser):
         action="store_true",
         help='Will be set automatically when loading a ModelOpt checkpoint.',
     )
-    
+
     # GPT-OSS YaRN RoPE support
     group.add_argument(
         '--enable-gpt-oss',

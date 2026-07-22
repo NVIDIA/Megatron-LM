@@ -1,8 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
+import functools
+import logging
 import types
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Tuple, Union
+from typing import Any, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -24,7 +28,17 @@ class ModuleSpec:
 
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
-    submodules: type = None
+    submodules: object = None
+    metainfo: dict = field(default_factory=lambda: {})
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Builds an instance of the module from the spec.
+
+        Args:
+            *args: Positional arguments to be passed to the module init.
+            **kwargs: Keyword arguments to be passed to the module init.
+        """
+        return build_module(self, *args, **kwargs)
 
 
 def import_module(module_path: Tuple[str]):
@@ -37,12 +51,14 @@ def import_module(module_path: Tuple[str]):
     try:
         module = __import__(base_path, globals(), locals(), [name])
     except ImportError as e:
-        print(f"couldn't import module due to {e}")
+        logger.error(f"couldn't import module due to {e}")
         return None
     return vars(module)[name]
 
 
+# pylint: disable=missing-function-docstring
 def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
+    """Returns or imports the provided module."""
     # If a module clas is already provided return it as is
     if isinstance(spec_or_module, (type, types.FunctionType)):
         return spec_or_module
@@ -56,6 +72,13 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
 
 
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
+    """Builds an instance of the module from the spec.
+
+    Args:
+        spec_or_module: The module spec or module class to build.
+        *args: Positional arguments to be passed to the module init.
+        **kwargs: Keyword arguments to be passed to the module init.
+    """
     # If the passed `spec_or_module` is
     # a `Function`, then return it as it is
     # NOTE: to support an already initialized module add the following condition
@@ -104,3 +127,16 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
         raise type(e)(f"{str(e)} when instantiating {module.__name__}").with_traceback(
             sys.exc_info()[2]
         )
+
+
+def get_submodules(spec: Callable[..., Any]) -> object:
+    """Gets the `submodules` field from the provided spec.
+
+    Supports `partial` objects, as well as ModuleSpec or any other object with a `submodules` attr.
+    Raises a ValueError if the provided spec is not supported.
+    """
+    if isinstance(spec, functools.partial):
+        return spec.keywords['submodules']
+    if hasattr(spec, "submodules"):
+        return spec.submodules  # type: ignore
+    raise ValueError(f"Could not find `submodules` in the provided spec: {spec!r}")

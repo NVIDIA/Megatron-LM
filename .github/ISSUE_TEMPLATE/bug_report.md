@@ -9,7 +9,8 @@ assignees: ''
 
 **Describe the bug**
 
-A clear and concise description of what the bug is.
+A clear and concise description of what the bug is. Tag @NVIDIA/mcore-oncall
+to get oncall's attention to this issue.
 
 **Steps/Code to reproduce bug**
 

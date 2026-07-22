@@ -13,6 +13,7 @@ from torch import Tensor
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import internal_api
 
 logger = logging.getLogger(__name__)
 
@@ -98,14 +99,16 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
             )
 
-    @lru_cache(maxsize=32)
-    def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
+            # clear the lru_cache for the forward method. If not cleared, the cache of forward
+            # method causes a memory leak in NeMo-RL.
+            self.forward.cache_clear()
+
+    def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
@@ -151,10 +154,36 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
+        return emb, _mscale
+
+    @lru_cache(maxsize=32)
+    @internal_api
+    def forward(
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Tensor:
+        """Forward pass of Yarn Rotary Embedding.
+
+        Args:
+            max_seq_len (int): Maximum size of sequence
+            offset (int, optional): RoPE offset. Defaults to 0.
+            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
+
+        Returns:
+            Tensor: Embeddings after applying Yarn RoPE.
+        """
+        emb, _mscale = self.get_emb(max_seq_len, offset)
+        if cp_group is None:
+            cp_group = self.cp_group
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, _mscale
 
     def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False):
@@ -228,22 +257,25 @@ def _yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 @lru_cache(maxsize=8)
 def _yarn_get_concentration_factor(
-    scaling_factor: float, mscale: float, mscale_all_dim: float
+    scaling_factor: float, mscale: Optional[float], mscale_all_dim: Optional[float]
 ) -> float:
     """
     Get the concentration factor (factor multiplied to the sine and cosine components of the
     embedding). This factor is also known as attention factor, and sometimes homonymously known as
     "mscale"
     """
+    if mscale is None or mscale_all_dim is None:
+        return _yarn_get_mscale(scaling_factor)
     return float(
         _yarn_get_mscale(scaling_factor, mscale) / _yarn_get_mscale(scaling_factor, mscale_all_dim)
     )
 
 
 def _yarn_get_concentration_factor_from_config(config: TransformerConfig) -> float:
-    fields = ["yarn_rotary_scaling_factor", "yarn_mscale", "yarn_mscale_all_dim"]
-    if all(hasattr(config, f) for f in fields):
+    if hasattr(config, "yarn_rotary_scaling_factor"):
         return _yarn_get_concentration_factor(
-            config.yarn_rotary_scaling_factor, config.yarn_mscale, config.yarn_mscale_all_dim
+            config.yarn_rotary_scaling_factor,
+            getattr(config, "yarn_mscale", None),
+            getattr(config, "yarn_mscale_all_dim", None),
         )
     return 1.0

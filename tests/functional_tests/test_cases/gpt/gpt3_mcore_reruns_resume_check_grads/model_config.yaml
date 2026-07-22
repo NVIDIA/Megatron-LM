@@ -85,13 +85,16 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --eval-interval: 1000
   --ckpt-format: torch_dist
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+  --dist-ckpt-optim-fully-reshardable: true
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
+  --async-save: true
+  --use-persistent-ckpt-worker: true
   # data settings
   --data-cache-path: ${DATA_CACHE_PATH}
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   # logging settings
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --timing-log-level: 0
@@ -101,8 +104,6 @@ BASE_MODEL_ARGS: &BASE_MODEL_ARGS
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
-  # Needed for easy access to optimizer states
-  --dist-ckpt-save-pre-mcore-014: true
   # rerun settings
   --rerun-mode: validate_results
 MODEL_ARGS:

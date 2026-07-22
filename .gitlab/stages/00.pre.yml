@@ -39,6 +39,9 @@ pre:create_ci_branches:
       - branch: ci-approve-main
       - branch: ci-approve-dev
       - branch: ci-sync-branches
+      - branch: ci-testing-1
+      - branch: ci-testing-2
+      - branch: ci-testing-3
   tags:
     - arch/amd64
     - env/prod
@@ -102,7 +105,7 @@ pre:label_merge_request:
     - cd gitlab-mr-labeler
     - go install .
     - cd ..
-    - go install github.com/itchyny/gojq/cmd/gojq@latest
+    - go install github.com/itchyny/gojq/cmd/gojq@v0.12.17
   script:
     - set -x
     - |

@@ -1,0 +1,32 @@
+# Inference perf test: 583M mcore-mistral checkpoint, TP=1 PP=1 DP=8 (8 GPUs).
+#
+# DP=8 mirrors what the now-deleted
+# tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq/
+# used to cover — exercises the multi-rank dynamic-batching path through the
+# ZMQ DP coordinator, not just the single-GPU efficient case.
+#
+# Baseline values are recorded by `RECORD_BASELINE=1 run_perf_test.sh ...`
+# and compared on subsequent runs with TOLERANCE_PCT tolerance.
+
+MODEL: gpt_583m
+TP: 1
+PP: 1
+DP: 8
+NUM_INPUT_TOKENS: 512
+NUM_OUTPUT_TOKENS: 128
+NUM_WARMUP_ITERS: 2
+NUM_TIMED_ITERS: 5
+BATCH_SIZES:
+  - 1
+  - 8
+  - 32
+  - 128
+TOLERANCE_PCT: 10
+# p99 omitted on purpose: with NUM_TIMED_ITERS=5 it is the max of 5 samples,
+# not a real percentile, so it produces flaky regressions even when throughput
+# / avg / p50 are stable. p99 is still recorded in results.json for visibility.
+METRICS:
+  - throughput_tok_per_sec
+  - avg_latency_ms
+  - p50_latency_ms
+  - tpot_ms_per_tok

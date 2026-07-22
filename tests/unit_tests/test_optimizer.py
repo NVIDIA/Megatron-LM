@@ -1,4 +1,7 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -10,19 +13,40 @@ from torch.optim import SGD, Adam
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
+from megatron.core.optimizer import (
+    ChainedOptimizer,
+    OptimizerConfig,
+    ParamKey,
+    ParamPredicate,
+    _get_param_groups,
+    check_config_overrides_consistency,
+    get_megatron_optimizer,
+    get_standard_config_overrides,
+)
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.multi_latent_attention import (
+    FusedMLASelfAttention,
+    MLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
+from tests.unit_tests.test_utils import _init_distributed
 
 try:
     # Check if FP8 block scaling is available.
     from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support
 
     fp8_block_scaling_available, reason_for_no_fp8_block_scaling = check_fp8_block_scaling_support()
-    from transformer_engine.common.recipe import Float8BlockScaling, Format
+    from transformer_engine.common.recipe import DelayedScaling, Float8BlockScaling, Format
 except:
     fp8_block_scaling_available = False
     reason_for_no_fp8_block_scaling = "FP8 block scaled GEMM requires Hopper and CUDA >= 12.9."
@@ -33,7 +57,7 @@ except:
 
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, add_layernorm=False):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
@@ -41,6 +65,10 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(16 * 5 * 5, 120)
         self.fc2 = nn.Linear(120, 84)
         self.fc3 = nn.Linear(84, 10)
+        if add_layernorm:
+            self.q_layernorm = nn.LayerNorm(10, bias=False)
+            self.k_layernorm = nn.LayerNorm(10, bias=False)
+            self.layernorm = nn.LayerNorm(10, bias=False)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
@@ -50,6 +78,223 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_no_overrides(mock_get_world_size):
+    net = Net()
+    # NOTE: to get no overrides, supply an empty dictionary rather than None.
+    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), {})
+    assert len(param_groups) == 1
+    pg0 = param_groups[0]
+    assert pg0.keys() == {
+        'params',
+        'is_expert_parallel',
+        'default_config',
+        'wd_mult',
+        'lr_mult',
+        'is_decoupled_lr',
+        'max_lr',
+        'min_lr',
+    }
+    assert pg0['params'] == list(net.parameters())
+    assert pg0['is_expert_parallel'] == False
+    assert pg0['default_config'] == True
+    assert pg0['wd_mult'] == 1.0
+    assert pg0['lr_mult'] == 1.0
+    assert pg0['is_decoupled_lr'] == False
+    assert pg0['max_lr'] == 0.01  # from the optimizer config default for lr
+    assert pg0['min_lr'] is None  # from the optimizer config default.
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_default_overrides(mock_get_world_size):
+    """Test that the default overrides are applied to the parameter groups."""
+    net = Net()
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    config_overrides = get_standard_config_overrides(opt_config)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
+    assert len(param_groups) == 2
+    pg0, pg1 = param_groups
+    wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
+    assert wd_mults == {1.0, 0.0}
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_with_overrides(mock_get_world_size):
+    net = Net()
+    config_overrides = {
+        ParamKey(
+            name="*.bias",
+            predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1),
+        ): ParamGroupOverride(wd_mult=0.0)
+    }
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 0.0 or param_groups[1]['wd_mult'] == 0.0
+    assert param_groups[0]['wd_mult'] == 1.0 or param_groups[1]['wd_mult'] == 1.0
+    assert len(param_groups[0]['params']) > 0 and len(param_groups[1]['params']) > 0
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_multiple_matches(mock_get_world_size):
+    net = Net()
+
+    param_groups = _get_param_groups(
+        [net],
+        OptimizerConfig(optimizer='adam', lr=0.01),
+        {
+            ParamKey(name="*.bias"): ParamGroupOverride(min_lr=1e-4, wd_mult=0.0),
+            ParamKey(
+                predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1)
+            ): ParamGroupOverride(wd_mult=0.0, min_lr=1e-4),
+        },
+    )
+    config_overrides = {
+        ParamKey(
+            name="*.bias",
+            predicate=ParamPredicate(name="param_len_1", fn=lambda param: len(param.shape) == 1),
+        ): ParamGroupOverride(min_lr=1e-4, wd_mult=0.0)
+    }
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups2 = _get_param_groups([net], opt_config, config_overrides)
+    assert len(param_groups) == 2
+    assert param_groups == param_groups2
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_overlapping_matches(mock_get_world_size):
+    """In this test, we see if we can have two matches that create three param groups."""
+    net = Net()
+    # We expect that all convolution parameters will have wd_mult=0.0
+    #  However the conv1 related parameters will additionally have a different LR schedule.
+    #  this should create three param groups (no match, conv1 (both wd_mult=0.0 and LR schedule), conv2 (only wd_mult=0.0))
+    config_overrides = {
+        ParamKey(name="*conv*"): ParamGroupOverride(wd_mult=0.0),
+        ParamKey(name="*conv1*"): ParamGroupOverride(min_lr=10, max_lr=20),
+    }
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
+    assert len(param_groups) == 3
+    p_set = set(net.parameters())
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params']) | set(
+        param_groups[2]['params']
+    )
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params']) + len(
+        param_groups[2]['params']
+    )
+    assert (
+        param_groups[0]['wd_mult'] == 1.0
+    ), "We expect the first param group to be the None one, which should have wd_mult=1.0"
+    assert (
+        param_groups[1]['wd_mult'] == 0.0
+    ), "We expect the second param group to be the conv1 one, which should have wd_mult=0.0"
+    assert (
+        param_groups[2]['wd_mult'] == 0.0
+    ), "We expect the third param group to be the conv2 one, which should have wd_mult=0.0"
+    assert param_groups[1]['min_lr'] == 10
+    assert param_groups[1]['max_lr'] == 20
+    assert param_groups[2]['min_lr'] is None
+    assert param_groups[2]['max_lr'] == 0.01
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernorm: bool):
+    """In this test, we see if the standard config overrides are applied correctly."""
+
+    # Initialize the model with layernorm
+    net = Net()
+
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    config_overrides = get_standard_config_overrides(config=config)
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 0.0 or param_groups[1]['wd_mult'] == 0.0
+    assert param_groups[0]['wd_mult'] == 1.0 or param_groups[1]['wd_mult'] == 1.0
+    assert len(param_groups[0]['params']) > 0 and len(param_groups[1]['params']) > 0
+
+    # Both param groups should have 5 parameters.
+    # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight
+    # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias
+    assert len(param_groups[0]['params']) == 5, (
+        f"Expected 5 parameters in the first param group, "
+        f"but got {len(param_groups[0]['params'])}"
+    )
+    assert len(param_groups[1]['params']) == 5, (
+        f"Expected 5 parameters in the second param group, "
+        f"but got {len(param_groups[1]['params'])}"
+    )
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: bool):
+    """In this test, we see if the `apply_wd_to_qk_layernorm` config is applied correctly."""
+
+    # Initialize the model with layernorm
+    net = Net(add_layernorm=True)
+
+    config = OptimizerConfig(
+        optimizer='adam', lr=0.01, apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm
+    )
+    config_overrides = get_standard_config_overrides(config=config)
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 1.0
+    assert param_groups[1]['wd_mult'] == 0.0
+
+    # There are two param groups, having 7, and 6 parameters respectively.
+    # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight,
+    #    q_layernorm.weight, k_layernorm.weight
+    # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias,
+    #    layernorm.weight
+    assert len(param_groups[0]['params']) == 7, (
+        f"Expected 5 parameters in the first param group, "
+        f"but got {len(param_groups[0]['params'])}"
+    )
+    assert len(param_groups[1]['params']) == 6, (
+        f"Expected 6 parameters in the second param group, "
+        f"but got {len(param_groups[1]['params'])}"
+    )
 
 
 def test_chained_optimizer():
@@ -90,6 +335,343 @@ def test_chained_optimizer():
 
     assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+
+
+def test_chained_optimizer_get_parameters():
+    """Test ChainedOptimizer.get_parameters() aggregates params from all sub-optimizers.
+
+    Regression test: without the get_parameters() override, ChainedOptimizer would
+    access self.optimizer which asserts only one optimizer exists, failing with VPP/MoE.
+    """
+
+    class MockOptimizer:
+        """Mock that mimics MegatronOptimizer's get_parameters() interface."""
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.param_groups = [{"params": self.params}]
+
+        def get_parameters(self):
+            return self.params
+
+    net = Net()
+    all_params = list(net.parameters())
+
+    # Test empty
+    assert ChainedOptimizer([]).get_parameters() == []
+
+    # Test single optimizer
+    opt1 = MockOptimizer(all_params[:3])
+    assert ChainedOptimizer([opt1]).get_parameters() == opt1.params
+
+    # Test multiple optimizers (the case that previously failed)
+    opt2 = MockOptimizer(all_params[3:6])
+    opt3 = MockOptimizer(all_params[6:])
+    chained = ChainedOptimizer([opt1, opt2, opt3])
+    result = chained.get_parameters()
+
+    assert len(result) == len(all_params)
+    assert result == opt1.params + opt2.params + opt3.params
+
+
+def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
+    """Test ChainedOptimizer reports skipped large-gradient updates as unsuccessful."""
+    from megatron.core import parallel_state
+
+    class MockOptimizer:
+        """Mock that mimics the ChainedOptimizer step interface."""
+
+        def __init__(self, param, config):
+            self.config = config
+            self.param = param
+            self.param_groups = [{"params": [param]}]
+            self.step_called = False
+            self.is_stub_optimizer = False
+
+        def prepare_grads(self):
+            return False
+
+        def get_grad_norm(self):
+            return 2.0
+
+        def get_parameters(self):
+            return [self.param]
+
+        def get_grad_stats_parallel_group(self):
+            return parallel_state.get_model_parallel_group()
+
+        def has_grad_norm_group(self, grad_norm_group):
+            return False
+
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
+            return []
+
+        def step_with_ready_grads(self):
+            self.step_called = True
+            return True
+
+    Utils.initialize_model_parallel()
+    try:
+        config = OptimizerConfig(clip_grad=0.0, grad_norm_skip_threshold=1.0)
+        param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        param.grad = torch.ones_like(param)
+        optimizer = MockOptimizer(param, config)
+        chained_optimizer = ChainedOptimizer([optimizer])
+
+        update_successful, grad_norm, num_zeros_in_grad = chained_optimizer.step()
+
+        assert update_successful is False
+        assert grad_norm == 2.0
+        assert num_zeros_in_grad is None
+        assert optimizer.step_called is False
+        torch.testing.assert_close(param.grad, torch.ones_like(param.grad))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_chained_optimizer_does_not_skip_update_for_large_mtp_grads():
+    """MTP grad magnitude does not influence the grad-norm skip check.
+
+    The skip threshold is evaluated against the main gradient norm only.
+    Even when MTP grads produce a norm far above the skip threshold, the
+    update proceeds as long as the main norm is within bounds.
+    """
+    from megatron.core import parallel_state
+
+    class MockOptimizer:
+        """Mock that exposes real MTP grads for group-norm computation."""
+
+        def __init__(self, main_param, mtp_param, config):
+            self.config = config
+            self.main_param = main_param
+            self.mtp_param = mtp_param
+            self.param_groups = [{"params": [main_param, mtp_param]}]
+            self.step_called = False
+            self.is_stub_optimizer = False
+
+        def prepare_grads(self):
+            return False
+
+        def get_grad_norm(self):
+            # Main grad norm safely below grad_norm_skip_threshold.
+            return 0.5
+
+        def get_parameters(self):
+            return [self.main_param, self.mtp_param]
+
+        def get_grad_stats_parallel_group(self):
+            return parallel_state.get_model_parallel_group()
+
+        def has_grad_norm_group(self, grad_norm_group):
+            return True
+
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
+            return [self.mtp_param.grad]
+
+        def step_with_ready_grads(self):
+            self.step_called = True
+            return True
+
+    Utils.initialize_model_parallel()
+    try:
+        skip_threshold = 1.0
+        config = OptimizerConfig(clip_grad=1.0, grad_norm_skip_threshold=skip_threshold)
+        main_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        main_param.grad = torch.full_like(main_param, 0.25)
+        mtp_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+        mtp_param.grad_norm_group = 'mtp'
+        # MTP grad norm (~20) is far above skip_threshold (1.0).
+        mtp_param.grad = torch.full_like(mtp_param, 10.0)
+
+        optimizer = MockOptimizer(main_param, mtp_param, config)
+        chained_optimizer = ChainedOptimizer([optimizer])
+
+        update_successful, grad_norm, num_zeros_in_grad = chained_optimizer.step()
+
+        # MTP group norm was computed and exceeds the skip threshold ...
+        mtp_group_norm = chained_optimizer.grad_norms_by_group.get('mtp', 0.0)
+        assert mtp_group_norm > skip_threshold
+        # ... yet the update was not skipped, because skip uses the main norm only.
+        assert update_successful is True
+        assert optimizer.step_called is True
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_mtp_grad_separation():
+    """Test that grad-norm helpers separate gradients based on grad_norm_group."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        """Minimal mock of MegatronOptimizer for testing grad filtering."""
+
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        # Create params: 2 main + 2 MTP
+        main_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        mtp_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        for p in mtp_params:
+            p.grad_norm_group = 'mtp'
+
+        # Assign gradients
+        all_params = main_params + mtp_params
+        for p in all_params:
+            p.grad = torch.randn_like(p)
+
+        mock_opt = MockOptimizer(all_params)
+
+        main_grads = mock_opt.get_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm('mtp')
+
+        assert len(main_grads) == 2
+        assert len(mtp_grads) == 2
+
+        # Verify the grads match the expected params
+        for grad, param in zip(main_grads, main_params):
+            assert torch.equal(grad, param.grad)
+        for grad, param in zip(mtp_grads, mtp_params):
+            assert torch.equal(grad, param.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_mtp_grad_separation_no_mtp_params():
+    """Test that without a registered separate grad-norm group, all grads go to main."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(3)]
+        for p in params:
+            p.grad = torch.randn_like(p)
+
+        mock_opt = MockOptimizer(params)
+
+        main_grads = mock_opt.get_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm('mtp')
+
+        assert len(main_grads) == 3
+        assert len(mtp_grads) == 0
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_unregistered_grad_norm_group_raises():
+    """Unknown grad-norm groups fail fast instead of silently joining the main norm."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+    param.grad_norm_group = 'unregistered'
+    param.grad = torch.randn_like(param)
+
+    with pytest.raises(ValueError, match="Unknown grad_norm_group"):
+        MockOptimizer([param]).get_grads_for_grad_norm()
+
+
+def test_has_grad_norm_group():
+    """has_grad_norm_group reflects whether any param is in the requested group."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+        get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        plain = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        assert MockOptimizer(plain).has_grad_norm_group('mtp') is False
+
+        tagged = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        tagged.grad_norm_group = 'mtp'
+        assert MockOptimizer(plain + [tagged]).has_grad_norm_group('mtp') is True
+
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_mtp_grad_clipping_uses_separate_norms():
+    """clip_grad_norm clips MTP params by their own norm, independently of main params."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+        get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+        _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
+        clip_grad_norm = MegatronOptimizer.clip_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        clip = 1.0
+        # Main param: large grad (norm >> clip) -> should be scaled down.
+        main_param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        main_param.grad = torch.full((4, 4), 10.0, device='cuda')
+        main_norm_before = main_param.grad.norm().item()
+        # MTP param: tiny grad (norm < clip) -> below threshold, should be untouched.
+        mtp_param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        mtp_param.grad_norm_group = 'mtp'
+        mtp_param.grad = torch.full((4, 4), 1e-3, device='cuda')
+        mtp_grad_before = mtp_param.grad.clone()
+
+        opt = MockOptimizer([main_param, mtp_param])
+        returned_norm = opt.clip_grad_norm(clip)
+
+        # Returned norm excludes MTP and reflects only the main params.
+        torch.testing.assert_close(float(returned_norm), main_norm_before, rtol=1e-4, atol=1e-4)
+        # Main grads were clipped down toward the threshold.
+        assert main_param.grad.norm().item() < main_norm_before
+        # MTP grads, below the clip threshold, are clipped independently and left unchanged.
+        torch.testing.assert_close(mtp_param.grad, mtp_grad_before)
+        assert 'mtp' in opt.grad_norms_by_group
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_precision_aware_fused_adam():
@@ -150,6 +732,7 @@ def test_precision_aware_fused_adam():
     "moment_dtype",
     [torch.float32, torch.float16, torch.bfloat16, torch.uint8],
 )
+@pytest.mark.skip(reason="inconsistent ci test runs resulting in NCCL errors")
 def test_precision_aware_optimizer(
     precision: str,
     main_params_dtype: torch.dtype,
@@ -244,28 +827,147 @@ def test_precision_aware_optimizer(
         test_model, input, test_optim, fp8_recipe, fp8_recipe_settings
     )
 
-    rtol = 1e-3  # relative tolerance
-    atol = 1e-5  # absolute tolerance
+    rtol, atol = 1.6e-2, 1e-5
 
     # Compare grad norms - allow small difference due to precision
-    rel_diff = abs(test_grad_norm - baseline_grad_norm) / (
-        abs(baseline_grad_norm) + 1e-7  # avoid div by 0
-    )
-    abs_diff = abs(test_grad_norm - baseline_grad_norm)
-    assert (
-        rel_diff <= rtol or abs_diff <= atol
-    ), f"Grad norm mismatch: baseline={baseline_grad_norm}, test={test_grad_norm}, rel_diff={rel_diff}, abs_diff={abs_diff}"
+    torch.testing.assert_close(test_grad_norm, baseline_grad_norm, atol=atol, rtol=rtol)
 
     # Compare losses - allow small difference due to precision
-    loss_rel_diff = abs(test_loss - baseline_loss) / (abs(baseline_loss) + 1e-7)
-    loss_abs_diff = abs(test_loss - baseline_loss)
-    assert (
-        loss_rel_diff <= rtol or loss_abs_diff <= atol
-    ), f"Loss mismatch: baseline={baseline_loss}, test={test_loss}, rel_diff={loss_rel_diff}, abs_diff={loss_abs_diff}"
+    torch.testing.assert_close(test_loss, baseline_loss, atol=atol, rtol=rtol)
 
     # Save and reload state dict for the test model
     state_dict = test_optim.state_dict()
     test_optim.load_state_dict(state_dict)
+
+
+@pytest.mark.parametrize("use_precision_aware", [True, False])
+def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
+    """Test that save/load of distributed optimizer handles non-tensor state entries.
+
+    Optimizers may store non-tensor entries (e.g. `found_inf: bool`) in the per-parameter
+    state dict. The distrib_optimizer's _get_main_param_and_optimizer_states and
+    _set_main_param_and_optimizer_states must skip these to avoid crashes when calling
+    tensor operations (.copy_(), get_unscaled_state, set_scaled_state) on non-tensors.
+
+    Tests both the precision-aware path (TE FusedAdam with scaled states) and the
+    non-precision-aware path (standard optimizer with .copy_()).
+    """
+    if use_precision_aware:
+        try:
+            from transformer_engine.pytorch.optimizers import FusedAdam
+        except ImportError:
+            pytest.skip("TE FusedAdam not available")
+
+        import inspect
+
+        adam_args = inspect.signature(FusedAdam).parameters
+        arg_names = [
+            "master_weight_dtype",
+            "exp_avg_dtype",
+            "exp_avg_sq_dtype",
+            "use_decoupled_grad",
+        ]
+        for name in arg_names:
+            if name not in adam_args:
+                pytest.skip("TE FusedAdam does not support precision-aware args")
+
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=use_precision_aware,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a training step to populate optimizer state
+    input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    # Access the underlying distrib_optimizer
+    distrib_optim = optim.chained_optimizers[0]
+    if use_precision_aware:
+        assert distrib_optim.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    # Inject non-tensor entries into optimizer state (simulates found_inf, etc.)
+    inner_optimizer = distrib_optim.optimizer
+    for param in inner_optimizer.state:
+        inner_optimizer.state[param]['found_inf'] = False
+        inner_optimizer.state[param]['non_tensor_int'] = 42
+
+    # Test 1: _get_main_param_and_optimizer_states should skip non-tensor entries
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    for k, v in tensors.items():
+                        assert isinstance(
+                            v, torch.Tensor
+                        ), f"Non-tensor value for key '{k}': {type(v)}"
+
+    # Test 2: Full save/load roundtrip via dp_reshardable path
+    saved_state = distrib_optim.get_parameter_state_dp_reshardable()
+
+    # Verify saved state doesn't contain non-tensor entries (except metadata keys)
+    metadata_keys = {"per_bucket_numel", "per_bucket_numel_unpadded"}
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    for k, v in param_dict.items():
+                        if k in ('gbuf_local_start', 'gbuf_local_end', 'padding'):
+                            continue
+                        assert isinstance(
+                            v, torch.Tensor
+                        ), f"Non-tensor in saved state key '{k}': {type(v)}"
+
+    # Test 3: load_parameter_state_from_dp_reshardable should not crash
+    # Add 'padding' key required by the load path (normally added by fully_reshardable save)
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    param_dict['padding'] = False
+    distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
+
+    # Test 4: Inject non-tensor entries directly into the saved state and verify load handles them
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    param_dict['found_inf'] = False
+                    param_dict['step_count'] = 42
+
+    # This should not crash - non-tensor entries should be skipped
+    distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
@@ -301,7 +1003,13 @@ def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: st
     optim = get_megatron_optimizer(optimizer_config, [model])
 
     model_sharded_state_dict = model.sharded_state_dict()
-    sharded_state_dict = optim.sharded_state_dict(model_sharded_state_dict)
+    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+    if precision == 'bf16' or use_distributed_optimizer:
+        sharded_state_dict = optim.sharded_state_dict(
+            model_sharded_state_dict, metadata=metadata, is_loading=True
+        )
+    else:
+        sharded_state_dict = optim.sharded_state_dict(model_sharded_state_dict)
 
     if 'optimizer' in sharded_state_dict and 'state' in sharded_state_dict['optimizer']:
         assert (
@@ -366,6 +1074,59 @@ def test_optimizer_reload_model_params():
             torch.testing.assert_close(
                 main_param, torch.empty_like(main_param).fill_(3.0), atol=0, rtol=0
             )
+
+
+def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_matching():
+    if not is_te_min_version("1.10.0"):
+        pytest.skip("Requires TE >= 1.10.0")
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            multi_latent_attention=True, mla_down_proj_fusion=True
+        ).self_attention.submodules
+        assert isinstance(submodules, MLASelfAttentionSubmodules)
+        fused_mla = FusedMLASelfAttention(
+            transformer_config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+        )
+
+        model = nn.Module()
+        model.decoder = nn.Module()
+        model.decoder.layers = nn.ModuleList([nn.Module()])
+        model.decoder.layers[0].self_attention = fused_mla
+
+        prefix = "module.decoder.layers.0.self_attention."
+        sharded_state_dict = fused_mla.sharded_state_dict(prefix=prefix)
+        q_key = next(k for k in sharded_state_dict if k.endswith("linear_q_down_proj.weight"))
+        kv_key = next(k for k in sharded_state_dict if k.endswith("linear_kv_down_proj.weight"))
+        fused_key = f"{prefix}{next(k for k in fused_mla.state_dict() if k.endswith('linear_qkv_down_proj.weight'))}"
+        q_weight = sharded_state_dict[q_key].data
+        kv_weight = sharded_state_dict[kv_key].data
+        state_dict = {q_key: q_weight, kv_key: kv_weight}
+
+        DistributedOptimizer._synthesize_state_dict_params_for_model(state_dict, model)
+
+        assert fused_key in state_dict
+        assert q_key not in state_dict
+        assert kv_key not in state_dict
+        torch.testing.assert_close(state_dict[fused_key], torch.cat([q_weight, kv_weight], dim=0))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(

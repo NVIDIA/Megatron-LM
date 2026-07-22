@@ -1,52 +1,82 @@
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 
-megatron/core/models/gpt/ @NVIDIA/gpt
+megatron/core/models/bert/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
-megatron/core/models/multimodal/ @NVIDIA/multi-modal
+megatron/core/models/common/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
-megatron/core/models/mamba/ @NVIDIA/hybrid-mamba
+megatron/core/models/gpt/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
-megatron/core/datasets/ @NVIDIA/datasets
+megatron/core/models/multimodal/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/multi-modal
 
-megatron/core/distributed/fsdp/ @NVIDIA/megatron-fsdp
+megatron/core/models/audio/ @NVIDIA/mcore-audio
 
-megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/megatron-fsdp
+megatron/core/models/mamba/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
+megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 
-megatron/core/dist_checkpointing/ @NVIDIA/dist-checkpointing
+megatron/core/models/hybrid/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model
 
-megatron/core/optimizer/distrib_optimizer/ @NVIDIA/dist-optimizer
+megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 
-megatron/core/inference/modelopt_support @NVIDIA/quantization-and-inference
+megatron/core/tokenizers/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/tokenizers
 
-megatron/core/datasets/ @NVIDIA/datasets
+megatron/core/distributed/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/data-parallelism
+megatron/core/distributed/fsdp/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 
-megatron/core/pipeline_parallel/ @NVIDIA/pipeline-parallelism
+megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 
-megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
+megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
-megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-devtech
+megatron/core/optimizer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
 
-megatron/core/inference/ @NVIDIA/inference
+megatron/core/optimizer/distrib_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/layer_wise_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/param_layout.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
 
-megatron/core/parallel_state.py @NVIDIA/core-nemo
+megatron/core/optimizer/emerging_optimizers.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers
+megatron/core/optimizer/muon.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers
+megatron/core/optimizer/qk_clip.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers @NVIDIA/transformer
 
-megatron/core/post_training/ @NVIDIA/post-training
+megatron/core/inference/modelopt_support @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
+
+megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
+
+megatron/core/pipeline_parallel/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/pipeline-parallelism
+
+megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transformer
+
+megatron/core/transformer/moe/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech
+
+megatron/core/inference/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference
+
+megatron/inference/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference-interface
+
+megatron/core/parallel_state.py @NVIDIA/core-adlr @NVIDIA/core-nemo
+
+megatron/core/post_training/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
 
 megatron/post_training/ @NVIDIA/post-training
 
+megatron/core/transformer/cuda_graphs.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/cuda-graphs
+
+megatron/training/ @NVIDIA/training-adlr @NVIDIA/training-nemo
+megatron/training/arguments.py
+
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
+.github/oncall_schedule.json @NVIDIA/mcore-oncall-rotation
 .gitlab-ci.yml @NVIDIA/ci
 docker/  @NVIDIA/ci
-tests/unit_tests/run_ci_test.sh @NVIDIA/ci
-tests/test_utils/python_scripts/ 
 tests/functional_tests/python_test_utils/ @NVIDIA/ci
 tests/functional_tests/shell_test_utils/ @NVIDIA/ci
-megatron/core/transformer/transformer_block.py @NVIDIA/ci
-megatron/core/transformer/transformer_layer.py @NVIDIA/ci
-tests/functional_tests/test_cases/ @NVIDIA/ci
-tests/functional_tests/recipes/ @NVIDIA/ci
-tests/unit_tests/ @NVIDIA/ci
+tests/test_utils/recipes/ @NVIDIA/ci
+tests/unit_tests/run_ci_test.sh @NVIDIA/ci
+
+# API Backwards Compatibility Check
+scripts/check_api_backwards_compatibility.py @NVIDIA/ci
+scripts/README_API_COMPAT.md @NVIDIA/ci
+.github/workflows/check_api_backwards_compatibility_workflow.yml @NVIDIA/ci
+docs/api-backwards-compatibility-check.md @NVIDIA/ci
+tests/unit_tests/test_api_backwards_compat_setup.py @NVIDIA/ci
 
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning

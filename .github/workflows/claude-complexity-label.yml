@@ -1,0 +1,92 @@
+name: Claude Complexity Label
+
+on:
+  pull_request_target:
+    types: [ready_for_review]
+
+jobs:
+  analyze_complexity:
+    name: Analyze PR Complexity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      label_json: ${{ steps.analyze.outputs.structured_output }}
+    env:
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude Complexity Analysis
+        id: analyze
+        uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
+        with:
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
+          github_token: ${{ github.token }}
+          prompt: |
+            REPO: ${{ env.REPO }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
+
+            You are a PR complexity analyzer. Your job is to analyze the diff of this PR and return exactly one complexity label.
+
+            STEPS:
+            1. Get the PR diff by running: gh pr diff $PR_NUMBER --repo $REPO
+            2. Analyze every changed line (added or removed) in the diff and classify each as one of:
+               - "docs-only": changes to docstrings, comments (lines starting with # or //), documentation files (.md, .rst, .txt), or similar non-functional text
+               - "test": changes in test files (files with "test" in the name/path, or inside a tests/ directory)
+               - "real code": all other changes (functional source code)
+            3. Compute "real code line changes" using this formula:
+               real_code_line_changes = (number of real code lines changed) + (number of test lines changed / 10)
+               Count both added and removed lines. Do not count unchanged context lines. Do not count comments or docstrings.
+            4. Return exactly ONE label:
+               - If there are ZERO real code lines and ZERO test lines (only docs-only changes), return "docs-only".
+               - If real_code_line_changes < 100, return "complexity: low".
+               - If real_code_line_changes >= 100 and < 500, return "complexity: medium".
+               - If real_code_line_changes >= 500, return "complexity: high".
+
+            Do NOT post comments, edit the PR, modify labels, or run any write operation.
+          claude_args: |
+            --allowedTools "Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --model "${{ vars.CLAUDE_MODEL }}"
+            --json-schema '{"type":"object","properties":{"label":{"type":"string","enum":["docs-only","complexity: low","complexity: medium","complexity: high"]}},"required":["label"],"additionalProperties":false}'
+
+  apply-complexity-label:
+    name: Apply PR Complexity Label
+    runs-on: ubuntu-latest
+    needs: analyze_complexity
+    permissions:
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      LABEL_JSON: ${{ needs.analyze_complexity.outputs.label_json }}
+    steps:
+      - name: Apply validated complexity label
+        run: |
+          set -euo pipefail
+
+          label=$(echo "$LABEL_JSON" | jq -r '.label // empty')
+          case "$label" in
+            "docs-only"|"complexity: low"|"complexity: medium"|"complexity: high")
+              ;;
+            *)
+              echo "::error::Claude returned invalid complexity label: $label"
+              exit 1
+              ;;
+          esac
+
+          gh pr edit "$PR_NUMBER" --repo "$REPO" \
+            --remove-label "complexity: low,complexity: medium,complexity: high,docs-only" || true
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$label"

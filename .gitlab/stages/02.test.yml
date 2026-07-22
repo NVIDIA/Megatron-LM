@@ -82,6 +82,7 @@ test:unit_tests_configure:
         "--dependent-job test:unit_tests_configure"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
+        "--enable-error-extraction"
       )
     - |
       export PYTHONPATH=$(pwd)
@@ -194,8 +195,9 @@ test:unit_tests_notify:
       fi
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || echo "0")
     - export TEAM_SLUG=$SLACK_ADMIN
+    - export PYTHONPATH=$(pwd)
     - |
       python tests/test_utils/python_scripts/notify.py \
         --pipeline-id "${CI_PIPELINE_ID}" \
@@ -210,31 +212,6 @@ test:unit_tests_notify:
     - if: $CI_PIPELINE_SOURCE == "schedule" && ($CI_COMMIT_BRANCH == "ci-unit-test-extended" || $CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")
       when: always
     - when: never
-
-test:linting_docs_build:
-  extends: [.test_rules]
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  needs: [test:build_image]
-  script:
-    - cd ..
-    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
-    - mv megatron-lm/ documentation/
-    - cd documentation/
-    - ./repo docs
-  rules:
-    - if: $PUBLISH == "yes"
-      when: never
-    - if: $BUILD == "no"
-      when: never
-    - when: on_success
-      allow_failure: true
 
 # Override from template
 secret_detection:

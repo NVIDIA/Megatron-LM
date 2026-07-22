@@ -1,0 +1,163 @@
+# Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: "Build, validate, and release Megatron-Core"
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      release-ref:
+        description: Ref (SHA or branch name) to release
+        required: true
+        type: string
+      dry-run:
+        description: Compute the release but do not publish wheel, GH release, or docs.
+        required: true
+        default: true
+        type: boolean
+      create-gh-release:
+        description: Create a GitHub release
+        required: true
+        default: true
+        type: boolean
+      generate-changelog:
+        description: Generate changelog
+        required: false
+        default: true
+        type: boolean
+      publish-docs:
+        description: Publish docs
+        required: false
+        default: true
+        type: boolean
+      version-bump-branch:
+        description: Branch for version bump
+        required: true
+        type: string
+      gh-release-from-tag:
+        description: Tag of previous release for changelog builder
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.94.1
+    if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name != 'workflow_dispatch'
+
+  bump:
+    needs: [pre-flight]
+    if: |
+      !cancelled() && !failure()
+      && github.repository == 'NVIDIA/Megatron-LM'
+      && !(needs.pre-flight.outputs.docs_only == 'true'
+           || needs.pre-flight.outputs.is_merge_group == 'true'
+           || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@v1.4.0
+    with:
+      release-branch-pattern: "core_[rv][0-9]*.[0-9]*.[0-9]*"
+      release-ref: ${{ inputs.release-ref || github.sha }}
+      validate-only: ${{ github.event_name != 'workflow_dispatch' }}
+      dry-run: ${{ inputs.dry-run || false }}
+      version-bump-branch: ${{ inputs.version-bump-branch || github.ref_name }}
+      restrict-to-admins: true
+      app-id: ${{ vars.BOT_ID }}
+      library-name: Megatron Core
+      bump-targets: |
+        [
+          {"python-package": "megatron.core", "src-dir": ""},
+          {"python-package": "megatron_fsdp", "src-dir": "megatron/core/distributed/fsdp/src/"}
+        ]
+    secrets: inherit  # pragma: allowlist secret
+
+  build-test-publish-wheels:
+    needs: [pre-flight, bump]
+    if: |
+      !cancelled() && !failure() && needs.bump.result == 'success'
+      && github.repository == 'NVIDIA/Megatron-LM'
+      && (
+        github.event_name == 'workflow_dispatch'
+        || !(needs.pre-flight.outputs.docs_only == 'true'
+             || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      )
+    uses: ./.github/workflows/_build_test_publish_wheel.yml
+    with:
+      ref: ${{ inputs.release-ref || github.sha }}
+      dry-run: ${{ inputs.dry-run || false }}
+      no-publish: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
+    secrets: inherit  # pragma: allowlist secret
+
+  finalize:
+    needs: [bump, build-test-publish-wheels]
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM'
+      && (success() || !failure())
+      && !cancelled()
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@v1.0.0
+    with:
+      release-ref: ${{ inputs.release-ref || github.sha }}
+      release-version: ${{ needs.bump.outputs.release-version }}
+      library-name: Megatron Core
+      pypi-name: megatron-core
+      validate-only: ${{ github.event_name != 'workflow_dispatch' }}
+      dry-run: ${{ inputs.dry-run || false }}
+      create-gh-release: ${{ inputs.create-gh-release || true }}
+      gh-release-tag-prefix: core_
+      gh-release-use-changelog-builder: ${{ inputs.generate-changelog || false }}
+      gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
+      publish-docs: ${{ inputs.publish-docs || true }}
+      docs-target-path: megatron-core/developer-guide
+      publish-as-latest: true
+      run-on-version-tag-only: ${{ github.ref_name != 'main' }}
+      app-id: ${{ vars.BOT_ID }}
+    secrets: inherit  # pragma: allowlist secret
+
+  release-summary:
+    needs: [pre-flight, bump, build-test-publish-wheels, finalize]
+    if: github.repository == 'NVIDIA/Megatron-LM' && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Result
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --repo ${{ github.repository }} --json jobs --jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required")] | length')
+
+          if [ "${FAILED_JOBS:-0}" -eq 0 ]; then
+              echo "✅ All previous jobs completed successfully"
+              exit 0
+          else
+              echo "❌ Found $FAILED_JOBS failed job(s)"
+              gh run view $GITHUB_RUN_ID --repo ${{ github.repository }} --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "action_required") | .name'
+              exit 1
+          fi

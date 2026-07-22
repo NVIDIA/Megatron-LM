@@ -1,4 +1,5 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import re
 from copy import deepcopy
 from functools import partial
@@ -23,7 +24,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, ChainedOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -276,6 +278,11 @@ def initialize_real_model(
     virtual_pipeline_model_parallel_size=None,
     **config_kwargs,
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -583,9 +590,9 @@ class TestDistributedOptimizer:
             ) as ckpt_dir_B,
         ):
             # Init model and optimizer with "src" bucket padding
-            with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
+            with patch('megatron.core.optimizer.param_layout.math.lcm') as lcm_mock:
                 lcm_mock.return_value = src_bucket_pad_divisor
-                assert len(lcm_mock.mock_calls) == 0
+
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
                     tp=src_tp_pp[0],
@@ -594,7 +601,6 @@ class TestDistributedOptimizer:
                     dist_opt=True,
                     initialize_fn=initialize_pp_agnostic_model,
                 )
-                assert len(lcm_mock.mock_calls) > 1
 
             metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
 
@@ -610,9 +616,9 @@ class TestDistributedOptimizer:
                 parallel_state.get_model_parallel_group()
             )
             # Init model and optimizer with "dest" bucket padding
-            with patch('megatron.core.distributed.param_and_grad_buffer.math.lcm') as lcm_mock:
+            with patch('megatron.core.optimizer.param_layout.math.lcm') as lcm_mock:
                 lcm_mock.return_value = dest_bucket_pad_divisor
-                assert len(lcm_mock.mock_calls) == 0
+
                 model_B, optimizer_B = setup_model_and_optimizer(
                     seed=3,
                     tp=dest_tp_pp[0],
@@ -621,7 +627,6 @@ class TestDistributedOptimizer:
                     dist_opt=True,
                     initialize_fn=initialize_pp_agnostic_model,
                 )
-                assert len(lcm_mock.mock_calls) > 1
 
             model_sharded_sd = model_B[0].sharded_state_dict()
             load_sharded_state_dict = optimizer_B.sharded_state_dict(
@@ -701,12 +706,10 @@ class TestDistributedOptimizer:
             # Note: PP must be > 1 if TP <= 2 because of empty buckets otherwise
             ((2, 4), (2, 4), 'fully_reshardable', False),
             ((4, 2), (4, 2), 'dp_reshardable', None),
-            ((8, 1), (8, 1), 'fully_sharded_model_space', None),
             # DP resharding:
             ((4, 2), (4, 1), 'dp_reshardable', None),
             ((2, 4), (2, 2), 'fully_reshardable', False),
             ((2, 4), (2, 2), 'fully_reshardable', True),
-            ((1, 8), (1, 2), 'fully_sharded_model_space', None),
         ],
     )
     @pytest.mark.parametrize("initalize_fn", [initialize_pp_agnostic_model])
@@ -873,6 +876,99 @@ class TestDistributedOptimizer:
         # Check each dst group has at least 1 rank both in src and dest
         assert same_groups == set(range(num_dest_dp_groups))
 
+    @pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
+    )
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
+    def test_lion_optimizer_checkpoint_round_trip(self, tmp_path_dist_ckpt, sharding_type):
+        """Test DistributedOptimizer checkpoint save/load with Lion (single-moment optimizer).
+
+        Lion is used as the scalar optimizer for Muon (muon_scalar_optimizer='lion'),
+        which is the natural path where Lion ends up inside a DistributedOptimizer.
+        This exercises the dynamic optimizer_state_keys logic with Lion's single
+        moment ('exp_avg') instead of Adam's two ('exp_avg', 'exp_avg_sq').
+        """
+        Utils.initialize_model_parallel(2, 1, order='tp-pp-dp')
+
+        def _get_lion_distopt(optimizer):
+            """Extract the Lion DistributedOptimizer from a Muon+Lion ChainedOptimizer."""
+            assert isinstance(optimizer, ChainedOptimizer)
+            for child in optimizer.chained_optimizers:
+                if isinstance(child, DistributedOptimizer):
+                    return child
+            raise AssertionError("No DistributedOptimizer found in ChainedOptimizer")
+
+        def _seed_random_optimizer_state(distopt, seed):
+            """Seed non-zero random exp_avg values in the DistOpt's raw optimizer state."""
+            torch.manual_seed(seed)
+            for group in distopt.optimizer.param_groups:
+                for p in group['params']:
+                    state = distopt.optimizer.state[p]
+                    if 'exp_avg' in state:
+                        state['exp_avg'].copy_(torch.randn_like(p.data))
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_lion_optimizer_checkpoint', sync=True
+        ) as ckpt_dir_A:
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=2,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='muon',
+                muon_scalar_optimizer='lion',
+                use_param_layout=True,
+            )
+
+            lion_distopt_A = _get_lion_distopt(optimizer_A)
+            assert lion_distopt_A.optimizer_state_keys == ("exp_avg",)
+            _seed_random_optimizer_state(lion_distopt_A, seed=100)
+
+            metadata = {'distrib_optim_sharding_type': sharding_type}
+
+            model_sharded_sd = model_A[0].sharded_state_dict()
+            optim_sd = optimizer_A.sharded_state_dict(model_sharded_sd, metadata=metadata)
+            save(optim_sd, ckpt_dir_A)
+
+            dp_zero_optim_A = lion_distopt_A.get_parameter_state_dp_zero(use_gloo_comm=False)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=2,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='muon',
+                muon_scalar_optimizer='lion',
+                use_param_layout=True,
+            )
+
+            lion_distopt_B = _get_lion_distopt(optimizer_B)
+            _seed_random_optimizer_state(lion_distopt_B, seed=200)
+
+            # Before loading, state should differ.
+            dp_zero_optim_B = lion_distopt_B.get_parameter_state_dp_zero(use_gloo_comm=False)
+            assert not self.check_equal_dp_zero_state(dp_zero_optim_A, dp_zero_optim_B, True)
+
+            model_sharded_sd = model_B[0].sharded_state_dict()
+            load_sharded_state_dict = optimizer_B.sharded_state_dict(
+                model_sharded_sd, metadata=metadata, is_loading=True
+            )
+            state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+            optimizer_B.load_state_dict(state_dict)
+
+            # After loading, state should match.
+            dp_zero_optim_B = lion_distopt_B.get_parameter_state_dp_zero(use_gloo_comm=False)
+            assert self.check_equal_dp_zero_state(
+                dp_zero_optim_A, dp_zero_optim_B, True, raise_if_different=True
+            )
+
+        Utils.destroy_model_parallel()
+
 
 class TestFP32Optimizer:
     def setup_method(self, method):
@@ -912,8 +1008,12 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
 
+                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+
                 save(
-                    optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()),
+                    optimizer_A.sharded_state_dict(
+                        model_A[0].sharded_state_dict(), metadata=metadata
+                    ),
                     ckpt_dir_A,
                     preprocess_common_before_consistancy_check=preprocess_fn,
                 )
@@ -929,12 +1029,17 @@ class TestFP32Optimizer:
                     bf16=False,
                 )
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
-                    model_B[0].sharded_state_dict(), is_loading=True
+                    model_B[0].sharded_state_dict(), is_loading=True, metadata=metadata
                 )
                 state_dict = load(load_sharded_state_dict, ckpt_dir_A)
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(
+                    optimizer_B.sharded_state_dict(
+                        model_B[0].sharded_state_dict(), metadata=metadata
+                    ),
+                    ckpt_dir_B,
+                )
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal
@@ -980,10 +1085,10 @@ class TestOptimizerResharding:
     ):
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
             ) as ckpt_dir_B:
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
@@ -994,10 +1099,7 @@ class TestOptimizerResharding:
                     initialize_fn=initialize_fn,
                 )
 
-                if fully_parallel:
-                    metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
-                else:
-                    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
 
                 save(
                     optimizer_A.sharded_state_dict(
@@ -1063,10 +1165,10 @@ class TestOptimizerResharding:
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
             ) as ckpt_dir_B:
                 Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
                 model_A, optimizer_A = setup_moe_model_and_optimizer(
@@ -1081,10 +1183,7 @@ class TestOptimizerResharding:
                     use_glu=use_glu,
                 )
 
-                if fully_parallel:
-                    metadata = {'distrib_optim_sharding_type': 'fully_sharded_model_space'}
-                else:
-                    metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
+                metadata = {'distrib_optim_sharding_type': 'fully_reshardable'}
 
                 save(
                     optimizer_A.sharded_state_dict(

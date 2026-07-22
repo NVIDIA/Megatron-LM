@@ -22,7 +22,7 @@ mkdir -p "$(dirname "$TENSORBOARD_LOGS_PATH")"
 GPUS_PER_NODE=8
 NUM_NODES=1
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 NODE_RANK=${NODE_RANK:-0}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
@@ -69,6 +69,7 @@ MODEL_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --swiglu
+    --normalization RMSNorm
     --init-method-std 0.0134
     --attention-backend fused
     --apply-layernorm-1p 

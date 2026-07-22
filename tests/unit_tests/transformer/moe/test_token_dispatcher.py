@@ -1,16 +1,17 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import copy
 import dataclasses
 
 import pytest
 import torch
 
 from megatron.core import config, parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -91,22 +92,24 @@ class MoEModelTestContainer:
             sequence_parallel=tp_size > 1,
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
-            moe_enable_deepep=kwargs.get("moe_enable_deepep", False),
+            moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
+            calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
         # init moe layer
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        transformer_layer_spec = get_gpt_layer_local_spec(
-            num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=self.config.num_moe_experts,
+                moe_grouped_gemm=self.config.moe_grouped_gemm,
+            ).mlp
         )
+        assert isinstance(submodules, MoESubmodules)
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = (
-            MoELayer(new_config, transformer_layer_spec.submodules.mlp.submodules)
-            .cuda()
-            .to(dtype=self.test_dtype)
-        )
+        moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
 
@@ -129,7 +132,7 @@ class MoEModelTestContainer:
         # Permute and then unpermute data are supposed to restore original data
         ans = hidden_states
         hidden_states.requires_grad = True
-        probs, indices = moe_layer.router(hidden_states)
+        probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
@@ -166,7 +169,7 @@ class MoEModelTestContainer:
         )
         hidden_states = hidden_states.cuda()
         hidden_states.requires_grad = True
-        probs, indices = moe_layer.router(hidden_states)
+        probs, indices = apply_module(moe_layer.router)(hidden_states)
 
         # Create the answer.
         prob_mask = probs != 0
@@ -225,7 +228,7 @@ class MoEModelTestContainer:
         ).cuda()
         hidden_states.requires_grad = True
 
-        probs_1, indices_1 = moe_layer.router(hidden_states)
+        probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
         (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
@@ -243,7 +246,7 @@ class MoEModelTestContainer:
         moe_layer_2 = self.new_moe_layer(moe_pad_expert_input_to_capacity=True)
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
-        probs_2, indices_2 = moe_layer_2.router(hidden_states)
+        probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
         (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
@@ -280,15 +283,15 @@ class MoEModelTestContainer:
         """Test if the routing map is padded correctly for FP8 training.
 
         The test runs the forward flow twice:
-        1. First with moe_router_padding_for_fp8=False
-        2. Then with moe_router_padding_for_fp8=True
+        1. First with moe_router_padding_for_quantization=False
+        2. Then with moe_router_padding_for_quantization=True
 
         We verify that:
         1. The results are the same in both cases
         2. The number of tokens received by each expert is padded to a multiple of 16
         """
-        # First run with moe_router_padding_for_fp8 = False
-        moe_layer = self.new_moe_layer(moe_router_padding_for_fp8=False)
+        # First run with moe_router_padding_for_quantization = False
+        moe_layer = self.new_moe_layer(moe_router_padding_for_quantization=False)
 
         num_tokens = 32
         hidden_states = torch.randn(
@@ -296,7 +299,7 @@ class MoEModelTestContainer:
         ).cuda()
         hidden_states.requires_grad = True
 
-        probs_1, indices_1 = moe_layer.router(hidden_states)
+        probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
         (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
@@ -309,11 +312,11 @@ class MoEModelTestContainer:
         grad_1 = hidden_states.grad.clone()
         hidden_states.grad = None
 
-        # Run with moe_router_padding_for_fp8 = True
-        moe_layer_2 = self.new_moe_layer(moe_router_padding_for_fp8=True, fp8="hybrid")
+        # Run with moe_router_padding_for_quantization = True
+        moe_layer_2 = self.new_moe_layer(moe_router_padding_for_quantization=True, fp8="hybrid")
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
-        probs_2, indices_2 = moe_layer_2.router(hidden_states)
+        probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
         (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
@@ -411,7 +414,22 @@ def is_deep_ep_available():
     return HAVE_DEEP_EP
 
 
-@pytest.mark.skipif(not is_deep_ep_available(), reason="Deep EP is not available")
+def is_hybrid_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
+
+    return HAVE_HYBRIDEP
+
+
+def is_nccl_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    return HAVE_TE_EP
+
+
+@pytest.mark.skipif(
+    not is_deep_ep_available() and not is_hybrid_ep_available(),
+    reason="Deep EP and Hybrid EP are not available",
+)
 class TestFlexDispatcher:
     def setup_method(self, method):
         pass
@@ -421,9 +439,37 @@ class TestFlexDispatcher:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4)])
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    def test_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize(
+        "moe_flex_dispatcher_backend",
+        [
+            "deepep",
+            "hybridep",
+            # NCCL EP aborts in dev CI with a pybind11 GIL dec_ref failure.
+            pytest.param("ncclep", marks=pytest.mark.flaky_in_dev),
+        ],
+    )
+    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
+    def test_forward_backward(
+        self,
+        tp_size,
+        ep_size,
+        permute_fusion,
+        moe_flex_dispatcher_backend,
+        moe_permute_fusion_into_hybridep,
+    ):
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
+        if moe_flex_dispatcher_backend == "ncclep" and not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+        if moe_permute_fusion_into_hybridep:
+            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
+                pytest.skip(
+                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
+                )
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -435,8 +481,16 @@ class TestFlexDispatcher:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="flex",
             moe_permute_fusion=permute_fusion,
-            hidden_size=32,
-            moe_enable_deepep=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
+            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
+            # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS (device-side
+            # em_scan check -> CUDA launch failure), so size it generously: small token counts have
+            # high routing-imbalance variance and a tight factor traps. The staging buffer is tiny
+            # at this model size, so a large factor costs little.
+            moe_expert_rank_capacity_factor=(
+                8.0 if moe_flex_dispatcher_backend == "ncclep" else None
+            ),
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()
@@ -448,7 +502,25 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    def test_capacity_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
+    def test_capacity_forward_backward(
+        self,
+        tp_size,
+        ep_size,
+        permute_fusion,
+        moe_flex_dispatcher_backend,
+        moe_permute_fusion_into_hybridep,
+    ):
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
+        if moe_permute_fusion_into_hybridep:
+            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
+                pytest.skip(
+                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
+                )
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -463,8 +535,9 @@ class TestFlexDispatcher:
             moe_expert_capacity_factor=0.5,
             moe_pad_expert_input_to_capacity=False,
             moe_permute_fusion=permute_fusion,
-            hidden_size=32,
-            moe_enable_deepep=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
+            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_capacity_test()
@@ -478,7 +551,25 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", [True])
-    def test_router_padding_for_fp8_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
+    def test_router_padding_for_fp8_forward_backward(
+        self,
+        tp_size,
+        ep_size,
+        permute_fusion,
+        moe_flex_dispatcher_backend,
+        moe_permute_fusion_into_hybridep,
+    ):
+        if moe_flex_dispatcher_backend == "deepep" and not is_deep_ep_available():
+            pytest.skip("Deep EP is not available")
+        if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
+        if moe_permute_fusion_into_hybridep:
+            if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
+                pytest.skip(
+                    "moe_permute_fusion_into_hybridep skipped because permute_fusion or hybridep is not set"
+                )
         if permute_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
@@ -491,8 +582,9 @@ class TestFlexDispatcher:
             moe_token_dispatcher_type="flex",
             moe_pad_expert_input_to_capacity=False,
             moe_permute_fusion=permute_fusion,
-            hidden_size=32,
-            moe_enable_deepep=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
+            moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_router_padding_for_fp8_test()

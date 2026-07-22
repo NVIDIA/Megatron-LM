@@ -14,6 +14,7 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import Split
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -114,12 +115,30 @@ class MaskedWordPieceDataset(MegatronDataset):
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
+        """Return the number of documents in the underlying low level dataset.
+
+        Args:
+            low_level_dataset (IndexedDataset): The underlying IndexedDataset
+
+        Returns:
+            int: The number of unique elements in the underlying IndexedDataset
+        """
         return low_level_dataset.document_indices.shape[0] - 1
 
     @staticmethod
     def build_low_level_dataset(
         dataset_path: str, config: MaskedWordPieceDatasetConfig
     ) -> IndexedDataset:
+        """Build the low level dataset (IndexedDataset) from the given path.
+
+        Args:
+            dataset_path (str): The real path prefix to the IndexedDataset .bin and .idx files
+
+            config (MaskedWordPieceDatasetConfig): The config
+
+        Returns:
+            IndexedDataset: The underlying IndexedDataset
+        """
         return IndexedDataset(dataset_path)
 
     @staticmethod
@@ -220,7 +239,7 @@ class MaskedWordPieceDataset(MegatronDataset):
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
-        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
+        sample_index = safe_numpy_load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -245,7 +264,7 @@ class MaskedWordPieceDataset(MegatronDataset):
                 2. masked_positions -> The indices for the masked token ids
                 3. masked_labels    -> The original token ids for the masked token ids
                 4. boundaries       -> The sentence and word boundaries for the sequence
-                4. masked_spans     -> The masked positions and labels with N-gram info intact
+                5. masked_spans     -> The masked positions and labels with N-gram info intact
         """
         # Build the token sentence and word boundaries and the masking candidates
         # e.g. [cls, id, ##id, ##id, id, ##id, sep, id, ##id, sep]

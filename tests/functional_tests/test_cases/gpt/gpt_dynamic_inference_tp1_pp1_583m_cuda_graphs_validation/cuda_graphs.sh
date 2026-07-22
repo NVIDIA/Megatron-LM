@@ -85,6 +85,7 @@ ARGS=" \
   \
   --output-path ${OUTPUT_PATH} \
   --output-every-n-results 512 \
+  --inference-logging-step-interval 1 \
 "
 
 # Enable cuda graphs.
@@ -96,7 +97,7 @@ if [ "${NUM_CUDA_GRAPHS}" != "0" ]; then
 fi
 
 # Command.
-CMD="python -m examples.inference.gpt.gpt_dynamic_inference ${ARGS}"
+CMD="python -m examples.inference.advanced.gpt_dynamic_inference ${ARGS}"
 echo "~~~"
 echo "CMD ...${CMD}."
 echo "~~~"

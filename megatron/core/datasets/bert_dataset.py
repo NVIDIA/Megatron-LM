@@ -54,7 +54,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
 
-        self.token_lookup = list(self.config.tokenizer.inv_vocab.keys())
+        self.token_lookup = sorted(self.config.tokenizer.inv_vocab.keys())
         # Account for the single <cls> and two <sep> token ids
         self.sample_index = self._build_sample_index(
             self.config.sequence_length - 3, 2 if self.config.classification_head else 1
@@ -78,7 +78,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, Union[int, numpy.ndarray]]: The
+            Dict[str, Union[int, numpy.ndarray]]: The sample information wrapped in a dictionary
         """
 
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
