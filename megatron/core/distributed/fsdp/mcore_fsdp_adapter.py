@@ -43,6 +43,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -58,6 +59,7 @@ try:
         Placements,
         fully_shard,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -532,12 +534,49 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             self.mp_policy,
         )
 
+        routed_expert_parameters = self._get_routed_expert_parameters(module)
+        routed_expert_parameter_ids = {
+            id(parameter) for parameter in routed_expert_parameters.values()
+        }
+        expert_parameter_count = sum(
+            parameter.numel() for parameter in routed_expert_parameters.values()
+        )
+        dense_parameter_count = sum(
+            parameter.numel()
+            for parameter in module.parameters()
+            if id(parameter) not in routed_expert_parameter_ids
+        )
+
         dp_group = pg_collection.dp_cp
         device_type = device.type if device is not None else "cuda"
-        mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
+        dense_mesh = DeviceMesh.from_group(
+            dp_group, device_type=device_type, mesh_dim_names=("dp",)
+        )
+        singleton_expert_mesh = None
+        if routed_expert_parameters:
+            singleton_expert_mesh = DeviceMesh.from_group(
+                pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expt_dp",)
+            )
         placements = Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         )
+
+        # EP has already partitioned the routed experts before this adapter is entered.
+        # Register each local expert subtree with its singleton expert-DP mesh only to
+        # establish MFSDP/optimizer ownership. A size-one mesh does not further shard
+        # expert tensors or communicate; it prevents dense dp_cp units from claiming them.
+        expert_owned_fsdp_modules = []
+        for submodule in module.modules():
+            if isinstance(submodule, BaseMoELayer) and submodule.experts is not None:
+                assert singleton_expert_mesh is not None
+                fully_shard(
+                    submodule.experts,
+                    mesh=singleton_expert_mesh,
+                    placements=placements,
+                    mixed_precision_policy=self.mp_policy,
+                )
+                expert_owned_fsdp_modules.append(submodule.experts)
+
         for submodule in reversed(list(module.modules())):
             if submodule is module:
                 # The root is always sharded after selected child units so it is not
@@ -546,12 +585,71 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
                 fully_shard(
                     submodule,
-                    mesh=mesh,
+                    mesh=dense_mesh,
                     placements=placements,
                     mixed_precision_policy=self.mp_policy,
                 )
-        fully_shard(module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy)
+        fully_shard(
+            module, mesh=dense_mesh, placements=placements, mixed_precision_policy=self.mp_policy
+        )
+
+        expert_owned_parameter_ids = {
+            id(parameter)
+            for expert_module in expert_owned_fsdp_modules
+            for group in expert_module.parameter_groups
+            for parameter in group.unsharded_parameters
+        }
+        dense_owned_parameter_ids = {
+            id(parameter)
+            for fsdp_module in module.modules()
+            if isinstance(fsdp_module, FsdpModule) and fsdp_module not in expert_owned_fsdp_modules
+            for group in fsdp_module.parameter_groups
+            for parameter in group.unsharded_parameters
+        }
+        if expert_owned_parameter_ids != routed_expert_parameter_ids:
+            raise RuntimeError("MFSDP v2 failed to assign every routed-expert parameter.")
+        if routed_expert_parameter_ids & dense_owned_parameter_ids:
+            raise RuntimeError("MFSDP v2 assigned a routed-expert parameter to a dense group.")
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "MFSDP v2 + EP startup: EP size = %d, dense MFSDP size = %d, "
+            "expert-DP size = %d, dense parameter count = %d, expert parameter count = %d",
+            pg_collection.ep.size(),
+            dense_mesh.size(),
+            pg_collection.expt_dp.size(),
+            dense_parameter_count,
+            expert_parameter_count,
+        )
         super().__init__(config=config, module=module)
+
+    @staticmethod
+    def _get_routed_expert_parameters(module: torch.nn.Module) -> Dict[str, torch.nn.Parameter]:
+        """Return parameters below recognized ``BaseMoELayer.experts`` containers."""
+        routed_parameter_ids = {
+            id(parameter)
+            for submodule in module.modules()
+            if isinstance(submodule, BaseMoELayer) and submodule.experts is not None
+            for parameter in submodule.experts.parameters()
+        }
+        routed_parameters = {
+            name: parameter
+            for name, parameter in module.named_parameters()
+            if id(parameter) in routed_parameter_ids
+        }
+        marked_outside_routed_experts = [
+            name
+            for name, parameter in module.named_parameters()
+            if not getattr(parameter, "allreduce", True)
+            and id(parameter) not in routed_parameter_ids
+        ]
+        if marked_outside_routed_experts:
+            raise ValueError(
+                "MFSDP v2 found expert-marked parameters outside recognized routed-expert "
+                f"containers: {', '.join(marked_outside_routed_experts)}"
+            )
+        return routed_parameters
 
     @staticmethod
     def _validate_config(
@@ -571,7 +669,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             "tensor_model_parallel_size",
             "pipeline_model_parallel_size",
             "context_parallel_size",
-            "expert_model_parallel_size",
         ]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
@@ -584,7 +681,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp", "ep"):
+        for group_name in ("tp", "pp", "cp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
@@ -592,10 +689,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     f"got {group.size()}."
                 )
 
-        if getattr(config, "num_moe_experts", None) is not None or any(
-            not getattr(parameter, "allreduce", True) for parameter in module.parameters()
-        ):
-            raise ValueError("MFSDP v2 does not currently support expert parameters.")
+        routed_expert_parameters = FullyShardedDataParallelV2._get_routed_expert_parameters(module)
+        if routed_expert_parameters:
+            if not hasattr(pg_collection, "expt_dp"):
+                raise ValueError("MFSDP v2 + EP requires an explicit expt_dp process group.")
+            if pg_collection.expt_dp.size() != 1:
+                raise ValueError(
+                    "MFSDP v2 + EP currently requires expert-DP size 1, "
+                    f"got {pg_collection.expt_dp.size()}."
+                )
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."

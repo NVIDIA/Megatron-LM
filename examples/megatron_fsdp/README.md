@@ -4,6 +4,33 @@ Example scripts for training and checkpoint conversion using [Megatron-FSDP](../
 
 ## Scripts
 
+### `train_mfsdp_v2_ep2.sh`
+
+Two-GPU smoke example for experimental MFSDP v2 with expert parallelism. It runs
+`pretrain_hybrid.py` with the two-layer `ME` hybrid pattern, two routed experts,
+EP=2, expert TP=1, and ZeRO-3 sharding. Routed experts are already partitioned
+by EP and are owned by singleton expert-DP meshes; router, norms, embeddings,
+output weights, and all Mamba/dense parameters are fully sharded over both GPUs.
+
+Run it from the repository root:
+
+```bash
+bash examples/megatron_fsdp/train_mfsdp_v2_ep2.sh
+```
+
+The startup log should contain:
+
+```text
+dense MFSDP size = 2
+EP size = 2
+expert-DP size = 1
+```
+
+The example runs five iterations with mock data and a null tokenizer. Every
+reported training loss should be finite. It intentionally has no checkpoint
+save/load, communication overlap, FP8, CUDA graphs, or fused gradient
+accumulation. The script unsets `CUDA_DEVICE_MAX_CONNECTIONS`, as MFSDP requires.
+
 ### `train_llama3_8b_fsdp_h100_fp8.sh`
 
 Single-node training script for **Llama 3 8B** using Megatron-FSDP with FP8 precision on H100 GPUs. Uses `torchrun` for local distributed training and supports both mock data (for benchmarking) and real datasets.
