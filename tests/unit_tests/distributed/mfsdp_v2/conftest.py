@@ -2,6 +2,7 @@
 
 import dataclasses
 import os
+import shutil
 from collections.abc import Iterator
 
 import pytest
@@ -50,3 +51,32 @@ def distributed_setup() -> Iterator[DistributedSetup]:
             dist.barrier(device_ids=[device.index])
         else:
             dist.barrier()
+
+
+def _barrier(device: torch.device) -> None:
+    if not dist.is_initialized():
+        return
+    if device.type == "cuda":
+        dist.barrier(device_ids=[device.index])
+    else:
+        dist.barrier()
+
+
+@pytest.fixture(scope="function")
+def shared_checkpoint_dir(distributed_setup, request) -> Iterator[str]:
+    """A filesystem directory shared across ranks for DCP save/load.
+
+    All ranks run on one node and share the same path, derived deterministically from the test
+    name so no cross-rank broadcast is needed (the process group is not yet initialized when this
+    fixture runs). Rank 0 removes the tree on teardown.
+    """
+    root = os.environ.get("MFSDP2_DCP_TMP", "/tmp/mfsdp2_dcp_tests")
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in request.node.name)
+    path = os.path.join(root, safe_name)
+    os.makedirs(path, exist_ok=True)
+
+    yield path
+
+    _barrier(distributed_setup.device)
+    if distributed_setup.rank == 0:
+        shutil.rmtree(path, ignore_errors=True)
