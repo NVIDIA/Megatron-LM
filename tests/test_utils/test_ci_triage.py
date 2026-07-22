@@ -133,12 +133,7 @@ def test_notification_rules_use_expected_pipeline_sources():
         '$CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")'
     ]
 
-    smoke_condition = functional["functional:smoke_notify"]["rules"][1]["if"]
-    assert smoke_condition == (
-        '$FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && '
-        '($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || '
-        '$CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")'
-    )
+    assert "functional:smoke_notify" not in functional
     assert functional["functional:x_notify"]["rules"][0]["if"] == (
         '($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && '
         '$FUNCTIONAL_TEST == "yes"'
@@ -235,13 +230,19 @@ def test_get_pipeline_jobs_uses_triage_collector(monkeypatch, notify_module):
     handle = Mock()
     handle.projects.get.return_value = project
     monkeypatch.setattr(notify, "get_gitlab_handle", lambda: handle)
-    collector = Mock(return_value=[{"status": "failed", "gpu": "Unknown"}])
+    collector = Mock(
+        side_effect=[
+            [{"status": "failed", "gpu": "Unknown"}],
+            [{"status": "failed", "gpu": "Unknown"}],
+        ]
+    )
     monkeypatch.setattr(notify.notification, "get_jobs_from_pipeline", collector)
 
     assert notify.get_pipeline_jobs(123, notify.JOB_PREFIXES["functional-tests"]) == [
-        ("functional:run_dev_dgx_h100", 101, [{"status": "failed", "gpu": "H100"}])
+        ("functional:run_dev_dgx_h100", 101, [{"status": "failed", "gpu": "H100"}]),
+        ("functional:smoke-gb200", 102, [{"status": "failed", "gpu": "GB200"}]),
     ]
-    collector.assert_called_once_with(project, 101)
+    assert collector.call_args_list == [((project, 101),), ((project, 102),)]
 
 
 def test_build_linear_reports_groups_matching_failures(monkeypatch):
