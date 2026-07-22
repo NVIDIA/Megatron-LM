@@ -34,11 +34,11 @@ ENV_DEPENDENT="\
   --grpo-kl-beta $GRPO_KL_BETA \
   --langrl-env-config $ENV_CONFIG "
 
-  #--pretrained-checkpoint $CHECKPOINT \
 MODEL_OPTIONS="\
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
   --inference-max-requests $MAX_INFERENCE_BS \
+  #--pretrained-checkpoint $CHECKPOINT \
   --no-use-tokenizer-model-from-checkpoint-args \
   --bf16 \
   --tensor-model-parallel-size $TP  \
