@@ -32,7 +32,7 @@ try:
 except ImportError:
     HAVE_ZSTANDARD = False
 
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.training import get_args
 from megatron.training.utils import get_blend_and_blend_per_split
 
@@ -98,11 +98,7 @@ def storage_makedirs(path: str, exist_ok: bool = True) -> None:
     """Create a local or MSC directory/prefix."""
     if not path:
         return
-    msc = _msc_if_needed(path)
-    if msc is not None:
-        msc.os.makedirs(path, exist_ok=exist_ok)
-    else:
-        os.makedirs(path, exist_ok=exist_ok)
+    maybe_msc.os.makedirs(path, exist_ok=exist_ok)
 
 
 def storage_move(src: str, dst: str) -> None:

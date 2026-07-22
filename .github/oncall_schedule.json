@@ -1,13 +1,5 @@
 [
     {
-        "user": "cspades",
-        "date": "2026-07-08"
-    },
-    {
-        "user": "dimapihtar",
-        "date": "2026-07-15"
-    },
-    {
         "user": "guihong-nv",
         "date": "2026-07-22"
     },
@@ -46,5 +38,13 @@
     {
         "user": "cspades",
         "date": "2026-09-23"
+    },
+    {
+        "user": "dimapihtar",
+        "date": "2026-09-30"
+    },
+    {
+        "user": "guihong-nv",
+        "date": "2026-10-07"
     }
 ]

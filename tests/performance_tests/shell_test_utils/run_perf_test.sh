@@ -95,6 +95,9 @@ mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 # and MoE-with-DP=1 picks up EP correctly.
 GROUP_SIZE=$((DP > EP ? DP : EP))
 WORLD_SIZE=$((TP * PP * GROUP_SIZE))
+# The inference coordinator uses the dense-model DP group. EP-only configs
+# therefore expose GROUP_SIZE workers even when the YAML DP value is one.
+COORDINATOR_WORKERS=$GROUP_SIZE
 ARGS_FILE="$PERF_DIR/server/model_args/${MODEL}.args"
 if [[ ! -f "$ARGS_FILE" ]]; then
     echo "[run_perf_test] error: model args file $ARGS_FILE not found" >&2
@@ -102,6 +105,7 @@ if [[ ! -f "$ARGS_FILE" ]]; then
 fi
 
 echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WORLD_SIZE  dataset=$DATASET"
+echo "[run_perf_test] coordinator workers: $COORDINATOR_WORKERS"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
 
@@ -257,6 +261,7 @@ for BS in "${BATCH_SIZES[@]}"; do
         --num-input-tokens "$NUM_INPUT_TOKENS" \
         --num-output-tokens "$NUM_OUTPUT_TOKENS" \
         --num-warmup-iters "$NUM_WARMUP_ITERS" \
+        --data-parallel-size "$COORDINATOR_WORKERS" \
         --num-iters "$NUM_TIMED_ITERS" \
         --output-json "$RESULTS_JSON" \
         2>&1 | tee -a "$RESULTS_ROOT/benchmark.log"
