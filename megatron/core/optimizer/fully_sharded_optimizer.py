@@ -9,6 +9,7 @@ import torch
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.module import MegatronModule
+from ..utils import to_local_if_dtensor
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
@@ -42,7 +43,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             init_state_fn: Function used to initialize optimizer state.
             model_chunks: MFSDP v2 model chunks optimized by this wrapper.
         """
-        self.validate_config(config, model_chunks)
+        self._validate_config(config, model_chunks)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
         if grad_scaler is not None:
@@ -52,11 +53,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
-            assert self.ddp_config == model_chunk.ddp_config
+            if self.ddp_config != model_chunk.ddp_config:
+                raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
 
     @staticmethod
-    def validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
+    def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
         if len(model_chunks) != 1:
             raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
@@ -123,3 +125,32 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""
+
+    @torch.no_grad()
+    def get_grad_norm(self) -> float:
+        """Return the L2 norm over uniquely owned dense and EP-local gradient shards.
+
+        MFSDP v2 + EP can place optimizer-visible DTensors on two different meshes:
+        dense parameters use ``dp_cp`` while routed experts use singleton ``expt_dp``.
+        Under the currently supported topology (TP=PP=CP=1 and expert-DP=1), every
+        local gradient shard is uniquely owned and one world sum produces the global
+        dense-plus-expert norm without double counting either mesh.
+        """
+        local_squared_norm = torch.zeros(1, dtype=torch.float32, device="cuda")
+        for grad in self.get_grads_for_grad_norm():
+            local_grad = to_local_if_dtensor(grad).detach().float()
+            local_squared_norm += torch.sum(local_grad * local_grad)
+        torch.distributed.all_reduce(local_squared_norm, op=torch.distributed.ReduceOp.SUM)
+        return local_squared_norm.sqrt().item()
+
+    @torch.no_grad()
+    def clip_grad_norm(self, clip_grad: float) -> float:
+        """Clip mixed-mesh MFSDP gradients using their global unique-shard norm."""
+        grad_norm = self.get_grad_norm()
+        if clip_grad > 0.0:
+            clip_coefficient = min(clip_grad / (grad_norm + 1.0e-6), 1.0)
+            if clip_coefficient < 1.0:
+                for parameter in self.get_parameters():
+                    if parameter.grad is not None:
+                        to_local_if_dtensor(parameter.grad).mul_(clip_coefficient)
+        return grad_norm

@@ -165,6 +165,8 @@ class FsdpParameterGroup:
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            if hasattr(parameter, "allreduce"):
+                sharded_parameter.allreduce = parameter.allreduce
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)

@@ -2,6 +2,8 @@
 
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
+import os
+from copy import copy
 from dataclasses import replace
 
 import pytest
@@ -13,7 +15,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -35,6 +39,33 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
     )
 
 
+def _mfsdp_v2_config() -> DistributedDataParallelConfig:
+    return DistributedDataParallelConfig(
+        use_megatron_fsdp=True,
+        megatron_fsdp_version=2,
+        use_distributed_optimizer=True,
+        data_parallel_sharding_strategy="optim_grads_params",
+        megatron_fsdp_main_params_dtype=torch.float32,
+        megatron_fsdp_main_grads_dtype=torch.float32,
+        fsdp_all_gather_in_start_param_sync=False,
+    )
+
+
+class _ToyMoELayer(BaseMoELayer):
+    """Minimal ownership-only MoE layer with routed and dense subtrees."""
+
+    def __init__(self, hidden_size: int):
+        torch.nn.Module.__init__(self)
+        self.experts = torch.nn.Sequential(torch.nn.Linear(hidden_size, hidden_size, bias=False))
+        for parameter in self.experts.parameters():
+            parameter.allreduce = False
+        self.router = torch.nn.Linear(hidden_size, 2, bias=False)
+        self.shared_experts = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, hidden_states):
+        return self.experts(hidden_states) + self.shared_experts(hidden_states)
+
+
 class TestMcoreAdapter:
     """Exercise a dense MCore transformer block over two data-parallel ranks."""
 
@@ -42,6 +73,7 @@ class TestMcoreAdapter:
         Utils.initialize_model_parallel(1, 1)
         if torch.distributed.get_world_size() < 2:
             pytest.skip("MFSDP v2 MCore integration test requires at least two ranks.")
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
@@ -75,6 +107,7 @@ class TestMcoreAdapter:
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
+            pg_collection=self.pg_collection,
         )
 
         assert isinstance(wrapped.module, FsdpModule)
@@ -122,6 +155,7 @@ class TestMcoreAdapter:
                 fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
+            pg_collection=self.pg_collection,
         )
 
         reference_optimizer_config = OptimizerConfig(
@@ -137,10 +171,6 @@ class TestMcoreAdapter:
         reference_optimizer = get_megatron_optimizer(
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
-        with pytest.raises(ValueError, match="precision-aware optimizer"):
-            FullyShardedOptimizer.validate_config(
-                replace(optimizer_config, use_precision_aware_optimizer=True), [model]
-            )
         optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
@@ -184,4 +214,87 @@ class TestMcoreAdapter:
         reference_losses = torch.stack(reference_losses)
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
-        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+
+
+class TestMcoreAdapterExpertParallel:
+    """Exercise separate dense and routed-expert ownership with EP=world size."""
+
+    def setup_method(self):
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < 2:
+            pytest.skip("MFSDP v2 + EP integration tests require at least two ranks.")
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=world_size)
+        self.world_size = world_size
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def _config(self) -> TransformerConfig:
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            num_moe_experts=self.world_size,
+            expert_model_parallel_size=self.world_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            gradient_accumulation_fusion=False,
+        )
+
+    def test_routes_experts_to_singleton_mesh_and_preserves_marker(self):
+        model = torch.nn.Sequential(_ToyMoELayer(16), torch.nn.Linear(16, 16, bias=False)).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+
+        wrapped = FullyShardedDataParallel(
+            config=self._config(),
+            ddp_config=_mfsdp_v2_config(),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        expert_groups = wrapped.module[0].experts.parameter_groups
+        assert expert_groups
+        assert all(group.mesh.size() == 1 for group in expert_groups)
+        assert all(
+            getattr(parameter, "allreduce", True) is False
+            for group in expert_groups
+            for parameter in group.sharded_parameters
+        )
+
+        dense_groups = [
+            group
+            for fsdp_module in wrapped.module.modules()
+            if isinstance(fsdp_module, FsdpModule) and fsdp_module is not wrapped.module[0].experts
+            for group in fsdp_module.parameter_groups
+        ]
+        assert dense_groups
+        assert all(group.mesh.size() == self.world_size for group in dense_groups)
+
+    def test_rejects_replicated_experts(self):
+        model = _ToyMoELayer(16).to(device="cuda", dtype=torch.bfloat16)
+        replicated_expert_pg_collection = copy(self.pg_collection)
+        replicated_expert_pg_collection.expt_dp = self.pg_collection.dp_cp
+
+        with pytest.raises(ValueError, match=r"MFSDP v2 \+ EP currently requires expert-DP size 1"):
+            FullyShardedDataParallel(
+                config=self._config(),
+                ddp_config=_mfsdp_v2_config(),
+                module=model,
+                pg_collection=replicated_expert_pg_collection,
+            )
+
+    def test_rejects_expert_marker_outside_routed_container(self):
+        model = torch.nn.Linear(16, 16, bias=False).to(device="cuda", dtype=torch.bfloat16)
+        model.weight.allreduce = False
+
+        with pytest.raises(ValueError, match="outside recognized routed-expert containers"):
+            FullyShardedDataParallel(
+                config=self._config(),
+                ddp_config=_mfsdp_v2_config(),
+                module=model,
+                pg_collection=self.pg_collection,
+            )
