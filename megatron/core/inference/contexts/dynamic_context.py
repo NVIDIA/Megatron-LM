@@ -2941,14 +2941,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # pool; matches already pinned by another in-flight request are not in
         # get_evictable_block_count() and pinning them frees nothing. Reserve only
         # the ref_count == 0 matches so availability is not under-reported.
-        num_evictable_to_exclude = 0
+        potential_matched_count = 0
         if matched_block_ids:
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
-            num_evictable_to_exclude = int(
+            potential_matched_count = int(
                 (self.kv_block_allocator.block_ref_counts[matched_tensor] == 0).sum()
             )
         kv_cache_available = self.kv_block_allocator.is_memory_available(
-            num_blocks_from_pool, num_evictable_to_exclude=num_evictable_to_exclude
+            num_blocks_from_pool, potential_matched_count=potential_matched_count
         )
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 

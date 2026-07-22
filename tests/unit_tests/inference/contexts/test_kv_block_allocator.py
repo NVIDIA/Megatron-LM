@@ -436,7 +436,7 @@ def test_evict_lru_asserts_on_cyclic_parent_graph():
 
 
 def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
-    """num_evictable_to_exclude removes soon-to-be-pinned cached blocks from the
+    """potential_matched_count removes soon-to-be-pinned cached blocks from the
     evictable capacity, so availability matches what allocation can satisfy
     once those blocks (e.g. prefix matches) are pinned."""
     a = _lru_allocator(total_count=6, paused_count=1)
@@ -454,10 +454,10 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     # Both evictable blocks count toward availability by default.
     assert a.is_memory_available(2) is True
     # Excluding one (it will be pinned) leaves only one usable for the request.
-    assert a.is_memory_available(2, num_evictable_to_exclude=1) is False
-    assert a.is_memory_available(1, num_evictable_to_exclude=1) is True
+    assert a.is_memory_available(2, potential_matched_count=1) is False
+    assert a.is_memory_available(1, potential_matched_count=1) is True
     # Excluding all evictable blocks leaves nothing to satisfy a new block.
-    assert a.is_memory_available(1, num_evictable_to_exclude=2) is False
+    assert a.is_memory_available(1, potential_matched_count=2) is False
 
 
 def _reference_leaf_peel(block_ids, hashes, parents, timestamps, k_evict):
