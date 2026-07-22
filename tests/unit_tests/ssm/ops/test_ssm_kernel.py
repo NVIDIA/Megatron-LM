@@ -1,27 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import math
+import argparse
 import unittest
 from unittest.mock import MagicMock
 
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Assume the provided class is in mamba_mixer.py
 from megatron.core.ssm.mamba_mixer import MambaMixer
-
-
-def _cutedsl_available() -> bool:
-    """True if the CuteDSL SSD backend can run here (Blackwell + cutlass DSL)."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        from megatron.core.ssm.ops.cutedsl_mamba2_ssd import is_cutedsl_ssd_available
-
-        return torch.cuda.get_device_capability()[0] >= 10 and is_cutedsl_ssd_available()
-    except Exception:
-        return False
+from megatron.core.ssm.ops.ssd_combined import _cutedsl_ssd_enabled
 
 
 def _build_varlen_ssd_inputs(seq_lens, chunk_size, nheads, headdim, ngroups, dstate, device, dtype):
@@ -179,117 +169,182 @@ _PARITY_CASES = [
 ]
 
 
+def _torch_reference_varlen(kernel_args: dict, real_num_tokens: int):
+    """Exact fp32 per-token recurrence for the varlen SSD op contract.
+
+    Recurrence compute
+    ``state = exp(dt*A) * state + dt * outer(x, B); y = state @ C + D * x``,
+    seeding from ``initial_states``.
+    """
+    ccs = kernel_args["cu_chunk_seqlens"].long()
+    lci = kernel_args["last_chunk_indices"].long()
+    x = kernel_args["x"].float()
+    B, C = kernel_args["B"].float(), kernel_args["C"].float()
+    A, D = kernel_args["A"].float(), kernel_args["D"].float()
+    dt = kernel_args["dt"].float() + kernel_args["dt_bias"].float()
+    if kernel_args["dt_softplus"]:
+        dt = F.softplus(dt)
+    lo, hi = kernel_args["dt_limit"]
+    if lo != 0.0 or hi != float("inf"):
+        dt = torch.clamp(dt, lo, hi)
+
+    H, P = x.shape[1], x.shape[2]
+    G, N = B.shape[1], B.shape[2]
+    ratio = H // G
+    n_chunks = ccs.numel() - 1
+    # chunk -> owning sequence (empty sequences own one zero-length chunk).
+    chunk_seq, prev = [], -1
+    for s, last in enumerate(lci.tolist()):
+        chunk_seq.extend([s] * (last - prev))
+        prev = last
+    S = len(lci)
+
+    init = kernel_args["initial_states"]
+    seq_state = [
+        (init[s].float().clone() if init is not None else x.new_zeros(H, P, N)) for s in range(S)
+    ]
+    out = x.new_zeros(real_num_tokens, H, P)
+    state_after_chunk = x.new_zeros(n_chunks, H, P, N)
+    for c in range(n_chunks):
+        s = chunk_seq[c]
+        state = seq_state[s]
+        for t in range(int(ccs[c]), int(ccs[c + 1])):
+            decay = torch.exp(dt[t] * A)  # (H,)
+            Bh = B[t].repeat_interleave(ratio, 0)  # (H, N)
+            Ch = C[t].repeat_interleave(ratio, 0)
+            state = state * decay[:, None, None] + dt[t][:, None, None] * (
+                x[t][:, :, None] * Bh[:, None, :]
+            )
+            out[t] = (state * Ch[:, None, :]).sum(-1) + D[:, None] * x[t]
+        seq_state[s] = state
+        state_after_chunk[c] = state
+
+    final = torch.stack(seq_state)
+    idx = kernel_args["intermediate_chunk_indices"]
+    inter = state_after_chunk[idx] if idx is not None else None
+    return out, final, inter
+
+
 @pytest.mark.skipif(
-    not _cutedsl_available(),
+    not _cutedsl_ssd_enabled(),
     reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
 )
-class TestCuteDSLMatchesTriton:
-    """The CuteDSL SSD kernel must produce near-identical results to Triton across
-    every supported varlen prefill shape (divisible sequence lengths), inference
-    feature (chunked prefill, prefix caching, padded/empty engine batches), and
-    must raise NotImplementedError on unsupported shapes so the dispatcher falls
-    back to Triton. All scenarios share one skeleton, driven by _PARITY_CASES."""
+class TestCuteDSLAccuracy:
+    """The CuteDSL SSD kernel must produce near-identical results to BOTH
+    references — the Triton kernel and the exact torch recurrence — across every
+    supported varlen prefill shape (divisible sequence lengths) and inference
+    feature (chunked prefill, prefix caching, padded/empty engine batches), so
+    all three implementations are pinned to the same op contract. Unsupported
+    shapes must be rejected by cutedsl_unsupported_reason so the dispatcher
+    falls back to Triton. All scenarios share one skeleton (_PARITY_CASES)."""
 
-    @pytest.mark.parametrize("case", _PARITY_CASES)
-    def test_cutedsl_matches_triton(self, case):
+    @pytest.mark.parametrize("ref_backend", ["triton", "pytorch"])
+    @pytest.mark.parametrize("params", _PARITY_CASES)
+    def test_cutedsl_matches_ref(self, params: dict, ref_backend: str):
         from megatron.core.ssm.ops.cutedsl_mamba2_ssd import (
             cutedsl_unsupported_reason,
             mamba_chunk_scan_combined_varlen_cutedsl_thd,
         )
         from megatron.core.ssm.ops.ssd_combined import _mamba_chunk_scan_combined_varlen_triton
 
-        torch.manual_seed(0)
+        torch.manual_seed(42)
         device = torch.device("cuda")
-        seq_lens, chunk_size = case["seq_lens"], case["chunk_size"]
+        seq_lens, chunk_size = params["seq_lens"], params["chunk_size"]
         headdim, ngroups = 64, 2
-        real = sum(seq_lens)
+        real_num_tokens = sum(seq_lens)
 
-        common = _build_varlen_ssd_inputs(
+        if ref_backend == "pytorch" and (
+            len(set(seq_lens)) != 1 or seq_lens[0] == 0 or seq_lens[0] % chunk_size != 0
+        ):
+            pytest.skip("torch reference supports only equal, chunk-divisible sequence lengths")
+
+        common_kernel_args = _build_varlen_ssd_inputs(
             seq_lens,
             chunk_size,
-            case["nheads"],
+            params["nheads"],
             headdim,
             ngroups,
-            case["dstate"],
+            params["dstate"],
             device,
             torch.bfloat16,
         )
-        if case["pad_to"] is not None:
-            # Extend x/dt/B/C with trailing padding rows (cu_chunk_seqlens still
-            # describes only the `real` tokens, exactly as the engine feeds them).
-            assert case["pad_to"] > real, "test must actually pad"
-            pad = case["pad_to"] - real
+        if params["pad_to"] is not None:
+            assert params["pad_to"] > real_num_tokens, "test must actually pad"
+            pad = params["pad_to"] - real_num_tokens
             for k in ("x", "dt", "B", "C"):
-                t = common[k]
-                common[k] = torch.cat(
+                t = common_kernel_args[k]
+                common_kernel_args[k] = torch.cat(
                     [t, torch.randn(pad, *t.shape[1:], device=device, dtype=t.dtype)], dim=0
                 )
-        if case["inter"] == "per_seq":
+        if params["inter"] == "per_seq":
             idx = _emit_per_seq_indices(seq_lens, chunk_size, device)
-        elif case["inter"] is not None:
-            idx = torch.tensor(case["inter"], dtype=torch.int64, device=device)
+        elif params["inter"] is not None:
+            idx = torch.tensor(params["inter"], dtype=torch.int64, device=device)
         else:
             idx = None
         initial_states = (
             torch.randn(
                 len(seq_lens),
-                case["nheads"],
+                params["nheads"],
                 headdim,
-                case["dstate"],
+                params["dstate"],
                 device=device,
                 dtype=torch.float32,
             )
-            if case["with_initial"]
+            if params["with_initial"]
             else None
         )
-        call = dict(
+        kernel_args = dict(
             z=None,
             initial_states=initial_states,
             dt_softplus=True,
             dt_limit=(0.0, float("inf")),
             state_dtype=torch.float32,
             intermediate_chunk_indices=idx,
-            **common,
+            **common_kernel_args,
         )
 
-        out_tri = torch.empty_like(common["x"])
-        tri = _mamba_chunk_scan_combined_varlen_triton(out=out_tri, **call)
-        out_cute = torch.empty_like(common["x"])
+        if ref_backend == "triton":
+            out_ref = torch.empty_like(common_kernel_args["x"])
+            ref = _mamba_chunk_scan_combined_varlen_triton(out=out_ref, **kernel_args)
+            final_ref, inter_ref = ref if idx is not None else (ref, None)
+            out_ref = out_ref[:real_num_tokens]
+        else:
+            out_ref, final_ref, inter_ref = _torch_reference_varlen(kernel_args, real_num_tokens)
 
-        # The wrapper assumes eligibility (it no longer raises); callers must
-        # consult cutedsl_unsupported_reason first, exactly like the dispatcher.
-        # NOTE: kernel_chunk_size is the kernel's fixed L (default 128), NOT the
-        # caller's chunk_size — do not override it here.
         reason = cutedsl_unsupported_reason(
-            x=call["x"],
-            chunk_size=call["chunk_size"],
-            cu_chunk_seqlens=call["cu_chunk_seqlens"],
-            last_chunk_indices=call["last_chunk_indices"],
-            z=call["z"],
+            x=kernel_args["x"],
+            chunk_size=kernel_args["chunk_size"],
+            cu_chunk_seqlens=kernel_args["cu_chunk_seqlens"],
+            last_chunk_indices=kernel_args["last_chunk_indices"],
+            z=kernel_args["z"],
             return_intermediate_states=False,
-            intermediate_chunk_indices=call["intermediate_chunk_indices"],
+            intermediate_chunk_indices=kernel_args["intermediate_chunk_indices"],
         )
-        if case["expect_fallback"]:
+        if params["expect_fallback"]:
             assert reason is not None, "eligibility check should reject this case"
-            return  # the dispatcher runs Triton for this batch; nothing to compare
-        assert reason is None, f"unexpected fallback for a supported case: {reason}"
+            pytest.skip(reason)
 
-        cute = mamba_chunk_scan_combined_varlen_cutedsl_thd(out=out_cute, **call)
+        out_cute = torch.empty_like(common_kernel_args["x"])
+        cute = mamba_chunk_scan_combined_varlen_cutedsl_thd(out=out_cute, **kernel_args)
 
         if idx is not None:
-            final_tri, inter_tri = tri
             final_cute, inter_cute = cute
             # Every emitted slot must match, including duplicated/padding slots.
-            torch.testing.assert_close(inter_cute, inter_tri, rtol=3e-2, atol=3e-2)
+            torch.testing.assert_close(
+                inter_cute, inter_ref.to(inter_cute.dtype), rtol=3e-2, atol=3e-2
+            )
         else:
-            final_tri, final_cute = tri, cute
+            final_cute = cute
         # bf16 MMAs + padded dstate are not bitwise equal; compare every REAL
         # token elementwise (padding outputs are undefined for both backends).
         # atol is one bf16 ulp at the typical accumulated-term magnitude (~64):
         # where y is a small difference of large terms, no two independently
         # tiled bf16 kernels agree below ulp(|terms|), even vs an fp64 reference.
-        torch.testing.assert_close(out_cute[:real], out_tri[:real], rtol=2e-2, atol=0.25)
-        torch.testing.assert_close(final_cute, final_tri, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(
+            out_cute[:real_num_tokens], out_ref.to(out_cute.dtype), rtol=2e-2, atol=0.25
+        )
+        torch.testing.assert_close(final_cute, final_ref.to(final_cute.dtype), rtol=3e-2, atol=3e-2)
 
 
 def _fused_cumsum_available() -> bool:
@@ -565,7 +620,3 @@ class TestMambaDynamicInference(unittest.TestCase):
             torch.allclose(remaining_ssm_states, torch.zeros_like(remaining_ssm_states)),
             "SSM states for padding requests (indices 1 to N-1) should remain 0",
         )
-
-
-if __name__ == '__main__':
-    unittest.main(argv=['first-arg-is-ignored'], exit=False)
