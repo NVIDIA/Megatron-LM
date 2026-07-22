@@ -143,7 +143,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_count += 1
             return file_name
 
-        def _clone_if_needed(ten: torch.Tensor):
+        def _clone_or_dequantize_if_needed(ten: torch.Tensor):
             """Clone if we detect incontiguous storage for CPU tensors
 
             Makes sure we perform a `clone` only if we detect incontiguous storage,
@@ -154,6 +154,11 @@ class FileSystemWriterAsync(FileSystemWriter):
             """
             ten = ten.detach()
             if ten.device.type != "cpu":
+                # We call ``dequantize`` if we detect a quantized tensor on GPU.
+                # This is a workaround to avoid the issue of quantized tensors not being
+                # supported by the async writer.
+                if ten.device.type == "cuda" and "dequantize" in type(ten).__dict__:
+                    ten = ten.dequantize()
                 # We do D2H later when the async_request is scheduled for both sync / async
                 # checkpointing
                 return ten
@@ -172,7 +177,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     if item.type == WriteItemType.BYTE_IO
                 ]
                 tensor_data = [
-                    (item, _clone_if_needed(planner.resolve_data(item)))
+                    (item, _clone_or_dequantize_if_needed(planner.resolve_data(item)))
                     for item in bucket
                     if item.type != WriteItemType.BYTE_IO
                 ]

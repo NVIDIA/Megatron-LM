@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# pylint: disable=line-too-long
 
 # Adapted from https://github.com/yifuwang/symm-mem-recipes.git
+
 
 from unittest.mock import MagicMock
 
@@ -16,60 +18,76 @@ except ImportError:
 
 
 @triton.jit
-def ld_128(ptr, mask, multicast_op: tl.constexpr):
+def ld_128(ptr, mask, multicast_op: tl.constexpr, reduce_f32: tl.constexpr = False):
     """
-    Loads 128 bits (8 x bf16) from memory into registers.
+    Loads 128 bits from memory into registers.
 
     This function abstracts two distinct hardware behaviors based on `multicast_op`:
 
     1.  **Standard Load (`multicast_op=False`)**:
         -   **Semantics:** Local Global Memory Load.
         -   **Action:** Reads 128 bits from `ptr` in global memory into the local register file.
-        -   **Use Case:** Standard tensor processing.
 
     2.  **Multicast Reduce-Load (`multicast_op=True`)**:
         -   **Semantics:** "Pull" Reduction over NVLink.
         -   **Action:** Simultaneously reads 128 bits from the *same* address across all peer GPUs
-            in the multicast group, sums them (add reduction), and loads the result into the
-            local register file.
+            in the multicast group, sums them, and loads the result into the local register file.
         -   **Hardware:** Uses `multimem.ld_reduce` (Hopper+).
-        -   **Use Case:** The "Reduce" step in collective operations.
+        -   When `reduce_f32=False` (default): bf16x2 addition with f32 accumulation
+            (128 bits = 8 x bf16, 2 per register).
+        -   When `reduce_f32=True`: native f32 addition
+            (128 bits = 4 x fp32, 1 per register).
 
     Args:
         ptr: Memory pointer to the source buffer.
         mask: Boolean predicate. If False, the operation is skipped (no-op).
         multicast_op (tl.constexpr): Toggles between standard load (False)
-        and multicast-reduce (True).
+            and multicast-reduce (True).
+        reduce_f32 (tl.constexpr): When True and multicast_op=True, uses f32 reduction
+            instead of bf16x2 reduction. Default False.
 
     Returns:
         Four 32-bit registers (tl.uint32), representing 128 bits of loaded data.
-        Note: When interpreting as bf16, this equates to 8 values (2 per register).
     """
-    # PTX Assembly Logic:
-    # 1. @$5: Predication. Only execute if argument 5 (mask) is True (1).
-    # 2. Opcode Selection:
-    #    - 'multimem.ld_reduce...add.v4.bf16x2': Hardware-accelerated reduction across peers.
-    #    - 'ld.global...v4.u32': Standard 128-bit memory read.
-    # 3. Operands:
-    #    - {$0, $1, $2, $3}: Destination registers (Output).
-    #    - [$4]: Source memory address (Input).
     if multicast_op:
-        return tl.inline_asm_elementwise(
-            """
-            {
-                .reg .pred %p0;
-                setp.ne.s32 %p0, $5, 1;
-                @%p0 bra end;
-                multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4];
-                end:
-            }
-            """,
-            "=r,=r,=r,=r,l,r",
-            args=[ptr, mask.to(tl.int32)],
-            dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
-            is_pure=True,
-            pack=1,
-        )
+        if reduce_f32:
+            # fp32 reduction: multimem.ld_reduce.add.v4.f32
+            # Each 128-bit load reduces 4 x fp32 values across peers.
+            return tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .pred %p0;
+                    setp.ne.s32 %p0, $5, 1;
+                    @%p0 bra end;
+                    multimem.ld_reduce.relaxed.sys.global.add.v4.f32 {$0, $1, $2, $3}, [$4];
+                    end:
+                }
+                """,
+                "=r,=r,=r,=r,l,r",
+                args=[ptr, mask.to(tl.int32)],
+                dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+                is_pure=True,
+                pack=1,
+            )
+        else:
+            # bf16x2 reduction with f32 accumulation: multimem.ld_reduce.add.acc::f32.v4.bf16x2
+            # Each 128-bit load reduces 8 x bf16 values (packed as 4 x bf16x2) across peers.
+            return tl.inline_asm_elementwise(
+                """
+                {
+                    .reg .pred %p0;
+                    setp.ne.s32 %p0, $5, 1;
+                    @%p0 bra end;
+                    multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2 {$0, $1, $2, $3}, [$4]; 
+                    end:
+                }
+                """,
+                "=r,=r,=r,=r,l,r",
+                args=[ptr, mask.to(tl.int32)],
+                dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+                is_pure=True,
+                pack=1,
+            )
     else:
         return tl.inline_asm_elementwise(
             """
@@ -191,6 +209,182 @@ def add_v8_bf16_from_u32(
         is_pure=True,
         pack=1,
     )
+
+
+@triton.jit
+def ld_64(ptr, mask):
+    """
+    Loads 64 bits from local global memory into two 32-bit registers.
+
+    Uses `ld.global.v2.u32`. Mirrors the non-multicast path of ld_128.
+
+    Args:
+        ptr: source pointer typed as uint64 (8-byte aligned).
+        mask: boolean predicate — if False, the load is skipped.
+
+    Returns:
+        (x, y): two tl.uint32 registers containing 64 bits of loaded data.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.ne.s32 %p0, $3, 1;
+            @%p0 bra end;
+            ld.global.v2.u32 {$0, $1}, [$2];
+            end:
+        }
+        """,
+        "=r,=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def st_64(ptr, x, y, mask, multicast_op: tl.constexpr):
+    """
+    Stores 64 bits (two 32-bit registers) to memory.
+
+    Mirrors st_128 but operates on 64-bit (v2) quantities.
+
+    1.  **Standard Store (`multicast_op=False`)**:
+        -   `st.global.v2.f32` — writes 64 bits to local global memory.
+
+    2.  **Multicast Store (`multicast_op=True`)**:
+        -   `multimem.st.relaxed.sys.global.v2.f32` — broadcasts 64 bits to all
+            peers in the multicast group simultaneously.
+
+    Args:
+        ptr: destination pointer typed as uint64 (8-byte aligned).
+        x, y: two tl.uint32 registers containing the data to store.
+        mask: boolean predicate — if False, the store is skipped.
+        multicast_op (tl.constexpr): False = local store, True = multicast broadcast.
+    """
+    if multicast_op:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $4, 1;
+                @%p0 bra end;
+                multimem.st.relaxed.sys.global.v2.f32 [$1], {$2, $3};
+                end:
+            }
+            """,
+            "=r,l,r,r,r",
+            args=[ptr, x, y, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $4, 1;
+                @%p0 bra end;
+                st.global.v2.f32 [$1], {$2, $3};
+                end:
+            }
+            """,
+            "=r,l,r,r,r",
+            args=[ptr, x, y, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+
+
+@triton.jit
+def ld_32(ptr, mask):
+    """
+    Loads 32 bits from local global memory into one 32-bit register.
+
+    Uses `ld.global.u32`. Scalar version of ld_64/ld_128.
+
+    Args:
+        ptr: source pointer typed as uint32 (4-byte aligned).
+        mask: boolean predicate — if False, the load is skipped.
+
+    Returns:
+        x: one tl.uint32 register containing 32 bits of loaded data.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.ne.s32 %p0, $2, 1;
+            @%p0 bra end;
+            ld.global.u32 $0, [$1];
+            end:
+        }
+        """,
+        "=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32,),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def st_32(ptr, x, mask, multicast_op: tl.constexpr):
+    """
+    Stores 32 bits (one 32-bit register) to memory.
+
+    Scalar version of st_64/st_128.
+
+    1.  **Standard Store (`multicast_op=False`)**:
+        -   `st.global.f32` — writes 32 bits to local global memory.
+
+    2.  **Multicast Store (`multicast_op=True`)**:
+        -   `multimem.st.relaxed.sys.global.f32` — broadcasts 32 bits to all
+            peers in the multicast group simultaneously.
+
+    Args:
+        ptr: destination pointer typed as uint32 (4-byte aligned).
+        x: one tl.uint32 register containing the data to store.
+        mask: boolean predicate — if False, the store is skipped.
+        multicast_op (tl.constexpr): False = local store, True = multicast broadcast.
+    """
+    if multicast_op:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $3, 1;
+                @%p0 bra end;
+                multimem.st.relaxed.sys.global.f32 [$1], $2;
+                end:
+            }
+            """,
+            "=r,l,r,r",
+            args=[ptr, x, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $3, 1;
+                @%p0 bra end;
+                st.global.f32 [$1], $2;
+                end:
+            }
+            """,
+            "=r,l,r,r",
+            args=[ptr, x, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
 
 
 @triton.jit

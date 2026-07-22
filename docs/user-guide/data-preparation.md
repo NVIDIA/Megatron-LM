@@ -37,19 +37,21 @@ python tools/preprocess_data.py \
 
 ### Key Arguments
 
+The following table summarizes the main preprocessor arguments:
+
 | Argument | Description |
 |----------|-------------|
 | `--input` | Path to input JSON/JSONL file |
 | `--output-prefix` | Prefix for output binary files (.bin and .idx) |
-| `--tokenizer-type` | Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, etc.) |
+| `--tokenizer-type` | Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, and so on) |
 | `--tokenizer-model` | Path to tokenizer model file |
 | `--workers` | Number of parallel workers for processing |
 | `--append-eod` | Add end-of-document token |
 
 ## Finding Optimal Number of Workers
 
-Use the `--find-optimal-num-workers` flag to find number of workers which gives the best performance in terms of preprocessed documents per second.
-Script will lauch a few short data preprocessing runs with a different number of workers to define the fastest run in respect to collected performance data.
+Use the `--find-optimal-num-workers` flag to find the number of workers that gives the best performance in terms of preprocessed documents per second.
+The script launches a few short data preprocessing runs with different worker counts and identifies the fastest run using the collected performance data.
 
 ```bash
 python tools/preprocess_data.py \
@@ -65,6 +67,8 @@ python tools/preprocess_data.py \
 
 **Required arguments**
 
+The following table lists the arguments required for worker optimization:
+
 | Argument | Description |
 |----------|-------------|
 | `--find-optimal-num-workers` | Activates search of optimal number of workers |
@@ -72,6 +76,8 @@ python tools/preprocess_data.py \
 | `--max-documents` | Number of documents to be preprocessed during each run |
 
 **Output example**
+
+The command prints performance results similar to the following:
 
 ```bash
 -----------------------------------
@@ -89,6 +95,7 @@ The most optimal num of workers is 16 with avg. preprocessed docs/s: 9606.6476.
 ## Output Files
 
 The preprocessing tool generates two files:
+
 - `processed_data.bin` - Binary file containing tokenized sequences
 - `processed_data.idx` - Index file for fast random access
 

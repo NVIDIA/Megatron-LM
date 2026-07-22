@@ -94,4 +94,3 @@ MODEL_OPTIONS="\
   --no-load-optim \
   --ckpt-format torch_dist \
   "
-

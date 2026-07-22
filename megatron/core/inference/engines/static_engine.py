@@ -18,6 +18,7 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.utils import get_asyncio_loop
 
 try:
@@ -129,6 +130,8 @@ class StaticInferenceEngine(AbstractEngine):
             self.controller.inference_wrapped_model.inference_context = original_context
             self.legacy = True
 
+        InferenceMode.set_active()
+
     def get_new_request_id(self) -> str:
         """Gets a new request id from the scheduler"""
         return self.scheduler.get_new_request_id()
@@ -174,7 +177,9 @@ class StaticInferenceEngine(AbstractEngine):
 
         if inference_request is None:
             # Support legacy single-arg tokenize_prompt mocks in tests.
-            prompt_tokens = self.controller.tokenize_prompt(prompt, add_BOS)
+            prompt_tokens = self.controller.tokenize_prompt(
+                self.controller.tokenizer, prompt, add_BOS
+            )
         else:
             prompt_tokens = inference_request.prompt_tokens
 

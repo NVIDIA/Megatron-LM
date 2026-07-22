@@ -13,7 +13,7 @@ orphan: true
 
 # User Guide
 
-Comprehensive guides for using Megatron Core and Megatron-LM.
+Guides for using Megatron Core and Megatron-LM.
 
 ```{toctree}
 :maxdepth: 2
@@ -22,5 +22,7 @@ msc_integration
 data-preparation
 training-examples
 parallelism-guide
+deterministic-training
 features/index
+hybrid-model-migration
 ```

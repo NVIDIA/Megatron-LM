@@ -81,6 +81,8 @@ def fully_shard_model(
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
@@ -101,6 +103,9 @@ def fully_shard_model(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
+    cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -141,6 +146,17 @@ def fully_shard_model(
         expt_device_mesh (Optional[DeviceMesh]):
             Expert parallel device mesh object defining the topology for MoE distributed training.
             Utilizes the mesh dimension names specified by the *_dim arguments.
+
+        fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for overlapping all-gather and reduce-scatter
+            operations. When provided, enables AG/RS overlap optimization for regular (non-expert)
+            parameters. Users should create this group with the same ranks as the dp-cp group.
+            Defaults to None.
+
+        expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for expert parameters in MoE models. When provided,
+            enables AG/RS overlap optimization for expert parameters. Users should create this group
+            with the same ranks as the expert data parallel group. Defaults to None.
 
         fsdp_unit_modules (Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]]):
             List of (sub-)module classes or (sub-)module class import paths that are "units",
@@ -184,7 +200,7 @@ def fully_shard_model(
 
         mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy):
             Megatron-FSDP mixed-precision config that controls compute and communication precision.
-            Defaults to FP32 for main weights, main gradients, and gradient communication buffers.
+            Default values are defined in `megatron_fsdp.MixedPrecisionPolicy`.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.
@@ -246,6 +262,28 @@ def fully_shard_model(
             when using MXFP8 parameters with activation recomputation. Specifically, it
             unshards parameters per-Module instead of unsharding all sub-modules of an FSDP
             unit module simultaneously. Defaults to False.
+
+        use_decoupled_grad (bool):
+            If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
+            of `Parameter.grad`. Defaults to False.
+
+        cuda_graph_mode (bool):
+            If true, Megatron-FSDP will practice CUDA graph-safe operations, such as
+            not dereferencing `param.grad` after the optimizer step to preserve references
+            for CUDA graph replay. Can affect memory utilization in some cases, such as
+            when the gradient shard is not a view of the Megatron-FSDP sharded gradient
+            buffer, so `FusedAdam(use_decoupled_grad=True) + use_decoupled_grad=True` or
+            setting `megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype`
+            is recommended to avoid casting the gradient to the parameter precision and
+            creating a casted-copy of the gradient shard that cannot be dereferenced due
+            to replay. Defaults to False.
+
+        maxpool_double_buffer (bool):
+            Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+            FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+            parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+            user buffer registration and CUDA graph replay for models with asymmetrical
+            FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
 
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
@@ -341,6 +379,9 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
+        megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
+        megatron_fsdp_max_pool_double_buffer=maxpool_double_buffer,
     )
 
     # Create FSDPDistributedIndex.
@@ -362,6 +403,9 @@ def fully_shard_model(
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
         # Only required for Megatron-FSDP + EP.
         expt_device_mesh=expt_device_mesh,
+        # AG groups for AG/RS overlap optimization.
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
     )
 
     # Wrap model in Megatron FSDP.
@@ -621,6 +665,8 @@ def fully_shard(
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
@@ -641,6 +687,9 @@ def fully_shard(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
+    cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -669,6 +718,8 @@ def fully_shard(
         hybrid_fsdp_group=hybrid_fsdp_group,
         hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         expt_device_mesh=expt_device_mesh,
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
@@ -688,7 +739,9 @@ def fully_shard(
         fsdp_double_buffer=fsdp_double_buffer,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        enable_fine_grained_param_gather=enable_fine_grained_param_gather,
+        use_decoupled_grad=use_decoupled_grad,
+        cuda_graph_mode=cuda_graph_mode,
+        maxpool_double_buffer=maxpool_double_buffer,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.

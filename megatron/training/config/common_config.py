@@ -47,7 +47,7 @@ class ProfilingConfig:
     pytorch_profiler_collect_callstack: bool = False
     """Collect callstack in pytorch profiler."""
   
-    pytorch_profiler_collect_chakra: bool = False                
+    pytorch_profiler_collect_chakra: bool = False
     """Collect chakra trace in pytorch profiler."""
 
     profile_ranks: list[int] = field(default_factory=lambda: [])
@@ -60,7 +60,7 @@ class ProfilingConfig:
     """Specifies where to dump the memory history pickle."""
 
     record_shapes: bool = False
-    """Record shapes of tensors."""
+    """Record shapes of tensors in `torch.autograd.profiler.emit_nvtx` for the Nsys profiler."""
 
     nvtx_ranges: bool = False
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
@@ -106,7 +106,7 @@ class DistributedInitConfig:
     """If set, distributed ranks initialize order is changed from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.
     """
 
-    enable_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}})
+    use_gloo_process_groups: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-gloo-process-groups"]}})
     """If enabled, create Gloo process groups for communications."""
 
     use_sharp: bool = False

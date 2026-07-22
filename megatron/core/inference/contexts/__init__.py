@@ -3,7 +3,7 @@
 import warnings
 
 from .base_context import BaseInferenceContext
-from .dynamic_block_allocator import BlockAllocator
+from .kv_block_allocator import KVBlockAllocator
 from .static_context import StaticInferenceContext
 
 warnings.warn(
