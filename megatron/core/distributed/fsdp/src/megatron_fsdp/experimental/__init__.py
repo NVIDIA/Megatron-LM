@@ -14,6 +14,12 @@
 
 """Experimental Megatron-FSDP implementation."""
 
+from .checkpoint import (
+    load_dcp_checkpoint,
+    materialize_optimizer_state,
+    resync_compute_weights,
+    save_dcp_checkpoint,
+)
 from .dbuffer import DBuffer
 from .fully_shard import fully_shard, fully_shard_context, microbatch
 from .optimizer import fully_shard_optimizer
@@ -29,5 +35,9 @@ __all__ = [
     "fully_shard",
     "fully_shard_context",
     "fully_shard_optimizer",
+    "load_dcp_checkpoint",
+    "materialize_optimizer_state",
     "microbatch",
+    "resync_compute_weights",
+    "save_dcp_checkpoint",
 ]
