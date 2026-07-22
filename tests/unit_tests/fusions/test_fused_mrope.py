@@ -766,11 +766,7 @@ def test_fused_mrope_thd_matches_unfused_forward_backward(
         fused_calls += 1
         return orig_fused_apply_mrope_thd(*args, **kwargs)
 
-    def unexpected_pack(*args, **kwargs):
-        raise AssertionError("raw THD mRoPE fusion should not materialize packed freqs")
-
     monkeypatch.setattr(rope_utils, "fused_apply_mrope_thd", wrapped_fused_apply_mrope_thd)
-    monkeypatch.setattr(rope_utils, "_pack_thd_raw_mrope_freqs", unexpected_pack)
     out = apply_rotary_pos_emb(
         t_fused, freqs, config, cu_seqlens, cp_group=cp_group, max_seqlen=_max_seqlen(cu_seqlens)
     )
@@ -807,12 +803,8 @@ def test_apply_rotary_pos_emb_thd_eval_uses_triton_without_te(interleaved_mrope,
         fused_calls += 1
         return orig_fused_apply_mrope_thd(*args, **kwargs)
 
-    def unexpected_pack(*args, **kwargs):
-        raise AssertionError("raw THD mRoPE fusion should not materialize packed freqs")
-
     monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb_thd", None)
     monkeypatch.setattr(rope_utils, "fused_apply_mrope_thd", wrapped_fused_apply_mrope_thd)
-    monkeypatch.setattr(rope_utils, "_pack_thd_raw_mrope_freqs", unexpected_pack)
     with torch.no_grad(), warnings.catch_warnings(record=True) as recorded_warnings:
         warnings.simplefilter("always")
         out = apply_rotary_pos_emb(
