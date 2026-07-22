@@ -37,7 +37,7 @@ class MockCoreAttention(torch.nn.Module):
         self.pg_collection = kwargs.get("pg_collection")
 
     def forward(
-        self, q, k, v, *args, packed_seq_params: Optional[PackedSeqParams] = None, **kwargs
+        self, q, k, v=None, *args, packed_seq_params: Optional[PackedSeqParams] = None, **kwargs
     ):
         """Mock forward pass."""
         if packed_seq_params is None:
@@ -181,7 +181,10 @@ def get_mock_mla_config(
 
 
 def get_absorbed_mla_submodules(
-    down_proj_use_column_parallel: bool, qk_layernorm: bool, rms_norm: bool
+    down_proj_use_column_parallel: bool,
+    qk_layernorm: bool,
+    rms_norm: bool,
+    combined_kv_up_projection: bool,
 ) -> AbsorbedMLASelfAttentionSubmodules:
     """Get submodules for AbsorbedMLASelfAttention testing."""
     backend = TESpecProvider()
@@ -192,17 +195,24 @@ def get_absorbed_mla_submodules(
         backend.column_parallel_linear() if down_proj_use_column_parallel else backend.linear()
     )
     qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True) if qk_layernorm else IdentityOp
+    if combined_kv_up_projection:
+        kv_up_projections = {"linear_kv_up_proj": backend.column_parallel_linear()}
+    else:
+        kv_up_projections = {
+            "linear_k_up_proj": backend.column_parallel_linear(),
+            "linear_v_up_proj": backend.column_parallel_linear(),
+        }
+
     return AbsorbedMLASelfAttentionSubmodules(
         linear_q_proj=backend.column_parallel_linear(),
         linear_q_down_proj=linear_q_down_proj,
         linear_q_up_proj=backend.column_parallel_linear(),
         linear_kv_down_proj=linear_kv_down_proj,
-        linear_k_up_proj=backend.column_parallel_linear(),
-        linear_v_up_proj=backend.column_parallel_linear(),
         core_attention=MockCoreAttention,
         linear_proj=backend.row_parallel_linear(),
         q_layernorm=qk_norm,
         kv_layernorm=qk_norm,
+        **kv_up_projections,
     )
 
 
@@ -240,11 +250,13 @@ def get_mla_submodules(
 @pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
 @pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
 @pytest.mark.parametrize("recompute_mla_up_proj", [False, True])
+@pytest.mark.parametrize("combined_kv_up_projection", [True, False])
 def test_functionality(
     tp_cp_sp: List,
     qkv_format: str,
     down_proj_use_column_parallel: bool,
     recompute_mla_up_proj: bool,
+    combined_kv_up_projection: bool,
 ):
     """Test that AbsorbedMLASelfAttention is equivalent to standard MLA."""
     tp_size, cp_size, sp = tp_cp_sp
@@ -264,6 +276,7 @@ def test_functionality(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
         qk_layernorm=True,
         rms_norm=True,
+        combined_kv_up_projection=combined_kv_up_projection,
     )
     standard_submodules = get_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
@@ -375,7 +388,7 @@ def test_functionality(
     # Map parameter names between absorbed and standard MLA
     # Most parameters have the same name, except for K/V up proj
     for name, param in standard_grads.items():
-        if 'linear_kv_up_proj' in name:
+        if 'linear_kv_up_proj' in name and not combined_kv_up_projection:
             # Special handling: combine k and v up proj grads from absorbed_mla
             k_name = name.replace('linear_kv_up_proj', 'linear_k_up_proj')
             v_name = name.replace('linear_kv_up_proj', 'linear_v_up_proj')

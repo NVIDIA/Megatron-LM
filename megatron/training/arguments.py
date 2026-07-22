@@ -4903,9 +4903,10 @@ def _add_experimental_attention_variant_args(parser):
     group.add_argument(
         '--no-dsa-kernel-fusion',
         action='store_false',
-        help='Disable fused DSA sparse-attention kernels (FlashMLA + cuDNN DSA) '
-        'and fall back to unfused PyTorch implementations.',
+        default=None,
         dest='apply_dsa_kernel_fusion',
+        help='Deprecated compatibility flag for DSv4 hybrid attention. '
+        'Use --dsa-kernel-backend none instead.',
     )
     # Note: --dsa-indexer-{n-heads,head-dim,topk,loss-coeff,use-sparse-loss},
     # --csa-window-size, --csa-compress-rotary-base, --csa-dense-mode are

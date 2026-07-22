@@ -1523,8 +1523,8 @@ class TestCSAIndexerThd:
     """``CSAIndexer`` THD-packed paths:
       * ``forward_before_topk(packed_seq_params=...)`` — 4-tuple return
         with ``cu_seqlens_compressed_idx``.
-      * ``forward(packed_seq_params=...)`` — THD dispatch through
-        :func:`fused_qk_topk_naive_thd`. New in the THD-completion turn.
+      * ``forward(packed_seq_params=...)`` — THD dispatch through ordinary
+        DSA top-k with CSA-provided row-wise compressed-key bounds.
 
     Multi-segment shape contract + B=1 SBHD-b=1 parity.
     """

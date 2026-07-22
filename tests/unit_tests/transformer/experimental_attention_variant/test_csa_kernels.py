@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for ``megatron.core.transformer.experimental_attention_variant.dsa_kernels``.
+"""Unit tests for ``megatron.core.transformer.experimental_attention_variant.csa_kernels``.
 
 Coverage:
 
@@ -10,8 +10,8 @@ Coverage:
 * Lazy-import gates: :func:`_ensure_flash_mla`, :func:`_ensure_dsa_namespace`
   raise informative ``ImportError`` when the optional packages are missing.
 * GPU helpers: :func:`_get_topk_alignment` — runs only on CUDA.
-* Wrapper functions :func:`_dsa_fwd_flash_mla`, :func:`indexer_topk`,
-  :func:`dsa_sparse_attn`, :func:`fused_indexer_sparse_attn` — exercised with
+* Wrapper functions :func:`_csa_fwd_flash_mla`, :func:`indexer_topk`,
+  :func:`csa_sparse_attn`, :func:`fused_csa_indexer_sparse_attn` — exercised with
   ``unittest.mock`` stand-ins for the underlying ``flash_mla`` /
   ``cudnn.DSA`` kernels so the data-marshalling logic (shape conversions,
   TopK padding, predict/target/KL composition, autograd plumbing) is
@@ -28,11 +28,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant import dsa_kernels as dk
-from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
-    FusedIndexerSparseAttnFunc,
-    SparseAttnFunc,
-    _dsa_fwd_flash_mla,
+from megatron.core.transformer.experimental_attention_variant import csa_kernels as dk
+from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+    CSASparseAttnFunc,
+    FusedCSAIndexerSparseAttnFromTopkFunc,
+    FusedCSAIndexerSparseAttnFunc,
+    _csa_fwd_flash_mla,
     _ensure_dsa_namespace,
     _ensure_flash_mla,
     _get_topk_alignment,
@@ -40,8 +41,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     _kl_loss_from_target_predict,
     batch_of_row,
     build_flat_topk_idxs,
-    dsa_sparse_attn,
-    fused_indexer_sparse_attn,
+    csa_sparse_attn,
+    fused_csa_indexer_sparse_attn,
     indexer_topk,
     local_to_global_flat,
 )
@@ -494,7 +495,7 @@ class TestGetTopkAlignment:
 
 
 # ---------------------------------------------------------------------------
-# _dsa_fwd_flash_mla — wrapper around flash_mla.flash_mla_sparse_fwd
+# _csa_fwd_flash_mla — wrapper around flash_mla.flash_mla_sparse_fwd
 # ---------------------------------------------------------------------------
 
 
@@ -554,7 +555,7 @@ class TestDsaFwdFlashMla:
     """
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_fwd_flash_mla_adapter(self, reset_lazy_kernel_state):
+    def test_csa_fwd_flash_mla_adapter(self, reset_lazy_kernel_state):
         """All adapter behaviours in one fixture (assertion blocks self-label
         on failure):
 
@@ -585,7 +586,7 @@ class TestDsaFwdFlashMla:
         stub = _make_flash_mla_stub(d_v=D)
         dk._flash_mla_sparse_fwd = stub
 
-        out, lse, lse_indexer = _dsa_fwd_flash_mla(q, kv, topk_idxs, softmax_scale=0.5, d_v=D)
+        out, lse, lse_indexer = _csa_fwd_flash_mla(q, kv, topk_idxs, softmax_scale=0.5, d_v=D)
         assert lse_indexer is None, "(a) lse_indexer should be None when indexer_topk=0"
         assert torch.equal(out, stub.last_out), "(a) out is not pass-through"
         assert torch.equal(lse, stub.last_lse), "(a) lse is not pass-through"
@@ -613,11 +614,11 @@ class TestDsaFwdFlashMla:
         dk._flash_mla_sparse_fwd = stub
 
         # (b) indexer_topk == 0
-        _, _, lse_idx_b = _dsa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=0)
+        _, _, lse_idx_b = _csa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=0)
         assert lse_idx_b is None, "(b) indexer_topk=0 must yield lse_indexer=None"
 
         # (c) 0 < indexer_topk < TopK
-        _, lse_c, lse_idx_c = _dsa_fwd_flash_mla(
+        _, lse_c, lse_idx_c = _csa_fwd_flash_mla(
             q, kv, topk_idxs_aligned, 0.5, indexer_topk=TopK // 2
         )
         assert lse_idx_c is not None, "(c) lse_indexer should be present"
@@ -627,7 +628,7 @@ class TestDsaFwdFlashMla:
         assert not torch.equal(lse_idx_c, lse_c), "(c) wrapper silently swapped lse_indexer for lse"
 
         # (d) indexer_topk == TopK -> fallback to lse.clone()
-        _, lse_d, lse_idx_d = _dsa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=TopK)
+        _, lse_d, lse_idx_d = _csa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=TopK)
         assert torch.equal(
             lse_idx_d, lse_d
         ), "(d) lse_indexer should equal lse on TopK-cap fallback"
@@ -638,7 +639,7 @@ class TestDsaFwdFlashMla:
         # ---- (e) topk_length + indexer_topk > 0 is rejected --------------
         # Use CPU tensors here — the assert fires before any kernel call.
         with pytest.raises(AssertionError, match="indexer_topk > 0 requires non-compact"):
-            _dsa_fwd_flash_mla(
+            _csa_fwd_flash_mla(
                 torch.zeros(2, 2, 512, dtype=torch.bfloat16),
                 torch.zeros(4, 512, dtype=torch.bfloat16),
                 torch.zeros(2, 8, dtype=torch.int32),
@@ -797,19 +798,19 @@ class TestIndexerTopk:
 
 
 # ---------------------------------------------------------------------------
-# dsa_sparse_attn / SparseAttnFunc forward (mocked)
+# csa_sparse_attn / CSASparseAttnFunc forward (mocked)
 # ---------------------------------------------------------------------------
 
 
 class TestDsaSparseAttn:
-    """Numerical fwd + bwd test for the public ``dsa_sparse_attn`` entry
+    """Numerical fwd + bwd test for the public ``csa_sparse_attn`` entry
     point. The underlying kernels are mocked so the whole wrapper — including
     the SBHD↔flat reshape on the forward and the autograd plumbing on the
     backward — can be checked against deterministic ground truth.
     """
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_sparse_attn_fwd_and_bwd(self, reset_lazy_kernel_state):
+    def test_csa_sparse_attn_fwd_and_bwd(self, reset_lazy_kernel_state):
         """Combined forward + backward fixture (assertion blocks self-label
         on failure):
 
@@ -843,7 +844,7 @@ class TestDsaSparseAttn:
         dk._flash_mla_sparse_fwd = flash_stub
         dk._DSA = fake_dsa
 
-        out = dsa_sparse_attn(query, kv, attn_sink, topk_idxs, softmax_scale=0.5)
+        out = csa_sparse_attn(query, kv, attn_sink, topk_idxs, softmax_scale=0.5)
 
         # ---- (a) forward ------------------------------------------------
         assert out.shape == (sq, b, np_ * d), "(a) forward shape"
@@ -865,7 +866,7 @@ class TestDsaSparseAttn:
 
 
 # ---------------------------------------------------------------------------
-# fused_indexer_sparse_attn — Path B autograd Function (mocked)
+# fused_csa_indexer_sparse_attn — Path B autograd Function (mocked)
 # ---------------------------------------------------------------------------
 
 
@@ -888,7 +889,7 @@ def _install_full_dsa_mock(
 ):
     """Patch the module-level ``_DSA`` and ``_flash_mla_sparse_fwd`` slots
     with a coordinated set of deterministic stubs covering every kernel
-    invoked by :class:`FusedIndexerSparseAttnFunc`.
+    invoked by :class:`FusedCSAIndexerSparseAttnFunc`.
 
     ``predict_fn`` / ``target_fn`` (if provided) build the per-row
     distribution given ``(b, sq, topk, device)``. By default both return a
@@ -1179,7 +1180,7 @@ class TestFusedIndexerSparseAttn:
             target_fn=target_fn,
         )
 
-        _, indexer_loss = fused_indexer_sparse_attn(
+        _, indexer_loss = fused_csa_indexer_sparse_attn(
             **inputs,
             indexer_topk=topk,
             ratio=4,
@@ -1214,7 +1215,7 @@ class TestFusedIndexerSparseAttn:
         _, flash_stub_a = _install_full_dsa_mock(
             b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
-        output_a, _ = fused_indexer_sparse_attn(
+        output_a, _ = fused_csa_indexer_sparse_attn(
             **inputs,
             indexer_topk=2,
             ratio=4,
@@ -1249,7 +1250,7 @@ class TestFusedIndexerSparseAttn:
             d_weights_value=-0.25,
             d_index_k_value=1.5,
         )
-        output_b, indexer_loss_b = fused_indexer_sparse_attn(
+        output_b, indexer_loss_b = fused_csa_indexer_sparse_attn(
             **inputs_b,
             indexer_topk=2,
             ratio=4,
@@ -1282,7 +1283,7 @@ class TestFusedIndexerSparseAttn:
         fake_dsa_c, _ = _install_full_dsa_mock(
             b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
-        fused_indexer_sparse_attn(
+        fused_csa_indexer_sparse_attn(
             **inputs_c,
             indexer_topk=999,  # > n_comp
             ratio=4,
@@ -1298,7 +1299,7 @@ class TestFusedIndexerSparseAttn:
 
 
 # ---------------------------------------------------------------------------
-# fused_indexer_sparse_attn — dense path (sparse_loss=False)
+# fused_csa_indexer_sparse_attn — dense path (sparse_loss=False)
 # ---------------------------------------------------------------------------
 
 
@@ -1306,7 +1307,7 @@ class TestDenseFusedIndexerSparseAttn:
     """End-to-end tests for the dense-loss branch of Path B with all
     underlying CUDA kernels mocked. Mirrors :class:`TestFusedIndexerSparseAttn`
     but exercises the ``sparse_loss=False`` code path through
-    :class:`FusedIndexerSparseAttnFunc`.
+    :class:`FusedCSAIndexerSparseAttnFunc`.
     """
 
     SHAPES = dict(sq=4, b=2, np_=2, d=512, skv=8, n_comp=4, idx_nh=4, idx_hd=64)
@@ -1401,7 +1402,7 @@ class TestDenseFusedIndexerSparseAttn:
             # predict_score_fn / predict_lse_fn defaults give uniform predict.
         )
 
-        _, indexer_loss = fused_indexer_sparse_attn(
+        _, indexer_loss = fused_csa_indexer_sparse_attn(
             **inputs,
             indexer_topk=2,
             ratio=4,
@@ -1442,7 +1443,7 @@ class TestDenseFusedIndexerSparseAttn:
         fake_dsa_a, _ = _install_full_dsa_mock_dense(
             b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
-        fused_indexer_sparse_attn(
+        fused_csa_indexer_sparse_attn(
             **inputs_a,
             indexer_topk=2,
             ratio=ratio,
@@ -1491,7 +1492,7 @@ class TestDenseFusedIndexerSparseAttn:
             d_weights_value=-0.25,
             d_index_k_value=1.5,
         )
-        output, indexer_loss = fused_indexer_sparse_attn(
+        output, indexer_loss = fused_csa_indexer_sparse_attn(
             **inputs_b,
             indexer_topk=2,
             ratio=ratio,
@@ -1532,9 +1533,9 @@ class TestDenseFusedIndexerSparseAttn:
 #
 # Everything above this banner stubs ``cudnn.DSA`` and ``flash_mla`` with
 # ``MagicMock``-based fakes; that exercises the Python plumbing of
-# ``dsa_kernels.py`` (shape transforms, autograd wiring, KL composition)
+# ``csa_kernels.py`` (shape transforms, autograd wiring, KL composition)
 # but does NOT verify that the cuDNN kernels themselves compute what
-# ``dsa_kernels.py`` expects them to compute.
+# ``csa_kernels.py`` expects them to compute.
 #
 # The tests below close that gap by running each helper / public function
 # end-to-end against a small PyTorch reference implementation. Numeric
@@ -1858,7 +1859,7 @@ class TestRealKernelScoreHelpers:
             with_topk=case.startswith('sparse_'),
         )
 
-        from megatron.core.transformer.experimental_attention_variant import dsa_kernels as _dk
+        from megatron.core.transformer.experimental_attention_variant import csa_kernels as _dk
 
         if case == 'sparse_indexer_predict':
             # The kernel takes sm_scale=1.0; scale is applied via weights
@@ -1992,7 +1993,7 @@ class TestRealKernelKLLossDense:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_dense_kl_loss_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
             _compute_dense_attn_score,
             _compute_dense_indexer_score,
             _kl_loss_from_dense_scores,
@@ -2054,7 +2055,7 @@ class TestRealKernelIndexerTopk:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_indexer_topk_set_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
             indexer_topk,
         )
 
@@ -2128,12 +2129,12 @@ class TestRealKernelIndexerTopk:
 
 
 # ---------------------------------------------------------------------------
-# Real ``dsa_sparse_attn``: forward + backward parity vs PyTorch reference.
+# Real ``csa_sparse_attn``: forward + backward parity vs PyTorch reference.
 # ---------------------------------------------------------------------------
 
 
 class TestRealKernelDsaSparseAttn:
-    """Real-kernel parity for :func:`dsa_sparse_attn`. Forward uses real
+    """Real-kernel parity for :func:`csa_sparse_attn`. Forward uses real
     FlashMLA + the SBHD/flat reshape wrapper; backward uses the real cuDNN
     sparse-attn-bwd kernel. Both checked in one test against the
     pure-PyTorch sparse-attn reference (``_ref_sparse_attn_forward``).
@@ -2167,7 +2168,7 @@ class TestRealKernelDsaSparseAttn:
         global_idxs = local_to_global_flat(topk_local, s['b']).contiguous()
         return query, kv, attn_sink, global_idxs
 
-    def test_real_dsa_sparse_attn_fwd_bwd_matches_reference(self, reset_lazy_kernel_state):
+    def test_real_csa_sparse_attn_fwd_bwd_matches_reference(self, reset_lazy_kernel_state):
         """Forward output AND backward gradients (dq, dkv, d_sink) must
         match a pure-PyTorch sparse-attn reference. Combining both checks
         in one test halves cuDNN compile time vs running them separately,
@@ -2176,9 +2177,9 @@ class TestRealKernelDsaSparseAttn:
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
 
-        # ---- Real path: forward + backward via dsa_sparse_attn ----
+        # ---- Real path: forward + backward via csa_sparse_attn ----
         query, kv, attn_sink, global_idxs = self._make_inputs(requires_grad=True)
-        out = dsa_sparse_attn(query, kv, attn_sink, global_idxs, softmax_scale=s['softmax_scale'])
+        out = csa_sparse_attn(query, kv, attn_sink, global_idxs, softmax_scale=s['softmax_scale'])
         torch.manual_seed(7)
         upstream = torch.randn_like(out)
         (out * upstream).sum().backward()
@@ -2228,13 +2229,13 @@ class TestRealKernelDsaSparseAttn:
 
 
 # ---------------------------------------------------------------------------
-# Real ``fused_indexer_sparse_attn``: dense-loss path end-to-end parity.
+# Real ``fused_csa_indexer_sparse_attn``: dense-loss path end-to-end parity.
 # ---------------------------------------------------------------------------
 
 
 class TestRealKernelFusedIndexerSparseAttn:
     """End-to-end parity for the dense loss path of
-    :func:`fused_indexer_sparse_attn`: real cuDNN dense kernels (forward
+    :func:`fused_csa_indexer_sparse_attn`: real cuDNN dense kernels (forward
     + backward) + real FlashMLA, compared to ``_ref_dense_indexer_loss``.
 
     Backward grad correctness for the indexer-grad kernel is established by
@@ -2293,7 +2294,7 @@ class TestRealKernelFusedIndexerSparseAttn:
         kv_offset = s['skv'] - s['n_comp']
 
         # Real path.
-        _, indexer_loss = fused_indexer_sparse_attn(
+        _, indexer_loss = fused_csa_indexer_sparse_attn(
             query,
             kv_full,
             attn_sink,
@@ -2319,8 +2320,8 @@ class TestRealKernelFusedIndexerSparseAttn:
 
         # The reference uses FlashMLA's actual normalization because it
         # includes the selected top-k positions and the per-head sink term.
-        from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
-            _dsa_fwd_flash_mla,
+        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+            _csa_fwd_flash_mla,
             _indexer_topk_core,
         )
 
@@ -2342,7 +2343,7 @@ class TestRealKernelFusedIndexerSparseAttn:
         global_idxs = local_to_global_flat(combined_local, s['b'])
         q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
         kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
-        _, _, lse_indexer = _dsa_fwd_flash_mla(
+        _, _, lse_indexer = _csa_fwd_flash_mla(
             q_flat,
             kv_flat,
             global_idxs,
@@ -2519,8 +2520,8 @@ class TestThdPureHelpers:
 
 class TestThdWrapperDispatchAndValidation:
     """THD-mode dispatch + missing-kwarg validation for the three
-    public layout-aware wrappers: ``indexer_topk``, ``dsa_sparse_attn``,
-    ``fused_indexer_sparse_attn``.
+    public layout-aware wrappers: ``indexer_topk``, ``csa_sparse_attn``,
+    ``fused_csa_indexer_sparse_attn``.
 
     All tests are mock-based or shape-only — no real CUDA kernels.
     They verify two contracts:
@@ -2605,29 +2606,29 @@ class TestThdWrapperDispatchAndValidation:
         assert torch.equal(seq_lens, torch.tensor([1, 1, 2, 0, 0], device=q.device))
 
     # =====================================================================
-    # dsa_sparse_attn(is_thd=True)
+    # csa_sparse_attn(is_thd=True)
     # =====================================================================
 
     @pytest.mark.parametrize(
         "query_shape, kv_shape, match",
         [
-            ((4, 2, 4, 64), (8, 64), "THD dsa_sparse_attn expects query"),
-            ((4, 4, 64), (8, 2, 64), "THD dsa_sparse_attn expects kv"),
+            ((4, 2, 4, 64), (8, 64), "THD csa_sparse_attn expects query"),
+            ((4, 4, 64), (8, 2, 64), "THD csa_sparse_attn expects kv"),
         ],
         ids=["query_wrong_ndim", "kv_wrong_ndim"],
     )
-    def test_dsa_sparse_attn_thd_wrong_ndim_raises(self, query_shape, kv_shape, match):
+    def test_csa_sparse_attn_thd_wrong_ndim_raises(self, query_shape, kv_shape, match):
         """THD mode requires ``query.ndim == 3`` and ``kv.ndim == 2``."""
         query = torch.zeros(*query_shape, dtype=torch.bfloat16)
         kv = torch.zeros(*kv_shape, dtype=torch.bfloat16)
         attn_sink = torch.zeros(4, dtype=torch.float32)
         topk = torch.zeros(query_shape[0], 2, dtype=torch.int32)
         with pytest.raises(ValueError, match=match):
-            dsa_sparse_attn(query, kv, attn_sink, topk, softmax_scale=0.125, is_thd=True)
+            csa_sparse_attn(query, kv, attn_sink, topk, softmax_scale=0.125, is_thd=True)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dsa_sparse_attn_thd_pass_through_no_reshape(self, reset_lazy_kernel_state):
-        """THD inputs flow into ``SparseAttnFunc`` unchanged (no SBHD
+    def test_csa_sparse_attn_thd_pass_through_no_reshape(self, reset_lazy_kernel_state):
+        """THD inputs flow into ``CSASparseAttnFunc`` unchanged (no SBHD
         reshape) and the output is ``(total_q, np * d_v)``.
         """
         total_q, np_, d, d_v = 6, 4, 64, 512
@@ -2640,17 +2641,17 @@ class TestThdWrapperDispatchAndValidation:
         flash_stub = _make_flash_mla_stub(d_v=d_v)
         dk._flash_mla_sparse_fwd = flash_stub
 
-        out = dsa_sparse_attn(query, kv, attn_sink, topk, softmax_scale=0.125, is_thd=True)
+        out = csa_sparse_attn(query, kv, attn_sink, topk, softmax_scale=0.125, is_thd=True)
         assert out.shape == (total_q, np_ * d_v)
         # The FlashMLA stub was called with the unmodified flat tensors.
-        # _dsa_fwd_flash_mla passes (q, kv_3d, indices, softmax_scale) positionally;
+        # _csa_fwd_flash_mla passes (q, kv_3d, indices, softmax_scale) positionally;
         # kv is unsqueezed to (n_kv, 1, d) before reaching the kernel.
         call_q, call_kv_3d = flash_stub.call_args.args[0], flash_stub.call_args.args[1]
         assert call_q.shape == (total_q, np_, d)
         assert call_kv_3d.squeeze(1).shape == (n_kv, d)
 
     # =====================================================================
-    # fused_indexer_sparse_attn (validation only — real-kernel parity is
+    # fused_csa_indexer_sparse_attn (validation only — real-kernel parity is
     # covered by TestRealKernelFusedIndexerSparseAttnThd below)
     # =====================================================================
 
@@ -2689,7 +2690,7 @@ class TestThdWrapperDispatchAndValidation:
             'max_seqlen_compressed_idx',
         ],
     )
-    def test_fused_indexer_sparse_attn_thd_missing_kwarg_raises(self, missing):
+    def test_fused_csa_indexer_sparse_attn_thd_missing_kwarg_raises(self, missing):
         """All five THD-companion kwargs are required when ``cu_seqlens_q``
         is supplied; a missing one raises ``ValueError`` upfront.
 
@@ -2701,7 +2702,7 @@ class TestThdWrapperDispatchAndValidation:
         kwargs[missing] = None
         inputs = self._fused_dummy_thd_inputs()
         with pytest.raises(ValueError, match="THD mode requires"):
-            fused_indexer_sparse_attn(
+            fused_csa_indexer_sparse_attn(
                 **inputs, indexer_topk=2, ratio=4, softmax_scale=0.125, **kwargs
             )
 
@@ -2770,7 +2771,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         kv_offset = s['skv'] - s['n_comp']
 
         # ---- SBHD reference --------------------------------------------------
-        _, loss_sbhd = fused_indexer_sparse_attn(
+        _, loss_sbhd = fused_csa_indexer_sparse_attn(
             query_sbhd,
             kv_full_sbhd,
             attn_sink,
@@ -2808,7 +2809,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         # B=1: per-segment [kv, compressed] layout collapses to a single
         # contiguous slice — same kv_offset as the SBHD case.
         compressed_kv_thd = kv_full_thd[kv_offset:]
-        _, loss_thd = fused_indexer_sparse_attn(
+        _, loss_thd = fused_csa_indexer_sparse_attn(
             query_thd,
             kv_full_thd,
             attn_sink,
@@ -2870,7 +2871,7 @@ class TestThdPaddingRowMasking:
 
     @staticmethod
     def _build_multi_seg_inputs(seg_lens, shapes, dev, *, seed=42):
-        """Build THD multi-segment inputs for fused_indexer_sparse_attn.
+        """Build THD multi-segment inputs for fused_csa_indexer_sparse_attn.
 
         Each segment has its own original KV (len = seg_len) and compressed
         KV (len = seg_len // ratio), concatenated per-segment in kv_full.
@@ -3052,10 +3053,10 @@ class TestThdPaddingRowMasking:
     def _run_fused(
         self, inputs, shapes, *, sparse_loss, loss_coeff=0.5, cu_seqlens_q_unpadded=None
     ):
-        """Run fused_indexer_sparse_attn with the given inputs dict."""
+        """Run fused_csa_indexer_sparse_attn with the given inputs dict."""
         s = shapes
         i = inputs
-        return fused_indexer_sparse_attn(
+        return fused_csa_indexer_sparse_attn(
             i['query'],
             i['kv_full'],
             i['attn_sink'],
@@ -3288,7 +3289,7 @@ class TestRealKernelDenseIndexerBackward:
         q_idx_real = q_idx_init.detach().clone().requires_grad_(True)
         k_idx_real = k_idx_init.detach().clone().requires_grad_(True)
         w_real = w_init.detach().clone().requires_grad_(True)
-        _, indexer_loss = fused_indexer_sparse_attn(
+        _, indexer_loss = fused_csa_indexer_sparse_attn(
             query,
             kv_full,
             attn_sink,
@@ -3311,9 +3312,9 @@ class TestRealKernelDenseIndexerBackward:
 
         # ---- Reference: capture the kernel's attn-side / lse_indexer (treated
         # as constants) and run autograd through the analytical dense KL.
-        from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
             _compute_dense_attn_score,
-            _dsa_fwd_flash_mla,
+            _csa_fwd_flash_mla,
             _indexer_topk_core,
             _kl_loss_from_dense_scores,
         )
@@ -3343,7 +3344,7 @@ class TestRealKernelDenseIndexerBackward:
             global_idxs = local_to_global_flat(combined_local, s['b'])
             q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
             kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
-            _, _, lse_indexer = _dsa_fwd_flash_mla(
+            _, _, lse_indexer = _csa_fwd_flash_mla(
                 q_flat,
                 kv_flat,
                 global_idxs,
@@ -3448,19 +3449,21 @@ class TestPublicApi:
     """
 
     def test_public_surface(self):
-        from megatron.core.transformer.experimental_attention_variant import dsa_kernels
+        from megatron.core.transformer.experimental_attention_variant import csa_kernels
 
-        for name in dsa_kernels.__all__:
-            assert hasattr(dsa_kernels, name), f"__all__ lists {name!r} but it is missing"
+        for name in csa_kernels.__all__:
+            assert hasattr(csa_kernels, name), f"__all__ lists {name!r} but it is missing"
 
         for fn in (
+            _csa_fwd_flash_mla,
             build_flat_topk_idxs,
             local_to_global_flat,
-            dsa_sparse_attn,
+            csa_sparse_attn,
             indexer_topk,
-            fused_indexer_sparse_attn,
+            fused_csa_indexer_sparse_attn,
         ):
             assert callable(fn)
 
-        assert issubclass(SparseAttnFunc, torch.autograd.Function)
-        assert issubclass(FusedIndexerSparseAttnFunc, torch.autograd.Function)
+        assert issubclass(CSASparseAttnFunc, torch.autograd.Function)
+        assert issubclass(FusedCSAIndexerSparseAttnFunc, torch.autograd.Function)
+        assert issubclass(FusedCSAIndexerSparseAttnFromTopkFunc, torch.autograd.Function)
