@@ -55,6 +55,14 @@ from .optimizer_config import OptimizerConfig
 logger = getLogger(__name__)
 
 
+def _zero_tensor_storage(tensor: torch.Tensor) -> None:
+    """Zero a Tensor or DTensor by writing only its local storage."""
+    local_tensor = getattr(tensor, "_local_tensor", None)
+    target = local_tensor if local_tensor is not None else tensor
+    with torch.no_grad():
+        target.zero_()
+
+
 def _zero_grad_group_helper(
     group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
 ):
@@ -66,6 +74,9 @@ def _zero_grad_group_helper(
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         if hasattr(param, grad_attr) and getattr(param, grad_attr) is not None:
             if set_to_none:
+                if getattr(param, "_mfsdp_keep_grad_for_cuda_graph", False):
+                    _zero_tensor_storage(getattr(param, grad_attr))
+                    continue
                 setattr(param, grad_attr, None)
             else:
                 grad_obj = getattr(param, grad_attr)

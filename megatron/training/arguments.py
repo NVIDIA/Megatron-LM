@@ -1186,6 +1186,14 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if getattr(args, 'use_megatron_fsdp_v2', False):
+        args.use_megatron_fsdp = True
+
+    if getattr(args, 'mfsdp_cuda_graph_modules', None):
+        assert getattr(args, 'use_megatron_fsdp_v2', False), (
+            "--mfsdp-cuda-graph requires --use-megatron-fsdp-v2"
+        )
+
     if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
         try:
             import flashinfer  # noqa: F401
@@ -1226,6 +1234,7 @@ def validate_args(args, defaults={}):
         assert args.optimizer in (
             'sgd',
             'adam',
+            *(('muon',) if getattr(args, 'use_megatron_fsdp_v2', False) else ()),
         ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
@@ -1845,7 +1854,12 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    # Megatron-FSDP handles emerging optimizers (e.g. muon) through its own
+    # optimizer factory (FullyShardV2Muon), NOT the LayerWiseDistributedOptimizer
+    # path below — so skip this whole block when Megatron-FSDP is enabled (it
+    # would otherwise disable use_distributed_optimizer and reject FSDP / the
+    # fsdp_dtensor ckpt format). muon+FSDP is gated to v2 by the assert above.
+    if args.optimizer not in ('sgd', 'adam') and not args.use_megatron_fsdp:
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -4156,6 +4170,27 @@ def _add_distributed_args(parser):
         'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.',
     )
     group.add_argument(
+        '--use-megatron-fsdp-v2',
+        action='store_true',
+        dest='use_megatron_fsdp_v2',
+        help='Use PyTorch fully shard API for FSDP implementation. '
+        'This option is only effective when use-megatron-fsdp is set. ',
+    )
+    group.add_argument(
+        '--mfsdp-cuda-graph',
+        nargs='+',
+        default=[],
+        choices=['mamba', 'transformer', 'attn', 'mlp', 'moe', 'moe_router'],
+        dest='mfsdp_cuda_graph_modules',
+        help='Enable CUDA graph capture on specific FSDP module types '
+        'when using Megatron FSDP v2 (--use-megatron-fsdp-v2). '
+        'Choices: mamba (MambaLayer), transformer (TransformerLayer), '
+        'attn (Attention), mlp (dense MLP), moe (MoE experts), and moe_router (MoE Router). '
+        'Can be combined when the selected FSDP modules are not nested, '
+        'e.g. --mfsdp-cuda-graph attn mlp. '
+        'Only non-nested (leaf) FSDP modules are eligible.',
+    )
+    group.add_argument(
         '--create-all-gather-group',
         action='store_true',
         help='Create a separate process group for all-gather operations '
@@ -4192,6 +4227,16 @@ def _add_distributed_args(parser):
         "Double-buffering the communication memory improves memory management efficiency by "
         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
+    )
+    group.add_argument(
+        '--fsdp-trace-pool',
+        action='store_true',
+        dest='fsdp_trace_pool',
+        help="Enable TracePoolAllocator for Megatron FSDP v2 communication buffers. "
+        "The TracePoolAllocator profiles one micro-batch to record allocation patterns, "
+        "then builds a static key-to-address plan that is reused across subsequent micro-batches. "
+        "This provides stable buffer addresses required for CUDA graph capture. "
+        "This flag only takes effect in the Megatron FSDP v2 path.",
     )
     group.add_argument(
         '--suggested-communication-unit-size',

@@ -23,6 +23,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.optimizer import _zero_grad_group_helper
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -748,6 +749,28 @@ def test_precision_aware_fused_adam():
             bytes_2 = p_2.data.view(torch.uint8)
             # Make sure bit-wise matched
             assert torch.all(bytes_1 == bytes_2)
+
+
+def test_zero_grad_preserves_marked_mfsdp_cuda_graph_grads():
+    param = torch.nn.Parameter(torch.ones(4))
+
+    grad = torch.ones_like(param)
+    param.grad = grad
+    param._mfsdp_keep_grad_for_cuda_graph = True
+    _zero_grad_group_helper([param], set_to_none=True)
+    assert param.grad is grad
+    assert torch.count_nonzero(param.grad) == 0
+
+    decoupled_grad = torch.ones_like(param)
+    param.decoupled_grad = decoupled_grad
+    _zero_grad_group_helper([param], set_to_none=True, use_decoupled_grad=True)
+    assert param.decoupled_grad is decoupled_grad
+    assert torch.count_nonzero(param.decoupled_grad) == 0
+
+    unmarked_param = torch.nn.Parameter(torch.ones(4))
+    unmarked_param.grad = torch.ones_like(unmarked_param)
+    _zero_grad_group_helper([unmarked_param], set_to_none=True)
+    assert unmarked_param.grad is None
 
 
 @pytest.mark.skipif(

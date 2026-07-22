@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Full iteration CUDA graph for training."""
 
@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
+
+
+def _has_megatron_fsdp_v2(model):
+    """Return whether the model contains a Megatron FSDP v2 wrapper."""
+    roots = model if isinstance(model, (list, tuple)) else (model,)
+    return any(
+        getattr(getattr(module, "ddp_config", None), "use_megatron_fsdp_v2", False)
+        for root in roots
+        for module in root.modules()
+    )
 
 
 def get_shared_capture_stream():
@@ -206,6 +216,9 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
+        if not training and _has_megatron_fsdp_v2(model):
+            return self.forward_backward_func(*args, **kwargs)
+
         data_iterator = kwargs['data_iterator']
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
