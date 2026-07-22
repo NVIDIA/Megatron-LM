@@ -56,7 +56,7 @@ uv pip install --no-build-isolation "megatron-core[training,dev]"
 ```
 
 ```{note}
-`--no-build-isolation` requires build dependencies to be pre-installed in the environment. `torch` is needed because several `[dev]` packages (`mamba-ssm`, `nv-grouped-gemm`, and `transformer-engine`) import it at build time to compile CUDA kernels. Expect this step to take **20+ minutes** depending on your hardware. If you prefer pre-built binaries, the [NGC Container](#option-c-ngc-container) ships with these pre-compiled.
+`--no-build-isolation` requires build dependencies to be pre-installed in the environment. `torch` is needed because several `[dev]` packages (`mamba-ssm`, `nv-grouped-gemm`, and `transformer-engine`) import it at build time to compile CUDA kernels. Expect this step to take **20+ minutes** depending on your hardware. If you prefer pre-built binaries, the [NGC Container](#option-c-nvidia-gpu-cloud-ngc-container) ships with these pre-compiled.
 ```
 
 ```{warning}

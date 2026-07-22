@@ -6,8 +6,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -15,8 +16,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -28,13 +27,13 @@ from megatron.core.ssm.mamba_context_parallel import (
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
+from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
-    cat_with_oom_fallback,
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
@@ -84,7 +83,7 @@ class GatedDeltaNet(MegatronModule):
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
         use_qk_l2norm: bool = True,
-        A_init_range: Tuple[float, float] = (1, 16),
+        A_init_range: tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
         name: str | None = None,
     ):
@@ -120,6 +119,7 @@ class GatedDeltaNet(MegatronModule):
         self.use_qk_l2norm = use_qk_l2norm
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
+        self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
@@ -289,7 +289,7 @@ class GatedDeltaNet(MegatronModule):
                 inference CUDA graphs.
 
         Return:
-            (Tuple[Tensor, Tensor]) GDN output and bias.
+            (tuple[Tensor, Tensor]) GDN output and bias.
 
         """
         # TODO: Deal with attention_mask
@@ -347,40 +347,40 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
+        if self.cp_size > 1:
+            # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
+            head_perm = _build_head_perm_for_split_sections(
+                (
+                    self.qk_dim_local_tp,
+                    self.qk_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ),
+                self.pg_collection.cp.size(),
+                torch.cuda.current_device(),
+            )
+            qkvzba = qkvzba.index_select(-1, head_perm)
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
-            outputs = []
-            for qkvzba_i in unpacked_qkvzba:
-                qkvzba_i = tensor_a2a_cp2hp(
-                    qkvzba_i,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=self.pg_collection.cp,
-                    split_sections=[
-                        self.qk_dim_local_tp,
-                        self.qk_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.num_value_heads // self.tp_size,
-                        self.num_value_heads // self.tp_size,
-                    ],
-                )
-                outputs.append(qkvzba_i)
-            qkvzba = torch.cat(outputs, dim=0)
-        else:
             qkvzba = tensor_a2a_cp2hp(
                 qkvzba,
                 seq_dim=0,
                 head_dim=-1,
                 cp_group=self.pg_collection.cp,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
+                undo_attention_load_balancing=False,
+            )
+            if self.cp_size > 1:
+                # Permute at the seq dim so that a single unsectioned a2a
+                # is equivalent to per-sequence a2a.
+                # This also folds the ``_undo_attention_load_balancing`` step.
+                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                    cu_seqlens_q, self.cp_size, seq_len
+                )
+                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
+        else:
+            qkvzba = tensor_a2a_cp2hp(
+                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
             )
 
         # Transpose: s b x --> b s x
@@ -495,14 +495,15 @@ class GatedDeltaNet(MegatronModule):
 
             # CP all to all: HP to CP
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                unpacked_norm_out = _unpack_sequence(norm_out_hp, cu_seqlens_q, dim=0)
-                outputs = []
-                for norm_out_i in unpacked_norm_out:
-                    norm_out_i = tensor_a2a_hp2cp(
-                        norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                    )
-                    outputs.append(norm_out_i)
-                norm_out = torch.cat(outputs, dim=0)
+                if self.cp_size > 1:
+                    norm_out_hp = norm_out_hp.index_select(0, thd_cp_a2a_inv)
+                norm_out = tensor_a2a_hp2cp(
+                    norm_out_hp,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=self.pg_collection.cp,
+                    redo_attention_load_balancing=False,
+                )
             else:
                 norm_out = tensor_a2a_hp2cp(
                     norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
@@ -591,7 +592,7 @@ class GatedDeltaNet(MegatronModule):
 
     def _resolve_cu_seqlens(
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
-    ):
+    ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
@@ -713,79 +714,62 @@ class GatedDeltaNet(MegatronModule):
         self.out_proj.backward_dw()
 
 
-def _unpack_sequence(x, cu_seqlens, dim=1):
-    unpacked_x = []
-    cu_seqlens_list = cu_seqlens.tolist()
-    num_seqs = len(cu_seqlens_list) - 1
-    for i in range(num_seqs):
-        idx_start = cu_seqlens_list[i]
-        idx_end = cu_seqlens_list[i + 1]
-        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
-        unpacked_x.append(x[tuple(chunked_index)])
-    return unpacked_x
+def _build_thd_cp_a2a_perm(
+    cu_seqlens: torch.Tensor, cp_size: int, t_global: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cu = cu_seqlens.to(dtype=torch.long)
+    t_local = t_global // cp_size
 
+    positions = torch.arange(t_global, device=cu.device)
+    seq_idx = torch.bucketize(positions, cu[1:], right=True)
+    seq_lens = torch.diff(cu)
+    halves = seq_lens // (2 * cp_size)  # per-sequence half-chunk size
+    local_starts = cu[:-1] // cp_size
+    global_starts = cu[:-1]
 
-####################
-# Sharded state dict utilities
-####################
-def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
-) -> ShardedTensorFactory:
-    """Builds a factory that splits a given ShardedTensor into several independent chunks."""
-    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
-    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
+    half_i = halves[seq_idx]
+    pos_in_seq = positions - global_starts[seq_idx]
 
-    if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
-        raise ValueError(
-            f"Split sections must cover the whole dimension size, "
-            f"got {split_sections=} vs dimensions size "
-            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
-        )
+    natural_chunk = pos_in_seq // half_i  # in [0, 2*cp)
+    offset = pos_in_seq - natural_chunk * half_i
 
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
-    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        factory_sh_ten = replace(
-            orig_sh_ten_no_data,
-            key=key,
-            data=t,
-            dtype=t.dtype,
-            replica_id=replica_id,
-            flattened_range=flattened_range,
-        )
-
-        chunk_sh_tens = []
-        split_start = 0
-        for split_size, split_name in zip(split_sections, split_names):
-            split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
-            for sh_ten in split_chunks:
-                sh_ten.key = f"{sh_ten.key}.{split_name}"
-            chunk_sh_tens.extend(split_chunks)
-            split_start += split_size
-
-        assert split_start == orig_sh_ten_no_data.local_shape[split_dim], (
-            split_start,
-            orig_sh_ten_no_data.local_shape[split_dim],
-        )
-        assert sum(sh_ten.data.numel() for sh_ten in chunk_sh_tens) == t.numel(), (
-            chunk_sh_tens,
-            t.shape,
-        )
-        return chunk_sh_tens
-
-    return ShardedTensorFactory(
-        orig_sh_ten.key,
-        orig_sh_ten.data,
-        sh_ten_build_fn,
-        cat_with_oom_fallback,
-        orig_sh_ten.replica_id,
+    # Invert the ordering produced by `_undo_attention_load_balancing`:
+    #   natural_chunk < cp:   load_balanced = 2 * natural_chunk
+    #   natural_chunk >= cp:  load_balanced = 4*cp - 2*natural_chunk - 1
+    lb_chunk = torch.where(
+        natural_chunk < cp_size, 2 * natural_chunk, 4 * cp_size - 2 * natural_chunk - 1
     )
+
+    # In the per-sequence load-balanced layout each rank owns load-balanced
+    # chunks (2r) and (2r+1), in that order, of every sequence.
+    rank = lb_chunk // 2
+    half_within_rank = lb_chunk - 2 * rank
+    k = half_within_rank * half_i + offset
+
+    idx = rank * t_local + local_starts[seq_idx] + k
+
+    inv = torch.empty_like(idx)
+    inv[idx] = positions
+
+    return idx, inv
+
+
+@lru_cache(maxsize=8)
+def _build_head_perm_for_split_sections(
+    split_sections: tuple[int, ...], cp_size: int, device: torch.device
+) -> torch.Tensor:
+    assert all(
+        s % cp_size == 0 for s in split_sections
+    ), f"split_sections {split_sections} must be divisible by cp_size {cp_size} for GDN"
+    offset = 0
+    parts = []
+    for s in split_sections:
+        parts.append(
+            torch.arange(offset, offset + s, device=device, dtype=torch.long).view(cp_size, -1)
+        )
+        offset += s
+
+    return torch.cat(parts, dim=-1).view(-1)
 
 
 ####################
@@ -795,7 +779,7 @@ def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
 
@@ -803,7 +787,7 @@ def get_parameter_local_cp(
         param (torch.Tensor): The entire parameter to get the local parameter for.
         dim (int): The dimension to split the parameter along. Usually the dimension of head.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None,
+        split_sections (Optional[list[int]]): If not None,
             first split the parameter along the dimension dim into sections,
             then get the local hidden parallel weights separately,
             finally concatenate the local hidden parallel weights along the dimension dim.
@@ -841,7 +825,7 @@ def tensor_a2a_cp2hp(
     seq_dim: int,
     head_dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
     undo_attention_load_balancing: bool = True,
 ):
     """All-to-all context parallel to hidden parallel.
@@ -852,7 +836,7 @@ def tensor_a2a_cp2hp(
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None, split the tensor along the dimension
+        split_sections (Optional[list[int]]): If not None, split the tensor along the dimension
             head_dim into sections first, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         undo_attention_load_balancing (bool): Whether to undo the attention load balancing of CP.
@@ -904,7 +888,7 @@ def tensor_a2a_hp2cp(
     seq_dim: int,
     head_dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
     redo_attention_load_balancing: bool = True,
 ):
     """All-to-all hidden parallel to context parallel.
@@ -915,7 +899,7 @@ def tensor_a2a_hp2cp(
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None, first split the tensor along the
+        split_sections (Optional[list[int]]): If not None, first split the tensor along the
             dimension head_dim into sections, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         redo_attention_load_balancing (bool): Whether to redo the attention load balancing of HP.
