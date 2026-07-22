@@ -11,21 +11,10 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+from megatron.core.ssm.ops.ssd_combined import _cutedsl_ssd_enabled
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
-
-def _cutedsl_available() -> bool:
-    """True if the CuteDSL SSD backend can run here (Blackwell + cutlass DSL)."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        from megatron.core.ssm.ops.cutedsl_mamba2_ssd import is_cutedsl_ssd_available
-
-        return torch.cuda.get_device_capability()[0] >= 10 and is_cutedsl_ssd_available()
-    except Exception:
-        return False
 
 
 @pytest.mark.internal
@@ -159,7 +148,7 @@ class TestMambaMixerErrorChecks:
 
 
 @pytest.mark.skipif(
-    not _cutedsl_available(),
+    not _cutedsl_ssd_enabled(),
     reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
 )
 class TestMambaMixerCuteDSL:
