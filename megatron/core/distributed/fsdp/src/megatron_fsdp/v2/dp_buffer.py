@@ -284,7 +284,10 @@ class DataParallelBuffer:
                 # Outer-only reduce consumes an already-scaled inner-DP result.
                 scaling_factor = self.gradient_scaling_factor
                 scale_inner = current_dim == 1 and scaling_factor not in (None, 1.0)
-                prescale = scale_inner and grad_comm_dtype == torch.bfloat16
+                prescale = scale_inner and (
+                    grad_comm_dtype == torch.bfloat16
+                    or torch.distributed.get_world_size(group) == 1
+                )
                 op = (
                     torch.distributed.ReduceOp.SUM
                     if not scale_inner or prescale
