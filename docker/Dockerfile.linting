@@ -21,3 +21,13 @@ ARG JET_API_VERSION
 RUN --mount=type=secret,id=JET_INDEX_URLS \
       JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \ 
       uv pip install --no-cache-dir "jet-client~=2.0" --upgrade $JET_INDEX_URLS
+
+# Keep this in the internal-only stage so public CI has no internal service dependency.
+ARG CI_SERVER_URL
+ARG NEMO_CI_TRIAGE_COMMIT=5474f95417758c76c75523ae5319727a1e703437
+RUN --mount=type=secret,id=NEMO_CI_TRIAGE_TOKEN \
+      GIT_CONFIG_COUNT=1 \
+      GIT_CONFIG_KEY_0=http.extraHeader \
+      GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'oauth2:%s' "$(cat /run/secrets/NEMO_CI_TRIAGE_TOKEN)" | base64 -w0)" \
+      uv pip install --no-cache-dir \
+        "nemo-ci-triage @ git+${CI_SERVER_URL}/dl/nemo/nemo-ci-triage.git@${NEMO_CI_TRIAGE_COMMIT}"

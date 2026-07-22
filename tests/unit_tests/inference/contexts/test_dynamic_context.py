@@ -300,6 +300,131 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    @pytest.mark.parametrize(
+        "transfer_bookkeeping,record_done_event,expected_event",
+        [(False, False, None), (True, False, None), (True, True, "bookkeeping")],
+    )
+    def test_initialize_attention_state_bookkeeping_transfer_event(
+        self, transfer_bookkeeping, record_done_event, expected_event
+    ):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.transfer_bookkeeping_to_gpu = mock.Mock(
+            side_effect=lambda *, record_done_event=False: (
+                "bookkeeping" if record_done_event else None
+            )
+        )
+
+        done_event = dynamic_context.initialize_attention_state(
+            transfer_bookkeeping_to_gpu=transfer_bookkeeping,
+            record_bookkeeping_done_event=record_done_event,
+        )
+
+        if transfer_bookkeeping:
+            dynamic_context.transfer_bookkeeping_to_gpu.assert_called_once_with(
+                record_done_event=record_done_event
+            )
+        else:
+            dynamic_context.transfer_bookkeeping_to_gpu.assert_not_called()
+        assert done_event == expected_event
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_transfer_bookkeeping_to_gpu_can_skip_input_token_ids(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        num_tokens = 4
+        dynamic_context.total_request_count = 2
+        dynamic_context.paused_request_count = 0
+        dynamic_context.padded_active_request_count = 2
+        dynamic_context.token_to_input_ids[:num_tokens] = torch.tensor(
+            [11, 12, 13, 14], dtype=torch.int64
+        )
+        dynamic_context.token_to_pos_ids[:num_tokens] = torch.tensor(
+            [21, 22, 23, 24], dtype=torch.int64
+        )
+        existing_gpu_tokens = torch.tensor(
+            [91, 92, 93, 94],
+            dtype=torch.int64,
+            device=dynamic_context.gpu_view.token_to_input_ids.device,
+        )
+        dynamic_context.gpu_view.token_to_input_ids[:num_tokens] = existing_gpu_tokens
+
+        done_event = dynamic_context.transfer_bookkeeping_to_gpu(
+            skip_token_input_ids=True, record_done_event=True
+        )
+        done_event.synchronize()
+
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:num_tokens], existing_gpu_tokens
+        )
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_pos_ids[:num_tokens].cpu(),
+            torch.tensor([21, 22, 23, 24], dtype=torch.int64),
+        )
+
+        dynamic_context.token_to_input_ids[:num_tokens] = torch.tensor(
+            [31, 32, 33, 34], dtype=torch.int64
+        )
+        dynamic_context.transfer_bookkeeping_to_gpu()
+
+        assert torch.equal(
+            dynamic_context.gpu_view.token_to_input_ids[:num_tokens].cpu(),
+            torch.tensor([31, 32, 33, 34], dtype=torch.int64),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    def test_copy_async_sched_sample_to_forward_populates_active_and_clears_padding(self):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=32,
+            buffer_size_gb=0.01,
+            block_size_tokens=4,
+            max_tokens=32,
+            max_requests=8,
+        )
+
+        ctx.total_request_count = 3
+        ctx.paused_request_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.active_token_count = 3
+        ctx.padded_active_token_count = 8
+        device = ctx.gpu_view.token_to_input_ids.device
+        ctx.gpu_view.token_to_input_ids[:8] = torch.full(
+            (8,), 777, dtype=torch.int64, device=device
+        )
+        sampled_tokens_cuda = torch.tensor([90, 91, 92], dtype=torch.int64, device=device)
+
+        ctx.copy_async_sched_sample_to_forward(sampled_tokens_cuda)
+
+        assert torch.equal(ctx.gpu_view.token_to_input_ids[:3], sampled_tokens_cuda)
+        assert torch.equal(
+            ctx.gpu_view.token_to_input_ids[3:8].cpu(), torch.zeros(5, dtype=torch.int64)
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
 
@@ -318,6 +443,8 @@ class TestDynamicContext:
         # Initialize all variables
         dynamic_context.total_request_count = 10
         dynamic_context.active_token_count = 10
+        dynamic_context.async_sched_step_count = 6
+        dynamic_context.async_sched_compaction_step_count = 7
         dynamic_context.paused_request_count = 5
         dynamic_context.padded_active_token_count = 10
         dynamic_context.padded_active_request_count = 5
@@ -346,6 +473,8 @@ class TestDynamicContext:
         # Assert all variables are reset to zero or their default values
         assert dynamic_context.total_request_count == 0
         assert dynamic_context.active_token_count == 0
+        assert dynamic_context.async_sched_step_count == 0
+        assert dynamic_context.async_sched_compaction_step_count == 0
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.padded_active_token_count == 0
         assert dynamic_context.padded_active_request_count == 0
@@ -849,6 +978,223 @@ class TestDynamicContext:
                     ]
                 )
             )
+
+    def _get_async_sched_context(self):
+        return self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=32,
+            buffer_size_gb=0.01,
+            block_size_tokens=4,
+            max_tokens=32,
+            max_requests=8,
+        )
+
+    @staticmethod
+    def _setup_async_sched_decode_rows(
+        ctx, active_request_count=3, request_ids=None, kv_offsets=None, last_block_offsets=None
+    ):
+        request_ids = request_ids or list(range(10, 10 + active_request_count))
+        kv_offsets = kv_offsets or list(range(3, 3 + active_request_count))
+        last_block_offsets = last_block_offsets or [1] * active_request_count
+
+        ctx.total_request_count = active_request_count
+        ctx.paused_request_count = 0
+        ctx.num_prefill_requests = 0
+        ctx.active_token_count = active_request_count
+        if active_request_count == 0:
+            return
+
+        active_slice = slice(0, active_request_count)
+        ctx.request_ids[active_slice] = torch.tensor(request_ids, dtype=torch.int32)
+        ctx.request_query_lengths[active_slice] = 1
+        ctx.request_output_lengths[active_slice] = 16
+        ctx.request_kv_length_offsets[active_slice] = torch.tensor(kv_offsets, dtype=torch.int32)
+        ctx.request_last_kv_block_offset[active_slice] = torch.tensor(
+            last_block_offsets, dtype=torch.int32
+        )
+
+        block_ids = ctx.kv_block_allocator.allocate_memory_blocks(active_request_count)
+        ctx.request_to_kv_block_ids[active_slice, 0] = block_ids
+        ctx.request_last_kv_block_id[active_slice] = block_ids
+        ctx.request_kv_block_counts[active_slice] = 1
+        ctx.token_to_input_ids[active_slice] = torch.arange(
+            90, 90 + active_request_count, dtype=torch.long
+        )
+        ctx.token_to_pos_ids[active_slice] = ctx.request_kv_length_offsets[active_slice]
+        ctx.token_to_request_idx[active_slice] = torch.arange(
+            active_request_count, dtype=torch.int32
+        )
+        ctx.token_to_position_in_request[active_slice] = ctx.token_to_pos_ids[active_slice]
+        ctx.token_to_block_idx[active_slice] = ctx.request_last_kv_block_id[active_slice]
+        ctx.token_to_local_position_within_kv_block[active_slice] = (
+            ctx.token_to_pos_ids[active_slice] % ctx.block_size_tokens
+        )
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    @pytest.mark.parametrize(
+        "active_request_count, kv_offsets, last_offsets, expected_kv_offsets, expected_last_offsets",
+        [
+            (0, [], [], [], []),
+            (2, [3, 5], [1, 2], [4, 6], [2, 3]),
+            (2, [3, 5], [3, 1], [4, 6], [0, 2]),
+        ],
+    )
+    def test_async_sched_prepare_requests_success(
+        self,
+        active_request_count,
+        kv_offsets,
+        last_offsets,
+        expected_kv_offsets,
+        expected_last_offsets,
+    ):
+        """Async scheduling prepare advances active decode rows without lifecycle changes."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(
+            ctx,
+            active_request_count=active_request_count,
+            kv_offsets=kv_offsets,
+            last_block_offsets=last_offsets,
+        )
+        original_tokens = ctx.token_to_input_ids[:active_request_count].clone()
+
+        ctx.prepare_requests()
+
+        assert ctx.active_token_count == active_request_count
+        assert torch.equal(
+            ctx.request_kv_length_offsets[:active_request_count],
+            torch.tensor(expected_kv_offsets, dtype=torch.int32),
+        )
+        assert torch.equal(
+            ctx.request_last_kv_block_offset[:active_request_count],
+            torch.tensor(expected_last_offsets, dtype=torch.int32),
+        )
+        assert torch.equal(ctx.token_to_input_ids[:active_request_count], original_tokens)
+        assert torch.equal(
+            ctx.token_to_pos_ids[:active_request_count],
+            torch.tensor(expected_kv_offsets, dtype=torch.long),
+        )
+        if last_offsets and last_offsets[0] == ctx.block_size_tokens - 1:
+            assert ctx.request_kv_block_counts[0] == 2
+            assert ctx.token_to_block_idx[0] == ctx.request_last_kv_block_id[0]
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    def test_async_sched_commit_sampled_tokens(self):
+        """Async scheduling commits sampled CPU tokens after prepare."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(ctx, active_request_count=2, kv_offsets=[3, 5])
+        original_tokens = ctx.token_to_input_ids[:2].clone()
+
+        ctx.prepare_requests()
+
+        assert torch.equal(ctx.token_to_input_ids[:2], original_tokens)
+        assert torch.equal(
+            ctx.request_kv_length_offsets[:2], torch.tensor([4, 6], dtype=torch.int32)
+        )
+
+        sampled_tokens_cpu = torch.tensor([90, 91], dtype=torch.int64)
+        if torch.cuda.is_available():
+            with pytest.raises(AssertionError, match="must be on the CPU"):
+                ctx.commit_sampled_tokens(sampled_tokens_cpu.cuda())
+        ctx.commit_sampled_tokens(sampled_tokens_cpu)
+
+        assert torch.equal(ctx.token_to_input_ids[:2], sampled_tokens_cpu)
+
+        with pytest.raises(RuntimeError, match="Expected 2 new tokens"):
+            ctx.commit_sampled_tokens(torch.tensor([90], dtype=torch.int64))
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    @pytest.mark.parametrize(
+        "setup, expected_message",
+        [
+            (lambda ctx: setattr(ctx, "num_speculative_tokens", 1), "speculative"),
+            (lambda ctx: setattr(ctx, "num_prefill_requests", 1), "decode-only"),
+            (lambda ctx: setattr(ctx, "paused_request_count", 1), "paused"),
+            (lambda ctx: None, "pause requests"),
+            (lambda ctx: None, "evict requests"),
+        ],
+    )
+    def test_async_sched_prepare_requests_errors(self, setup, expected_message):
+        """Async scheduling prepare raises instead of performing lifecycle operations."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(
+            ctx, active_request_count=2, kv_offsets=[3, 5], last_block_offsets=[3, 1]
+        )
+        if "pause requests" in expected_message:
+            ctx.kv_block_allocator.get_active_avail = mock.Mock(return_value=0)
+        elif "evict requests" in expected_message:
+            ctx.kv_block_allocator.get_active_avail = mock.Mock(return_value=1)
+            ctx.kv_block_allocator.allocate_memory_blocks = mock.Mock(return_value=None)
+        else:
+            setup(ctx)
+
+        with pytest.raises(RuntimeError, match=expected_message):
+            ctx.prepare_requests()
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    @pytest.mark.parametrize(
+        "mask, expected_finished_ids, expected_request_ids",
+        [([1, 1, 1], [], [10, 11, 12]), ([1, 0, 1], [11], [10, 12]), ([0, 0, 0], [10, 11, 12], [])],
+    )
+    def test_async_sched_resolve_requests_success(
+        self, mask, expected_finished_ids, expected_request_ids
+    ):
+        """Async scheduling resolve compacts survivors and releases finished rows."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(
+            ctx,
+            active_request_count=len(mask),
+            request_ids=[10, 11, 12],
+            kv_offsets=[4, 5, 6],
+            last_block_offsets=[0, 1, 2],
+        )
+        active_mask = torch.tensor(mask, dtype=torch.int32)
+        if torch.cuda.is_available():
+            active_mask = active_mask.cuda()
+
+        finished_request_ids = ctx.resolve_requests(active_mask)
+
+        assert torch.equal(
+            finished_request_ids, torch.tensor(expected_finished_ids, dtype=torch.int32)
+        )
+        assert ctx.total_request_count == len(expected_request_ids)
+        assert ctx.active_token_count == len(expected_request_ids)
+        assert torch.equal(
+            ctx.request_ids[: len(expected_request_ids)],
+            torch.tensor(expected_request_ids, dtype=torch.int32),
+        )
+        assert torch.equal(
+            ctx.token_to_request_idx[: len(expected_request_ids)],
+            torch.arange(len(expected_request_ids), dtype=torch.int32),
+        )
+        if not expected_request_ids:
+            assert torch.all(ctx.request_to_kv_block_ids == -1)
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    @pytest.mark.parametrize(
+        "setup, mask, expected_message",
+        [
+            (lambda ctx: setattr(ctx, "num_speculative_tokens", 1), [1, 1], "speculative"),
+            (lambda ctx: setattr(ctx, "num_prefill_requests", 1), [1, 1], "decode-only"),
+            (lambda ctx: setattr(ctx, "paused_request_count", 1), [1, 1], "paused"),
+            (lambda ctx: None, [1], "Expected active mask"),
+        ],
+    )
+    def test_async_sched_resolve_requests_errors(self, setup, mask, expected_message):
+        """Async scheduling resolve raises for unsupported lifecycle state."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(ctx, active_request_count=2)
+        setup(ctx)
+
+        with pytest.raises(RuntimeError, match=expected_message):
+            ctx.resolve_requests(torch.tensor(mask, dtype=torch.int32))
 
     @pytest.mark.internal
     @rounder_override(64)

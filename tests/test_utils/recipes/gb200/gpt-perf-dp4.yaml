@@ -45,3 +45,4 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_gb200]
+        allow_failure: [true] # TODO: remove after https://github.com/NVIDIA/Megatron-LM/issues/5692

@@ -100,8 +100,8 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     FIRST_PREFIX_BLOCK = "first_prefix_block"
     """Route to the rank that has the first block hash cached. O(ranks) check."""
 
-    ROUND_ROBIN = "round_robin"
-    """Route requests to ranks in round-robin order, ignoring prefix affinity."""
+    LOAD_BALANCED = "load_balanced"
+    """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
 class KVCacheManagementMode(str, Enum):
@@ -131,6 +131,19 @@ class CudaGraphSizingDistribution(str, Enum):
 
     EXPONENTIAL = "exponential"
     LINEAR = "linear"
+
+
+class AsyncScheduleMode(str, Enum):
+    """Async scheduling mode for dynamic inference."""
+
+    LEGACY = "legacy"
+    """Resolve requests before preparing the next forward pass."""
+
+    SERIAL = "serial"
+    """Prepare and forward speculatively before resolving the sampled requests."""
+
+    OVERLAP = "overlap"
+    """Overlap async scheduling prepare/sample and forward/resolve phases."""
 
 
 @dataclass
@@ -207,7 +220,7 @@ class InferenceConfig:
     Maximum number of cuda graphs to capture.
     Graph token counts are spaced from 1 up to a per-graph-type budget:
       - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
-      - Prefill/mixed graphs share that same bound by default,
+      - Prefill/mixed graphs are bounded by `cuda_graph_max_tokens` by default,
         or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
     Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
@@ -235,9 +248,17 @@ class InferenceConfig:
     cuda_graph_all_prefills: bool = False
     """
     Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
-    When False (default), prefill/mixed graphs are bounded by the same token limit as decode graphs:
-    `max_requests * (num_speculative_tokens + 1)`.
+    When False (default), prefill/mixed graphs are bounded by `cuda_graph_max_tokens`.
     When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
+    """
+
+    cuda_graph_max_tokens: int = 512
+    """
+    Token ceiling for the largest captured prefill/mixed CUDA graph.
+    This is a raw token count (not scaled by speculative decoding). The effective ceiling is
+    clamped to `[max_requests * (num_speculative_tokens + 1), max_tokens]` so it never falls
+    below the decode bound nor exceeds the token budget. Ignored when `cuda_graph_all_prefills`
+    is set, which extends capture to the full `max_tokens`.
     """
 
     static_kv_memory_pointers: bool = False
@@ -290,7 +311,7 @@ class InferenceConfig:
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
@@ -344,6 +365,9 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    """Mode used to schedule dynamic batching inference work."""
+
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
     """Whether returned log-probs are modified by the sampling parameters or not."""
 
@@ -384,6 +408,7 @@ class InferenceConfig:
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
+        self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
