@@ -104,14 +104,21 @@ def test_idempotent():
 # ---------------------------------------------------------------------------
 # _forward_backward_grad_context
 #
-# Why this matters for PP>1: on a non-first pipeline stage the input activation
-# is received via ``create_tensor_recv_prev()``
+# The helper returns a ``(grad_context, forward_only)`` tuple that a frozen train
+# step uses to mirror the eval forward pass:
+#   * grad_context is ``torch.no_grad()`` when frozen, else a no-op context;
+#   * forward_only is True when frozen, so the schedule skips the backward and
+#     finalize-grads collectives entirely.
+#
+# Why the grad_context matters for PP>1: on a non-first pipeline stage the input
+# activation is received via ``create_tensor_recv_prev()``
 # (``megatron/core/pipeline_parallel/p2p_communication.py``), which allocates it
 # with ``requires_grad=True`` so gradients can flow back to the prior stage.
 # That means a fully *frozen* model still builds an autograd graph during forward
 # -- purely because its input requires grad -- retaining activations for a
-# backward that is never useful. Wrapping the step in ``torch.no_grad()`` is what
-# suppresses that graph on frozen (e.g. teacher logits dump) runs.
+# backward that is never useful. ``forward_only`` alone does not prevent that
+# graph (it only skips the backward call); ``torch.no_grad()`` is what suppresses
+# it on frozen (e.g. teacher logits dump) runs.
 # ---------------------------------------------------------------------------
 
 
@@ -126,22 +133,32 @@ def _forward_through_frozen_stage(chunk, recv_prev):
     return chunk.output_layer(chunk.embedding(recv_prev))
 
 
-def test_grad_context_frozen_returns_no_grad():
-    """With --freeze-all-layers the train step runs under torch.no_grad()."""
+def test_frozen_returns_no_grad_and_forward_only():
+    """With --freeze-all-layers: no_grad context and forward_only=True."""
     args = SimpleNamespace(freeze_all_layers=True)
 
-    ctx = _forward_backward_grad_context(args)
+    grad_context, forward_only = _forward_backward_grad_context(args)
 
-    assert isinstance(ctx, torch.no_grad)
+    assert isinstance(grad_context, torch.no_grad)
+    assert forward_only is True
 
 
-def test_grad_context_unfrozen_returns_nullcontext():
-    """Without --freeze-all-layers the context is a no-op."""
+def test_unfrozen_returns_nullcontext_and_not_forward_only():
+    """Without --freeze-all-layers: no-op context and forward_only=False."""
     args = SimpleNamespace(freeze_all_layers=False)
 
-    ctx = _forward_backward_grad_context(args)
+    grad_context, forward_only = _forward_backward_grad_context(args)
 
-    assert isinstance(ctx, nullcontext)
+    assert isinstance(grad_context, nullcontext)
+    assert forward_only is False
+
+
+def test_missing_flag_defaults_to_not_frozen():
+    """A minimal args mock (no freeze_all_layers attr) is treated as unfrozen."""
+    grad_context, forward_only = _forward_backward_grad_context(SimpleNamespace())
+
+    assert isinstance(grad_context, nullcontext)
+    assert forward_only is False
 
 
 def test_pp_gt1_frozen_forward_without_context_still_builds_graph():
@@ -165,7 +182,8 @@ def test_pp_gt1_frozen_forward_under_context_skips_graph():
     _freeze_all_model_chunks([chunk])
     args = SimpleNamespace(freeze_all_layers=True)
 
-    with _forward_backward_grad_context(args):
+    grad_context, _ = _forward_backward_grad_context(args)
+    with grad_context:
         assert not torch.is_grad_enabled()
         out = _forward_through_frozen_stage(chunk, _recv_prev_activation())
 
@@ -179,7 +197,8 @@ def test_unfrozen_forward_builds_graph_normally():
     chunk = _FakeModelChunk()  # params trainable
     args = SimpleNamespace(freeze_all_layers=False)
 
-    with _forward_backward_grad_context(args):
+    grad_context, _ = _forward_backward_grad_context(args)
+    with grad_context:
         assert torch.is_grad_enabled()
         out = _forward_through_frozen_stage(chunk, _recv_prev_activation())
 

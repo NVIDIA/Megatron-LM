@@ -1702,12 +1702,15 @@ def _freeze_all_model_chunks(model_list):
 def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
-    Returns ``torch.no_grad()`` when all layers are frozen (e.g. teacher logits
-    dumps): no parameter needs gradients, so there is no reason to build the
-    autograd graph, and the schedule already skips the backward when the output
-    does not require grad. Otherwise returns a no-op context.
+    Returns a tuple of (grad_context, forward_only).
+    grad_context is ``torch.no_grad()`` when all layers are frozen (e.g. teacher logits
+    dumps), no parameter needs gradients, so there is no reason to build the
+    autograd graph. Otherwise returns a no-op context.
+    forward_only is True when all layers are frozen, False otherwise.
     """
-    return torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
+    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
+    forward_only = getattr(args, "freeze_all_layers", False)
+    return grad_context, forward_only
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
@@ -2382,7 +2385,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        with _forward_backward_grad_context(args):
+        grad_context, forward_only = _forward_backward_grad_context(args)
+        with grad_context:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -2391,7 +2395,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
-                forward_only=False,
+                forward_only=forward_only,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                 force_all_reduce=save_wgrads_in_this_iteration,
                 p2p_communicator=p2p_communicator,
