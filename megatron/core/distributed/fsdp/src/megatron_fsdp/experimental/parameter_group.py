@@ -253,6 +253,22 @@ class FsdpParameterGroup:
         for index, sharded_parameter in enumerate(self.sharded_parameters):
             sharded_parameter.grad = self.main_grad.get_dtensor(index)
 
+    def _new_accumulation_grad(self) -> DBuffer:
+        """Allocate a fresh main_grad at the DP-outer-Partial accumulation placement.
+
+        HFSDP's finalize reduce-scatters main_grad to a smaller optimizer-sharded
+        buffer that cannot be relabeled back to the larger accumulation layout, so
+        the next step allocates a new buffer here.
+        """
+        assert self.main_grad is not None
+        return DBuffer(
+            mesh=self.mesh,
+            placements=self._accumulation_placements,
+            tensor_shapes=self.main_weight.layout.tensor_shapes,
+            dtype=self.main_grad.dtype,
+            device=self.main_weight.device,
+        )
+
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
@@ -286,12 +302,13 @@ class FsdpParameterGroup:
     ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
-        For HSDP main_grad rests DP-outer-Partial (Partial where main_weight is
-        Replicate) between microbatches, accumulating each backward through the
-        standard zero_grad contract; the last microbatch reduces the DP-outer axes,
-        finalizing main_grad to main_weight's placements so ``.grad`` is the fully
-        reduced gradient before ``optimizer.step()``. With every axis Flat (plain
-        DP) main_grad already rests finalized.
+        For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,
+        accumulating each backward through the standard zero_grad contract; the
+        last microbatch reduces the DP-outer axes, finalizing main_grad to
+        main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
+        to Flat for HFSDP) so ``.grad`` is the fully reduced gradient before
+        ``optimizer.step()``. With every axis Flat (plain DP) main_grad already
+        rests finalized.
         """
         assert self.main_grad is not None
 
@@ -313,11 +330,26 @@ class FsdpParameterGroup:
         has_sharded_grads = has_grad(self.sharded_parameters)
 
         # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Redistribute it back to the
-        # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
-        # and a fresh reduce-scattered buffer for HFSDP in the future.
+        # only happens on the first microbatch. Restore it to the DP-outer-Partial
+        # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
+        # on DP-outer), so relabel it in place; HFSDP's finalize reduce-scattered
+        # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
+        # (zeroed when we accumulate into it, i.e. sharded grads are still set).
         if self.main_grad.placements != self._accumulation_placements:
-            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+            reset_axis = changed_mesh_axis(
+                self.main_grad.placements, self._accumulation_placements
+            )
+            assert reset_axis is not None  # the placements differ, so an axis changed
+            if isinstance(self.main_grad.placements[reset_axis], Replicate):
+                self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+            else:
+                # Zero the fresh buffer only when we accumulate into it
+                # (set_to_none=False). With set_to_none=True the reduction below
+                # overwrites it (reduced into via out=, or copied), so leaving it
+                # uninitialized is safe.
+                self.main_grad = self._new_accumulation_grad()
+                if has_sharded_grads:
+                    self.main_grad.local_buffer.zero_()
             if has_sharded_grads:
                 self._install_sharded_grads()
 
