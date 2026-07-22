@@ -1297,7 +1297,7 @@ class TestMTPBlockScopeCudaGraph:
             if inference_cuda_graph_scope != 'block':
                 context.mtp_decoder_hidden_states = None
 
-            input_ids, position_ids = ctrl._dynamic_step_context_init()
+            input_ids, position_ids, _ = ctrl._dynamic_step_context_init()
             ctrl._dynamic_step_forward_logits(input_ids, position_ids)
 
             assert context.mtp_decoder_hidden_states is not None, (
@@ -1461,7 +1461,7 @@ class TestMTPBlockScopeCudaGraph:
         # run loop.
         with InferenceMode.active():
             for step in range(3):
-                input_ids, position_ids = ctrl._dynamic_step_context_init()
+                input_ids, position_ids, _ = ctrl._dynamic_step_context_init()
                 ctrl._dynamic_step_forward_logits(input_ids, position_ids)
 
                 assert context.mtp_decoder_hidden_states is None, (

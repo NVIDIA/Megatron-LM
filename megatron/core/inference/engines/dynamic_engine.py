@@ -352,6 +352,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prefix caching tracking.
         self._prefix_cache_hits = 0
         self._prefix_cache_blocks_matched = 0
+        self._prefill_tokens_computed = 0
+        self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
         # Coordinator state.
@@ -439,7 +441,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
-            input_ids, position_ids = self.controller._dynamic_step_context_init(
+            input_ids, position_ids, _ = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
             )
             # Progress.
@@ -991,11 +993,11 @@ class DynamicInferenceEngine(AbstractEngine):
         return self.requests[request_id].record[-1]
 
     def _validate_async_sched_support_for_config(self) -> None:
-        """Validate config-level restrictions for serial async scheduling.
+        """Validate config-level restrictions for async scheduling.
 
-        Raises if the config does not support serial async scheduling.
+        Raises if the config does not support async scheduling.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         model_config = self.controller.inference_wrapped_model.model.config
@@ -1015,12 +1017,12 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support routing replay.")
 
     def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
-        """Validate request-level restrictions for serial async scheduling.
+        """Validate request-level restrictions for async scheduling.
 
         Args:
             request (DynamicInferenceRequest): Request being added to the engine.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         sampling_params = request.sampling_params
@@ -1818,28 +1820,64 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available and token_partially_can_be_added:
                 # How many tokens we can admit this step.
                 token_budget = self.context.max_tokens - self.context.active_token_count
-                max_chunk = min(remaining_len, token_budget)
+
+                # Prefix-cache skip: on a request's first chunk, the tokens covered
+                # by a cached prefix are reused rather than recomputed, so they do
+                # NOT consume the compute budget. Extend this chunk's SPAN to cover
+                # the entire skippable prefix plus up to `token_budget` newly computed
+                # tokens. Without this the span is capped at the budget, forcing the
+                # rest of a long cached prefix to be re-prefilled over many chunks
+                # (latency then scales with prompt length instead of the delta).
+                # add_request() only computes `effective = span - skip` tokens.
+                prefix_skip = 0
+                if prefix_caching_enabled and not is_continuing_chunked_prefill:
+                    (_, _, _, _, prefix_skip, _) = self.context._compute_prefix_match(
+                        req, remaining_len
+                    )
+                    prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
+
+                computed_budget = min(remaining_len - prefix_skip, token_budget)
 
                 # Skip CG gating for the continuation of an in-flight chunked prefill:
                 # the request is already mid-flight, deferring it would deadlock progress.
                 if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
-                    # Snap chunk size to the largest captured-CG boundary within budget.
-                    # Fall back to eager (max_chunk) if no CG shape covers the budget.
-                    snapped_chunk = self._find_cg_chunk_size(max_chunk)
-                    prefill_chunk_length = snapped_chunk if snapped_chunk is not None else max_chunk
+                    # Snap the COMPUTED chunk size to the largest captured-CG boundary
+                    # within budget (skipped tokens don't affect the CG batch shape).
+                    # Fall back to eager (computed_budget) if no CG shape covers it.
+                    snapped_chunk = self._find_cg_chunk_size(computed_budget)
+                    computed_chunk = snapped_chunk if snapped_chunk is not None else computed_budget
                     req.cg_wait_iters = 0
                 else:
-                    prefill_chunk_length = max_chunk
+                    computed_chunk = computed_budget
+
+                prefill_chunk_length = prefix_skip + computed_chunk
 
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
-                # final chunk, reduce by 1 (or defer if we only have 1 token of budget).
+                # final chunk, reduce by 1 (or defer if we only have 1 computed token).
                 # See https://github.com/Dao-AILab/flash-attention/issues/1537
                 # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
                 # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
                 if remaining_len - prefill_chunk_length == 1:
-                    if prefill_chunk_length > 1:
+                    if computed_chunk > 1:
                         prefill_chunk_length -= 1
                     else:
+                        can_schedule = False
+                        break
+
+                # add_request recomputes the skip for this exact chunk and applies a
+                # ">= 2 computed tokens" clamp. When the chunk would compute fewer than
+                # 2 tokens (tight budget late in a batched step, or a prompt that is
+                # all-but-one cached) that clamp shrinks the skip and grows the computed
+                # count by up to one block, which can exceed the token budget
+                # (TokenOverflowError). Only then re-derive the exact effective length
+                # add_request will use and defer on overflow (a later full-budget step
+                # admits the request). For >= 2 computed tokens add_request computes
+                # exactly this chunk, which already fits the budget.
+                if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
+                    (_, _, _, _, _, actual_effective) = self.context._compute_prefix_match(
+                        req, prefill_chunk_length
+                    )
+                    if self.context.active_token_count + actual_effective > self.context.max_tokens:
                         can_schedule = False
                         break
 
@@ -2078,8 +2116,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
             self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
+            self._prefill_tokens_computed += self.context.prefix_cache_prefill_computed_tokens
+            self._prefill_tokens_skipped += self.context.prefix_cache_prefill_skipped_tokens
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
+            self.context.prefix_cache_prefill_computed_tokens = 0
+            self.context.prefix_cache_prefill_skipped_tokens = 0
 
         # Log KV cache utilization stats to W&B
         nvtx_range_push("wandb_logging")
@@ -2207,6 +2249,36 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+            if self.context.enable_prefix_caching:
+                # Prefill compute actually saved by prefix caching (cumulative).
+                # computed = prompt tokens run through the model; skipped = prompt
+                # tokens whose prefill was reused from cache. If skipped% stays high
+                # while per-step latency grows, the growth is attention over the
+                # growing KV context, NOT re-prefilling skipped tokens.
+                _computed = self._prefill_tokens_computed
+                _skipped = self._prefill_tokens_skipped
+                _total = _computed + _skipped
+                output_str += " ... prefill (cumul): computed %d, skipped %d (%.1f%% skipped)" % (
+                    _computed,
+                    _skipped,
+                    (100.0 * _skipped / _total) if _total > 0 else 0.0,
+                )
+                # Current cache occupancy (utilization). A Mamba durable-slot count
+                # near its max indicates the cache is saturating and will start
+                # LRU-evicting cached prefixes (hybrid models can only skip prefill
+                # where Mamba state is still cached).
+                kv_alloc = self.context.kv_block_allocator
+                output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
+                    len(kv_alloc.kv_hash_to_block_id),
+                    kv_alloc.total_count,
+                    int(kv_alloc.get_evictable_block_count()),
+                )
+                msa = self.context.mamba_slot_allocator
+                if msa is not None:
+                    output_str += ", mamba %d/%d durable slots" % (
+                        msa.max_slots - msa.free_count,
+                        msa.max_slots,
+                    )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
@@ -2364,6 +2436,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_pop("add_request")
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
+            elif header == Headers.START_CUDA_PROFILER:
+                # Side-effect, not a state transition: apply immediately on every
+                # rank so an outer nsys --capture-range=cudaProfilerApi starts here.
+                torch.cuda.cudart().cudaProfilerStart()
+            elif header == Headers.STOP_CUDA_PROFILER:
+                torch.cuda.cudart().cudaProfilerStop()
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
