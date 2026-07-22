@@ -20,6 +20,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -50,7 +51,6 @@ jobs:
           DISABLE_PROMPT_CACHING: "1"
         with:
           anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
-          github_token: ${{ github.token }}
           trigger_phrase: "/claude review"
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read"
@@ -117,6 +117,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+      id-token: write
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -152,7 +153,6 @@ jobs:
           DISABLE_PROMPT_CACHING: "1"
         with:
           anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
-          github_token: ${{ github.token }}
           trigger_phrase: "/claude strict-review"
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read"
