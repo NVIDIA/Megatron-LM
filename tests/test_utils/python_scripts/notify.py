@@ -29,7 +29,7 @@ TEAM_SLUG = os.getenv("TEAM_SLUG", "")
 JOB_PREFIXES = {
     "unit-tests": "test:unit_tests",
     "integration-tests": "integration:run_",
-    "functional-tests": "functional:run_",
+    "functional-tests": ("functional:run_", "functional:smoke-"),
     "smoke-tests": "functional:smoke-",
 }
 
@@ -55,7 +55,7 @@ def _bridge_gpu(bridge_name: str) -> str:
 
 
 def get_pipeline_jobs(
-    pipeline_id: int, job_prefix: str, project: Any | None = None
+    pipeline_id: int, job_prefix: str | tuple[str, ...], project: Any | None = None
 ) -> list[tuple[str, int, list[dict]]]:
     """Collect Megatron-LM's direct child pipelines using nemo-ci-triage-2."""
     project = project or get_project()
