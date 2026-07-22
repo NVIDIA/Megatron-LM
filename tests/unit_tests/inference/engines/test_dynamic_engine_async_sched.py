@@ -16,7 +16,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 
 
-def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
+def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     context = SimpleNamespace(
         config=SimpleNamespace(async_sched_mode=async_sched_mode),
@@ -53,7 +53,6 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
     [
         ({"async_sched_mode": AsyncScheduleMode.LEGACY, "num_speculative_tokens": 1}, False),
         ({}, False),
-        ({"async_sched_mode": AsyncScheduleMode.OVERLAP}, False),
         ({"enable_chunked_prefill": True}, True),
         ({"num_speculative_tokens": 1}, True),
         ({"num_speculative_tokens": 1, "controller_num_mtp_depths": 1}, False),
@@ -80,14 +79,12 @@ def test_validate_async_sched_support_for_config(overrides, should_raise):
     "async_sched_mode, sampling_params, should_raise",
     [
         (AsyncScheduleMode.LEGACY, SamplingParams(top_k=0, top_p=0.5), False),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0), False),
-        (AsyncScheduleMode.OVERLAP, SamplingParams(top_k=1, top_p=0.0), False),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=0, top_p=0.0), True),
-        (AsyncScheduleMode.OVERLAP, SamplingParams(top_k=0, top_p=0.0), True),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.5), True),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0, return_log_probs=True), True),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0, top_n_logprobs=1), True),
-        (AsyncScheduleMode.SERIAL, SamplingParams(top_k=1, top_p=0.0, stop_words=["END"]), True),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0), False),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=0, top_p=0.0), True),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.5), True),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, return_log_probs=True), True),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, top_n_logprobs=1), True),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, stop_words=["END"]), True),
     ],
 )
 def test_validate_async_sched_support_for_request(async_sched_mode, sampling_params, should_raise):
@@ -162,8 +159,8 @@ def test_async_sched_prefill_probe_uses_non_mutating_cuda_graph_match():
     "mode, run_async_prefill, primer_only, expected_schedule_calls",
     [
         (AsyncScheduleMode.LEGACY, False, False, 1),
-        (AsyncScheduleMode.SERIAL, False, False, 0),
-        (AsyncScheduleMode.OVERLAP, True, True, 0),
+        (AsyncScheduleMode.ASYNC, False, False, 0),
+        (AsyncScheduleMode.ASYNC, True, True, 0),
     ],
 )
 def test_async_forward_routes_one_controller_iteration(

@@ -1104,7 +1104,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 min_prompt_length=4,
                 max_prompt_length=4,
                 num_tokens_to_generate=16,
-                async_sched_mode=AsyncScheduleMode.OVERLAP,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
             )
             env = self._build_test_env(test_config)
             long_request, short_request = env.requests

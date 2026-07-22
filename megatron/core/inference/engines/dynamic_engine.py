@@ -998,8 +998,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Raises if the config does not support async scheduling.
         """
-        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
+        mode = self.context.config.async_sched_mode
+        if mode == AsyncScheduleMode.LEGACY:
             return
+        if mode != AsyncScheduleMode.ASYNC:
+            raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
         model_config = self.controller.inference_wrapped_model.model.config
         if self.enable_chunked_prefill:
@@ -1021,8 +1024,11 @@ class DynamicInferenceEngine(AbstractEngine):
         Args:
             request (DynamicInferenceRequest): Request being added to the engine.
         """
-        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
+        mode = self.context.config.async_sched_mode
+        if mode == AsyncScheduleMode.LEGACY:
             return
+        if mode != AsyncScheduleMode.ASYNC:
+            raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
         sampling_params = request.sampling_params
         if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
@@ -1975,8 +1981,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if mode == AsyncScheduleMode.LEGACY:
             self.schedule_waiting_requests()
             run_async_prefill = False
-        else:
+        elif mode == AsyncScheduleMode.ASYNC:
             run_async_prefill = self._has_async_sched_prefill_work()
+        else:
+            raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
