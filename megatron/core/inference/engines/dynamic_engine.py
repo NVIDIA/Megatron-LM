@@ -1093,8 +1093,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         sequence_budget = min(
             self.context.max_sequence_length,
-            usable_blocks * self.context.block_size_tokens
-            - self.context.num_speculative_tokens,
+            usable_blocks * self.context.block_size_tokens - self.context.num_speculative_tokens,
         )
         remaining_tokens = max(sequence_budget - prompt_length, 0)
         if request.sampling_params.num_tokens_to_generate is None:
