@@ -3005,12 +3005,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
-        # A HybridDeviceOptimizer holds the main params internally, and additionally keeps
-        # detached CPU clones and FP32 working copies of them that its sub-optimizers step
-        # against. Nothing else refreshes those copies, so re-seed all of them from the
-        # current params; otherwise they retain their stale (often random-initialized)
-        # values and get copied back over the freshly loaded weights on the next step().
         if isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Under precision-aware -- which optimizer_cpu_offload implies in practice --
+            # the shard main params are None, so there is nothing for copy_group_params()
+            # below to refresh; only the optimizer's own detached copies are stale.
             self.optimizer.reload_model_params()
             return
 

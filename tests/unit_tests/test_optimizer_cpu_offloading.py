@@ -175,15 +175,12 @@ def test_multi_device_hybrid_optimizer(
 )
 @pytest.mark.parametrize('offload_fraction', [0.5, 1.0])
 @pytest.mark.parametrize('param_update_in_fp32', [True, False])
-def test_reload_model_params_reseeds_internal_copies(offload_fraction, param_update_in_fp32):
-    """``reload_model_params`` must re-seed the optimizer's internal copies.
+def test_reload_model_params_preserves_loaded_weights(offload_fraction, param_update_in_fp32):
+    """A step after a fine-tune load must not revert to the pre-load weights.
 
-    Regression test for the bug where loading a checkpoint without the
-    optimizer state (fine-tuning) left ``HybridDeviceOptimizer``'s pinned CPU
-    clones (``gpu_params_map_cpu_copy``) and FP32 working copies
-    (``param_to_fp32_param``) at their stale (random-init) values. The first
-    ``step()`` would then copy those stale values back onto the model
-    parameters, silently discarding the freshly loaded weights.
+    Regression test for the bug where loading a checkpoint without the optimizer state
+    left ``HybridDeviceOptimizer``'s detached copies at their stale (random-init) values,
+    so the first ``step()`` copied them back over the freshly loaded weights.
     See NVIDIA-NeMo/RL#2371.
     """
     setup_seed(42)
@@ -225,60 +222,42 @@ def test_reload_model_params_reseeds_internal_copies(offload_fraction, param_upd
     with torch.no_grad():
         for param in params:
             param.copy_(torch.randn_like(param))
+    loaded_weights = [param.detach().clone() for param in params]
 
-    # Before reload, the internal copies are stale (do not match new params).
-    for orig_param, cpu_copy in hdo.gpu_params_map_cpu_copy.items():
-        assert not _matches_param(cpu_copy, orig_param)
-    for orig_param, fp32_param in hdo.param_to_fp32_param.items():
-        assert not _matches_param(fp32_param, orig_param)
+    # Before the reload the detached copies are stale, i.e. they still hold the
+    # pre-load values rather than the ones just written into the params.
+    stale = [
+        (param, inner) for param, inner in hdo.param_to_inner_param.items() if inner is not param
+    ]
+    assert stale, "expected at least one detached copy in this configuration"
+    for param, inner_param in stale:
+        assert not _matches_param(inner_param, param)
 
-    # Reload re-seeds every internal copy from the current parameter values.
     hdo.reload_model_params()
 
-    for orig_param, cpu_copy in hdo.gpu_params_map_cpu_copy.items():
-        assert _matches_param(cpu_copy, orig_param), "CPU clone not re-seeded on reload"
-    for orig_param, fp32_param in hdo.param_to_fp32_param.items():
-        assert _matches_param(fp32_param, orig_param), "FP32 copy not re-seeded on reload"
+    for param, inner_param in stale:
+        assert _matches_param(inner_param, param), "detached copy not re-seeded on reload"
 
+    # The behaviour that actually matters: stepping after the load must leave the
+    # params near the loaded weights instead of snapping back to the pre-load values.
+    net(torch.randn(1, 3, 32, 32).cuda().to(dtype)).sum().backward()
+    hdo.step()
+    hdo.zero_grad()
 
-@pytest.mark.parametrize('use_precision_aware_optimizer', [True, False])
-def test_distributed_optimizer_reloads_hybrid_optimizer(use_precision_aware_optimizer):
-    """``DistributedOptimizer`` must reach ``HybridDeviceOptimizer.reload_model_params``.
-
-    ``_copy_model_params_to_main_params`` used to call ``update_fp32_param_by_new_param``
-    here, which refreshes the FP32 working copies but leaves the pinned CPU clones stale.
-    The re-seed must not be gated on ``use_precision_aware_optimizer_no_fp8_or_ds_fp8``:
-    ``optimizer_cpu_offload`` forces that flag on (see ``OptimizerConfig`` and the
-    ``--optimizer-cpu-offload`` assertion in ``megatron/training/arguments.py``), so
-    gating on it either way is easy to get wrong. Both settings must re-seed.
-    """
-    # `spec` makes `isinstance` succeed and pins the method name: renaming
-    # `reload_model_params` turns this into an AttributeError rather than a
-    # silently passing test.
-    hdo = MagicMock(spec=HybridDeviceOptimizer)
-
-    # Minimal stand-in for a DistributedOptimizer: the method under test only
-    # reads these attributes, and the empty param groups make the shard copies
-    # a no-op, so no distributed initialization or GPU is required.
-    stub = SimpleNamespace(
-        ddp_config=SimpleNamespace(use_megatron_fsdp=False),
-        config=SimpleNamespace(
-            use_precision_aware_optimizer_no_fp8_or_ds_fp8=use_precision_aware_optimizer
-        ),
-        optimizer=hdo,
-        model_float16_groups=[],
-        model_fp32_groups=[],
-        shard_fp32_from_float16_groups=[],
-        shard_fp32_groups=[],
-    )
-
-    DistributedOptimizer._copy_model_params_to_main_params(stub)
-
-    hdo.reload_model_params.assert_called_once_with()
+    for param, loaded in zip(params, loaded_weights):
+        assert torch.allclose(
+            param, loaded, atol=5e-2
+        ), "step() after reload discarded the loaded weights"
 
 
 def _distopt_stub(optimizer, use_megatron_fsdp=False, use_precision_aware_optimizer=True):
-    """Minimal stand-in for ``DistributedOptimizer``; see the test above."""
+    """Minimal stand-in for ``DistributedOptimizer``.
+
+    ``_copy_model_params_to_main_params`` only reads these attributes before the
+    ``HybridDeviceOptimizer`` branch returns, so these dispatch tests need neither a
+    process group nor a GPU. They cover which branch is taken; the re-seed itself is
+    covered functionally by ``test_reload_model_params_preserves_loaded_weights``.
+    """
     return SimpleNamespace(
         ddp_config=SimpleNamespace(use_megatron_fsdp=use_megatron_fsdp),
         config=SimpleNamespace(
@@ -292,12 +271,26 @@ def _distopt_stub(optimizer, use_megatron_fsdp=False, use_precision_aware_optimi
     )
 
 
-def test_megatron_fsdp_with_hybrid_optimizer_reloads():
-    """Megatron-FSDP + CPU offload must keep working, not raise.
+def test_distributed_optimizer_reloads_hybrid_optimizer():
+    """The hybrid optimizer's detached copies must be re-seeded, not just the FP32 ones.
 
-    The ``HybridDeviceOptimizer`` branch sits above the Megatron-FSDP
-    ``NotImplementedError``, so this combination returns early and never raises.
-    Reordering the two would start failing a configuration that works today.
+    Upstream called ``update_fp32_param_by_new_param`` here, which refreshes
+    ``param_to_fp32_param`` but leaves the pinned CPU clones stale. ``spec`` makes
+    ``isinstance`` succeed and pins the method name, so a rename fails loudly.
+    """
+    hdo = MagicMock(spec=HybridDeviceOptimizer)
+
+    DistributedOptimizer._copy_model_params_to_main_params(_distopt_stub(hdo))
+
+    hdo.reload_model_params.assert_called_once_with()
+
+
+def test_megatron_fsdp_ordering_is_unchanged():
+    """The hybrid optimizer branch stays above the Megatron-FSDP ``NotImplementedError``.
+
+    This pins the ordering that exists on main; it does not claim Megatron-FSDP plus CPU
+    offload is a tested configuration. Swapping the two would start raising for callers
+    that reach this method today without raising.
     """
     hdo = MagicMock(spec=HybridDeviceOptimizer)
 

@@ -381,33 +381,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             fp32_param.data.copy_(param)
 
     def reload_model_params(self):
-        """Re-seed the optimizer's internal parameter copies from the current
-        parameter values.
+        """Re-seed the detached copies the sub-optimizers step against.
 
-        Besides the parameters exposed in ``self.param_groups``,
-        ``HybridDeviceOptimizer`` keeps up to two additional copies of each
-        parameter that the sub-optimizers actually step against:
-
-          * ``gpu_params_map_cpu_copy`` -- pinned CPU clones used by the CPU
-            sub-optimizers for the offloaded parameters (this is what makes
-            "cpu offload" actually offload).
-          * ``param_to_fp32_param`` -- FP32 working copies used for
-            mixed-precision (e.g. BF16) updates.
-
-        When the parameters are modified outside of the optimizer -- for
-        example when loading a checkpoint without the optimizer state during
-        fine-tuning -- these copies are left at their previous (frequently
-        random-initialized) values. Without re-seeding them the next
-        ``step()`` would compute updates from, and copy back, stale weights,
-        silently discarding the freshly loaded parameters. This method
-        refreshes both copies from the current parameter values so the next
-        step operates on the loaded weights.
+        Call whenever the parameters change outside the optimizer, e.g. loading a
+        checkpoint without its optimizer state; otherwise the next ``step()`` copies
+        the stale values back over them. See NVIDIA-NeMo/RL#2371.
         """
-        # Refresh the pinned CPU clones used for the offloaded parameters.
-        for gpu_param, cpu_copy in self.gpu_params_map_cpu_copy.items():
-            cpu_copy.data.copy_(gpu_param.data)
-        # Refresh the FP32 working copies used for mixed-precision updates.
-        self.update_fp32_param_by_new_param()
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is not param:
+                inner_param.data.copy_(param.data)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
