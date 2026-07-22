@@ -91,6 +91,9 @@ def main() -> None:
     if args.mimo_encoder_prefetch and len(provider.encoder_module_names) != 1:
         raise ValueError("encoder prefetch requires exactly one encoder")
 
+    # Encoder prefetch runs encoder forward while producing batches, so it needs the built
+    # rank-local encoder instance. Capture the wrapped model here so the data provider can
+    # later extract that encoder and bind it to the prefetch worker.
     captured_model = {}
     hooks = []
     if args.mimo_encoder_prefetch:
