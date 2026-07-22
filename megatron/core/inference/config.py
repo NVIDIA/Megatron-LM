@@ -142,6 +142,9 @@ class AsyncScheduleMode(str, Enum):
     SERIAL = "serial"
     """Prepare and forward speculatively before resolving the sampled requests."""
 
+    OVERLAP = "overlap"
+    """Overlap async scheduling prepare/sample and forward/resolve phases."""
+
 
 @dataclass
 class InferenceConfig:
