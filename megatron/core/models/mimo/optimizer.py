@@ -118,6 +118,11 @@ class MimoOptimizer(MegatronOptimizer):
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage parameters for explicit synchronization in all active module optimizers."""
+        for opt in self._active_optimizers:
+            opt.prepare_model_params_for_param_sync()
+
     def get_loss_scale(self) -> torch.Tensor:
         """Return the loss scale tensor from the first active optimizer."""
         if self._active_optimizers:

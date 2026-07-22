@@ -96,7 +96,9 @@ uv run --extra ssm python -m torch.distributed.run \
   --adam-beta2 0.95 \
   --clip-grad 1.0 \
   --use-distributed-optimizer \
-  --ddp-bucket-size 0 \
+  --overlap-grad-reduce \
+  --overlap-param-gather \
+  --encoder-ddp-overlap \
   --train-iters "${TRAIN_ITERS}" \
   --eval-interval "${EVAL_INTERVAL}" \
   --eval-iters "${EVAL_ITERS}" \
