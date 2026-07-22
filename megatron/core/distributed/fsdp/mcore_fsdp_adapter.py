@@ -119,6 +119,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         config: TransformerConfig,
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
+        # This should be named fsdp_unit_module_types; the v1 name is retained for API compatibility.
         fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
@@ -514,6 +515,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
 
         if fsdp_unit_modules is None:
