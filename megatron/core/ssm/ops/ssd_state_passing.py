@@ -32,6 +32,9 @@ def _state_passing_fwd_kernel(
     initstates_ptr,
     seq_idx_ptr,
     cu_chunk_seqlens_ptr,
+    dst_states_ptr,
+    dst_indices_ptr,
+    dst_flags_ptr,
     # Matrix dimensions
     dim: tl.constexpr,
     nchunks,
@@ -51,8 +54,12 @@ def _state_passing_fwd_kernel(
     stride_initstates_head: tl.int64,
     stride_initstates_dim: tl.constexpr,
     stride_seq_idx_chunk: tl.constexpr,
+    stride_dst_batch: tl.int64,
+    stride_dst_head: tl.int64,
+    stride_dst_dim: tl.constexpr,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    HAS_DST_STATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_h = tl.program_id(axis=1)
@@ -77,11 +84,23 @@ def _state_passing_fwd_kernel(
 
     prev_seq_idx = 0
     for c in range(nchunks):
-        new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        if HAS_DST_STATES:
+            dst_flag = tl.load(dst_flags_ptr + c) != 0
+        else:
+            dst_flag = True
+        # Unflagged destination chunks have no chunk state.
+        new_states = tl.load(states_ptrs, mask=(offs_m < dim) & dst_flag, other=0.0).to(
+            tl.float32
+        )
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
+        if HAS_DST_STATES:
+            # Destination chunks start from their indexed initial state.
+            is_new_seq = True
+        else:
+            is_new_seq = prev_seq_idx != seq_idx
         # we have started a new sequence
-        if prev_seq_idx != seq_idx:
+        if is_new_seq:
             if HAS_INITSTATES:
                 initstates_ptrs = (
                     initstates_ptr
@@ -95,7 +114,20 @@ def _state_passing_fwd_kernel(
 
         prev_seq_idx = seq_idx
         states = tl.exp(dA_cs) * states + new_states
-        tl.store(out_ptrs, states, mask=offs_m < dim)
+        if not HAS_DST_STATES:
+            tl.store(out_ptrs, states, mask=offs_m < dim)
+
+        if HAS_DST_STATES:
+            # Commit completed chunks directly to the state cache.
+            if dst_flag:
+                dst_idx = tl.load(dst_indices_ptr + c).to(tl.int64)
+                dst_ptrs = (
+                    dst_states_ptr
+                    + dst_idx * stride_dst_batch
+                    + pid_h * stride_dst_head
+                    + offs_m * stride_dst_dim
+                )
+                tl.store(dst_ptrs, states, mask=offs_m < dim)
 
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
@@ -103,18 +135,46 @@ def _state_passing_fwd_kernel(
 
 
 def _state_passing_fwd(
-    states, dA_cumsum, cu_chunk_seqlens, seq_idx, initial_states=None, out_dtype=None
+    states,
+    dA_cumsum,
+    cu_chunk_seqlens,
+    seq_idx,
+    initial_states=None,
+    out_dtype=None,
+    dst_states=None,
+    dst_indices=None,
+    dst_flags=None,
 ):
+    """
+    dst_states/dst_indices/dst_flags write flagged boundary states directly to
+    dst_states without allocating an output tensor.
+    """
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     seqlen = seq_idx.shape[-1]
-    out_dtype = states.dtype if out_dtype is None else out_dtype
-    out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+    has_dst = dst_states is not None
+    assert (dst_indices is not None) == has_dst and (dst_flags is not None) == has_dst, (
+        "dst_states, dst_indices, and dst_flags must be provided together"
+    )
+    if not has_dst:
+        out_dtype = states.dtype if out_dtype is None else out_dtype
+        out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+        out_strides = out.stride()
+    else:
+        out = states
+        out_strides = (0, 0, 0)
 
     initial_states_strides = (
         (initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
         if initial_states is not None
+        else (0, 0, 0)
+    )
+    if has_dst:
+        assert dst_states.shape[1] == nheads and dst_states.shape[2] == dim
+    dst_strides = (
+        (dst_states.stride(0), dst_states.stride(1), dst_states.stride(2))
+        if has_dst
         else (0, 0, 0)
     )
 
@@ -127,6 +187,9 @@ def _state_passing_fwd(
             initstates_ptr=initial_states,
             seq_idx_ptr=seq_idx,
             cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            dst_states_ptr=dst_states,
+            dst_indices_ptr=dst_indices,
+            dst_flags_ptr=dst_flags,
             dim=dim,
             nchunks=nchunks,
             seqlen=seqlen if seq_idx is not None else 0,
@@ -134,9 +197,9 @@ def _state_passing_fwd(
             stride_states_chunk=states.stride(0),
             stride_states_head=states.stride(1),
             stride_states_dim=states.stride(2),
-            stride_out_chunk=out.stride(0),
-            stride_out_head=out.stride(1),
-            stride_out_dim=out.stride(2),
+            stride_out_chunk=out_strides[0],
+            stride_out_head=out_strides[1],
+            stride_out_dim=out_strides[2],
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
@@ -144,6 +207,10 @@ def _state_passing_fwd(
             stride_initstates_head=initial_states_strides[1],
             stride_initstates_dim=initial_states_strides[2],
             stride_seq_idx_chunk=seq_idx.stride(0),
+            stride_dst_batch=dst_strides[0],
+            stride_dst_head=dst_strides[1],
+            stride_dst_dim=dst_strides[2],
             HAS_INITSTATES=initial_states is not None,
+            HAS_DST_STATES=has_dst,
         )
-    return out
+    return None if has_dst else out

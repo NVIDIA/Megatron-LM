@@ -24,6 +24,10 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    is_batch_invariant_mode_enabled,
+    rmsnorm_batch_invariant,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -41,6 +45,9 @@ except ImportError:
 
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
+    # Use the same RMSNorm kernel as the training recompute.
+    if is_batch_invariant_mode_enabled():
+        return rmsnorm_batch_invariant(x, weight, eps).to(x.dtype)
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
     out, _, _ = tex.rmsnorm_fwd(
@@ -405,11 +412,14 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
+        # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
+        # the training reduction path. This does not affect MoE EP NVLS.
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
+            and not is_batch_invariant_mode_enabled()
         )
 
         if can_use_nvls:
@@ -532,7 +542,13 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
-    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
+    # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
+    # training. This does not affect MoE EP NVLS.
+    if (
+        triton_nvls_kernels_allowed
+        and SymmetricMemoryManager.is_initialized("tp")
+        and not is_batch_invariant_mode_enabled()
+    ):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
 

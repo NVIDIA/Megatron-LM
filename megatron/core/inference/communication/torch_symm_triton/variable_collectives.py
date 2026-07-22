@@ -355,6 +355,125 @@ def multimem_reduce_scatter_v(
 
 
 @triton.jit
+def _ordered_reduce_scatter_v_kernel(
+    local_ptr,
+    buffer_ptrs_dev,
+    signal_pad_ptrs,
+    local_tokens,
+    rank_token_offset_ptr,
+    ep_max_tokens_ptr,
+    input_byte_offset,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """Variable-count reduce-scatter with explicit rank-order fp32 addition.
+
+    This is intentionally not a multimem.ld_reduce kernel. Each rank reads the
+    same token row from every peer symmetric buffer in rank order and accumulates
+    in fp32, which gives batch-invariant MoE a defined cross-rank reduction tree.
+    """
+    pid = tl.program_id(axis=0)
+
+    ep_max_tokens = tl.load(ep_max_tokens_ptr)
+    if pid >= ep_max_tokens:
+        return
+
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=False,
+        hasSubsequentMemAccess=True,
+    )
+    sync_threads()
+
+    tid = tl.arange(0, BLOCK_SIZE)
+    rank_token_offset = tl.load(rank_token_offset_ptr)
+    buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
+
+    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+        global_token = rank_token_offset + token_offset
+
+        for channel_offset in range(0, HIDDEN_SIZE, BLOCK_SIZE):
+            offsets = channel_offset + tid
+            mask = offsets < HIDDEN_SIZE
+            acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+            for src_rank in tl.range(0, WORLD_SIZE):
+                peer_base = tl.load(buffer_ptrs + src_rank).to(tl.pointer_type(tl.uint8))
+                peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
+                vals = tl.load(peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0)
+                acc += vals
+
+            tl.store(local_ptr + token_offset * HIDDEN_SIZE + offsets, acc, mask=mask)
+
+
+def ordered_reduce_scatter_v(
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    symm_mem_hdl: _SymmetricMemory,
+    rank_token_offset: torch.Tensor,
+    ep_max_tokens: torch.Tensor,
+    per_rank_max_tokens: int,
+    input_byte_offset: int = 0,
+    **kwargs,
+) -> torch.Tensor:
+    """Variable-count reduce-scatter with fixed rank-order fp32 accumulation.
+
+    This is the batch-invariant alternative to multimem_reduce_scatter_v. It
+    uses symmetric memory for peer visibility, but performs no hardware FP
+    reduction; each output token is accumulated by explicitly loading peers in
+    rank order.
+    """
+    assert HAVE_TRITON, "Triton is required for ordered_reduce_scatter_v."
+    assert (
+        output_tensor.ndim == 2 and input_tensor.ndim == 2
+    ), "output_tensor and input_tensor must be 2-D [tokens, hidden_size]."
+    assert is_device_nvls_capable(
+        output_tensor.device
+    ), "ordered_reduce_scatter_v requires a Hopper+ GPU with NVLink (SM >= 9)."
+    assert (
+        output_tensor.dtype == input_tensor.dtype == torch.float32
+    ), "ordered_reduce_scatter_v requires fp32 input and output tensors."
+    assert (
+        rank_token_offset.numel() == 1
+        and rank_token_offset.dtype == torch.int32
+        and rank_token_offset.is_cuda
+    ), "rank_token_offset must be a scalar int32 CUDA tensor."
+
+    hidden_size = output_tensor.shape[1]
+    assert (
+        input_tensor.shape[1] == hidden_size
+    ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
+
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
+    MAX_BLOCK_SIZE = 1024
+    WARP_SIZE = 32
+    block_size = min(triton.next_power_of_2(hidden_size), MAX_BLOCK_SIZE)
+    num_warps = max(1, block_size // WARP_SIZE)
+    num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+
+    _ordered_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
+        output_tensor,
+        symm_mem_hdl.buffer_ptrs_dev,
+        symm_mem_hdl.signal_pad_ptrs_dev,
+        local_tokens=output_tensor.shape[0],
+        rank_token_offset_ptr=rank_token_offset,
+        ep_max_tokens_ptr=ep_max_tokens,
+        input_byte_offset=input_byte_offset,
+        HIDDEN_SIZE=hidden_size,
+        BLOCK_SIZE=block_size,
+        RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=symm_mem_hdl.world_size,
+        num_warps=num_warps,
+    )
+    return output_tensor
+
+
+@triton.jit
 def _multimem_all_gatherv_3tensor_kernel(
     local_ptr_0,
     multicast_ptr_0,

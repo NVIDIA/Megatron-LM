@@ -88,7 +88,8 @@ def _chunk_scan_fwd_kernel(
     states_ptr,
     D_ptr,
     initstates_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
+    target_rows_ptr,
     # Matrix dimensions
     chunk_size: tl.constexpr,
     hdim: tl.constexpr,
@@ -133,6 +134,7 @@ def _chunk_scan_fwd_kernel(
     HAS_D: tl.constexpr,
     D_HAS_HDIM: tl.constexpr,
     HAS_Z: tl.constexpr,
+    HAS_TARGET_ROWS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -145,9 +147,17 @@ def _chunk_scan_fwd_kernel(
     num_pid_n = tl.cdiv(hdim, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
+    if HAS_TARGET_ROWS:
+        # Keep the tile containing the only output row consumed.
+        if pid_m != tl.load(target_rows_ptr + pid_c) // BLOCK_SIZE_M:
+            return
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
+    if HAS_TARGET_ROWS:
+        # Fixed windows need only a start offset.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
     dA_cumsum_ptr += pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
@@ -159,20 +169,31 @@ def _chunk_scan_fwd_kernel(
 
     seq_idx_ptr += pid_c * stride_seq_idx_chunk
     seq_idx = tl.load(seq_idx_ptr)
-    seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1)
-
-    if HAS_INITSTATES and (seq_idx != seq_idx_prev):
+    if HAS_TARGET_ROWS:
+        # Each fixed window starts from its indexed cached state.
+        seq_idx_prev = -1
         prev_states_ptr = (
             initstates_ptr + seq_idx * stride_init_states_batch + pid_h * stride_init_states_head
         )
         prev_states_hdim = stride_init_states_hdim
         prev_states_dstate = stride_init_states_dstate
     else:
-        prev_states_ptr = (
-            states_ptr + (pid_c - 1) * stride_states_chunk + pid_h * stride_states_head
-        )
-        prev_states_hdim = stride_states_hdim
-        prev_states_dstate = stride_states_dstate
+        seq_idx_prev = tl.load(seq_idx_ptr - stride_seq_idx_chunk, mask=pid_c >= 1, other=-1)
+
+        if HAS_INITSTATES and (seq_idx != seq_idx_prev):
+            prev_states_ptr = (
+                initstates_ptr
+                + seq_idx * stride_init_states_batch
+                + pid_h * stride_init_states_head
+            )
+            prev_states_hdim = stride_init_states_hdim
+            prev_states_dstate = stride_init_states_dstate
+        else:
+            prev_states_ptr = (
+                states_ptr + (pid_c - 1) * stride_states_chunk + pid_h * stride_states_head
+            )
+            prev_states_hdim = stride_states_hdim
+            prev_states_dstate = stride_states_dstate
 
     chunk_size_limit = chunk_seqlen_end - chunk_seqlen_start
 
@@ -305,13 +326,32 @@ def _chunk_scan_fwd_kernel(
         ).to(tl.float32)
         acc *= z * tl.sigmoid(z)
 
-    out_ptr += chunk_seqlen_start * stride_out_seqlen + pid_h * stride_out_head
-    out_ptrs = out_ptr + (
-        stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim
-    )
-    tl.store(
-        out_ptrs, acc, mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim)
-    )
+    if HAS_TARGET_ROWS:
+        # Store just the target row to a compact (nchunks, nheads, hdim)
+        # output; nothing else is consumed downstream. Same acc values as
+        # the full store, only the mask is narrower.
+        tr = tl.load(target_rows_ptr + pid_c)
+        out_ptr += pid_c * stride_out_seqlen + pid_h * stride_out_head
+        # All M-lanes alias the same output row (row stride 0); the mask
+        # keeps only lane tr, so one lane stores per column.
+        out_ptrs = out_ptr + (
+            offs_out_m[:, None] * 0 + offs_out_n[None, :] * stride_out_hdim
+        )
+        tl.store(
+            out_ptrs,
+            acc,
+            mask=(offs_out_m[:, None] == tr) & (offs_out_n[None, :] < hdim),
+        )
+    else:
+        out_ptr += chunk_seqlen_start * stride_out_seqlen + pid_h * stride_out_head
+        out_ptrs = out_ptr + (
+            stride_out_seqlen * offs_out_m[:, None] + offs_out_n[None, :] * stride_out_hdim
+        )
+        tl.store(
+            out_ptrs,
+            acc,
+            mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim),
+        )
 
 
 def _chunk_scan_fwd(
@@ -327,8 +367,18 @@ def _chunk_scan_fwd(
     D=None,
     z=None,
     initial_states=None,
+    target_rows=None,
+    chunk_starts=None,
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
+    has_target_rows = target_rows is not None
+    assert (chunk_starts is not None) == has_target_rows, (
+        "target_rows and chunk_starts must be provided together"
+    )
+    if has_target_rows:
+        chunk_offsets = chunk_starts
+    else:
+        chunk_offsets = cu_chunk_seqlens
 
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -375,7 +425,8 @@ def _chunk_scan_fwd(
         states_ptr=states,
         D_ptr=D,
         initstates_ptr=initial_states,
-        cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        chunk_offsets_ptr=chunk_offsets,
+        target_rows_ptr=target_rows,
         chunk_size=chunk_size,
         hdim=headdim,
         dstate=dstate,
@@ -417,6 +468,7 @@ def _chunk_scan_fwd(
         HAS_D=D is not None,
         D_HAS_HDIM=D.dim() == 2 if D is not None else True,
         HAS_Z=z is not None,
+        HAS_TARGET_ROWS=has_target_rows,
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,

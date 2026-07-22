@@ -461,6 +461,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             'reversed_local_input_permutation_mapping',
             'routing_map',
         ]
+        self.batch_invariant_inverse_permutation_mapping = None
+        if self.config.batch_invariant_mode:
+            self.cudagraph_attrs.append('batch_invariant_inverse_permutation_mapping')
 
         self.shared_experts = None
 
@@ -639,7 +642,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             permutated_local_input_tokens,
             permuted_probs,
             self.reversed_local_input_permutation_mapping,
-            _,
+            self.batch_invariant_inverse_permutation_mapping,
             _,
         ) = permute(
             hidden_states,
@@ -648,6 +651,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            return_batch_invariant_inverse_map=self.config.batch_invariant_mode,
         )
         return permutated_local_input_tokens, permuted_probs
 
@@ -867,6 +871,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             routing_map=self.routing_map,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
         )
 
         # Reshape the output tensor

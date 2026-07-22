@@ -15,6 +15,8 @@ import torch
 
 from megatron.core.utils import null_decorator
 
+from . import batch_invariant
+
 try:
     import triton
     import triton.language as tl
@@ -239,6 +241,7 @@ def _permute_tokens_kernel(
     out_hidden_ptr,  # [output_size, hidden_dim] output: permuted hidden states
     out_probs_ptr,  # [output_size] output: permuted probabilities
     out_src_idx_ptr,  # [output_size] output: permutation_map (original token index, -1 for padding)
+    inverse_map_ptr,  # [max_tokens, num_local_experts] token/local-expert -> permuted row
     counters_ptr,  # [num_local_experts] exclusive offsets, atomically incremented
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     hidden_dim,  # hidden dimension
@@ -248,6 +251,7 @@ def _permute_tokens_kernel(
     num_local_experts: tl.constexpr,  # number of experts on this rank
     BLOCK_H: tl.constexpr,  # tile size for copying hidden_dim
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+    HAS_INVERSE: tl.constexpr,  # whether to write inverse_map_ptr
 ):
     """Permute tokens into expert-grouped order.
 
@@ -282,6 +286,8 @@ def _permute_tokens_kernel(
                 tl.store(out_probs_ptr + pos, tl.load(probs_ptr + tok * topk + k))
                 # Record source token index for unpermute
                 tl.store(out_src_idx_ptr + pos, tok)
+                if HAS_INVERSE:
+                    tl.store(inverse_map_ptr + tok * num_local_experts + lid, pos)
 
 
 def permute_tokens(
@@ -292,6 +298,7 @@ def permute_tokens(
     num_local_experts: int,
     valid_tokens: torch.Tensor,
     alignment: int = 1,
+    return_batch_invariant_inverse_map: bool = False,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -308,15 +315,22 @@ def permute_tokens(
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens this
             iteration. Fixed address; value updated each step before graph replay.
         alignment: per-expert token alignment (default 1).
+        return_batch_invariant_inverse_map: if True, also return the map used by
+            batch-invariant unpermute.
 
     Returns:
-        (permuted_hidden, permuted_probs, permutation_map, inclusive_offsets)
+        By default, returns the original 4-tuple:
+        (permuted_hidden, permuted_probs, permutation_map, inclusive_offsets).
+        If return_batch_invariant_inverse_map=True, appends the inverse map as a
+        fifth return value.
         - permuted_hidden: [output_size, hidden_size]
         - permuted_probs: [output_size]
         - permutation_map: [output_size] int32, maps each permuted row back to
           its original token index. Used by unpermute_tokens to scatter expert
           outputs back and by activation kernels to skip padding rows (-1).
         - inclusive_offsets: [num_local_experts] int32 cumulative offsets for grouped_mm
+        - inverse map: [max_tokens, num_local_experts] int32 map from token/local-expert
+          to permuted row, only present when requested.
     """
     max_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]
@@ -342,12 +356,24 @@ def permute_tokens(
     )
     permuted_probs = torch.empty(output_size, dtype=probs.dtype, device=probs.device)
     permutation_map = torch.empty(output_size, dtype=torch.int32, device=probs.device)
+    batch_invariant_inverse_map = None
+    if return_batch_invariant_inverse_map:
+        batch_invariant_inverse_map = torch.full(
+            (max_tokens, num_local_experts), -1, dtype=torch.int32, device=probs.device
+        )
     # Only initialize [0, n_used) to -1; activation and unpermute kernels are gated
     # by the same inclusive_expert_offsets[-1] pointer so they never read beyond n_used.
     init_permutation_map(permutation_map, inclusive_expert_offsets[-1:])
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     max_pairs = max_tokens * topk
     NUM_BLOCKS = min(max_pairs, 512)
+    # The inverse-map pointer is unused when HAS_INVERSE=False. Reuse an existing
+    # int32 device tensor instead of allocating a dummy buffer for that kernel variant.
+    inverse_map_ptr = (
+        batch_invariant_inverse_map
+        if batch_invariant_inverse_map is not None
+        else permutation_map
+    )
     _permute_tokens_kernel[(NUM_BLOCKS,)](
         hidden_states,
         probs,
@@ -355,6 +381,7 @@ def permute_tokens(
         permuted_hidden,
         permuted_probs,
         permutation_map,
+        inverse_map_ptr,
         exclusive_expert_offsets,
         valid_tokens,
         hidden_dim,
@@ -364,7 +391,16 @@ def permute_tokens(
         num_local_experts,
         BLOCK_H=BLOCK_H,
         NUM_BLOCKS=NUM_BLOCKS,
+        HAS_INVERSE=batch_invariant_inverse_map is not None,
     )
+    if return_batch_invariant_inverse_map:
+        return (
+            permuted_hidden,
+            permuted_probs,
+            permutation_map,
+            inclusive_expert_offsets,
+            batch_invariant_inverse_map,
+        )
     return permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets
 
 
@@ -440,6 +476,7 @@ def unpermute_tokens(
     n_used: torch.Tensor,
     valid_tokens: torch.Tensor,
     out: torch.Tensor = None,
+    batch_invariant_inverse_map: torch.Tensor = None,
 ) -> torch.Tensor:
     """Unpermute expert outputs back to original token order.
 
@@ -464,6 +501,25 @@ def unpermute_tokens(
         permuted_probs.dtype == torch.float32
     ), f"permuted_probs must be fp32, got {permuted_probs.dtype}"
     output_size, hidden_dim = expert_output.shape
+
+    # Triton kernel below uses tl.atomic_add (non-deterministic). Batch-invariant
+    # MoE instead reduces each token independently in fixed local-expert order,
+    # so unrelated tokens cannot affect the accumulation tree.
+    if batch_invariant.enabled():
+        assert batch_invariant_inverse_map is not None, (
+            "batch-invariant MoE unpermute requires its inverse map"
+        )
+        # The expert-order kernel stores every row tok < valid_tokens, including zero
+        # rows for tokens with no local expert contribution. Rows beyond
+        # valid_tokens are not read by the graphed RSV combine.
+        return batch_invariant.unpermute_tokens_in_expert_order(
+            expert_output,
+            permuted_probs,
+            batch_invariant_inverse_map,
+            valid_tokens,
+            out,
+        )
+
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     if out is None:
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)

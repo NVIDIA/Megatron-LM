@@ -6,6 +6,7 @@
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import logging
 from collections import namedtuple
 from collections.abc import Callable
@@ -28,11 +29,29 @@ except ImportError:
     tl = MagicMock()
     HAVE_TRITON = False
 
+try:
+    import deep_gemm
+
+    HAVE_DEEPGEMM_BF16 = all(
+        hasattr(deep_gemm, name)
+        for name in (
+            "m_grouped_bf16_gemm_nt_contiguous",
+            "k_grouped_bf16_gemm_tn_contiguous",
+            "bf16_gemm_nn",
+        )
+    )
+except ImportError:
+    deep_gemm = None
+    HAVE_DEEPGEMM_BF16 = False
+
 __all__ = [
     "set_batch_invariant_mode",
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
+    "grouped_gemm_batch_invariant",
+    "grouped_gemm_batch_invariant_alignment",
+    "HAVE_DEEPGEMM_BF16",
 ]
 
 
@@ -478,13 +497,48 @@ def mean_dim(
     return output
 
 
+# Kernel backend for mm / addmm. Production uses DeepGEMM; the Triton option
+# remains available to tests that exercise non-bf16 operators.
+#   "deepgemm" (default): DeepGEMM `bf16_gemm_nn` — bitwise-identical to
+#       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
+#   "triton": batch-invariant Triton `matmul_persistent` — works on any CUDA
+#       device with bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
+_BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton")
+_BATCH_INVARIANT_BACKEND: str = "deepgemm"
+
+
+def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """`a @ b` via DeepGEMM `bf16_gemm_nn`. Both inputs are row-major.
+
+    Bitwise-identical to `torch.mm` on Hopper/Blackwell, deterministic across
+    runs, batch-invariant.
+    """
+    if a.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"The DeepGEMM batch-invariant backend requires bf16 inputs "
+            f"(got {a.dtype}); use backend='triton' for fp16/fp32."
+        )
+    M = a.shape[0]
+    N = b.shape[1]
+    d = torch.empty(M, N, device=a.device, dtype=a.dtype)
+    deep_gemm.bf16_gemm_nn(a, b, d)
+    return d
+
+
 def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::mm`."""
+    if _BATCH_INVARIANT_BACKEND == "deepgemm":
+        return _mm_deepgemm(a, b)
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm` using a persistent matmul kernel."""
+    """Batch-invariant replacement for `aten::addmm`."""
+    if _BATCH_INVARIANT_BACKEND == "deepgemm":
+        out = _mm_deepgemm(a, b)
+        if bias is not None:
+            out = out + bias
+        return out
     return matmul_persistent(a, b, bias=bias)
 
 
@@ -525,6 +579,7 @@ _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+_TE_GROUPED_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 
 
 def _import_module_if_available(name: str):
@@ -617,6 +672,335 @@ def _te_patch_for_batch_invariant():
             _TE_RMSNORM_FUNC_ORIGS[name] = orig
             setattr(te_layernorm_mod, name, _make_rmsnorm_patched(orig))
 
+    # Patch TE.general_grouped_gemm at every known import site so that
+    # TEGroupedMLP (forward + dgrad + wgrad) goes through DeepGEMM in bf16.
+    _te_patch_general_grouped_gemm()
+
+
+def _te_patch_general_grouped_gemm() -> None:
+    """Replace TE.general_grouped_gemm with a batch-invariant dispatcher.
+
+    Patches the symbol at three import sites — the consumer module
+    (transformer_engine.pytorch.module.grouped_linear), the package-level
+    re-export (transformer_engine.pytorch.cpp_extensions), and the source
+    module (transformer_engine.pytorch.cpp_extensions.gemm). Stores originals
+    in _TE_GROUPED_GEMM_FUNC_ORIGS so the unpatch can restore them.
+    """
+    te_grouped_linear_mod = _import_module_if_available(
+        "transformer_engine.pytorch.module.grouped_linear"
+    )
+    if te_grouped_linear_mod is not None and hasattr(te_grouped_linear_mod, "general_grouped_gemm"):
+        key = "module.grouped_linear.general_grouped_gemm"
+        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
+            _TE_GROUPED_GEMM_FUNC_ORIGS[key] = te_grouped_linear_mod.general_grouped_gemm
+            te_grouped_linear_mod.general_grouped_gemm = _te_general_grouped_gemm_patched
+
+    te_cpp = _import_module_if_available("transformer_engine.pytorch.cpp_extensions")
+    if te_cpp is not None and hasattr(te_cpp, "general_grouped_gemm"):
+        key = "cpp_extensions.general_grouped_gemm"
+        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
+            _TE_GROUPED_GEMM_FUNC_ORIGS[key] = te_cpp.general_grouped_gemm
+            te_cpp.general_grouped_gemm = _te_general_grouped_gemm_patched
+
+    te_cpp_gemm = _import_module_if_available("transformer_engine.pytorch.cpp_extensions.gemm")
+    if te_cpp_gemm is not None and hasattr(te_cpp_gemm, "general_grouped_gemm"):
+        key = "cpp_extensions.gemm.general_grouped_gemm"
+        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
+            _TE_GROUPED_GEMM_FUNC_ORIGS[key] = te_cpp_gemm.general_grouped_gemm
+            te_cpp_gemm.general_grouped_gemm = _te_general_grouped_gemm_patched
+
+
+def _te_unpatch_general_grouped_gemm() -> None:
+    """Restore the originals captured by _te_patch_general_grouped_gemm."""
+    module_paths = {
+        "module.grouped_linear.general_grouped_gemm": (
+            "transformer_engine.pytorch.module.grouped_linear",
+            "general_grouped_gemm",
+        ),
+        "cpp_extensions.general_grouped_gemm": (
+            "transformer_engine.pytorch.cpp_extensions",
+            "general_grouped_gemm",
+        ),
+        "cpp_extensions.gemm.general_grouped_gemm": (
+            "transformer_engine.pytorch.cpp_extensions.gemm",
+            "general_grouped_gemm",
+        ),
+    }
+    for key, (mod_name, attr) in module_paths.items():
+        if key not in _TE_GROUPED_GEMM_FUNC_ORIGS:
+            continue
+        mod = _import_module_if_available(mod_name)
+        if mod is not None and hasattr(mod, attr):
+            setattr(mod, attr, _TE_GROUPED_GEMM_FUNC_ORIGS[key])
+        _TE_GROUPED_GEMM_FUNC_ORIGS.pop(key, None)
+
+
+def _get_original_te_grouped_gemm():
+    for key in (
+        "module.grouped_linear.general_grouped_gemm",
+        "cpp_extensions.general_grouped_gemm",
+        "cpp_extensions.gemm.general_grouped_gemm",
+    ):
+        orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get(key)
+        if orig is not None:
+            return orig
+    return None
+
+
+def _original_te_grouped_gemm_has_quantization_params(orig) -> bool:
+    try:
+        return "quantization_params" in inspect.signature(orig).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _call_original_te_grouped_gemm(
+    orig,
+    A,
+    B,
+    out,
+    quantization_params,
+    out_dtype,
+    *,
+    layout,
+    m_splits,
+    gelu,
+    grad,
+    accumulate,
+    bias,
+    use_bias,
+    use_split_accumulator,
+    D_dtype,
+    single_output,
+):
+    kwargs = dict(
+        layout=layout,
+        m_splits=m_splits,
+        gelu=gelu,
+        grad=grad,
+        accumulate=accumulate,
+        bias=bias,
+        use_bias=use_bias,
+        use_split_accumulator=use_split_accumulator,
+        D_dtype=D_dtype,
+        single_output=single_output,
+    )
+    if _original_te_grouped_gemm_has_quantization_params(orig):
+        return orig(A, B, out, quantization_params, out_dtype, **kwargs)
+    return orig(A, B, out, out_dtype, **kwargs)
+
+
+def _is_bf16_grouped_path(A, B, quantization_params, gelu: bool) -> bool:
+    """Decide if TE's general_grouped_gemm call can be served by DeepGEMM bf16."""
+    if gelu:
+        return False
+    if not HAVE_DEEPGEMM_BF16:
+        return False
+    if not (isinstance(A, list) and isinstance(B, list)):
+        return False
+    if len(A) != len(B) or len(A) == 0:
+        return False
+    if quantization_params is not None and any(q is not None for q in quantization_params):
+        return False
+    for t in (*A, *B):
+        if not isinstance(t, torch.Tensor):
+            return False
+        if t.dtype != torch.bfloat16:
+            return False
+    return True
+
+
+def _te_general_grouped_gemm_patched(
+    A,
+    B,
+    out,
+    quantization_params=None,
+    out_dtype=None,
+    layout: str = "TN",
+    m_splits=None,
+    gelu: bool = False,
+    grad: bool = False,
+    accumulate: bool = False,
+    bias=None,
+    use_bias: bool = False,
+    use_split_accumulator: bool = False,
+    D_dtype=None,
+    single_output: bool = False,
+):
+    """Batch-invariant replacement for TE general_grouped_gemm.
+
+    Dispatches by (layout, single_output, grad) to forward / dgrad / wgrad
+    implementations backed by DeepGEMM. Falls back to TE's original for any
+    case we cannot guarantee batch-invariant: quantized inputs, gelu fusion,
+    non-bf16 dtypes, or unsupported (layout, mode) combinations.
+    """
+    # TE versions differ here:
+    #   old: general_grouped_gemm(A, B, out, out_dtype, ...)
+    #   new: general_grouped_gemm(A, B, out, quantization_params, out_dtype, ...)
+    if out_dtype is None and isinstance(quantization_params, torch.dtype):
+        out_dtype = quantization_params
+        quantization_params = None
+
+    if not _is_bf16_grouped_path(A, B, quantization_params, gelu):
+        orig = _get_original_te_grouped_gemm()
+        if orig is None:
+            raise RuntimeError(
+                "Batch-invariant grouped GEMM patch was invoked but no original "
+                "TE general_grouped_gemm was captured; patching order issue."
+            )
+        return _call_original_te_grouped_gemm(
+            orig,
+            A,
+            B,
+            out,
+            quantization_params,
+            out_dtype,
+            layout=layout,
+            m_splits=m_splits,
+            gelu=gelu,
+            grad=grad,
+            accumulate=accumulate,
+            bias=bias,
+            use_bias=use_bias,
+            use_split_accumulator=use_split_accumulator,
+            D_dtype=D_dtype,
+            single_output=single_output,
+        )
+
+    # Dispatch by TE's call convention.
+    # In TE _GroupedLinear:
+    #   forward  -> layout="TN", single_output=True,  grad=False  (A=weights, B=inputmats)
+    #   dgrad    -> layout="NN", single_output=True,  grad=True   (A=weights, B=grad_y)
+    #   wgrad    -> layout="NT", single_output=False, grad=True   (A=inputmats, B=grad_y)
+    if single_output and layout == "TN" and not grad:
+        return _batch_invariant_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate)
+    if single_output and layout == "NN" and grad:
+        return _batch_invariant_te_grouped_dgrad(A, B, out, m_splits, accumulate)
+    if (not single_output) and layout == "NT" and grad:
+        return _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
+    # Unknown TE call shape — defer to the original.
+    orig = _get_original_te_grouped_gemm()
+    if orig is None:
+        raise RuntimeError(
+            "Batch-invariant grouped GEMM patch was invoked but no original "
+            "TE general_grouped_gemm was captured; patching order issue."
+        )
+    return _call_original_te_grouped_gemm(
+        orig,
+        A,
+        B,
+        out,
+        quantization_params,
+        out_dtype,
+        layout=layout,
+        m_splits=m_splits,
+        gelu=gelu,
+        grad=grad,
+        accumulate=accumulate,
+        bias=bias,
+        use_bias=use_bias,
+        use_split_accumulator=use_split_accumulator,
+        D_dtype=D_dtype,
+        single_output=single_output,
+    )
+
+
+def _stack_weights_for_deepgemm(weights: List[torch.Tensor]) -> torch.Tensor:
+    """Stack a per-expert weight list into a contiguous [E, N, K] buffer."""
+    if not weights:
+        return torch.empty(0)
+    return torch.stack([w.contiguous() for w in weights], dim=0)
+
+
+def _batch_invariant_te_grouped_forward(A, B, out, m_splits, bias, use_bias, accumulate):
+    """TE forward: Y = X @ W^T per expert, then optional bias.
+
+    A = weights:   List[Tensor[N, K]]
+    B = inputmats: List[Tensor[m_i, K]]
+    out:           [single Tensor[M_total, N]]  (single_output=True)
+    """
+    assert not accumulate, "Forward never accumulates"
+    assert len(out) == 1, "single_output=True forward expects a single out tensor"
+    out_buf = out[0]
+    w_stack = _stack_weights_for_deepgemm(A)
+    x_cat = torch.cat([b.contiguous() for b in B], dim=0)
+    m_total = x_cat.shape[0]
+    m_indices = _m_splits_to_m_indices(m_splits, x_cat.device, m_total)
+
+    y = _bf16_grouped_gemm_contiguous(x_cat, w_stack, m_indices, m_splits)
+    if use_bias and bias is not None:
+        offset = 0
+        for i, m in enumerate(m_splits):
+            if m == 0:
+                continue
+            b_i = bias[i] if i < len(bias) else None
+            if b_i is not None and b_i.numel() > 0:
+                y[offset : offset + m] = y[offset : offset + m] + b_i.to(y.dtype)
+            offset += m
+
+    if y.dtype != out_buf.dtype:
+        y = y.to(out_buf.dtype)
+    out_buf.copy_(y)
+    # TE's contract: (out_list, bias_or_grad_bias, gelu_input)
+    return out, bias if use_bias else [None] * len(A), None
+
+
+def _batch_invariant_te_grouped_dgrad(A, B, out, m_splits, accumulate):
+    """TE dgrad: dX = dY @ W per expert.
+
+    A = weights:    List[Tensor[N, K]]
+    B = grad_y_per_expert: List[Tensor[m_i, N]]
+    out:            [single Tensor[M_total, K]] (single_output=True)
+    """
+    assert not accumulate, "Dgrad never accumulates"
+    assert len(out) == 1
+    out_buf = out[0]
+    w_stack = _stack_weights_for_deepgemm(A)
+    dy_cat = torch.cat([b.contiguous() for b in B], dim=0)
+    m_total = dy_cat.shape[0]
+    m_indices = _m_splits_to_m_indices(m_splits, dy_cat.device, m_total)
+    # NT call interprets B as [E, out_dim, in_dim]; for dgrad we need W as [E, K, N]
+    w_kn = w_stack.transpose(1, 2).contiguous()
+    dx = _bf16_grouped_gemm_contiguous(dy_cat, w_kn, m_indices, m_splits)
+    if dx.dtype != out_buf.dtype:
+        dx = dx.to(out_buf.dtype)
+    out_buf.copy_(dx)
+    return out, [None] * len(A), None
+
+
+def _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate):
+    """TE wgrad: dW[g] = dY[g]^T @ X[g], plus optional dbias[g] = sum(dY[g], dim=0).
+
+    A = inputmats: List[Tensor[m_i, K]]
+    B = grad_y:    List[Tensor[m_i, N]]
+    out:           List[Tensor[N, K]] per expert (single_output=False)
+    """
+    E = len(m_splits)
+    x_cat = torch.cat([a.contiguous() for a in A], dim=0)
+    dy_cat = torch.cat([b.contiguous() for b in B], dim=0)
+    m_total = x_cat.shape[0]
+    assert sum(m_splits) == m_total
+    dw_stack = _bf16_grouped_gemm_wgrad_contiguous(dy_cat, x_cat, m_splits)
+
+    grad_bias = [None] * E
+    if use_bias:
+        offset = 0
+        for i, m in enumerate(m_splits):
+            if m > 0:
+                grad_bias[i] = dy_cat[offset : offset + m].sum(dim=0)
+                offset += m
+
+    for i in range(E):
+        target = out[i]
+        contrib = dw_stack[i]
+        if contrib.dtype != target.dtype:
+            contrib = contrib.to(target.dtype)
+        if accumulate:
+            target.add_(contrib)
+        else:
+            target.copy_(contrib)
+    return out, grad_bias, None
+
 
 def _te_unpatch_for_batch_invariant():
     """Restore original Transformer Engine functions if they were patched."""
@@ -690,6 +1074,9 @@ def _te_unpatch_for_batch_invariant():
     else:
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
 
+    # Restore TE general_grouped_gemm at every patched import site.
+    _te_unpatch_general_grouped_gemm()
+
 
 def _extract_te_gemm_args(args: tuple, kwargs: Dict[str, Any]):
     """Utility to parse TE general_gemm flexible signature.
@@ -739,7 +1126,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             opA = opA.reshape(-1, opA.shape[-1])
         elif opA.dim() < 2:
             raise ValueError(f"opA has insufficient dimensions: {opA.shape}")
-        assert opA.dim() == 2, f"opA must be 2D for matmul_persistent, got shape {opA.shape}"
+        assert opA.dim() == 2, f"opA must be 2D, got shape {opA.shape}"
 
         # Flatten all leading dims of opB except the last feature dim to match TE behavior
         if opB.dim() >= 2:
@@ -751,7 +1138,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             opB_2d = opB
 
         # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
-        base_2d = matmul_persistent(opB_2d, opA, bias=None)
+        base_2d = mm_batch_invariant(opB_2d, opA)
 
         # Reshape back to original leading dims with output features at the end
         out = base_2d.reshape(*leading_shape, base_2d.shape[-1])
@@ -945,6 +1332,256 @@ def rmsnorm_batch_invariant(x: torch.Tensor, weight: torch.Tensor, eps: float) -
     return BatchInvariantRMSNormFn.apply(x, weight, eps, False)
 
 
+# ---------------------------------------------------------------------------
+# Batch-invariant grouped GEMM (DeepGEMM-backed). Used by MoE so that training
+# (TEGroupedMLP via patched TE.general_grouped_gemm) and inference
+# (InferenceGroupedMLP via patched _bf16_grouped_mm) produce bitwise-identical
+# outputs for the same inputs. This is what gives RL rollout==train log-prob
+# parity for MoE models.
+# ---------------------------------------------------------------------------
+
+
+def _require_deepgemm_bf16(op: str) -> None:
+    """Raise a clear error if DeepGEMM bf16 grouped bindings are unavailable."""
+    if not HAVE_DEEPGEMM_BF16:
+        raise RuntimeError(
+            f"Batch-invariant grouped GEMM ({op}) requires DeepGEMM with bf16 bindings. "
+            "Install via `uv pip install -e .[batch_invariant]` (pins a DeepGEMM commit "
+            "that exposes m_grouped_bf16_gemm_nt_contiguous), or disable "
+            "transformer_config.batch_invariant_mode for MoE models."
+        )
+
+
+def _offs_to_m_indices(offs: torch.Tensor, m_total: int) -> torch.Tensor:
+    """Convert inclusive cumulative per-expert offsets to per-row expert ids.
+
+    offs: int32 [num_experts] inclusive offsets — offs[i] is the (exclusive) end
+          row of expert i in the contiguous M dimension. Equivalently, offs[i] is
+          the start of expert i+1.
+    Returns: int32 [m_total] m_indices[r] = expert id for row r. Rows past offs[-1]
+             (post-padding tail when m_total > offs[-1]) get -1; DeepGEMM skips
+             those rows.
+    """
+    rows = torch.arange(m_total, device=offs.device, dtype=torch.int32)
+    # For row r, expert id = bisect_right(offs, r). torch.searchsorted is deterministic.
+    m_indices = torch.searchsorted(offs, rows, right=True).to(torch.int32)
+    n_used = offs[-1].to(torch.int32)
+    m_indices = torch.where(rows < n_used, m_indices, torch.full_like(m_indices, -1))
+    return m_indices
+
+
+def _m_splits_to_m_indices(m_splits: List[int], device: torch.device, m_total: int) -> torch.Tensor:
+    """Convert TE per-expert token counts (List[int]) to int32 [m_total] m_indices.
+
+    No padding rows in TE training path — sum(m_splits) == m_total exactly.
+    """
+    assert sum(m_splits) == m_total, f"m_splits sum ({sum(m_splits)}) != m_total ({m_total})"
+    parts = [
+        torch.full((n,), i, device=device, dtype=torch.int32)
+        for i, n in enumerate(m_splits)
+        if n > 0
+    ]
+    if not parts:
+        return torch.empty(0, device=device, dtype=torch.int32)
+    return torch.cat(parts, dim=0)
+
+
+# DeepGEMM's contiguous M-grouped and K-grouped bf16 GEMMs require each
+# per-expert block on the grouped axis to be a multiple of this alignment
+# (typically 128 on SM90/SM100). We pad inputs to satisfy this, then strip the
+# padding from the output. Padding rows are zeros (correct identity for the
+# reduction sum) and tagged with m_indices=-1 for the M-grouped case so the
+# kernel can skip them in store.
+_DEEPGEMM_M_ALIGNMENT: Optional[int] = None
+
+
+def _deepgemm_m_alignment() -> int:
+    """Lazily fetch DeepGEMM's required per-expert block alignment."""
+    global _DEEPGEMM_M_ALIGNMENT
+    if _DEEPGEMM_M_ALIGNMENT is None:
+        _DEEPGEMM_M_ALIGNMENT = int(deep_gemm.get_m_alignment_for_contiguous_layout())
+    return _DEEPGEMM_M_ALIGNMENT
+
+
+def grouped_gemm_batch_invariant_alignment() -> int:
+    """Return the M alignment required by the DeepGEMM grouped-GEMM backend."""
+    _require_deepgemm_bf16("get_m_alignment_for_contiguous_layout")
+    return _deepgemm_m_alignment()
+
+
+def _pad_for_m_grouped(a: torch.Tensor, counts: List[int]) -> tuple:
+    """Pad an M-grouped contiguous input to satisfy DeepGEMM's per-expert M alignment.
+
+    Returns the padded input, row-to-expert map, and padded counts.
+    The padded layout groups expert i's true rows contiguously at the start of
+    its 128-aligned block; remaining rows in the block are zero with m_indices=-1.
+    """
+    alignment = _deepgemm_m_alignment()
+    padded_counts = [((count + alignment - 1) // alignment) * alignment for count in counts]
+    M_pad = sum(padded_counts)
+    if M_pad == 0:
+        return (
+            torch.empty(0, a.shape[1], device=a.device, dtype=a.dtype),
+            torch.empty(0, device=a.device, dtype=torch.int32),
+            padded_counts,
+        )
+
+    a_padded = torch.zeros(M_pad, a.shape[1], device=a.device, dtype=a.dtype)
+    m_indices_padded = torch.full((M_pad,), -1, device=a.device, dtype=torch.int32)
+    src = 0
+    dst = 0
+    for i, (count, padded_count) in enumerate(zip(counts, padded_counts)):
+        if count > 0:
+            a_padded[dst : dst + count] = a[src : src + count]
+            m_indices_padded[dst : dst + count] = i
+        src += count
+        dst += padded_count
+    return a_padded, m_indices_padded, padded_counts
+
+
+def _bf16_grouped_gemm_contiguous(
+    a: torch.Tensor, b: torch.Tensor, m_indices: torch.Tensor, counts: List[int]
+) -> torch.Tensor:
+    """bf16 M-grouped GEMM via DeepGEMM. Deterministic / batch-invariant.
+
+    a:         [M_total, K] bf16, contiguous, expert-grouped (rows of expert i
+                                              are contiguous; m_indices is sorted).
+    b:         [E, N, K]    bf16, contiguous (per-expert weights, NT layout —
+                                              DeepGEMM transposes B internally).
+    m_indices: [M_total]    int32, expert id per row (-1 to skip).
+    Returns:   [M_total, N] bf16 with rows in the same order as `a`.
+
+    Handles DeepGEMM's per-expert M alignment requirement by padding/unpadding
+    internally; the caller does not need pre-padded inputs.
+    """
+    _require_deepgemm_bf16("m_grouped_bf16_gemm_nt_contiguous")
+    assert (
+        a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+    ), f"bf16 grouped GEMM requires bf16; got a.dtype={a.dtype}, b.dtype={b.dtype}"
+    assert a.is_contiguous() and b.is_contiguous(), "a, b must be contiguous"
+    assert (
+        m_indices.dtype == torch.int32 and m_indices.is_contiguous()
+    ), "m_indices must be int32 contiguous"
+    M_total, K = a.shape
+    E, N, K_b = b.shape
+    assert K == K_b, f"K mismatch between a ({K}) and b ({K_b})"
+    assert (
+        m_indices.shape[0] == M_total
+    ), f"m_indices length {m_indices.shape[0]} != M_total {M_total}"
+
+    assert len(counts) == E and sum(counts) == M_total
+    a_padded, m_indices_padded, padded_counts = _pad_for_m_grouped(a, counts)
+    M_pad = a_padded.shape[0]
+    if M_pad == 0:
+        return torch.zeros(M_total, N, device=a.device, dtype=torch.bfloat16)
+
+    d_padded = torch.empty(M_pad, N, device=a.device, dtype=torch.bfloat16)
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a_padded, b, d_padded, m_indices_padded)
+
+    # Strip padding: copy each expert's true rows back to a [M_total, N] tensor.
+    d = torch.empty(M_total, N, device=a.device, dtype=torch.bfloat16)
+    src = 0
+    dst = 0
+    for count, padded_count in zip(counts, padded_counts):
+        if count > 0:
+            d[src : src + count] = d_padded[dst : dst + count]
+        src += count
+        dst += padded_count
+    return d
+
+
+def _bf16_grouped_gemm_aligned_contiguous(
+    a: torch.Tensor, b: torch.Tensor, m_indices: torch.Tensor
+) -> torch.Tensor:
+    """DeepGEMM M-grouped GEMM for already aligned expert blocks.
+
+    This path is used by inference CUDA graphs. The caller is responsible for
+    using `grouped_gemm_batch_invariant_alignment()` when building expert
+    offsets, so no device-to-host count extraction or dynamic padding is needed
+    on the captured path.
+    """
+    _require_deepgemm_bf16("m_grouped_bf16_gemm_nt_contiguous")
+    assert (
+        a.dtype == torch.bfloat16 and b.dtype == torch.bfloat16
+    ), f"bf16 grouped GEMM requires bf16; got a.dtype={a.dtype}, b.dtype={b.dtype}"
+    assert a.is_contiguous() and b.is_contiguous(), "a, b must be contiguous"
+    assert (
+        m_indices.dtype == torch.int32 and m_indices.is_contiguous()
+    ), "m_indices must be int32 contiguous"
+    M_total, K = a.shape
+    E, N, K_b = b.shape
+    assert K == K_b, f"K mismatch between a ({K}) and b ({K_b})"
+    assert (
+        m_indices.shape[0] == M_total
+    ), f"m_indices length {m_indices.shape[0]} != M_total {M_total}"
+
+    d = torch.empty(M_total, N, device=a.device, dtype=torch.bfloat16)
+    if M_total == 0:
+        return d
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+    return d
+
+
+def _bf16_grouped_gemm_wgrad_contiguous(
+    grad_y: torch.Tensor, x: torch.Tensor, counts: List[int]
+) -> torch.Tensor:
+    """K-grouped TN GEMM producing per-expert weight gradients via DeepGEMM.
+
+    grad_y:    [M_total, N] bf16, contiguous, expert-grouped.
+    x:         [M_total, K] bf16, contiguous, expert-grouped (same row ordering).
+    Returns:   [E, N, K]    bf16 stacked per-expert wgrad.
+
+    DeepGEMM's k_grouped_bf16 kernel computes in fp32 and requires fp32 d/c
+    accumulators; we cast the result back to bf16. Per-expert K alignment is
+    handled by padding internally.
+    """
+    _require_deepgemm_bf16("k_grouped_bf16_gemm_tn_contiguous")
+    assert grad_y.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
+    assert grad_y.is_contiguous() and x.is_contiguous()
+    M_total, N = grad_y.shape
+    M_total_b, K = x.shape
+    assert M_total == M_total_b
+
+    num_experts = len(counts)
+    assert sum(counts) == M_total
+    alignment = _deepgemm_m_alignment()
+    padded_counts = [((count + alignment - 1) // alignment) * alignment for count in counts]
+    M_pad = sum(padded_counts)
+    if M_pad == 0:
+        return torch.zeros(num_experts, N, K, device=grad_y.device, dtype=torch.bfloat16)
+
+    grad_y_pad = torch.zeros(M_pad, N, device=grad_y.device, dtype=torch.bfloat16)
+    x_pad = torch.zeros(M_pad, K, device=x.device, dtype=torch.bfloat16)
+    src = 0
+    dst = 0
+    for c, cp in zip(counts, padded_counts):
+        if c > 0:
+            grad_y_pad[dst : dst + c] = grad_y[src : src + c]
+            x_pad[dst : dst + c] = x[src : src + c]
+        src += c
+        dst += cp
+
+    ks_tensor = torch.tensor(padded_counts, dtype=torch.int32, device=grad_y.device)
+    d_fp32 = torch.zeros(num_experts, N, K, device=grad_y.device, dtype=torch.float32)
+    c_zero = torch.zeros(num_experts, N, K, device=grad_y.device, dtype=torch.float32)
+    deep_gemm.k_grouped_bf16_gemm_tn_contiguous(
+        grad_y_pad, x_pad, d_fp32, padded_counts, ks_tensor, c_zero
+    )
+    return d_fp32.to(torch.bfloat16)
+
+
+def grouped_gemm_batch_invariant(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    offs: torch.Tensor,
+    m_total: int,
+) -> torch.Tensor:
+    """Run the graph-safe grouped GEMM over pre-aligned inference expert blocks."""
+    m_indices = _offs_to_m_indices(offs, m_total).contiguous()
+    return _bf16_grouped_gemm_aligned_contiguous(a.contiguous(), b.contiguous(), m_indices)
+
+
 def _te_rmsnorm_forward_patched(self, x: torch.Tensor) -> torch.Tensor:
     """Patched TE RMSNorm.forward that routes to batch-invariant
     implementation with autograd support.
@@ -962,11 +1599,30 @@ def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
 
-def enable_batch_invariant_mode():
-    """Enable global batch-invariant mode and patch Aten/TE kernels."""
-    global _batch_invariant_MODE, _batch_invariant_LIB
+def enable_batch_invariant_mode(backend: str = "deepgemm"):
+    """Enable global batch-invariant mode and patch Aten/TE kernels.
+
+    Args:
+        backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
+            "deepgemm" (default) routes bf16 CUDA inputs through DeepGEMM
+            `bf16_gemm_nn`. "triton" routes through the batch-invariant
+            Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
+            on any CUDA device). Grouped GEMM always uses DeepGEMM regardless.
+    """
+    global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
     if _batch_invariant_MODE:
         return
+    if backend not in _BATCH_INVARIANT_BACKENDS:
+        raise ValueError(
+            f"Unknown batch-invariant backend {backend!r}; "
+            f"expected one of {_BATCH_INVARIANT_BACKENDS}."
+        )
+    if backend == "deepgemm" and not HAVE_DEEPGEMM_BF16:
+        raise RuntimeError(
+            "The DeepGEMM batch-invariant backend requires DeepGEMM with "
+            "bf16 bindings. Install DeepGEMM or use backend='triton'."
+        )
+    _BATCH_INVARIANT_BACKEND = backend
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
@@ -976,6 +1632,10 @@ def enable_batch_invariant_mode():
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
     _te_patch_for_batch_invariant()
+    # Pin the Mamba autotuners so rollout and training processes can't end
+    # up on different tile configs (and therefore different fp32 reduction
+    # orders) through autotune timing noise.
+    _pin_mamba_autotuners()
 
 
 def disable_batch_invariant_mode():
@@ -987,33 +1647,137 @@ def disable_batch_invariant_mode():
     _batch_invariant_LIB = None
     # Restore Transformer Engine kernels if previously patched
     _te_unpatch_for_batch_invariant()
+    _unpin_mamba_autotuners()
+
+
+# (autotuner, original configs list) pairs saved by _pin_mamba_autotuners.
+_PINNED_AUTOTUNERS: list = []
+
+# Rollout uses the repo kernels while training uses mamba_ssm. Pin a config
+# present in both copies so autotune timing cannot change the reduction order.
+_PINNED_MAMBA_CONFIGS = {
+    "_bmm_chunk_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+    "_chunk_scan_fwd_kernel": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
+    "_chunk_state_fwd_kernel": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
+    "_chunk_cumsum_fwd_kernel": {"BLOCK_SIZE_H": 8},
+    "_state_passing_fwd_kernel": {"BLOCK_SIZE": 1024},
+}
+
+
+def _pin_mamba_autotuners():
+    """Pin the Mamba chunked-scan forward kernels to fixed tile configs.
+
+    BLOCK sizes determine the fp32 reduction grouping inside tl.dot loops,
+    so rollout/train parity needs the inference process (repo ssd_* kernels)
+    and the training process (mamba_ssm package kernels) to pick the same
+    config. Triton's autotuner re-benchmarks per process and timing noise
+    can flip the winner; we've seen that break parity in practice. Pinning
+    both sides to the same config removes the benchmark from the loop.
+
+    Only the five forward kernels matter for parity; backward kernels only
+    affect gradients.
+    """
+    global _PINNED_AUTOTUNERS
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except ImportError:
+        return
+
+    kernels = []
+    try:
+        from megatron.core.ssm.ops import (
+            ssd_bmm as r_bmm,
+            ssd_chunk_scan as r_scan,
+            ssd_chunk_state as r_state,
+            ssd_state_passing as r_pass,
+        )
+
+        kernels += [
+            r_bmm._bmm_chunk_fwd_kernel,
+            r_scan._chunk_scan_fwd_kernel,
+            r_state._chunk_cumsum_fwd_kernel,
+            r_state._chunk_state_fwd_kernel,
+            r_pass._state_passing_fwd_kernel,
+        ]
+    except ImportError:
+        pass
+    try:
+        from mamba_ssm.ops.triton import (
+            ssd_bmm as p_bmm,
+            ssd_chunk_scan as p_scan,
+            ssd_chunk_state as p_state,
+            ssd_state_passing as p_pass,
+        )
+
+        kernels += [
+            p_bmm._bmm_chunk_fwd_kernel,
+            p_scan._chunk_scan_fwd_kernel,
+            p_state._chunk_cumsum_fwd_kernel,
+            p_state._chunk_state_fwd_kernel,
+            p_pass._state_passing_fwd_kernel,
+        ]
+    except (ImportError, AttributeError):
+        pass
+
+    for kernel in kernels:
+        if not isinstance(kernel, Autotuner) or len(kernel.configs) <= 1:
+            continue
+        name = getattr(getattr(kernel, "fn", None), "__name__", "")
+        expected = _PINNED_MAMBA_CONFIGS[name]
+        chosen = next(
+            cfg
+            for cfg in kernel.configs
+            if all(cfg.kwargs.get(key) == value for key, value in expected.items())
+        )
+        _PINNED_AUTOTUNERS.append((kernel, kernel.configs))
+        kernel.configs = [chosen]
+        if hasattr(kernel, "cache"):
+            kernel.cache.clear()
+
+
+def _unpin_mamba_autotuners():
+    """Restore the original autotune config lists saved by _pin_mamba_autotuners."""
+    global _PINNED_AUTOTUNERS
+    for kernel, original in _PINNED_AUTOTUNERS:
+        kernel.configs = original
+        if hasattr(kernel, "cache"):
+            kernel.cache.clear()
+    _PINNED_AUTOTUNERS = []
 
 
 @contextlib.contextmanager
-def set_batch_invariant_mode(enabled: bool = True):
+def set_batch_invariant_mode(enabled: bool = True, backend: Optional[str] = None):
     """Context manager to toggle global batch-invariant mode.
 
     When `enabled` is True, batch-invariant kernels are enabled for the duration of
     the context; when False, they are disabled for the duration. This implementation
     is re-entrant and correctly restores the previous state even under nesting.
+    The helper default remains "triton" for tests that exercise non-bf16 operators.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB
     # Save the previous on/off state so we can correctly restore it, even under
     # nested usage or when toggling from True->False inside an outer True scope.
     prev_enabled = _batch_invariant_MODE
+    prev_backend = _BATCH_INVARIANT_BACKEND
 
     # Apply the requested state only if it differs from the current one.
     if enabled and not prev_enabled:
-        enable_batch_invariant_mode()
+        enable_batch_invariant_mode(backend=backend or "triton")
+    elif enabled and prev_enabled and backend is not None and backend != prev_backend:
+        raise RuntimeError(
+            "Cannot switch batch-invariant backend inside an active context "
+            f"(active={prev_backend!r}, requested={backend!r})."
+        )
     elif not enabled and prev_enabled:
         disable_batch_invariant_mode()
 
     try:
         yield
     finally:
-        # Restore the previous state. If we turned BIK on at entry, turn it off here.
-        # If we turned it off at entry (inside an outer True scope), turn it back on.
+        # Restore the previous state. If we turned batch-invariant mode on at
+        # entry, turn it off here. If we turned it off at entry (inside an
+        # outer True scope), turn it back on.
         if enabled and not prev_enabled:
             disable_batch_invariant_mode()
         elif not enabled and prev_enabled:
-            enable_batch_invariant_mode()
+            enable_batch_invariant_mode(backend=prev_backend)

@@ -26,6 +26,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.ops.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -438,6 +439,10 @@ class MambaMixer(MegatronModule):
                 return self._dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
+                assert not self.config.batch_invariant_mode, (
+                    "batch_invariant_mode for Mamba inference is only supported with "
+                    "DynamicInferenceContext."
+                )
                 assert not self.config.sequence_parallel
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
@@ -936,7 +941,20 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
-            ssm_varlen_result = mamba_chunk_scan_combined_varlen(
+            # Batch-invariant decode replays the partial prefill tail, so keep
+            # the cached SSM state at the last complete chunk boundary.
+            boundary_chunk_indices = None
+            has_boundary = None
+            if self.config.batch_invariant_mode:
+                prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+                tail_lens = prefill_lens % self.chunk_size
+                has_boundary = prefill_lens >= self.chunk_size
+                # A partial tail uses the preceding full chunk's state.
+                boundary_chunk_indices = (
+                    last_chunk_indices.to(torch.long) - (tail_lens > 0).to(torch.long)
+                ).clamp(min=0)
+
+            scan_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
                 A=A,
@@ -955,23 +973,40 @@ class MambaMixer(MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=self.cp.get_dt_bias().float(),
                 initial_states=initial_ssm_state,
-                return_intermediate_states=False,
-                intermediate_chunk_indices=intermediate_chunk_indices,
+                return_intermediate_states=self.config.batch_invariant_mode,
+                intermediate_chunk_indices=(
+                    None if self.config.batch_invariant_mode else intermediate_chunk_indices
+                ),
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 state_dtype=ssm_state.dtype,
             )
 
-            if intermediate_chunk_indices is not None:
-                ssm_varlen_states, intermediate_ssm_states = ssm_varlen_result
-            else:
-                ssm_varlen_states = ssm_varlen_result
-                intermediate_ssm_states = None
-
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+            if self.config.batch_invariant_mode:
+                scan_states = scan_result
+                boundary_mask = has_boundary.view(-1, 1, 1, 1)
+                cache_states = torch.where(
+                    boundary_mask, scan_states[boundary_chunk_indices], initial_ssm_state
+                )
+                intermediate_ssm_states = (
+                    scan_states[intermediate_chunk_indices]
+                    if intermediate_chunk_indices is not None
+                    else None
+                )
+            elif intermediate_chunk_indices is not None:
+                cache_states, intermediate_ssm_states = scan_result
+            else:
+                cache_states = scan_result
+                intermediate_ssm_states = None
+
+            tensor_masked_update(ssm_state, batch_indices, cache_states)
+            if self.config.batch_invariant_mode:
+                self._batch_invariant_decode().seed(
+                    x, dt, B, C, cu_seqlens, batch_indices, max_batch=ssm_state.shape[0]
+                )
 
             # Write intermediate states to pre-allocated output buffers
             # All tensor ops, no Python loops, fully CUDA graph compatible.
@@ -1045,6 +1080,12 @@ class MambaMixer(MegatronModule):
                 self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
             self._A_neg_exp_cache_stale = False
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+
+    def _batch_invariant_decode(self) -> MambaBatchInvariantDecode:
+        """Batch-invariant decode adapter, created on first use."""
+        if not hasattr(self, "_batch_invariant_decoder"):
+            self._batch_invariant_decoder = MambaBatchInvariantDecode(self)
+        return self._batch_invariant_decoder
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
@@ -1192,6 +1233,12 @@ class MambaMixer(MegatronModule):
                     y = y * self.act(z)  # (B D)
 
             y = y.unsqueeze(1)  # Restore seq dimension
+        elif self.config.batch_invariant_mode:
+            assert batch_indices is not None, (
+                "batch_invariant_mode for Mamba decode requires dynamic batching "
+                "batch_indices."
+            )
+            y = self._batch_invariant_decode().step(x, dt, B, C, batch_indices, ssm_state)
         else:
             A = self._get_decode_A_neg_exp()
 
