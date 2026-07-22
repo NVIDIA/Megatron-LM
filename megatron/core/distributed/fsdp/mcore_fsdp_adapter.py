@@ -507,7 +507,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
-        self._validate_config(config, ddp_config, module, pg_collection, disable_bucketing)
+        FullyShardedDataParallelV2._validate_config(
+            config, ddp_config, module, pg_collection, disable_bucketing
+        )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

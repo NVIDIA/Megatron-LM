@@ -42,7 +42,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             init_state_fn: Function used to initialize optimizer state.
             model_chunks: MFSDP v2 model chunks optimized by this wrapper.
         """
-        self._validate_config(config, model_chunks)
+        FullyShardedOptimizer._validate_config(config, model_chunks)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
         if grad_scaler is not None:
