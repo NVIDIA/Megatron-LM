@@ -18,10 +18,12 @@ try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_apply_mla_rope_for_kv,
         fused_apply_mla_rope_for_q,
+        rotary_bwd_q_kernel,
     )
 except:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
+    rotary_bwd_q_kernel = None
 
 
 def dtype_tols(dtype):
@@ -300,9 +302,65 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_rotary_bwd_q_single_warp_configs_are_deterministic() -> None:
+    """Exercise every production config as an exact in-place layout permutation."""
+    import triton
+
+    num_heads = 32
+    q_dim = 128
+    emb_dim = 64
+    total_seqlen = 128
+    generator = torch.Generator(device="cuda").manual_seed(617)
+    before = torch.randn(
+        (total_seqlen, num_heads, q_dim + emb_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    cos = torch.ones((total_seqlen, 1, 1, emb_dim), dtype=torch.bfloat16, device="cuda")
+    sin = torch.zeros_like(cos)
+
+    torch_reference = before.clone()
+    half = emb_dim // 2
+    torch_reference[..., q_dim::2] = before[..., q_dim : q_dim + half]
+    torch_reference[..., q_dim + 1 :: 2] = before[..., q_dim + half :]
+
+    def launch(block_h: int, num_warps: int, num_stages: int) -> torch.Tensor:
+        result = before.clone()
+        rotary_bwd_q_kernel.fn[(total_seqlen, triton.cdiv(num_heads, block_h))](
+            result,
+            cos,
+            sin,
+            q_dim,
+            emb_dim,
+            num_heads,
+            1,
+            None,
+            None,
+            result.stride(0),
+            result.stride(1),
+            0,
+            1,
+            BLOCK_H=block_h,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return result
+
+    for config in rotary_bwd_q_kernel.configs:
+        assert config.num_warps == 1, "In-place backward layout conversion must be single-warp"
+        block_h = config.kwargs["BLOCK_H"]
+        for _ in range(100):
+            actual = launch(block_h, config.num_warps, config.num_stages)
+            assert torch.equal(actual, torch_reference)
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
 class TestFusedApplyMLARope:
-    @pytest.mark.flaky_in_dev
     def test_forward_backward_for_q(self, input_format):
         _test_fused_apply_mla_rope_for_q(input_format)
 
