@@ -982,6 +982,13 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    context_parallel_attention_backend: Literal['default', 'nvshmem'] = 'default'
+    """Context-parallel attention implementation.
+
+    ``default`` preserves the configured core-attention implementation. ``nvshmem`` enables the
+    experimental symmetric-QKV backend for its explicitly validated CP=4 training contract.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -2735,6 +2742,29 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+
+        if self.context_parallel_attention_backend == 'nvshmem':
+            assert self.context_parallel_size == 4, (
+                "The experimental NVSHMEM attention backend currently requires "
+                f"context_parallel_size=4, got {self.context_parallel_size}."
+            )
+            assert self.tensor_model_parallel_size == 1, (
+                "The experimental NVSHMEM attention backend currently requires "
+                f"tensor_model_parallel_size=1, got {self.tensor_model_parallel_size}."
+            )
+            assert self.cp_comm_type == 'p2p', (
+                "The experimental NVSHMEM attention backend uses p2p as its explicit baseline "
+                f"contract, got cp_comm_type={self.cp_comm_type!r}."
+            )
+            assert self.kv_channels == 128, (
+                "The experimental NVSHMEM attention backend currently requires head_dim=128, "
+                f"got kv_channels={self.kv_channels}."
+            )
+            assert self.num_query_groups == self.num_attention_heads, (
+                "The experimental NVSHMEM attention backend currently supports MHA only, got "
+                f"num_query_groups={self.num_query_groups} and "
+                f"num_attention_heads={self.num_attention_heads}."
+            )
 
         assert (
             self.pipeline_model_parallel_size > 0
