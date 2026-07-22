@@ -60,7 +60,7 @@ from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -120,6 +120,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import (
     StragglerDetector,
@@ -205,6 +206,8 @@ except ImportError:
 
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
+
+    from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -920,7 +923,7 @@ def get_start_time_from_progress_log():
     def _get_field(string, type):
         return type(string.split(': ')[1])
 
-    with open_file(progress_log_filename, 'r') as f:
+    with maybe_msc.open(progress_log_filename, 'r') as f:
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
@@ -984,7 +987,13 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            # Treat missing and explicit None identifier values as equivalent.
+            # Wrap each component so None never compares directly with floats or strings.
+            def key_fn(pg):
+                return [
+                    (value is not None, value)
+                    for value in (pg.get(key) for key in param_group_identifier_keys)
+                ]
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -1700,16 +1709,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import has_modelopt_state
-
-        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
-        # set a flag to use our model provider if so.
-        if args.load is not None and has_modelopt_state(args.load):
-            print_rank_0(f'ModelOpt checkpoint detected')
-            args.modelopt_enabled = True
-        elif getattr(args, "export_kd_teacher_load", None):
-            # For distillation ckpts without ModelOpt state
-            args.modelopt_enabled = True
+        maybe_enable_modelopt(args)
 
     # Build model.
     def build_model():
@@ -2016,8 +2016,11 @@ def setup_model_and_optimizer(
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+
     def _build_model_wrapper(wrap_with_ddp: bool):
-        if cfg_container is not None and hasattr(cfg_container, "model"):
+        if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
@@ -2175,6 +2178,14 @@ def setup_model_and_optimizer(
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+
+    # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
+    # Import locally to prevent circular import: megatron.post_training.checkpointing
+    # imports `get_args` from megatron.training at module scope.
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
+
+        load_kd_teacher_checkpoint(model)
 
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
@@ -2370,6 +2381,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
+
+        # Advance the router tracer step if active.
+        tracer = get_moe_router_tracer()
+        if tracer is not None:
+            tracer.advance_step(iteration)
 
         # Reset force_all_reduce field.
         for model_chunk in model:
@@ -2950,10 +2966,6 @@ def save_checkpoint_and_time(
     timers('interval-time').stop()
     energy_monitor.pause()
 
-    # Extra barrier is added to make sure all ranks report the max time.
-    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=True)
-
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
@@ -2963,6 +2975,10 @@ def save_checkpoint_and_time(
         if hasattr(model_chunk, 'free_overlap_buffers'):
             model_chunk.free_overlap_buffers()
     torch.cuda.empty_cache()
+
+    # timer.log() reports the min & max time. We do not need a barrier here.
+    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+    timers(timer_key, log_level=0).start(barrier=False)
 
     # Resolve checkpoint groups from this rank's module PGC; None for stock runs
     # falls back to the mpu groups inside save_checkpoint (byte-identical).
@@ -3002,7 +3018,8 @@ def save_checkpoint_and_time(
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
-    timers(timer_key).stop(barrier=True)
+    # Since timer.log() reports the min & max time, we do not need a barrier here.
+    timers(timer_key).stop(barrier=False)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
 
     if should_report_memory:
@@ -3455,6 +3472,23 @@ def train(
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
         _run_gpu_sniff_test('before training')
+
+    # Initialize router trace if requested.  The tracer attaches forward hooks
+    # to all TopKRouter modules and writes one JSONL record per (iteration,
+    # layer).  advance_step() is called at the end of each train_step().
+    if getattr(args, 'moe_routing_trace_path', None):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        max_steps = getattr(args, 'moe_routing_trace_max_training_iters', None) or args.train_iters
+        init_moe_router_tracer(
+            output_dir=args.moe_routing_trace_path,
+            max_steps=max_steps,
+            rank=rank,
+            training_mode=True,
+            capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
+            capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
+            dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+        )
+        get_moe_router_tracer().register_hooks(model)
 
     report_memory_flag = True
     pre_hook_enabled = False
@@ -3967,6 +4001,13 @@ def train(
         if should_exit:
             break
 
+    # Early-exit paths (exit-duration / exit-interval / signal handler) sys.exit()
+    # below before the normal-path logging, so record the train-loop finish time here.
+    if should_exit:
+        one_logger and one_logger.log_metrics(
+            {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
+
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
@@ -4014,6 +4055,9 @@ def train(
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
                     if getattr(buf, 'nccl_mem_pool', None) is not None:
                         nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+        one_logger and one_logger.log_metrics(
+            {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()

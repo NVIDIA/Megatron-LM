@@ -742,6 +742,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
+            packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
 
@@ -759,11 +760,51 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return pre_mlp_layernorm_output
 
+    def _maybe_unflatten_for_moe(self, hidden_states, padding_mask, packed_seq_params):
+        """Un-flatten packed sequences to restore the batch dimension for MoE.
+
+        When inter-document masking flattens MBS > 1 into [mbs*S, 1, H], the MoE
+        router sees bsz=1 and computes seq_aux_loss over the entire flattened
+        sequence instead of per sample. Un-flattening to [S, mbs, H] before the
+        MoE layer restores the correct per-sample structure.
+
+        Returns:
+            (hidden_states, padding_mask, mbs) where mbs is None if no
+            un-flattening was applied.
+        """
+        if (
+            not self.is_moe_layer
+            or packed_seq_params is None
+            or getattr(packed_seq_params, 'tokens_per_sample', None) is None
+        ):
+            return hidden_states, padding_mask, None
+
+        tokens_per_sample = packed_seq_params.tokens_per_sample
+        mbs = hidden_states.shape[0] // tokens_per_sample
+        if mbs <= 1:
+            return hidden_states, padding_mask, None
+
+        # The flattened tensor has all tokens from sample 0, then all tokens
+        # from sample 1, etc. A plain reshape would keep that ordering, but we
+        # need dim 0 to be the token position and dim 1 to be the sample index,
+        # so view + transpose is required.
+        hidden_states = hidden_states.view(mbs, tokens_per_sample, -1).transpose(0, 1).contiguous()
+        if padding_mask is not None:
+            padding_mask = padding_mask.view(mbs, tokens_per_sample)
+        return hidden_states, padding_mask, mbs
+
+    def _maybe_reflatten_from_moe(self, output, packed_seq_params, mbs):
+        """Re-flatten MoE output back to [mbs*S, 1, H] for the residual add."""
+        if mbs is None:
+            return output
+        return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
+
     def _forward_mlp(
         self,
         hidden_states: Tensor,
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
+        packed_seq_params=None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -776,6 +817,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from aux loss computations.
                 The MoELayer will internally transform this to [seq_length, bsz] format.
+            packed_seq_params: Packed sequence parameters, used to detect flattened
+                batches that need reshaping for MoE sequence load balancing.
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
@@ -797,6 +840,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.fp32_residual_connection:
             residual = residual.float()
+
+        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
+            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        )
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -867,6 +914,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = apply_module(self.mlp)(
                 pre_mlp_layernorm_output, padding_mask=padding_mask
             )
+
+        if moe_unflatten_mbs is not None:
+            mlp_output, mlp_bias = mlp_output_with_bias
+            mlp_output = self._maybe_reflatten_from_moe(
+                mlp_output, packed_seq_params, moe_unflatten_mbs
+            )
+            mlp_output_with_bias = (mlp_output, mlp_bias)
 
         nvtx_range_pop(suffix="mlp")
 
@@ -1645,7 +1699,9 @@ class MoETransformerLayer(TransformerLayer):
 
         return out
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+    def _forward_mlp(
+        self, hidden_states, inference_context=None, padding_mask=None, packed_seq_params=None
+    ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
 
@@ -1680,11 +1736,15 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         if self.use_partial_cudagraphs:
+            hidden_states, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
+                hidden_states, padding_mask, packed_seq_params
+            )
+
             if self.moe_layer_recompute:
                 if self.config.fp8 or self.config.fp4:
                     from megatron.core.extensions.transformer_engine import te_checkpoint
 
-                    return te_checkpoint(
+                    result = te_checkpoint(
                         _forward_mlp_partial_cudagraphs,
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
@@ -1693,7 +1753,7 @@ class MoETransformerLayer(TransformerLayer):
                         padding_mask=padding_mask,
                     )
                 else:
-                    return tensor_parallel.checkpoint(
+                    result = tensor_parallel.checkpoint(
                         functools.partial(
                             _forward_mlp_partial_cudagraphs, padding_mask=padding_mask
                         ),
@@ -1701,6 +1761,12 @@ class MoETransformerLayer(TransformerLayer):
                         hidden_states,
                     )
             else:
-                return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
+                result = _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
+
+            result = self._maybe_reflatten_from_moe(result, packed_seq_params, moe_unflatten_mbs)
+
+            return result
         else:
-            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
+            return super()._forward_mlp(
+                hidden_states, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+            )
