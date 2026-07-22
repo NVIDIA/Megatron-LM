@@ -7,4 +7,5 @@ from .variable_collectives import (
     multimem_all_gather_v,
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
+    ordered_reduce_scatter_v,
 )

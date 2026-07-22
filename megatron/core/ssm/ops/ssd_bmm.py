@@ -67,7 +67,8 @@ def _bmm_chunk_fwd_kernel(
     a_ptr,
     b_ptr,
     out_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
+    target_rows_ptr,
     # Matrix dimensions
     seqlen,
     chunk_size: tl.constexpr,
@@ -85,6 +86,7 @@ def _bmm_chunk_fwd_kernel(
     stride_outn: tl.constexpr,
     # Meta-parameters
     IS_CAUSAL: tl.constexpr,
+    HAS_TARGET_ROWS: tl.constexpr,
     dot_dtype: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -99,9 +101,20 @@ def _bmm_chunk_fwd_kernel(
     if IS_CAUSAL:
         if pid_n * BLOCK_SIZE_N >= (pid_m + 1) * BLOCK_SIZE_M:
             return
+    if HAS_TARGET_ROWS:
+        # Keep the target row's tile and its causal column tiles.
+        tr = tl.load(target_rows_ptr + pid_c)
+        if pid_m != tr // BLOCK_SIZE_M:
+            return
+        if pid_n * BLOCK_SIZE_N > tr:
+            return
 
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
+    if HAS_TARGET_ROWS:
+        # Fixed windows need only a start offset.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
 
     a_ptr += chunk_seqlen_start * stride_a_seqlen + pid_h * stride_a_head
     b_ptr += chunk_seqlen_start * stride_b_seqlen + pid_h * stride_b_head
@@ -140,7 +153,16 @@ def _bmm_chunk_fwd_kernel(
     tl.store(out_ptrs, out, mask=(offs_m[:, None] < chunk_size) & (offs_n[None, :] < chunk_size))
 
 
-def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None):
+def _bmm_chunk_fwd(
+    a,
+    b,
+    chunk_size,
+    cu_chunk_seqlens,
+    causal=False,
+    output_dtype=None,
+    target_rows=None,
+    chunk_starts=None,
+):
     """
     Argument:
         a: (seqlen, ngroups, k)
@@ -149,9 +171,23 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
         cu_chunk_seq_lens: (nchunks+1,)
         causal: if True, then out[i, j] for i > j will be arbitrary, only out[i, j] for i <= j are
             guaranteed to be correct.
+        target_rows: optional (nchunks,) int32. Decode mode: compute only the
+            M-block containing target_rows[c] (and N-blocks up to it); other
+            output entries are left uninitialized.
     Return:
         out: (nchunks, ngroups, chunk_size, chunk_size)
     """
+    has_target_rows = target_rows is not None
+    assert (chunk_starts is not None) == has_target_rows, (
+        "target_rows and chunk_starts must be provided together"
+    )
+    if has_target_rows:
+        # chunk_starts has one fixed-window start per chunk.
+        chunk_offsets = chunk_starts
+        nchunks = len(chunk_starts)
+    else:
+        chunk_offsets = cu_chunk_seqlens
+        nchunks = len(cu_chunk_seqlens) - 1
     seqlen, ngroups, k = a.shape
     assert b.shape == a.shape
     if a.stride(-1) != 1 and a.stride(0) != 1:
@@ -159,7 +195,6 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
     if b.stride(-1) != 1 and b.stride(0) != 1:
         b = b.contiguous()
 
-    nchunks = len(cu_chunk_seqlens) - 1
     # Allocates output.
     out_dtype = a.dtype if output_dtype is None else output_dtype
     out = torch.empty((nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype)
@@ -178,7 +213,8 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
             a_ptr=a,
             b_ptr=b,
             out_ptr=out,
-            cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            chunk_offsets_ptr=chunk_offsets,
+            target_rows_ptr=target_rows,
             seqlen=seqlen,
             chunk_size=chunk_size,
             K=k,
@@ -194,6 +230,7 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
             stride_outm=out.stride(-2),
             stride_outn=out.stride(-1),
             IS_CAUSAL=causal,
+            HAS_TARGET_ROWS=has_target_rows,
             dot_dtype=dot_dtype,
         )
     return out

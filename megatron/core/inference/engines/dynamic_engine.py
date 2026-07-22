@@ -1467,6 +1467,26 @@ class DynamicInferenceEngine(AbstractEngine):
                 return i + 1
         return 0
 
+    def _mamba_batch_invariant_prefill_chunk_length(
+        self, req: DynamicInferenceRequest, capacity: int
+    ) -> int:
+        """Raw prefill length that computes an aligned chunk within ``capacity``.
+
+        Non-final calls must start and end at Mamba chunk boundaries. The final
+        prompt call may be shorter because it seeds the decode replay tail.
+        """
+        remaining = len(req.remaining_prompt_tokens)
+        if capacity >= remaining:
+            return remaining
+
+        chunk_size = self.context.mamba_chunk_size
+        computed_tokens = (capacity // chunk_size) * chunk_size
+        if remaining - computed_tokens == 1:
+            computed_tokens -= chunk_size
+        if computed_tokens <= 0:
+            return 0
+        return computed_tokens
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         # Keep track of which requests get scheduled.
@@ -1571,6 +1591,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+            batch_invariant_mamba_prefill = (
+                self.context.batch_invariant_mode and self.context.is_hybrid_model
+            )
 
             # Check for conflicting block hashes.
             if prefix_caching_enabled and not is_continuing_chunked_prefill:
@@ -1630,29 +1653,47 @@ class DynamicInferenceEngine(AbstractEngine):
                                 not in self.context.kv_block_allocator.kv_hash_to_block_id
                             ):
                                 pending_block_hashes.add(block_hash)
-                    prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
+                    available_prefill_length = (
+                        self.context.max_tokens - self.context.active_token_count
+                    )
+                    scheduled_prefill_length = available_prefill_length
+
+                    if batch_invariant_mamba_prefill:
+                        scheduled_prefill_length = self._mamba_batch_invariant_prefill_chunk_length(
+                            req, available_prefill_length
+                        )
+                        # No valid non-final Mamba chunk fits in the remaining token budget.
+                        if scheduled_prefill_length == 0:
+                            can_schedule = False
+                            break
 
                     # If this chunk would leave exactly 1 token for the final chunk, reduce
                     # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
                     # This avoids the edge case where max_seqlen_q=1 which results in a bug
                     # with the Flash Attention kernel.
                     # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - prefill_chunk_length == 1:
-                        if prefill_chunk_length > 1:
-                            prefill_chunk_length -= 1
+                    # Batch-invariant Mamba handles this in its chunk-length helper.
+                    if (
+                        not batch_invariant_mamba_prefill
+                        and remaining_len - scheduled_prefill_length == 1
+                    ):
+                        if scheduled_prefill_length > 1:
+                            scheduled_prefill_length -= 1
                         else:
                             # We only have space for 1 token, but remaining is 2.
                             # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
                             can_schedule = False
                             break
 
-                    self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
+                    self.context.add_request(req, prefill_chunk_length=scheduled_prefill_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
-                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[prefill_chunk_length:]
-                    req.finished_chunk_token_count += prefill_chunk_length
+                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[
+                        scheduled_prefill_length:
+                    ]
+                    req.finished_chunk_token_count += scheduled_prefill_length
                     # Still have tokens to prefill, so we break and keep the
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
