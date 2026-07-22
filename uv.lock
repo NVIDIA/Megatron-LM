@@ -2223,6 +2223,7 @@ training = [
 build = [
     { name = "cython" },
     { name = "hatchling" },
+    { name = "nvidia-cudnn-frontend" },
     { name = "nvidia-mathdx" },
     { name = "packaging" },
     { name = "pybind11" },
@@ -2322,6 +2323,7 @@ provides-extras = ["training", "mlm", "dev", "lts", "te", "ssm"]
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
+    { name = "nvidia-cudnn-frontend", specifier = ">=1.25.0" },
     { name = "nvidia-mathdx" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pybind11" },

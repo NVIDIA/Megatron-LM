@@ -163,7 +163,8 @@ build = [
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-mathdx",              # for TE
+    "nvidia-cudnn-frontend>=1.25.0",  # for TE
+    "nvidia-mathdx",                  # for TE
 ]
 linting = [
     "ruff~=0.9.0",
