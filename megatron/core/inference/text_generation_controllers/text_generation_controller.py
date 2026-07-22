@@ -245,7 +245,7 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = None
         self._async_sched_logits = AsyncScheduleLogitsState()
-        # This buffer has a stable address across legacy-prefill, async-decode,
+        # This buffer has a stable address across legacy, no-overlap, overlap,
         # and MTP routing. Sampling producers must copy into it rather than rebind it.
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
         self._async_sched_sample_values_cuda = torch.empty(
@@ -2464,13 +2464,13 @@ class TextGenerationController:
                     self._run_async_sched_forward(input_ids, position_ids)
                 else:
                     primer_launched, bookkeeping_done_event = self._run_async_sched_forward_primer()
-                    assert primer_launched, "Initial async prefill must launch a forward primer."
+                    assert primer_launched, "Initial no-overlap step must launch a forward primer."
                     self._synchronize_async_sched_event(bookkeeping_done_event)
             elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
                 self._run_dummy_async_sched_base_step()
 
         if not had_pending_forward:
-            assert active_request_count > 0, "Async prefill admission did not add a request."
+            assert active_request_count > 0, "Async no-overlap admission did not add a request."
             return DynamicBatchControllerStepResult(primer_only=True)
 
         result = self._build_async_sched_step_result(
@@ -2480,13 +2480,13 @@ class TextGenerationController:
         return result
 
     async def _run_async_sched_step_overlap(self) -> DynamicBatchControllerStepResult:
-        """Run ``prepare -> sample -> forward -> resolve`` for one-token decode.
+        """Run ``prepare -> sample -> forward -> resolve`` with one token per request.
 
         Returns:
             DynamicBatchControllerStepResult: Completed sampled-step result.
         """
         context = self.inference_wrapped_model.inference_context
-        assert self._async_sched_logits.is_valid, "Async decode requires pending logits."
+        assert self._async_sched_logits.is_valid, "Async overlap requires pending logits."
 
         with torch.inference_mode():
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
@@ -2549,13 +2549,13 @@ class TextGenerationController:
         return result
 
     async def _run_async_sched_step_overlap_mtp(self) -> DynamicBatchControllerStepResult:
-        """Run ``sample/MTP -> prepare -> forward -> resolve`` for MTP decode.
+        """Run ``sample/MTP -> prepare -> forward -> resolve`` with MTP.
 
         Returns:
             DynamicBatchControllerStepResult: Completed sampled-step result.
         """
         context = self.inference_wrapped_model.inference_context
-        assert self._async_sched_logits.is_valid, "Async MTP decode requires pending logits."
+        assert self._async_sched_logits.is_valid, "Async MTP overlap requires pending logits."
 
         with torch.inference_mode():
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
@@ -2793,7 +2793,7 @@ class TextGenerationController:
         self,
         skip_bookkeeping: Optional[bool] = False,
         *,
-        run_async_prefill: bool = False,
+        run_async_overlap: bool = True,
         schedule_waiting_requests: Optional[Callable[[], None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
@@ -2801,9 +2801,9 @@ class TextGenerationController:
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip context bookkeeping
                 on the legacy path.
-            run_async_prefill (bool): Whether to run the async prefill ordering.
+            run_async_overlap (bool): Whether to run the overlap ordering.
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
-                used by the async prefill path to admit eligible requests.
+                used by the no-overlap path to admit eligible prefill requests.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.
@@ -2822,11 +2822,11 @@ class TextGenerationController:
         self._validate_async_sched_support_for_step()
 
         active_request_count = context.total_request_count - context.paused_request_count
-        if context.active_token_count == 0 and active_request_count == 0 and not run_async_prefill:
+        if context.active_token_count == 0 and active_request_count == 0 and run_async_overlap:
             self._async_sched_logits.clear()
             return DynamicBatchControllerStepResult()
 
-        if run_async_prefill or not self._async_sched_logits.is_valid:
+        if not run_async_overlap or not self._async_sched_logits.is_valid:
             return await self._run_async_sched_step_no_overlap(
                 schedule_waiting_requests=schedule_waiting_requests
             )
@@ -2852,7 +2852,7 @@ class TextGenerationController:
             context = self.inference_wrapped_model.inference_context
             result = loop.run_until_complete(
                 self.async_generate_output_tokens_dynamic_batch(
-                    run_async_prefill=context.num_prefill_requests != 0
+                    run_async_overlap=context.num_prefill_requests == 0
                 )
             )
             if not result.primer_only:

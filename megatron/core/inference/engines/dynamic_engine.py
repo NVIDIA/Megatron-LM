@@ -1655,19 +1655,19 @@ class DynamicInferenceEngine(AbstractEngine):
             return self._cg_admission_check(req, candidate)
         return self._matches_cg_admission(candidate)
 
-    def _has_async_sched_prefill_work(self) -> bool:
-        """Return whether this step should use async prefill ordering.
+    def _should_run_async_sched_overlap(self) -> bool:
+        """Return whether this step should use overlap ordering.
 
         Returns:
-            bool: Whether prefill is active or the queue head is currently admissible.
+            bool: Whether the next step can use overlap ordering.
         """
         if self.context.num_prefill_requests > 0:
-            return True
-        if not self.waiting_request_ids:
             return False
+        if not self.waiting_request_ids:
+            return True
 
         req = self.get_request(self.waiting_request_ids[0])
-        return self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
+        return not self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
 
     def schedule_non_chunked_prefill(self) -> None:
         """Schedule non-chunked prefill requests."""
@@ -1980,9 +1980,17 @@ class DynamicInferenceEngine(AbstractEngine):
         mode = self.context.config.async_sched_mode
         if mode == AsyncScheduleMode.LEGACY:
             self.schedule_waiting_requests()
-            run_async_prefill = False
+            is_decode_only = self.context.is_decode_only()
+            controller_kwargs = {}
         elif mode == AsyncScheduleMode.ASYNC:
-            run_async_prefill = self._has_async_sched_prefill_work()
+            run_async_overlap = self._should_run_async_sched_overlap()
+            is_decode_only = run_async_overlap
+            controller_kwargs = {
+                "run_async_overlap": run_async_overlap,
+                "schedule_waiting_requests": (
+                    None if run_async_overlap else self.schedule_waiting_requests
+                ),
+            }
         else:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
@@ -1995,11 +2003,6 @@ class DynamicInferenceEngine(AbstractEngine):
             and (self.context.step_count + 1) % self.logging_step_interval == 0
         )
 
-        is_decode_only = (
-            self.context.is_decode_only()
-            if mode == AsyncScheduleMode.LEGACY
-            else not run_async_prefill
-        )
         if will_log_this_step:
             pre_step_context_state = {
                 "is_decode_only": is_decode_only,
@@ -2026,12 +2029,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if will_log_this_step:
             self.step_start_event.record()
         controller_result: DynamicBatchControllerStepResult = (
-            await self.controller.async_generate_output_tokens_dynamic_batch(
-                run_async_prefill=run_async_prefill,
-                schedule_waiting_requests=(
-                    self.schedule_waiting_requests if run_async_prefill else None
-                ),
-            )
+            await self.controller.async_generate_output_tokens_dynamic_batch(**controller_kwargs)
         )
         result = controller_result.output
         if will_log_this_step:

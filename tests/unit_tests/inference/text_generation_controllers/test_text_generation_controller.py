@@ -925,7 +925,7 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
     assert observed == [(1, False)]
 
 
-def test_async_sched_initial_prefill_launches_primer_only():
+def test_async_sched_initial_no_overlap_step_launches_primer_only():
     """Initial admission launches one primer and returns across the engine boundary."""
     context = _make_async_sched_context(total_request_count=0)
     context.active_token_count = 0
@@ -955,7 +955,7 @@ def test_async_sched_initial_prefill_launches_primer_only():
     assert context.async_sched_step_count == 0
 
 
-def test_async_sched_prefill_resolves_before_prepare_and_admission():
+def test_async_sched_no_overlap_resolves_before_prepare_and_admission():
     """Prefill resolution rebuilds survivor decode rows before admitting new prompts."""
     context = _make_async_sched_context(total_request_count=2)
     context.num_prefill_requests = 1
@@ -1029,7 +1029,7 @@ def test_async_sched_prefill_resolves_before_prepare_and_admission():
     ]
 
 
-def test_async_sched_prefill_finishes_with_matching_ep_base_forward():
+def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
     """A rank that resolves its last request still matches the peer base collective."""
     context = _make_async_sched_context(total_request_count=1)
     context.num_prefill_requests = 1
@@ -1078,7 +1078,7 @@ def test_async_sched_prefill_finishes_with_matching_ep_base_forward():
     controller._run_async_sched_forward.assert_not_called()
 
 
-def test_async_sched_mtp_decode_step_order():
+def test_async_sched_mtp_overlap_step_order():
     """MTP verification and rewind precede prepare while forward precedes resolve."""
     context = _make_async_sched_context(total_request_count=3)
     controller = _make_async_sched_controller(context)
@@ -1160,20 +1160,28 @@ def test_async_sched_mtp_decode_step_order():
 
 
 @pytest.mark.parametrize(
-    "mode, run_async_prefill, num_speculative_tokens, expected_method, expected_output",
+    "mode, run_async_overlap, has_pending_logits, num_speculative_tokens, "
+    "expected_method, expected_output",
     [
-        (AsyncScheduleMode.LEGACY, False, 0, "legacy", "legacy"),
-        (AsyncScheduleMode.ASYNC, True, 0, "no_overlap", "no_overlap"),
-        (AsyncScheduleMode.ASYNC, False, 0, "overlap", "overlap"),
-        (AsyncScheduleMode.ASYNC, False, 2, "overlap_mtp", "overlap_mtp"),
+        (AsyncScheduleMode.LEGACY, None, True, 0, "legacy", "legacy"),
+        (AsyncScheduleMode.ASYNC, False, True, 0, "no_overlap", "no_overlap"),
+        (AsyncScheduleMode.ASYNC, True, False, 0, "no_overlap", "no_overlap"),
+        (AsyncScheduleMode.ASYNC, True, True, 0, "overlap", "overlap"),
+        (AsyncScheduleMode.ASYNC, True, True, 2, "overlap_mtp", "overlap_mtp"),
     ],
 )
 def test_async_generate_output_tokens_dynamic_batch_routes(
-    mode, run_async_prefill, num_speculative_tokens, expected_method, expected_output
+    mode,
+    run_async_overlap,
+    has_pending_logits,
+    num_speculative_tokens,
+    expected_method,
+    expected_output,
 ):
     context = _make_async_sched_context()
     context.config.async_sched_mode = mode
     controller = _make_async_sched_controller(context)
+    controller._async_sched_logits.is_valid = has_pending_logits
     controller.num_speculative_tokens = num_speculative_tokens
     controller._validate_async_sched_support_for_step = mock.Mock()
     controller._run_legacy_step = mock.AsyncMock(return_value="legacy")
@@ -1188,11 +1196,15 @@ def test_async_generate_output_tokens_dynamic_batch_routes(
     )
     schedule_waiting_requests = mock.Mock()
 
-    result = asyncio.run(
-        controller.async_generate_output_tokens_dynamic_batch(
-            run_async_prefill=run_async_prefill, schedule_waiting_requests=schedule_waiting_requests
-        )
+    kwargs = (
+        {}
+        if run_async_overlap is None
+        else {
+            "run_async_overlap": run_async_overlap,
+            "schedule_waiting_requests": schedule_waiting_requests,
+        }
     )
+    result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch(**kwargs))
 
     assert result.output == expected_output
     methods = {

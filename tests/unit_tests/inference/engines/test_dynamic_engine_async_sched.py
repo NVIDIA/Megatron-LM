@@ -116,14 +116,14 @@ def test_add_request_runs_async_sched_request_validation():
 @pytest.mark.parametrize(
     "has_prefill, has_waiting, availability, expected",
     [
-        (True, False, (False, False, False), True),
-        (False, False, (True, True, True), False),
-        (False, True, (False, True, True), False),
-        (False, True, (True, True, True), True),
+        (True, False, (False, False, False), False),
+        (False, False, (True, True, True), True),
+        (False, True, (False, True, True), True),
+        (False, True, (True, True, True), False),
     ],
 )
-def test_has_async_sched_prefill_work(has_prefill, has_waiting, availability, expected):
-    """The async prefill probe observes eligibility without admitting the request."""
+def test_should_run_async_sched_overlap(has_prefill, has_waiting, availability, expected):
+    """The overlap probe observes prefill eligibility without admitting the request."""
     engine = _make_engine()
     engine.context.num_prefill_requests = int(has_prefill)
     engine.context.check_availability = mock.Mock(return_value=availability)
@@ -132,12 +132,12 @@ def test_has_async_sched_prefill_work(has_prefill, has_waiting, availability, ex
     engine.get_request = mock.Mock(return_value=request)
     engine._cg_admission_gating_active = mock.Mock(return_value=False)
 
-    assert engine._has_async_sched_prefill_work() is expected
+    assert engine._should_run_async_sched_overlap() is expected
     assert list(engine.waiting_request_ids) == ([10] if has_waiting else [])
     assert request.cg_wait_iters == 3
 
 
-def test_async_sched_prefill_probe_uses_non_mutating_cuda_graph_match():
+def test_async_sched_overlap_probe_uses_non_mutating_cuda_graph_match():
     """A scheduling probe does not update CUDA-graph wait accounting."""
     engine = _make_engine()
     engine.context.active_token_count = 2
@@ -156,15 +156,15 @@ def test_async_sched_prefill_probe_uses_non_mutating_cuda_graph_match():
 
 
 @pytest.mark.parametrize(
-    "mode, run_async_prefill, primer_only, expected_schedule_calls",
+    "mode, run_async_overlap, primer_only, expected_schedule_calls",
     [
-        (AsyncScheduleMode.LEGACY, False, False, 1),
-        (AsyncScheduleMode.ASYNC, False, False, 0),
-        (AsyncScheduleMode.ASYNC, True, True, 0),
+        (AsyncScheduleMode.LEGACY, None, False, 1),
+        (AsyncScheduleMode.ASYNC, True, False, 0),
+        (AsyncScheduleMode.ASYNC, False, True, 0),
     ],
 )
 def test_async_forward_routes_one_controller_iteration(
-    mode, run_async_prefill, primer_only, expected_schedule_calls
+    mode, run_async_overlap, primer_only, expected_schedule_calls
 ):
     """Primer-only work crosses the engine boundary without an internal controller loop."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
@@ -172,13 +172,13 @@ def test_async_forward_routes_one_controller_iteration(
     engine.logging_step_interval = 0
     engine.metrics_writer = None
     engine.schedule_waiting_requests = mock.Mock()
-    engine._has_async_sched_prefill_work = mock.Mock(return_value=run_async_prefill)
+    engine._should_run_async_sched_overlap = mock.Mock(return_value=run_async_overlap)
     engine.context = SimpleNamespace(
         config=SimpleNamespace(async_sched_mode=mode),
         step_count=4,
         prefix_cache_lru_clock=7,
         active_token_count=2,
-        is_decode_only=mock.Mock(return_value=not run_async_prefill),
+        is_decode_only=mock.Mock(return_value=True),
     )
     output = None if primer_only else {"sample": "tokens"}
     engine.controller = SimpleNamespace(
@@ -197,7 +197,14 @@ def test_async_forward_routes_one_controller_iteration(
     assert engine.context.step_count == 5
     assert engine.context.prefix_cache_lru_clock == 8
     assert engine.schedule_waiting_requests.call_count == expected_schedule_calls
-    engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
-        run_async_prefill=run_async_prefill,
-        schedule_waiting_requests=(engine.schedule_waiting_requests if run_async_prefill else None),
-    )
+    if mode == AsyncScheduleMode.LEGACY:
+        engine._should_run_async_sched_overlap.assert_not_called()
+        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with()
+    else:
+        engine._should_run_async_sched_overlap.assert_called_once_with()
+        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
+            run_async_overlap=run_async_overlap,
+            schedule_waiting_requests=(
+                None if run_async_overlap else engine.schedule_waiting_requests
+            ),
+        )

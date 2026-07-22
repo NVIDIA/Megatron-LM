@@ -1096,8 +1096,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    async def test_async_sched_run_engine_accepts_request_during_decode(self):
-        """Verify async decode yields so a new request can enter a running engine."""
+    async def test_async_sched_run_engine_accepts_request_during_overlap(self):
+        """Verify async overlap yields so a new request can enter a running engine."""
         with torch.inference_mode():
             test_config = DynamicEngineTestConfig(
                 num_requests=2,
