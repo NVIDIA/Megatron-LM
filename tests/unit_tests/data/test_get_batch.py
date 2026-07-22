@@ -123,6 +123,91 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     return iter([batch]), num_real_tokens
 
 
+def create_inter_document_masking_data_iterator(max_seq_length: int = 1024):
+    """Create a mock inter-document-masking data iterator (non-SFT path).
+
+    ``--dataloader-inter-document-masking`` runs with ``sft=False``, so
+    ``get_batch`` does NOT call ``preprocess_sft_batch``. The dataloader
+    (a GPTDataset with inter-document masking) must therefore emit samples that
+    are already padded to ``max_seq_length`` and carry per-segment
+    ``position_ids``, ``cu_seqlens`` (last entry == ``max_seq_length``) and
+    ``max_seqlen`` — the same packed layout the old SFTDataset produced. After
+    PyTorch DataLoader ``default_collate`` every tensor gains a leading batch
+    dim of 1.
+    """
+    min_len = max(1, int(0.1 * max_seq_length))
+    max_len = max(2, int(0.4 * max_seq_length))
+    candidate_lengths = [torch.randint(min_len, max_len + 1, (1,)).item() for _ in range(10)]
+
+    lengths = []
+    total = 0
+    for l in candidate_lengths:
+        if total + l >= max_seq_length:
+            break
+        lengths.append(l)
+        total += l
+
+    num_real_tokens = sum(lengths)
+    assert (
+        num_real_tokens < max_seq_length
+    ), f"Sum of lengths {num_real_tokens} is greater than max_seq_length {max_seq_length}"
+
+    # Generate packed token sequence (num_real_tokens + 1 for labels shift)
+    text = torch.randint(0, 10000, (num_real_tokens + 1,), dtype=torch.int64)
+
+    # Pad to max_seq_length (mimics a packed dataloader sample).
+    pad_len = max_seq_length - num_real_tokens
+    pad_token = 0
+
+    tokens = torch.cat([text[:-1], torch.full((pad_len,), pad_token, dtype=torch.int64)])
+    labels = torch.cat([text[1:], torch.full((pad_len,), pad_token, dtype=torch.int64)])
+
+    # Position IDs: per-segment positions, then padding positions.
+    position_ids = torch.cat([torch.arange(l, dtype=torch.int64) for l in lengths])
+    position_ids = torch.cat(
+        [
+            position_ids,
+            torch.arange(
+                position_ids[-1].item() + 1,
+                position_ids[-1].item() + 1 + pad_len,
+                dtype=torch.int64,
+            ),
+        ]
+    )
+
+    # Loss mask: 1 for real tokens, 0 for padding.
+    loss_mask = torch.cat(
+        [
+            torch.ones(num_real_tokens, dtype=torch.float32),
+            torch.zeros(pad_len, dtype=torch.float32),
+        ]
+    )
+
+    # cu_seqlens: cumulative segment lengths, last entry padded to max_seq_length.
+    cu_seqlens = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32),
+            torch.cumsum(torch.tensor(lengths, dtype=torch.int64), dim=0).to(torch.int32),
+        )
+    )
+    cu_seqlens[-1] = max_seq_length
+
+    # max_seqlen: longest segment.
+    seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    max_seqlen = torch.tensor([seg_lengths.max().item()], dtype=torch.int32)
+
+    # Add batch dimension to all per-sample tensors to mimic DataLoader default_collate.
+    batch = {
+        "tokens": tokens.unsqueeze(0),
+        "labels": labels.unsqueeze(0),
+        "loss_mask": loss_mask.unsqueeze(0),
+        "position_ids": position_ids.unsqueeze(0),
+        "cu_seqlens": cu_seqlens.unsqueeze(0),
+        "max_seqlen": max_seqlen,
+    }
+    return iter([batch]), num_real_tokens
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -545,7 +630,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0:
-        data_iterator, _ = create_sft_data_iterator(seq_length)
+        data_iterator, _ = create_inter_document_masking_data_iterator(seq_length)
 
     (
         attention_mask,
