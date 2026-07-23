@@ -3,6 +3,7 @@
 """Learning rate decay and weight decay incr functions."""
 import logging
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import torch
@@ -34,7 +35,56 @@ class ParamGroupOverride(TypedDict, total=False):
     start_wd: float
     end_wd: float
     wd_mult: float
+    eps: float
     optimizer: str
+    optimizer_instance: str
+    optimizer_kwargs: dict[str, Any]
+    param_group: str
+    param_group_kwargs: dict[str, Any]
+
+
+def canonicalize_optimizer_config_value(value: Any) -> Any:
+    """Convert nested optimizer config values to a stable, hashable representation.
+
+    Args:
+        value (Any): A scalar or nested mapping, sequence, or set from optimizer config.
+
+    Returns:
+        Any: A recursively tagged tuple representation suitable for grouping and checkpoint keys.
+
+    Raises:
+        TypeError: If a value is neither hashable nor a supported container.
+    """
+    if isinstance(value, Mapping):
+        return (
+            "mapping",
+            tuple(
+                sorted(
+                    (
+                        (
+                            canonicalize_optimizer_config_value(key),
+                            canonicalize_optimizer_config_value(item),
+                        )
+                        for key, item in value.items()
+                    )
+                )
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return ("sequence", tuple(canonicalize_optimizer_config_value(item) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return ("set", tuple(sorted(canonicalize_optimizer_config_value(item) for item in value)))
+    try:
+        hash(value)
+    except TypeError as exc:
+        raise TypeError(
+            f"Optimizer config value of type {type(value).__name__} is not hashable or a "
+            "supported container"
+        ) from exc
+    value_type = f"{type(value).__module__}.{type(value).__qualname__}"
+    if isinstance(value, (str, int, float, bool, bytes, type(None))):
+        return ("scalar", value_type, value)
+    return ("scalar", value_type, repr(value))
 
 
 def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
@@ -67,7 +117,12 @@ def param_group_override_to_tuple(
     """
     if param_group_override is None:
         return None
-    return tuple(sorted(param_group_override.items()))
+    return tuple(
+        sorted(
+            (key, canonicalize_optimizer_config_value(value))
+            for key, value in param_group_override.items()
+        )
+    )
 
 
 def combine_param_group_overrides(
@@ -88,6 +143,19 @@ def combine_param_group_overrides(
         if override is None:
             continue
         for key, value in override.items():
+            if key in {"optimizer_kwargs", "param_group_kwargs"}:
+                combined_values = combined_override.setdefault(key, {})
+                for nested_key, nested_value in value.items():
+                    if (
+                        nested_key in combined_values
+                        and combined_values[nested_key] != nested_value
+                    ):
+                        raise ValueError(
+                            f"Conflicting overrides for {key}.{nested_key}: "
+                            f"{combined_values[nested_key]} and {nested_value}"
+                        )
+                    combined_values[nested_key] = nested_value
+                continue
             if key in combined_override:
                 if combined_override[key] != value:
                     raise ValueError(

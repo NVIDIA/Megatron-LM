@@ -97,6 +97,8 @@ class EmergingOptimizerEntry:
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
+        constructor_only_kwargs: Arguments that configure optimizer-instance behavior and must
+            not be supplied by an individual parameter group.
     """
 
     optimizer_cls: type
@@ -105,9 +107,17 @@ class EmergingOptimizerEntry:
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
         default_factory=_default_param_overrides_factory
     )
+    constructor_only_kwargs: frozenset[str] = field(default_factory=frozenset)
 
 
-def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
+def _create_emerging_optimizer(
+    config,
+    param_groups,
+    eopt_name,
+    model_chunks,
+    pg_collection,
+    optimizer_kwargs: Dict[str, Any] | None = None,
+):
     """Instantiate an emerging optimizer and return it with its init_state_fn."""
     entry = _EMERGING_OPTIMIZERS[eopt_name]
     if entry.config_to_kwargs is not None:
@@ -116,6 +126,28 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
         eopt_kwargs = _default_adam_based_eopt_config_to_kwargs(
             eopt_name, config, model_chunks, pg_collection
         )
+    configured_kwargs = dict(optimizer_kwargs or {})
+    if "params" in configured_kwargs:
+        raise ValueError("optimizer_kwargs cannot override the protected 'params' argument")
+
+    signature = inspect.signature(entry.optimizer_cls.__init__)
+    accepts_arbitrary_kwargs = any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    invalid_kwargs = {
+        name
+        for name in configured_kwargs
+        if name not in signature.parameters
+        or signature.parameters[name].kind
+        in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.VAR_POSITIONAL}
+    }
+    if invalid_kwargs and not accepts_arbitrary_kwargs:
+        raise ValueError(
+            f"Unsupported optimizer_kwargs for {eopt_name}: {sorted(invalid_kwargs)}. "
+            f"Constructor: {signature}"
+        )
+    eopt_kwargs.update(configured_kwargs)
     optimizer = entry.optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
 
@@ -417,7 +449,9 @@ def _default_adam_based_eopt_config_to_kwargs(
 ) -> Dict[str, Any]:
     """Convert OptimizerConfig to default emerging optimizer constructor kwargs."""
     kwargs = _kwargs_from_config(registry.get_optimizer_cls(eopt_name), eopt_name, config)
-    kwargs["betas"] = (config.adam_beta1, config.adam_beta2)
+    beta1 = getattr(config, f"{eopt_name}_beta1", config.adam_beta1)
+    beta2 = getattr(config, f"{eopt_name}_beta2", config.adam_beta2)
+    kwargs["betas"] = (beta1, beta2)
     return kwargs
 
 
@@ -437,6 +471,21 @@ _EMERGING_OPTIMIZERS.update(
                     )
                 ): {'optimizer': 'adam'}
             },
+            constructor_only_kwargs=frozenset(
+                {
+                    "split_qkv",
+                    "is_qkv_fn",
+                    "qkv_split_shapes",
+                    "fp32_matmul_prec",
+                    "coefficient_type",
+                    "num_ns_steps",
+                    "scale_mode",
+                    "extra_scale_factor",
+                    "use_decoupled_weight_decay",
+                    "pg_collection",
+                    "tp_mode",
+                }
+            ),
         ),
         "adaptive_muon": EmergingOptimizerEntry(
             optimizer_cls=TensorParallelAdaptiveMuon,
@@ -449,6 +498,22 @@ _EMERGING_OPTIMIZERS.update(
                     )
                 ): {'optimizer': 'adam'}
             },
+            constructor_only_kwargs=frozenset(
+                {
+                    "split_qkv",
+                    "is_qkv_fn",
+                    "qkv_split_shapes",
+                    "fp32_matmul_prec",
+                    "coefficient_type",
+                    "num_ns_steps",
+                    "scale_mode",
+                    "extra_scale_factor",
+                    "use_decoupled_weight_decay",
+                    "pg_collection",
+                    "tp_mode",
+                    "moment2_method",
+                }
+            ),
         ),
     }
 )

@@ -1,8 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import fnmatch
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
 
 import torch
 
@@ -135,6 +136,78 @@ class ParamKey:
         return False
 
 
+@dataclass(frozen=True)
+class OptimizerParamGroupTarget:
+    """Reference to a parameter group owned by a configured optimizer instance."""
+
+    optimizer: str
+    param_group: str
+
+
+@dataclass
+class OptimizerInstanceConfig:
+    """Configuration for one named optimizer instance and its parameter groups."""
+
+    optimizer_type: str
+    kwargs: Dict[str, Any]
+    param_groups: Dict[str, Dict[str, Any]]
+
+
+@dataclass
+class OptimizerOverrideRecipe:
+    """Resolved optimizer instances, parameter groups, defaults, and matchers."""
+
+    optimizers: Dict[str, OptimizerInstanceConfig]
+    matchers: Dict[ParamKey, OptimizerParamGroupTarget]
+    default: OptimizerParamGroupTarget
+
+    def resolve(self, target: OptimizerParamGroupTarget) -> Dict[str, Any]:
+        """Return checkpoint-stable metadata for a configured parameter group."""
+        optimizer = self.optimizers[target.optimizer]
+        raw_group = optimizer.param_groups[target.param_group]
+        named_override_fields = {
+            'max_lr',
+            'min_lr',
+            'start_wd',
+            'end_wd',
+            'wd_mult',
+            'eps',
+            'lr_mult',
+            'is_decoupled_lr',
+        }
+        resolved = {
+            key: copy.deepcopy(value)
+            for key, value in raw_group.items()
+            if key in named_override_fields
+        }
+        arbitrary_group_kwargs = {
+            key: copy.deepcopy(value)
+            for key, value in raw_group.items()
+            if key not in named_override_fields
+        }
+        resolved.update(
+            {
+                'optimizer': optimizer.optimizer_type,
+                'optimizer_instance': target.optimizer,
+                'optimizer_kwargs': copy.deepcopy(optimizer.kwargs),
+                'param_group': target.param_group,
+            }
+        )
+        if arbitrary_group_kwargs:
+            resolved['param_group_kwargs'] = arbitrary_group_kwargs
+        return resolved
+
+    def values(self) -> Iterator[Dict[str, Any]]:
+        """Iterate over every resolved parameter-group configuration."""
+        for optimizer_name, optimizer in self.optimizers.items():
+            for param_group_name in optimizer.param_groups:
+                yield self.resolve(
+                    OptimizerParamGroupTarget(
+                        optimizer=optimizer_name, param_group=param_group_name
+                    )
+                )
+
+
 @dataclass
 class OptimizerConfig:
     """Configuration object for Megatron optimizers."""
@@ -164,6 +237,17 @@ class OptimizerConfig:
 
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
+
+    overrides_config: Optional[Union[str, Dict[str, Any]]] = None
+    """Serialized per-parameter optimizer overrides.
+
+    Accepts either a YAML file path or a mapping following the quantization recipe shape.
+    ``optimizers`` defines named optimizer instances, their constructor-only ``kwargs``, and named
+    ``param_groups`` containing arbitrary parameter-group fields. ``default`` selects the target for
+    unmatched parameters, while enabled glob ``matchers`` select another optimizer and parameter
+    group directly. Numeric values are expected to be resolved by the caller before constructing
+    this config. When provided, this mapping replaces the deprecated standard and MuP overrides.
+    """
 
     ##############
     # Precision
