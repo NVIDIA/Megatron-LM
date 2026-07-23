@@ -105,6 +105,10 @@ class StudentLogitsCapture:
 
     def attach_hooks(self, model: LanguageModule) -> None:
         """Attach forward hooks to the model's output layer."""
+        # Only the last pipeline stage has output_layer (post_process=True); guard so PP>1
+        # non-final stages don't AttributeError (matches LogitsSaverHooks). PP1 is unaffected.
+        if getattr(model, "output_layer", None) is None:
+            return
         handle = model.output_layer.register_forward_hook(self._capture_logits)
         self._hook_handles.append(handle)
 

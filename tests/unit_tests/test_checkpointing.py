@@ -450,3 +450,82 @@ class TestBuildShardedStateDictMetadata:
         args = _make_metadata_args()
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+def test_save_checkpoint_logit_dump_skips_model_write(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+):
+    """Teacher logit-dump mode: flush the logits tar, never write model weights."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = True
+    args.async_save = True
+    args.async_strategy = "mcore"
+    args.dist_ckpt_workers = 1
+    args.async_ckpt_use_cpu_shm = False
+    args.log_progress = False
+    args.save_retain_interval = None
+    args.verify_integrity = False
+
+    iteration = 123
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    mock_saver = mock.MagicMock()
+    # (tar_path, writes, meta_bytes, msc_enabled) as returned by take_pending_data().
+    mock_saver.take_pending_data.return_value = ("tar", {}, b"", False)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_logit_dump", sync=True) as save_dir:
+        args.save = save_dir
+        set_args(args)
+        with (
+            mock.patch("megatron.training.distillation.get_logits_saver", return_value=mock_saver),
+            mock.patch("megatron.training.checkpointing.generate_state_dict") as mock_generate,
+            mock.patch("megatron.training.checkpointing.dist_checkpointing.save") as mock_dist_save,
+            mock.patch("megatron.training.checkpointing.schedule_async_save") as mock_schedule,
+        ):
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, 456)
+
+        # No model weights: neither the state dict nor the dist-ckpt write runs.
+        mock_generate.assert_not_called()
+        mock_dist_save.assert_not_called()
+        # Logits ARE flushed: the pending data is taken and one async request scheduled.
+        mock_saver.take_pending_data.assert_called_once()
+        assert mock_schedule.call_count == 1
+        # No model checkpoint bookkeeping (tracker file) is written.
+        assert not os.path.exists(save_dir / "latest_checkpointed_iteration.txt")
+
+
+def test_save_checkpoint_normal_mode_writes_model_and_no_logits(
+    init_model_parallel, create_args, tmp_path_dist_ckpt
+):
+    """Normal (non-logit-dump) mode is unchanged: model is written, no logits request."""
+    args = create_args
+    args.ckpt_format = "torch"
+    args.use_dist_ckpt = False
+    args.use_distributed_optimizer = True
+
+    iteration = 123
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_normal_mode", sync=True) as save_dir:
+        args.save = save_dir
+        set_args(args)
+        with (
+            mock.patch("megatron.training.distillation.get_logits_saver", return_value=None),
+            mock.patch("megatron.training.checkpointing.schedule_async_save") as mock_schedule,
+        ):
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, 456)
+
+        # Model weights written via the (sync) legacy path.
+        assert os.path.exists(save_dir / "iter_0000123" / "mp_rank_00" / "model_optim_rng.pt")
+        with open(save_dir / "latest_checkpointed_iteration.txt", "r") as f:
+            assert iteration == int(f.read())
+        # A sync save never touches the async scheduler, so no logits request is scheduled.
+        mock_schedule.assert_not_called()

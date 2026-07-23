@@ -2366,7 +2366,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
+            forward_only=args.freeze_all_layers,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             force_all_reduce=save_wgrads_in_this_iteration,
             p2p_communicator=p2p_communicator,

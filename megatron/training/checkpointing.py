@@ -531,6 +531,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
+    # Teacher logit-save mode: flush only the logits tar, skip re-writing frozen weights.
+    from megatron.training.distillation import get_logits_saver
+    logits_saver = get_logits_saver()
+    logit_save_mode = logits_saver is not None
+
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
@@ -624,10 +629,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # exactly one rank. Neither dp_rank==0 nor edp_rank==0 alone covers all shards when
     # the dense and expert parallelism layouts disagree (e.g. TP > EP*ETP); the union
     # does, with at most one rank per (tp_rank, ep_rank) inside any DP group.
-    if not torch.distributed.is_initialized() \
-            or ckpt_type != CheckpointType.LEGACY \
-            or dp_rank == 0 \
-            or expt_dp_rank == 0:
+    if not logit_save_mode and (
+        not torch.distributed.is_initialized()
+        or ckpt_type != CheckpointType.LEGACY
+        or dp_rank == 0
+        or expt_dp_rank == 0
+    ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
             if args.use_distributed_optimizer:
@@ -802,8 +809,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 torch.distributed.barrier()
 
     # And update the latest iteration
-    if not torch.distributed.is_initialized() \
-            or torch.distributed.get_rank() == 0:
+    if not logit_save_mode and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_rank() == 0
+    ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
         if ckpt_type == CheckpointType.LOCAL:
@@ -884,8 +893,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             iter_finalize_fn()
 
     # Additional callback for one_logger (last rank)
-    if not torch.distributed.is_initialized() \
-       or is_last_rank():
+    if not logit_save_mode and (
+        not torch.distributed.is_initialized() or is_last_rank()
+    ):
         def onelogger_finalize_fn():
             on_save_checkpoint_success(productive_metrics, args.async_save)
         if args.async_save:
@@ -895,8 +905,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             onelogger_finalize_fn()
 
     # Additional callback for wandb (last rank)
-    if not torch.distributed.is_initialized() \
-       or is_last_rank():
+    if not logit_save_mode and (
+        not torch.distributed.is_initialized() or is_last_rank()
+    ):
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(checkpoint_name, get_checkpoint_tracker_filename(save_dir), save_dir, iteration)
         if args.async_save:
@@ -911,19 +922,23 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         # thread), then writes logits in the background.  Finalize_fns are
         # moved from the checkpoint request to the logits request so that
         # "success" callbacks only fire after both writes are confirmed.
-        from megatron.training.distillation import get_logits_saver
-
-        logits_saver = get_logits_saver()
+        # In logit-save mode async_save_request is None (no weights written);
+        # the logits request then owns its own (empty) finalize_fns.
         if logits_saver is not None:
             async_request_cls = get_async_strategy(args.async_strategy)[1]["AsyncRequest"]
             async_logits_request = async_request_cls(
                 async_fn=logits_saver._write_batched_tar,
                 async_fn_args=logits_saver.take_pending_data(),
-                finalize_fns=async_save_request.finalize_fns.copy(),
+                finalize_fns=(
+                    async_save_request.finalize_fns.copy()
+                    if async_save_request is not None else []
+                ),
             )
-            async_save_request.finalize_fns.clear()
+            if async_save_request is not None:
+                async_save_request.finalize_fns.clear()
 
-        schedule_async_save(async_save_request)
+        if async_save_request is not None:
+            schedule_async_save(async_save_request)
         if logits_saver is not None:
             schedule_async_save(async_logits_request)
         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
@@ -1959,28 +1974,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
-    # Override iteration/consumed_samples if requested (e.g. to rewind the data loader).
-    if getattr(args, 'override_ckpt_iteration', None) is not None:
-        target_iter = args.override_ckpt_iteration
-        state_dict['iteration'] = target_iter
-        if 'args' in state_dict:
-            checkpoint_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
-            if (
-                checkpoint_global_batch_size is not None
-                and checkpoint_global_batch_size != args.global_batch_size
-            ):
-                raise RuntimeError(
-                    '--override-ckpt-iteration recomputes consumed_train_samples from the target '
-                    f'iteration and current global_batch_size, but checkpoint global_batch_size '
-                    f'({checkpoint_global_batch_size}) != current global_batch_size '
-                    f'({args.global_batch_size}). This would replay the data loader from the '
-                    'wrong sample offset.'
-                )
-            state_dict['args'].consumed_train_samples = target_iter * args.global_batch_size
-            state_dict['args'].skipped_train_samples = 0
-        print_rank_0(f'Overriding checkpoint iteration to {target_iter} '
-                     f'(consumed_train_samples = {target_iter * args.global_batch_size})')
-
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
@@ -2017,6 +2010,31 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                               'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+
+    # --override-ckpt-iteration: rewind the data loader to this iteration, overriding the
+    # baseline resolved above -- the checkpoint's on a resume, or 0 on a bare --finetune load
+    # (no saved args) -- so one path covers both. Enables checkpoint-free offline-KD dump
+    # segments over disjoint sample windows. GBS must match so the sample offset is correct.
+    if getattr(args, 'override_ckpt_iteration', None) is not None:
+        if 'args' in state_dict:
+            ckpt_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
+            if (
+                ckpt_global_batch_size is not None
+                and ckpt_global_batch_size != args.global_batch_size
+            ):
+                raise RuntimeError(
+                    '--override-ckpt-iteration recomputes consumed_train_samples from the target '
+                    f'iteration and current global_batch_size, but checkpoint global_batch_size '
+                    f'({ckpt_global_batch_size}) != current global_batch_size '
+                    f'({args.global_batch_size}). This would replay the data loader from the '
+                    'wrong sample offset.'
+                )
+        iteration = args.override_ckpt_iteration
+        args.consumed_train_samples = iteration * args.global_batch_size
+        args.skipped_train_samples = 0
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
+        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
+                     f'(consumed_train_samples {args.consumed_train_samples})')
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
