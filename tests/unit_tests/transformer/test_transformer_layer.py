@@ -21,7 +21,7 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
-from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -794,18 +794,14 @@ class TestMHCWithCudaGraph:
         (mapping_proj, alpha_*, bias) will not get proper pre-forward hooks during
         graph replay, leading to stale parameter values.
         """
-        layer, config = self._create_mhc_layer()
+        layer, config = self._create_mhc_layer(
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mlp]
+        )
 
         submodules = layer._get_submodules_under_cudagraphs()
 
-        hc_modules_found = any(
-            hasattr(m, 'mapping_proj') for submod in submodules for m in submod.modules()
-        )
-        assert hc_modules_found, (
-            "_get_submodules_under_cudagraphs does not include HyperConnectionModule. "
-            "Parameters like mapping_proj, alpha_pre/post/res will not be updated "
-            "during CUDA graph replay."
-        )
+        assert layer.self_attention_hyper_connection in submodules
+        assert layer.mlp_hyper_connection in submodules
 
     def test_forward_through_te_cuda_graph_capture_path(self):
         """_te_cuda_graph_capture must produce correct output shapes for mHC.
