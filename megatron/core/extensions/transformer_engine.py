@@ -1184,6 +1184,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
+        # Under fp32_residual_connection, hidden_states arrives in fp32 and TE's
+        # set_activation_dtype rejects input dtype != param dtype outside autocast.
+        # Downcast to params_dtype; fp32 residual precision is preserved upstream
+        # in bias_dropout_add.
+        if x.dtype != self.layer_norm_weight.dtype:
+            x = x.to(self.layer_norm_weight.dtype)
+
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
