@@ -58,7 +58,37 @@ Baseline order is mandatory:
 | QWEN-005b | 2026-07-23 | Guards were merely conservative; async serial works for MoE+EP if opened | env-gated EP+MoE guards in `dynamic_engine.py` + `text_generation_controller.py` (`MCORE_ALLOW_ASYNC_MOE`) | **hang** | n/a | server init OK but **first decode request hangs** (>2min) | session `qwen-opt` `asyncmoe` (cancelled) | Rejected — the guard encodes a real limitation: async serial + nvls alltoall + EP deadlocks on the first decode step. Patch reverted (tree clean). Would need real engine work to support. |
 | QWEN-006 | 2026-07-23 | `nccl` AllGather/ReduceScatter inference dispatcher overlaps/costs less than `nvls` | `run_e2e_cfg.sh` (`--inference-moe-token-dispatcher-type nccl`) | **14,677 tok/s** | **0.66× (much worse)** | Coherent | session `qwen-opt` `nccl` | Rejected — nccl pads to worst-case per-rank token count (fixed-count AllGather), inflating comm volume ~2×. `nvls` variable-count stays the best dispatcher. |
 | QWEN-007 | 2026-07-23 | `async-sched-mode=serial` (guards opened) hides the between-graph idle at the real OSL1024 regime | env-gated guards + `run_e2e_cfg.sh` | **22,589 tok/s** | **+0.85% (marginal)** | Runs at BS256 (hang was single-request-only) | session `qwen-opt` `async1024` | Marginal. Proves decode at OSL1024 is **NOT idle-bound** (the earlier "21% idle" was an OSL256 prefill artifact). Not worth shipping (unsupported path + tiny gain). Guards left env-gated default-off. |
+| QWEN-008 | 2026-07-23 | `CUDA_DEVICE_MAX_CONNECTIONS=8` (was hardcoded 1) lets comm & compute overlap on separate HW queues, hiding exposed NVLS comm | `run_e2e_cfg.sh` (env override) | **~22,556 tok/s** | **~flat (noise)** | Coherent | session `qwen-opt` `maxconn8` | Reject — overlap is bounded by the full-iteration CUDA-graph structure / data deps, not connection count. No effect. |
+| QWEN-009 | 2026-07-23 | Built-in `--moe-router-fusion` (TE fused softmax+topk) + `--moe-permute-fusion` cut the routing critical path (~18%) | `run_e2e_cfg.sh` EXTRA_SERVER_ARGS | server crash | n/a | n/a | session `qwen-opt` `routperm`/`routfus` | Rejected — both crash: `AssertionError: hidden_size mismatch: 128 vs 8`. TE fused router emits a dense **128-expert** routing map, but `InferenceTopKRouter` (transformer_impl=inference_optimized) uses a dense **top-8** contract for the vLLM/nvls dispatcher. The built-in fusions are wired to the training MoE path only. A hand-written fused softmax+topk would need to honor the top-8 inference contract. |
 | PROFILE-DECODE | 2026-07-23 | Get the TRUE per-step decode bottleneck (prior OSL256 totals were prefill-contaminated) | analysis of archived `mcore_osl256.sqlite`, pure-decode window (t0+220s, big-dispatch-free) | n/a | n/a | n/a | local sqlite | **Corrected model** (decode GPU-time share): MoE grouped-GEMM (`_fused_moe_kernel`) **~40% #1**, routing (count/moe_sum/topk/scatter/softmax/meta) ~18%, exposed comm (dispatch 122k + combine 320k) ~16%, attention ~13%, norm/elt ~10%. Kernels overlap across streams → **wall = per-layer critical path** (attn→router→dispatch→GEMM→combine). vLLM wins via TRT-LLM fused MoE (0 exposed comm, fused routing+finalize). Explains QWEN-002 1.25× kernel → +0.55% e2e. |
+
+## Session 2 (2026-07-23) — conclusion & recommendation
+
+**Best shippable config stays: legacy async / nvls dispatcher / vLLM grouped-GEMM
+backend / FC1+SwiGLU fusion (QWEN-002) = 22,398.9 tok/s (65.9% of vLLM 33,994.5).**
+
+Every accessible knob was swept and rejected (QWEN-003…009). Key learnings:
+- Decode at OSL1024 is **compute/comm-bound, not idle-bound** (async serial +0.85%).
+- The gap is **structural**: mcore runs the MoE decode as a chain of discrete
+  kernels — router gemm → softmax → topk → count/scatter/metadata → **exposed
+  NVLS AllGather-V dispatch** → grouped GEMM (FC1+SwiGLU, FC2) → moe_sum →
+  **exposed NVLS ReduceScatter-V combine** — all on the per-layer critical path.
+  vLLM/TRT-LLM does the equivalent as one fused MoE (fused routing, cutlass
+  grouped bmm, fused finalize) with **0 exposed comm**.
+- Built-in fusions (`--moe-router-fusion`, `--moe-permute-fusion`) and
+  `sampling-backend=flashinfer` are wired to training / non-full-graph paths and
+  are **incompatible** with the `inference_optimized` top-8 + full-iteration-graph
+  contract.
+
+**To actually close the 1.5× gap (large, multi-session work), in priority order:**
+1. **Eliminate exposed NVLS comm** (~16% + it gates the critical path): overlap
+   dispatch/combine with expert GEMM via chunked/pipelined experts, or fuse the
+   combine ReduceScatter-V with the FC2 epilogue + moe_sum (finalize fusion).
+2. **Fuse the routing chain** honoring the inference top-8 contract: one kernel
+   for softmax+top8+count+scatter-metadata (cuts ~18% of small serial kernels).
+3. **A TRT-LLM-style single fused MoE decode kernel** (dispatch+groupedGEMM+
+   SwiGLU+finalize) — the real vLLM-parity path; QWEN-001's full fusion was
+   slower, so this needs a cutlass/CUTE grouped-bmm core, not Triton.
 
 ## Detailed records
 
