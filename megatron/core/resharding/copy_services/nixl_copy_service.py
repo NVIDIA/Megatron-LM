@@ -67,7 +67,7 @@ class NixlCopyService(CopyService):
         self.group = group
 
         try:
-            from nixl._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
+            from nixl._api import nixl_agent, nixl_agent_config
         except ImportError as e:
             raise ImportError(
                 "NixlCopyService requires the 'nixl' package; install it or use "
