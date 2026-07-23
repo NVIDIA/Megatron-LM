@@ -28,7 +28,7 @@ import torch.distributed as dist
 from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
 if not HAVE_GTP:
-    pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
+    pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401

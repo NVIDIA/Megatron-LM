@@ -363,10 +363,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 from megatron.core.tensor_parallel.gtp import HAVE_GTP
 
                 assert HAVE_GTP, (
-                    "GTP requires TransformerEngine >= 2.17. "
-                    "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds, "
-                    "or set both --gtp_remat-weight-remat-size and "
-                    "--expert-generalized-tensor-parallel-remat-size to 1."
+                    "GTP requires TransformerEngine >= 2.19. "
+                    "Set both --gtp_remat-weight-remat-size and "
+                    "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
                 )
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,

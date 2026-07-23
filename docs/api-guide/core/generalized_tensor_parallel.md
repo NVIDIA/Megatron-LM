@@ -2,6 +2,8 @@
 
 > ⚠️ **Experimental.** GTP is an experimental feature and its API, configuration, and behavior may change in future versions without notice.
 
+> 📦 **Requires TransformerEngine >= 2.19** (GTP support is merged into TE main). On an older TE, GTP is disabled at import (`HAVE_GTP = False`) and enabling it raises an `ImportError` — please install TransformerEngine >= 2.19.
+
 **At a glance.** GTP factors the weight-parallel domain into two orthogonal sub-axes — `GTP = TP × GTP_remat`. Each linear weight is sharded `1/(TP × GTP_remat)` along `out_features`:
 
 - **`TP`** slice — kept sharded through the GEMM. Ordinary tensor parallelism; the output is TP-sharded.
@@ -470,12 +472,8 @@ Weights that must **not** join a chain (embedding, output_layer — they all-gat
 **Whenever you add or change a GTP_remat/EGTP_remat feature, run the GTP_remat unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
 
 ```bash
-# 4 GPUs; uses the custom TransformerEngine and force-enables GTP_remat.
-export MEGATRON_GTP_FORCE_ENABLE=1
-export TE_PATH=/path/to/TransformerEngine        # the GTP_remat-enabled TE build
-export PYTHONPATH="${TE_PATH}:${PYTHONPATH}"
+# 4 GPUs. GTP_remat requires TransformerEngine >= 2.19.
 torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v
-```
 
 | Test file | What it guards |
 |-----------|----------------|
@@ -491,4 +489,4 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
 
-All tests require ≥ 4 GPUs and the GTP_remat-enabled TransformerEngine; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.
+All tests require ≥ 4 GPUs and TransformerEngine >= 2.19; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.
