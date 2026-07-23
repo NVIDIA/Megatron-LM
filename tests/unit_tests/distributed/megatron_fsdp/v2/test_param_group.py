@@ -31,8 +31,8 @@ import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
@@ -185,9 +185,7 @@ def test_init_buffers(strategy):
         if has_wbuf:
             assert pg.model_weight_buffer is not None
             wbuf = pg.model_weight_buffer
-            assert wbuf.storage_placements[1] is (
-                Placement.FLAT if w_dist else Placement.REPLICATE
-            )
+            assert wbuf.storage_placements[1] is (Placement.FLAT if w_dist else Placement.REPLICATE)
 
             # Per-param check: get_item should return this rank's portion of
             # the original param. A param may span shard boundaries, so the
@@ -456,9 +454,7 @@ def test_hsdp_reduce_grad_multi_microbatch(strategy):
         full_grad_buffer.zero_()
         full_batch_grad = torch.zeros_like(full_grad_buffer)
         for microbatch in range(num_micro_batches):
-            micro_grad = torch.full_like(
-                full_grad_buffer, float((microbatch + 1) * (rank + 1))
-            )
+            micro_grad = torch.full_like(full_grad_buffer, float((microbatch + 1) * (rank + 1)))
             full_grad_buffer.add_(micro_grad)
             full_batch_grad.add_(micro_grad)
             gbuf.placements = [Placement.PARTIAL, Placement.PARTIAL]

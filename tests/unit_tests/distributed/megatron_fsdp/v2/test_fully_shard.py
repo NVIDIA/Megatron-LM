@@ -54,11 +54,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     get_state_dict,
     preprocess_state_dict_for_uneven_dtensor,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import mfsdp_forward_pre_hook
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import MixedPrecisionPolicy
-from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
 
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
@@ -592,9 +592,7 @@ class TestFullyShardBasic:
                     active_manager_groups.pop()
 
         def capture_redistribute(buffer, *args, **kwargs):
-            active_group = (
-                active_manager_groups[-1] if active_manager_groups else None
-            )
+            active_group = active_manager_groups[-1] if active_manager_groups else None
             comm_dim = 0 if active_group is outer_dp_group else 1
             unshard_calls.append((id(buffer), comm_dim, active_group))
             return original_redistribute(buffer, *args, **kwargs)
@@ -604,16 +602,8 @@ class TestFullyShardBasic:
             return original_all_gather(*args, **kwargs)
 
         monkeypatch.setattr(DataParallelBuffer, "redistribute", capture_redistribute)
-        monkeypatch.setattr(
-            fsdp_module_mod,
-            "_coalescing_manager",
-            capture_coalescing_manager,
-        )
-        monkeypatch.setattr(
-            torch.distributed,
-            "all_gather_into_tensor",
-            capture_all_gather,
-        )
+        monkeypatch.setattr(fsdp_module_mod, "_coalescing_manager", capture_coalescing_manager)
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", capture_all_gather)
 
         try:
             model.unshard(async_op=True)
@@ -673,8 +663,7 @@ class TestFullyShardBasic:
         from torch.distributed.tensor.placement_types import Shard
 
         assert all(
-            isinstance(placement, Shard)
-            for placement in param_group.dist_params[0].placements
+            isinstance(placement, Shard) for placement in param_group.dist_params[0].placements
         )
 
         optimizer = torch.optim.SGD(model.parameters(), lr=0.25)
@@ -687,10 +676,7 @@ class TestFullyShardBasic:
         model.set_is_last_backward(True)
         model(x).float().sum().backward()
         model.finish_grad_sync()
-        assert param_group.main_grad_buffer.placements == [
-            Placement.DIRTY,
-            Placement.FLAT,
-        ]
+        assert param_group.main_grad_buffer.placements == [Placement.DIRTY, Placement.FLAT]
 
         ctx = model._fsdp_root_context
         assert ctx.model_weight_refresh_pending

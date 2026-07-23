@@ -51,11 +51,7 @@ def _unshard_weight_buffers(
             for weight_buffer in weight_buffers:
                 target_placements = weight_buffer.placements.copy()
                 target_placements[unshard_dim] = Placement.REPLICATE
-                weight_buffer.redistribute(
-                    target_placements,
-                    bind_params=False,
-                    stream=stream,
-                )
+                weight_buffer.redistribute(target_placements, bind_params=False, stream=stream)
         if async_op and coalescing_event is not None:
             coalescing_event.wait()
 
@@ -501,9 +497,7 @@ class FSDPModule:
 
             # The backward writes a fully replicated gradient; reduce_grad later
             # reduces it to the requested placement.
-            gbuf_data = gbuf.fetch_buffer(
-                [Placement.REPLICATE, Placement.REPLICATE]
-            )
+            gbuf_data = gbuf.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
             assert gbuf_data is not None
             assert gbuf_data.numel() > 0
 
@@ -939,9 +933,7 @@ class FSDPModule:
             # produces an outer-DP contribution that still needs reduction.
             param_group.main_grad_buffer.redistribute(
                 [
-                    Placement.PARTIAL
-                    if param_group.mesh.size(0) > 1
-                    else Placement.REPLICATE,
+                    Placement.PARTIAL if param_group.mesh.size(0) > 1 else Placement.REPLICATE,
                     Placement.PARTIAL,
                 ]
             )

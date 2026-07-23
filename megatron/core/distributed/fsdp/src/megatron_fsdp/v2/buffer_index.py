@@ -299,20 +299,14 @@ class BufferIndex:
     #                            ranks.
     # ------------------------------------------------------------------ #
 
-    def _get_shard_meta(
-        self,
-        placements: list[Placement],
-    ):
+    def _get_shard_meta(self, placements: list[Placement]):
         """Return logical metadata, treating FLAT and DIRTY as sharded."""
         if len(placements) != 2:
             raise ValueError(f"Expected two placements, got {len(placements)}")
         if not all(isinstance(placement, Placement) for placement in placements):
             raise TypeError(f"Unsupported placements: {placements}")
 
-        key = tuple(
-            int(placement in (Placement.FLAT, Placement.DIRTY))
-            for placement in placements
-        )
+        key = tuple(int(placement in (Placement.FLAT, Placement.DIRTY)) for placement in placements)
         return self.outer_shard_metas[key]
 
     def local_slice_for(
@@ -330,11 +324,7 @@ class BufferIndex:
         global_start, global_end = global_range
         requested_meta = self._get_shard_meta(requested_placements)
         storage_meta = self._get_shard_meta(storage_placements)
-        start = max(
-            global_start,
-            requested_meta.global_data_index,
-            storage_meta.global_data_index,
-        )
+        start = max(global_start, requested_meta.global_data_index, storage_meta.global_data_index)
         end = min(
             global_end,
             requested_meta.global_data_index + requested_meta.size,
@@ -354,10 +344,7 @@ class BufferIndex:
         return (idx.global_data_index, idx.global_data_index + idx.size)
 
     def _get_item_self_range(
-        self,
-        item_id: int,
-        *,
-        placements: Optional[list[Placement]] = None,
+        self, item_id: int, *, placements: Optional[list[Placement]] = None
     ) -> Tuple[int, int]:
         """Return coordinates relative to the item's own start.
 
@@ -383,10 +370,7 @@ class BufferIndex:
         return (range_start - idx.global_data_index, range_end - idx.global_data_index)
 
     def _get_item_local_range(
-        self,
-        item_id: int,
-        *,
-        placements: Optional[list[Placement]] = None,
+        self, item_id: int, *, placements: Optional[list[Placement]] = None
     ) -> Tuple[int, int]:
         """Return item coordinates relative to the selected placements.
 

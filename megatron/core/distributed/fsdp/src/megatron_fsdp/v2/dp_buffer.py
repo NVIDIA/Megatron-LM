@@ -10,7 +10,6 @@ from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .utils import ParamGroupIdx
 
 
-
 class Placement(enum.Enum):
     """Logical state of a DP buffer along one mesh dimension.
 
@@ -88,12 +87,12 @@ class DataParallelBuffer:
             raise ValueError(f"Unsupported data-parallel buffer role: {buffer_role}")
 
         self.storage_placements: list[Placement] = [
-            Placement.FLAT
-            if is_sharded_from_strategy(outer_dp_sharding_strategy)
-            else Placement.REPLICATE,
-            Placement.FLAT
-            if is_sharded_from_strategy(sharding_strategy)
-            else Placement.REPLICATE,
+            (
+                Placement.FLAT
+                if is_sharded_from_strategy(outer_dp_sharding_strategy)
+                else Placement.REPLICATE
+            ),
+            Placement.FLAT if is_sharded_from_strategy(sharding_strategy) else Placement.REPLICATE,
         ]
         self.placements: list[Placement] = self.storage_placements.copy()
         self.outer_sharded = self.storage_placements[0] is Placement.FLAT
@@ -172,14 +171,9 @@ class DataParallelBuffer:
         else:
             self.data = self.data.to(target_device, non_blocking=non_blocking)
 
-
     @torch.no_grad()
     def set_item(
-        self,
-        item_id: int,
-        item_data: torch.Tensor,
-        *,
-        placements: Optional[list[Placement]] = None,
+        self, item_id: int, item_data: torch.Tensor, *, placements: Optional[list[Placement]] = None
     ) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
         requested_placements = placements if placements is not None else self.placements
@@ -265,9 +259,7 @@ class DataParallelBuffer:
             ):
                 with torch.cuda.stream(stream):
                     torch.distributed.all_gather_into_tensor(
-                        output_tensor=output_buffer,
-                        input_tensor=input_buffer,
-                        group=group,
+                        output_tensor=output_buffer, input_tensor=input_buffer, group=group
                     )
                 # Parameters can bind only after both mesh dimensions are replicated.
                 if kwargs.get("bind_params", False) and all(
@@ -298,11 +290,7 @@ class DataParallelBuffer:
                 comm_input = input_buffer
                 input_key = None
                 if grad_comm_dtype != self.dtype:
-                    input_key = (
-                        self.alloc_key,
-                        "grad_reduce_input",
-                        current_dim,
-                    )
+                    input_key = (self.alloc_key, "grad_reduce_input", current_dim)
                     comm_input = self.allocator.allocate(
                         key=input_key,
                         size=input_buffer.numel(),
@@ -326,18 +314,13 @@ class DataParallelBuffer:
                     else:
                         input_meta = self.buffer_index._get_shard_meta(self.placements)
                         output_meta = self.buffer_index._get_shard_meta(next_placements)
-                        output_offset = (
-                            output_meta.global_data_index - input_meta.global_data_index
-                        )
+                        output_offset = output_meta.global_data_index - input_meta.global_data_index
                         # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
                         comm_output = comm_input[
                             output_offset : output_offset + output_buffer.numel()
                         ]
                         torch.distributed.reduce_scatter_tensor(
-                            output=comm_output,
-                            input=comm_input,
-                            group=group,
-                            op=op,
+                            output=comm_output, input=comm_input, group=group, op=op
                         )
 
                     # Commit the result, accumulating prior inner-DP microbatches when requested.
@@ -382,26 +365,16 @@ class DataParallelBuffer:
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def get_shard_view(
-        self,
-        placements: Optional[list[Placement]] = None,
-    ) -> torch.Tensor:
+    def get_shard_view(self, placements: Optional[list[Placement]] = None) -> torch.Tensor:
         """Return a placement view inside the persistent data buffer."""
         assert self.data is not None, "DataParallelBuffer data not initialized"
-        requested_placements = (
-            placements if placements is not None else self.placements
-        )
+        requested_placements = placements if placements is not None else self.placements
         _, local_slice = self.buffer_index.local_slice_for(
-            (0, self.buffer_index.bucket_meta.size),
-            requested_placements,
-            self.storage_placements,
+            (0, self.buffer_index.bucket_meta.size), requested_placements, self.storage_placements
         )
         return self.data[:0] if local_slice is None else self.data[local_slice]
 
-    def fetch_buffer(
-        self,
-        placements: list[Placement],
-    ) -> torch.Tensor:
+    def fetch_buffer(self, placements: list[Placement]) -> torch.Tensor:
         """Return a buffer for placements, allocating temporary storage if needed.
 
         1. If placements match the storage placements, return self.data directly.
@@ -419,11 +392,8 @@ class DataParallelBuffer:
             return self.data
 
         data_contains_requested = all(
-            storage_placement is not Placement.FLAT
-            or requested_placement is Placement.FLAT
-            for storage_placement, requested_placement in zip(
-                self.storage_placements, placements
-            )
+            storage_placement is not Placement.FLAT or requested_placement is Placement.FLAT
+            for storage_placement, requested_placement in zip(self.storage_placements, placements)
         )
         if data_contains_requested:
             return self.get_shard_view(placements)
@@ -436,10 +406,7 @@ class DataParallelBuffer:
                 device=self.device,
             )
             self._unsharded_buffer = bucket.data
-        if all(
-            placement is Placement.REPLICATE
-            for placement in placements
-        ):
+        if all(placement is Placement.REPLICATE for placement in placements):
             return self._unsharded_buffer
         return self._unsharded_buffer[
             requested_meta.bucket_data_index : requested_meta.bucket_data_index

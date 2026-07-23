@@ -357,31 +357,20 @@ class FullyShardedDataParallel(_BaseDataParallel):
                     isinstance(m, TransformerLayer) and "transformer" in cuda_graph_on,
                     isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
                     isinstance(m, Attention) and "attn" in cuda_graph_on,
-                    isinstance(m, MLP)
-                    and m not in moe_submodules
-                    and "mlp" in cuda_graph_on,
-                    isinstance(m, (TEGroupedMLP, SequentialMLP))
-                    and "moe" in cuda_graph_on,
+                    isinstance(m, MLP) and m not in moe_submodules and "mlp" in cuda_graph_on,
+                    isinstance(m, (TEGroupedMLP, SequentialMLP)) and "moe" in cuda_graph_on,
                     isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
                 ]
             )
             if enable_cuda_graph:
                 fully_shard(
-                    m,
-                    enable_cuda_graph=True,
-                    mesh=mesh,
-                    gradient_scaling_factor=grad_sf,
-                    **kwargs,
+                    m, enable_cuda_graph=True, mesh=mesh, gradient_scaling_factor=grad_sf, **kwargs
                 )
             elif isinstance(m, (TEGroupedMLP, SequentialMLP)) or (
                 fsdp_unit_modules is not None and isinstance(m, tuple(fsdp_unit_modules))
             ):
                 fully_shard(
-                    m,
-                    mesh=mesh,
-                    gradient_scaling_factor=grad_sf,
-                    enable_cuda_graph=False,
-                    **kwargs,
+                    m, mesh=mesh, gradient_scaling_factor=grad_sf, enable_cuda_graph=False, **kwargs
                 )
         fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
 

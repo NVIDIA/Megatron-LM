@@ -67,16 +67,13 @@ class TestMegatronFSDPE2E:
                 raise RuntimeError("root fully_shard reached")
 
         monkeypatch.setattr(
-            "megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard",
-            record_fully_shard,
+            "megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard", record_fully_shard
         )
 
         with pytest.raises(RuntimeError, match="root fully_shard reached"):
             FullyShardedDataParallel(
                 config=TransformerConfig(
-                    num_attention_heads=1,
-                    num_layers=1,
-                    calculate_per_token_loss=True,
+                    num_attention_heads=1, num_layers=1, calculate_per_token_loss=True
                 ),
                 ddp_config=DistributedDataParallelConfig(
                     use_megatron_fsdp=True,

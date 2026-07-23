@@ -202,9 +202,7 @@ class ParameterGroup:
                 main_params_dtype != model_weight_dtype
                 or mbuf.storage_placements != wbuf.storage_placements
             ):
-                mbuf.init_data(
-                    torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device)
-                )
+                mbuf.init_data(torch.empty(mbuf.data_size, dtype=mbuf.dtype, device=self.device))
                 for i, p in enumerate(self.params):
                     item = self.mp_policy.get_high_precision_value(p)
                     mbuf.set_item(i, item.detach().to(main_params_dtype))
@@ -264,9 +262,7 @@ class ParameterGroup:
         """
         for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
             weight_buffer.redistribute(
-                [Placement.REPLICATE, Placement.REPLICATE],
-                bind_params=bind_params,
-                stream=stream,
+                [Placement.REPLICATE, Placement.REPLICATE], bind_params=bind_params, stream=stream
             )
         self.post_unshard(bwd_pass=bwd_pass)
 
@@ -283,9 +279,7 @@ class ParameterGroup:
 
     def reshard(self):
         """Reshard model weights by releasing unsharded buffer."""
-        self.model_weight_buffer.redistribute(
-            self.model_weight_buffer.storage_placements
-        )
+        self.model_weight_buffer.redistribute(self.model_weight_buffer.storage_placements)
         if self.transpose_weight_buffer is not None:
             self.transpose_weight_buffer.redistribute(
                 self.transpose_weight_buffer.storage_placements
@@ -330,10 +324,7 @@ class ParameterGroup:
         # Preserve dimensions whose reduction is deferred on this backward.
         target_placements = grad_buffer.placements.copy()
         for comm_dim, (grad_storage_placement, optimizer_dtensor_placement) in enumerate(
-            zip(
-                grad_buffer.storage_placements,
-                self.dist_params[0].placements,
-            )
+            zip(grad_buffer.storage_placements, self.dist_params[0].placements)
         ):
             # Replicated storage accumulates locally until the last backward.
             if not is_last_backward and grad_storage_placement is Placement.REPLICATE:
@@ -345,10 +336,7 @@ class ParameterGroup:
                 else Placement.REPLICATE
             )
             # Replicated storage stays physically full while only its owned shard is valid.
-            if (
-                target_placement is Placement.FLAT
-                and grad_storage_placement is Placement.REPLICATE
-            ):
+            if target_placement is Placement.FLAT and grad_storage_placement is Placement.REPLICATE:
                 target_placement = Placement.DIRTY
             target_placements[comm_dim] = target_placement
 
@@ -362,9 +350,9 @@ class ParameterGroup:
             stream=stream,
             accumulate=self._reduced_grad_buffer_has_accumulated_grad,
         )
-        if (
-            source_placements[1] is Placement.PARTIAL
-            and target_placements[1] in (Placement.FLAT, Placement.DIRTY)
+        if source_placements[1] is Placement.PARTIAL and target_placements[1] in (
+            Placement.FLAT,
+            Placement.DIRTY,
         ):
             # The full buffer was only collective input. Its contents are no
             # longer a valid unreduced accumulation after reduce-scatter.
@@ -424,12 +412,8 @@ class ParameterGroup:
         self.dist_grads = []  # placeholder, populated in _init_dist_grads
         optimizer_buffer = self.main_weight_buffer or self.model_weight_buffer
         buffer_placements = [
-            Placement.FLAT
-            if self.outer_dp_sharding_strategy == "optim"
-            else Placement.REPLICATE,
-            Placement.FLAT
-            if self.sharding_strategy != "no_shard"
-            else Placement.REPLICATE,
+            Placement.FLAT if self.outer_dp_sharding_strategy == "optim" else Placement.REPLICATE,
+            Placement.FLAT if self.sharding_strategy != "no_shard" else Placement.REPLICATE,
         ]
         optimizer_dtensor_placements = [
             Shard(dim=0) if placement is Placement.FLAT else Replicate()
@@ -440,10 +424,7 @@ class ParameterGroup:
 
         for param in self.params:
             item_id = self.param_idx[param]
-            data = optimizer_buffer.get_item(
-                item_id,
-                placements=buffer_placements,
-            )
+            data = optimizer_buffer.get_item(item_id, placements=buffer_placements)
             param_shape = (
                 param.shape
                 if self.main_weight_buffer is not None
@@ -451,16 +432,9 @@ class ParameterGroup:
             )
 
             dist_data = make_uneven_dtensor(
-                data,
-                param_shape,
-                self.mesh,
-                optimizer_dtensor_placements,
-                post_process_uneven=True,
+                data, param_shape, self.mesh, optimizer_dtensor_placements, post_process_uneven=True
             )
-            dist_param = torch.nn.Parameter(
-                dist_data,
-                requires_grad=param.requires_grad,
-            )
+            dist_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
             dist_param = torch.nn.Parameter(dist_data, requires_grad=param.requires_grad)
             # ``torch.nn.Parameter(DTensor)`` wraps the DTensor and creates a
             # fresh local tensor object, so Python-side uneven-DTensor metadata
@@ -547,10 +521,7 @@ class ParameterGroup:
             for placement in self.dist_params[0].placements
         ]
         for param, dist_param in zip(self.params, self.dist_params):
-            data = optimizer_buffer.get_item(
-                self.param_idx[param],
-                placements=buffer_placements,
-            )
+            data = optimizer_buffer.get_item(self.param_idx[param], placements=buffer_placements)
             object.__setattr__(dist_param._local_tensor, 'data', data)
 
         if self.main_grad_buffer is not None and self.main_grad_buffer.data is not None:
@@ -558,8 +529,7 @@ class ParameterGroup:
                 if dist_grad is None:
                     continue
                 grad_data = self.main_grad_buffer.get_item(
-                    self.param_idx[param],
-                    placements=buffer_placements,
+                    self.param_idx[param], placements=buffer_placements
                 )
                 object.__setattr__(dist_grad._local_tensor, 'data', grad_data)
 

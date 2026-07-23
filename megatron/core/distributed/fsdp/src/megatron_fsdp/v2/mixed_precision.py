@@ -598,9 +598,7 @@ class MixedPrecisionPolicy:
             model_param_shards = []
             for param in params:
                 item_id = param_idx[param]
-                model_shard = model_weight_buffer.get_item(
-                    item_id, placements=optimizer_placements
-                )
+                model_shard = model_weight_buffer.get_item(item_id, placements=optimizer_placements)
                 if model_shard.numel() == 0:
                     fp8_params.append(param)
                     main_params.append(None)
@@ -613,12 +611,9 @@ class MixedPrecisionPolicy:
                     transpose_shard = transpose_weight_buffer.get_item(
                         item_id, placements=optimizer_placements
                     )
-                main_weight = main_weight_buffer.get_item(
-                    item_id, placements=optimizer_placements
-                )
+                main_weight = main_weight_buffer.get_item(item_id, placements=optimizer_placements)
                 start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(
-                    item_id,
-                    placements=optimizer_placements,
+                    item_id, placements=optimizer_placements
                 )
                 fp8_params.append(param)
                 main_params.append(main_weight)
@@ -790,9 +785,7 @@ def quantize_main_weights_to_nvfp4(
 
     for param in model_params:
         item_id = param_idx[param]
-        main_weight_shard = main_weight_buffer.get_item(
-            item_id, placements=sharded_placements
-        )
+        main_weight_shard = main_weight_buffer.get_item(item_id, placements=sharded_placements)
         if main_weight_shard.numel() == 0:
             main_weight_shard = None
 

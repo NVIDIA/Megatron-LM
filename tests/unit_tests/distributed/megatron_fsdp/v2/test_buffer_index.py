@@ -24,7 +24,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.buffer_index import Buf
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
 
-
 CANONICAL_PLACEMENTS = (
     [Placement.REPLICATE, Placement.REPLICATE],
     [Placement.REPLICATE, Placement.FLAT],
@@ -107,12 +106,8 @@ class TestBufferIndex:
             meta.size,
         ) == self.ref_shard_metas[tuple(placements)]
 
-        assert index.shard_meta == index._get_shard_meta(
-            [Placement.REPLICATE, Placement.FLAT]
-        )
-        assert index.outer_shard_meta == index._get_shard_meta(
-            [Placement.FLAT, Placement.FLAT]
-        )
+        assert index.shard_meta == index._get_shard_meta([Placement.REPLICATE, Placement.FLAT])
+        assert index.outer_shard_meta == index._get_shard_meta([Placement.FLAT, Placement.FLAT])
 
     @pytest.mark.parametrize("item_id", [0, 1, 2])
     @pytest.mark.parametrize("placements", CANONICAL_PLACEMENTS)
@@ -155,9 +150,7 @@ class TestBufferIndex:
 
     def _expected_local_slices(self, global_range, requested_placements, storage_placements):
         global_start, global_end = global_range
-        requested_start, _, _, requested_size = self.ref_shard_metas[
-            tuple(requested_placements)
-        ]
+        requested_start, _, _, requested_size = self.ref_shard_metas[tuple(requested_placements)]
         storage_start, storage_local_start, _, storage_size = self.ref_shard_metas[
             tuple(storage_placements)
         ]
@@ -184,9 +177,7 @@ class TestBufferIndex:
 
         assert index.local_slice_for(
             global_range, requested_placements, storage_placements
-        ) == self._expected_local_slices(
-            global_range, requested_placements, storage_placements
-        )
+        ) == self._expected_local_slices(global_range, requested_placements, storage_placements)
 
     @pytest.mark.parametrize("requested_placements", CANONICAL_PLACEMENTS)
     @pytest.mark.parametrize("storage_placements", CANONICAL_PLACEMENTS)
@@ -201,6 +192,4 @@ class TestBufferIndex:
 
         assert index.local_slice_for(
             global_range, requested_placements, storage_placements
-        ) == self._expected_local_slices(
-            global_range, requested_placements, storage_placements
-        )
+        ) == self._expected_local_slices(global_range, requested_placements, storage_placements)
