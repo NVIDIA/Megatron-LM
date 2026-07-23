@@ -159,6 +159,10 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
+    """
+
     megatron_fsdp_prefetch_recompute_forward_weights: bool = False
     """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
       recomputation during backward before prefetching backward transpose weights.
@@ -198,9 +202,6 @@ class DistributedDataParallelConfig:
     parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
     user buffer registration and CUDA graph replay for models with asymmetrical
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
-
-    use_megatron_fsdp_v2: bool = False
-    """If true, use the `fully_shard` API for FSDP sharding the model.
     """
 
     def __post_init__(self):

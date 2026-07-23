@@ -198,10 +198,10 @@ strategy controls which buffers and communication collectives are used.
 
 | Strategy | Shard Weights | Shard Gradients | Status | Notes |
 |----------|---------------|-----------------|--------|-------|
-| `optim_grads_params` | Yes | Yes | **Supported** | Like ZeRO-3: full parameter/gradient/optimizer sharding |
-| `no_shard` | No | No | **Supported** | Like DDP: replicated weights and full-gradient all-reduce |
-| `optim` | No | No | **Supported** | Like ZeRO-1: shard optimizer states only |
-| `optim_grads` | No | Yes | **Supported** | Like ZeRO-2: shard optimizer states + gradients |
+| `optim_grads_params` | Yes | Yes | **Supported** | Like ZeRO-3: all-gather weights pre-forward, reduce-scatter grads during backward, sharded optimizer states |
+| `optim_grads` | No | Yes | **Supported** | Like ZeRO-2: replicated weights, reduce-scatter grads during backward, sharded optimizer states. No param-gather overlap. |
+| `optim` | No | No | **Supported** | Like ZeRO-1: replicated weights, grads accumulated in replicated buffer, single reduce-scatter at ``finish_grad_sync``, sharded optimizer states. No param-gather overlap. |
+| `no_shard` | No | No | **Supported** | Like DDP: replicated weights, full-gradient all-reduce, replicated optimizer states. No param-gather overlap. |
 
 ## Known Limitations
 
@@ -219,7 +219,9 @@ strategy controls which buffers and communication collectives are used.
 ### Sharding Strategies
 
 `no_shard` (DDP-like), `optim` (ZeRO-1), `optim_grads` (ZeRO-2), and
-`optim_grads_params` (ZeRO-3 equivalent) are implemented.
+`optim_grads_params` (ZeRO-3 equivalent) are implemented. `no_shard`,
+`optim`, and `optim_grads` use replicated compute weights, so parameter gather
+overlap (prefetch/unshard pipelining) is not applicable.
 
 ### CUDA Graph
 

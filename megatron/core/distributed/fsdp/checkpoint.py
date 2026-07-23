@@ -203,8 +203,12 @@ def handle_experts_in_state_dict(model_state_dict: dict, num_experts: int) -> di
 
 
 def _get_expert_index_from_key(key: str):
-    """Extract expert index from key (``weight{N}`` or ``local_experts.N.``)."""
-    m = re.search(r'(?:weight(\d+)$)|(?:local_experts\.(\d+)\.)', key)
+    """Extract expert index from grouped or sequential expert checkpoint keys."""
+    m = re.search(
+        r'(?:mlp\.experts\.linear_fc[12]\.weight(\d+)(?:_[wv])?$)'
+        r'|(?:mlp\.experts\.local_experts\.(\d+)\.)',
+        key,
+    )
     if m:
         return int(m.group(1) or m.group(2))
     return None
@@ -340,21 +344,28 @@ def _split_fused_params_v2(
             opt_state = optimizer_state_dict["state"]
             new_opt_state = {}
             for key in list(opt_state.keys()):
-                param_key = key
-                if param_key.startswith("module."):
-                    param_key = param_key[len("module.") :]
-                dist_param = _get_dist_param(model, param_key)
+                state = opt_state[key]
+                detector_input = next((state[sk] for sk in state_keys if sk in state), None)
+                if detector_input is None:
+                    param_key = key
+                    if param_key.startswith("module."):
+                        param_key = param_key[len("module.") :]
+                    try:
+                        detector_input = _get_dist_param(model, param_key)
+                    except AttributeError:
+                        new_opt_state[key] = state
+                        continue
 
-                match = detector(key, dist_param, model)
+                match = detector(key, detector_input, model)
                 if match is None:
-                    new_opt_state[key] = opt_state[key]
+                    new_opt_state[key] = state
                     continue
                 sizes, names, dim = match
 
                 for sub_name in names:
-                    new_opt_state[key_fmt(key, sub_name)] = opt_state[key].copy()
+                    new_opt_state[key_fmt(key, sub_name)] = state.copy()
                 for sk in state_keys:
-                    sub_tensors = split_dtensor(opt_state[key][sk], sizes, dim)
+                    sub_tensors = split_dtensor(state[sk], sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
                         new_opt_state[key_fmt(key, sub_name)][sk] = tensor
             optimizer_state_dict["state"] = new_opt_state
@@ -500,18 +511,70 @@ _MAMBA_MIXER_KEY_PATTERNS = [
     r"(.*)\.mixer\.in_proj\.weight$",
     r"(.*)\.mixer\.conv1d\.weight$",
     r"(.*)\.mixer\.conv1d\.bias$",
+    r"(.*)\.mixer\.conv1d_weight$",
+    r"(.*)\.mixer\.conv1d_bias$",
 ]
 
 
 def _detect_mamba_mixers(model: nn.Module) -> dict:
     """Return ``{layer_path: MambaMixer_module}`` for MambaMixer layers."""
-    if MambaMixer is None:
-        return {}
     _mixers = {}
     for name, module in model.named_modules():
-        if isinstance(module, MambaMixer):
+        if _is_mamba_mixer(module):
             _mixers[_strip_wrappers(name)] = module
     return _mixers
+
+
+def _get_mamba_mixer_cls():
+    """Resolve MambaMixer after module initialization completes.
+
+    ``checkpoint`` may be imported while ``mamba_mixer`` is still being
+    initialized, in which case the optional module-level import above leaves
+    ``MambaMixer`` unset. Retry lazily when checkpoint processing actually
+    needs the class.
+    """
+    if MambaMixer is not None:
+        return MambaMixer
+    try:
+        from megatron.core.ssm.mamba_mixer import MambaMixer as _MambaMixer
+    except ImportError:
+        return None
+    return _MambaMixer
+
+
+def _is_mamba_mixer(module: nn.Module) -> bool:
+    """Return whether a module provides the MambaMixer split metadata."""
+    mamba_mixer_cls = _get_mamba_mixer_cls()
+    if mamba_mixer_cls is not None and isinstance(module, mamba_mixer_cls):
+        return True
+    return all(
+        hasattr(module, attr)
+        for attr in (
+            "d_inner_local_tp",
+            "ngroups_local_tp",
+            "d_state",
+            "nheads_local_tp",
+            "in_proj",
+        )
+    )
+
+
+def _resolve_mamba_mixer(model: nn.Module, prefix: str, mixer_map: dict):
+    """Resolve a mixer from a state-dict prefix across wrapper layouts."""
+    normalized = _strip_wrappers(prefix)
+    mixer_module = mixer_map.get(normalized)
+    if mixer_module is not None:
+        return mixer_module
+
+    candidates = [prefix, normalized, f"module.{normalized}"]
+    for candidate in dict.fromkeys(candidates):
+        try:
+            module = model.get_submodule(candidate)
+        except AttributeError:
+            continue
+        if _is_mamba_mixer(module):
+            return module
+    return None
 
 
 def _mamba_mixer_detector(key, dtensor, model, mixer_map):
@@ -521,23 +584,15 @@ def _mamba_mixer_detector(key, dtensor, model, mixer_map):
     or ``mixer.conv1d.*``, using the TP-local dimensions from the owning
     ``MambaMixer`` module.  Returns ``None`` for non-mamba keys.
     """
-    if not _MAMBA_MIXER_KEY_PATTERNS or MambaMixer is None:
+    if not _MAMBA_MIXER_KEY_PATTERNS:
         return None
     dim = 0
     for pat in _MAMBA_MIXER_KEY_PATTERNS:
         m = re.match(pat, key)
         if not m:
             continue
-        prefix = m.group(1)
-        mixer_module = mixer_map.get(prefix)
-        if mixer_module is None:
-            # Strip module. prefix and retry
-            alt = prefix
-            while alt.startswith(_MODULE_PREFIX):
-                alt = alt[len(_MODULE_PREFIX) :]
-                mixer_module = mixer_map.get(alt)
-                if mixer_module is not None:
-                    break
+        prefix = f"{m.group(1)}.mixer"
+        mixer_module = _resolve_mamba_mixer(model, prefix, mixer_map)
         if mixer_module is None:
             return None
         if "in_proj.weight" in key:
@@ -549,7 +604,9 @@ def _mamba_mixer_detector(key, dtensor, model, mixer_map):
                 mixer_module.nheads_local_tp,
             ]
             return (sizes, _MAMBA_MIXER_IN_PROJ_NAMES, dim)
-        if "conv1d.weight" in key or "conv1d.bias" in key:
+        if any(
+            name in key for name in ("conv1d.weight", "conv1d.bias", "conv1d_weight", "conv1d_bias")
+        ):
             sizes = [
                 mixer_module.d_inner_local_tp,
                 mixer_module.ngroups_local_tp * mixer_module.d_state,
@@ -569,8 +626,6 @@ def handle_mamba_in_state_dict_v2(
     TP-local dimensions read from each ``MambaMixer`` module.
     Delegates to :func:`_split_fused_params_v2`.
     """
-    if MambaMixer is None:
-        return model_state_dict, optimizer_state_dict
     mixer_map = _detect_mamba_mixers(model)
     if not mixer_map:
         return model_state_dict, optimizer_state_dict
@@ -578,13 +633,15 @@ def handle_mamba_in_state_dict_v2(
     def detector(key, dtensor, _model):
         return _mamba_mixer_detector(key, dtensor, _model, mixer_map)
 
+    def split_key(key, sub_name):
+        if key.endswith(".conv1d_weight"):
+            key = f"{key[:-len('.conv1d_weight')]}.conv1d.weight"
+        elif key.endswith(".conv1d_bias"):
+            key = f"{key[:-len('.conv1d_bias')]}.conv1d.bias"
+        return f"{key}.{sub_name}"
+
     return _split_fused_params_v2(
-        model,
-        model_state_dict,
-        optimizer_state_dict,
-        detector,
-        lambda k, s: f"{k}.{s}",
-        "MambaMixer",
+        model, model_state_dict, optimizer_state_dict, detector, split_key, "MambaMixer"
     )
 
 

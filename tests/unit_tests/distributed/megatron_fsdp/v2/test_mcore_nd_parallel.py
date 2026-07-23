@@ -17,7 +17,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import 
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import is_torch_min_version
-from tests.unit_tests.distributed.megatron_fsdp.utils import (
+from tests.unit_tests.distributed.mfsdp_v1.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
     pretrain_forward_backward,

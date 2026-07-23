@@ -1540,7 +1540,6 @@ def _load_global_dist_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
-    model=None,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
@@ -1626,7 +1625,6 @@ def _load_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
-    model=None,
 ):
     """Load the base state_dict from the given directory
 
@@ -1713,7 +1711,6 @@ def _load_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
-            model=model,
         )
     elif ckpt_format == "torch":
         ckpt_type = CheckpointType.LEGACY
@@ -2303,7 +2300,6 @@ def load_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
-            model=model,
             **load_kwargs,
         )
 

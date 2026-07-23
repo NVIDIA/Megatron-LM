@@ -10,7 +10,7 @@ from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from megatron.core.utils import is_torch_min_version
-from tests.unit_tests.distributed.megatron_fsdp.utils import (
+from tests.unit_tests.distributed.mfsdp_v1.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
     pretrain_forward_backward,
@@ -56,6 +56,38 @@ def _normalize_key(key: str) -> str:
     while key.startswith("module."):
         key = key[len("module.") :]
     return key
+
+
+def test_detect_mamba_mixers_structurally():
+    from megatron.core.distributed.fsdp.checkpoint import (
+        _MAMBA_MIXER_CONV1D_NAMES,
+        _detect_mamba_mixers,
+        _mamba_mixer_detector,
+    )
+
+    model = torch.nn.Module()
+    model.mixer = torch.nn.Module()
+    model.mixer.d_inner_local_tp = 8
+    model.mixer.ngroups_local_tp = 2
+    model.mixer.d_state = 4
+    model.mixer.nheads_local_tp = 2
+    model.mixer.in_proj = torch.nn.Linear(1, 1)
+
+    assert _detect_mamba_mixers(model) == {"mixer": model.mixer}
+    sizes, names, dim = _mamba_mixer_detector(
+        "module.mixer.conv1d_weight", torch.empty(16, 1, 4), model, {}
+    )
+    assert sizes == [8, 8, 8]
+    assert names == _MAMBA_MIXER_CONV1D_NAMES
+    assert dim == 0
+
+
+@pytest.mark.parametrize("suffix", ["", "_w", "_v"])
+def test_get_grouped_expert_index_after_swiglu_split(suffix):
+    from megatron.core.distributed.fsdp.checkpoint import _get_expert_index_from_key
+
+    key = f"decoder.layers.1.mlp.experts.linear_fc1.weight3{suffix}"
+    assert _get_expert_index_from_key(key) == 3
 
 
 def _get_model_from_chunks(model_chunks):

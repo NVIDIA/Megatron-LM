@@ -14,7 +14,6 @@
 
 import logging
 import random
-from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple, Type
 
 try:
@@ -213,6 +212,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 f"{supported_fsdp_unit_modules}, "
                 f"got {self.fsdp_unit_modules}."
             )
+
         super().__init__(
             config=config,
             module=MegatronFSDP(
