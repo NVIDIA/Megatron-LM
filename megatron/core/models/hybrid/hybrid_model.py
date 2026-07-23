@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from typing import Literal, Optional
@@ -23,6 +23,7 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -37,6 +38,18 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
+    tp_group = getattr(pg_collection, 'tp', None)
+    dp_cp_group = getattr(pg_collection, 'dp_cp', None)
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError(
+            "pg_collection.tp and pg_collection.dp_cp must both be set or both be unset."
+        )
+    if tp_group is None:
+        return {}
+    return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
 
 
 class HybridModel(LanguageModule, GraphableMegatronModule):
@@ -187,12 +200,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+
         layer_type_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
 
         # Determine if MTP is needed (based on pattern parsing)
@@ -203,7 +219,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
             # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
             # stage separate from loss) to be supported in the hybrid model.
-            and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
+            and mtp_on_this_rank(
+                layout=self.config.pipeline_model_parallel_layout,
+                mtp_num_layers=self.config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=self.vp_stage,
+            )
         )
 
         # megatron core pipelining currently depends on model type
@@ -260,6 +281,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
+            name="decoder",
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -279,6 +301,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
+                name="mtp",
             )
             self._setup_mtp_cuda_graphs()
 
@@ -328,20 +351,30 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
         off_interface.init_chunk_handler(
+            pp_rank=self.pg_collection.pp.rank(),
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction=self.config.activation_offload_fraction,
+            max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
-                off_interface.mark_not_offloadable(param)
+                off_interface.mark_not_offload(param)
             if self.mtp_process:
                 for param in self.mtp.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             if self.post_process:
                 for param in self.output_layer.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             self.disable_param_offloading = False
+
+    def preprocess_for_paged_stash(self):
+        """Preprocess for paged stash."""
+        return paged_stash_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
+        )
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """
@@ -406,6 +439,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         in_inference_mode = InferenceMode.is_active()
@@ -428,6 +464,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 and is_using_quantization_scales(self.config)
             ):
                 decoder_input[inference_context.padding_slice] = 0.0
+
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                # The embedding skips SP scatter for models whose outer wrapper scatters instead
+                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -510,9 +553,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
-                self._decoder_hidden_states_cache = hidden_states
-            else:
+            if is_spec_decode:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    # Block-scope CUDA graph mode: copy_() into the
+                    # pre-allocated buffer so every graph replay writes to
+                    # the same fixed GPU address regardless of batch size.
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    # Non-block scope: direct assignment; the controller will set
+                    # this back to None after reading to allow GC.
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
+                # For RL (labels is None), process_mtp_loss derives labels from
+                # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -524,8 +581,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
                     cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
         sequence_parallel_override = False
         if (

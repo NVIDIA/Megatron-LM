@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from contextlib import nullcontext
@@ -19,6 +19,17 @@ from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _release_tensor_storage(tensors):
+    """Release tensor storage after all backward users are done."""
+    if tensors is None:
+        return
+
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream())
+            tensor.untyped_storage().resize_(0)
 
 
 def combined_1f1b_schedule_for_no_pipelining(
@@ -370,12 +381,6 @@ def combined_forward_backward_step(
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
             )
-            from megatron.core.models.gpt.gpt_model import GPTModel
-
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
-            )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
             )
@@ -405,6 +410,7 @@ def combined_forward_backward_step(
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
     b_schedule_plan = None
+    loss_node_inputs_to_release = None
     if b_model is not None:
         # Retain the grad on the input_tensor.
         if not isinstance(b_input_tensor, list):
@@ -432,6 +438,8 @@ def combined_forward_backward_step(
             # Backward pass for loss function
             torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
             b_output_tensor_grad[0] = loss_node.get_grad()
+            loss_node_inputs_to_release = loss_node.inputs
+            loss_node._release_state()
 
     # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
     # otherwise do nothing extra at the outer level
@@ -454,6 +462,7 @@ def combined_forward_backward_step(
             post_forward=post_forward,
             post_backward=post_backward,
         )
+    _release_tensor_storage(loss_node_inputs_to_release)
 
     # forward post process
     num_tokens = None
