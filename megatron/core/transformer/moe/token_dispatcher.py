@@ -19,9 +19,12 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    deepepv2_combine,
+    deepepv2_dispatch,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
+    get_elastic_buffer,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     nccl_ep_combine,
@@ -1404,6 +1407,113 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _DeepepV2Manager(_DeepepManager):
+    """
+    A manager class for the DeepEP v2 ElasticBuffer backend.
+
+    This keeps the original DeepEP backend isolated under "deepep", while "deepepv2"
+    uses the v2 dispatch/combine APIs.
+    """
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ):
+        # Do not call _DeepepManager.__init__; v2-only images may not ship the v1 Buffer API.
+        self.group = group
+        self.num_local_experts = num_local_experts
+        self.config = config
+
+        self.router_topk = router_topk
+        self.num_experts = num_experts
+        self.router_dtype = config.moe_router_dtype
+        self.capacity_factor = config.moe_expert_capacity_factor
+        self.permute_fusion = config.moe_permute_fusion
+        self.num_sms = (
+            config.moe_flex_dispatcher_num_sms
+            if config.moe_flex_dispatcher_num_sms is not None
+            else 0
+        )
+
+        self.token_indices: Optional[torch.Tensor] = None
+        self.token_probs: Optional[torch.Tensor] = None
+        self.handle = None
+        self.buffer = None
+
+        if deepepv2_dispatch is None:
+            raise ImportError(
+                "DeepEP v2 is not installed. Please install a DeepEP package that provides "
+                "ElasticBuffer."
+            )
+
+    def _get_buffer(self, hidden_states: torch.Tensor):
+        self.buffer = get_elastic_buffer(
+            self.group,
+            num_max_tokens_per_rank=hidden_states.shape[0],
+            hidden=hidden_states.shape[1],
+            num_topk=self.token_indices.shape[1],
+        )
+        return self.buffer
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        # DeepEP v2 only supports float32 probs.
+        if self.token_probs.dtype != torch.float32:
+            if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                logger.warning(
+                    "DeepEP v2 only supports float32 probs, please set --moe-router-dtype=fp32"
+                )
+            self.token_probs = self.token_probs.float()
+        buffer = self._get_buffer(hidden_states)
+        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+            deepepv2_dispatch(
+                buffer,
+                hidden_states,
+                self.token_indices,
+                self.token_probs,
+                self.num_experts,
+                num_max_tokens_per_rank=hidden_states.shape[0],
+                expert_alignment=1,
+                num_sms=self.num_sms,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+        )
+        self.handle = handle
+        self.tokens_per_expert = num_tokens_per_expert
+        self.dispatched_indices = dispatched_indices
+        self.dispatched_probs = dispatched_probs
+
+        return hidden_states
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        hidden_states, _ = deepepv2_combine(
+            self.buffer,
+            hidden_states,
+            self.handle,
+            num_sms=self.num_sms,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
+        self.handle = None
+        self.dispatched_indices = None
+        self.dispatched_probs = None
+        return hidden_states
+
+
 class _NCCLEPManager(_DispatchManager):
     """A manager class to handle dispatch/combine for MoE models using the NCCL Expert
     Parallelism backend, via TransformerEngine's transformer_engine.pytorch.ep API
@@ -1661,6 +1771,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+        elif self.config.moe_flex_dispatcher_backend == "deepepv2":
+            assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
+            self._comm_manager = _DeepepV2Manager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             self._comm_manager = _HybridEPManager(
                 group=self.tp_ep_group,
@@ -1682,7 +1802,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
+                "Please set --moe-flex-dispatcher-backend to deepep, deepepv2, hybridep, or ncclep"
             )
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
