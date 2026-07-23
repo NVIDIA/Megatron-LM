@@ -110,6 +110,7 @@ class MegatronFSDPStateful(Stateful):
         self.args = args
 
     def state_dict(self):
+        """Return model and optional optimizer state in DCP-compatible form."""
         if self.optimizer is not None:
             model_sd, optim_sd = _get_state_dict(self.model, self.optimizer)
         else:
@@ -126,6 +127,7 @@ class MegatronFSDPStateful(Stateful):
         return state_dict
 
     def load_state_dict(self, state_dict):
+        """Load model and optional optimizer state from a DCP-compatible mapping."""
         _set_state_dict(
             self.model,
             self.optimizer,
