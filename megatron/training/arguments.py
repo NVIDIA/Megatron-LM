@@ -2881,6 +2881,10 @@ def _add_distributed_args(parser):
                             'The "optim" option is only supported when --data-parallel-sharding-strategy is "optim_grads_params". '
                             'This option is only effective when Hybrid FSDP is enabled (i.e., when dp_outer_dim is not None). '
                             'Default: "no_shard".')
+    group.add_argument('--hfsdp-param-gather-overlap', action='store_true',
+                       help='Pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner. '
+                            'DP-Inner is prefetched one FSDP unit ahead and DP-Outer two units ahead. '
+                            'Only effective with --outer-dp-sharding-strategy=optim.')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',

@@ -31,6 +31,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     AllGatherPipeline,
+    BucketStatus,
     PrefetchOrder,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -326,6 +327,58 @@ class TestMegatronFsdpFullyShard:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.4.0'),
+        reason="Requires DTensor and DeviceMesh support in PyTorch 2.4.0 or later.",
+    )
+    def test_hfsdp_param_gather_overlap(self):
+        """HFSDP stages DP-Outer two units ahead and DP-Inner one unit ahead."""
+        if Utils.world_size != 8:
+            pytest.skip("Requires 8 GPUs for a 2x4 HFSDP mesh.")
+
+        device_mesh = build_distributed_environment((2, 4, 1, 1))
+        model = ToyCNN(height=DIM_SIZE, width=DIM_SIZE, num_layers=4).cuda()
+        fsdp_model = fully_shard_model(
+            module=model,
+            device_mesh=device_mesh,
+            dp_shard_dim=DP_SHARD,
+            dp_outer_dim=DP_OUTER,
+            tp_dim=TP,
+            hybrid_fsdp_group=device_mesh[HSDP].get_group(),
+            fsdp_unit_modules=[torch.nn.Conv2d, torch.nn.Linear],
+            zero_dp_strategy=OPTIM_GRADS_PARAMS,
+            outer_dp_sharding_strategy=OPTIM,
+            hfsdp_param_gather_overlap=True,
+        )
+        optimizer = fully_shard_optimizer(Adam(fsdp_model.parameters(), lr=0.01))
+
+        fsdp_model.synchronize_param_gather()
+        fsdp_model.start_param_sync()
+        pipeline = fsdp_model.all_gather_pipeline
+        parameter_groups = fsdp_model.param_and_grad_buffer.parameter_groups
+        inner_units = {
+            parameter_groups[bucket_id].fsdp_unit_id
+            for (bucket_id, _), status in pipeline.bucket_status.items()
+            if status == BucketStatus.COMMUNICATING
+            and parameter_groups[bucket_id].fsdp_unit_id is not None
+        }
+        outer_units = {
+            parameter_groups[bucket_id].fsdp_unit_id
+            for bucket_id, _ in pipeline.outer_bucket_ready_events
+            if parameter_groups[bucket_id].fsdp_unit_id is not None
+        }
+        assert len(inner_units) == 2
+        assert len(outer_units) == 3
+
+        inputs = torch.randn(1, 3, DIM_SIZE, DIM_SIZE, device="cuda")
+        loss = fsdp_model(inputs).square().mean()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        assert torch.isfinite(loss)
+
+        destroy_device_mesh(device_mesh)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),

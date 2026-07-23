@@ -106,6 +106,7 @@ def fully_shard_model(
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
     maxpool_double_buffer: bool = False,
+    hfsdp_param_gather_overlap: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -209,6 +210,10 @@ def fully_shard_model(
         overlap_param_gather (bool):
             Whether to overlap parameter all-gather with forward and backward compute.
             Defaults to True.
+
+        hfsdp_param_gather_overlap (bool):
+            Whether to pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner.
+            Defaults to False.
 
         sync_model_each_microbatch (bool): Whether to sync parameters and install gradients on
             each training step. When disabled, Megatron-FSDP will overlap reduce-scatter with
@@ -373,6 +378,7 @@ def fully_shard_model(
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
+        hfsdp_param_gather_overlap=hfsdp_param_gather_overlap,
         average_in_collective=average_in_collective,
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
@@ -690,6 +696,7 @@ def fully_shard(
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
     maxpool_double_buffer: bool = False,
+    hfsdp_param_gather_overlap: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -728,6 +735,7 @@ def fully_shard(
         mixed_precision_policy=mixed_precision_policy,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
+        hfsdp_param_gather_overlap=hfsdp_param_gather_overlap,
         sync_model_each_microbatch=sync_model_each_microbatch,
         preproc_state_dict_for_dcp_ckpt=preproc_state_dict_for_dcp_ckpt,
         report_nan_in_param_grad=report_nan_in_param_grad,

@@ -4596,8 +4596,11 @@ class AllGatherPipeline:
             self.buffer.ddp_config.fsdp_double_buffer
             and no_fsdp_units
         )
-        # Activated by configuration in a follow-up change.
-        pipeline_hfsdp_gathers = False
+        pipeline_hfsdp_gathers = (
+            self.buffer.ddp_config.hfsdp_param_gather_overlap
+            and self.buffer.dist_index.use_hybrid_fsdp
+            and self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard"
+        )
         outer_ag_buckets = []
 
         if pipeline_hfsdp_gathers:
