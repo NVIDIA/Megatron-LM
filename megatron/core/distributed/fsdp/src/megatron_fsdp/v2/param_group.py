@@ -261,8 +261,16 @@ class ParameterGroup:
         parameters rebind their TE raw payload instead of ``param.data``.
         """
         for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
+            if self.outer_dp_sharding_strategy == "optim":
+                weight_buffer.redistribute(
+                    [Placement.REPLICATE, weight_buffer.placements[1]],
+                    bind_params=False,
+                    stream=stream,
+                )
             weight_buffer.redistribute(
-                [Placement.REPLICATE, Placement.REPLICATE], bind_params=bind_params, stream=stream
+                [weight_buffer.placements[0], Placement.REPLICATE],
+                bind_params=bind_params,
+                stream=stream,
             )
         self.post_unshard(bwd_pass=bwd_pass)
 
@@ -321,43 +329,24 @@ class ParameterGroup:
         self._full_grad_buffer_has_accumulated_grad = True
 
         grad_buffer = self.main_grad_buffer
-        # Preserve dimensions whose reduction is deferred on this backward.
-        target_placements = grad_buffer.placements.copy()
-        for comm_dim, (grad_storage_placement, optimizer_dtensor_placement) in enumerate(
-            zip(grad_buffer.storage_placements, self.dist_params[0].placements)
-        ):
-            # Replicated storage accumulates locally until the last backward.
-            if not is_last_backward and grad_storage_placement is Placement.REPLICATE:
-                continue
-            # The optimizer DTensor placement determines which gradient extent stays valid.
-            target_placement = (
-                Placement.FLAT
-                if isinstance(optimizer_dtensor_placement, Shard)
-                else Placement.REPLICATE
+        if is_last_backward or grad_buffer.inner_sharded:
+            inner_target = grad_buffer.storage_placements[1]
+            if self.sharding_strategy == "optim":
+                inner_target = Placement.DIRTY
+            grad_buffer.redistribute(
+                [grad_buffer.placements[0], inner_target],
+                stream=stream,
+                accumulate=self._reduced_grad_buffer_has_accumulated_grad,
             )
-            # Replicated storage stays physically full while only its owned shard is valid.
-            if target_placement is Placement.FLAT and grad_storage_placement is Placement.REPLICATE:
-                target_placement = Placement.DIRTY
-            target_placements[comm_dim] = target_placement
+            self._reduced_grad_buffer_has_accumulated_grad = True
+            if inner_target is not Placement.REPLICATE:
+                self._full_grad_buffer_has_accumulated_grad = False
 
-        # No collective is due for any mesh dimension on this backward.
-        if target_placements == grad_buffer.placements:
-            return
-
-        source_placements = grad_buffer.placements.copy()
-        grad_buffer.redistribute(
-            target_placements,
-            stream=stream,
-            accumulate=self._reduced_grad_buffer_has_accumulated_grad,
-        )
-        if source_placements[1] is Placement.PARTIAL and target_placements[1] in (
-            Placement.FLAT,
-            Placement.DIRTY,
-        ):
-            # The full buffer was only collective input. Its contents are no
-            # longer a valid unreduced accumulation after reduce-scatter.
-            self._full_grad_buffer_has_accumulated_grad = False
-        self._reduced_grad_buffer_has_accumulated_grad = True
+        if is_last_backward and self.mesh.size(0) > 1:
+            outer_target = grad_buffer.storage_placements[0]
+            if self.outer_dp_sharding_strategy == "optim":
+                outer_target = Placement.DIRTY
+            grad_buffer.redistribute([outer_target, grad_buffer.placements[1]], stream=stream)
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""

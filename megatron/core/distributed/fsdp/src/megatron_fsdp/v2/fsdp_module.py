@@ -929,14 +929,13 @@ class FSDPModule:
                 if zero_tensors:
                     torch._foreach_zero_(zero_tensors)
 
+            grad_buffer = param_group.main_grad_buffer
+            grad_buffer.redistribute([grad_buffer.placements[0], Placement.PARTIAL])
+
             # A non-HSDP mesh has a singleton outer dimension, so only HSDP
             # produces an outer-DP contribution that still needs reduction.
-            param_group.main_grad_buffer.redistribute(
-                [
-                    Placement.PARTIAL if param_group.mesh.size(0) > 1 else Placement.REPLICATE,
-                    Placement.PARTIAL,
-                ]
-            )
+            if param_group.mesh.size(0) > 1:
+                grad_buffer.redistribute([Placement.PARTIAL, grad_buffer.placements[1]])
 
             for param in params_with_grad:
                 if param.grad is not None:
