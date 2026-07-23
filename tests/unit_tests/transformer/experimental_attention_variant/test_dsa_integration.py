@@ -17,7 +17,9 @@ from megatron.core.transformer.experimental_attention_variant import (
     absorbed_mla as absorbed_mla_module,
 )
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
-from megatron.core.transformer.experimental_attention_variant import dsa_kernels
+from megatron.core.transformer.experimental_attention_variant import (
+    dsa_kernels,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -27,6 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
 from megatron.training.arguments import (
     _add_experimental_attention_variant_args,
 )
@@ -191,6 +194,42 @@ def test_deprecated_dsa_kernel_fusion_cli_has_no_implicit_true_default():
 
     args = parser.parse_args(["--no-dsa-kernel-fusion"])
     assert args.apply_dsa_kernel_fusion is False
+
+
+def test_dsa_kernel_backend_cli_flag_and_effective_default():
+    parser = ArgumentParser()
+    _add_experimental_attention_variant_args(parser)
+
+    assert parser.parse_args([]).dsa_kernel_backend is None
+    assert parser.parse_args(["--dsa-kernel-backend", "cudnn"]).dsa_kernel_backend == "cudnn"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--dsa-kernel-backend", "bogus"])
+
+    def resolve(variant=None, backend=None, legacy=None, linear_attention_type=None):
+        args = SimpleNamespace(apply_dsa_kernel_fusion=legacy)
+        kw_args = {
+            "dsa_kernel_backend": backend,
+            "experimental_attention_variant": variant,
+            "linear_attention_type": linear_attention_type,
+        }
+        _resolve_dsa_kernel_backend_cli_default(args, kw_args)
+        return kw_args["dsa_kernel_backend"]
+
+    # dsv4_hybrid keeps the historical fused-by-default CLI behavior.
+    assert resolve(variant="dsv4_hybrid") == "cudnn"
+    assert resolve(linear_attention_type="dsv4_hybrid") == "cudnn"
+    # Explicit values and the deprecated switch always win over the default.
+    assert resolve(variant="dsv4_hybrid", backend="none") == "none"
+    assert resolve(variant="dsv4_hybrid", backend="cudnn") == "cudnn"
+    assert resolve(variant="dsv4_hybrid", legacy=False) == "none"
+    # Every other configuration defaults to "none".
+    assert resolve(variant="dsa") == "none"
+    assert resolve() == "none"
+
+    # kw_args without the field (non-CLI callers) are left untouched.
+    untouched = {"experimental_attention_variant": "dsv4_hybrid"}
+    _resolve_dsa_kernel_backend_cli_default(SimpleNamespace(), untouched)
+    assert "dsa_kernel_backend" not in untouched
 
 
 def test_ordinary_dsa_kernels_dependency_validation(monkeypatch):

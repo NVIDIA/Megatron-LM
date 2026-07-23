@@ -2777,6 +2777,7 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "apply_dsa_kernel_fusion",
+        "dsa_kernel_backend",
         "mamba_training_ssm_states_dtype",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
@@ -4907,6 +4908,19 @@ def _add_experimental_attention_variant_args(parser):
         dest='apply_dsa_kernel_fusion',
         help='Deprecated compatibility flag for DSv4 hybrid attention. '
         'Use --dsa-kernel-backend none instead.',
+    )
+    # Defined manually (and excluded from ArgumentGroupFactory) so that an omitted
+    # flag is distinguishable from an explicit "none": dsv4_hybrid launches resolve
+    # an omitted flag to "cudnn" in core_transformer_config_from_args, preserving
+    # the historical fused-by-default CLI behavior of --no-dsa-kernel-fusion.
+    group.add_argument(
+        '--dsa-kernel-backend',
+        type=str,
+        choices=['none', 'tilelang', 'cudnn'],
+        default=None,
+        help='Fused DSA kernel backend. When omitted, resolves to "cudnn" for '
+        'experimental_attention_variant="dsv4_hybrid" launches and to "none" '
+        'otherwise.',
     )
     # Note: --dsa-indexer-{n-heads,head-dim,topk,loss-coeff,use-sparse-loss},
     # --csa-window-size, --csa-compress-rotary-base, --csa-dense-mode are
