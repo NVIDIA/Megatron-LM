@@ -40,11 +40,13 @@ class RegisterFSDPBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, post_backward: Callable, *inputs: torch.Tensor):
+        """Pass inputs through while storing the post-backward callback."""
         ctx.post_backward = post_backward
         return inputs
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
+        """Run the post-backward callback and return the input gradients."""
         ctx.post_backward()
         return (None,) + grads
 
