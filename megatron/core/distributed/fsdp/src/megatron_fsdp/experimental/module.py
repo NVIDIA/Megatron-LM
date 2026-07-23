@@ -24,7 +24,7 @@ from torch.distributed import DeviceMesh
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
-from .placement import MeshAxis, Placements
+from .placement import Placement
 
 
 class FsdpContext:
@@ -34,7 +34,7 @@ class FsdpContext:
     reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
-    # from ``main_weight``, has placements different from ``Placements.optimizer``.
+    # from ``main_weight``, has placements different from the main-weight placements.
     is_last_microbatch: bool
     root_module: "FsdpModule"
     # Static orders used to drive all-gather prefetch. We may want to switch to
@@ -95,7 +95,10 @@ class FsdpModule:
     def __init__(
         self,
         mesh: DeviceMesh,
-        placements: Placements,
+        dp_axes: tuple[int, ...],
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symm_mem: bool = False,
     ) -> None:
@@ -104,16 +107,15 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
-        axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-        assert axis_indices == tuple(
-            range(mesh.ndim)
-        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
         parameter_groups = [
             FsdpParameterGroup(
                 owning_module=self,
                 parameters=group_parameters,
                 mesh=mesh,
-                placements=placements,
+                dp_axes=dp_axes,
+                model_weight_placements=model_weight_placements,
+                main_grad_placements=main_grad_placements,
+                main_weight_placements=main_weight_placements,
                 mixed_precision_policy=mixed_precision_policy,
                 use_symm_mem=use_symm_mem,
             )
@@ -360,21 +362,6 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, order)
-
-
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        axis_index = axis
-        if axis_index < 0:
-            axis_index += mesh.ndim
-        if axis_index < 0 or axis_index >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis_index
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
 
 
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:

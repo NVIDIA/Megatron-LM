@@ -24,7 +24,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .placement import Partial, Placement, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -55,7 +55,10 @@ class FsdpParameterGroup:
         owning_module: nn.Module,
         parameters: dict[str, nn.Parameter],
         mesh: DeviceMesh,
-        placements: Placements,
+        dp_axes: tuple[int, ...],
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symm_mem: bool = False,
     ) -> None:
@@ -64,8 +67,11 @@ class FsdpParameterGroup:
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
             parameters: Root-module-relative FQNs and their parameters.
-            mesh: Device mesh used for all DBuffer storage in this version.
-            placements: Parameter, gradient, and optimizer placements.
+            mesh: Parent device mesh used to reconstruct parameter and gradient DTensors.
+            dp_axes: Normalized parent-mesh axes that form the data-parallel mesh.
+            model_weight_placements: Placements for model-weight buffers.
+            main_grad_placements: Placements for main-gradient buffers.
+            main_weight_placements: Placements for main-weight buffers.
             mixed_precision_policy: Precision policy for main weights and gradients.
             use_symm_mem: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
@@ -73,9 +79,17 @@ class FsdpParameterGroup:
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
 
-        model_weight_placements = tuple(placements.parameter)
-        main_grad_placements = tuple(placements.gradient)
-        main_weight_placements = tuple(placements.optimizer)
+        dp_mesh = _select_dp_mesh(mesh, dp_axes)
+        for name, placements in (
+            ("model_weight", model_weight_placements),
+            ("main_grad", main_grad_placements),
+            ("main_weight", main_weight_placements),
+        ):
+            if len(placements) != dp_mesh.ndim:
+                raise ValueError(
+                    f"Expected {dp_mesh.ndim} {name} placements for the DP mesh, "
+                    f"got {len(placements)}."
+                )
 
         # Python dicts preserve insertion order, so parameter_names and
         # parameters.values() define the same stable DBuffer tensor order.
@@ -101,7 +115,7 @@ class FsdpParameterGroup:
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
-            mesh=self.mesh,
+            mesh=dp_mesh,
             placements=main_weight_placements,
         )
 
@@ -114,8 +128,8 @@ class FsdpParameterGroup:
 
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
+                mesh=dp_mesh,
+                placements=[Replicate()] * dp_mesh.ndim,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
@@ -124,7 +138,7 @@ class FsdpParameterGroup:
             self.model_weight = self.main_weight
         else:
             self.model_weight = DBuffer(
-                mesh=self.mesh,
+                mesh=dp_mesh,
                 placements=model_weight_placements,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
@@ -140,7 +154,7 @@ class FsdpParameterGroup:
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
             self.main_grad = DBuffer(
-                mesh=self.mesh,
+                mesh=dp_mesh,
                 placements=main_grad_placements,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=grad_dtype,
@@ -265,10 +279,11 @@ class FsdpParameterGroup:
             if parameter.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
             grads.append(parameter.grad)
+        dp_mesh = self.main_grad.mesh
         with self._symmetric_memory_context():
             return DBuffer(
-                mesh=self.mesh,
-                placements=[Partial(partial_op)] * self.mesh.ndim,
+                mesh=dp_mesh,
+                placements=[Partial(partial_op)] * dp_mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -328,7 +343,9 @@ class FsdpParameterGroup:
         if reduce_axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
         partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        grad_divisor = (
+            partial_grad.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        )
         if self._symm_mem_pool is not None:
             partial_grad.rendezvous(reduce_axis)
         if can_reduce_into_main_grad:
@@ -351,6 +368,20 @@ class FsdpParameterGroup:
             # reduce-scatter for HFSDP) and install the sharded parameter gradients.
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
             self._install_sharded_grads()
+
+
+def _select_dp_mesh(mesh: DeviceMesh, dp_axes: tuple[int, ...]) -> DeviceMesh:
+    """Derive the data-parallel submesh from a parent mesh and normalized axes."""
+    if dp_axes == tuple(range(mesh.ndim)):
+        return mesh
+
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None:
+        raise ValueError(
+            "Selecting a data-parallel submesh requires a DeviceMesh with mesh_dim_names."
+        )
+    selected_names = tuple(dim_names[axis] for axis in dp_axes)
+    return mesh[selected_names] if len(selected_names) > 1 else mesh[selected_names[0]]
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:

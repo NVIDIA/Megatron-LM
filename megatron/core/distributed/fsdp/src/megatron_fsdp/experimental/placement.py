@@ -39,9 +39,6 @@ class Placement:
     """Base class for DBuffer placements."""
 
 
-MeshAxis = int | str
-
-
 @dataclasses.dataclass(frozen=True)
 class Replicate(Placement):
     """Replicated local buffer placement."""
@@ -76,24 +73,3 @@ def changed_mesh_axis(
             )
         changed_axis = axis
     return changed_axis
-
-
-@dataclasses.dataclass(frozen=True)
-class Placements:
-    """Per-mesh-axis placements for parameter, gradient, and optimizer buffers."""
-
-    dp_axes: list[MeshAxis]
-    parameter: list[Placement]
-    gradient: list[Placement]
-    optimizer: list[Placement]
-
-    def __post_init__(self) -> None:
-        """Validate placement list lengths."""
-        axis_count = len(self.dp_axes)
-        for name, placements in (
-            ("parameter", self.parameter),
-            ("gradient", self.gradient),
-            ("optimizer", self.optimizer),
-        ):
-            if len(placements) != axis_count:
-                raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
