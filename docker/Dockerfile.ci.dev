@@ -75,6 +75,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         --no-install-package nvidia-nccl-cu12
 EOF
 
+# Test A — diagnostic (zero behavior change): probe the nccl_ep artifact state in the uv
+# checkout right after the TE-building uv sync. A non-empty libnccl_ep.a with an EMPTY
+# build/include/.../hybrid_ep.cuh line means the .a is present while the staged header is
+# missing ("stale .a, unstaged headers"); if the build/include header is present the
+# hypothesis is wrong and the runtime failure is a path/persistence issue. The probes are
+# rooted at the whole uv cache and are strictly non-fatal (no set -e, each find guarded to
+# exit 0) so this step can never change build behavior, whatever it finds.
+RUN --mount=type=cache,target=/root/.cache/uv bash -x <<"EOF"
+    echo "=== nccl_ep artifact state in the uv cache ==="
+    ls -la /root/.cache/uv 2>&1 || true                                                         # where uv actually put its cache
+    find /root/.cache/uv -name 'libnccl_ep.a' 2>/dev/null || true                               # the .a the gate keys on
+    find /root/.cache/uv -path '*/build/include/nccl_ep/device/hybrid_ep.cuh' 2>/dev/null || true  # the header the JIT needs
+    find /root/.cache/uv -path '*/contrib/nccl_ep/device/hybrid_ep.cuh' 2>/dev/null || true     # the source header (always present)
+    echo "=== end nccl_ep probe ==="
+    exit 0
+EOF
+
 # Install DeepEP
 ARG DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
 ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
