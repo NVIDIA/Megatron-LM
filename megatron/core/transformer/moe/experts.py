@@ -1007,6 +1007,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         func = self.config.activation_func
         if func == squared_relu:
             return McoreActivationType.SQUARED_RELU
+        if func == F.silu and self.config.gated_linear_unit:
+            # gated SiLU -> SwiGLU (padded_swiglu / vllm silu_and_mul path)
+            return McoreActivationType.SWIGLU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
     def _build_concatenated_mxfp8_weights(self):

@@ -82,3 +82,8 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_inference_optimized_swiglu_logitsmatch]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]

@@ -1477,10 +1477,16 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            if self.gated_linear_unit:
+            # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vllm
+            # grouped-GEMM backends only.
+            if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
+                "torch",
+                "vllm",
+            ):
                 raise ValueError(
-                    "--transformer-impl='inference_optimized' does not yet support "
-                    "gated linear units (SwiGLU/GeGLU)."
+                    "--transformer-impl='inference_optimized' supports gated linear units "
+                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
             if self.fp8 == "mxfp8":
