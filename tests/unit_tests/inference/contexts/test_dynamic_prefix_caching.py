@@ -905,7 +905,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         )
 
         def token_based(ctx):
-            return math.ceil(ctx.max_tokens / ctx.block_size_tokens) + 1
+            return math.ceil(ctx.max_tokens / ctx.block_size_tokens)
 
         def request_based(ctx):
             return MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * ctx.max_requests
@@ -1008,11 +1008,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # ...the step never overruns the scratch buffer...
         assert md.intermediate_count <= budget
         # ...and it fills all but a small, *derived* deficit: the block-spillover
-        # (per_req > bs, so fewer requests fit than there are blocks) plus the
-        # single +1 safety margin. n <= max_requests forces the token-based bound,
-        # so budget == ceil(max_tokens / bs) + 1.
-        assert budget == math.ceil(ctx.max_tokens / bs) + 1
-        expected_unfilled = (math.ceil(ctx.max_tokens / bs) - n) + 1
+        # (per_req > bs, so fewer requests fit than there are blocks). n <=
+        # max_requests forces the token-based bound, so budget == ceil(max_tokens / bs).
+        assert budget == math.ceil(ctx.max_tokens / bs)
+        expected_unfilled = math.ceil(ctx.max_tokens / bs) - n
         assert budget - md.intermediate_count == expected_unfilled
 
     @pytest.mark.internal
