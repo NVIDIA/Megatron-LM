@@ -2908,11 +2908,11 @@ class TextGenerationController:
 
             request.status = Status.COMPLETED
 
+            # Detokenize up to input_prompt_length + required_sequence_length for this idx.
+            sequence_length = input_prompt_length + required_sequence_length
             text, segments = self.detokenize_generations(
-                batch_prompt_tokens_with_generations[
-                    idx, : (input_prompt_length + required_sequence_length)
-                ],
-                input_prompt_length + generated_sequence_lengths,
+                batch_prompt_tokens_with_generations[idx, :sequence_length],
+                torch.tensor([sequence_length], device=batch_prompt_tokens_with_generations.device),
                 sampling_params.return_segments,
             )
             request.text = text  # Inference server returns prompts & generations together
