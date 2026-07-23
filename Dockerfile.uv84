@@ -1,6 +1,0 @@
-FROM nvcr.io/nvidia/pytorch:26.04-py3
-ARG UV_VERSION=0.8.4
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
-WORKDIR /workspace
-COPY . /workspace
