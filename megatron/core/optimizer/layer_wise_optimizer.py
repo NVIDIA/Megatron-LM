@@ -90,16 +90,40 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     """Layer-wise distributed optimizer for Megatron-core models.
 
     Experimental distributed optimizer wrapper that distributes weight to DP ranks by layer.
-    Implemented as ChainedOptimizer to support multiple optimizers (e.g. muon + adamW)
+    Implemented as ChainedOptimizer to support multiple optimizers (e.g. muon + adamW).
     When using, keep all megatron distributed-optimizer related options OFF.
 
-    How LayerWiseDistributedOptimizer work:
-    1. weights are splited into lists and each rank only keep its shard in its optimizer
-    2. Megatron DDP handle allreduce grad, note that each rank have full model and grad
-    3. optimizer is already modified so only param belong to this DP rank is updated
-    4. grad_norm and zero counting will reduce metrics globally in step function
-    5. Do regular update with chained optimizers, modified optimizer only update shard
-    6. allgather updated params to every rank
+    How LayerWiseDistributedOptimizer works:
+
+    1. Weights are split into lists and each rank only keeps its shard in its optimizer.
+    2. Megatron DDP handles allreduce grad; each rank has full model and grad.
+    3. Optimizer is modified so only params belonging to this DP rank are updated.
+    4. grad_norm and zero counting reduce metrics globally in step function.
+    5. Regular update with chained optimizers; modified optimizer only updates shard.
+    6. All-gather (or broadcast) updated params to every rank.
+
+    CPU Offloading:
+
+    When ``optimizer_cpu_offload=True`` in the config, this optimizer manages a
+    host-device-host (H2D/D2H) cycle for the fp32 master weights and momentum
+    buffers owned by the wrapped ``Float16OptimizerWithFloat16Params`` sub-optimizers.
+    This is particularly beneficial for Muon, where most model parameters are
+    "muonable" and their fp32 master weights + momentum constitute the majority
+    of optimizer memory.
+
+    The offload lifecycle per training step:
+
+    1. **reload_optimizer_states()**: Move fp32 master weights and optimizer state
+       tensors from CPU pinned memory back to GPU before the optimizer step.
+    2. **super().step()**: Run the actual optimizer update (e.g. Newton-Schulz for
+       Muon, Adam for fallback params) on GPU.
+    3. **broadcast_params()**: Synchronize updated bf16 model params across DP ranks.
+    4. **offload_optimizer_states()**: Move fp32 master weights and optimizer state
+       tensors back to CPU pinned memory to free GPU memory.
+
+    Note: The Adam fallback optimizer's ``optimizer_cpu_offload`` is set to False
+    when ``use_layer_wise_distributed_optimizer=True``, preventing double-offloading
+    via ``HybridDeviceOptimizer``. All offloading is unified through this class.
     """
 
     @staticmethod
@@ -416,6 +440,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         super().__init__(optimizers)
 
+        self._cpu_offload = getattr(config, 'optimizer_cpu_offload', False)
+        if self._cpu_offload:
+            self.offload_optimizer_states()
+            logger.info('[layerwise] optimizer states CPU offloading enabled')
         # Assign self.model_chunks AFTER super().__init__: ChainedOptimizer.__init__
         # resets self.model_chunks to [] and then repopulates only from chained
         # children that have a model_chunks attribute (DistOpt does, Float16-wrapped
@@ -685,7 +713,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     @torch.no_grad()
     def broadcast_params(self):
         """All rank broadcast updated local params."""
-        # Broadcast linear layer weights to all other ranks. Kept as reference test.
         if self.dp_cp_params_list is None:
             return
         for i, params in enumerate(self.dp_cp_params_list):
@@ -775,6 +802,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
     @torch.no_grad()
+    def prepare_grads(self) -> bool:
+        """Reload offloaded states before gradient preprocessing.
+
+        ``ChainedOptimizer.step()`` calls ``prepare_grads()`` before
+        ``step_with_ready_grads()``.  The child optimizers'
+        ``_copy_model_grads_to_main_grads`` assigns CUDA gradients to the fp32
+        master params — which requires those params to be on GPU already.
+        """
+        if self._cpu_offload:
+            self.reload_optimizer_states()
+        return super().prepare_grads()
+
+    @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step then all-gather LayerWise-managed param buffers.
 
@@ -782,7 +822,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         runs when this optimizer is a child of an outer ``ChainedOptimizer``,
         which calls ``step_with_ready_grads`` directly on each child and bypasses
         ``step``.
+
+        When CPU offloading is enabled and this method is called directly
+        (without a preceding ``prepare_grads``), reload states first.
+        ``reload_optimizer_states`` is idempotent (skips already-CUDA tensors).
         """
+        if self._cpu_offload:
+            self.reload_optimizer_states()
+
         success = super().step_with_ready_grads()
 
         # All-gather updated params. If overlap_param_gather is True, the all-gather
@@ -800,7 +847,71 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             else:
                 self.allgather_params()
 
+        if self._cpu_offload:
+            self.offload_optimizer_states()
+
         return success
+
+    @torch.no_grad()
+    def offload_optimizer_states(self) -> None:
+        """Move fp32 master weights and optimizer state tensors to CPU pinned memory.
+
+        This transfers all fp32 master weight parameters (``fp32_from_float16_groups``)
+        and optimizer state tensors (e.g. momentum buffers) from GPU to CPU pinned memory.
+        Pinned memory enables faster H2D transfers on the next reload.
+
+        Called after each optimizer step to free GPU memory for the next forward pass.
+        A ``torch.cuda.synchronize()`` at entry ensures any pending GPU work (e.g.
+        param broadcasts) completes before tensors are moved off-device.
+        """
+        torch.cuda.synchronize()
+        for opt in self.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    if param.data.is_cuda:
+                        param.data = param.data.cpu().pin_memory()
+            for state_vals in opt.optimizer.state.values():
+                for key, val in state_vals.items():
+                    if isinstance(val, torch.Tensor) and val.is_cuda:
+                        state_vals[key] = val.cpu().pin_memory()
+
+    @torch.no_grad()
+    def reload_optimizer_states(self) -> None:
+        """Move fp32 master weights and optimizer state tensors back to GPU.
+
+        This transfers all fp32 master weight parameters and optimizer state tensors
+        from CPU pinned memory to the current CUDA device. A ``torch.cuda.synchronize()``
+        at exit ensures all H2D transfers complete before the optimizer step proceeds.
+
+        This method is idempotent: if all tensors are already on GPU (e.g. when called
+        a second time from ``step_with_ready_grads`` after ``prepare_grads`` already
+        reloaded), no synchronization barrier is issued.
+
+        Called at the start of each optimizer step so that the Newton-Schulz iterations
+        (Muon) or Adam updates can operate on GPU tensors.
+        """
+        any_moved = False
+        for opt in self.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if not isinstance(opt, Float16OptimizerWithFloat16Params):
+                continue
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    if not param.data.is_cuda:
+                        param.data = param.data.to('cuda')
+                        any_moved = True
+            for state_vals in opt.optimizer.state.values():
+                for key, val in state_vals.items():
+                    if isinstance(val, torch.Tensor) and not val.is_cuda:
+                        state_vals[key] = val.to('cuda')
+                        any_moved = True
+        if any_moved:
+            torch.cuda.synchronize()
 
     # TODO(deyuf): need to improve dist checkpointing design to properly handle this
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty
