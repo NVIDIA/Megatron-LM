@@ -281,15 +281,29 @@ def test_async_forward_routes_one_controller_iteration(
             ("non-decode", False),
         ),
         (AsyncScheduleMode.LEGACY, DecodeOnly(consumed=True, launched=True), ("decode", True)),
-        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=False, launched=False), ("(P,P)", False)),
-        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=True), ("(D,D)", True)),
-        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=False, launched=True), ("(P,D)", True)),
-        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=False), ("(D,P)", False)),
-        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=None, launched=False), ("(-,P)", False)),
-        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=None), ("(D,-)", True)),
-        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=None, launched=None), ("(-,-)", None)),
+        (
+            AsyncScheduleMode.ASYNC,
+            DecodeOnly(consumed=False, launched=False),
+            ("non-decode", False),
+        ),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=True), ("decode", True)),
+        (
+            AsyncScheduleMode.ASYNC,
+            DecodeOnly(consumed=False, launched=True),
+            ("decode (prev: non-decode)", True),
+        ),
+        (
+            AsyncScheduleMode.ASYNC,
+            DecodeOnly(consumed=True, launched=False),
+            ("non-decode (prev: decode)", False),
+        ),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=None, launched=False), ("non-decode", False)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=None, launched=True), ("decode", True)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=False, launched=None), ("non-decode", False)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=None), ("decode", True)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=None, launched=None), ("idle", None)),
     ],
 )
 def test_get_decode_only_log_state(mode, decode_only, expected):
-    """Console logging reports both async phases and colors the latest available phase."""
+    """Console logging reports transitions and colors the latest available phase."""
     assert _get_decode_only_log_state(mode, decode_only) == expected

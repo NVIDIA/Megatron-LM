@@ -151,25 +151,36 @@ def format_mem_bytes(mem_bytes):
 def _get_decode_only_log_state(
     mode: AsyncScheduleMode, decode_only: DecodeOnly
 ) -> Tuple[str, Optional[bool]]:
-    """Build the console label and color state for one inference step.
+    """Build the console transition label and color state for one inference step.
 
     Args:
         mode (AsyncScheduleMode): Active scheduling mode.
         decode_only (DecodeOnly): Decode-only state for the consumed and launched forwards.
 
     Returns:
-        Tuple[str, Optional[bool]]: Step label and whether to use decode coloring.
+        Tuple[str, Optional[bool]]: Current step label, including the previous
+            step when it differs, and whether to use decode coloring.
     """
     if mode == AsyncScheduleMode.LEGACY:
         is_decode_only = bool(decode_only)
         return ("decode" if is_decode_only else "non-decode"), is_decode_only
 
-    phase_labels = {None: "-", False: "P", True: "D"}
-    step_type = f"({phase_labels[decode_only.consumed]},{phase_labels[decode_only.launched]})"
-    color_decode_only = (
+    current_decode_only = (
         decode_only.launched if decode_only.launched is not None else decode_only.consumed
     )
-    return step_type, color_decode_only
+    if current_decode_only is None:
+        return "idle", None
+
+    step_type = "decode" if current_decode_only else "non-decode"
+    if (
+        decode_only.consumed is not None
+        and decode_only.launched is not None
+        and decode_only.consumed != decode_only.launched
+    ):
+        previous_step_type = "decode" if decode_only.consumed else "non-decode"
+        step_type = f"{step_type} (prev: {previous_step_type})"
+
+    return step_type, current_decode_only
 
 
 def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
