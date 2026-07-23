@@ -91,9 +91,9 @@ def measure_peak_memory(fn, *args, **kwargs):
 @pytest.mark.parametrize(
     "num_permuted_tokens, num_total_tokens, hidden_size, ffn_hidden",
     [
-        (65536, 131072, 4096, 14336),   # DeepSeek-V3 scale
-        (32768, 65536, 2048, 7168),     # Medium scale
-        (16384, 32768, 1024, 4096),     # Small scale
+        (65536, 131072, 4096, 14336),  # DeepSeek-V3 scale
+        (32768, 65536, 2048, 7168),  # Medium scale
+        (16384, 32768, 1024, 4096),  # Small scale
     ],
 )
 def test_moe_recompute_memory_reduction(
@@ -130,8 +130,7 @@ def test_moe_recompute_memory_reduction(
         """Simulate one MoE step with full recompute."""
         # Wrap in checkpoint to simulate full recomputation
         output = torch.utils.checkpoint.checkpoint(
-            layer, permuted_tokens, sorted_indices, restore_shape,
-            use_reentrant=False
+            layer, permuted_tokens, sorted_indices, restore_shape, use_reentrant=False
         )
         loss = torch.nn.functional.mse_loss(output, target)
         scaled_loss = loss * grad_scaler
@@ -169,15 +168,11 @@ def test_moe_recompute_memory_reduction(
     # The del version should use less or equal peak memory
     # In practice, the difference is ~the size of intermediate activations
     # (output_tokens + permuted_tokens + sorted_indices indices)
-    assert (
-        peak_with_del <= peak_no_del
-    ), (
+    assert peak_with_del <= peak_no_del, (
         f"Peak memory with del ({peak_with_del:.1f} MB) should NOT exceed "
         f"without del ({peak_no_del:.1f} MB) at scale {num_permuted_tokens}x{hidden_size}"
     )
-    assert (
-        retained_with_del <= retained_no_del
-    ), (
+    assert retained_with_del <= retained_no_del, (
         f"Retained memory after backward with del ({retained_with_del:.1f} MB) "
         f"should NOT exceed without del ({retained_no_del:.1f} MB)"
     )
