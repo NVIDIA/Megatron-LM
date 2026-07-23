@@ -510,7 +510,6 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
     controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = True
@@ -571,7 +570,6 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
     controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = True
@@ -655,7 +653,6 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         inference_context=context,
         model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
     )
-    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
     controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = False
@@ -672,6 +669,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
     controller._dynamic_step_context_init = lambda: (
         torch.tensor([[1, 2]], dtype=torch.int64),
         torch.tensor([[0, 1]], dtype=torch.int64),
+        None,
     )
     controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
     controller._router_record_bookkeeping = lambda: None
@@ -754,7 +752,6 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         inference_context=context,
         model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
     )
-    controller._decode_forward_primer = tgc_module.DecodeForwardPrimer()
     controller._retire_dynamic_forward_side_effects = lambda: None
     controller.num_speculative_tokens = 0
     controller._async_pending_forward = False
@@ -771,6 +768,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
     controller._dynamic_step_context_init = lambda: (
         torch.tensor([[1, 2]], dtype=torch.int64),
         torch.tensor([[0, 1]], dtype=torch.int64),
+        None,
     )
     controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
     controller._router_record_bookkeeping = lambda: None
@@ -1265,7 +1263,7 @@ def test_dummy_async_handoff_mirrors_real_rank_launch(
     )
     controller._dynamic_step_context_init = lambda is_dummy_forward=False: events.append(
         ("context_init", is_dummy_forward)
-    ) or ("input_ids", "position_ids")
+    ) or ("input_ids", "position_ids", None)
     controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
 
     assert controller._try_launch_dummy_async_handoff() is expected_ok
