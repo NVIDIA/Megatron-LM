@@ -15,9 +15,7 @@ import torch
 
 
 def unpermute_without_del(
-    permuted_tokens: torch.Tensor,
-    sorted_indices: torch.Tensor,
-    restore_shape: torch.Size,
+    permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape: torch.Size
 ) -> torch.Tensor:
     """Original unpermute WITHOUT the explicit del statements (baseline)."""
     _, hidden = restore_shape
@@ -25,17 +23,13 @@ def unpermute_without_del(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    output_tokens.scatter_add_(
-        0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
-    )
+    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
     out = output_tokens.to(dtype=input_dtype)
     return out
 
 
 def unpermute_with_del(
-    permuted_tokens: torch.Tensor,
-    sorted_indices: torch.Tensor,
-    restore_shape: torch.Size,
+    permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape: torch.Size
 ) -> torch.Tensor:
     """Fixed unpermute WITH explicit del (the PR's approach)."""
     _, hidden = restore_shape
@@ -43,9 +37,7 @@ def unpermute_with_del(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    output_tokens.scatter_add_(
-        0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
-    )
+    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
     out = output_tokens.to(dtype=input_dtype)
     # Explicitly release intermediate tensor references so CUDA allocator
     # can reclaim memory immediately during full recomputation.
@@ -66,10 +58,7 @@ class MoELayer(torch.nn.Module):
         self.unpermute_fn = unpermute_fn
 
     def forward(
-        self,
-        permuted_tokens: torch.Tensor,
-        sorted_indices: torch.Tensor,
-        restore_shape: torch.Size,
+        self, permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape: torch.Size
     ) -> torch.Tensor:
         expert_out = self.ffn(permuted_tokens)
         return self.unpermute_fn(expert_out, sorted_indices, restore_shape)
@@ -118,9 +107,7 @@ def test_moe_recompute_memory_reduction(
     permuted_tokens = torch.randn(
         num_permuted_tokens, hidden_size, device=device, dtype=dtype, requires_grad=True
     )
-    sorted_indices = torch.randint(
-        0, num_total_tokens, (num_permuted_tokens,), device=device
-    )
+    sorted_indices = torch.randint(0, num_total_tokens, (num_permuted_tokens,), device=device)
     restore_shape = torch.Size((num_total_tokens, hidden_size))
 
     # Random target for loss
@@ -155,9 +142,7 @@ def test_moe_recompute_memory_reduction(
     layer_no_del.ffn[0].weight.requires_grad_(True)
     layer_no_del.ffn[2].weight.requires_grad_(True)
 
-    _, peak_no_del, retained_no_del = measure_peak_memory(
-        compute_loss_and_backward, layer_no_del
-    )
+    _, peak_no_del, retained_no_del = measure_peak_memory(compute_loss_and_backward, layer_no_del)
 
     print(
         f"\n[scale={num_permuted_tokens}x{hidden_size}] "
