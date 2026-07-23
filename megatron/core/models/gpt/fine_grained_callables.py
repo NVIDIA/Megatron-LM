@@ -21,7 +21,11 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
     get_mtp_layer_offset,
 )
-from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
+    TransformerLayer,
+    make_viewless_tensor,
+)
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
@@ -103,6 +107,55 @@ def should_free_input(name, is_moe, config, num_local_experts):
     return free_input_nodes.get(name, False)
 
 
+def finalize_decoder_layer_output(node, hidden_states):
+    """Apply the decoder block boundary at whichever node is terminal for the layer.
+
+    The decoder block boundary (mHC output contraction + final layer norm, see
+    ``TransformerBlock.postprocess_for_layer_schedule``) must run on the last decoder
+    layer regardless of whether that layer's terminal schedule node is the MoE combine,
+    the standalone mHC-post, or the dense MLP. Embedding the boundary only in the MoE
+    closures skips it for mixed patterns whose final layer is dense (for example
+    ``moe_layer_freq=[1, 0]``), letting an uncontracted ``[s, b, n*h]`` tensor reach GPT
+    postprocessing without ``learned_output_contract`` or the final layer norm. Factoring
+    it here keeps the math independent of layer type and mHC-post placement.
+
+    When MTP is enabled the boundary also produces the pre-contraction mHC multi-stream
+    consumed by the MTP depths. That side output is detached at its producer so MTP reads
+    a leaf; ``TransformerLayerNode.backward_impl`` reconnects the accumulated gradient when
+    the scheduler runs this node's backward, exactly as ``residual`` / ``mlp_h_res`` /
+    ``mlp_hc_h_post`` are bridged. Storing it undetached would let MTP backward traverse the
+    decoder mHC graph out of schedule order, producing a second-backward error after saved
+    tensors are freed or bypassing the point where the contracted and MTP branches merge.
+
+    Args:
+        node: The terminal ``TransformerLayerNode`` for the layer.
+        hidden_states: The layer output prior to the decoder boundary.
+
+    Returns:
+        The node output: contracted + normalized ``[s, b, h]`` on the final decoder layer,
+        otherwise a viewless view of ``hidden_states``.
+    """
+    # Layer nodes exist only for concrete layers; empty decoder chunks use PostProcessNode.
+    # MTP layers finalize via submodule_mtp_postprocess_forward, not the decoder boundary.
+    if node.is_mtp or not node.is_last_layer:
+        return make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+    output, mhc_multistream = node.chunk_state.model.decoder.postprocess_for_layer_schedule(
+        hidden_states, return_mhc_multistream=True
+    )
+    # postprocess_for_layer_schedule already makes final-layernorm outputs viewless; keep
+    # this wrapper for the no-layernorm and mHC contraction-only exits.
+    output = make_viewless_tensor(inp=output, requires_grad=output.requires_grad, keep_graph=True)
+    # Detach the pre-contraction multi-stream at its producer so MTP reads a leaf and this
+    # node's backward_impl reconnects the accumulated gradient under scheduler control.
+    node.chunk_state.mhc_multistream = (
+        node.detach(mhc_multistream) if mhc_multistream is not None else None
+    )
+    return output
+
+
 class TransformerLayerState:
     """State shared within a transformer layer.
 
@@ -163,13 +216,15 @@ class PreProcessNode(ScheduleNode):
             padding_mask=self.chunk_state.padding_mask,
         )
 
-        # Saved for later use
+        # Saved for later use. Keep this as the GPT preprocess output; the decoder layer input may
+        # be expanded below by TransformerBlock boundary logic when mHC is enabled.
         self.chunk_state.decoder_input = decoder_input
         self.chunk_state.rotary_pos_emb = rotary_pos_emb
         self.chunk_state.rotary_pos_cos = rotary_pos_cos
         self.chunk_state.rotary_pos_sin = rotary_pos_sin
         self.chunk_state.sequence_len_offset = sequence_len_offset
         self.chunk_state.padding_mask = padding_mask
+        decoder_input = self.gpt_model.decoder.preprocess_for_layer_schedule(decoder_input)
         return decoder_input
 
 
@@ -207,13 +262,9 @@ class PostProcessNode(ScheduleNode):
             The logits or loss depending on whether labels are provided.
         """
 
-        empty_decoder = len(self.gpt_model.decoder.layers) == 0
-        layer_norm = self.gpt_model.decoder.final_layernorm
-        if not self.gpt_model.config.mtp_num_layers and empty_decoder and layer_norm:
-            hidden_states = layer_norm(hidden_states)
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
+        if len(self.gpt_model.decoder.layers) == 0:
+            # Safe for MTP: empty-decoder MTP stages have final_layernorm=None.
+            hidden_states = self.gpt_model.decoder.postprocess_for_layer_schedule(hidden_states)
 
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
@@ -296,6 +347,10 @@ class TransformerLayerNode(ScheduleNode):
         self.detached = tuple()
         self.before_detached = tuple()
         self.is_mtp = extra_args.get("is_mtp", False)
+        self.mhc_recompute_manager = extra_args.get("mhc_recompute_manager")
+        self.is_last_layer_in_mhc_recompute_group = extra_args.get(
+            "is_last_layer_in_mhc_recompute_group", False
+        )
         self.post_wgrad_grad_acc_hooks = None
 
         # Create flags to indicate first and last layer
@@ -470,16 +525,17 @@ class _BackwardDWWrapper:
 
 def build_transformer_layer_callables(layer: TransformerLayer):
     """Create callables for transformer layer nodes.
+
     Divides the transformer layer's operations into a sequence of smaller, independent
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
 
-    The five callables are:
-    1. Attention (computation)
-    2. Post-Attention (computation)
-    3. MoE Dispatch (communication)
-    4. MLP / MoE Experts (computation)
-    5. MoE Combine (communication)
+    The five callable slots are:
+    1. Attention and routing preprocess (computation)
+    2. MoE Dispatch (communication)
+    3. MLP / MoE Experts (computation)
+    4. MoE Combine and MLP-side mHC post-processing (communication)
+    5. MTP post-processing (computation, MTP layers only)
 
     By assigning these functions to different CUDA streams (e.g., a compute stream
     and a communication stream), the scheduler can overlap their execution, preventing
@@ -494,7 +550,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         - forward_funcs: List of callable functions for the layer
         - backward_dw: Dict of weight gradient functions for the layer
     """
-
     is_moe = isinstance(layer.mlp, MoELayer)
     enable_deepep = (
         layer.config.moe_token_dispatcher_type == "flex"
@@ -508,6 +563,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         layer.config.moe_token_dispatcher_type == "flex"
         and layer.config.moe_flex_dispatcher_backend == "ncclep"
     )
+    is_hyper_connection_layer = isinstance(layer, HyperConnectionTransformerLayer)
+    is_mhc_layer = is_moe and is_hyper_connection_layer
 
     def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
@@ -516,11 +573,19 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             pre mlp layernorm->router->dispatch preprocess
         """
 
-        if (
+        mhc_recompute_manager = getattr(node, "mhc_recompute_manager", None)
+        is_last_in_mhc_recompute_group = getattr(
+            node, "is_last_layer_in_mhc_recompute_group", False
+        )
+        if mhc_recompute_manager is not None:
+            mhc_recompute_manager.is_last_layer_in_recompute_block = is_last_in_mhc_recompute_group
+
+        using_cuda_graph_replay = (
             isinstance(layer, GraphableMegatronModule)
             and hasattr(layer, 'cuda_graphs')
             and layer.cuda_graphs
-        ):
+        )
+        if using_cuda_graph_replay:
             layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
         else:
@@ -533,8 +598,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 rotary_pos_sin: Optional[Tensor] = None,
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
+                mhc_recompute_manager=None,
             ):
-                hidden_states, _ = layer._forward_attention(
+                attention_kwargs = dict(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     rotary_pos_emb=rotary_pos_emb,
@@ -543,12 +609,29 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                 )
+                if is_hyper_connection_layer:
+                    attention_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
+                hidden_states, _ = layer._forward_attention(**attention_kwargs)
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                if is_mhc_layer:
+                    nvtx_range_push(suffix="mlp_hyper_connection")
+                    hidden_states, mlp_h_res, mlp_hc_h_post, residual = layer.mlp_hyper_connection(
+                        hidden_states, mhc_recompute_manager=mhc_recompute_manager
+                    )
+                    nvtx_range_pop(suffix="mlp_hyper_connection")
+                else:
+                    mlp_h_res, mlp_hc_h_post = None, None
+                    residual = hidden_states
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
                 node.layer_state.mlp_norm_manager = mlp_norm_manager
-                if layer.recompute_pre_mlp_layernorm:
-                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                checkpoint_pre_mlp_layernorm = layer.recompute_pre_mlp_layernorm or (
+                    mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
+                )
+                if checkpoint_pre_mlp_layernorm:
+                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                        ckpt_manager=mhc_recompute_manager
+                    )
                     with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                             apply_module(layer.pre_mlp_layernorm), hidden_states
@@ -570,6 +653,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                             f"got {len(pre_mlp_layernorm_output)}"
                         )
                     pre_mlp_layernorm_output, hidden_states = pre_mlp_layernorm_output
+                    if not is_mhc_layer:
+                        residual = hidden_states
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(
@@ -578,9 +663,18 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )
+                if is_mhc_layer:
+                    return (
+                        residual,
+                        local_tokens,
+                        probs,
+                        shared_expert_output,
+                        mlp_h_res,
+                        mlp_hc_h_post,
+                    )
                 return hidden_states, local_tokens, probs, shared_expert_output
 
-        hidden_states, local_tokens, probs, shared_expert_output = forward_func(
+        forward_kwargs = dict(
             hidden_states=hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
@@ -589,11 +683,27 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
+        if is_hyper_connection_layer and (
+            not using_cuda_graph_replay
+            or CudaGraphModule.attn not in layer.config.cuda_graph_modules
+        ):
+            forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
+        forward_outputs = forward_func(**forward_kwargs)
+        if is_mhc_layer:
+            hidden_states, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post = (
+                forward_outputs
+            )
+        else:
+            hidden_states, local_tokens, probs, shared_expert_output = forward_outputs
+            mlp_h_res, mlp_hc_h_post = None, None
         if not isinstance(layer.mlp, MoELayer):
             return hidden_states
 
         # Detach here for mlp_bda residual connection
         node.layer_state.residual = node.detach(hidden_states)
+        if is_mhc_layer:
+            node.layer_state.mlp_h_res = node.detach(mlp_h_res)
+            node.layer_state.mlp_hc_h_post = node.detach(mlp_hc_h_post)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
             # Detach here for shared expert connection in moe_combine
             node.layer_state.shared_expert_output = node.detach(shared_expert_output)
@@ -649,25 +759,32 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     def submodule_combine_forward(node: ScheduleNode, output: torch.Tensor):
         """
-        # Triggers token combine and the remaining computation in the transformer layer.
-        # The `mlp_bda` computation is placed after `mlp.combine` due to data dependency.
-        # This ordering is also critical for pipeline performance. Starting the `mlp.combine`
-        # communication at first allows it to be overlapped with computation from another
-        # microbatch. If `mlp_bda` were to run first, it would compete for SM resources
-        # with another microbatch's computation and expose the communication.
+        Trigger token combine and the remaining layer computation.
+
+        MHC post-processing stays in this communication-stream node so it preserves the
+        existing EP overlap stream topology.
         """
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
         output = layer.mlp.combine(output)
         output = layer.mlp.postprocess(output, shared_expert_output)
 
-        mlp_output_with_bias = (output, None)
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
+
+        if shared_expert_output is not None:
+            shared_expert_output.record_stream(torch.cuda.current_stream())
+        node.layer_state.shared_expert_output = None
+
+        if is_mhc_layer:
+            return submodule_mhc_post_forward(node, output)
+
+        mlp_output_with_bias = (output, None)
         with layer.bias_dropout_add_exec_handler():
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout
             )
+
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
@@ -676,30 +793,68 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 hidden_states, forced_released_tensors=[residual]
             )
             node.layer_state.mlp_norm_manager = None
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
+        output = finalize_decoder_layer_output(node, hidden_states)
 
         # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
-        if shared_expert_output is not None:
-            shared_expert_output.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
         node.layer_state.residual = None
-        node.layer_state.shared_expert_output = None
+        return output
 
-        # final layer norm from decoder
-        final_layernorm = node.chunk_state.model.decoder.final_layernorm
-        if not node.is_mtp and final_layernorm and node.is_last_layer:
-            output = final_layernorm(output)
-            output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
+    def submodule_mhc_post_forward(node: ScheduleNode, output: torch.Tensor):
+        """Run MLP-side mHC post-processing after combine communication completes."""
+        residual = node.layer_state.residual
+        manager = getattr(node, "mhc_recompute_manager", None)
+        is_group_end = getattr(node, "is_last_layer_in_mhc_recompute_group", False)
+        bda_manager = None if is_group_end else manager
+        hidden_states = layer._forward_mhc_mlp_post(
+            output,
+            node.layer_state.mlp_h_res,
+            residual,
+            node.layer_state.mlp_hc_h_post,
+            bda_manager,
+        )
+
+        mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
+        if mlp_norm_manager is not None:
+            hidden_states = mlp_norm_manager.group_offload(
+                hidden_states, forced_released_tensors=[residual]
+            )
+            node.layer_state.mlp_norm_manager = None
+
+        output = finalize_decoder_layer_output(node, hidden_states)
+
+        node.layer_state.residual.record_stream(torch.cuda.current_stream())
+        node.layer_state.mlp_h_res.record_stream(torch.cuda.current_stream())
+        node.layer_state.mlp_hc_h_post.record_stream(torch.cuda.current_stream())
+        node.layer_state.residual = None
+        node.layer_state.mlp_h_res = None
+        node.layer_state.mlp_hc_h_post = None
+
+        if manager is not None and is_group_end:
+            manager.discard_all_outputs()
+
         return output
 
     @copy_signature(layer._forward_mlp, handle_first_dst_param='preserve')
     def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
-        """Wrapper for Dense forward."""
-        return layer._forward_mlp(*args, **kwargs)
+        """Wrapper for dense forward with explicit mHC recompute management."""
+        manager = (
+            getattr(node, "mhc_recompute_manager", None) if is_hyper_connection_layer else None
+        )
+        if manager is not None:
+            manager.is_last_layer_in_recompute_block = getattr(
+                node, "is_last_layer_in_mhc_recompute_group", False
+            )
+            kwargs["mhc_recompute_manager"] = manager
+        output = layer._forward_mlp(*args, **kwargs)
+        # Dense layers are terminal for their own layer, so the decoder boundary (mHC
+        # contraction + final layer norm) must be applied here for a dense final layer.
+        output = finalize_decoder_layer_output(node, output)
+        if manager is not None and getattr(node, "is_last_layer_in_mhc_recompute_group", False):
+            manager.discard_all_outputs()
+        return output
 
     def raise_not_implemented(*args):
         """Raise NotImplementedError for Dense layer."""
@@ -719,12 +874,26 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
 
 def build_mtp_layer_callables(layer):
-    """Callables for multi-token prediction layer nodes.
+    """Create callables for multi-token prediction layer schedule nodes.
 
-    This class contains the callable functions for different types of
-    multi-token prediction layer nodes (attention, MLP, etc.)
+    The returned forward callables use the same five-slot layout as transformer layers:
+
+    1. Attention with MTP preprocessing.
+    2. MoE dispatch.
+    3. MoE experts.
+    4. MoE combine and MLP-side mHC post-processing.
+    5. MTP post-processing.
+
+    Args:
+        layer: Multi-token prediction layer whose underlying transformer layer is decomposed.
+
+    Returns:
+        A tuple containing the ordered forward callables and a mapping of node names to backward
+        weight-gradient callables.
+
+    Raises:
+        AssertionError: If the underlying transformer layer is not an MoE layer.
     """
-
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
     attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
     is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
@@ -735,7 +904,11 @@ def build_mtp_layer_callables(layer):
         if node.is_first_layer:
             offset = get_mtp_layer_offset(layer.config, node.chunk_state.model.vp_stage)
             node.chunk_state.mtp_hidden_states = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-            hidden_states = node.chunk_state.mtp_hidden_states[offset]
+            mhc_multistream = getattr(node.chunk_state, "mhc_multistream", None)
+            if layer.config.enable_hyper_connections and mhc_multistream is not None:
+                hidden_states = list(torch.chunk(mhc_multistream, 1 + offset, dim=0))[offset]
+            else:
+                hidden_states = node.chunk_state.mtp_hidden_states[offset]
 
         input_ids, position_ids, padding_mask, decoder_input, hidden_states = layer._get_embeddings(
             input_ids=node.chunk_state.input_ids,
@@ -769,11 +942,18 @@ def build_mtp_layer_callables(layer):
             return attn_forward(node, hidden_states)
 
     def submodule_mtp_postprocess_forward(node, hidden_states):
+        # Save pre-contraction multi-stream; _postprocess contracts for mtp_hidden_states.
+        pre_contraction_hidden_states = (
+            hidden_states if layer.config.enable_hyper_connections else None
+        )
         hidden_states = layer._postprocess(hidden_states)
         node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
             hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
             node.chunk_state.mtp_hidden_states = None
+            node.chunk_state.mhc_multistream = None
+        elif pre_contraction_hidden_states is not None:
+            hidden_states = pre_contraction_hidden_states
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):
@@ -796,10 +976,17 @@ def build_mtp_layer_callables(layer):
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
     forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, mtp_post_process_func]
+    # Under hyper-connections the MTP layer builds separate e_proj/h_proj and
+    # sets eh_proj to None; appending eh_proj unconditionally would place None
+    # in the delayed-wgrad callable list (crashing backward_dw) and leave the
+    # e_proj/h_proj weight gradients without a delayed-wgrad trigger.
+    mtp_projs = (
+        [layer.e_proj, layer.h_proj] if layer.config.enable_hyper_connections else [layer.eh_proj]
+    )
     if isinstance(backward_dw["attn"], list):
-        backward_dw["attn"].append(layer.eh_proj)
+        backward_dw["attn"].extend(mtp_projs)
     else:
-        backward_dw["attn"] = [backward_dw["attn"], layer.eh_proj]
+        backward_dw["attn"] = [backward_dw["attn"], *mtp_projs]
 
     return forward_funcs, backward_dw
 

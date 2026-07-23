@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import math
@@ -1382,6 +1382,12 @@ class DSAIndexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
+    def backward_dw(self):
+        """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer linears."""
+        self.linear_wq_b.backward_dw()
+        self.linear_wk.backward_dw()
+        self.linear_weights_proj.backward_dw()
+
     def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor, mscale: float):
         """Apply RoPE to the input tensor."""
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
@@ -1620,6 +1626,10 @@ class DSAttention(MegatronModule):
                 k_channels if k_channels is not None else config.kv_channels
             )
         self.softmax_scale = softmax_scale
+
+    def backward_dw(self):
+        """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
+        self.indexer.backward_dw()
 
     def forward(
         self,

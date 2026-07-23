@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 from dataclasses import dataclass
@@ -893,6 +893,11 @@ class Compressor(MegatronModule):
             submodules.norm, config=norm_config, hidden_size=head_dim, eps=config.layernorm_epsilon
         )
 
+    def backward_dw(self):
+        """Compute the deferred weight gradients (delay_wgrad_compute) of the compressor linears."""
+        self.linear_wkv.backward_dw()
+        self.linear_wgate.backward_dw()
+
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float = 0) -> torch.Tensor:
         """Apply overlapping window transform for 4x compression.
 
@@ -1285,6 +1290,12 @@ class CSAIndexer(MegatronModule):
             name=(name + ".compressor") if name is not None else None,
         )
 
+    def backward_dw(self):
+        """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer linears."""
+        self.linear_wq_b.backward_dw()
+        self.linear_weights_proj.backward_dw()
+        self.compressor.backward_dw()
+
     def forward_before_topk(
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Union[
@@ -1548,6 +1559,17 @@ class CompressedSparseAttention(MegatronModule):
             )
         else:
             self.indexer = None
+
+    def backward_dw(self):
+        """Compute the deferred weight gradients of the optional compressor/indexer submodules.
+
+        The None-guards mirror __init__: compressor exists only for compress_ratio > 1,
+        the indexer only for compress_ratio == 4 outside csa_dense_mode.
+        """
+        if self.compressor is not None:
+            self.compressor.backward_dw()
+        if self.indexer is not None:
+            self.indexer.backward_dw()
 
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.

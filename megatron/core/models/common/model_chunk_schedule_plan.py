@@ -11,6 +11,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
+    ScheduleNode,
     get_comm_stream,
     get_comp_stream,
 )
@@ -28,17 +29,17 @@ class ModelChunkState:
 
 
 class TransformerLayerSchedulePlan:
-    """Schedule the executing plan of the nodes in a transformer/mtp layer.
+    """Schedule the execution plan for nodes in a transformer or MTP layer.
 
-    This class organizes the sub-modules of a transformer/mtp layer,
-    including attention, post attention, MLP, dispatch, combine and
-    mtp post process nodes.
+    This class organizes the submodules of a transformer or MTP layer, including attention,
+    MLP, MoE dispatch and combine, optional mHC recomputation, and MTP post-processing nodes.
 
     layer (TransformerLayerSchedulePlan)
     ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
-    ├── moe_combine (TransformerLayerNode): combine All2All
+    ├── moe_combine (TransformerLayerNode): combine All2All (incl. MLP-side mHC post-processing)
+    ├── mhc_recompute (ScheduleNode): optional explicit replay before mHC backward
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
@@ -52,6 +53,7 @@ class TransformerLayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
+    mhc_recompute = None
     mtp_post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
@@ -97,6 +99,9 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'moe_combine') and self.moe_combine is not None:
             del self.moe_combine
             self.moe_combine = None
+        if hasattr(self, 'mhc_recompute') and self.mhc_recompute is not None:
+            del self.mhc_recompute
+            self.mhc_recompute = None
         if hasattr(self, 'mtp_post_process') and self.mtp_post_process is not None:
             del self.mtp_post_process
             self.mtp_post_process = None
@@ -109,7 +114,7 @@ class TransformerLayerSchedulePlan:
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
+            attn, mlp, moe_dispatch, moe_combine, and mtp_post_process.
         """
         from megatron.core.models.gpt.fine_grained_callables import (
             TransformerLayerNode,
@@ -165,6 +170,24 @@ class TransformerLayerSchedulePlan:
         else:
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
+
+        mhc_recompute_manager = extra_args.get("mhc_recompute_manager")
+        if mhc_recompute_manager is not None and extra_args.get(
+            "is_last_layer_in_mhc_recompute_group", False
+        ):
+            group_index = extra_args["mhc_recompute_group_index"]
+            # The group counter restarts per module (decoder / mtp), so fold the
+            # module tag into the NVTX label to keep profiles unambiguous.
+            module_tag = extra_args.get("mhc_recompute_module_tag", "decoder")
+            self.mhc_recompute = ScheduleNode(
+                mhc_recompute_manager.recompute_now,
+                comp_stream,
+                event,
+                name="mhc_recompute",
+                forward_nvtx_name=f"mhc/recompute/{module_tag}/group_{group_index}/B",
+            )
+        else:
+            self.mhc_recompute = None
 
         if is_mtp:
             self.mtp_post_process = create_node(
@@ -237,6 +260,9 @@ class TransformerLayerSchedulePlan:
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
         comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
         comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
+        MLP-side mHC post-processing runs inside the combine node on the communication stream.
+        Group recompute runs on the normal compute stream immediately before the node containing
+        mHC post-processing backward.
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
         and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
 
@@ -254,6 +280,8 @@ class TransformerLayerSchedulePlan:
 
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
+            if b_layer.mhc_recompute is not None:
+                b_layer.mhc_recompute.forward()
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -369,6 +397,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.decoder_input = decoder_input
         self._model_chunk_state.labels = labels
         self._model_chunk_state.mtp_hidden_states = None
+        self._model_chunk_state.mhc_multistream = None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.padding_mask = padding_mask
@@ -389,9 +418,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # build layer schedule plan for each layer.
         # The methods to obtain layers are different for MTP so we need the other build plan for
         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
-        self._build_layer_schedule_plan(model.decoder, get_comp_stream, get_comm_stream)
         self._build_layer_schedule_plan(
-            getattr(model, "mtp", None), get_comp_stream, get_comm_stream
+            model.decoder, get_comp_stream, get_comm_stream, module_tag="decoder"
+        )
+        self._build_layer_schedule_plan(
+            getattr(model, "mtp", None), get_comp_stream, get_comm_stream, module_tag="mtp"
         )
 
         # build post process
@@ -400,14 +431,39 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
-    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
+    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream, module_tag):
         if module is None:
             return
+
+        from megatron.core.tensor_parallel.random import CheckpointManager
+
         num_layers = len(module.layers)
+        config = module.config
+        use_mhc_recompute = (
+            module.training
+            and torch.is_grad_enabled()
+            and config.enable_hyper_connections
+            and config.recompute_granularity == "selective"
+            and "mhc" in config.recompute_modules
+        )
+        group_size = config.mhc_recompute_layer_num or num_layers
+        mhc_recompute_manager = (
+            CheckpointManager() if use_mhc_recompute and num_layers > 0 else None
+        )
+        group_index = 0
+
         for layer_idx in range(num_layers):
+            is_group_end = bool(
+                mhc_recompute_manager is not None
+                and (layer_idx == num_layers - 1 or (layer_idx + 1) % group_size == 0)
+            )
             extra_args = {
                 "is_first_layer": layer_idx == 0,
                 "is_last_layer": layer_idx == num_layers - 1,
+                "mhc_recompute_manager": mhc_recompute_manager,
+                "is_last_layer_in_mhc_recompute_group": is_group_end,
+                "mhc_recompute_group_index": group_index,
+                "mhc_recompute_module_tag": module_tag,
             }
             layer_plan = TransformerLayerSchedulePlan(
                 module.layers[layer_idx],
@@ -418,6 +474,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 extra_args,
             )
             self._transformer_layers.append(layer_plan)
+
+            if is_group_end and layer_idx != num_layers - 1:
+                group_index += 1
+                mhc_recompute_manager = CheckpointManager()
 
     @property
     def event(self):
