@@ -305,6 +305,23 @@ class DistributedDataParallel(_BaseDataParallel):
                         bucket_groups[num_bucket_groups - i - 1]
                     )
 
+        # Set `previous_grad_reduce_bucket_group` so each bucket group can drain its predecessor's
+        # reduce-scatter at dispatch time. Only needed for reduce_scatter_with_fp32_accumulation,
+        # which holds an intermediate all-to-all output tensor pinned until .wait() runs; without
+        # this draining, all such tensors stay live until end-of-step. The fp32-accum path asserts
+        # num_distributed_optimizer_instances == 1 elsewhere, so we only link in that case.
+        # Grad-reduce dispatches happen in forward order of bucket_groups during backward (buckets
+        # closer to the output finish their gradients first), so bucket_groups[i]'s immediate
+        # predecessor in dispatch order is bucket_groups[i-1].
+        if (
+            self.ddp_config.overlap_grad_reduce
+            and self.ddp_config.reduce_scatter_with_fp32_accumulation
+            and self.ddp_config.num_distributed_optimizer_instances == 1
+        ):
+            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+                for i in range(1, len(bucket_groups)):
+                    bucket_groups[i].previous_grad_reduce_bucket_group = bucket_groups[i - 1]
+
         # Create map from param to bucket group, used in pre_hook.
         for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
             for bucket_group in bucket_groups:
@@ -391,7 +408,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Force synchronize parameters.
         if param_sync:
-            self.start_param_sync(force_sync=True)
+            # Hook-disable paths (eval/checkpointing/shutdown) synchronize params as an
+            # explicit state update, not as differentiable forward compute.
+            with torch.no_grad():
+                self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """
@@ -442,7 +462,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
+                cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
+                if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
@@ -511,6 +532,19 @@ class DistributedDataParallel(_BaseDataParallel):
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
+
+    def reset_param_sync_dispatch_state(self):
+        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            # A non-None handle means the previous all-gather is still in flight. Resetting only
+            # the dispatch flag would create the invalid state
+            # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
+            # second all-gather into the same parameter buffer.
+            assert bucket_group.param_gather_handle is None, (
+                "Cannot reset parameter all-gather dispatch state while an asynchronous "
+                "parameter all-gather is still in flight."
+            )
+            bucket_group.param_gather_dispatched = False
 
     def start_grad_sync(self, *unused):
         """

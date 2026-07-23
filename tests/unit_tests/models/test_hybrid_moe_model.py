@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -16,6 +16,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -83,16 +84,25 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
     "dsa_indexer_head_dim": None,
+    "dsa_indexer_k_norm_epsilon": None,
+    "dsa_indexer_k_norm_fp32": False,
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_n_heads": None,
+    "dsa_indexer_rope_interleaved": False,
+    "dsa_indexer_rotate_activation": True,
+    "dsa_indexer_scoring_relu": True,
+    "dsa_indexer_skip_topk_offset": 0,
     "dsa_indexer_topk": None,
+    "dsa_indexer_topk_freq": 1,
     "dsa_indexer_use_sparse_loss": False,
+    "dsa_kernel_backend": "none",
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
     "enable_cuda_graph": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
+    "experimental_attention_variant_loss_scale_func": None,
     "expert_model_parallel_size": 4,
     "expert_tensor_parallel_size": 1,
     "external_cuda_graph": False,
@@ -113,6 +123,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_interval": 1,
     "fp8_margin": 0,
     "fp8_multi_head_attention": False,
+    "fp8_output_proj": False,
     "fp8_param": False,
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
@@ -122,6 +133,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
+    "mtp_grad_scale_func": None,
     "grad_sync_func": None,
     "gradient_accumulation_fusion": True,
     "hetereogenous_dist_checkpoint": False,
@@ -152,6 +164,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_num_groups": 8,
     "mamba_num_heads": 64,
     "mamba_state_dim": 128,
+    "mamba_training_ssm_states_dtype": None,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
     "microbatch_group_size_per_vp_stage": 1,
@@ -159,12 +172,14 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mlp_chunks_for_training": 1,
     "moe_apply_probs_on_input": False,
     "moe_aux_loss_coeff": 0.0,
-    "moe_deepep_num_sms": 20,
+    "moe_deepep_num_sms": None,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
     "moe_expert_rank_capacity_factor": None,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
+    "moe_flex_dispatcher_num_sms": None,
+    "moe_grad_scale_func": None,
     "moe_grouped_gemm": True,
     "moe_hybridep_num_sms": None,
     "moe_hybridep_num_sms_preprocessing": 108,
@@ -174,6 +189,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_latent_size": None,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_ncclep_static_shape": False,
+    "moe_ncclep_use_symm_mem": False,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_paged_stash": False,
@@ -194,12 +211,15 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_padding_for_fp8": False,
     "moe_router_padding_for_quantization": False,
     "moe_router_pre_softmax": False,
+    "moe_router_quantile_balancing_ema": 0.0,
     "moe_router_score_function": "sigmoid",
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shared_expert_gate": False,
+    "use_grouped_gemm_for_shared_expert": False,
     "moe_shared_expert_intermediate_size": 3712,
+    "moe_shared_expert_glu_interleave_size": None,
     "moe_shared_expert_overlap": False,
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
@@ -213,6 +233,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mup_embedding_mult": 1.0,
     "mup_output_mult": 1.0,
     "mup_width_mult": 1.0,
+    "mtp_detach_heads": False,
     "mtp_hybrid_override_pattern": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
@@ -295,6 +316,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
+    "delay_offload_until_cuda_graph": False,
+    "delta_offload_bytes_across_pp_ranks": 0,
+    "activation_offload_fraction": 1.0,
     "fine_grained_offloading_max_inflight_offloads": None,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
@@ -510,6 +534,7 @@ class TestHybridMoEModel:
     def setup_method(self, method):
 
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        destroy_moe_metrics_tracker()
         args = self.create_test_args()
         set_args(args)
 

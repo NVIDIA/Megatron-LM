@@ -20,10 +20,21 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
-from ..fp4_utils import get_nvfp4_rowwise_packed_shape, is_nvfp4tensor
+from ..fp4_utils import (
+    get_nvfp4_rowwise_packed_shape,
+    is_grouped_nvfp4tensor,
+    is_nvfp4tensor,
+    modify_grouped_nvfp4_rowwise_storage,
+    modify_nvfp4_rowwise_storage,
+)
 from ..fp8_utils import (
+    copy_tensor_to_quantized_param,
     is_float8tensor,
+    is_grouped_mxfp8tensor,
+    is_grouped_tensor,
+    is_grouped_tensor_with_quantized_storage,
     is_mxfp8tensor,
+    modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
     post_all_gather_processing,
 )
@@ -45,8 +56,6 @@ except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
-import megatron.core.nccl_allocator as nccl_allocator
-
 
 class BufferType(Enum):
     """
@@ -67,6 +76,17 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
         buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
     ]
     return sharded_buffer
+
+
+def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
+    """Return whether the parameter owns TE quantized storage instead of plain tensor storage."""
+    # In TE2, is_float8tensor() checks QuantizedTensor, so it includes plain MXFP8Tensor.
+    # Grouped quantized params are GroupedTensor wrappers, so check their backing storage.
+    return (
+        is_float8tensor(param)
+        or is_nvfp4tensor(param)
+        or is_grouped_tensor_with_quantized_storage(param)
+    )
 
 
 class _ParamAndGradBucket:
@@ -200,6 +220,12 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+        # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
+        # points to the bucket group whose grad-reduce was dispatched immediately before mine in
+        # the backward pass. start_grad_sync drains this predecessor before dispatching its own
+        # collective, so the predecessor's intermediate all-to-all buffer is freed before the new
+        # one is allocated.
+        self.previous_grad_reduce_bucket_group = None
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
@@ -246,6 +272,10 @@ class _ParamAndGradBucketGroup:
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+        # Per-iteration flag: True once finish_grad_sync has run this step. Lets a successor
+        # bucket group early-drain its predecessor without the end-of-step finalize loop
+        # double-waiting. Reset by `reset()`.
+        self.grad_reduce_finished = False
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -266,22 +296,24 @@ class _ParamAndGradBucketGroup:
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
+        self.grad_reduce_finished = False
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
-                is_bf16_weight_bucket = False
+                has_non_quantized_weight = False
                 for param in bucket.params:
-                    # Skip copying since bf16 weights in the mxfp8 model
-                    # are already mapped to param.data.
-                    if not is_float8tensor(param):
-                        is_bf16_weight_bucket = True
+                    # Non-quantized weights are already mapped to param.data. Skip
+                    # mixed buckets because zeroing bucket.param_data would also
+                    # clear those model weights.
+                    if not _param_uses_quantized_storage(param):
+                        has_non_quantized_weight = True
                         break
                     param_start, param_end = bucket.param_to_index[param]
                     param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    param.data.copy_(param_slice.view(param.data.shape))
-                if is_bf16_weight_bucket:
+                    copy_tensor_to_quantized_param(param, param_slice)
+                if has_non_quantized_weight:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
                 # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
@@ -294,7 +326,7 @@ class _ParamAndGradBucketGroup:
         quantized_params = []
         for bucket in self.buckets:
             for param in bucket.params:
-                if is_float8tensor(param) or is_nvfp4tensor(param):
+                if _param_uses_quantized_storage(param):
                     quantized_params.append(param)
         if len(quantized_params) > 0:
             post_all_gather_processing(quantized_params)
@@ -556,9 +588,38 @@ class _ParamAndGradBucketGroup:
             # already been dispatched.
             return
 
+        # Drain the predecessor bucket group's reduce-scatter before allocating ours. Only
+        # linked under reduce_scatter_with_fp32_accumulation, which holds an intermediate
+        # all-to-all output tensor pinned until .wait() runs. We only drain when the
+        # predecessor has actually been dispatched this iteration (grad_reduce_handle set):
+        # backward param ordering does not always match bucket linkage order (e.g. NVFP4
+        # bucket layouts), so the predecessor may not have fired yet when we arrive here.
+        # In that case the predecessor will dispatch and drain on its own once its params
+        # become ready. The end-of-step finalize loop still catches any bucket that
+        # neither a successor nor itself drained.
+        if (
+            self.previous_grad_reduce_bucket_group is not None
+            and self.previous_grad_reduce_bucket_group.grad_reduce_handle is not None
+        ):
+            self.previous_grad_reduce_bucket_group.finish_grad_sync(
+                force_all_reduce=force_all_reduce
+            )
+
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
+
+        # Local CUDA graph replay is asynchronous with respect to the outer
+        # autograd hooks. Wait before reading, scaling, or reducing gradients
+        # accumulated by a replay into this bucket.
+        current_stream = torch.cuda.current_stream()
+        waited_event_ids = set()
+        for bucket in self.buckets:
+            for param in bucket.params_list:
+                event = getattr(param, "_cudagraph_wgrad_ready_event", None)
+                if event is not None and id(event) not in waited_event_ids:
+                    current_stream.wait_event(event)
+                    waited_event_ids.add(id(event))
 
         # Copy accumulated .main_grad into communication buffer before collective if
         # .main_grad is not in .grad_data already (e.g., because we want to do local
@@ -576,9 +637,11 @@ class _ParamAndGradBucketGroup:
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
-        for bucket in self.buckets:
-            if bucket.gradient_scaling_factor != 1.0:
-                bucket.grad_data *= bucket.gradient_scaling_factor
+        # This mutates gradient communication state and must not be tracked by autograd.
+        with torch.no_grad():
+            for bucket in self.buckets:
+                if bucket.gradient_scaling_factor != 1.0:
+                    bucket.grad_data *= bucket.gradient_scaling_factor
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -701,12 +764,22 @@ class _ParamAndGradBucketGroup:
         When ddp_config.overlap_grad_reduce is set to True, waits for asynchronous
         communication call to complete. When ddp_config.overlap_grad_reduce is set to False,
         makes synchronous call.
+
+        When ddp_config.overlap_grad_reduce is set to True, this method is idempotent
+        within an iteration: a second call is a no-op. This lets a successor bucket
+        group early-drain its predecessor at dispatch time (see
+        `previous_grad_reduce_bucket_group`) while still allowing the end-of-step
+        finalize loop to call this on every bucket without double-waiting. The
+        non-overlap path preserves its original per-call dispatch+wait behaviour
+        because it has no predecessor draining.
         """
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
             self._copy_back_extra_main_grads()
+            return
+        if self.grad_reduce_finished:
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
@@ -718,6 +791,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
             self._copy_back_extra_main_grads()
+            self.grad_reduce_finished = True
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -727,6 +801,7 @@ class _ParamAndGradBucketGroup:
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
         self._copy_back_extra_main_grads()
+        self.grad_reduce_finished = True
 
     def free_overlap_buffers(self):
         """Free GPU buffers used by overlap param gather.
@@ -814,7 +889,7 @@ def group_params_for_buffers(
         assert param.requires_grad
 
         param_dtype = param.dtype
-        if is_float8tensor(param) or is_nvfp4tensor(param):
+        if _param_uses_quantized_storage(param):
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
         is_expert_parallel = not getattr(param, 'allreduce', True)
@@ -996,7 +1071,9 @@ class _ParamAndGradBuffer:
         # The packed index map is derived from param_index_map by iterating through
         # the already-computed layout and halving numel for NVFP4 tensors.
         #
-        self.has_nvfp4_params = any(is_nvfp4tensor(p) for p in self.params)
+        self.has_nvfp4_params = any(
+            is_nvfp4tensor(p) or is_grouped_nvfp4tensor(p) for p in self.params
+        )
         self.nvfp4_packed_param_index_map = None
         self.nvfp4_packed_bucket_indices = None
         if self.has_nvfp4_params:
@@ -1053,7 +1130,7 @@ class _ParamAndGradBuffer:
             # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
             # It can be temporarily reused by param AG.
             if self.ddp_config.use_distributed_optimizer and any(
-                is_mxfp8tensor(p) for p in self.params
+                is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
             ):
                 self.shared_buffer = torch.zeros(
                     self.numel,
@@ -1131,50 +1208,129 @@ class _ParamAndGradBuffer:
             nvfp4_packed_param_start_index = None
             if self.has_nvfp4_params:
                 nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
-            # For MXFP8 param:
-            # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
-            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag or not is_mxfp8tensor(param):
+            # This branch remaps the parameter storage into persistent DDP param_data buffer.
+            #
+            # Enter when:
+            # - `reuse_grad_buf_for_mxfp8_param_ag` is off: param AG has a persistent
+            #   param_data buffer instead of sharing storage with grad_data,
+            #   so every parameter must be backed by param_data.
+            # - param is not quantized: BF16/FP16/plain params still need persistent
+            #   param_data even when quantized params use grad_data as temporary AG storage.
+            #
+            # Skip only when both are true: AG reuses grad_data and the param is quantized.
+            # In that case AG writes into grad_data, then _post_param_sync copies the
+            # gathered values back into TE quantized storage.
+            #
+            # Remap cases below:
+            #   non-grouped TE NVFP4 tensor   -> remap packed rowwise bytes
+            #   non-grouped TE quantized      -> remap TE quantized storage
+            #   regular torch.Tensor param    -> replace param.data with param_data view
+            #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
+            #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
+            #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
+            if (
+                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                or not _param_uses_quantized_storage(param)
+            ):
                 if self.param_data is not None:
-                    if is_nvfp4tensor(param):
-                        # Remap the NVFP4 tensor's internal rowwise uint8 storage so it
-                        # points into the contiguous DDP param buffer. This enables the
-                        # all-gather to communicate packed NVFP4 bytes directly.
-                        from ..fp4_utils import modify_nvfp4_rowwise_storage
-
-                        packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
-                        rowwise_bytes_view = self._get(
-                            packed_shape,
-                            nvfp4_packed_param_start_index,
-                            buffer_type=BufferType.PARAM,
-                        )
-                        modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
-                    elif is_float8tensor(param):
-                        new_param_data = self._get(
-                            param.data.shape,
-                            (
-                                nvfp4_packed_param_start_index
-                                if self.has_nvfp4_params
-                                else param_start_index
-                            ),
-                            buffer_type=BufferType.PARAM,
-                        )
-                        modify_underlying_storage(param, new_param_data)
+                    if not is_grouped_tensor(param):
+                        # Plain NVFP4: remap packed rowwise bytes only.
+                        if is_nvfp4tensor(param):
+                            packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                            rowwise_bytes_view = self._get(
+                                packed_shape,
+                                nvfp4_packed_param_start_index,
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                        # In TE2, is_float8tensor() checks QuantizedTensor, including MXFP8.
+                        # NVFP4 is handled by the branch above.
+                        elif is_float8tensor(param):
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_underlying_storage(param, new_param_data)
+                        # Plain torch param: replace param.data with DDP buffer view.
+                        else:
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            old_param_data = param.data
+                            param.data = new_param_data
+                            assert old_param_data._base is None
+                            # Copy tensor values (from initialization or checkpoint).
+                            param.data.detach().copy_(old_param_data)
+                            del old_param_data
                     else:
-                        new_param_data = self._get(
-                            param.data.shape,
-                            (
-                                nvfp4_packed_param_start_index
-                                if self.has_nvfp4_params
-                                else param_start_index
-                            ),
-                            buffer_type=BufferType.PARAM,
-                        )
-                        old_param_data = param.data
-                        param.data = new_param_data
-                        assert old_param_data._base is None
-                        # Copy tensor values (from initialization or checkpoint).
-                        param.data.detach().copy_(old_param_data)
-                        del old_param_data
+                        # GroupedTensor: preserve wrapper/metadata; remap backing storage only.
+                        # Grouped NVFP4: only rowwise bytes live in DDP param_data.
+                        if is_grouped_nvfp4tensor(param):
+                            packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                            rowwise_bytes_view = self._get(
+                                packed_shape,
+                                nvfp4_packed_param_start_index,
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_grouped_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != rowwise_bytes_view.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap grouped NVFP4 rowwise storage into DDP "
+                                    "param_data."
+                                )
+                        # Grouped MXFP8: do not remap grouped quantized storage into param_data.
+                        # Use grad-buffer AG reuse and copy gathered values back after AG.
+                        elif is_grouped_mxfp8tensor(param):
+                            raise RuntimeError(
+                                "Single grouped MXFP8 params require "
+                                "--reuse-grad-buf-for-mxfp8-param-ag."
+                            )
+                        elif is_grouped_tensor_with_quantized_storage(param):
+                            raise RuntimeError(
+                                "Unsupported single grouped quantized parameter recipe."
+                            )
+                        # Grouped BF16/FP16: remap full rowwise_data.
+                        else:
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_grouped_tensor_rowwise_storage(param, new_param_data)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != new_param_data.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap high-precision TE GroupedTensor parameter "
+                                    "storage into DDP param_data."
+                                )
 
             # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
@@ -1307,7 +1463,7 @@ class _ParamAndGradBuffer:
                 cur_bucket_id = bucket_id
 
             # NVFP4 tensors use half the numel in the packed param buffer.
-            if is_nvfp4tensor(param):
+            if is_nvfp4tensor(param) or is_grouped_nvfp4tensor(param):
                 assert (
                     param_numel % 2 == 0
                 ), f"NVFP4 requires even numel for packing, got {param_numel}"
