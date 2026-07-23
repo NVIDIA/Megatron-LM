@@ -421,7 +421,6 @@ def test_forward_step_projects_prefetched_features_inside_debug_timer(monkeypatc
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_real_cuda_pending_handoff_waits_for_encode():
-    torch.cuda.set_device(0)
     read_ahead_started = threading.Event()
     release_read_ahead = threading.Event()
     backbone = nn.Linear(4, 4, bias=False, device="cuda")
@@ -466,7 +465,6 @@ def test_real_cuda_pending_handoff_waits_for_encode():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_real_cuda_handoff_and_projection_gradients():
-    torch.cuda.set_device(0)
     backbone = nn.Linear(4, 4, bias=False, device="cuda")
     projection = nn.Linear(4, 1, bias=False, device="cuda")
     backbone.requires_grad_(False)
