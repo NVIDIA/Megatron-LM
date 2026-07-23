@@ -42,7 +42,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -2297,6 +2297,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """
     args = get_args()
     timers = get_timers()
+    scheduled_num_microbatches = get_num_microbatches()
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
@@ -2309,7 +2310,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    source_data_iterator = data_iterator
+    while rerun_state_machine.should_run_forward_backward(source_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2351,6 +2353,26 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            scheduler_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+            assert isinstance(scheduler_pg_collection, ProcessGroupCollection), (
+                "sequence packing requires the model to expose a ProcessGroupCollection"
+            )
+            (
+                scheduled_data_iterator,
+                scheduled_num_microbatches,
+                _total_real_tokens_in_batch,
+                _seqlen_squared_sum_in_batch,
+            ) = wrap_data_iterator(
+                source_data_iterator,
+                config,
+                get_num_microbatches(),
+                pg_collection=scheduler_pg_collection,
+            )
+        else:
+            scheduled_data_iterator = source_data_iterator
+            scheduled_num_microbatches = get_num_microbatches()
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -2360,9 +2382,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
+            data_iterator=scheduled_data_iterator,
             model=model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=scheduled_num_microbatches,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
@@ -2411,7 +2433,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            scheduled_num_microbatches,
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -2505,8 +2537,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            scheduled_num_microbatches,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return (
+        {},
+        skipped_iter,
+        should_checkpoint,
+        should_exit,
+        exit_code,
+        grad_norm,
+        num_zeros_in_grad,
+        log_max_attention_logit,
+        scheduled_num_microbatches,
+    )
 
 
 def training_log(
@@ -2525,6 +2568,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2694,7 +2738,7 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -2733,7 +2777,7 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -3671,7 +3715,7 @@ def train(
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing:
+            if args.rl_use_sequence_packing or args.sequence_packing_scheduler is not None:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
@@ -3709,6 +3753,9 @@ def train(
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
+            assert (
+                getattr(config, "sequence_packing_scheduler", None) is None
+            ), "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -3755,6 +3802,7 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            num_microbatches = get_num_microbatches()
         else:
             ft_integration.on_training_step_start()
             (
@@ -3766,6 +3814,7 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                num_microbatches,
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                 pg_collection=pg_collection,
@@ -3911,6 +3960,7 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            num_microbatches=num_microbatches,
         )
         is_first_iteration = False
 
@@ -4151,11 +4201,31 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if getattr(config, "sequence_packing_scheduler", None) is not None:
+                assert isinstance(
+                    eval_pgc, ProcessGroupCollection
+                ), "sequence packing requires the model to expose a ProcessGroupCollection"
+                try:
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            pg_collection=eval_pgc,
+                        )
+                    )
+                except StopIteration:
+                    ft_integration.on_eval_step_end()
+                    config.timers = get_timers()
+                    break
+            else:
+                packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=packed_data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
+                num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
