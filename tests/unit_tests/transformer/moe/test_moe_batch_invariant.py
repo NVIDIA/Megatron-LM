@@ -82,16 +82,10 @@ def test_grouped_gemm_split_invariance(E):
     # contiguous-layout DeepGEMM — must split on a boundary).
     half = (E // 2) * per_expert
     y0 = _bf16_grouped_gemm_contiguous(
-        x[:half].contiguous(),
-        w,
-        m_indices[:half].contiguous(),
-        counts[: E // 2] + [0] * (E // 2),
+        x[:half].contiguous(), w, m_indices[:half].contiguous(), counts[: E // 2] + [0] * (E // 2)
     )
     y1 = _bf16_grouped_gemm_contiguous(
-        x[half:].contiguous(),
-        w,
-        m_indices[half:].contiguous(),
-        [0] * (E // 2) + counts[E // 2 :],
+        x[half:].contiguous(), w, m_indices[half:].contiguous(), [0] * (E // 2) + counts[E // 2 :]
     )
     y_cat = torch.cat([y0, y1], dim=0)
     assert torch.equal(

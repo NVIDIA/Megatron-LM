@@ -233,9 +233,7 @@ class TestNCCLAllGatherDispatcher:
     def test_init_rejects_batch_invariant_ep(self):
         """Batch-invariant MoE on the inference EP path is NVLS-only on this branch."""
         if Utils.world_size == 1:
-            pytest.skip(
-                "NCCL batch-invariant rejection is only relevant with expert parallelism."
-            )
+            pytest.skip("NCCL batch-invariant rejection is only relevant with expert parallelism.")
 
         with pytest.raises(ValueError, match="requires inference_moe_token_dispatcher_type"):
             self._make_dispatcher(
@@ -554,10 +552,10 @@ class TestNVLSAllGatherVDispatcher:
             HAVE_DEEPGEMM_BF16,
             set_batch_invariant_mode,
         )
+        from megatron.core.transformer.moe import token_dispatcher_inference
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
         )
-        from megatron.core.transformer.moe import token_dispatcher_inference
 
         if Utils.world_size < 2:
             pytest.skip("NVLS RSV branch test requires expert-parallel world_size > 1.")

@@ -1571,11 +1571,7 @@ def _bf16_grouped_gemm_wgrad_contiguous(
 
 
 def grouped_gemm_batch_invariant(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    *,
-    offs: torch.Tensor,
-    m_total: int,
+    a: torch.Tensor, b: torch.Tensor, *, offs: torch.Tensor, m_total: int
 ) -> torch.Tensor:
     """Run the graph-safe grouped GEMM over pre-aligned inference expert blocks."""
     m_indices = _offs_to_m_indices(offs, m_total).contiguous()
@@ -1685,12 +1681,10 @@ def _pin_mamba_autotuners():
 
     kernels = []
     try:
-        from megatron.core.ssm.ops import (
-            ssd_bmm as r_bmm,
-            ssd_chunk_scan as r_scan,
-            ssd_chunk_state as r_state,
-            ssd_state_passing as r_pass,
-        )
+        from megatron.core.ssm.ops import ssd_bmm as r_bmm
+        from megatron.core.ssm.ops import ssd_chunk_scan as r_scan
+        from megatron.core.ssm.ops import ssd_chunk_state as r_state
+        from megatron.core.ssm.ops import ssd_state_passing as r_pass
 
         kernels += [
             r_bmm._bmm_chunk_fwd_kernel,
@@ -1702,12 +1696,10 @@ def _pin_mamba_autotuners():
     except ImportError:
         pass
     try:
-        from mamba_ssm.ops.triton import (
-            ssd_bmm as p_bmm,
-            ssd_chunk_scan as p_scan,
-            ssd_chunk_state as p_state,
-            ssd_state_passing as p_pass,
-        )
+        from mamba_ssm.ops.triton import ssd_bmm as p_bmm
+        from mamba_ssm.ops.triton import ssd_chunk_scan as p_scan
+        from mamba_ssm.ops.triton import ssd_chunk_state as p_state
+        from mamba_ssm.ops.triton import ssd_state_passing as p_pass
 
         kernels += [
             p_bmm._bmm_chunk_fwd_kernel,

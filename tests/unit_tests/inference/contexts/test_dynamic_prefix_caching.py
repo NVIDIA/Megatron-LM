@@ -800,9 +800,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         one_left_req = self._req(ctx, self._prompt(ctx.mamba_chunk_size + 1), request_id=3)
         assert (
-            engine._mamba_batch_invariant_prefill_chunk_length(
-                one_left_req, ctx.mamba_chunk_size
-            )
+            engine._mamba_batch_invariant_prefill_chunk_length(one_left_req, ctx.mamba_chunk_size)
             == 0
         )
         assert (

@@ -25,8 +25,8 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
-    unpermute as batch_invariant_unpermute,
 )
+from megatron.core.transformer.moe.batch_invariant import unpermute as batch_invariant_unpermute
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
@@ -444,10 +444,7 @@ def permute(
 
         if return_batch_invariant_inverse_map:
             batch_invariant_inverse_map = build_batch_invariant_inverse_permutation_map(
-                routing_map_for_inverse,
-                flat_sorted,
-                sorted_indices,
-                num_out_tokens,
+                routing_map_for_inverse, flat_sorted, sorted_indices, num_out_tokens
             )
 
     # use the mapping to permute the tokens
@@ -525,9 +522,9 @@ def unpermute(
 
     if batch_invariant_mode:
         assert routing_map is not None, "batch-invariant MoE unpermute requires routing_map"
-        assert batch_invariant_inverse_map is not None, (
-            "batch-invariant MoE unpermute requires the AllToAll inverse map"
-        )
+        assert (
+            batch_invariant_inverse_map is not None
+        ), "batch-invariant MoE unpermute requires the AllToAll inverse map"
         return batch_invariant_unpermute(
             permuted_tokens,
             restore_shape,

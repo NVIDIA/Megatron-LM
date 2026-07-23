@@ -350,9 +350,9 @@ def _chunk_state_fwd(
     chunk_starts=None,
 ):
     has_chunk_flags = chunk_flags is not None
-    assert (chunk_starts is not None) == has_chunk_flags, (
-        "chunk_flags and chunk_starts must be provided together"
-    )
+    assert (
+        chunk_starts is not None
+    ) == has_chunk_flags, "chunk_flags and chunk_starts must be provided together"
     if has_chunk_flags:
         chunk_offsets = chunk_starts
     else:

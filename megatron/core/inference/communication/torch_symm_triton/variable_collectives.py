@@ -405,7 +405,9 @@ def _ordered_reduce_scatter_v_kernel(
             for src_rank in tl.range(0, WORLD_SIZE):
                 peer_base = tl.load(buffer_ptrs + src_rank).to(tl.pointer_type(tl.uint8))
                 peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
-                vals = tl.load(peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0)
+                vals = tl.load(
+                    peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0
+                )
                 acc += vals
 
             tl.store(local_ptr + token_offset * HIDDEN_SIZE + offsets, acc, mask=mask)

@@ -24,9 +24,9 @@ def build_inverse_permutation_map(
     assert isinstance(
         num_out_tokens, int
     ), "batch-invariant graph unpermute requires static num_out_tokens"
-    assert num_out_tokens % num_tokens == 0, (
-        "batch-invariant graph unpermute expects fixed top-k per token"
-    )
+    assert (
+        num_out_tokens % num_tokens == 0
+    ), "batch-invariant graph unpermute expects fixed top-k per token"
 
     topk = num_out_tokens // num_tokens
     row_ids = torch.arange(num_out_tokens, device=routing_map.device, dtype=torch.long)
@@ -38,7 +38,9 @@ def build_inverse_permutation_map(
     linear_slots = token_ids * topk + row_slots
 
     inverse_rows = torch.full((num_tokens, topk), -1, device=routing_map.device, dtype=torch.long)
-    inverse_experts = torch.full((num_tokens, topk), -1, device=routing_map.device, dtype=torch.long)
+    inverse_experts = torch.full(
+        (num_tokens, topk), -1, device=routing_map.device, dtype=torch.long
+    )
     inverse_rows.view(-1).scatter_(0, linear_slots, row_ids)
     inverse_experts.view(-1).scatter_(0, linear_slots, expert_ids)
     return torch.stack((inverse_rows, inverse_experts), dim=0)
@@ -75,9 +77,7 @@ def unpermute(
         for k in range(topk):
             row_ids = inverse_rows[:, k]
             expert_ids = inverse_experts[:, k]
-            valid_mask = (
-                (row_ids >= 0) & (expert_ids >= start_expert) & (expert_ids < end_expert)
-            )
+            valid_mask = (row_ids >= 0) & (expert_ids >= start_expert) & (expert_ids < end_expert)
 
             safe_rows = row_ids.clamp_min(0)
             chunk = permuted_tokens.index_select(0, safe_rows).to(torch.float32)

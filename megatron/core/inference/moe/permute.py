@@ -370,9 +370,7 @@ def permute_tokens(
     # The inverse-map pointer is unused when HAS_INVERSE=False. Reuse an existing
     # int32 device tensor instead of allocating a dummy buffer for that kernel variant.
     inverse_map_ptr = (
-        batch_invariant_inverse_map
-        if batch_invariant_inverse_map is not None
-        else permutation_map
+        batch_invariant_inverse_map if batch_invariant_inverse_map is not None else permutation_map
     )
     _permute_tokens_kernel[(NUM_BLOCKS,)](
         hidden_states,
@@ -506,18 +504,14 @@ def unpermute_tokens(
     # MoE instead reduces each token independently in fixed local-expert order,
     # so unrelated tokens cannot affect the accumulation tree.
     if batch_invariant.enabled():
-        assert batch_invariant_inverse_map is not None, (
-            "batch-invariant MoE unpermute requires its inverse map"
-        )
+        assert (
+            batch_invariant_inverse_map is not None
+        ), "batch-invariant MoE unpermute requires its inverse map"
         # The expert-order kernel stores every row tok < valid_tokens, including zero
         # rows for tokens with no local expert contribution. Rows beyond
         # valid_tokens are not read by the graphed RSV combine.
         return batch_invariant.unpermute_tokens_in_expert_order(
-            expert_output,
-            permuted_probs,
-            batch_invariant_inverse_map,
-            valid_tokens,
-            out,
+            expert_output, permuted_probs, batch_invariant_inverse_map, valid_tokens, out
         )
 
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)

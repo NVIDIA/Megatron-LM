@@ -178,9 +178,9 @@ def _bmm_chunk_fwd(
         out: (nchunks, ngroups, chunk_size, chunk_size)
     """
     has_target_rows = target_rows is not None
-    assert (chunk_starts is not None) == has_target_rows, (
-        "target_rows and chunk_starts must be provided together"
-    )
+    assert (
+        chunk_starts is not None
+    ) == has_target_rows, "target_rows and chunk_starts must be provided together"
     if has_target_rows:
         # chunk_starts has one fixed-window start per chunk.
         chunk_offsets = chunk_starts

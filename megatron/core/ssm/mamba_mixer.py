@@ -1004,7 +1004,7 @@ class MambaMixer(MegatronModule):
 
             tensor_masked_update(ssm_state, batch_indices, cache_states)
             if self.config.batch_invariant_mode:
-                self._batch_invariant_decode().seed(
+                self._get_batch_invariant_decoder().seed(
                     x, dt, B, C, cu_seqlens, batch_indices, max_batch=ssm_state.shape[0]
                 )
 
@@ -1081,7 +1081,7 @@ class MambaMixer(MegatronModule):
             self._A_neg_exp_cache_stale = False
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
-    def _batch_invariant_decode(self) -> MambaBatchInvariantDecode:
+    def _get_batch_invariant_decoder(self) -> MambaBatchInvariantDecode:
         """Batch-invariant decode adapter, created on first use."""
         if not hasattr(self, "_batch_invariant_decoder"):
             self._batch_invariant_decoder = MambaBatchInvariantDecode(self)
@@ -1235,10 +1235,9 @@ class MambaMixer(MegatronModule):
             y = y.unsqueeze(1)  # Restore seq dimension
         elif self.config.batch_invariant_mode:
             assert batch_indices is not None, (
-                "batch_invariant_mode for Mamba decode requires dynamic batching "
-                "batch_indices."
+                "batch_invariant_mode for Mamba decode requires dynamic batching " "batch_indices."
             )
-            y = self._batch_invariant_decode().step(x, dt, B, C, batch_indices, ssm_state)
+            y = self._get_batch_invariant_decoder().step(x, dt, B, C, batch_indices, ssm_state)
         else:
             A = self._get_decode_A_neg_exp()
 
