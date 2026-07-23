@@ -1401,9 +1401,18 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
             calculate_per_token_loss=True,
             bf16=True,
             params_dtype=torch.bfloat16,
-            recompute_granularity="full",
-            recompute_method="uniform",
-            recompute_num_layers=1,
+            expert_model_parallel_size=cp,
+            expert_tensor_parallel_size=1,
+            num_moe_experts=64,
+            moe_ffn_hidden_size=1024,
+            moe_shared_expert_intermediate_size=1024,
+            moe_shared_expert_gate=True,
+            moe_router_load_balancing_type="aux_loss",
+            moe_router_topk=10,
+            moe_grouped_gemm=True,
+            moe_aux_loss_coeff=0.0,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_dtype="fp32",
         )
 
     def initialize_gpt_model(
@@ -1444,9 +1453,27 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
             if param.requires_grad:
                 _get_param_grad(param).data.mul_(scale)
 
+    def _is_routed_expert_param(name):
+        return ".mlp.experts." in name
+
+    def _param_category(name):
+        if ".mlp.experts." in name:
+            return "routed_expert"
+        if ".mlp.shared_experts." in name:
+            return "shared_expert"
+        if ".mlp.router." in name:
+            return "router"
+        if ".self_attention." in name:
+            return "self_attention"
+        if ".input_layernorm." in name or ".pre_mlp_layernorm." in name:
+            return "layernorm"
+        return "other"
+
     def _all_reduce_grads(model, group):
-        for param in model.parameters():
+        for name, param in model.named_parameters():
             if param.requires_grad:
+                if _is_routed_expert_param(name):
+                    continue
                 torch.distributed.all_reduce(_get_param_grad(param), group=group)
 
     def _collect_grads(model):
@@ -1462,6 +1489,141 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
             total += grad.double().pow(2).sum()
         return total.sqrt()
 
+    def _print_grad_diagnostics(baseline_grads, parallel_grads, group):
+        worst_name = None
+        worst_abs = -1.0
+        categories = {}
+        for name, baseline_grad in baseline_grads.items():
+            diff = (parallel_grads[name] - baseline_grad).float().abs()
+            category = _param_category(name)
+            stats = categories.setdefault(
+                category,
+                {
+                    "max_abs": 0.0,
+                    "sum_abs": 0.0,
+                    "numel": 0,
+                    "baseline_norm_sq": 0.0,
+                    "parallel_norm_sq": 0.0,
+                    "worst_name": None,
+                },
+            )
+            max_abs = diff.max().item()
+            stats["max_abs"] = max(stats["max_abs"], max_abs)
+            stats["sum_abs"] += diff.sum().item()
+            stats["numel"] += diff.numel()
+            stats["baseline_norm_sq"] += baseline_grad.float().pow(2).sum().item()
+            stats["parallel_norm_sq"] += parallel_grads[name].float().pow(2).sum().item()
+            if max_abs >= stats["max_abs"]:
+                stats["worst_name"] = name
+            if max_abs > worst_abs:
+                worst_abs = max_abs
+                worst_name = name
+
+        cp_rank = torch.distributed.get_rank(group=group)
+        for category, stats in sorted(categories.items()):
+            mean_abs = stats["sum_abs"] / max(stats["numel"], 1)
+            print(
+                "CP_GRAD_CATEGORY "
+                f"cp_rank={cp_rank} "
+                f"category={category} "
+                f"max_abs={stats['max_abs']:.8f} "
+                f"mean_abs={mean_abs:.8f} "
+                f"baseline_norm={stats['baseline_norm_sq'] ** 0.5:.8f} "
+                f"parallel_norm={stats['parallel_norm_sq'] ** 0.5:.8f} "
+                f"worst_name={stats['worst_name']}",
+                flush=True,
+            )
+        print(
+            "CP_GRAD_WORST "
+            f"cp_rank={cp_rank} "
+            f"max_abs={worst_abs:.8f} "
+            f"name={worst_name}",
+            flush=True,
+        )
+        return worst_abs
+
+    def _install_route_capture(model, captures):
+        for name, module in model.named_modules():
+            if not hasattr(module, "route") or not hasattr(module, "token_dispatcher"):
+                continue
+            original_route = module.route
+
+            def wrapped_route(
+                hidden_states,
+                padding_mask=None,
+                input_ids=None,
+                packed_seq_params=None,
+                *,
+                _name=name,
+                _original_route=original_route,
+            ):
+                probs, routing_map = _original_route(
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    input_ids=input_ids,
+                    packed_seq_params=packed_seq_params,
+                )
+                captures.setdefault(_name, []).append(routing_map.detach().clone())
+                return probs, routing_map
+
+            module.route = wrapped_route
+
+    def _print_route_diagnostics(baseline_routes, parallel_routes, group, get_partition_mode):
+        cp_rank = torch.distributed.get_rank(group=group)
+        worst_token_mismatch = 0.0
+        worst_name = None
+        worst_index = -1
+        assert baseline_routes.keys() == parallel_routes.keys()
+        for name, baseline_maps in sorted(baseline_routes.items()):
+            partition_mode = get_partition_mode(name)
+            parallel_maps = parallel_routes[name]
+            assert len(baseline_maps) == len(parallel_maps)
+            for index, (baseline_map, parallel_map) in enumerate(zip(baseline_maps, parallel_maps)):
+                expected_map = get_tensor_on_this_cp_rank(
+                    baseline_map, 0, group, cp_partition_mode=partition_mode
+                )
+                if expected_map.shape != parallel_map.shape:
+                    print(
+                        "CP_ROUTE_DIAG "
+                        f"cp_rank={cp_rank} "
+                        f"partition_mode={partition_mode} "
+                        f"name={name} "
+                        f"index={index} "
+                        f"shape_mismatch expected={tuple(expected_map.shape)} "
+                        f"actual={tuple(parallel_map.shape)}",
+                        flush=True,
+                    )
+                    token_mismatch = 1.0
+                    entry_mismatch = 1.0
+                else:
+                    mismatch = expected_map != parallel_map
+                    token_mismatch = mismatch.any(dim=-1).float().mean().item()
+                    entry_mismatch = mismatch.float().mean().item()
+                    print(
+                        "CP_ROUTE_DIAG "
+                        f"cp_rank={cp_rank} "
+                        f"partition_mode={partition_mode} "
+                        f"name={name} "
+                        f"index={index} "
+                        f"token_mismatch={token_mismatch:.8f} "
+                        f"entry_mismatch={entry_mismatch:.8f}",
+                        flush=True,
+                    )
+                if token_mismatch > worst_token_mismatch:
+                    worst_token_mismatch = token_mismatch
+                    worst_name = name
+                    worst_index = index
+
+        print(
+            "CP_ROUTE_WORST "
+            f"cp_rank={cp_rank} "
+            f"token_mismatch={worst_token_mismatch:.8f} "
+            f"name={worst_name} "
+            f"index={worst_index}",
+            flush=True,
+        )
+        return worst_token_mismatch
+
     def _zero_grads(model):
         for param in model.parameters():
             param.grad = None
@@ -1470,7 +1632,11 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
                 main_grad.zero_()
 
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+        expert_model_parallel_size=cp,
+        expert_tensor_parallel_size=1,
     )
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
@@ -1537,8 +1703,12 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
         baseline_config = make_config(context_parallel_size=1)
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
+        mock_args.expert_model_parallel_size = cp
+        mock_args.expert_tensor_parallel_size = 1
         baseline_model = unwrap_model(get_model(initialize_gpt_model, config=baseline_config))
         baseline_model[0].train()
+        baseline_routes = {}
+        _install_route_capture(baseline_model[0], baseline_routes)
 
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
         mock_args.no_save_optim = True
@@ -1565,14 +1735,22 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
 
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp,
+            expert_model_parallel_size=cp,
+            expert_tensor_parallel_size=1,
         )
         model_parallel_cuda_manual_seed(seed)
         parallel_config = make_config(context_parallel_size=cp)
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = cp
+        mock_args.expert_model_parallel_size = cp
+        mock_args.expert_tensor_parallel_size = 1
         parallel_model = unwrap_model(get_model(initialize_gpt_model, config=parallel_config))
         parallel_model[0].train()
+        parallel_routes = {}
+        _install_route_capture(parallel_model[0], parallel_routes)
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
                 load_checkpoint(parallel_model, None, None)
@@ -1585,6 +1763,8 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
             position_ids, 1, cp_group, cp_partition_mode=input_partition_mode
         )
         _zero_grads(parallel_model[0])
+        max_loss_avg_diff = 0.0
+        max_loss_token_diff = 0.0
         for input_ids, labels, loss_mask, baseline_loss in zip(
             input_ids_list, labels_list, loss_mask_list, baseline_losses
         ):
@@ -1630,20 +1810,20 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
             parallel_avg = local_loss_stats[0] / local_loss_stats[3].clamp(min=1)
             expected_avg = local_loss_stats[1] / local_loss_stats[3].clamp(min=1)
             mean_abs = local_loss_stats[2] / local_loss_stats[3].clamp(min=1)
+            loss_avg_diff = (parallel_avg - expected_avg).abs().item()
+            max_loss_avg_diff = max(max_loss_avg_diff, loss_avg_diff)
+            max_loss_token_diff = max(max_loss_token_diff, local_loss_max.item())
             if torch.distributed.get_rank(group=cp_group) == 0:
                 print(
                     "CP_LOSS_DIAG "
                     f"input_partition_mode={input_partition_mode} "
                     f"parallel_avg={parallel_avg.item():.8f} "
                     f"expected_avg={expected_avg.item():.8f} "
-                    f"avg_diff={(parallel_avg - expected_avg).abs().item():.8f} "
+                    f"avg_diff={loss_avg_diff:.8f} "
                     f"mean_abs={mean_abs.item():.8f} "
                     f"max_abs={local_loss_max.item():.8f}",
                     flush=True,
                 )
-            torch.testing.assert_close(
-                parallel_avg, expected_avg, atol=2e-3, rtol=2e-3
-            )
             (parallel_loss.float() * local_loss_mask).sum().backward()
 
         _all_reduce_grads(parallel_model[0], cp_group)
@@ -1661,14 +1841,38 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
             )
 
         assert baseline_grads.keys() == parallel_grads.keys()
+        def _get_route_partition_mode(name):
+            parts = name.split(".")
+            if "layers" in parts:
+                layer_index = int(parts[parts.index("layers") + 1])
+                required_partition_mode = parallel_model[0].decoder.cp_partition_mode_plan[
+                    layer_index
+                ]
+                if required_partition_mode is not None:
+                    return required_partition_mode
+                return parallel_model[0].decoder.get_cp_partition_mode_before_local_index(
+                    layer_index
+                )
+            return input_partition_mode
+
+        worst_route_mismatch = _print_route_diagnostics(
+            baseline_routes, parallel_routes, cp_group, _get_route_partition_mode
+        )
+        worst_grad_abs = _print_grad_diagnostics(baseline_grads, parallel_grads, cp_group)
         for name, baseline_grad in baseline_grads.items():
             torch.testing.assert_close(
                 parallel_grads[name],
                 baseline_grad,
-                atol=2e-3,
-                rtol=2e-3,
+                atol=1e-3,
+                rtol=0.0,
                 msg=lambda msg, param_name=name: f"gradient mismatch for {param_name}: {msg}",
             )
+        assert max_loss_avg_diff <= 1e-3, (
+            f"max averaged loss diff too large: {max_loss_avg_diff}; "
+            f"max token loss diff: {max_loss_token_diff}; "
+            f"worst route mismatch: {worst_route_mismatch}; "
+            f"worst grad abs: {worst_grad_abs}"
+        )
 
         Utils.destroy_model_parallel()
 
