@@ -220,6 +220,7 @@ class GPTModel(LanguageModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
+            name="decoder",
         )
 
         if self.mtp_process:
@@ -228,6 +229,7 @@ class GPTModel(LanguageModule):
                 spec=self.mtp_block_spec,
                 vp_stage=vp_stage,
                 pg_collection=self.pg_collection,
+                name="mtp",
             )
 
             self._setup_mtp_cuda_graphs()
