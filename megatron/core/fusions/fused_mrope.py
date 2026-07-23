@@ -181,7 +181,14 @@ def get_fused_mrope_thd_unavailable_reason(
     cp_size: int = 1,
     cp_rank: int = 0,
 ) -> Optional[str]:
-    """Return why fused THD mRoPE cannot run, or None when it is launchable."""
+    """Return why fused THD mRoPE cannot run, or None when it is launchable.
+
+    ``cu_seqlens`` is assumed to describe the padded layout used to partition
+    the THD tensor. In particular, every packed sub-sequence must be divisible
+    by ``cp_size`` when context parallelism is enabled. This function does not
+    inspect CUDA tensor values so availability checks remain free of host
+    synchronization.
+    """
     if not HAVE_TRITON:
         return "Triton is not available"
     if rotary_interleaved:
@@ -227,16 +234,6 @@ def get_fused_mrope_thd_unavailable_reason(
             "raw mRoPE THD freqs sequence length must be divisible by context parallel size, "
             f"got freqs.shape[2]={freqs.shape[2]}, cp_size={cp_size}"
         )
-    if cp_size > 1:
-        # Guard: each packed sub-sequence length must satisfy seqlen % cp_size == 0.
-        seq_bounds = cu_seqlens.tolist()
-        for seq_start, seq_end in zip(seq_bounds[:-1], seq_bounds[1:]):
-            if (seq_end - seq_start) % cp_size != 0:
-                return (
-                    "each packed THD sub-sequence length must be divisible by context "
-                    f"parallel size, got sub-sequence length {seq_end - seq_start} "
-                    f"with cp_size={cp_size}"
-                )
     if freqs.shape[2] != t.shape[0] * cp_size:
         return (
             "raw mRoPE THD freqs sequence length must match local tokens times cp_size, "
@@ -620,7 +617,7 @@ def _launch_fused_mrope_thd(
     t: torch.Tensor,
     cu_seqlens: torch.Tensor,
     freqs: torch.Tensor,
-    mrope_section: List[int],
+    launch_metadata: tuple[int, int, int, int, int, int, int],
     interleaved_mrope: bool,
     rotary_interleaved: bool,
     inverse: bool,
@@ -629,19 +626,7 @@ def _launch_fused_mrope_thd(
     fp32_compute: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    unavailable_reason = get_fused_mrope_thd_unavailable_reason(
-        t,
-        cu_seqlens,
-        freqs,
-        rotary_interleaved=rotary_interleaved,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-    )
-    assert unavailable_reason is None, unavailable_reason
-
-    tokens, heads, head_dim, half_rotary_dim, sec_t, sec_h, sec_w = _validate_mrope_thd_inputs(
-        t, cu_seqlens, freqs, mrope_section, interleaved_mrope, cp_size
-    )
+    tokens, heads, head_dim, half_rotary_dim, sec_t, sec_h, sec_w = launch_metadata
 
     if out is None:
         out = torch.empty_like(t)
@@ -751,18 +736,21 @@ class _FusedMRoPETHD(torch.autograd.Function):
     ):
         """Apply fused THD mRoPE and save packed metadata for backward."""
         assert not freqs.requires_grad, "fused THD mRoPE expects non-gradient raw frequency tensors"
-        ctx.mrope_section = tuple(int(section) for section in mrope_section)
+        mrope_section = tuple(int(section) for section in mrope_section)
         ctx.interleaved_mrope = bool(interleaved_mrope)
         ctx.rotary_interleaved = bool(rotary_interleaved)
         ctx.cp_size = int(cp_size)
         ctx.cp_rank = int(cp_rank)
         ctx.fp32_compute = bool(fp32_compute)
+        ctx.launch_metadata = _validate_mrope_thd_inputs(
+            t, cu_seqlens, freqs, mrope_section, ctx.interleaved_mrope, ctx.cp_size
+        )
         ctx.save_for_backward(cu_seqlens, freqs)
         return _launch_fused_mrope_thd(
             t,
             cu_seqlens,
             freqs,
-            ctx.mrope_section,
+            ctx.launch_metadata,
             ctx.interleaved_mrope,
             ctx.rotary_interleaved,
             inverse=False,
@@ -779,7 +767,7 @@ class _FusedMRoPETHD(torch.autograd.Function):
             grad_output.contiguous(),
             cu_seqlens,
             freqs,
-            ctx.mrope_section,
+            ctx.launch_metadata,
             ctx.interleaved_mrope,
             ctx.rotary_interleaved,
             inverse=True,
@@ -833,7 +821,9 @@ def fused_apply_mrope_thd(
 
     Args:
         t: Input tensor with shape ``[total_tokens, heads, head_dim]``.
-        cu_seqlens: Global cumulative sequence lengths for the packed batch.
+        cu_seqlens: Global cumulative sequence lengths for the padded packed
+            layout used to partition ``t``. With context parallelism, every
+            sub-sequence length must be divisible by ``cp_size``.
         freqs: Raw mRoPE frequencies with shape ``[3, 1, total_seqlen, rotary_dim / 2]``.
         mrope_section: Temporal, height, and width channel sections.
         interleaved_mrope: Use Qwen3.5-VL stride-3 T/H/W layout when True.

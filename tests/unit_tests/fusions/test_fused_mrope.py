@@ -827,7 +827,11 @@ def test_apply_rotary_pos_emb_thd_fused_dispatch_does_not_read_cuda_scalars(monk
     def unexpected_item(_tensor):
         raise AssertionError("fused raw THD mRoPE dispatch should not call Tensor.item()")
 
+    def unexpected_tolist(_tensor):
+        raise AssertionError("fused raw THD mRoPE dispatch should not call Tensor.tolist()")
+
     monkeypatch.setattr(torch.Tensor, "item", unexpected_item)
+    monkeypatch.setattr(torch.Tensor, "tolist", unexpected_tolist)
     out = apply_rotary_pos_emb(
         t, freqs, config, cu_seqlens, cp_group=FakeCPGroup(), max_seqlen=max_seqlen
     )
@@ -1369,29 +1373,3 @@ def test_fused_mrope_thd_matches_unfused_real_shapes(interleaved_mrope):
     ref.backward(grad)
     out.backward(grad)
     torch.testing.assert_close(t_ref.grad.float(), t_fused.grad.float(), **tols)
-
-
-def test_thd_unavailable_reason_rejects_non_cp_divisible_subsequence():
-    # Per-sequence CP divisibility: total length is divisible by cp_size but an
-    # individual packed sub-sequence is not. The fused THD launch path
-    # (apply_rotary_pos_emb -> fused_apply_mrope_thd) must reject this so it falls
-    # back to the unfused path (which splits per-sequence correctly), instead of
-    # silently computing wrong CP token indices.
-    cp_size = 2
-    # sub-sequence lengths 10 and 14 -> both even (OK); 9 and 15 -> total 24 even
-    # but each odd (must be rejected).
-    cu_seqlens = torch.tensor([0, 9, 24], dtype=torch.int32, device="cuda")
-    local_tokens = 24 // cp_size
-    t = torch.randn(local_tokens, 3, 20, dtype=torch.bfloat16, device="cuda")
-    freqs = torch.randn(3, 1, 24, 8, dtype=torch.float32, device="cuda")
-    reason = get_fused_mrope_thd_unavailable_reason(
-        t, cu_seqlens, freqs, rotary_interleaved=False, cp_size=cp_size, cp_rank=0
-    )
-    assert reason is not None and "sub-sequence" in reason, reason
-
-    # Control: all sub-sequences divisible by cp_size -> launchable (reason None).
-    cu_ok = torch.tensor([0, 10, 24], dtype=torch.int32, device="cuda")
-    reason_ok = get_fused_mrope_thd_unavailable_reason(
-        t, cu_ok, freqs, rotary_interleaved=False, cp_size=cp_size, cp_rank=0
-    )
-    assert reason_ok is None, reason_ok
