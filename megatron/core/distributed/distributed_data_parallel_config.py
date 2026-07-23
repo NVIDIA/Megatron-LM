@@ -249,6 +249,12 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    hfsdp_param_gather_overlap: bool = False
+    """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
+    communication domains. DP-Inner gathers are prefetched one FSDP unit ahead and
+    DP-Outer gathers two units ahead. Only effective with ``outer_dp_sharding_strategy='optim'``.
+    """
+
     @property
     def param_sync_via_bucket_group(self) -> bool:
         """Whether DP parameter synchronization is dispatched through DDP bucket groups.
