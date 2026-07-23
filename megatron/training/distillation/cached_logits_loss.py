@@ -34,12 +34,12 @@ Assumptions
   ordering matches.
 * The current CP size may differ from the teacher run for CP-agnostic shards,
   provided the full sequence length is divisible by ``2 * context_parallel_size``.
-* The current ``micro_batch_size``, ``data_parallel_size`` and
-  ``global_batch_size`` may each differ from the teacher run, restricted to
-  integer multiples (in either direction) of the saved value.  The loader
-  builds a :class:`~megatron.training.distillation.utils.LogprobsReshardPlan`
-  that maps each load microbatch to one or a few contiguous slices of saved
-  monoliths.
+* The current ``micro_batch_size`` and ``global_batch_size`` may each differ
+  from the teacher run when they are integer multiples (in either direction)
+  of the saved value.  ``data_parallel_size`` may change to any size compatible
+  with the saved and current global batches.  The loader builds a
+  :class:`~megatron.training.distillation.utils.LogprobsReshardPlan` that maps
+  each load microbatch to one or a few contiguous slices of saved monoliths.
 * Teacher log-probs were saved by ``LogitsSaverHooks`` with payload
   ``format_version >= 2``.  Older ``format_version == 1`` tars are read by
   :class:`LegacyTeacherTarDataset` (selected automatically by
@@ -144,12 +144,7 @@ class StudentLogitsCapture:
         global _ACTIVE_STUDENT_LOGITS_CAPTURE
         _ACTIVE_STUDENT_LOGITS_CAPTURE = self
 
-    def _capture_logits(
-        self,
-        module: torch.nn.Module,
-        input: Any,
-        output: Any,
-    ) -> None:
+    def _capture_logits(self, module: torch.nn.Module, input: Any, output: Any) -> None:
         if not module.training:
             return
         # NOTE: Assumes main head runs after MTP layers, overwriting this value prior to pop().
@@ -196,9 +191,10 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     to map (load iteration, microbatch step, current DP rank) → saved
     (iteration, DP rank, row range) tuples.
 
-    Supports flexible MBS / DP / GBS at load time, restricted to integer
-    multiples in either direction.  See :class:`LogprobsReshardPlan`
-    for the exact restriction.
+    Supports flexible MBS / DP / GBS at load time.  MBS and GBS are restricted
+    to integer multiples in either direction; DP may change to any size
+    compatible with both global batches.  See :class:`LogprobsReshardPlan`
+    for the exact restrictions.
 
     Tars and their inner members are named by the **global sample range**
     they cover (``dp{d}__{start}-{end}.tar``, ``{start}-{end}.pt.zst``)
@@ -276,8 +272,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             )
         if self._remote_logprobs and self._msc_prefetch_depth > 0:
             print_rank_last(
-                f"Teacher logits remote tar prefetch: {self._msc_prefetch_depth} "
-                "shard(s) ahead"
+                f"Teacher logits remote tar prefetch: {self._msc_prefetch_depth} " "shard(s) ahead"
             )
 
         p = self._plan
@@ -303,7 +298,8 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     def _build_plan(cls, meta: Dict[str, Any], *, dp_size: int) -> LogprobsReshardPlan:
         saver = meta.get("saver", {})
         missing = [
-            field for field in ("mbs_save", "dp_size_save", "gbs_save", "format_version")
+            field
+            for field in ("mbs_save", "dp_size_save", "gbs_save", "format_version")
             if field not in saver
         ]
         if missing:
@@ -373,9 +369,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         return i_save, values, indices
 
     def _iter_entries_parallel(
-        self,
-        pool: concurrent.futures.ThreadPoolExecutor,
-        entries: Iterator[Any],
+        self, pool: concurrent.futures.ThreadPoolExecutor, entries: Iterator[Any]
     ) -> Iterator[Any]:
         """Yield decoded entries using a decode thread pool.
 
@@ -411,15 +405,11 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             yield decoded
 
     def _iter_decoded_entries(
-        self,
-        pool: Optional[concurrent.futures.ThreadPoolExecutor],
-        url: str,
+        self, pool: Optional[concurrent.futures.ThreadPoolExecutor], url: str
     ) -> Iterator[Any]:
         """Yield decoded iteration payloads from one tar URL."""
         entries = v2_iter_logprobs_tar_entries(
-            url,
-            start_sample=self._save_sample_start,
-            expected_hash=self._expected_hash,
+            url, start_sample=self._save_sample_start, expected_hash=self._expected_hash
         )
         if pool is None:
             for entry in entries:
@@ -503,9 +493,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     # ------------------------------------------------------------------
 
     def _slice_cp_sequences(
-        self,
-        values_list: List[torch.Tensor],
-        indices_list: List[torch.Tensor],
+        self, values_list: List[torch.Tensor], indices_list: List[torch.Tensor]
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Extract this CP rank's zigzag sequence slice from full-CP tensors."""
         if self.cp_size <= 1:
@@ -559,8 +547,8 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                         f"dp_rank={src.d_save}, got {entry[0]}."
                     )
                 _, v_mon, i_mon = entry
-                slices_v.append(v_mon[:, src.row_start:src.row_end])
-                slices_i.append(i_mon[:, src.row_start:src.row_end])
+                slices_v.append(v_mon[:, src.row_start : src.row_end])
+                slices_i.append(i_mon[:, src.row_start : src.row_end])
 
             # The saver guarantees a single uniform K across all saved
             # microbatches / iterations (= effective_k), so the slices
@@ -593,14 +581,10 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             i_load = self.start_iteration
             while True:
                 try:
-                    values_list, indices_list = self._build_load_iteration(
-                        i_load, cache, streams
-                    )
+                    values_list, indices_list = self._build_load_iteration(i_load, cache, streams)
                 except StopIteration:
                     return
-                values_list, indices_list = self._slice_cp_sequences(
-                    values_list, indices_list
-                )
+                values_list, indices_list = self._slice_cp_sequences(values_list, indices_list)
                 yield i_load, values_list, indices_list
                 i_load += 1
 
@@ -617,8 +601,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 yield from run(None, prefetcher)
             else:
                 with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self._decode_threads,
-                    thread_name_prefix="teacher-decode",
+                    max_workers=self._decode_threads, thread_name_prefix="teacher-decode"
                 ) as pool:
                     yield from run(pool, prefetcher)
 
@@ -631,9 +614,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 class LegacyTeacherTarDataset(TeacherTarDataset):
     """Read v1 (list-of-microbatches) cached-logits tars.
 
-    Preserves the pre-v2 behavior verbatim: per-tar-member iteration,
-    DP-only resharding via microbatch stride / interleave, and
-    list-shaped decoded payloads.  Selected automatically by
+    Preserves the v1 per-tar-member iteration and list-shaped decoded payloads
+    while supporting DP-only resharding between any sizes compatible with the
+    unchanged MBS and GBS.  Selected automatically by
     :func:`make_teacher_tar_dataset` when the on-disk ``_meta.json`` has
     ``format_version`` missing or ``< 2``.
 
@@ -719,69 +702,69 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
                 "enable GBS resharding."
             )
 
-        # v1 DP remapping (microbatch-stride based; unchanged from pre-v2).
-        self._source_dp_ranks, self._sub_rank, self._dp_ratio, dp_size_saved = (
-            self._compute_dp_remapping(logprobs_dir, dp_rank, dp_size)
+        # Map each current-rank microbatch to the saved rank and local
+        # microbatch slot that holds the same global samples.
+        (self._source_dp_ranks, self._microbatch_sources, self._num_mb_save, dp_size_saved) = (
+            self._compute_dp_remapping(
+                logprobs_dir,
+                dp_rank,
+                dp_size,
+                int(args.micro_batch_size),
+                int(args.global_batch_size),
+            )
         )
-        if len(self._source_dp_ranks) > 1:
+        if dp_size_saved != dp_size:
             print_rank_last(
-                f"DP downscaling (v1): dp_rank {dp_rank} loads from saved dp_ranks "
+                f"DP resharding (v1): dp_rank {dp_rank} loads from saved dp_ranks "
                 f"{self._source_dp_ranks} (saved_dp_size {dp_size_saved}, "
                 f"current_dp_size {dp_size})"
             )
-        elif self._dp_ratio > 1:
-            print_rank_last(
-                f"DP upscaling (v1): dp_rank {dp_rank} -> mapped_dp_rank "
-                f"{self._source_dp_ranks[0]} (sub_rank {self._sub_rank}, "
-                f"saved_dp_size {dp_size_saved}, current_dp_size {dp_size})"
-            )
 
     # ------------------------------------------------------------------
-    #  v1 DP remapping (microbatch-stride based)
+    #  v1 DP remapping
     # ------------------------------------------------------------------
 
     @staticmethod
     def _compute_dp_remapping(
-        logprobs_dir: str,
-        dp_rank: int,
-        dp_size: int,
-    ) -> Tuple[List[int], int, int, int]:
-        """Compute the DP rank remapping based on the saved DP world size.
+        logprobs_dir: str, dp_rank: int, dp_size: int, micro_batch_size: int, global_batch_size: int
+    ) -> Tuple[List[int], List[Tuple[int, int]], int, int]:
+        """Map current-rank microbatches to ``(saved_rank, saved_mb)`` pairs.
 
-        Returns ``(source_dp_ranks, sub_rank, dp_ratio, dp_size_saved)``.
+        Returns ``(source_dp_ranks, microbatch_sources, num_mb_save,
+        dp_size_saved)``.
         Microbatches are distributed round-robin across DP ranks, so saved
         rank *d* holds microbatch indices ``d, d + dp_save, d + 2·dp_save,
-        ...``.  Upscaling (``dp_save < dp_load``) strides through one
-        saved file; downscaling (``dp_save > dp_load``) interleaves
-        microbatches from multiple saved files.
+        ...``.  Mapping through the global microbatch index supports arbitrary
+        saved/current DP ratios without special stride/interleave cases.
         """
         dp_size_saved = detect_saved_dp_size(logprobs_dir)
 
         if dp_size_saved is None:
-            return [dp_rank], 0, 1, dp_size
-        if dp_size_saved == dp_size:
-            return [dp_rank], 0, 1, dp_size_saved
-
-        if dp_size_saved < dp_size:
-            if dp_size % dp_size_saved != 0:
-                raise ValueError(
-                    f"Current DP size ({dp_size}) is not an exact multiple of "
-                    f"saved DP size ({dp_size_saved})."
-                )
-            dp_ratio = dp_size // dp_size_saved
-            mapped_dp_rank = dp_rank % dp_size_saved
-            sub_rank = dp_rank // dp_size_saved
-            return [mapped_dp_rank], sub_rank, dp_ratio, dp_size_saved
-
-        if dp_size_saved % dp_size != 0:
+            dp_size_saved = dp_size
+        if global_batch_size % micro_batch_size != 0:
             raise ValueError(
-                f"Saved DP size ({dp_size_saved}) is not an exact multiple of "
-                f"current DP size ({dp_size})."
+                f"v1 cached-logits global batch size ({global_batch_size}) must "
+                f"be divisible by micro batch size ({micro_batch_size})."
             )
-        num_sources = dp_size_saved // dp_size
-        source_dp_ranks = [dp_rank + i * dp_size for i in range(num_sources)]
-        dp_ratio = dp_size / dp_size_saved
-        return source_dp_ranks, 0, dp_ratio, dp_size_saved
+        num_global_mb = global_batch_size // micro_batch_size
+        if num_global_mb % dp_size_saved != 0:
+            raise ValueError(
+                f"v1 cached-logits global microbatch count ({num_global_mb}) must "
+                f"be divisible by saved DP size ({dp_size_saved})."
+            )
+        if num_global_mb % dp_size != 0:
+            raise ValueError(
+                f"v1 cached-logits global microbatch count ({num_global_mb}) must "
+                f"be divisible by current DP size ({dp_size})."
+            )
+
+        num_mb_load = num_global_mb // dp_size
+        microbatch_sources = []
+        for m_load in range(num_mb_load):
+            global_mb = m_load * dp_size + dp_rank
+            microbatch_sources.append((global_mb % dp_size_saved, global_mb // dp_size_saved))
+        source_dp_ranks = sorted({d_save for d_save, _ in microbatch_sources})
+        return (source_dp_ranks, microbatch_sources, num_global_mb // dp_size_saved, dp_size_saved)
 
     # ------------------------------------------------------------------
     #  v1 decode + tar walking
@@ -807,41 +790,6 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
                 new_urls.append(url)
         return new_urls
 
-    def _slice_microbatches(
-        self,
-        values_list: List[torch.Tensor],
-        indices_list: List[torch.Tensor],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Return this rank's DP microbatch slice and CP sequence slice."""
-        if self._dp_ratio > 1:
-            num_mb = len(values_list)
-            if num_mb % self._dp_ratio != 0:
-                raise ValueError(
-                    f"Saved microbatch count ({num_mb}) is not divisible by "
-                    f"DP ratio ({self._dp_ratio}). Cannot evenly split "
-                    f"microbatches across remapped DP ranks."
-                )
-            values_list = values_list[self._sub_rank :: self._dp_ratio]
-            indices_list = indices_list[self._sub_rank :: self._dp_ratio]
-
-        return self._slice_cp_sequences(values_list, indices_list)
-
-    @staticmethod
-    def _interleave_microbatches(
-        all_values: List[List[torch.Tensor]],
-        all_indices: List[List[torch.Tensor]],
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Interleave microbatches from multiple source dp_ranks (downscaling)."""
-        num_sources = len(all_values)
-        num_mb = len(all_values[0])
-        merged_values: List[torch.Tensor] = []
-        merged_indices: List[torch.Tensor] = []
-        for mb_idx in range(num_mb):
-            for src_idx in range(num_sources):
-                merged_values.append(all_values[src_idx][mb_idx])
-                merged_indices.append(all_indices[src_idx][mb_idx])
-        return merged_values, merged_indices
-
     def _not_found_error(self) -> FileNotFoundError:
         dp_ranks = self._source_dp_ranks
         if len(dp_ranks) == 1:
@@ -857,14 +805,11 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         )
 
     def _shard_groups(
-        self,
-        processed: set,
-        prefetcher: TarShardPrefetcher,
+        self, processed: set, prefetcher: TarShardPrefetcher
     ) -> Iterator[Tuple[str, ...]]:
         while True:
             urls_per_src = [
-                self._discover_shards(processed, src_dp)
-                for src_dp in self._source_dp_ranks
+                self._discover_shards(processed, src_dp) for src_dp in self._source_dp_ranks
             ]
             if not all(urls_per_src):
                 if not processed:
@@ -876,14 +821,10 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
                 yield group
 
     def _iter_decoded_entries(
-        self,
-        pool: Optional[concurrent.futures.ThreadPoolExecutor],
-        url: str,
+        self, pool: Optional[concurrent.futures.ThreadPoolExecutor], url: str
     ):
         entries = iter_logprobs_tar_entries(
-            url,
-            start_iteration=self.start_iteration,
-            expected_hash=self._expected_hash,
+            url, start_iteration=self.start_iteration, expected_hash=self._expected_hash
         )
         if pool is None:
             for entry in entries:
@@ -891,42 +832,46 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         else:
             yield from self._iter_entries_parallel(pool, entries)
 
-    def _interleave_decoded_group(self, decoded_group):
-        all_values: List[List[torch.Tensor]] = []
-        all_indices: List[List[torch.Tensor]] = []
+    def _remap_decoded_group(self, decoded_group):
+        values_by_rank: Dict[int, List[torch.Tensor]] = {}
+        indices_by_rank: Dict[int, List[torch.Tensor]] = {}
         ref_iteration: Optional[int] = None
-        for decoded in decoded_group:
+        for d_save, decoded in zip(self._source_dp_ranks, decoded_group):
             iteration, vals, inds = decoded
             if ref_iteration is None:
                 ref_iteration = iteration
             elif iteration != ref_iteration:
                 raise RuntimeError(
                     f"Iteration mismatch across source dp_ranks during "
-                    f"downscaled DP loading: expected iteration "
+                    f"v1 DP resharding: expected iteration "
                     f"{ref_iteration} but got {iteration}."
                 )
-            all_values.append(vals)
-            all_indices.append(inds)
-        merged_values, merged_indices = self._interleave_microbatches(all_values, all_indices)
-        return ref_iteration, merged_values, merged_indices
+            if len(vals) != self._num_mb_save or len(inds) != self._num_mb_save:
+                raise RuntimeError(
+                    f"Saved dp_rank={d_save}, iteration={iteration} contains "
+                    f"{len(vals)} value and {len(inds)} index microbatches; "
+                    f"expected {self._num_mb_save}."
+                )
+            values_by_rank[d_save] = vals
+            indices_by_rank[d_save] = inds
 
-    def _iter_single_source_group(self, pool, url):
-        for iteration, values_list, indices_list in self._iter_decoded_entries(pool, url):
-            values_list, indices_list = self._slice_microbatches(values_list, indices_list)
-            yield iteration, values_list, indices_list
+        values_list = [
+            values_by_rank[d_save][m_save] for d_save, m_save in self._microbatch_sources
+        ]
+        indices_list = [
+            indices_by_rank[d_save][m_save] for d_save, m_save in self._microbatch_sources
+        ]
+        return ref_iteration, values_list, indices_list
 
-    def _iter_downscaled_group(self, pool, urls):
+    def _iter_remapped_group(self, pool, urls):
         decoded_iters = [self._iter_decoded_entries(pool, url) for url in urls]
         for decoded_group in zip(*decoded_iters):
-            iteration, values_list, indices_list = self._interleave_decoded_group(decoded_group)
+            iteration, values_list, indices_list = self._remap_decoded_group(decoded_group)
             values_list, indices_list = self._slice_cp_sequences(values_list, indices_list)
             yield iteration, values_list, indices_list
 
     def _iter_group(self, pool, group):
-        if len(self._source_dp_ranks) > 1:
-            yield from self._iter_downscaled_group(pool, group)
-        else:
-            yield from self._iter_single_source_group(pool, group[0])
+        yield from self._iter_remapped_group(pool, group)
 
     def __iter__(self):
         processed: set = set()
@@ -940,8 +885,7 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
                     yield from self._iter_group(None, group)
             else:
                 with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self._decode_threads,
-                    thread_name_prefix="teacher-decode",
+                    max_workers=self._decode_threads, thread_name_prefix="teacher-decode"
                 ) as pool:
                     for group in self._shard_groups(processed, prefetcher):
                         yield from self._iter_group(pool, group)
@@ -978,8 +922,10 @@ def make_teacher_tar_dataset(
     cls: type = TeacherTarDataset if fmt >= 2 else LegacyTeacherTarDataset
     return cls(
         logprobs_dir,
-        cp_rank, cp_size,
-        dp_rank, dp_size,
+        cp_rank,
+        cp_size,
+        dp_rank,
+        dp_size,
         start_iteration=start_iteration,
         decode_threads=decode_threads,
         decode_lookahead=decode_lookahead,
@@ -992,6 +938,7 @@ def make_teacher_tar_dataset(
 # ---------------------------------------------------------------------------
 #  Top-K KL divergence
 # ---------------------------------------------------------------------------
+
 
 def topk_kl_div(
     student_logits: torch.Tensor,
@@ -1033,17 +980,21 @@ def topk_kl_div(
     # ---- Add a "ghost" token containing sum of non-top-K probabilities to both student and teacher ----
     if add_ghost_token:
         eps = 1e-8
-        student_topk_logprobs_exp = student_topk_logprobs.exp() * mask  # don't sum duplicate indices if any
+        student_topk_logprobs_exp = (
+            student_topk_logprobs.exp() * mask
+        )  # don't sum duplicate indices if any
         student_topk_exp_sum = student_topk_logprobs_exp.sum(dim=-1, keepdim=True)
         if tp_size > 1:
             student_topk_exp_sum = dist_nn.functional.all_reduce(
                 student_topk_exp_sum, op=dist.ReduceOp.SUM, group=tp_group
             )
         student_residual = torch.log((1.0 - student_topk_exp_sum).clamp(min=eps))
-        teacher_residual = torch.log((1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps))
+        teacher_residual = torch.log(
+            (1.0 - teacher_topk_logprobs.exp().sum(dim=-1, keepdim=True)).clamp(min=eps)
+        )
         student_topk_logprobs = torch.cat([student_topk_logprobs, student_residual], dim=-1)
         teacher_topk_logprobs = torch.cat([teacher_topk_logprobs, teacher_residual], dim=-1)
-        mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank==0))], dim=-1)
+        mask = torch.cat([mask, mask.new_full((*mask.shape[:-1], 1), float(tp_rank == 0))], dim=-1)
 
     # ---- Sparse KL divergence (summed over top-K dimension) ----
     kl_div = teacher_topk_logprobs.exp() * (teacher_topk_logprobs - student_topk_logprobs)
@@ -1051,9 +1002,11 @@ def topk_kl_div(
 
     return kl_loss.transpose(0, 1).contiguous()  # [S, B] -> [B, S]
 
+
 # ---------------------------------------------------------------------------
 #  KD dataloading + loss class
 # ---------------------------------------------------------------------------
+
 
 class CachedLogitsKDLoss:
     """Offline knowledge-distillation loss backed by cached teacher top-K log-probs.
@@ -1149,11 +1102,7 @@ class CachedLogitsKDLoss:
         # Remote shard discovery uses a per-PP-stage collective, so keep the
         # iterable in the main training process (all last-PP ranks participate).
         loader = torch.utils.data.DataLoader(
-            dataset=dataset,
-            batch_size=None,
-            collate_fn=lambda x: x,
-            pin_memory=True,
-            num_workers=0,
+            dataset=dataset, batch_size=None, collate_fn=lambda x: x, pin_memory=True, num_workers=0
         )
         self._dataloader_iter = iter(loader)
 
@@ -1209,7 +1158,9 @@ class CachedLogitsKDLoss:
                     "Teacher logit shard for iteration %s is behind training "
                     "iteration %s (overlapping/duplicate shard in %s); skipping "
                     "to resync alignment.",
-                    self._loaded_iteration, iteration, self.logprobs_dir,
+                    self._loaded_iteration,
+                    iteration,
+                    self.logprobs_dir,
                 )
                 self._advance_iteration()
             if self._loaded_iteration != iteration:
@@ -1248,10 +1199,10 @@ class CachedLogitsKDLoss:
                 warnings.warn(
                     "CachedLogitsKDLoss: teacher logits sequence length "
                     f"({teacher_values.size(0)}) is longer than student sequence length "
-                    f"({student_logits.size(0)}); trimming teacher logits to match.",
+                    f"({student_logits.size(0)}); trimming teacher logits to match."
                 )
-            teacher_values = teacher_values[:student_logits.size(0)]
-            teacher_indices = teacher_indices[:student_logits.size(0)]
+            teacher_values = teacher_values[: student_logits.size(0)]
+            teacher_indices = teacher_indices[: student_logits.size(0)]
 
         # ---- compute loss ----
         return topk_kl_div(
@@ -1264,9 +1215,11 @@ class CachedLogitsKDLoss:
             add_ghost_token=True,
         )
 
+
 # ---------------------------------------------------------------------------
 #  Main callable wrapper to pass to Megatron LM training loop
 # ---------------------------------------------------------------------------
+
 
 class LossFuncCallable:
     def __init__(
@@ -1346,10 +1299,14 @@ class LossFuncCallable:
             if not self.ignore_errors:
                 raise
             # Don't fail the entire training process if KD loss fails
-            logger.warning(f">>>>>> KD LOSS FAILED — falling back to LM loss. {type(e).__name__}: {e} <<<<<<")
+            logger.warning(
+                f">>>>>> KD LOSS FAILED — falling back to LM loss. {type(e).__name__}: {e} <<<<<<"
+            )
             return loss_lm, num_tokens, report
 
-        report["logits distillation loss"] = torch.cat([loss_kd.clone().detach().view(1), num_tokens.view(1)])
+        report["logits distillation loss"] = torch.cat(
+            [loss_kd.clone().detach().view(1), num_tokens.view(1)]
+        )
 
         loss_total = (1 - self.alpha) * loss_lm + self.alpha * loss_kd
         report["total loss"] = torch.cat([loss_total.clone().detach().view(1), num_tokens.view(1)])
