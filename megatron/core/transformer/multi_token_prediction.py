@@ -497,9 +497,9 @@ class MTPLossLoggingHelper:
             if calculate_per_token_loss:
                 tracker["num_tokens"] = torch.zeros(num_layers, device=torch.cuda.current_device())
         else:
-            assert tracker.get("calculate_per_token_loss") == calculate_per_token_loss, (
-                "MTP loss tracker cannot mix per-token and microbatch-normalized logging modes."
-            )
+            assert (
+                tracker.get("calculate_per_token_loss") == calculate_per_token_loss
+            ), "MTP loss tracker cannot mix per-token and microbatch-normalized logging modes."
 
         if calculate_per_token_loss:
             tracker["loss_sums"][layer_number] += loss_sum.detach()
