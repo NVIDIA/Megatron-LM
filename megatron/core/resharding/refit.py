@@ -121,7 +121,7 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     when swap_model_weights is called multiple times with the same backend.
 
     Args:
-        backend: Backend name ("nccl", "gloo", or "nvshmem").
+        backend: Backend name ("nccl", "gloo", "nvshmem", or "nixl").
         group: Optional process group for NCCL backend.
     """
     if backend in _service_cache:

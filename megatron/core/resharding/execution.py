@@ -195,7 +195,8 @@ def execute_reshard_plan(
     logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
     torch.cuda.synchronize()
-    dist.barrier(group=group)
+    if service.requires_process_group_barrier:
+        dist.barrier(group=group)
 
     # Write back received buffers into their destination parameter slices.
     #

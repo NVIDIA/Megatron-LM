@@ -80,7 +80,7 @@ swap_model_weights(None, None, "nccl",
 | `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
-| `nixl` | GPU RDMA via NIXL (UCX), receiver-initiated READ | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
+| `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
 
 All backends detect same-rank (local) transfers via `task_id` and
 short-circuit them into direct `tensor.copy_()` instead of going
@@ -104,9 +104,10 @@ through the network stack.
 4. Each rank keeps only the ops where it is the sender or receiver.
 5. The plan is cached so repeated refits skip steps 1-4.
 
-Because planning is local and deterministic, the destination pool can **grow**
-(nodes added): all ranks re-gather over the new world and replay, and `task_id`s
-stay consistent as long as every rank agrees on `world_size` and iteration order.
+The deterministic schedule stays stable when a larger roster is supplied: existing
+transfers keep their `task_id`s and newly appended destination ranks receive new
+ones. Live process-group membership changes and their orchestration remain future
+work; this module does not currently add or remove ranks from a running group.
 
 ## MXFP8 Transform
 
@@ -156,11 +157,12 @@ attribute with the following groups:
 | File | Role |
 |------|------|
 | `refit.py` | Public API, caching, MXFP8 auto-detection |
-| `planner.py` | Centralized plan builder (metadata, LCM/block-interleaved planners) |
+| `planner.py` | Local deterministic plan builder (metadata, LCM/block-interleaved planners) |
 | `execution.py` | Plan executor (send/recv submission, writeback, format conversion) |
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |
 | `copy_services/nccl_copy_service.py` | NCCL backend |
 | `copy_services/gloo_copy_service.py` | Gloo backend |
+| `copy_services/nixl_copy_service.py` | NIXL/UCX backend |
 | `copy_services/nvshmem_copy_service.py` | NVSHMEM backend (delegates to `nvshmem_copy_service/`) |
 | `nvshmem_copy_service/` | Full NVSHMEM implementation (planning, memory, kernels, pipeline) |

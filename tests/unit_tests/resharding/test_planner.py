@@ -11,6 +11,7 @@ import math
 
 import pytest
 
+import megatron.core.resharding.planner as planner
 from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
     _finalize_dp_transfers,
@@ -436,3 +437,26 @@ class TestBuildPlanFromRosters:
         # The new rank added exactly one transfer with a fresh task_id.
         assert len(sends_after) == 3
         assert {(s, d) for _, s, d in sends_after} == {(0, 1), (0, 2), (0, 3)}
+
+
+def test_centralized_planner_compatibility_wrapper(monkeypatch):
+    """The previous public planner name warns and forwards every argument."""
+    sentinel = object()
+    forwarded = {}
+
+    def fake_local(src_module, dst_module, **kwargs):
+        forwarded["args"] = (src_module, dst_module)
+        forwarded["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(planner, "build_local_reshard_plan", fake_local)
+    with pytest.warns(DeprecationWarning, match="build_local_reshard_plan"):
+        result = planner.build_centralized_reshard_plan(
+            "src", "dst", num_experts=8, group="group", src_rank_offset=3, dst_rank_offset=7
+        )
+
+    assert result is sentinel
+    assert forwarded == {
+        "args": ("src", "dst"),
+        "kwargs": {"num_experts": 8, "group": "group", "src_rank_offset": 3, "dst_rank_offset": 7},
+    }

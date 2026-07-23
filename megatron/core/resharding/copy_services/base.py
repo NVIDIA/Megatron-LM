@@ -37,6 +37,11 @@ class CopyService(ABC):
     remote transfers simply ignore it.
     """
 
+    # Most torch.distributed backends retain the executor's historical
+    # process-group rendezvous after run(). Backends whose run() protocol already
+    # establishes completion across every participating peer can opt out.
+    requires_process_group_barrier = True
+
     def __init__(self, group=None):
         self.group = group
         # group.rank()/size() supports cross-cluster ProcessGroups where members

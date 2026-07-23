@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -406,9 +407,9 @@ def build_plan_from_rosters(
 ) -> ReshardPlan:
     """Replay the deterministic global schedule and keep only this rank's ops.
 
-    Pure and collective-free, so it can be re-run whenever the rosters change —
-    e.g. after a node is added and announces its metadata over NIXL — to rebuild
-    this rank's plan locally without touching the process group.
+    Pure and collective-free, so it can be tested or reused with preassembled
+    rosters without touching the process group. Live membership orchestration
+    is intentionally outside this module.
     """
     my_plan = ReshardPlan([], [])
     for (
@@ -453,7 +454,7 @@ def build_plan_from_rosters(
 def build_local_reshard_plan(
     src_module: torch.nn.Module,
     dst_module: torch.nn.Module,
-    num_experts: int = None,
+    num_experts: int | None = None,
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
@@ -466,9 +467,8 @@ def build_local_reshard_plan(
     metadata.
 
     The metadata gather (the one collective) and the plan build are split into
-    index_metadata_rosters + build_plan_from_rosters, so the build can also run
-    off rosters assembled another way — e.g. from a node that joined later and
-    announced itself over NIXL, rebuilding the plan without a process group.
+    index_metadata_rosters + build_plan_from_rosters, so the deterministic build
+    can also be tested against preassembled rosters without a process group.
 
     src_module/dst_module may be None for non-collocated ranks (destination-only,
     source-only, or idle). Each rank contributes metadata only for the models it
@@ -498,3 +498,27 @@ def build_local_reshard_plan(
     dst_param_metadata_by_rank, src_param_metadata = index_metadata_rosters(gathered_pairs)
     del gathered_pairs
     return build_plan_from_rosters(dst_param_metadata_by_rank, src_param_metadata, my_global_rank)
+
+
+def build_centralized_reshard_plan(
+    src_module: torch.nn.Module,
+    dst_module: torch.nn.Module,
+    num_experts: int | None = None,
+    group=None,
+    src_rank_offset: int = 0,
+    dst_rank_offset: int = 0,
+) -> ReshardPlan:
+    """Deprecated compatibility wrapper for :func:`build_local_reshard_plan`."""
+    warnings.warn(
+        "build_centralized_reshard_plan is deprecated; use build_local_reshard_plan instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return build_local_reshard_plan(
+        src_module,
+        dst_module,
+        num_experts=num_experts,
+        group=group,
+        src_rank_offset=src_rank_offset,
+        dst_rank_offset=dst_rank_offset,
+    )

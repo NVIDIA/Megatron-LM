@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
 import logging
@@ -44,22 +44,21 @@ class NixlCopyService(CopyService):
 
     Each rank runs a NIXL agent. To WRITE into a peer it needs that peer's agent
     metadata (connection info) plus a {task_id: (addr, len, dev)} map of the peer's
-    registered recv buffers. This peer table is built once and cached, either by a
-    torch all-gather handshake (the only collective) or — so membership can grow
-    without one — by update_membership installing an orchestrator-relayed roster
-    (see local_roster_entry). Buffers are registered locally, not exchanged.
+    registered recv buffers. A one-time torch all-gather builds and caches this
+    peer table. Buffers are registered locally, not exchanged.
 
     Every refit after that is pure NIXL and sender-driven: a receiver signals each
     source that its buffers are free ("ready"); the source waits, syncs its weights,
     and issues one WRITE per receiver, each carrying a "data" notification. Those two
     notifications order producer and consumer per refit, so there's no barrier and no
-    per-refit collective. Notifications are tagged with the membership epoch and a
-    per-refit sequence, so stale ones are ignored. Same-rank transfers skip NIXL and
-    copy directly.
+    per-refit collective. Notifications are tagged with a per-refit sequence, so stale
+    ones are ignored. Same-rank transfers skip NIXL and copy directly.
 
     Registered buffers are assumed address-stable across refits; if a recv address
     changes after setup, call clear_service_cache() to rebuild.
     """
+
+    requires_process_group_barrier = False
 
     def __init__(self, group=None, agent_name: Optional[str] = None):
         super().__init__(group=group)
@@ -68,7 +67,7 @@ class NixlCopyService(CopyService):
         self.group = group
 
         try:
-            from nixl._api import nixl_agent, nixl_agent_config
+            from nixl._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
         except ImportError as e:
             raise ImportError(
                 "NixlCopyService requires the 'nixl' package; install it or use "
@@ -80,6 +79,8 @@ class NixlCopyService(CopyService):
         # Name by group rank, which is unique across the (possibly cross-world)
         # group. dist.get_rank() would collide: separate worlds each have a rank 0.
         self.agent_name = agent_name or f"refit-nixl-rank-{self.rank}"
+        # This backend is intentionally UCX-only: refit moves CPU/CUDA tensors
+        # directly between ranks and does not use NIXL's storage-oriented plugins.
         self.agent = nixl_agent(self.agent_name, nixl_agent_config(backends=["UCX"]))
 
         self.send_ops: List[SendOp] = []
@@ -87,20 +88,17 @@ class NixlCopyService(CopyService):
         self._copy_stream = torch.cuda.Stream()
 
         # Peer table {group rank -> (agent_name, agent_metadata, recv_descs)},
-        # populated by the first run's handshake or by update_membership. A dict,
-        # not a list, so the rank set can grow when nodes are added.
+        # populated by the first run's handshake.
         self._remote_agent_names: Dict[int, str] = {}  # group rank -> agent name
         self._gathered: Optional[Dict[int, tuple]] = None
         self._recv_descs: Optional[Dict[int, _MemDesc]] = None
         # RDMA registrations, kept across refits; send and recv tracked separately
         # so a changing side doesn't re-pin the other.
         self._reg: Dict[str, tuple] = {}  # 'send'/'recv' -> (handle, signature)
-        # Notifications are tagged (kind, epoch, seq): epoch bumps on a membership
-        # change so stale notifs from the old roster are ignored; seq is the
-        # per-refit counter. _future_notifs buffers tags we're not draining yet.
-        self._epoch = 0
+        # Notifications are tagged (kind, seq). _future_notifs buffers tags for
+        # later refits that we're not draining yet.
         self._seq = 0
-        self._future_notifs: Dict[Tuple[str, int, int], int] = {}
+        self._future_notifs: Dict[Tuple[str, int], int] = {}
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
@@ -128,51 +126,16 @@ class NixlCopyService(CopyService):
 
     def _handshake(self, recv_descs: Dict[int, _MemDesc]) -> None:
         # Initial bootstrap over the torch group: share agent metadata and recv
-        # descriptors, connect to every peer, cache the peer table. This is the
-        # one torch collective; update_membership grows the table without it.
+        # descriptors, connect to every peer, and cache the peer table. This is
+        # NIXL's one torch collective.
         payload = (self.agent_name, self.agent.get_agent_metadata(), recv_descs)
         gathered: List[Optional[tuple]] = [None] * self.world_size
         dist.all_gather_object(gathered, payload, group=self.group)
-        roster = {rank: entry for rank, entry in enumerate(gathered) if entry is not None}
-        self.update_membership(roster, epoch=0)
-
-    def local_roster_entry(self, recv_items) -> tuple:
-        """Register this rank's recv buffers and return its roster entry
-        (agent_name, agent_metadata, recv_descs) for the orchestrator to
-        distribute. ``recv_items`` is an iterable of (task_id, tensor).
-
-        Registration must happen before the metadata is read: a peer can only
-        WRITE into these buffers if the metadata it holds already covers them.
-        """
-        items = list(recv_items)
-        self._register("recv", [t for _, t in items])
-        descs = {task_id: self._mem_desc(t) for task_id, t in items}
-        return (self.agent_name, self.agent.get_agent_metadata(), descs)
-
-    def update_membership(self, roster: Dict[int, tuple], epoch: int) -> None:
-        """Install a peer roster without a torch collective.
-
-        ``roster`` maps group rank -> (agent_name, agent_metadata, recv_descs) and
-        must include this rank. The orchestrator assembles it (relaying each node's
-        agent metadata and recv descriptors) when a node is added, and every rank
-        calls this at a refit boundary; a joining node uses it in place of the
-        initial handshake. New peers are connected via add_remote_agent.
-
-        ``epoch`` is the orchestrator's membership generation — a value all ranks
-        share for the same roster (not a local counter, since a joining node has
-        seen fewer changes). It tags notifications so any left over from a previous
-        roster are ignored, and must increase on every membership change.
-        """
-        if self._gathered is None:
-            self._gathered = {}
-        for rank, (name, metadata, _descs) in roster.items():
-            if rank != self.rank and rank not in self._remote_agent_names:
+        self._gathered = {rank: entry for rank, entry in enumerate(gathered) if entry is not None}
+        for rank, (name, metadata, _descs) in self._gathered.items():
+            if rank != self.rank:
                 self._remote_agent_names[rank] = self.agent.add_remote_agent(metadata) or name
-        self._gathered.update(roster)
-        self._recv_descs = roster[self.rank][2] if self.rank in roster else self._recv_descs
-        self._epoch = epoch
-        self._seq = 0
-        self._future_notifs.clear()
+        self._recv_descs = recv_descs
 
     def _do_local_copies(self) -> None:
         # Collocated (same-rank) transfers never hit the network.
@@ -188,6 +151,8 @@ class NixlCopyService(CopyService):
     def _plan_writes(self, remote_sends: List[SendOp]):
         # Group writes by destination agent: one WRITE per receiver pushes all its
         # regions at once, with local[i] landing in remote[i].
+        if self._gathered is None:
+            raise RuntimeError("NixlCopyService: handshake has not completed")
         by_dst: Dict[int, Tuple[List[torch.Tensor], List[_MemDesc]]] = {}
         for op in remote_sends:
             dst_entry = self._gathered.get(op.dest_rank)
@@ -204,21 +169,20 @@ class NixlCopyService(CopyService):
         return by_dst
 
     @staticmethod
-    def _notif(kind: str, epoch: int, seq: int) -> bytes:
-        return f"{kind}{epoch}.{seq}".encode()
+    def _notif(kind: str, seq: int) -> bytes:
+        return f"{kind}{seq}".encode()
 
     @staticmethod
-    def _parse_notif(m: bytes) -> Tuple[str, int, int]:
-        epoch, seq = m[1:].split(b".")
-        return chr(m[0]), int(epoch), int(seq)
+    def _parse_notif(m: bytes) -> Tuple[str, int]:
+        return chr(m[0]), int(m[1:])
 
     def _await_notifs(self, kind: str, expected: int, seq: int) -> None:
         # Wait for `expected` notifications of this kind ('R' ready / 'D' data)
-        # tagged with this (epoch, refit). Buffer any tagged otherwise — e.g. a
-        # data notif arriving while we're still collecting ready signals.
+        # tagged with this refit. Buffer any tagged otherwise — e.g. a data notif
+        # arriving while we're still collecting ready signals.
         if expected == 0:
             return
-        want = (kind, self._epoch, seq)
+        want = (kind, seq)
         got = self._future_notifs.pop(want, 0)
         while got < expected:
             for _agent, msgs in self.agent.get_new_notifs().items():
@@ -255,7 +219,7 @@ class NixlCopyService(CopyService):
 
         # Tell each source our destination buffers are free for this refit; this is
         # what orders a source's write after we've consumed the previous one.
-        ready = self._notif("R", self._epoch, seq)
+        ready = self._notif("R", seq)
         for src_rank in {op.src_rank for op in remote_recvs}:
             self.agent.send_notif(self._remote_agent_names[src_rank], ready)
 
@@ -265,7 +229,7 @@ class NixlCopyService(CopyService):
         if remote_sends:
             torch.cuda.current_stream().synchronize()
 
-        data = self._notif("D", self._epoch, seq)
+        data = self._notif("D", seq)
         handles = []
         for dst_rank, (local_tensors, remote_descs) in self._plan_writes(remote_sends).items():
             # local and remote are the same memory class (GPU->GPU for refit); the
@@ -280,15 +244,16 @@ class NixlCopyService(CopyService):
                 raise RuntimeError(f"NixlCopyService: WRITE to dst {dst_rank} failed to start")
             handles.append((dst_rank, handle))
 
-        # Wait for our own writes to land, then for every source writing into us.
+        # NIXL's asynchronous Python API exposes transfer completion through
+        # check_xfer_state(); the official examples poll it until DONE. Transfers
+        # progress in the backend, so yield the Python thread between checks.
         for dst_rank, handle in handles:
-            while True:
-                state = self.agent.check_xfer_state(handle)
-                if state == "DONE":
-                    break
-                if state == "ERR":
-                    raise RuntimeError(f"NixlCopyService: WRITE to dst {dst_rank} errored")
+            state = self.agent.check_xfer_state(handle)
+            while state not in ("DONE", "ERR"):
                 time.sleep(0)
+                state = self.agent.check_xfer_state(handle)
+            if state == "ERR":
+                raise RuntimeError(f"NixlCopyService: WRITE to dst {dst_rank} errored")
             self.agent.release_xfer_handle(handle)
         self._await_notifs("D", len({op.src_rank for op in remote_recvs}), seq)
 
