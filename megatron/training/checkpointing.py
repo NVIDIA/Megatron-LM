@@ -1301,7 +1301,7 @@ def generate_state_dict(
             )
         else:  # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
-            if args.use_megatron_fsdp_v2 and args.ckpt_format == "fsdp_dtensor":
+            if getattr(args, "use_megatron_fsdp_v2", False) and args.ckpt_format == "fsdp_dtensor":
                 propagate_chunk_metadata_to_state_dict(model[i], model_sd)
 
         state_dict[key] = model_sd
@@ -2145,7 +2145,7 @@ def load_checkpoint(
                     )
 
                 if (
-                    args.use_megatron_fsdp_v2
+                    getattr(args, "use_megatron_fsdp_v2", False)
                     and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
                 ):
                     raise RuntimeError(
@@ -2280,7 +2280,7 @@ def load_checkpoint(
         load_kwargs["sharded_state_dict"] = state_dict
 
     if (
-        args.use_megatron_fsdp_v2
+        getattr(args, "use_megatron_fsdp_v2", False)
         and ckpt_format == "torch_dist"
         and ckpt_type == CheckpointType.GLOBAL
     ):
@@ -2354,7 +2354,7 @@ def load_checkpoint(
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
 
-        if args.use_megatron_fsdp_v2:
+        if getattr(args, "use_megatron_fsdp_v2", False):
             sync_module_states_after_load(module)
 
     # Model.
