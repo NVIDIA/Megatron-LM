@@ -17,6 +17,9 @@ from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
 from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_fused_compressor import (
+    maybe_compress_thd_fused,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -1054,47 +1057,66 @@ class Compressor(MegatronModule):
         kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
         score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
 
-        if pre_grouped:
-            # Compressor-prep already groups rows as ``[g * ratio, (g + 1) * ratio)``.
-            kv_grouped = kv.reshape(total_comp, ratio, 1, -1)
-            score_grouped = score.reshape(total_comp, ratio, 1, -1)
-            local_pos = None
-        else:
-            # Build gather index: (total_comp, ratio). ``total_comp`` can be a
-            # static capacity for CUDA graph capture, so rows beyond the true
-            # ``cu_seqlens_compressed[-1]`` are mapped to a safe source row and left
-            # as tail padding by downstream index lowering.
-            row_idx = torch.arange(total_comp, device=device, dtype=cu_seqlens_compressed.dtype)
-            batch_ids = batch_of_row(cu_seqlens_compressed, total_q=total_comp)
-            valid_comp = row_idx < cu_seqlens_compressed[-1]
-            local_pos = row_idx - cu_seqlens_compressed[batch_ids]
-            local_pos = torch.where(valid_comp, local_pos, torch.zeros_like(local_pos))
-            # (total_comp, 1) + (1, ratio)  →  (total_comp, ratio)
-            base = cu_seqlens[batch_ids].unsqueeze(1) + local_pos.unsqueeze(1) * ratio
-            base = torch.where(valid_comp.unsqueeze(1), base, torch.zeros_like(base))
-            offsets = torch.arange(ratio, device=device, dtype=base.dtype).unsqueeze(0)
-            gather_idx = base + offsets  # (total_comp, ratio)
-
-            kv_grouped = kv[gather_idx]  # (total_comp, ratio, 1, coff * d)
-            score_grouped = score[gather_idx]
-
-        # APE: (ratio, coff * d) → broadcast (1, ratio, 1, coff * d).
-        score_grouped = score_grouped + self.ape.view(1, ratio, 1, -1)
-
-        if self.overlap:
-            if pre_grouped:
-                is_first = compressed_group_ids[:total_comp] == 0
-            else:
-                is_first = local_pos == 0  # (total_comp,)
-            kv_grouped = self._overlap_transform_thd(kv_grouped, is_first, fill_value=0)
-            score_grouped = self._overlap_transform_thd(
-                score_grouped, is_first, fill_value=float("-inf")
+        # Additive fused fast path (CuTe DSL, one kernel per direction) for the
+        # gather / overlap-window / softmax / weighted-sum region below. Returns None
+        # (-> keep the eager region) for any unsupported configuration; see
+        # csa_fused_compressor.py for the gating rules.
+        compressed_thd = None
+        if not pre_grouped:
+            compressed_thd = maybe_compress_thd_fused(
+                kv,
+                score,
+                self.ape,
+                cu_seqlens,
+                cu_seqlens_compressed,
+                total_comp,
+                ratio=ratio,
+                head_dim=self.head_dim,
+                coff=self.coff,
             )
 
-        # Batched softmax + weighted sum — single kernel for all entries.
-        # (total_comp, [2*]ratio, 1, [coff*]d)  →  (total_comp, 1, head_dim)
-        weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
-        compressed_thd = (kv_grouped * weights).sum(dim=1)
+        if compressed_thd is None:
+            if pre_grouped:
+                # Compressor-prep already groups rows as ``[g * ratio, (g + 1) * ratio)``.
+                kv_grouped = kv.reshape(total_comp, ratio, 1, -1)
+                score_grouped = score.reshape(total_comp, ratio, 1, -1)
+                local_pos = None
+            else:
+                # Build gather index: (total_comp, ratio). ``total_comp`` can be a
+                # static capacity for CUDA graph capture, so rows beyond the true
+                # ``cu_seqlens_compressed[-1]`` are mapped to a safe source row and left
+                # as tail padding by downstream index lowering.
+                row_idx = torch.arange(total_comp, device=device, dtype=cu_seqlens_compressed.dtype)
+                batch_ids = batch_of_row(cu_seqlens_compressed, total_q=total_comp)
+                valid_comp = row_idx < cu_seqlens_compressed[-1]
+                local_pos = row_idx - cu_seqlens_compressed[batch_ids]
+                local_pos = torch.where(valid_comp, local_pos, torch.zeros_like(local_pos))
+                # (total_comp, 1) + (1, ratio)  →  (total_comp, ratio)
+                base = cu_seqlens[batch_ids].unsqueeze(1) + local_pos.unsqueeze(1) * ratio
+                base = torch.where(valid_comp.unsqueeze(1), base, torch.zeros_like(base))
+                offsets = torch.arange(ratio, device=device, dtype=base.dtype).unsqueeze(0)
+                gather_idx = base + offsets  # (total_comp, ratio)
+
+                kv_grouped = kv[gather_idx]  # (total_comp, ratio, 1, coff * d)
+                score_grouped = score[gather_idx]
+
+            # APE: (ratio, coff * d) → broadcast (1, ratio, 1, coff * d).
+            score_grouped = score_grouped + self.ape.view(1, ratio, 1, -1)
+
+            if self.overlap:
+                if pre_grouped:
+                    is_first = compressed_group_ids[:total_comp] == 0
+                else:
+                    is_first = local_pos == 0  # (total_comp,)
+                kv_grouped = self._overlap_transform_thd(kv_grouped, is_first, fill_value=0)
+                score_grouped = self._overlap_transform_thd(
+                    score_grouped, is_first, fill_value=float("-inf")
+                )
+
+            # Batched softmax + weighted sum — single kernel for all entries.
+            # (total_comp, [2*]ratio, 1, [coff*]d)  →  (total_comp, 1, head_dim)
+            weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
+            compressed_thd = (kv_grouped * weights).sum(dim=1)
 
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
