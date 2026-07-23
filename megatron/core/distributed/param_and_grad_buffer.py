@@ -279,6 +279,13 @@ class _ParamAndGradBucketGroup:
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            def _prepare_mxfp8_param_for_gemm(param):
+                if not is_mxfp8tensor(param):
+                    return
+                quantizer = param._get_quantizer()
+                quantizer.set_usage(rowwise=True, columnwise=True)
+                quantizer.optimize_for_gemm = True
+
             for bucket in self.buckets:
                 is_bf16_weight_bucket = False
                 for param in bucket.params:
@@ -289,7 +296,9 @@ class _ParamAndGradBucketGroup:
                         break
                     param_start, param_end = bucket.param_to_index[param]
                     param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    param.data.copy_(param_slice.view(param.data.shape))
+                    _prepare_mxfp8_param_for_gemm(param)
+                    with torch.no_grad():
+                        param.copy_(param_slice.view(param.shape))
                 if is_bf16_weight_bucket:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
