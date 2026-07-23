@@ -45,7 +45,6 @@ class Utils:
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
-    store = None
 
     @staticmethod
     def initialize_distributed():
@@ -73,10 +72,16 @@ class Utils:
             # Use a PrefixStore to avoid accidental overrides of keys used by
             # different systems (e.g. RPC) in case the store is multi-tenant.
             store = PrefixStore("default_pg", store)
-            Utils.store = store
 
+            local_rank = Utils.rank % torch.cuda.device_count()
+            # Give the world PG a cpu:gloo backend alongside cuda:nccl so gloo
+            # subgroups can be built with split_group (mirrors _initialize_distributed).
             torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
+                backend='cpu:gloo,cuda:nccl',
+                world_size=Utils.world_size,
+                rank=Utils.rank,
+                store=store,
+                device_id=torch.device(f'cuda:{local_rank}'),
             )
 
             torch.distributed.barrier()
