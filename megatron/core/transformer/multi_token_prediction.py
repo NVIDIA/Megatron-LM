@@ -758,7 +758,7 @@ class MTPLossAutoScaler(torch.autograd.Function):
 
 
 def process_mtp_loss(
-    hidden_states: Tensor,
+    hidden_states: Union[Tensor, List[Tensor], tuple],
     labels: Tensor,
     loss_mask: Optional[Tensor],
     output_layer: Callable,
@@ -776,10 +776,12 @@ def process_mtp_loss(
     """Process Multi-Token Prediction (MTP) loss computation.
 
     This is a standalone function that handles MTP loss computation. It's used on the
-    post_process rank to split concatenated hidden states and compute MTP losses.
+    post_process rank to split concatenated hidden states and compute MTP losses. It also
+    accepts pre-split hidden states to avoid a redundant cat-then-chunk sequence.
 
     Args:
-        hidden_states (Tensor): Hidden states tensor (concatenated with MTP outputs).
+        hidden_states (Tensor or list[Tensor]): Hidden states tensor (concatenated with MTP
+            outputs), or already split ``[decoder, mtp_1, ...]`` tensors.
         labels (Tensor): Ground truth labels.
         loss_mask (Optional[Tensor]): Mask for loss computation. If None, uses all ones.
         output_layer (Callable): Output layer method to compute logits.
@@ -801,7 +803,16 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+    if isinstance(hidden_states, (list, tuple)):
+        hidden_states_list = hidden_states
+        expected_chunks = 1 + config.mtp_num_layers
+        if len(hidden_states_list) != expected_chunks:
+            raise ValueError(
+                f"MTP hidden state list must contain {expected_chunks} tensors, "
+                f"got {len(hidden_states_list)}."
+            )
+    else:
+        hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
     # When labels are not provided (e.g. RL training), derive them from input_ids by
@@ -1793,7 +1804,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
-    ) -> Tensor:
+        return_hidden_state_list: bool = False,
+    ) -> Union[Tensor, List[Tensor]]:
         """
         Perform the forward pass through all of the MTP modules.
 
@@ -1835,6 +1847,9 @@ class MultiTokenPredictionBlock(MegatronModule):
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list
             hidden_states_list.append(hidden_states)
+
+        if return_hidden_state_list:
+            return hidden_states_list
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
