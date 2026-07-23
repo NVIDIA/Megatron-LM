@@ -206,7 +206,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
 
         return tokens
 
-    def text_to_ids(self, text: str) -> List[int]:
+    def text_to_ids(self, text: str, add_special_tokens: bool = True) -> List[int]:
         """Converts text to list of ids."""
         tokens = self.tokenizer.encode(text, allowed_special="all")
         return tokens

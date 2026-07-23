@@ -26,9 +26,10 @@ from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.sft_dataset import IGNORE_INDEX, SFTDataset, SFTDatasetConfig
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -47,10 +48,12 @@ from megatron.core.utils import (
     get_batch_on_this_tp_rank,
     get_te_version,
     get_torch_version,
+    preprocess_sft_batch,
 )
 from megatron.training import (
     get_args,
     get_timers,
+    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -61,7 +64,6 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -101,7 +103,10 @@ def get_batch(data_iterator, vp_stage=None):
     config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size
+    tp_size = args.tensor_model_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
+    sp = args.sequence_parallel
+    max_seq_len = args.seq_length
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
@@ -123,6 +128,17 @@ def get_batch(data_iterator, vp_stage=None):
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
+        if is_sft:
+            batch = preprocess_sft_batch(
+                batch,
+                tp_rank=tp_rank,
+                cp_size=cp_size,
+                tp_size=tp_size,
+                sp=sp,
+                padding_token_id=get_tokenizer().pad,
+                padding_label_id=IGNORE_INDEX,
+                max_seq_len=max_seq_len,
+            )
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -375,34 +391,39 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         with open(args.per_dataset_sequences_path, "r") as f:
             sequences_per_dataset = json.load(f)
 
-    return GPTDatasetConfig(
-        random_seed=args.seed,
-        sequence_length=args.seq_length,
-        blend=blend,
-        blend_per_split=blend_per_split,
-        split=args.split,
-        multiple_validation_sets=args.multiple_validation_sets,
-        full_validation=args.full_validation,
-        num_dataset_builder_threads=args.num_dataset_builder_threads,
-        path_to_cache=args.data_cache_path,
-        mmap_bin_files=args.mmap_bin_files,
-        tokenizer=tokenizer,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-        object_storage_cache_path=args.object_storage_cache_path,
-        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
-        fast_cache_load=args.dataloader_fast_cache_load,
-        sequences_per_dataset=sequences_per_dataset,
-        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
-        context_parallel_size=args.context_parallel_size,
-        data_parallel_size=args.data_parallel_size,
-        sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
-        inter_document_masking=args.dataloader_inter_document_masking,
-    )
+    data_args = {
+        "random_seed": args.seed,
+        "sequence_length": args.seq_length,
+        "blend": blend,
+        "blend_per_split": blend_per_split,
+        "split": args.split,
+        "multiple_validation_sets": args.multiple_validation_sets,
+        "full_validation": args.full_validation,
+        "num_dataset_builder_threads": args.num_dataset_builder_threads,
+        "path_to_cache": args.data_cache_path,
+        "mmap_bin_files": args.mmap_bin_files,
+        "tokenizer": tokenizer,
+        "reset_position_ids": args.reset_position_ids,
+        "reset_attention_mask": args.reset_attention_mask,
+        "eod_mask_loss": args.eod_mask_loss,
+        "create_attention_mask": args.create_attention_mask_in_dataloader,
+        "object_storage_cache_path": args.object_storage_cache_path,
+        "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
+        "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
+        "fast_cache_load": args.dataloader_fast_cache_load,
+        "sequences_per_dataset": sequences_per_dataset,
+        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
+        "context_parallel_size": args.context_parallel_size,
+        "data_parallel_size": args.data_parallel_size,
+        "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
+        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "inter_document_masking": args.dataloader_inter_document_masking,
+    }
+
+    if args.sft:
+        return SFTDatasetConfig(**data_args)
+
+    return GPTDatasetConfig(**data_args)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):

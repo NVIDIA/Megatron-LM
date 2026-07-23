@@ -70,7 +70,7 @@ class ByteLevelTokenizer(MegatronTokenizerTextAbstract):
         """
         return self.ids_to_text(tokens)
 
-    def text_to_ids(self, text):
+    def text_to_ids(self, text, add_special_tokens=True):
         """
         Convert a text to a list of IDs.
         """

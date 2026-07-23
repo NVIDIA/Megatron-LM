@@ -62,7 +62,7 @@ class MegatronTokenizerTextAbstract(ABC):
         pass
 
     @abstractmethod
-    def text_to_ids(self, text: str) -> List[int]:
+    def text_to_ids(self, text: str, add_special_tokens: bool = True) -> List[int]:
         """
         Converts text to ids.
 

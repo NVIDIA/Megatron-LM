@@ -19,9 +19,9 @@ class NullTokenizer:
         self._eod_id = int(eod_id) if eod_id is not None else self._vocab_size - 1
         self._pad_id = int(pad_id)
 
-    def text_to_ids(self, text):
+    def text_to_ids(self, text, add_special_tokens=True):
         """Converts text to ids."""
-        return [int(x) for x in text.split(' ')]
+        return [ord(x) % self._vocab_size for x in text]
 
     def ids_to_text(self, ids):
         """Converts ids to text."""
