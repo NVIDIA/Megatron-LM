@@ -1340,8 +1340,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.batch_invariant_mode:
                 if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TORCH:
                     raise ValueError(
-                        "batch_invariant_mode requires "
-                        "inference_grouped_gemm_backend='torch'."
+                        "batch_invariant_mode requires " "inference_grouped_gemm_backend='torch'."
                     )
                 if (
                     self.expert_model_parallel_size > 1
@@ -2503,9 +2502,7 @@ class TransformerConfig(ModelParallelConfig):
                 assert not (
                     self.fp8 or self.fp4
                 ), "Batch-invariant MoE is bf16-only. Disable fp8/fp4 to use it."
-                assert not (
-                    self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep
-                ), (
+                assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
                     "Batch-invariant MoE requires the unfused permute/unpermute path so "
                     "top-k reductions use the fixed batch-invariant add tree."
                 )

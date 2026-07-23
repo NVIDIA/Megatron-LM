@@ -12,15 +12,15 @@ from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_decode_rows
 class BatchInvariantDecodeBuffers:
     """Per-slot persistent state for the buffered decode scan."""
 
-    x: torch.Tensor            # (max_batch + 1, chunk_size, nheads, headdim)
-    dt: torch.Tensor           # (max_batch + 1, chunk_size, nheads)
-    B: torch.Tensor            # (max_batch + 1, chunk_size, ngroups, dstate)
-    C: torch.Tensor            # (max_batch + 1, chunk_size, ngroups, dstate)
+    x: torch.Tensor  # (max_batch + 1, chunk_size, nheads, headdim)
+    dt: torch.Tensor  # (max_batch + 1, chunk_size, nheads)
+    B: torch.Tensor  # (max_batch + 1, chunk_size, ngroups, dstate)
+    C: torch.Tensor  # (max_batch + 1, chunk_size, ngroups, dstate)
     # Tokens buffered since the slot's last chunk boundary; doubles as the
     # write cursor for the next token.
     num_buffered: torch.Tensor  # (max_batch + 1,) int32
     # Per-entry target-row output, allocated once and sliced per step.
-    out: torch.Tensor          # (max_batch + 1, nheads, headdim)
+    out: torch.Tensor  # (max_batch + 1, nheads, headdim)
 
     @classmethod
     def allocate(
@@ -87,13 +87,9 @@ class BatchInvariantDecodeBuffers:
         # from reaching the target row through tensor-core operations.
         offsets = torch.arange(chunk_size, device=x.device, dtype=torch.long)
         safe_tail_lens = torch.clamp(tail_lens, min=1)
-        safe_tail_offsets = torch.minimum(
-            offsets.unsqueeze(0), (safe_tail_lens - 1).unsqueeze(1)
-        )
+        safe_tail_offsets = torch.minimum(offsets.unsqueeze(0), (safe_tail_lens - 1).unsqueeze(1))
         safe_tail_starts = torch.where(
-            tail_lens > 0,
-            seq_ends - tail_lens,
-            torch.clamp(seq_ends - 1, min=0),
+            tail_lens > 0, seq_ends - tail_lens, torch.clamp(seq_ends - 1, min=0)
         )
         tail_token_idx = (safe_tail_starts.unsqueeze(1) + safe_tail_offsets).clamp(
             max=x.shape[0] - 1
@@ -113,10 +109,10 @@ class BatchInvariantDecodeBuffers:
 
 def batch_invariant_decode_buffered_scan(
     buffers: BatchInvariantDecodeBuffers,
-    x: torch.Tensor,           # (decode_batch_size, 1, nheads, headdim)
-    dt: torch.Tensor,          # (decode_batch_size, 1, nheads)
-    B: torch.Tensor,           # (decode_batch_size, 1, ngroups, dstate)
-    C: torch.Tensor,           # (decode_batch_size, 1, ngroups, dstate)
+    x: torch.Tensor,  # (decode_batch_size, 1, nheads, headdim)
+    dt: torch.Tensor,  # (decode_batch_size, 1, nheads)
+    B: torch.Tensor,  # (decode_batch_size, 1, ngroups, dstate)
+    C: torch.Tensor,  # (decode_batch_size, 1, ngroups, dstate)
     A: torch.Tensor,
     D: torch.Tensor,
     dt_bias: torch.Tensor,

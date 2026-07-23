@@ -334,14 +334,8 @@ def _chunk_scan_fwd_kernel(
         out_ptr += pid_c * stride_out_seqlen + pid_h * stride_out_head
         # All M-lanes alias the same output row (row stride 0); the mask
         # keeps only lane tr, so one lane stores per column.
-        out_ptrs = out_ptr + (
-            offs_out_m[:, None] * 0 + offs_out_n[None, :] * stride_out_hdim
-        )
-        tl.store(
-            out_ptrs,
-            acc,
-            mask=(offs_out_m[:, None] == tr) & (offs_out_n[None, :] < hdim),
-        )
+        out_ptrs = out_ptr + (offs_out_m[:, None] * 0 + offs_out_n[None, :] * stride_out_hdim)
+        tl.store(out_ptrs, acc, mask=(offs_out_m[:, None] == tr) & (offs_out_n[None, :] < hdim))
     else:
         out_ptr += chunk_seqlen_start * stride_out_seqlen + pid_h * stride_out_head
         out_ptrs = out_ptr + (
@@ -372,9 +366,9 @@ def _chunk_scan_fwd(
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
     has_target_rows = target_rows is not None
-    assert (chunk_starts is not None) == has_target_rows, (
-        "target_rows and chunk_starts must be provided together"
-    )
+    assert (
+        chunk_starts is not None
+    ) == has_target_rows, "target_rows and chunk_starts must be provided together"
     if has_target_rows:
         chunk_offsets = chunk_starts
     else:

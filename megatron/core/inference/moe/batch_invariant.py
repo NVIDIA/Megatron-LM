@@ -35,10 +35,7 @@ def enabled() -> bool:
 def grouped_mm(x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
     """Batch-invariant BF16 grouped GEMM used by inference fused MoE."""
     return grouped_gemm_batch_invariant(
-        x_bf16,
-        weight,
-        offs=offs.to(torch.int32),
-        m_total=x_bf16.shape[0],
+        x_bf16, weight, offs=offs.to(torch.int32), m_total=x_bf16.shape[0]
     )
 
 
@@ -93,9 +90,7 @@ def unpermute_tokens_in_expert_order(
     _, hidden_dim = expert_output.shape
     num_tokens, num_local_experts = inverse_map.shape
     if out is None:
-        out = torch.empty(
-            num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device
-        )
+        out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
 
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_H))

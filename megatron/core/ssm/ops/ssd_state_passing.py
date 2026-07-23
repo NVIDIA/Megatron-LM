@@ -89,9 +89,7 @@ def _state_passing_fwd_kernel(
         else:
             dst_flag = True
         # Unflagged destination chunks have no chunk state.
-        new_states = tl.load(states_ptrs, mask=(offs_m < dim) & dst_flag, other=0.0).to(
-            tl.float32
-        )
+        new_states = tl.load(states_ptrs, mask=(offs_m < dim) & dst_flag, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
         if HAS_DST_STATES:
@@ -154,9 +152,9 @@ def _state_passing_fwd(
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     seqlen = seq_idx.shape[-1]
     has_dst = dst_states is not None
-    assert (dst_indices is not None) == has_dst and (dst_flags is not None) == has_dst, (
-        "dst_states, dst_indices, and dst_flags must be provided together"
-    )
+    assert (dst_indices is not None) == has_dst and (
+        dst_flags is not None
+    ) == has_dst, "dst_states, dst_indices, and dst_flags must be provided together"
     if not has_dst:
         out_dtype = states.dtype if out_dtype is None else out_dtype
         out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
@@ -173,9 +171,7 @@ def _state_passing_fwd(
     if has_dst:
         assert dst_states.shape[1] == nheads and dst_states.shape[2] == dim
     dst_strides = (
-        (dst_states.stride(0), dst_states.stride(1), dst_states.stride(2))
-        if has_dst
-        else (0, 0, 0)
+        (dst_states.stride(0), dst_states.stride(1), dst_states.stride(2)) if has_dst else (0, 0, 0)
     )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), nheads)

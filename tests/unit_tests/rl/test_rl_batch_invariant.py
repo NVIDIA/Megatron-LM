@@ -43,9 +43,7 @@ def test_moe_unpermute_batch_invariant_inverse_map_rank_tree():
     ).expand(4, hidden)
     sorted_indices = torch.zeros(4, device="cuda", dtype=torch.int64)
     routing_map = torch.ones(1, 4, device="cuda", dtype=torch.bool)
-    inverse_map = torch.tensor(
-        [[[0, 1, 2, 3]], [[0, 1, 2, 3]]], device="cuda", dtype=torch.int64
-    )
+    inverse_map = torch.tensor([[[0, 1, 2, 3]], [[0, 1, 2, 3]]], device="cuda", dtype=torch.int64)
 
     parallel_state.set_expert_model_parallel_world_size(2)
     try:
@@ -110,7 +108,7 @@ def test_moe_batch_invariant_permute_unpermute_cuda_graph_non_padded():
         parallel_state.set_expert_model_parallel_world_size(None)
 
     torch.testing.assert_close(graph_out, expected, rtol=0.0, atol=0.0)
-    reference = (
-        tokens.float() * probs[:, 0, None] + tokens.float() * probs[:, 2, None]
-    ).to(tokens.dtype)
+    reference = (tokens.float() * probs[:, 0, None] + tokens.float() * probs[:, 2, None]).to(
+        tokens.dtype
+    )
     torch.testing.assert_close(graph_out, reference, rtol=0.0, atol=0.0)
