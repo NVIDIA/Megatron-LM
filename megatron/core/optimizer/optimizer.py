@@ -786,7 +786,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # The reuse_grad_buf (fp8-param-gather) path stages master params into the DDP
+            # param buffer, which only DistributedOptimizer owns. Optimizers without it
+            # (e.g. LayerWiseDistributedOptimizer's Float16 base opts) must instead copy
+            # master -> model params so the forward sees the update.
+            if self.config.reuse_grad_buf_for_mxfp8_param_ag and hasattr(
+                self, "_copy_main_params_to_param_buffer"
+            ):
                 # In the case of overlap_param_gather,
                 # copy is manually called in the training loop
                 if not self.config.overlap_param_gather:
