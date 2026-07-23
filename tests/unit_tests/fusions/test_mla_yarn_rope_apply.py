@@ -302,39 +302,32 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_rotary_bwd_q_block_h2_loads_before_stores() -> None:
-    """Exercise the cross-warp in-place conversion without the autotuner."""
+def test_rotary_bwd_q_single_warp_configs_are_deterministic() -> None:
+    """Exercise every production config as an exact in-place layout permutation."""
     import triton
 
     num_heads = 32
     q_dim = 128
     emb_dim = 64
-    max_seqlen = 128
-    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
-    freqs, mscale = yarn_rope(max_seqlen, 0)
-    cos = (torch.cos(freqs) * mscale).to(torch.bfloat16)
-    sin = (torch.sin(freqs) * mscale).to(torch.bfloat16)
+    total_seqlen = 128
     generator = torch.Generator(device="cuda").manual_seed(617)
     before = torch.randn(
-        (128, num_heads, q_dim + emb_dim), dtype=torch.bfloat16, device="cuda", generator=generator
+        (total_seqlen, num_heads, q_dim + emb_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
     )
+    cos = torch.ones((total_seqlen, 1, 1, emb_dim), dtype=torch.bfloat16, device="cuda")
+    sin = torch.zeros_like(cos)
 
     torch_reference = before.clone()
-    rotary = before[..., q_dim:].float()
     half = emb_dim // 2
-    cos_float = cos.view(max_seqlen, 1, emb_dim).float()
-    sin_float = sin.view(max_seqlen, 1, emb_dim).float()
-    left, right = rotary[..., :half], rotary[..., half:]
-    x_1 = left * cos_float[..., :half] + right * sin_float[..., half:]
-    x_2 = -left * sin_float[..., :half] + right * cos_float[..., half:]
-    converted = torch.empty_like(rotary)
-    converted[..., 0::2] = x_1
-    converted[..., 1::2] = x_2
-    torch_reference[..., q_dim:] = converted.to(before.dtype)
+    torch_reference[..., q_dim::2] = before[..., q_dim : q_dim + half]
+    torch_reference[..., q_dim + 1 :: 2] = before[..., q_dim + half :]
 
-    def launch(block_h: int) -> torch.Tensor:
+    def launch(block_h: int, num_warps: int, num_stages: int) -> torch.Tensor:
         result = before.clone()
-        rotary_bwd_q_kernel.fn[(result.shape[0], triton.cdiv(num_heads, block_h))](
+        rotary_bwd_q_kernel.fn[(total_seqlen, triton.cdiv(num_heads, block_h))](
             result,
             cos,
             sin,
@@ -349,21 +342,17 @@ def test_rotary_bwd_q_block_h2_loads_before_stores() -> None:
             0,
             1,
             BLOCK_H=block_h,
-            num_warps=4,
-            num_stages=3,
+            num_warps=num_warps,
+            num_stages=num_stages,
         )
         return result
 
-    expected = launch(block_h=1)
-    torch.testing.assert_close(
-        expected.float(), torch_reference.float(), **dtype_tols(before.dtype)
-    )
-    for _ in range(100):
-        actual = launch(block_h=2)
-        assert torch.equal(actual, expected)
-        torch.testing.assert_close(
-            actual.float(), torch_reference.float(), **dtype_tols(before.dtype)
-        )
+    for config in rotary_bwd_q_kernel.configs:
+        assert config.num_warps == 1, "In-place backward layout conversion must be single-warp"
+        block_h = config.kwargs["BLOCK_H"]
+        for _ in range(100):
+            actual = launch(block_h, config.num_warps, config.num_stages)
+            assert torch.equal(actual, torch_reference)
 
 
 @pytest.mark.experimental
