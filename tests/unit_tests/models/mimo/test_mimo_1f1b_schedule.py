@@ -148,29 +148,28 @@ def create_all_embedding_groups(grids):
     """Create embedding PGs for all grids upfront.
 
     dist.new_group is a collective — ALL ranks must call it, even non-members.
-    We create all embedding groups in a consistent order across all ranks to
-    avoid hangs from asymmetric new_group calls.
+    Enumerate every PP subgroup from each grid so all ranks create the same
+    deduplicated sequence of embedding groups. Looking only at ``grid.get_pg("pp")``
+    would expose the caller's local subgroup and make different ranks issue
+    different ``new_group`` calls.
 
     Args:
         grids: List of all HyperCommGrids that need embedding groups.
     """
     for grid in grids:
-        pp_group = grid.get_pg("pp")
-        if not pp_group:
-            continue
+        for pp_ranks in grid.get_rank_enum("pp"):
+            pp_ranks = sorted(pp_ranks)
+            cache_key = tuple(pp_ranks)
 
-        pp_ranks = sorted(dist.get_process_group_ranks(pp_group))
-        cache_key = tuple(pp_ranks)
-
-        if cache_key not in _embedding_pg_cache:
-            pos_embd_ranks = [pp_ranks[0]]
-            embd_ranks = [pp_ranks[0]]
-            if pp_ranks[-1] != pp_ranks[0]:
-                embd_ranks.append(pp_ranks[-1])
-            _embedding_pg_cache[cache_key] = (
-                dist.new_group(ranks=pos_embd_ranks),
-                dist.new_group(ranks=embd_ranks),
-            )
+            if cache_key not in _embedding_pg_cache:
+                pos_embd_ranks = [pp_ranks[0]]
+                embd_ranks = [pp_ranks[0]]
+                if pp_ranks[-1] != pp_ranks[0]:
+                    embd_ranks.append(pp_ranks[-1])
+                _embedding_pg_cache[cache_key] = (
+                    dist.new_group(ranks=pos_embd_ranks),
+                    dist.new_group(ranks=embd_ranks),
+                )
 
 
 def add_embedding_groups(pg_collection, is_language_model=False):
@@ -246,6 +245,7 @@ def get_language_model_spec(
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+    cp_size = pg_collection.cp.size() if pg_collection.cp is not None else 1
 
     pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
     extra_kwargs = {}
@@ -269,6 +269,7 @@ def get_language_model_spec(
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='native',
         calculate_per_token_loss=per_token_loss,
+        context_parallel_size=cp_size,
         **extra_kwargs,
     )
     return ModuleSpec(
@@ -454,7 +455,7 @@ def get_mimo_model(
         module_to_grid_map=module_to_grid_map,
     )
 
-    mimo_model = MimoModel(mimo_config)
+    mimo_model = MimoModel(mimo_config, cp_group=language_pg.cp, tp_group=language_pg.tp)
     mimo_model.to(torch.device("cuda"))
     if bf16:
         mimo_model.to(torch.bfloat16)
@@ -577,6 +578,7 @@ def run_mimo_1f1b_test(
     llm_pp,
     llm_dp,
     llm_offset,
+    llm_cp=1,
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
@@ -603,7 +605,7 @@ def run_mimo_1f1b_test(
     encoder_grid = create_hypercomm_grid(
         offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
     )
-    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=1, pp=llm_pp, dp=llm_dp)
+    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=llm_cp, pp=llm_pp, dp=llm_dp)
 
     # Create all embedding PGs upfront — dist.new_group is a collective that
     # requires ALL ranks to participate, so we must create them before any
@@ -749,12 +751,17 @@ def run_mimo_1f1b_test(
         assert (
             grad_norm is not None and grad_norm > 0
         ), f"Expected positive grad norm, got {grad_norm}"
+        assert torch.isfinite(
+            torch.as_tensor(grad_norm)
+        ).all(), f"Expected finite grad norm, got {grad_norm}"
 
         # Verify results on last LLM stage
         if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
             assert len(losses) > 0, "Expected losses on last LLM stage"
             for loss_dict in losses:
                 assert 'loss_reduced' in loss_dict
+                loss = torch.as_tensor(loss_dict['loss_reduced'])
+                assert torch.isfinite(loss).all(), f"Expected finite loss, got {loss}"
 
         return losses
     finally:
@@ -873,11 +880,17 @@ class TestMimo1F1BSchedule:
             num_microbatches=4,
         )
 
-    def test_fan_in_dp4_to_dp1_llm_tp2_pp2_8gpu(self):
-        """Fan-in 4→1: Encoder DP=4 → LLM TP=2 PP=2 DP=1, on 8 GPUs.
+    @pytest.mark.parametrize(
+        "llm_tp,llm_cp,hidden_size",
+        [(2, 1, 256), (1, 2, 128)],
+        ids=["tp2-cp1", "tp1-cp2"],
+    )
+    def test_fan_in_dp4_to_dp1_llm_pp2_8gpu(self, llm_tp, llm_cp, hidden_size):
+        """Fan-in 4→1: Encoder DP=4 → LLM PP=2 DP=1 with TP or CP.
 
         High fan-in ratio. Each encoder rank processes MBS=1, bridge concatenates
-        4 × [img_seq, H] → [4*img_seq, H]. LLM has both TP and PP.
+        4 × [img_seq, H] → [4*img_seq, H]. The CP2 case exercises destination
+        CP gradient reconstruction in steady-state and cooldown backward paths.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -887,11 +900,12 @@ class TestMimo1F1BSchedule:
             encoder_pp=1,
             encoder_dp=4,
             encoder_offset=0,
-            llm_tp=2,
+            llm_tp=llm_tp,
+            llm_cp=llm_cp,
             llm_pp=2,
             llm_dp=1,
             llm_offset=4,
-            hidden_size=256,
+            hidden_size=hidden_size,
             num_layers=2,
             vocab_size=1000,
             seq_length=64,
