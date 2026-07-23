@@ -104,10 +104,6 @@ try:
 except ImportError:
     HAVE_PSUTIL = False
 
-# Named module logger so these messages pass their own INFO level gate and propagate to the
-# root handler regardless of the root logger's level (which defaults to WARNING). Without a
-# named logger, bare logger.info(...) calls below log directly to the root logger and are
-# dropped whenever the root level is WARNING.
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
