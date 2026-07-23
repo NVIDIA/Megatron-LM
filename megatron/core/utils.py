@@ -1008,8 +1008,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # TP + FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = tensor._local_tensor
 
@@ -1025,7 +1028,7 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1034,6 +1037,11 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
@@ -1069,16 +1077,20 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     dp_size = get_pg_size(dp_cp_group)
     dp_replica_id = get_pg_rank(dp_cp_group)
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = get_full_tensor_if_necessary(tensor)
+        # Add FSDP sharding rank offsets.
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1087,10 +1099,19 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def get_full_tensor_if_necessary(tensor):
-    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    """
+    Captures an edge case where devices out-number elements in a DTensor,
+    for instance when generating a ShardedTensor. Replicate the DTensor
+    on all ranks to avoid empty DTensors on any rank.
+    """
     need_full_tensor = False
     for i in range(tensor.device_mesh.ndim):
         if (
