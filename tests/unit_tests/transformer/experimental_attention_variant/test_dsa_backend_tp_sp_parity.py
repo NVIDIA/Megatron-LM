@@ -681,3 +681,112 @@ def test_packed_cp_tp2_sequence_parallel_shared_skip_backend_matches_unfused_ref
     finally:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_indexer_loss_tracker_grows_for_hybrid_mtp_layer_numbers():
+    """Hybrid MTP layers can have a layer number beyond the nominal layer count."""
+    DSAIndexerLossLoggingHelper.tracker = {}
+    try:
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=torch.tensor(2.0, device="cuda"),
+            layer_number=7,
+            num_layers=5,
+        )
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=torch.tensor(3.0, device="cuda"),
+            layer_number=9,
+            num_layers=5,
+        )
+
+        values = DSAIndexerLossLoggingHelper.tracker["values"]
+        assert values.shape == (9,)
+        torch.testing.assert_close(values[6], torch.tensor(2.0, device="cuda"))
+        torch.testing.assert_close(values[8], torch.tensor(3.0, device="cuda"))
+    finally:
+        DSAIndexerLossLoggingHelper.tracker = {}
+
+
+def test_clean_indexer_loss_tracker_preserves_group_identity_when_requested():
+    original_tracker = DSAIndexerLossLoggingHelper.tracker
+    reduce_group, avg_group = object(), object()
+    DSAIndexerLossLoggingHelper.tracker = {
+        "values": torch.ones(2),
+        "reduce_group": reduce_group,
+        "avg_group": avg_group,
+    }
+    try:
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
+
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        assert torch.count_nonzero(tracker["values"]) == 0
+        assert tracker["reduce_group"] is reduce_group
+        assert tracker["avg_group"] is avg_group
+
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        assert tracker["reduce_group"] is None
+        assert tracker["avg_group"] is None
+    finally:
+        DSAIndexerLossLoggingHelper.tracker = original_tracker
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_indexer_metrics_average_only_ratio4_layers(monkeypatch: pytest.MonkeyPatch):
+    """Window and compressed-only layers must not dilute the indexer-loss average."""
+    DSAIndexerLossLoggingHelper.tracker = {
+        "values": torch.tensor([0.0, 3.0, 0.0, 0.0, 0.0], device="cuda")
+    }
+    monkeypatch.setattr(DSAIndexerLossLoggingHelper, "reduce_loss_in_tracker", lambda **_: None)
+    total_loss_dict = {}
+    try:
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=0.5,
+            iteration=1,
+            writer=None,
+            pg_collection=object(),
+            total_loss_dict=total_loss_dict,
+            num_layers=5,
+            csa_compress_ratios=[0, 4, 128, 0, 0],
+        )
+
+        torch.testing.assert_close(
+            total_loss_dict["indexer loss"], torch.tensor(1.5, device="cuda")
+        )
+    finally:
+        DSAIndexerLossLoggingHelper.tracker = {}
+
+
+def test_indexer_metrics_reduce_across_pipeline_rank_without_indexer():
+    """Every pipeline rank must join indexer loss reduction, even without a local indexer."""
+    if Utils.world_size < 2:
+        pytest.skip("Cross-pipeline indexer reduction requires at least two distributed ranks")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+    DSAIndexerLossLoggingHelper.tracker = {}
+    try:
+        num_layers = 5
+        if parallel_state.get_pipeline_model_parallel_rank() == 0:
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=torch.tensor(3.0, device="cuda"), layer_number=2, num_layers=num_layers
+            )
+
+        total_loss_dict = {}
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=0.5,
+            iteration=1,
+            writer=None,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['pp', 'dp']
+            ),
+            total_loss_dict=total_loss_dict,
+            num_layers=num_layers,
+            csa_compress_ratios=[0, 4, 128, 0, 0],
+        )
+
+        torch.testing.assert_close(
+            total_loss_dict["indexer loss"], torch.tensor(1.5, device="cuda")
+        )
+        assert torch.count_nonzero(DSAIndexerLossLoggingHelper.tracker["values"]) == 0
+    finally:
+        DSAIndexerLossLoggingHelper.tracker = {}
+        Utils.destroy_model_parallel()

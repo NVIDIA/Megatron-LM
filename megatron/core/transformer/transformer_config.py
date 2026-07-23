@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import logging
 import math
 import warnings
@@ -24,6 +25,7 @@ from megatron.core.transformer.enums import (
     CudaGraphModule,
     CudaGraphScope,
     InferenceCudaGraphScope,
+    LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -217,7 +219,7 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu."""
+    is quick_gelu or SwiGLU (MoE only)."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -281,11 +283,16 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = (
+        None
+    )
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
+
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks."""
 
     ####################
     # DSA
@@ -332,6 +339,27 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    ####################
+    # Compressed sparse attention
+    ####################
+    csa_window_size: int = 128
+    """Sliding window size for compressed sparse attention."""
+
+    csa_compress_ratios: Optional[List[int]] = None
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
+
+    csa_compress_rotary_base: float = 40000.0
+    """RoPE base for compressed KV positions in compressed sparse attention."""
+
+    csa_dense_mode: bool = False
+    """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
+    disabled."""
+
+    apply_dsa_kernel_fusion: bool = False
+    """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
+    indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``
+    with CuTe-DSL support. When False, falls back to unfused PyTorch implementations."""
 
     ####################
     # linear attention
@@ -536,7 +564,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+             "shared_experts", "gdn_norm_out", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -546,7 +574,11 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
+            enable_hyper_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", and "mhc" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -810,6 +842,15 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    moe_n_hash_layers: int = 0
+    """Number of leading transformer layers that use hash-based MoE routing.
+    Layers with ``layer_number <= moe_n_hash_layers`` select experts from a
+    token-to-expert lookup table instead of learned top-k routing."""
+
+    actual_vocab_size: Optional[int] = None
+    """Vocabulary size of the token-to-expert lookup table.
+    Required when ``moe_n_hash_layers > 0``."""
+
     use_grouped_gemm_for_dense_mlp: bool = False
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
     ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
@@ -864,6 +905,13 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
+
+    moe_hybridep_pad_uneven_dispatch_inputs: bool = False
+    """Pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
+    Enable when local HybridEP input token counts can differ across ranks, for example
+    with dynamically packed THD inputs. Leave disabled when dispatcher inputs are
+    already padded to equal token counts.
+    """
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -1043,6 +1091,17 @@ class TransformerConfig(ModelParallelConfig):
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
 
+    create_attention_mask_in_dataloader: bool = True
+    """Whether data loaders create and pass an explicit attention mask."""
+
+    thd_max_packed_sequences: int = field(
+        default=32, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
+    )
+    """Static THD sequence capacity, including an optional dummy padding sequence."""
+
+    cuda_graph_dynamic_microbatches: bool = False
+    """Capture enough TE graph slots for varying packed-microbatch counts."""
+
     inference_cuda_graph_scope: Optional[InferenceCudaGraphScope] = field(
         default=None,
         metadata={
@@ -1073,6 +1132,42 @@ class TransformerConfig(ModelParallelConfig):
     migrated to cuda_graph_modules in __post_init__. Will be removed in a future release.
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
+
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    use_fused_mhc: bool = False
+    """Use fused kernels for mHC operations when supported.
+
+    Backend selection is operation-specific, with native torch fallbacks that
+    preserve the same public behavior when Triton or cuTile is unavailable.
+    """
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
+
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
 
     ####################
     # miscellaneous
@@ -1325,10 +1420,43 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if (
+            self.experimental_attention_variant == "dsv4_hybrid"
+            and self.hybrid_context_parallel
+        ):
+            raise ValueError(
+                "DSv4 Hybrid does not support dynamic per-microbatch context parallelism; "
+                "use a static context_parallel_size."
+            )
+
+        if self.context_parallel_size > 1:
+            if self.experimental_attention_variant == "dsv4_hybrid":
+                if self.sequence_packing_scheduler is None:
+                    raise ValueError(
+                        "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+                    )
+                if self.cp_partition_mode != "contiguous":
+                    raise ValueError(
+                        "DSv4 Hybrid with CP requires cp_partition_mode='contiguous'."
+                    )
+            elif self.cp_partition_mode != "zigzag":
+                raise ValueError(
+                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
+                )
+
         if self.experimental_attention_variant == "gated_delta_net":
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear gated_delta_net."
+
+            if self.pad_packed_seq_alignment is not None:
+                assert self.pad_packed_seq_by_appending_dummy_seq, (
+                    "gated_delta_net with pad_packed_seq_alignment requires "
+                    "pad_packed_seq_by_appending_dummy_seq."
+                )
 
             # Check required parameters
             assert (
@@ -1377,6 +1505,101 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+        elif self.experimental_attention_variant == "dsv4_hybrid":
+            assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
+            assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
+            mtp_layers = self.mtp_num_layers or 0
+            expected_len = self.num_layers + mtp_layers
+            # A HybridModel MTP depth may contain more than one hybrid layer, while
+            # mtp_num_layers counts depths. The per-layer ratio list therefore has a minimum,
+            # rather than an exact, length here; HybridModel argument normalization checks its
+            # exact pattern-derived length before constructing this config.
+            assert len(self.csa_compress_ratios) >= expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must be at least "
+                f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
+            )
+            assert all(
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+            ), "csa_compress_ratios must be 0, 4, or 128"
+            assert (
+                self.tensor_model_parallel_size == 1
+            ), "DSv4 Hybrid Attention only supports TP size 1."
+            assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
+            self.hetereogenous_dist_checkpoint = True
+
+            if self.apply_dsa_kernel_fusion:
+                assert (
+                    torch.cuda.is_available()
+                ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
+                sm = torch.cuda.get_device_capability()
+                assert sm[0] >= 9, (
+                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
+                    f"but current device has compute capability {sm[0]}.{sm[1]}."
+                )
+                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if (
+                    sm[0] == 9
+                    and uses_ratio4_indexer
+                    and indexer_loss_enabled
+                    and not self.dsa_indexer_use_sparse_loss
+                ):
+                    raise ValueError(
+                        "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
+                        "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
+                        "this path. Use sparse indexer loss or disable DSA kernel fusion."
+                    )
+
+                flash_mla_available = True
+                try:
+                    from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+                except ImportError:
+                    flash_mla_available = False
+
+                cudnn_dsa_available = True
+                try:
+                    from cudnn import DSA  # noqa: F401
+                except ImportError:
+                    cudnn_dsa_available = False
+
+                if not flash_mla_available or not cudnn_dsa_available:
+                    missing = []
+                    if not flash_mla_available:
+                        missing.append(
+                            "flash_mla (install from "
+                            "https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
+                        )
+                    if not cudnn_dsa_available:
+                        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
+                    raise ValueError(
+                        f"apply_dsa_kernel_fusion requires fused DSA kernels, but the "
+                        f"following packages are not available: {', '.join(missing)}. "
+                        f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
+                        f"PyTorch fallback."
+                    )
+
+                if self.context_parallel_size > 1 and uses_ratio4_indexer:
+                    required_wrappers = [DSA.indexer_forward_wrapper]
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        required_wrappers.extend(
+                            [
+                                DSA.dense_indexer_score_recompute_wrapper,
+                                DSA.dense_attn_score_recompute_wrapper,
+                                DSA.dense_indexer_backward_wrapper,
+                            ]
+                        )
+                    missing_offsets = [
+                        wrapper.__name__
+                        for wrapper in required_wrappers
+                        if "q_causal_offsets" not in inspect.signature(wrapper).parameters
+                    ]
+                    if missing_offsets:
+                        raise ValueError(
+                            "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
+                            "with q_causal_offsets support; missing from: "
+                            f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
+                            "build or disable DSA kernel fusion."
+                        )
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1755,6 +1978,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1825,6 +2049,53 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for "mhc" in recompute_modules
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "'mhc' is in recompute_modules."
+                )
+            if self.fine_grained_activation_offloading:
+                raise NotImplementedError(
+                    "'mhc' in recompute_modules + fine_grained_activation_offloading is "
+                    "not yet supported. The mHC recompute hook currently fires before "
+                    "the offloading backward chunk is initialized, causing tensor_pop "
+                    "on a None chunk. Disable one of them."
+                )
+
+        if (
+            self.enable_hyper_connections
+            and not self.fine_grained_activation_offloading
+            and self.cuda_graph_impl != "transformer_engine"
+            and not self.external_cuda_graph
+            and not (
+                self.recompute_granularity == "selective"
+                and "mhc" in self.recompute_modules
+            )
+        ):
+            warnings.warn(
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
+            )
+
+        if self.use_fused_mhc and not self.enable_hyper_connections:
+            raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
 
         if self.fine_grained_activation_offloading:
             assert (
@@ -2143,6 +2414,33 @@ class TransformerConfig(ModelParallelConfig):
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
+        if (
+            self.activation_func_clamp_value is not None
+            and self.activation_func == F.silu
+            and self.gated_linear_unit
+        ):
+            if (
+                not math.isfinite(self.activation_func_clamp_value)
+                or self.activation_func_clamp_value <= 0
+            ):
+                raise ValueError(
+                    "activation_func_clamp_value for SwiGLU must be finite and greater than zero."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError(
+                    "activation_func_clamp_value for SwiGLU is only supported with MoE."
+                )
+            if self.glu_linear_offset != 0.0:
+                raise ValueError(
+                    "glu_linear_offset must be zero when activation_func_clamp_value "
+                    "is set for SwiGLU."
+                )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "use_te_activation_func must be False "
+                    "when activation_func_clamp_value is not None for SwiGLU"
+                )
+
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
                 warnings.warn(
@@ -2270,6 +2568,37 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
+            )
+
+        if self.moe_n_hash_layers > 0:
+            assert (
+                self.actual_vocab_size is not None and self.actual_vocab_size > 0
+            ), "actual_vocab_size must be positive when moe_n_hash_layers > 0."
+            assert (
+                self.num_moe_experts is not None
+            ), "num_moe_experts must be set when moe_n_hash_layers > 0."
+            if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
+                assert self.pipeline_model_parallel_layout is not None, (
+                    "pipeline_model_parallel_layout must be set when using hash MoE "
+                    "layers with pipeline parallelism (PP > 1)."
+                )
+                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
+                    "All hash MoE layers must currently share the virtual pipeline stage "
+                    "that owns the embedding. The embedding stage has "
+                    f"{n_decoders_with_embedding} decoder layers, but "
+                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                )
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm does not support hash MoE layers yet."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Hash MoE initialized with a placeholder round-robin token-to-expert table. "
+                "Load a trained table from a checkpoint or provide a workload-aware "
+                "initialization before training.",
             )
 
         if self.num_moe_experts and self.fp8:
@@ -2429,6 +2758,22 @@ class TransformerConfig(ModelParallelConfig):
             "local",
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+        if (
+            self.cuda_graph_impl == "transformer_engine"
+            and self.recompute_granularity == "selective"
+            and "mhc" in self.recompute_modules
+        ):
+            raise NotImplementedError(
+                "'mhc' in recompute_modules is not supported with "
+                "cuda_graph_impl='transformer_engine'. TE CUDA graph replay bypasses "
+                "the per-forward mHC recompute manager. Remove 'mhc' from "
+                "recompute_modules when using TE CUDA graphs."
+            )
+        if self.cuda_graph_impl != "transformer_engine":
+            assert not self.cuda_graph_dynamic_microbatches, (
+                "cuda_graph_dynamic_microbatches is only supported with "
+                "cuda_graph_impl=transformer_engine."
+            )
 
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl
@@ -2829,6 +3174,65 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
 
+        if (
+            self.cuda_graph_impl == "transformer_engine"
+            and self.sequence_packing_scheduler is not None
+        ):
+            assert self.pad_packed_seq_alignment is not None, (
+                "THD CUDA Graph requires pad_packed_seq_alignment to be set."
+            )
+            assert (
+                self.pad_packed_seq_alignment == "max"
+                or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
+            ), (
+                "THD CUDA Graph requires pad_packed_seq_alignment='max' or an alignment "
+                "equal to max_seqlen_per_dp_cp_rank "
+                f"({self.max_seqlen_per_dp_cp_rank}), got "
+                f"{self.pad_packed_seq_alignment}."
+            )
+            if (
+                self.cuda_graph_impl == "transformer_engine"
+                and self.num_moe_experts is not None
+                and self.sequence_parallel
+                and self.tensor_model_parallel_size > 1
+            ):
+                raise ValueError(
+                    "THD Transformer Engine CUDA graphs with MoE do not yet support "
+                    "tensor_parallel_size > 1 with sequence_parallel: runtime "
+                    "padding_mask/input_ids remain at the full CP-local length while "
+                    "router activations are TP-scattered."
+                )
+
+        if self.sequence_packing_scheduler is not None:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "THD sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
+
+            self.variable_seq_lengths = True
+            assert self.num_moe_experts is None or self.moe_token_dispatcher_type in (
+                "alltoall",
+                "flex",
+            ), (
+                "sequence_packing only supports moe_token_dispatcher_type in "
+                "('alltoall', 'flex'), "
+                f"got '{self.moe_token_dispatcher_type}'"
+            )
+
+            supported_schedulers = ['dp_balanced']
+            if self.sequence_packing_scheduler not in supported_schedulers:
+                raise ValueError(
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
+
 
 @dataclass
 class MLATransformerConfig(TransformerConfig):
@@ -2845,10 +3249,12 @@ class MLATransformerConfig(TransformerConfig):
     """Rank of Query tensor's low rank representation."""
 
     kv_lora_rank: int = 512
-    """Rank of Key and Value tensors' low rank representation."""
+    """Rank of Key and Value tensors' low rank representation.
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_head_dim: int = 128
-    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim"""
+    """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
+       This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
     qk_pos_emb_head_dim: int = 64
     """Dimension of the position embedding in the QK projection."""
@@ -2886,6 +3292,12 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    o_groups: int = 8
+    """Number of groups for grouped low-rank output projection (wo_a)."""
+
+    o_lora_rank: int = 1024
+    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
        This is only for the dynamic inference backend and requires that 
@@ -2898,11 +3310,40 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+        if (
+            self.multi_latent_attention
+            and self.apply_rope_fusion
+            and self.rope_type != "yarn"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")
+
+        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            assert (
+                not self.mla_down_proj_fusion
+            ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+            assert self.q_lora_rank is not None, "DSv4 hybrid mode requires q_lora_rank."
+            assert self.o_groups > 0, "DSv4 hybrid mode requires o_groups to be positive."
+            assert self.o_lora_rank > 0, "DSv4 hybrid mode requires o_lora_rank to be positive."
+            assert (
+                self.num_attention_heads * self.v_head_dim
+            ) % self.o_groups == 0, (
+                "num_attention_heads * v_head_dim must be divisible by o_groups."
+            )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                "v_head_dim and qk_pos_emb_head_dim",
+            )
+            derived = self.v_head_dim - self.qk_pos_emb_head_dim
+            assert derived > 0, "v_head_dim must be greater than qk_pos_emb_head_dim."
+            self.qk_head_dim = derived
+            self.kv_lora_rank = derived
 
         if self.cache_mla_latents:
             assert (

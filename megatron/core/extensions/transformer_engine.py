@@ -1748,11 +1748,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
-        # total_tokens and seq_idx are only for Mamba and should not be forwarded to TE attention.
-        # tokens_per_sample is only for MoE sequence-level aux loss reshaping.
+        # These fields are MCore-only and should not be forwarded to TE attention.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
+        self.kept_packed_seq_params.discard("cp_partition_mode")
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
@@ -2006,12 +2006,23 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group_for_te = None
 
             if is_te_min_version("2.14.0"):
-                extra_kwargs["single_grouped_weight"] = getattr(
-                    config, "moe_single_grouped_weight", False
-                )
-                extra_kwargs["single_grouped_bias"] = getattr(
-                    config, "moe_single_grouped_bias", False
-                )
+                # Some TE 2.14 builds predate these keyword arguments. Cache the
+                # installed constructor signature instead of relying on the version alone.
+                global _TE_GROUPED_LINEAR_INIT_PARAMS
+                try:
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS
+                except NameError:
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS = set(
+                        inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+                    )
+                if "single_grouped_weight" in grouped_linear_init_params:
+                    extra_kwargs["single_grouped_weight"] = getattr(
+                        config, "moe_single_grouped_weight", False
+                    )
+                if "single_grouped_bias" in grouped_linear_init_params:
+                    extra_kwargs["single_grouped_bias"] = getattr(
+                        config, "moe_single_grouped_bias", False
+                    )
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
@@ -3396,3 +3407,16 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(
+    cu_seqlens: torch.Tensor, total_tokens: int, cp_size: int, cp_rank: int
+) -> torch.Tensor:
+    """Get partitioned indices for THD data in context parallelism."""
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)

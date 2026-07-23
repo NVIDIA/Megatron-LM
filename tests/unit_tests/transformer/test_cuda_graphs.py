@@ -16,7 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_block import HybridStack
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.num_microbatches_calculator import (
@@ -35,11 +35,12 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _layer_is_graphable,
     create_cudagraphs,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -971,6 +972,45 @@ class TestParallelHybridBlockCudagraphs:
             assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
 
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+
+class TestMhcHybridCudagraphDiscovery:
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_wrapped_hybrid_layers_are_graphable(self):
+        assert issubclass(HyperConnectionHybridLayer, GraphableMegatronModule)
+
+        layer_type_list = validate_segment_layers("*-")
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mlp],
+        )
+        block = HybridStack(
+            config,
+            hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=["tp", "pp", "cp"]
+            ),
+        )
+
+        assert all(
+            isinstance(layer, HyperConnectionHybridLayer) for layer in block.layers
+        )
+        assert any(_layer_is_graphable(layer, config) for layer in block.layers)
 
 
 # Global storage for comparing unique buffer counts across different num_microbatches,

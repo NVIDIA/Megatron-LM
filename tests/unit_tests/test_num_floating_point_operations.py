@@ -13,6 +13,7 @@ These tests pin both code paths and the accumulator math.
 """
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ import megatron.training.training as training_module
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
+    set_seqlen_stats_in_iteration,
     update_seqlen_stats_from_cu_seqlens,
 )
 
@@ -29,6 +31,7 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
 
 
 def _make_gpt_args(
@@ -397,6 +400,26 @@ class TestAccumulator:
         assert total_real_tokens == 200 + 250
         assert seqlen_squared_sum == 20000 + 42500
 
+    def test_scheduler_global_stats_skip_all_reduce_and_reset(self):
+        set_seqlen_stats_in_iteration(450, 62500)
+
+        assert training_module._seqlen_stats_active is True
+        assert training_module._seqlen_stats_are_global is True
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(
+                training_module.mpu, "model_parallel_is_initialized", return_value=True
+            ),
+            mock.patch.object(torch.distributed, "all_reduce") as all_reduce,
+        ):
+            result = consume_seqlen_stats_in_iteration()
+
+        assert result == (450, 62500)
+        all_reduce.assert_not_called()
+        assert training_module._seqlen_stats_active is False
+        assert training_module._seqlen_stats_are_global is False
+        assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
+
     def test_consume_resets_accumulator(self):
         cu = torch.tensor([0, 100, 200], dtype=torch.int32)
         update_seqlen_stats_from_cu_seqlens(cu)
@@ -644,3 +667,185 @@ class TestAccumulatorTopology:
             f"topology tp={tp} cp={cp} pp={pp} dp={dp_size}: "
             f"got seqlen_squared_sum={seqlen_squared_sum}, expected {expected_sum_sq}"
         )
+
+
+def _make_dsv4_args():
+    """Build a minimal DSv4 HybridModel, including one unified MTP layer."""
+    return SimpleNamespace(
+        num_layers=4,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        padded_vocab_size=1024,
+        swiglu=True,
+        ffn_hidden_size=2048,
+        kv_channels=64,
+        group_query_attention=False,
+        num_query_groups=8,
+        multi_latent_attention=True,
+        moe_router_topk=0,
+        moe_ffn_hidden_size=None,
+        moe_latent_size=None,
+        moe_shared_expert_intermediate_size=None,
+        mtp_num_layers=1,
+        experimental_attention_variant="dsv4_hybrid",
+        linear_key_head_dim=None,
+        linear_value_head_dim=None,
+        linear_num_key_heads=None,
+        linear_num_value_heads=None,
+        linear_conv_kernel_dim=None,
+        mamba_state_dim=128,
+        mamba_head_dim=64,
+        mamba_num_groups=8,
+        mamba_num_heads=128,
+        q_lora_rank=128,
+        qk_head_dim=32,
+        qk_pos_emb_head_dim=32,
+        kv_lora_rank=64,
+        v_head_dim=64,
+        o_lora_rank=64,
+        o_groups=2,
+        csa_window_size=64,
+        csa_compress_ratios=[0, 4, 128, 128, 0],
+        dsa_indexer_n_heads=4,
+        dsa_indexer_head_dim=32,
+        dsa_indexer_topk=16,
+        hybrid_layer_pattern="W-C-H-H-/W-",
+    )
+
+
+def _dsv4_golden_flops(args, total_tokens, seqlen_squared_sum):
+    """Independently calculate DSv4 HybridModel FLOPs from the pattern."""
+    pattern = args.hybrid_layer_pattern.replace("|", "").replace("/", "")
+    n_r0 = pattern.count("W")
+    n_r4 = pattern.count("C")
+    n_r128 = pattern.count("H")
+    n_attention = n_r0 + n_r4 + n_r128
+    n_mlp = pattern.count("-")
+
+    q_projection = args.q_lora_rank * (
+        args.hidden_size + args.num_attention_heads * args.v_head_dim + 1
+    )
+    kv_projection = args.hidden_size * args.v_head_dim + args.v_head_dim
+    output_projection = (
+        args.num_attention_heads * args.v_head_dim * args.o_lora_rank
+        + args.o_groups * args.o_lora_rank * args.hidden_size
+    )
+    attention_token_term = n_attention * (
+        q_projection + kv_projection + output_projection
+    )
+
+    attention_token_term += (
+        n_r0 * args.num_attention_heads * args.csa_window_size * args.v_head_dim * 2
+        + n_r128
+        * args.num_attention_heads
+        * args.csa_window_size
+        * args.v_head_dim
+        * 2
+    )
+    attention_core_term = n_r128 * args.num_attention_heads * args.v_head_dim / 128
+    attention_token_term += (
+        n_r4 * args.hidden_size * (2 * args.v_head_dim) * 2
+        + n_r128 * args.hidden_size * args.v_head_dim * 2
+    )
+
+    if n_r4:
+        effective_topk = min(args.dsa_indexer_topk, args.seq_length // 4)
+        average_compressed_tokens = effective_topk * (
+            1 - effective_topk * 4 / (2 * args.seq_length)
+        )
+        attention_token_term += (
+            n_r4
+            * args.num_attention_heads
+            * (args.csa_window_size + average_compressed_tokens)
+            * args.v_head_dim
+            * 2
+            + n_r4 * args.hidden_size * (2 * args.dsa_indexer_head_dim) * 2
+            + n_r4
+            * args.q_lora_rank
+            * args.dsa_indexer_n_heads
+            * args.dsa_indexer_head_dim
+            + n_r4 * args.hidden_size * args.dsa_indexer_n_heads
+        )
+        attention_core_term += (
+            n_r4 * args.dsa_indexer_n_heads * args.dsa_indexer_head_dim / 4
+        )
+
+    mlp_expansion = args.ffn_hidden_size / args.hidden_size
+    swiglu_scale = 3 / 2 if args.swiglu else 1
+    mlp_forward = (
+        n_mlp
+        * 4
+        * mlp_expansion
+        * swiglu_scale
+        * total_tokens
+        * args.hidden_size**2
+    )
+    mtp_forward = (
+        2
+        * args.mtp_num_layers
+        * (3 * args.hidden_size + 2 * args.hidden_size**2)
+        * total_tokens
+    )
+    logits_forward = (
+        2
+        * total_tokens
+        * args.hidden_size
+        * args.padded_vocab_size
+        * (1 + args.mtp_num_layers)
+    )
+    attention_forward = 2 * (
+        attention_token_term * total_tokens
+        + attention_core_term * seqlen_squared_sum
+    )
+    return 3 * (attention_forward + mlp_forward + mtp_forward + logits_forward)
+
+
+class TestDSv4Hybrid:
+    """DSv4 HybridModel FLOPs against an independent pattern-based golden."""
+
+    def test_bshd(self):
+        args = _make_dsv4_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        seqlen_squared_sum = batch_size * args.seq_length**2
+
+        actual = num_floating_point_operations(args, batch_size)
+        expected = _dsv4_golden_flops(args, total_tokens, seqlen_squared_sum)
+
+        assert actual == pytest.approx(expected)
+
+    def test_thd(self):
+        args = _make_dsv4_args()
+        batch_size = 2
+        packed_lengths = [64, 64, 128, 256]
+        total_tokens = sum(packed_lengths)
+        seqlen_squared_sum = sum(length**2 for length in packed_lengths)
+
+        actual = num_floating_point_operations(
+            args,
+            batch_size,
+            total_real_tokens_in_batch=total_tokens,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum,
+        )
+        expected = _dsv4_golden_flops(args, total_tokens, seqlen_squared_sum)
+
+        assert actual == pytest.approx(expected)
+        assert actual < num_floating_point_operations(args, batch_size)
+
+    def test_mtp_projection_norm_accounting(self):
+        args = _make_dsv4_args()
+        without_mtp_scaffolding = SimpleNamespace(**vars(args))
+        without_mtp_scaffolding.mtp_num_layers = 0
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        delta = num_floating_point_operations(
+            args, batch_size
+        ) - num_floating_point_operations(without_mtp_scaffolding, batch_size)
+        expected = 3 * (
+            2 * total_tokens * (3 * args.hidden_size + 2 * args.hidden_size**2)
+            + 2 * total_tokens * args.hidden_size * args.padded_vocab_size
+        )
+
+        assert delta == expected

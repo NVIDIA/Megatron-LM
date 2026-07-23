@@ -63,7 +63,7 @@ class HybridModelConfig(ModelConfig):
     rotary_base: int = 10000
     seq_len_interpolation_factor: float | None = None
     make_vocab_size_divisible_by: int = 128
-    hybrid_stack_spec: ModuleSpec | None = None
+    hybrid_stack_spec: ModuleSpec | Callable[[TransformerConfig], ModuleSpec] | None = None
     vocab_size: int | None = None
     should_pad_vocab: bool = False
 
@@ -159,6 +159,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                 )
             else:
                 hybrid_stack_spec = default_hybrid_stack_spec
+        elif not isinstance(hybrid_stack_spec, ModuleSpec) and callable(hybrid_stack_spec):
+            hybrid_stack_spec = hybrid_stack_spec(self._model_config.transformer)
 
         assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:

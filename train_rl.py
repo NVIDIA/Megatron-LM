@@ -18,17 +18,19 @@ from megatron.core.utils import StragglerDetector
 from megatron.rl.rl_utils import (
     calculate_grpo_loss,
     get_logprobs,
+    get_rl_packed_seq_params_for_cuda_graph,
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.utils import is_hybrid_model
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args, pretrain_cfg_container_from_args
+from megatron.training.utils import is_hybrid_model
 from model_provider import model_provider
-
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
 stimer = StragglerDetector()
 
@@ -260,22 +262,12 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     model_to_use = model[0] if isinstance(model, list) else model
 
     if packed_seq_params is None:
-        if args.rl_use_sequence_packing:
-            packed_seq_params = get_default_packed_seq_params(
-                seq_length=tokens.shape[1],
-                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
-                device=tokens.device,
-            )
-        else:
-            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
-            packed_seq_params = PackedSeqParams(
-                qkv_format='thd',
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=tokens.shape[1],
-                max_seqlen_kv=tokens.shape[1],
-                total_tokens=tokens.shape[1],
-            )
+        packed_seq_params = get_rl_packed_seq_params_for_cuda_graph(
+            seq_length=tokens.shape[1],
+            device=tokens.device,
+            sequence_packing=args.rl_use_sequence_packing,
+            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+        )
 
     # Clear RoPE cache to avoid inference tensor errors
     try:

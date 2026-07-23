@@ -15,7 +15,7 @@ from megatron.core.utils import (
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
-from pretrain_hybrid import get_batch
+from pretrain_hybrid import core_gpt_dataset_config_from_args, get_batch
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -68,6 +68,98 @@ def initialize_test_environment(
         hybrid_context_parallel=hybrid_context_parallel,
     )
     return args
+
+
+def test_sequence_packing_scheduler_forwards_process_groups():
+    """Hybrid scheduler batching preserves THD metadata and model process groups."""
+    args = MagicMock(
+        context_parallel_size=2,
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        hybrid_context_parallel=False,
+        sequence_packing_scheduler="dp_balanced",
+    )
+    config = MagicMock(
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=1,
+    )
+    data_iterator = object()
+    pg_collection = object()
+    tokens, labels, loss_mask, position_ids = (object() for _ in range(4))
+    packed_seq_params, padding_mask = object(), object()
+    scheduler_batch = (
+        tokens,
+        labels,
+        loss_mask,
+        None,
+        position_ids,
+        packed_seq_params,
+        padding_mask,
+    )
+
+    with (
+        patch("pretrain_hybrid.get_args", return_value=args),
+        patch("pretrain_hybrid.core_transformer_config_from_args", return_value=config),
+        patch("pretrain_hybrid.mpu.get_tensor_model_parallel_rank", return_value=0),
+        patch("pretrain_hybrid.mtp_on_this_rank_func", return_value=True),
+        patch(
+            "pretrain_hybrid.get_batch_on_this_rank_for_sequence_packing",
+            return_value=scheduler_batch,
+        ) as scheduler_get_batch,
+    ):
+        batch = get_batch(data_iterator, vp_stage=0, pg_collection=pg_collection)
+
+    assert batch == (
+        None,
+        None,
+        None,
+        None,
+        labels,
+        None,
+        loss_mask,
+        None,
+        position_ids,
+        tokens,
+        padding_mask,
+        packed_seq_params,
+    )
+    scheduler_get_batch.assert_called_once_with(
+        data_iterator,
+        vpp_size=None,
+        mtp_on_this_rank=True,
+        vp_stage=0,
+        pg_collection=pg_collection,
+        config=config,
+    )
+
+
+def test_varlen_dataset_config_uses_main_api():
+    """Hybrid varlen data uses VarlenDatasetConfig with parsed mock settings."""
+    args = MagicMock(
+        per_dataset_sequences_path=None,
+        use_varlen_dataset=True,
+        varlen_mock_dataset_config_json='{"mode": "distribution"}',
+        varlen_sbhd_validation=False,
+    )
+    parsed_mock_config = {"mode": "distribution"}
+    expected_config = object()
+
+    with (
+        patch("pretrain_hybrid.build_tokenizer", return_value=object()),
+        patch("pretrain_hybrid.get_blend_and_blend_per_split", return_value=(None, None)),
+        patch("pretrain_hybrid.load_json_arg", return_value=parsed_mock_config) as load_json,
+        patch("pretrain_hybrid.VarlenDatasetConfig", return_value=expected_config) as config_class,
+    ):
+        config = core_gpt_dataset_config_from_args(args)
+
+    assert config is expected_config
+    load_json.assert_called_once_with(args.varlen_mock_dataset_config_json)
+    config_kwargs = config_class.call_args.kwargs
+    assert config_kwargs["mock_dataset_config"] is parsed_mock_config
+    assert config_kwargs["sbhd_validation"] is False
+    assert "varlen_mock_dataset_config_json" not in config_kwargs
 
 
 def create_sft_data_iterator(max_seq_length: int = 1024):
@@ -190,7 +282,12 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -757,7 +854,12 @@ def test_pretrain_batch(
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
@@ -986,7 +1088,12 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         max_seqlen,
         position_ids,
         tokens,
+        padding_mask,
+        packed_seq_params,
     ) = get_batch(data_iterator)
+
+    assert padding_mask is None
+    assert packed_seq_params is None
 
     # Presence checks
     assert tokens is not None

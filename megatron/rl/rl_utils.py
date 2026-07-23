@@ -746,6 +746,34 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def get_rl_packed_seq_params_for_cuda_graph(
+    seq_length: int,
+    device: torch.device,
+    sequence_packing: bool = False,
+    max_sequences_per_bin: int = None,
+) -> PackedSeqParams:
+    """Build RL ``PackedSeqParams`` used to keep CUDA graph signatures stable."""
+    if sequence_packing:
+        assert max_sequences_per_bin is not None, (
+            "max_sequences_per_bin is required when sequence_packing is enabled."
+        )
+        return get_default_packed_seq_params(
+            seq_length=seq_length,
+            max_sequences_per_bin=max_sequences_per_bin,
+            device=device,
+        )
+
+    cu_seqlens = torch.tensor([0, seq_length], dtype=torch.int32, device=device)
+    return PackedSeqParams(
+        qkv_format='thd',
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=seq_length,
+        max_seqlen_kv=seq_length,
+        total_tokens=seq_length,
+    )
+
+
 def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
     """Get sequence logprobs from their token ids.
 
@@ -773,22 +801,12 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     # graph signature matches the training forward_step in train_rl.py.
     # This is necessary because reference logprobs steps will reuse the training forward graph.
     if packed_seq_params is None:
-        if sequence_packing:
-            packed_seq_params = get_default_packed_seq_params(
-                seq_length=tokens.shape[1],
-                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
-                device=tokens.device,
-            )
-        else:
-            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
-            packed_seq_params = PackedSeqParams(
-                qkv_format='thd',
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=tokens.shape[1],
-                max_seqlen_kv=tokens.shape[1],
-                total_tokens=tokens.shape[1],
-            )
+        packed_seq_params = get_rl_packed_seq_params_for_cuda_graph(
+            seq_length=tokens.shape[1],
+            device=tokens.device,
+            sequence_packing=sequence_packing,
+            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+        )
 
     nvtx_range = get_nvtx_range()
 

@@ -6,15 +6,16 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 
+from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -23,23 +24,24 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
+    ArgumentGroupFactory,
+    core_transformer_config_from_args,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
-
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
-
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -79,6 +81,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -323,6 +326,15 @@ def no_rope_freq_type(x):
         # it's a single int but in str
         return int(x)
 
+
+def compress_ratios_type(x):
+    """Parse per-layer compression ratios for compressed sparse attention."""
+    if isinstance(x, list):
+        return x
+    assert isinstance(x, str)
+    return _eval_pattern(x)
+
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -398,8 +410,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -719,8 +732,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -860,8 +875,10 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    # All D/C/H/W hybrid attention symbols use MLA projections.
+    if args.hybrid_layer_pattern and any(
+        symbol in args.hybrid_layer_pattern for symbol in Symbols.MLA_ATTENTION
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -1490,6 +1507,67 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    _validate_varlen_dataset_args(args)
+
+    if args.sequence_packing_scheduler is not None:
+        assert not args.hybrid_context_parallel, (
+            "--sequence-packing-scheduler and --hybrid-context-parallel are "
+            "separate scheduling paths and cannot be enabled together"
+        )
+        assert args.calculate_per_token_loss, (
+            "Sequence packing requires --calculate-per-token-loss so gradients "
+            "do not depend on packing boundaries"
+        )
+        args.variable_seq_lengths = True
+        assert args.max_seqlen_per_dp_cp_rank is not None, (
+            "--max-seqlen-per-dp-cp-rank must be set when using sequence packing"
+        )
+        packed_capacity = args.context_parallel_size * args.max_seqlen_per_dp_cp_rank
+        assert packed_capacity >= args.seq_length, (
+            f"Packed sequence capacity ({packed_capacity}) must be at least "
+            f"--seq-length ({args.seq_length})"
+        )
+
+    if getattr(args, 'pad_packed_seq_alignment', None) is not None:
+        args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+            args.pad_packed_seq_alignment
+        )
+        if args.max_seqlen_per_dp_cp_rank is None:
+            raise ValueError(
+                '--max-seqlen-per-dp-cp-rank must be set when '
+                '--pad-packed-seq-alignment is enabled.'
+            )
+        if args.pad_packed_seq_alignment != 'max':
+            if args.pad_packed_seq_alignment <= 0:
+                raise ValueError(
+                    "--pad-packed-seq-alignment must be 'max' or a positive integer."
+                )
+            if args.pad_packed_seq_alignment > args.max_seqlen_per_dp_cp_rank:
+                raise ValueError(
+                    '--pad-packed-seq-alignment must not exceed '
+                    f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
+                    f'got {args.pad_packed_seq_alignment}.'
+                )
+
+    if (
+        args.cuda_graph_impl == "transformer_engine"
+        and args.sequence_packing_scheduler is not None
+    ):
+        if getattr(args, 'pad_packed_seq_alignment', None) is None:
+            raise ValueError(
+                'THD CUDA Graph requires --pad-packed-seq-alignment to be set.'
+            )
+        if (
+            args.pad_packed_seq_alignment != 'max'
+            and args.pad_packed_seq_alignment != args.max_seqlen_per_dp_cp_rank
+        ):
+            raise ValueError(
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' or an "
+                "alignment equal to --max-seqlen-per-dp-cp-rank "
+                f"({args.max_seqlen_per_dp_cp_rank}), got "
+                f"{args.pad_packed_seq_alignment}."
+            )
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
@@ -2082,6 +2160,7 @@ def _add_network_size_args(parser):
         "no_rope_freq",
         "moe_layer_freq",
         "linear_attention_freq",
+        "csa_compress_ratios",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -2137,8 +2216,11 @@ def _add_network_size_args(parser):
         "barrier_with_L1_time",
         # args uses same var with a different name
         "num_moe_experts",
+        "actual_vocab_size",
         "fp8_param",
         "fp4_param",
+        # already generated by data args
+        "create_attention_mask_in_dataloader",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -2148,6 +2230,8 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        "sequence_packing_scheduler",
+        "apply_dsa_kernel_fusion",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2579,8 +2663,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2919,6 +3002,9 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None,
+                       choices=['dp_balanced'],
+                       help='Pack variable-length sequences across DP x CP ranks.')
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
@@ -3256,6 +3342,11 @@ def _add_mla_args(parser):
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--o-groups', type=int, default=8,
+                       help="Number of groups for grouped low-rank output projection (wo_a).")
+    group.add_argument('--o-lora-rank', type=int, default=1024,
+                       help="Low-rank dimension per group for grouped output (wo_a). "
+                            "Used when o-groups > 0.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
     group.add_argument(
@@ -3280,6 +3371,22 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    group.add_argument(
+        '--csa-compress-ratios',
+        type=compress_ratios_type,
+        default=None,
+        help='Per-layer compress ratios for compressed sparse attention. '
+             'Accepts a Python list expression such as "[0,0,4,128,4,128]" or '
+             '"([0]+[4,128]*2)*3". Valid values are 0, 4, and 128, and the '
+             'list length must equal num_layers plus mtp_num_layers.',
+    )
+    group.add_argument(
+        '--no-dsa-kernel-fusion',
+        action='store_false',
+        help='Disable fused DSA sparse-attention kernels (FlashMLA + cuDNN DSA) '
+        'and fall back to unfused PyTorch implementations.',
+        dest='apply_dsa_kernel_fusion',
+    )
     return parser
 
 def _add_heterogeneous_args(parser):
@@ -3439,7 +3546,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
@@ -3469,6 +3576,68 @@ def _add_sft_args(parser):
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
     return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='variable-length dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action='store_true',
+        help='Use variable-length raw-text pretraining data.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action='store_true',
+        help='Use a dense-model fixed-shape reference padded to --seq-length.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Inline JSON or a JSON file configuring synthetic variable-length samples.',
+    )
+    return parser
+
+
+def _validate_varlen_dataset_args(args):
+    assert (
+        not args.varlen_sbhd_validation or args.use_varlen_dataset
+    ), "--varlen-sbhd-validation requires --use-varlen-dataset"
+    assert (
+        args.varlen_mock_dataset_config_json is None or args.use_varlen_dataset
+    ), "--varlen-mock-dataset-config-json requires --use-varlen-dataset"
+    assert (
+        args.varlen_mock_dataset_config_json is None or args.mock_data
+    ), "--varlen-mock-dataset-config-json requires --mock-data"
+    if not args.use_varlen_dataset:
+        return
+
+    assert not args.sft, "--use-varlen-dataset and --sft are mutually exclusive"
+    assert not args.fim_data, "--use-varlen-dataset and --fim-data are mutually exclusive"
+    assert not args.hybrid_context_parallel, (
+        "--use-varlen-dataset uses the dp_balanced static-CP scheduler and cannot use "
+        "--hybrid-context-parallel"
+    )
+    assert not args.reset_position_ids, "--use-varlen-dataset does not support reset position ids"
+    assert not args.reset_attention_mask, (
+        "--use-varlen-dataset does not support reset attention masks"
+    )
+    assert not args.dataloader_inter_document_masking, (
+        "--use-varlen-dataset does not support inter-document masking"
+    )
+    args.create_attention_mask_in_dataloader = False
+    if args.varlen_sbhd_validation:
+        assert (
+            args.sequence_packing_scheduler is None
+        ), "--varlen-sbhd-validation cannot use a sequence packing scheduler"
+        assert not args.mock_data, "--varlen-sbhd-validation is only supported with real datasets"
+        assert args.num_experts is None, (
+            "--varlen-sbhd-validation currently supports dense models only; "
+            "MoE requires physical padding-mask propagation"
+        )
+    elif args.sequence_packing_scheduler is None:
+        args.sequence_packing_scheduler = "dp_balanced"
+
 
 def _add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')

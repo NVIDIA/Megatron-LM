@@ -1,0 +1,235 @@
+# Launch this recipe's ARGS with pretrain_hybrid.py.
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
+  dockerfile: |
+    # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+    # IMAGE_NAME: dsv4-hybrid-gb200-torch2604
+
+    FROM nvcr.io/nvidia/pytorch:26.04-py3
+
+    ENV SHELL=/bin/bash
+    ENV DEBIAN_FRONTEND=noninteractive
+
+    RUN apt-get update && \
+        apt-get install -y --no-install-recommends git curl wget gettext sudo && \
+        wget https://github.com/mikefarah/yq/releases/download/v4.27.5/yq_linux_arm64 \
+          -O /usr/bin/yq && \
+        chmod +x /usr/bin/yq && \
+        apt-get clean && \
+        rm -rf /var/lib/apt/lists/*
+
+    RUN unset PIP_CONSTRAINT && \
+        pip install --no-cache-dir \
+          datasets einops omegaconf sentencepiece tensorboard tiktoken \
+          tokenizers transformers==4.57.1 wandb \
+          nvidia-cutlass-dsl==4.5.2 nvidia-cudnn-frontend==1.26.0
+
+    # Pins match the GB200 image used to validate this port.
+    ARG TE_COMMIT=7cb8b313d55021eb12c5efd4d02f4c8ff7679453
+    RUN unset PIP_CONSTRAINT && \
+        NVTE_CUDA_ARCHS="100a;103a" NVTE_BUILD_THREADS_PER_JOB=8 \
+        NVTE_FRAMEWORK=pytorch pip install --no-build-isolation --no-cache-dir \
+          "git+https://github.com/NVIDIA/TransformerEngine.git@$TE_COMMIT"
+
+    ARG HYBRIDEP_COMMIT=1b8f467965bb818bf2f6511e06993f5607e1721f
+    RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git \
+          /workspace/DeepEP && \
+        cd /workspace/DeepEP && \
+        git checkout $HYBRIDEP_COMMIT && \
+        TORCH_CUDA_ARCH_LIST="10.0" pip install --no-build-isolation .
+
+    ARG FHT_COMMIT=e7706faf8d1c3b9f241e36860640ad1dac644ede
+    RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform.git \
+          /workspace/fast-hadamard-transform && \
+        cd /workspace/fast-hadamard-transform && \
+        git checkout $FHT_COMMIT && \
+        pip install --no-build-isolation .
+
+    ARG FLASHMLA_COMMIT=b7643bd54521f563b839b98289b5cd048c062ba2
+    RUN git clone --branch nv_dev https://github.com/deepseek-ai/FlashMLA.git \
+          /workspace/FlashMLA && \
+        cd /workspace/FlashMLA && \
+        git checkout $FLASHMLA_COMMIT && \
+        FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
+        CFLAGS="-I$CUDA_HOME/include/cccl" \
+        CXXFLAGS="-I$CUDA_HOME/include/cccl" \
+        pip install --no-build-isolation .
+
+    RUN rm -rf /root/.cache /tmp/*
+    WORKDIR /workspace
+
+ENV_VARS:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,graph_capture_record_stream_reuse:True
+  NCCL_NVLS_ENABLE: '0'
+  NVTE_FUSED_ATTN: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  PYTHONWARNINGS: ignore
+  NCCL_DEBUG: VERSION
+  NCCL_GRAPH_REGISTER: '0'
+  NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+  NVTE_CPU_OFFLOAD_V1: '1'
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: '64'
+  USE_MNNVL: '1'
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+  NUM_OF_STAGES_DISPATCH_API: '10'
+  NUM_OF_IN_FLIGHT_S2G_DISPATCH_API: '8'
+
+ARGS:
+  tokenizer_type: HuggingFaceTokenizer
+  tokenizer_model: unsloth/DeepSeek-V3
+  hidden_size: 4096
+  num_attention_heads: 64
+  kv_channels: 512
+  max_position_embeddings: 65536
+  normalization: RMSNorm
+  norm_epsilon: 1e-6
+  swiglu: true
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  position_embedding_type: rope
+  rotary_base: 10000
+  make_vocab_size_divisible_by: 3232
+  multi_latent_attention: true
+  q_lora_rank: 1024
+  qk_pos_emb_head_dim: 64
+  v_head_dim: 512
+  rotary_scaling_factor: 4
+  mscale: 1.0
+  mscale_all_dim: 1.0
+  qk_layernorm: true
+  o_groups: 8
+  o_lora_rank: 1024
+  original_max_position_embeddings: 65536
+  experimental_attention_variant: dsv4_hybrid
+  csa_window_size: 128
+  csa_compress_ratios: '([0,0,4]+[128,4]*20+[0])'
+  csa_compress_rotary_base: 40000
+  dsa_indexer_n_heads: 64
+  dsa_indexer_head_dim: 128
+  dsa_indexer_topk: 512
+  dsa_indexer_loss_coeff: 1e-2
+  dsa_indexer_use_sparse_loss: true
+  num_experts: 256
+  moe_n_hash_layers: 3
+  moe_ffn_hidden_size: 2048
+  moe_shared_expert_intermediate_size: 2048
+  moe_router_load_balancing_type: seq_aux_loss
+  moe_router_topk: 6
+  moe_aux_loss_coeff: 1e-4
+  moe_router_topk_scaling_factor: 1.5
+  moe_router_score_function: sqrtsoftplus
+  moe_router_enable_expert_bias: true
+  moe_router_bias_update_rate: 1e-3
+  activation_func_clamp_value: 10.0
+  enable_hyper_connections: true
+  num_residual_streams: 4
+  mhc_sinkhorn_iterations: 20
+  use_fused_mhc: true
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: 0.1
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  hybrid_layer_pattern: "WEWECEHECE|HECEHECEHECE|HECEHECEHECE|HECEHECEHECE|HECEHECEHECE|HECEHECEHECE|HECEHECEHECE|HECE/WE"
+  spec:
+  - megatron.core.models.hybrid.hybrid_layer_specs
+  - hybrid_dsv4_stack_spec
+  mock_data: true
+  seq_length: 65536
+  moe_router_force_load_balancing: true
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 2
+  expert_model_parallel_size: 64
+  context_parallel_size: 16
+  expert_tensor_parallel_size: 1
+  use_distributed_optimizer: true
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_hybridep_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_router_fusion: true
+  moe_router_dtype: fp32
+  recompute_granularity: selective
+  recompute_modules:
+  - mla_up_proj
+  fine_grained_activation_offloading: true
+  offload_modules:
+  - expert_fc1
+  delay_offload_until_cuda_graph: true
+  cuda_graph_impl: transformer_engine
+  cuda_graph_modules:
+  - attn
+  - moe_router
+  - moe_preprocess
+  te_rng_tracker: true
+  cuda_graph_warmup_steps: 1
+  use_flash_attn: true
+  transformer_impl: transformer_engine
+  micro_batch_size: 1
+  global_batch_size: 128
+  train_samples: 585937500
+  exit_duration_in_mins: 220
+  no_save_optim: true
+  no_check_for_nan_in_loss_and_grad: true
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: native
+  no_create_attention_mask_in_dataloader: true
+  manual_gc: true
+  manual_gc_interval: 10
+  use_varlen_dataset: true
+  varlen_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":65536,"max_seq_len":65536,"mean_seq_len":65536,"lognormal_sigma":1.1}'
+  sequence_packing_scheduler: dp_balanced
+  calculate_per_token_loss: true
+  pad_packed_seq_alignment: max
+  max_seqlen_per_dp_cp_rank: 4096
+  thd_max_packed_sequences: 8
+  cp_partition_mode: contiguous
+  lr: 3.9e-06
+  min_lr: 3.9e-07
+  lr_warmup_init: 3.9e-07
+  lr_decay_style: cosine
+  lr_decay_samples: 584765624
+  lr_warmup_samples: 1536000
+  weight_decay: 0.1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  bf16: true
+  fp8_recipe: mxfp8
+  fp8_format: e4m3
+  fp8_param_gather: true
+  reuse_grad_buf_for_mxfp8_param_ag: true
+  use_precision_aware_optimizer: true
+  main_grads_dtype: fp32
+  main_params_dtype: fp32
+  exp_avg_dtype: bf16
+  exp_avg_sq_dtype: bf16
+  moe_router_padding_for_quantization: true
+  init_method_std: 0.02
+  eval_iters: 32
+  eval_interval: 200
+  no_load_optim: true
+  no_load_rng: true
+  auto_detect_ckpt_format: true
+  load: $LOAD_PATH
+  save: $OUTPUT_PATH/checkpoints
+  save_interval: 500
+  dist_ckpt_strictness: log_all
+  log_throughput: true
+  log_interval: 1
+  logging_level: 20
+  log_timers_to_tensorboard: true
+  log_memory_to_tensorboard: true
+  log_validation_ppl_to_tensorboard: true
+  tensorboard_dir: $OUTPUT_PATH/tensorboard
+  wandb_exp_name: DeepSeek-V4-Flash-HybridModel-GB200-MXFP8-THD-TP1PP2EP64CP16-GBS128SEQLEN65536
+  wandb_project: megatron-deepseek-v4-flash-benchmark
+  wandb_save_dir: $OUTPUT_PATH/wandb
+  enable_experimental: true
+  log_memory_interval: 5
+  log_device_memory_used: true
