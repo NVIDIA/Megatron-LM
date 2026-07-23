@@ -278,6 +278,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    token_superposition_size: int = 1
+    """Number of contiguous raw tokens averaged into one latent token during
+    Token-Superposition Training. A value of 1 disables token superposition.
+    """
+ 
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
