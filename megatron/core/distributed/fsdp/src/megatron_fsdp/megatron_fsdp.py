@@ -103,6 +103,35 @@ def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
             param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
 
 
+def _dtensor_placement_signature(param):
+    placements = getattr(param, "placements", None)
+    if placements is None and hasattr(param, "_spec"):
+        placements = getattr(param._spec, "placements", None)
+    if placements is None and hasattr(param, "data"):
+        data = param.data
+        placements = getattr(data, "placements", None)
+        if placements is None and hasattr(data, "_spec"):
+            placements = getattr(data._spec, "placements", None)
+    if placements is None:
+        return None
+    return tuple(repr(placement) for placement in placements)
+
+
+def _dtensor_mesh_signature(param):
+    mesh = getattr(param, "device_mesh", None)
+    if mesh is None and hasattr(param, "_spec"):
+        mesh = getattr(param._spec, "mesh", None)
+    if mesh is None:
+        return None
+    mesh_tensor = mesh.mesh
+    return (
+        mesh.device_type,
+        tuple(mesh_tensor.shape),
+        tuple(mesh_tensor.flatten().tolist()),
+        tuple(mesh.mesh_dim_names or ()),
+    )
+
+
 class MegatronFSDP(torch.nn.Module):
     """Fully Sharded Data Parallel training.
 
@@ -282,6 +311,9 @@ class MegatronFSDP(torch.nn.Module):
         recurse_types = fine_grained_recurse_module_types or ()
         self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
+        self._fsdp_optimizer_initialization_attempted = False
+        self._fsdp_first_forward_attempted = False
+        self._fsdp_parameter_reconciliation_failed_reason: Optional[str] = None
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
         # If not provided, Megatron-FSDP will default to a simple data parallel index
@@ -401,6 +433,7 @@ class MegatronFSDP(torch.nn.Module):
         )
         self.param_to_name = {p: name for name, p in self.module.named_parameters()}
         self.raw_param = dict(self.module.named_parameters())
+        self._initialize_parameter_registry()
 
         # Initialize a gradient buffer and accumulation stream for the GradReducePipeline.
         self.side_stream_for_buffer_copy_and_grad_accum = torch.cuda.Stream()
@@ -1372,6 +1405,280 @@ class MegatronFSDP(torch.nn.Module):
         # Reset the microbatch count to zero after the gradient sync is complete.
         self.microbatch_count = 0
 
+    def _current_parameters_by_fqn(self) -> Dict[str, torch.nn.Parameter]:
+        return dict(self.module.named_parameters(remove_duplicate=False))
+
+    def _logical_raw_parameters_by_fqn(
+        self, current_by_fqn: Dict[str, torch.nn.Parameter]
+    ) -> Dict[str, torch.nn.Parameter]:
+        """Map installed distributed Parameters back to their raw counterparts."""
+        fsdp_params = dict(self.param_and_grad_buffer.optimizer_named_parameters)
+        logical_by_fqn = dict(current_by_fqn)
+        for name, canonical_name in self._parameter_fqn_to_canonical.items():
+            current_param = current_by_fqn.get(name)
+            expected_param = fsdp_params.get(canonical_name)
+            raw_param = self.raw_param.get(canonical_name)
+            if (
+                current_param is not None
+                and expected_param is not None
+                and raw_param is not None
+                and current_param is expected_param
+            ):
+                logical_by_fqn[name] = raw_param
+        return logical_by_fqn
+
+    def _parameter_spec(self, param: torch.nn.Parameter) -> Dict[str, Any]:
+        device = getattr(param, "device", None)
+        local_param = to_local_if_dtensor(param)
+        return {
+            "shape": tuple(param.shape),
+            "dtype": param.dtype,
+            "device": (device.type, device.index) if device is not None else None,
+            "tensor_type": type(param),
+            "layout": param.layout,
+            "stride": tuple(local_param.stride()),
+            "mesh": _dtensor_mesh_signature(param),
+            "placements": _dtensor_placement_signature(param),
+        }
+
+    def _initialize_parameter_registry(self):
+        """Record Megatron-FSDP-owned parameter state by fully-qualified name."""
+        all_named_params = list(self.module.named_parameters(remove_duplicate=False))
+        names_by_param_id: Dict[int, List[str]] = {}
+        for name, param in all_named_params:
+            names_by_param_id.setdefault(id(param), []).append(name)
+
+        fqn_to_canonical: Dict[str, str] = {}
+        alias_groups: List[Tuple[str, ...]] = []
+        for names in names_by_param_id.values():
+            canonical = next((name for name in names if name in self.raw_param), names[0])
+            ordered_names = [canonical] + [name for name in names if name != canonical]
+            alias_group = tuple(ordered_names)
+            alias_groups.append(alias_group)
+            for name in alias_group:
+                fqn_to_canonical[name] = canonical
+
+        self._parameter_fqn_to_canonical = fqn_to_canonical
+        self._parameter_alias_groups = alias_groups
+        self._parameter_canonical_fqns = tuple(self.raw_param.keys())
+        self._parameter_specs = {
+            name: self._parameter_spec(param) for name, param in self.raw_param.items()
+        }
+
+    def _validate_registered_parameter(self, name: str, param: torch.nn.Parameter) -> None:
+        spec = self._parameter_specs[name]
+        current_spec = self._parameter_spec(param)
+        for spec_key, label in [
+            ("shape", "shape"),
+            ("dtype", "dtype"),
+            ("device", "device"),
+            ("layout", "layout"),
+            ("stride", "stride"),
+            ("mesh", "DTensor mesh"),
+            ("placements", "DTensor placement"),
+            ("tensor_type", "tensor subclass"),
+        ]:
+            if current_spec[spec_key] != spec[spec_key]:
+                expected = spec[spec_key]
+                actual = current_spec[spec_key]
+                if spec_key == "tensor_type":
+                    expected = expected.__name__
+                    actual = actual.__name__
+                raise RuntimeError(
+                    f"[Megatron-FSDP] reregister_parameters() {label} mismatch "
+                    f"for {name}: expected {expected}, got {actual}."
+                )
+
+    def _parameter_alias_topology(
+        self, parameters_by_fqn: Dict[str, torch.nn.Parameter]
+    ) -> set[frozenset[str]]:
+        names_by_parameter: Dict[int, List[str]] = {}
+        for name, param in parameters_by_fqn.items():
+            names_by_parameter.setdefault(id(param), []).append(name)
+        return {frozenset(names) for names in names_by_parameter.values()}
+
+    def _restore_module_parameter_snapshot(
+        self, parameters_by_fqn: Dict[str, torch.nn.Parameter]
+    ) -> None:
+        for name, param in parameters_by_fqn.items():
+            _replace_module_parameter(self.module, name, param)
+
+    def _install_owned_parameter_presentation(self, distributed: bool) -> None:
+        if distributed:
+            owned_parameters = dict(self.param_and_grad_buffer.optimizer_named_parameters)
+        else:
+            owned_parameters = self.raw_param
+        for name in self._parameter_canonical_fqns:
+            _replace_module_parameter(self.module, name, owned_parameters[name])
+        self._reestablish_shared_weights(self.raw_param, owned_parameters)
+        self.is_param_fsdp_distributed = distributed
+
+    def _raise_if_parameter_reconciliation_failed(self, operation: str) -> None:
+        if self._fsdp_parameter_reconciliation_failed_reason is not None:
+            raise RuntimeError(
+                f"[Megatron-FSDP] {operation} cannot proceed because parameter-value "
+                "reconciliation previously failed after copying began; the wrapper is "
+                f"terminally closed ({self._fsdp_parameter_reconciliation_failed_reason})."
+            )
+
+    def _parameter_reconciliation_validation_error(
+        self,
+    ) -> Tuple[Optional[str], Optional[Tuple[str, ...]]]:
+        try:
+            self._raise_if_parameter_reconciliation_failed("reregister_parameters()")
+            if self._fsdp_optimizer_initialization_attempted:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() must run before "
+                    "fully_shard_optimizer() initialization is attempted."
+                )
+            if self._fsdp_first_forward_attempted:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() must run before the first "
+                    "forward attempt."
+                )
+
+            was_distributed = self.is_param_fsdp_distributed
+            current_by_fqn = self._current_parameters_by_fqn()
+            expected_fqns = set(self._parameter_fqn_to_canonical)
+            current_fqns = set(current_by_fqn)
+            missing_fqns = sorted(expected_fqns - current_fqns)
+            extra_fqns = sorted(current_fqns - expected_fqns)
+            if missing_fqns or extra_fqns:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() FQN set mismatch: "
+                    f"missing={missing_fqns}, extra={extra_fqns}."
+                )
+
+            expected_alias_topology = {
+                frozenset(alias_group) for alias_group in self._parameter_alias_groups
+            }
+            current_alias_topology = self._parameter_alias_topology(current_by_fqn)
+            if current_alias_topology != expected_alias_topology:
+                raise RuntimeError(
+                    "[Megatron-FSDP] reregister_parameters() alias topology mismatch: "
+                    f"expected={expected_alias_topology}, got={current_alias_topology}."
+                )
+
+            logical_by_fqn = (
+                self._logical_raw_parameters_by_fqn(current_by_fqn)
+                if was_distributed
+                else current_by_fqn
+            )
+            planned_parameters = {
+                name: logical_by_fqn[name] for name in self._parameter_canonical_fqns
+            }
+            for name, param in planned_parameters.items():
+                self._validate_registered_parameter(name, param)
+            replacements = {
+                name: param
+                for name, param in planned_parameters.items()
+                if param is not self.raw_param[name]
+            }
+            self.param_and_grad_buffer._build_parameter_value_reconciliation_plan(replacements)
+        except Exception as error:
+            return f"{type(error).__name__}: {error}", None
+        return None, tuple(sorted(replacements))
+
+    def _parameter_reconciliation_validation_consensus(
+        self, local_error: Optional[str], local_plan: Optional[Tuple[str, ...]]
+    ) -> None:
+        group = self.dist_index.get_dp_group()
+        validation_results: List[Tuple[Optional[str], Optional[Tuple[str, ...]]]] = [
+            (None, None)
+        ] * group.size()
+        torch.distributed.all_gather_object(
+            validation_results, (local_error, local_plan), group=group
+        )
+        failures = [
+            f"group rank {rank}: {error}"
+            for rank, (error, _) in enumerate(validation_results)
+            if error is not None
+        ]
+        if failures:
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() validation failed before mutation "
+                "on the data-parallel group: " + "; ".join(failures)
+            )
+
+        validation_plans = {plan for _, plan in validation_results}
+        if len(validation_plans) != 1:
+            details = "; ".join(
+                f"group rank {rank}: {plan}" for rank, (_, plan) in enumerate(validation_results)
+            )
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() validation plans differ before "
+                "mutation on the data-parallel group: " + details
+            )
+
+    def reregister_parameters(self):
+        """Reconcile validated replacement values with Megatron-FSDP-owned storage.
+
+        This collective API supports only 'optim_grads_params' and must run
+        synchronously on the data-parallel group after same-layout
+        load_state_dict(assign=True) and final alias restoration, but before
+        the first forward attempt or optimizer-initialization attempt. External
+        Parameters are temporary value sources; owned identities remain authoritative.
+
+        Validation, including special-storage checks, reaches group consensus
+        before mutation. Validation failures leave storage unchanged. Unexpected
+        failures after copying begins are not rolled back: the wrapper enters a
+        terminal state and rejects later reconciliation, forward, and optimizer use.
+        """
+        local_error, local_plan = self._parameter_reconciliation_validation_error()
+        self._parameter_reconciliation_validation_consensus(local_error, local_plan)
+
+        was_distributed = self.is_param_fsdp_distributed
+        current_by_fqn = self._current_parameters_by_fqn()
+        expected_fqns = set(self._parameter_fqn_to_canonical)
+        current_fqns = set(current_by_fqn)
+        missing_fqns = sorted(expected_fqns - current_fqns)
+        extra_fqns = sorted(current_fqns - expected_fqns)
+        if missing_fqns or extra_fqns:
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() FQN set mismatch: "
+                f"missing={missing_fqns}, extra={extra_fqns}."
+            )
+
+        expected_alias_topology = {
+            frozenset(alias_group) for alias_group in self._parameter_alias_groups
+        }
+        current_alias_topology = self._parameter_alias_topology(current_by_fqn)
+        if current_alias_topology != expected_alias_topology:
+            raise RuntimeError(
+                "[Megatron-FSDP] reregister_parameters() alias topology mismatch: "
+                f"expected={expected_alias_topology}, got={current_alias_topology}."
+            )
+
+        logical_by_fqn = (
+            self._logical_raw_parameters_by_fqn(current_by_fqn)
+            if was_distributed
+            else current_by_fqn
+        )
+        planned_parameters = {name: logical_by_fqn[name] for name in self._parameter_canonical_fqns}
+        for name, param in planned_parameters.items():
+            self._validate_registered_parameter(name, param)
+
+        replacements = {
+            name: param
+            for name, param in planned_parameters.items()
+            if param is not self.raw_param[name]
+        }
+        if not replacements:
+            return self
+
+        copy_plan = self.param_and_grad_buffer._build_parameter_value_reconciliation_plan(
+            replacements
+        )
+        try:
+            self.param_and_grad_buffer._reconcile_parameter_values(replacements, copy_plan)
+            self._install_owned_parameter_presentation(distributed=was_distributed)
+        except Exception as error:
+            self._fsdp_parameter_reconciliation_failed_reason = f"{type(error).__name__}: {error}"
+            self._restore_module_parameter_snapshot(current_by_fqn)
+            self.is_param_fsdp_distributed = was_distributed
+            raise
+        return self
+
     def _replace_param_with_distributed_if_needed(self):
         if self.is_param_fsdp_distributed:
             return
@@ -1379,7 +1686,7 @@ class MegatronFSDP(torch.nn.Module):
 
         pg_buffer = self.param_and_grad_buffer
         fsdp_params = dict(pg_buffer.optimizer_named_parameters)
-        for name, _ in self.module.named_parameters():
+        for name in self._parameter_canonical_fqns:
             assert name in fsdp_params, f"Parameter {name} not found in FSDP parameters."
             dist_param = fsdp_params[name]
             # Set the __fsdp_param__ attribute to True to indicate that this
@@ -1398,7 +1705,7 @@ class MegatronFSDP(torch.nn.Module):
             return
         self.is_param_fsdp_distributed = False
 
-        for name, _ in self.module.named_parameters():
+        for name in self._parameter_canonical_fqns:
             assert name in self.raw_param, f"Raw parameter {name} not found in module."
             if not hasattr(self.raw_param[name], "_megatron_fsdp_model"):
                 self.raw_param[name]._megatron_fsdp_model = self
@@ -1410,28 +1717,29 @@ class MegatronFSDP(torch.nn.Module):
         self._reestablish_shared_weights(fsdp_params, self.raw_param)
 
     def _reestablish_shared_weights(self, old_params, new_params):
-        """
-        Reestablishes shared (tied) weights in a PyTorch module after parameter replacement.
+        """Reestablish tied/shared weights from the Megatron-FSDP FQN registry."""
+        if hasattr(self, "_parameter_alias_groups"):
+            for alias_group in self._parameter_alias_groups:
+                if len(alias_group) <= 1:
+                    continue
+                canonical_name = alias_group[0]
+                shared_param = new_params.get(canonical_name)
+                if shared_param is None:
+                    raise RuntimeError(
+                        "[Megatron-FSDP] Could not restore shared parameter group "
+                        f"{alias_group}: missing canonical parameter {canonical_name}."
+                    )
+                for alias_name in alias_group[1:]:
+                    _replace_module_parameter(self.module, alias_name, shared_param)
+                setattr(shared_param, "_is_shared", True)
+            return
 
-        When iterating over `named_parameters()`, PyTorch skips parameters that are shared
-        via weight-tying (e.g., `lm_head.weight` referencing `wte.weight`). After replacing
-        parameters, these shared weights become independent, causing previously hidden
-        parameters to appear in the parameter list. This function restores the original
-        shared structure by ensuring parameters that were previously tied remain shared.
-
-        Args:
-            old_params (dict): Mapping from parameter names to original parameter tensors.
-            new_params (dict): Mapping from parameter names to new parameter tensors.
-        """
         for name, param in self.module.named_parameters():
             if name in new_params:
-                # Parameter was explicitly replaced; nothing to do.
                 continue
 
-            # Attempt to find the corresponding shared parameter in old_params.
             shared_param = None
             for old_name, old_weight in old_params.items():
-                # Found a shared parameter; get the new version.
                 if id(param) == id(old_weight):
                     shared_param = new_params.get(old_name)
                     break
@@ -1439,9 +1747,8 @@ class MegatronFSDP(torch.nn.Module):
                 shared_param is not None
             ), f"Parameter {name} not found in new parameters or as a shared weight."
 
-            # Replace the module parameter with the restored shared parameter.
             _replace_module_parameter(self.module, name, shared_param)
-            setattr(shared_param, "_is_shared", True)  # Mark as shared
+            setattr(shared_param, "_is_shared", True)
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
@@ -1484,6 +1791,8 @@ class MegatronFSDP(torch.nn.Module):
         """
         Wrapped forward pass of the model managed by FSDP.
         """
+        self._raise_if_parameter_reconciliation_failed("forward()")
+        self._fsdp_first_forward_attempted = True
         self._replace_param_with_raw_if_needed()
         with torch.autograd.profiler.record_function("CustomFSDP.forward"):
             # Call the forward pass of the wrapped module.
