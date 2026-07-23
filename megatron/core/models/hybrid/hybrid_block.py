@@ -21,6 +21,10 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_layer_fusion import (
+    build_fused_layer,
+    canonicalize_hybrid_sharded_state_dict,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -38,8 +42,12 @@ from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_
 class HybridStackSubmodules:
     """
     A class for the module specs for the HybridStack.
+
+    The `*_layer` fields specify the full block used for a stand-alone layer
+    (a single symbol in the hybrid layer pattern).
     """
 
+    # Stand-alone layer specs – one block per pattern symbol.
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
@@ -62,7 +70,12 @@ class HybridStack(MegatronModule):
             this pipeline segment. When provided (by HybridModel), pipeline stage
             selection has already been done via '|' separators in the pattern.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
-            segment. Defaults to 0.
+            segment, measured in physical blocks (fused groups count as one).
+            Defaults to 0.
+        sub_layer_offset (int, optional): the global sub-layer offset for this
+            pipeline segment, measured in the canonical unfused layout (fused
+            groups count by their number of symbols). Defaults to
+            `pp_layer_offset`.
         post_layer_norm (bool, optional): whether to include a final layer norm.
             Defaults to True.
         post_process (bool, optional): whether to include an output layer.
@@ -81,6 +94,7 @@ class HybridStack(MegatronModule):
         pre_process: bool = True,
         layer_type_list: Optional[list[str]] = None,
         pp_layer_offset: int = 0,
+        sub_layer_offset: Optional[int] = None,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
@@ -113,6 +127,7 @@ class HybridStack(MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
+        self.sub_layer_offset = pp_layer_offset if sub_layer_offset is None else sub_layer_offset
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -125,7 +140,24 @@ class HybridStack(MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if layer_type == LayerSymbols.MAMBA:
+                if len(layer_type) > 1:
+                    # Multi-character entries come from bracketed fusion groups
+                    # in the hybrid layer pattern, e.g., "[*-]" -> "*-".
+                    # `layer_number` already includes `pp_layer_offset` (see
+                    # the computation at the top of this loop), so the outer
+                    # TransformerLayer must not add it again – same contract
+                    # as the stand-alone TransformerLayer dispatches below.
+                    layer = build_fused_layer(
+                        layer_type,
+                        submodules,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        pp_layer_offset=pp_layer_offset,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                    )
+                elif layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
@@ -216,10 +248,19 @@ class HybridStack(MegatronModule):
         """
         Returns the Mamba conv and ssm states shapes per input sequence
         if this block contains Mamba layers (this may not be the case with PP > 1).
+
+        A stand-alone Mamba block exposes `mamba_state_shapes_per_request`
+        directly (it is a `MambaLayer`). A fused `[M...]` block is a
+        `TransformerLayer` whose `self_attention` slot holds the MambaMixer,
+        so we have to descend one level.
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
+            # Fused Mamba is surfaced via the enclosing TransformerLayer's `self_attention`
+            # attribute.
+            elif LayerSymbols.MAMBA in layer_type:
+                return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
     def forward(
@@ -389,8 +430,11 @@ class HybridStack(MegatronModule):
 
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
+        sub_layer_cursor = self.sub_layer_offset
 
-        for local_layer_idx, layer in enumerate(self.layers):
+        for local_layer_idx, (layer_type, layer) in enumerate(
+            zip(self.layer_type_list, self.layers)
+        ):
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = (
@@ -398,13 +442,22 @@ class HybridStack(MegatronModule):
             )
 
             sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
-            sharded_pp_offset = []
+            sharded_pp_offset: list[tuple[int, int, int]] = []
 
             layer_sharded_state_dict = layer.sharded_state_dict(
                 state_dict_prefix, sharded_pp_offset, metadata
             )
 
             replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, sharded_prefix)
+
+            canonicalize_hybrid_sharded_state_dict(
+                layer_sharded_state_dict,
+                layer_prefix=layer_prefix,
+                layer_type_list=[layer_type],
+                physical_offset=global_layer_offset,
+                sub_layer_offset=sub_layer_cursor,
+            )
+            sub_layer_cursor += len(layer_type)
 
             sharded_state_dict.update(layer_sharded_state_dict)
 
