@@ -216,8 +216,10 @@ def get_hybrid_layer_cp_partition_mode(
         return "zigzag"
     if layer_symbol == Symbols.GDN:
         mode = getattr(config, "linear_cp_mode", "chunkwise")
-        if mode in {"chunkwise", "headwise"}:
+        if mode == "chunkwise":
             return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
         raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
     if layer_symbol == Symbols.ATTENTION:
         return "zigzag"
@@ -236,7 +238,7 @@ def get_hybrid_stage_input_cp_partition_mode(
     config,
     hybrid_layer_pattern: Optional[str],
     stage_layer_offset: int,
-) -> CpPartitionMode:
+) -> Optional[CpPartitionMode]:
     """Return the CP partition mode expected at one HybridModel stage input."""
     parsed = parse_hybrid_pattern(hybrid_layer_pattern)
     main_pattern = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
@@ -256,7 +258,7 @@ def get_hybrid_stage_input_cp_partition_mode(
                 current_partition_mode = required_partition_mode
                 break
 
-    return current_partition_mode or "zigzag"
+    return current_partition_mode
 
 
 def get_hybrid_stage_input_cp_partition_mode_for_stage(
@@ -267,7 +269,7 @@ def get_hybrid_stage_input_cp_partition_mode_for_stage(
     *,
     first_stage_layers: Optional[int] = None,
     last_stage_layers: Optional[int] = None,
-) -> CpPartitionMode:
+) -> Optional[CpPartitionMode]:
     """Return the CP partition mode expected at one hybrid PP/VPP stage input."""
     parsed = parse_hybrid_pattern(hybrid_layer_pattern)
     layer_offset = get_hybrid_stage_layer_offset(

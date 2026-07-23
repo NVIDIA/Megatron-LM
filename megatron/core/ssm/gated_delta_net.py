@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Union
@@ -204,16 +205,19 @@ class GatedDeltaNet(MegatronModule):
 
         # weight shape: [conv_dim, 1, d_conv]
         # bias shape: [conv_dim]
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim_local_tp,
-            out_channels=self.conv_dim_local_tp,
-            bias=conv_bias,
-            kernel_size=self.conv_kernel_dim,
-            groups=self.conv_dim_local_tp,
-            padding=self.conv_kernel_dim - 1,
-            device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
-        )
+        # Conv1d performs implicit CUDA RNG initialization in its constructor.
+        # Isolate it; reset_parameters below owns the final Megatron-tracked init.
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            self.conv1d = nn.Conv1d(
+                in_channels=self.conv_dim_local_tp,
+                out_channels=self.conv_dim_local_tp,
+                bias=conv_bias,
+                kernel_size=self.conv_kernel_dim,
+                groups=self.conv_dim_local_tp,
+                padding=self.conv_kernel_dim - 1,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
         setattr(self.conv1d.weight, "partition_dim", 0)
         if conv_bias:
@@ -297,6 +301,12 @@ class GatedDeltaNet(MegatronModule):
                 # conv1d.weight
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                else:
+                    nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
+                if self.conv1d.bias is not None:
+                    fan_in = self.conv1d.weight.size(1) * self.conv1d.weight.size(2)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.conv1d.bias, -bound, bound)
                 # dt_bias
                 torch.ones(
                     self.num_v_heads_local_tp,
@@ -386,6 +396,14 @@ class GatedDeltaNet(MegatronModule):
             assert (
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
+            if cp_size_chunkwise > 1:
+                self._validate_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, "contiguous"
+                )
+            elif cp_size_headwise > 1:
+                self._validate_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, "zigzag"
+                )
 
             # Resolve cu_seqlens with alignment padding handling.
             # cu_seqlens in packed_seq_params is the global (pre-CP-split) cu_seqlens, so we
@@ -395,14 +413,14 @@ class GatedDeltaNet(MegatronModule):
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
-                cp_size=self.cp_size,
+                cp_size=cp_size_chunkwise,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len_global,
                 "cu_seqlens_kv",
-                cp_size=self.cp_size,
+                cp_size=cp_size_chunkwise,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
@@ -923,6 +941,19 @@ class GatedDeltaNet(MegatronModule):
             )
 
         return cu_seqlens
+
+    def _validate_packed_seq_params_cp_partition_mode(
+        self, packed_seq_params: PackedSeqParams, expected_cp_partition_mode: str
+    ) -> None:
+        """Ensure block-level CP layout conversion satisfied GDN's THD layout contract."""
+        actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+        if actual_cp_partition_mode != expected_cp_partition_mode:
+            raise ValueError(
+                f"GatedDeltaNet with linear_cp_mode={self.config.linear_cp_mode!r} requires "
+                f"cp_partition_mode={expected_cp_partition_mode!r}, but packed_seq_params has "
+                f"{actual_cp_partition_mode!r}. CP partition conversion must be handled before "
+                "calling GatedDeltaNet."
+            )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

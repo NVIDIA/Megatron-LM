@@ -102,8 +102,10 @@ def get_required_cp_partition_mode_for_layer(
         return None
     if "GatedDeltaNet" in module_type_names:
         mode = getattr(config, "linear_cp_mode", "chunkwise")
-        if mode in {"chunkwise", "headwise"}:
+        if mode == "chunkwise":
             return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
         raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
     if module_type_names & {"DSv4HybridAttention", "DSv4HybridSelfAttention"}:
         return "contiguous"

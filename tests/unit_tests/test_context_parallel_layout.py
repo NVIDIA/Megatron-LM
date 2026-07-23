@@ -5,7 +5,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state
 import megatron.core.context_parallel_layout as context_parallel_layout
+from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.context_parallel_layout import (
     build_thd_cp_partition_route,
     build_cp_partition_mode_plan,
@@ -22,6 +24,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_stage_input_cp_partition_mode,
 )
+from tests.unit_tests.test_utilities import Utils
 
 
 class _PipelineLayout:
@@ -56,6 +59,18 @@ class _FakeGroup:
 
 def _token_ranges(*spans):
     return [token for start, end in spans for token in range(start, end)]
+
+
+def _make_sequence_tensor(total_seq_len, seq_dim, device):
+    if seq_dim == 0:
+        shape = (total_seq_len, 3, 5)
+    elif seq_dim == 1:
+        shape = (3, total_seq_len, 5)
+    else:
+        raise ValueError(f"Unsupported test seq_dim {seq_dim}.")
+    return torch.arange(torch.prod(torch.tensor(shape)), device=device, dtype=torch.float32).view(
+        *shape
+    )
 
 
 def test_context_parallel_layout_chunk_indices():
@@ -172,6 +187,95 @@ def test_thd_cp_partition_route_reassembles_target_layout(
         assert torch.equal(out, target_indices[dst_rank])
 
 
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+@pytest.mark.parametrize("seq_dim", [0, 1])
+def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
+    source_layout, target_layout, seq_dim
+):
+    if not torch.cuda.is_available() or Utils.world_size < 2:
+        pytest.skip("SBHD CP partition-mode conversion needs at least two CUDA ranks.")
+
+    cp_size = 2
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    try:
+        cp_group = parallel_state.get_context_parallel_group()
+        full_tensor = _make_sequence_tensor(
+            total_seq_len=32,
+            seq_dim=seq_dim,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+        )
+        source_shard = get_pos_emb_on_this_cp_rank(
+            full_tensor, seq_dim, cp_group, cp_partition_mode=source_layout
+        )
+
+        converted = context_parallel_layout.convert_cp_partition_mode(
+            source_shard,
+            cp_group,
+            source_partition_mode=source_layout,
+            target_partition_mode=target_layout,
+            seq_dim=seq_dim,
+        )
+        expected = get_pos_emb_on_this_cp_rank(
+            full_tensor, seq_dim, cp_group, cp_partition_mode=target_layout
+        )
+
+        torch.testing.assert_close(converted, expected, atol=0.0, rtol=0.0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+@pytest.mark.parametrize("seq_dim", [0, 1])
+def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
+    source_layout, target_layout, seq_dim
+):
+    if not torch.cuda.is_available() or Utils.world_size < 2:
+        pytest.skip("SBHD CP partition-mode conversion backward needs at least two CUDA ranks.")
+
+    cp_size = 2
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    try:
+        cp_group = parallel_state.get_context_parallel_group()
+        full_tensor = _make_sequence_tensor(
+            total_seq_len=32,
+            seq_dim=seq_dim,
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+        )
+        full_upstream_grad = full_tensor.mul(0.125).add(1.0)
+        source_shard = (
+            get_pos_emb_on_this_cp_rank(
+                full_tensor, seq_dim, cp_group, cp_partition_mode=source_layout
+            )
+            .detach()
+            .requires_grad_(True)
+        )
+
+        converted = context_parallel_layout.convert_cp_partition_mode(
+            source_shard,
+            cp_group,
+            source_partition_mode=source_layout,
+            target_partition_mode=target_layout,
+            seq_dim=seq_dim,
+        )
+        target_upstream_grad = get_pos_emb_on_this_cp_rank(
+            full_upstream_grad, seq_dim, cp_group, cp_partition_mode=target_layout
+        )
+        converted.mul(target_upstream_grad).sum().backward()
+        expected_source_grad = get_pos_emb_on_this_cp_rank(
+            full_upstream_grad, seq_dim, cp_group, cp_partition_mode=source_layout
+        )
+
+        torch.testing.assert_close(source_shard.grad, expected_source_grad, atol=0.0, rtol=0.0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_thd_cp_partition_route_cache_reuses_same_microbatch_route():
     packed_seq_params = SimpleNamespace(
         qkv_format="thd",
@@ -279,6 +383,21 @@ def test_required_partition_mode_rejects_unknown_layer_type():
         get_required_cp_partition_mode_for_layer(object(), SimpleNamespace(cp_comm_type=None))
 
 
+@pytest.mark.parametrize(
+    ("linear_cp_mode", "expected_partition_mode"),
+    [("chunkwise", "contiguous"), ("headwise", "zigzag")],
+)
+def test_gated_delta_net_layer_layout_policy_follows_cp_mode(
+    linear_cp_mode, expected_partition_mode
+):
+    config = SimpleNamespace(cp_comm_type=None, linear_cp_mode=linear_cp_mode)
+
+    assert (
+        get_required_cp_partition_mode_for_layer(GatedDeltaNet(), config)
+        == expected_partition_mode
+    )
+
+
 def test_build_cp_partition_mode_plan_requires_stage_entry_layout():
     config = SimpleNamespace(
         context_parallel_size=2, dynamic_context_parallel=False, cp_comm_type=None
@@ -339,7 +458,7 @@ def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern(
     )
 
 
-def test_gated_delta_net_headwise_layout_plan_uses_contiguous():
+def test_gated_delta_net_headwise_layout_plan_uses_zigzag():
     config = SimpleNamespace(
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1, 0],
@@ -351,7 +470,7 @@ def test_gated_delta_net_headwise_layout_plan_uses_contiguous():
 
     assert (
         get_experimental_attention_variant_stage_input_cp_partition_mode(config)
-        == "contiguous"
+        == "zigzag"
     )
 
 
@@ -369,6 +488,12 @@ def test_hybrid_stage_input_layout_uses_future_layer_before_first_sensitive_laye
     assert get_hybrid_stage_input_cp_partition_mode(config, "-G", 0) == "contiguous"
 
 
+def test_hybrid_stage_input_layout_preserves_headwise_gdn_zigzag():
+    config = SimpleNamespace(experimental_attention_variant=None, linear_cp_mode="headwise")
+
+    assert get_hybrid_stage_input_cp_partition_mode(config, "-G", 0) == "zigzag"
+
+
 def test_hybrid_stage_input_layout_handles_dsv4_symbols():
     config = SimpleNamespace(
         experimental_attention_variant="dsv4_hybrid", linear_cp_mode="chunkwise"
@@ -376,3 +501,10 @@ def test_hybrid_stage_input_layout_handles_dsv4_symbols():
 
     assert get_hybrid_stage_input_cp_partition_mode(config, "D-E", 0) == "contiguous"
     assert get_hybrid_stage_input_cp_partition_mode(config, "C-E", 0) == "contiguous"
+
+
+def test_hybrid_stage_input_layout_without_sensitive_layer_returns_none():
+    config = SimpleNamespace(experimental_attention_variant=None, linear_cp_mode="chunkwise")
+
+    assert get_hybrid_stage_input_cp_partition_mode(config, "-E-", 0) is None
+    assert get_hybrid_stage_input_cp_partition_mode(config, "-E-", 3) is None

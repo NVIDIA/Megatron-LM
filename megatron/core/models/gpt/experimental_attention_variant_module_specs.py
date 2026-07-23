@@ -435,7 +435,7 @@ def get_experimental_attention_variant_layer_cp_partition_mode_pattern(
 
 def get_experimental_attention_variant_stage_input_cp_partition_mode(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
-) -> CpPartitionMode:
+) -> Optional[CpPartitionMode]:
     """Return the CP partition mode expected at one experimental GPT stage input."""
     layer_layouts = get_experimental_attention_variant_layer_cp_partition_mode_pattern(config)
 
@@ -461,7 +461,7 @@ def get_experimental_attention_variant_stage_input_cp_partition_mode(
                 current_partition_mode = required_partition_mode
                 break
 
-    return current_partition_mode or "zigzag"
+    return current_partition_mode
 
 
 def _get_experimental_attention_variant_cp_partition_mode(
@@ -470,8 +470,10 @@ def _get_experimental_attention_variant_cp_partition_mode(
     """Return the CP partition mode required by the experimental attention variant."""
     if config.experimental_attention_variant == "gated_delta_net":
         mode = getattr(config, "linear_cp_mode", "chunkwise")
-        if mode in {"chunkwise", "headwise"}:
+        if mode == "chunkwise":
             return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
         raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
     if config.experimental_attention_variant == "dsv4_hybrid":
         return "contiguous"

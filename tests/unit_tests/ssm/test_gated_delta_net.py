@@ -14,6 +14,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -1148,7 +1149,528 @@ def test_parallel_gated_delta_net_correctness(
         sequence_length=256,
         micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
+        cp_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
+        cp_stage_entry_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
+        compare_param_grads=is_chunkwise_cp and tp == 1 and not sequence_packing,
     )
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+@pytest.mark.parametrize("cp", [2, 4])
+def test_mixed_gdn_sdpa_gpt_model_cp_boundary_forward_backward_correctness(
+    tmp_path_dist_ckpt, cp
+):
+    if not torch.cuda.is_available() or Utils.world_size < cp:
+        pytest.skip(f"Mixed GDN/SDPA CP parity needs at least {cp} CUDA ranks.")
+
+    sequence_length = 64
+    micro_batch_size = 1
+    vocab_size = 128
+    seed = 123
+
+    def make_config(context_parallel_size):
+        return TransformerConfig(
+            hidden_size=128,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=4,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=4,
+            linear_cp_mode="chunkwise",
+            transformer_impl="transformer_engine",
+            context_parallel_size=context_parallel_size,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+
+    def initialize_gpt_model(
+        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
+    ):
+        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=config, vp_stage=vp_stage, pp_rank=0
+        )
+        cp_stage_entry_partition_mode = (
+            get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        )
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=sequence_length,
+            pre_process=pre_process,
+            post_process=post_process,
+            position_embedding_type="rope",
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
+        )
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    input_ids = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(micro_batch_size, sequence_length),
+        device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+    )
+    position_ids = torch.arange(
+        sequence_length, device=input_ids.device, dtype=torch.long
+    ).unsqueeze(0)
+    labels = (input_ids + 1) % vocab_size
+
+    def _get_param_grad(param):
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is None:
+            param.grad = torch.zeros_like(param)
+            grad = param.grad
+        return grad
+
+    def _scale_grads(model, scale):
+        for param in model.parameters():
+            if param.requires_grad:
+                _get_param_grad(param).data.mul_(scale)
+
+    def _all_reduce_grads(model, group):
+        for param in model.parameters():
+            if param.requires_grad:
+                torch.distributed.all_reduce(_get_param_grad(param), group=group)
+
+    def _collect_grads(model):
+        return {
+            name: _get_param_grad(param).detach().float().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+    def _zero_grads(model):
+        for param in model.parameters():
+            param.grad = None
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is not None:
+                main_grad.zero_()
+
+    with TempNamedDir(tmp_path_dist_ckpt / 'test_mixed_gdn_sdpa_gpt_cp', sync=True) as ckpt_dir:
+        mock_args = parse_args(ignore_unknown_args=True)
+        set_args(mock_args)
+
+        baseline_config = make_config(context_parallel_size=1)
+        init_basic_mock_args(mock_args, 1, 1, bf16=True)
+        mock_args.context_parallel_size = 1
+        baseline_model = unwrap_model(get_model(initialize_gpt_model, config=baseline_config))
+        baseline_model[0].eval()
+
+        init_checkpointing_mock_args(mock_args, ckpt_dir, False)
+        mock_args.no_save_optim = True
+        mock_args.no_save_rng = True
+        mock_args.no_load_optim = True
+        mock_args.no_load_rng = True
+        save_checkpoint(10, baseline_model, None, None, 0)
+
+        _zero_grads(baseline_model[0])
+        baseline_loss = baseline_model[0](
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            labels=labels,
+        )
+        baseline_loss.float().sum().backward()
+        _scale_grads(baseline_model[0], 1.0 / baseline_loss.numel())
+        baseline_grads = _collect_grads(baseline_model[0])
+        baseline_loss = baseline_loss.detach()
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp
+        )
+        model_parallel_cuda_manual_seed(seed)
+        parallel_config = make_config(context_parallel_size=cp)
+        init_basic_mock_args(mock_args, 1, 1, bf16=True)
+        mock_args.context_parallel_size = cp
+        parallel_model = unwrap_model(get_model(initialize_gpt_model, config=parallel_config))
+        parallel_model[0].eval()
+        with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
+            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
+                load_checkpoint(parallel_model, None, None)
+
+        cp_group = parallel_state.get_context_parallel_group()
+        input_partition_mode = parallel_model[0].get_input_cp_partition_mode()
+        assert input_partition_mode == "contiguous"
+
+        local_input_ids = get_tensor_on_this_cp_rank(
+            input_ids, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        local_position_ids = get_tensor_on_this_cp_rank(
+            position_ids, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        local_labels = get_tensor_on_this_cp_rank(
+            labels, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        _zero_grads(parallel_model[0])
+        parallel_loss = parallel_model[0](
+            input_ids=local_input_ids,
+            position_ids=local_position_ids,
+            attention_mask=None,
+            labels=local_labels,
+        )
+
+        expected_loss = get_tensor_on_this_cp_rank(
+            baseline_loss, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        torch.testing.assert_close(
+            parallel_loss.float(), expected_loss.float(), atol=2e-3, rtol=2e-3
+        )
+
+        parallel_loss.float().sum().backward()
+        _all_reduce_grads(parallel_model[0], cp_group)
+        _scale_grads(parallel_model[0], 1.0 / baseline_loss.numel())
+        parallel_grads = _collect_grads(parallel_model[0])
+
+        assert baseline_grads.keys() == parallel_grads.keys()
+        for name, baseline_grad in baseline_grads.items():
+            torch.testing.assert_close(
+                parallel_grads[name],
+                baseline_grad,
+                atol=2e-3,
+                rtol=2e-3,
+                msg=lambda msg, param_name=name: f"gradient mismatch for {param_name}: {msg}",
+            )
+
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+@pytest.mark.parametrize("cp", [2, 4])
+def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
+    tmp_path_dist_ckpt, cp
+):
+    if not torch.cuda.is_available() or Utils.world_size < cp:
+        pytest.skip(f"Mixed GDN/SDPA CP parity needs at least {cp} CUDA ranks.")
+
+    sequence_length = 8192
+    micro_batch_size = 1
+    num_microbatches = 8
+    vocab_size = 32768
+    seed = 123
+
+    def make_config(context_parallel_size):
+        return TransformerConfig(
+            hidden_size=4096,
+            ffn_hidden_size=10240,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_num_value_heads=64,
+            num_layers=4,
+            normalization="RMSNorm",
+            layernorm_epsilon=1e-6,
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=32,
+            kv_channels=256,
+            num_query_groups=2,
+            qk_layernorm=True,
+            attention_output_gate=True,
+            activation_func=F.silu,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=4,
+            linear_cp_mode="chunkwise",
+            transformer_impl="transformer_engine",
+            context_parallel_size=context_parallel_size,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            calculate_per_token_loss=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+
+    def initialize_gpt_model(
+        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
+    ):
+        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=config, vp_stage=vp_stage, pp_rank=0
+        )
+        cp_stage_entry_partition_mode = (
+            get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        )
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=sequence_length,
+            pre_process=pre_process,
+            post_process=post_process,
+            position_embedding_type="rope",
+            rotary_percent=0.25,
+            rotary_base=10000000,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
+        )
+
+    def _get_param_grad(param):
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is None:
+            param.grad = torch.zeros_like(param)
+            grad = param.grad
+        return grad
+
+    def _scale_grads(model, scale):
+        for param in model.parameters():
+            if param.requires_grad:
+                _get_param_grad(param).data.mul_(scale)
+
+    def _all_reduce_grads(model, group):
+        for param in model.parameters():
+            if param.requires_grad:
+                torch.distributed.all_reduce(_get_param_grad(param), group=group)
+
+    def _collect_grads(model):
+        return {
+            name: _get_param_grad(param).detach().float().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+    def _grad_norm_from_grads(grads):
+        total = torch.zeros([], device=input_ids_list[0].device, dtype=torch.float64)
+        for grad in grads.values():
+            total += grad.double().pow(2).sum()
+        return total.sqrt()
+
+    def _zero_grads(model):
+        for param in model.parameters():
+            param.grad = None
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is not None:
+                main_grad.zero_()
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    input_ids_list = [
+        torch.randint(
+            low=0,
+            high=vocab_size,
+            size=(micro_batch_size, sequence_length),
+            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+        )
+        for _ in range(num_microbatches)
+    ]
+    valid_lengths = [
+        sequence_length,
+        7013,
+        6144,
+        4097,
+        4096,
+        3073,
+        2048,
+        1025,
+    ]
+    prompt_lengths = [
+        0,
+        123,
+        2345,
+        2049,
+        3071,
+        17,
+        1023,
+        1000,
+    ]
+    loss_mask_list = []
+    for input_ids, valid_length, prompt_length in zip(
+        input_ids_list, valid_lengths, prompt_lengths
+    ):
+        assert 0 <= prompt_length < valid_length
+        input_ids[:, valid_length:] = 0
+        loss_mask = torch.zeros(
+            (micro_batch_size, sequence_length),
+            device=input_ids.device,
+            dtype=torch.float32,
+        )
+        loss_mask[:, prompt_length:valid_length] = 1.0
+        loss_mask_list.append(loss_mask)
+    position_ids = torch.arange(
+        sequence_length, device=input_ids_list[0].device, dtype=torch.long
+    ).unsqueeze(0)
+    labels_list = []
+    for input_ids, valid_length, prompt_length in zip(
+        input_ids_list, valid_lengths, prompt_lengths
+    ):
+        labels = (input_ids + 1) % vocab_size
+        labels[:, :prompt_length] = -100
+        labels[:, valid_length:] = 0
+        labels_list.append(labels)
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / 'test_mixed_gdn_sdpa_gpt_cp_accumulated', sync=True
+    ) as ckpt_dir:
+        mock_args = parse_args(ignore_unknown_args=True)
+        set_args(mock_args)
+
+        baseline_config = make_config(context_parallel_size=1)
+        init_basic_mock_args(mock_args, 1, 1, bf16=True)
+        mock_args.context_parallel_size = 1
+        baseline_model = unwrap_model(get_model(initialize_gpt_model, config=baseline_config))
+        baseline_model[0].train()
+
+        init_checkpointing_mock_args(mock_args, ckpt_dir, False)
+        mock_args.no_save_optim = True
+        mock_args.no_save_rng = True
+        mock_args.no_load_optim = True
+        mock_args.no_load_rng = True
+        save_checkpoint(10, baseline_model, None, None, 0)
+
+        _zero_grads(baseline_model[0])
+        baseline_losses = []
+        total_tokens = 0.0
+        for input_ids, labels, loss_mask in zip(input_ids_list, labels_list, loss_mask_list):
+            baseline_loss = baseline_model[0](
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                labels=labels,
+            )
+            baseline_losses.append(baseline_loss.detach())
+            total_tokens += loss_mask.sum().item()
+            (baseline_loss.float() * loss_mask).sum().backward()
+        _scale_grads(baseline_model[0], 1.0 / total_tokens)
+        baseline_grads = _collect_grads(baseline_model[0])
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp
+        )
+        model_parallel_cuda_manual_seed(seed)
+        parallel_config = make_config(context_parallel_size=cp)
+        init_basic_mock_args(mock_args, 1, 1, bf16=True)
+        mock_args.context_parallel_size = cp
+        parallel_model = unwrap_model(get_model(initialize_gpt_model, config=parallel_config))
+        parallel_model[0].train()
+        with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
+            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
+                load_checkpoint(parallel_model, None, None)
+
+        cp_group = parallel_state.get_context_parallel_group()
+        input_partition_mode = parallel_model[0].get_input_cp_partition_mode()
+        assert input_partition_mode in ("contiguous", "zigzag")
+
+        local_position_ids = get_tensor_on_this_cp_rank(
+            position_ids, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        _zero_grads(parallel_model[0])
+        for input_ids, labels, loss_mask, baseline_loss in zip(
+            input_ids_list, labels_list, loss_mask_list, baseline_losses
+        ):
+            local_input_ids = get_tensor_on_this_cp_rank(
+                input_ids, 1, cp_group, cp_partition_mode=input_partition_mode
+            )
+            local_labels = get_tensor_on_this_cp_rank(
+                labels, 1, cp_group, cp_partition_mode=input_partition_mode
+            )
+            local_loss_mask = get_tensor_on_this_cp_rank(
+                loss_mask, 1, cp_group, cp_partition_mode=input_partition_mode
+            )
+            parallel_loss = parallel_model[0](
+                input_ids=local_input_ids,
+                position_ids=local_position_ids,
+                attention_mask=None,
+                labels=local_labels,
+            )
+
+            expected_loss = get_tensor_on_this_cp_rank(
+                baseline_loss, 1, cp_group, cp_partition_mode=input_partition_mode
+            )
+            loss_diff = (parallel_loss.float() - expected_loss.float()).abs()
+            masked_loss_diff = loss_diff * local_loss_mask
+            local_valid_tokens = local_loss_mask.sum()
+            if local_valid_tokens.item() > 0:
+                local_loss_max = loss_diff[local_loss_mask.bool()].max()
+            else:
+                local_loss_max = torch.zeros([], device=loss_diff.device)
+            local_loss_stats = torch.tensor(
+                [
+                    (parallel_loss.float() * local_loss_mask).sum().item(),
+                    (expected_loss.float() * local_loss_mask).sum().item(),
+                    masked_loss_diff.sum().item(),
+                    local_valid_tokens.item(),
+                ],
+                device=parallel_loss.device,
+            )
+            torch.distributed.all_reduce(local_loss_stats, group=cp_group)
+            torch.distributed.all_reduce(
+                local_loss_max, op=torch.distributed.ReduceOp.MAX, group=cp_group
+            )
+            parallel_avg = local_loss_stats[0] / local_loss_stats[3].clamp(min=1)
+            expected_avg = local_loss_stats[1] / local_loss_stats[3].clamp(min=1)
+            mean_abs = local_loss_stats[2] / local_loss_stats[3].clamp(min=1)
+            if torch.distributed.get_rank(group=cp_group) == 0:
+                print(
+                    "CP_LOSS_DIAG "
+                    f"input_partition_mode={input_partition_mode} "
+                    f"parallel_avg={parallel_avg.item():.8f} "
+                    f"expected_avg={expected_avg.item():.8f} "
+                    f"avg_diff={(parallel_avg - expected_avg).abs().item():.8f} "
+                    f"mean_abs={mean_abs.item():.8f} "
+                    f"max_abs={local_loss_max.item():.8f}",
+                    flush=True,
+                )
+            torch.testing.assert_close(
+                parallel_avg, expected_avg, atol=2e-3, rtol=2e-3
+            )
+            (parallel_loss.float() * local_loss_mask).sum().backward()
+
+        _all_reduce_grads(parallel_model[0], cp_group)
+        _scale_grads(parallel_model[0], 1.0 / total_tokens)
+        parallel_grads = _collect_grads(parallel_model[0])
+        baseline_grad_norm = _grad_norm_from_grads(baseline_grads)
+        parallel_grad_norm = _grad_norm_from_grads(parallel_grads)
+        if torch.distributed.get_rank(group=cp_group) == 0:
+            print(
+                "CP_GRAD_DIAG "
+                f"baseline_norm={baseline_grad_norm.item():.8f} "
+                f"parallel_norm={parallel_grad_norm.item():.8f} "
+                f"abs_diff={(baseline_grad_norm - parallel_grad_norm).abs().item():.8f}",
+                flush=True,
+            )
+
+        assert baseline_grads.keys() == parallel_grads.keys()
+        for name, baseline_grad in baseline_grads.items():
+            torch.testing.assert_close(
+                parallel_grads[name],
+                baseline_grad,
+                atol=2e-3,
+                rtol=2e-3,
+                msg=lambda msg, param_name=name: f"gradient mismatch for {param_name}: {msg}",
+            )
+
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("cp_size", [2, 4], scope="class")
