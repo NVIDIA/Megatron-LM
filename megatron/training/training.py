@@ -2016,6 +2016,18 @@ def setup_model_and_optimizer(
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
 
+    if args.context_parallel_attention_backend == 'nvshmem':
+        from megatron.core.transformer.nvshmem_cp_attention import (
+            configure_nvshmem_cp_backend,
+            eager_initialize_nvshmem_cp_backend_if_enabled,
+            validate_nvshmem_cp_microbatch_contract,
+        )
+
+        configure_nvshmem_cp_backend()
+        validate_nvshmem_cp_microbatch_contract(get_num_microbatches())
+        if eager_initialize_nvshmem_cp_backend_if_enabled():
+            print_rank_0("Initialized experimental NVSHMEM CP backend before model construction")
+
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
@@ -2043,6 +2055,19 @@ def setup_model_and_optimizer(
             return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
 
     model = _build_model_wrapper(wrap_with_ddp)
+    if args.context_parallel_attention_backend == 'nvshmem':
+        from megatron.core.transformer.nvshmem_cp_attention import (
+            eager_allocate_nvshmem_cp_workspaces_if_enabled,
+        )
+
+        workspace_count = eager_allocate_nvshmem_cp_workspaces_if_enabled(
+            model,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+        )
+        print_rank_0(
+            f"Collectively preallocated {workspace_count} experimental NVSHMEM CP workspaces"
+        )
     unwrapped_model = unwrap_model(model)
 
     if args.logits_save_dir is not None:

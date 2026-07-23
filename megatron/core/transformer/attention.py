@@ -1352,6 +1352,26 @@ class Attention(MegatronModule, ABC):
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
 
+        if self.config.context_parallel_attention_backend == 'nvshmem':
+            from megatron.core.transformer.nvshmem_cp_fa_owner import (
+                nvshmem_cp_symmetric_qkv_self_attention_forward,
+            )
+
+            return nvshmem_cp_symmetric_qkv_self_attention_forward(
+                module=self,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                key_value_states=key_value_states,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+
         # =====================
         # Query, Key, and Value
         # =====================
