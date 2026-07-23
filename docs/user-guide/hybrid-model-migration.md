@@ -92,10 +92,11 @@ different tensor, pipeline, expert, or FSDP layout on the following load.
 Load-time translation is handled by
 [`megatron/core/models/hybrid/gpt_checkpoint_interop.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/models/hybrid/gpt_checkpoint_interop.py).
 It triggers automatically when a non-hybrid (GPT) checkpoint is loaded into a
-`HybridModel` run: the run's sharded state dict is rewritten into the GPT
-checkpoint's homogeneous-layer format, the checkpoint is read directly, and the
-weights are resharded to the current TP/PP/EP/ETP layout. No conversion tool is
-run, and the GPT checkpoint on disk is never modified.
+`HybridModel` run: the run's model (and, by default, optimizer) sharded state
+dict is rewritten into the GPT checkpoint's homogeneous-layer format, the
+checkpoint is read directly, and the weights and optimizer state are resharded
+to the current TP/PP/EP/ETP layout. No conversion tool is run, and the GPT
+checkpoint on disk is never modified.
 
 The reverse mismatch is an error: loading a checkpoint that was saved by a
 hybrid run into a non-hybrid run raises a `RuntimeError` that directs you to the
@@ -107,12 +108,28 @@ When the hybrid run loads a GPT checkpoint, it must set:
 
 - `--hybrid-layer-pattern` — pairs the checkpoint's layers with hybrid layer
   positions. Without it the load is rejected.
-- `--finetune` and `--no-load-optim` — hybrid layers without a GPT counterpart
-  keep their fresh initialization, and the GPT run's optimizer state and
-  iteration bookkeeping do not carry over. The load is rejected if either flag
-  is missing.
+- `--finetune` — the hybrid architecture has a different layer count than the
+  GPT checkpoint, so iteration bookkeeping and the LR schedule restart fresh.
+  The load is rejected without it.
 - `--pretrained-checkpoint` pointing at the GPT checkpoint root (see
   [Section 3](#3-how-to-train-a-model)).
+
+By default the GPT run's **optimizer state is also translated and loaded** —
+Adam moments and fp32 master params for the attention and MLP layers carry over,
+enabling architecture-preserving continued training. Pass `--no-load-optim` to
+skip this and start every layer's optimizer state fresh.
+
+Loading optimizer state requires the GPT checkpoint to use a model-space
+distributed-optimizer format (`fully_reshardable` or `fully_sharded_model_space`,
+i.e. saved with `--ckpt-fully-parallel-save`). The bucket-space formats key
+optimizer state by a flat buffer layout that the extra hybrid layers reshuffle,
+so the run raises an error directing you to re-save the checkpoint or pass
+`--no-load-optim`.
+
+Layers without a GPT counterpart (for example Mamba `M` positions) have no
+optimizer state in the checkpoint; their moments start fresh, and the run prints
+a warning naming how many layers are affected. Everything else — iteration
+count, LR schedule, RNG, and rerun state — restarts fresh under `--finetune`.
 
 #### Supported patterns and key mapping
 
@@ -143,10 +160,9 @@ The checkpoint's `num_layers` must equal the number of `*` positions in the
 pattern; a mismatch is rejected.
 
 ```{warning}
-Like the offline tool, this is a weights-only load: sharded optimizer, RNG,
-rerun, and Transformer Engine `_extra_state` state are not carried over from the
-GPT run. The `--finetune` and `--no-load-optim` flags are required precisely
-because the model starts with a fresh optimizer and RNG state.
+Optimizer loading warm-starts the Adam moments and fp32 master params only; RNG,
+rerun, iteration, and LR-schedule state restart fresh under `--finetune`. Pass
+`--no-load-optim` for a pure weights-only load (as the offline tool produces).
 ```
 
 ### Option B: Convert offline with `gpt_hybrid_conversion.py`
@@ -253,13 +269,15 @@ Start with the command that trained the GPT model and make these changes:
    training checkpoints to a separate directory:
    - With **Option A (load-time translation)**, point
      `--pretrained-checkpoint` directly at the *GPT* checkpoint and add
-     `--finetune --no-load-optim`. No offline conversion is needed.
+     `--finetune`. The optimizer state is loaded by default; add
+     `--no-load-optim` only if you want a fresh optimizer. No offline conversion
+     is needed.
    - With **Option B (offline conversion)**, point `--pretrained-checkpoint` at
      the converted *hybrid* checkpoint. Set `--ckpt-format` to the converter's
      `torch_dist` or `fsdp_dtensor` output format.
 
-A minimal Option A migration — loading the GPT checkpoint directly — looks like
-this:
+A minimal Option A migration — loading the GPT checkpoint and its optimizer
+state directly for architecture-preserving continued training — looks like this:
 
 ```diff
 - torchrun --nproc_per_node=8 pretrain_gpt.py \
@@ -271,14 +289,13 @@ this:
 +     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
 +     --pretrained-checkpoint /path/to/gpt-checkpoints \  # first-time only
 +     --finetune \
-+     --no-load-optim \
 +     --load /path/to/new-training-checkpoints \
 +     --save /path/to/new-training-checkpoints
 ```
 
 For Option B, point `--pretrained-checkpoint` at the converted hybrid
-checkpoint instead; `--finetune` and `--no-load-optim` are not required because
-the converted checkpoint already matches the hybrid layout.
+checkpoint instead; `--finetune` is not required because the converted
+checkpoint already matches the hybrid layout.
 
 Keep the existing architecture, optimizer, precision, data, and basic
 TP/DP/EP/CP arguments unless this guide identifies a required change. Review
@@ -290,10 +307,12 @@ A GPT training workflow that uses fill-in-the-middle data needs a custom dataset
 path or equivalent Hybrid entry-point support before migration.
 ```
 
-With an empty `--load` directory, `--pretrained-checkpoint` loads the converted
-weights with finetuning semantics: iteration starts at zero, and optimizer and
-RNG state are not restored. After the job writes a checkpoint to `--load`, later
-launches resume the new HybridModel training state normally.
+With an empty `--load` directory, `--pretrained-checkpoint` loads the pretrained
+weights with finetuning semantics: iteration starts at zero and RNG state is not
+restored. For Option A the optimizer state is still warm-started unless
+`--no-load-optim` is set (Option B always starts with a fresh optimizer). After
+the job writes a checkpoint to `--load`, later launches resume the new
+HybridModel training state normally.
 
 ### Train from scratch
 

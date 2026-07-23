@@ -13,6 +13,9 @@ Covers the load-time sharded state dict retargeting in
   counterpart keep their fresh initialization.
 """
 
+from functools import partial
+from unittest import mock
+
 import pytest
 import torch
 
@@ -39,7 +42,13 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.arguments import parse_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.dist_checkpointing.utils import (
+    init_checkpointing_mock_args,
+    setup_model_and_optimizer,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -177,6 +186,63 @@ class TestRetargetShardedStateDict:
         sharded_sd = {'bad': _sharded_tensor('decoder.layers.7.self_attention.linear_qkv.weight')}
         with pytest.raises(ValueError, match='not part of the hybrid layer pattern'):
             retarget_sharded_state_dict_to_gpt_checkpoint(sharded_sd, maps)
+
+    def test_optimizer_state_entries_retarget_like_the_model(self):
+        # The distributed optimizer's model-space sharded state dict embeds the
+        # model key under ``optimizer.state.<state>.<model_key>`` and mirrors the
+        # model param's sharding, so the same retargeting must point the moments
+        # and fp32 master params at the GPT checkpoint and keep fresh-layer
+        # optimizer state local.
+        maps = gpt_compatible_layer_maps('M*-')
+        fresh_exp_avg = torch.full((4,), 3.0)
+        optim_sd = {
+            'param_state': {
+                # attention position (hybrid layer 1 -> GPT layer 0)
+                0: {
+                    'exp_avg': _sharded_tensor(
+                        'optimizer.state.exp_avg.decoder.layers.1.self_attention.linear_qkv.weight'
+                    ),
+                    'fp32_param': _sharded_tensor(
+                        'optimizer.state.fp32_param.decoder.layers.1.self_attention.linear_qkv.weight'
+                    ),
+                },
+                # MLP position (hybrid layer 2 -> GPT layer 0)
+                1: {
+                    'exp_avg_sq': _sharded_tensor(
+                        'optimizer.state.exp_avg_sq.decoder.layers.2.mlp.linear_fc1.weight'
+                    )
+                },
+                # fresh Mamba position (hybrid layer 0) -> stays local
+                2: {
+                    'exp_avg': ShardedTensor.from_rank_offsets(
+                        'optimizer.state.exp_avg.decoder.layers.0.mixer.in_proj.weight',
+                        fresh_exp_avg,
+                    )
+                },
+            },
+            'param_state_sharding_type': 'fully_sharded_model_space',
+        }
+
+        retarget_sharded_state_dict_to_gpt_checkpoint(optim_sd, maps)
+
+        attn = optim_sd['param_state'][0]['exp_avg']
+        assert attn.key == 'optimizer.state.exp_avg.decoder.layers.self_attention.linear_qkv.weight'
+        assert attn.prepend_axis_num == 1
+        assert attn.global_shape == (1, 4)
+        assert attn.global_offset == (0, 0)
+        master = optim_sd['param_state'][0]['fp32_param']
+        assert (
+            master.key
+            == 'optimizer.state.fp32_param.decoder.layers.self_attention.linear_qkv.weight'
+        )
+        assert optim_sd['param_state'][1]['exp_avg_sq'].key == (
+            'optimizer.state.exp_avg_sq.decoder.layers.mlp.linear_fc1.weight'
+        )
+        fresh = optim_sd['param_state'][2]['exp_avg']
+        assert isinstance(fresh, LocalNonpersistentObject)
+        assert fresh.unwrap() is fresh_exp_avg
+        # Non-sharded bookkeeping is passed through untouched.
+        assert optim_sd['param_state_sharding_type'] == 'fully_sharded_model_space'
 
 
 def _base_config_kwargs(parallel, moe, glu):
@@ -366,3 +432,145 @@ class TestGPTToHybridLoad:
             assert not only_back, f'roundtrip produced keys missing from the GPT ckpt: {only_back}'
             assert not only_gpt, f'GPT ckpt keys not covered by the hybrid load: {only_gpt}'
             assert not mismatch, f'weights changed by the GPT->hybrid->GPT roundtrip: {mismatch}'
+
+
+# ---------------------------------------------------------------------------
+# End-to-end optimizer loading through save_checkpoint / load_checkpoint.
+# ---------------------------------------------------------------------------
+
+_OPT_HIDDEN = 256
+_OPT_HEADS = 8
+
+
+def _opt_provider_config(num_layers, **config_kwargs):
+    # get_model passes these through; they are not TransformerConfig fields.
+    for extra in ('pg_collection', 'config', 'vp_stage'):
+        config_kwargs.pop(extra, None)
+    return TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=_OPT_HIDDEN,
+        num_attention_heads=_OPT_HEADS,
+        use_cpu_initialization=True,
+        add_bias_linear=True,
+        gated_linear_unit=False,
+        **config_kwargs,
+    )
+
+
+def gpt_provider_for_opt(pre_process=True, post_process=True, *, seed=0, num_gpt_layers, **kw):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    return GPTModel(
+        config=_opt_provider_config(num_gpt_layers, **kw),
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+        position_embedding_type='rope',
+        share_embeddings_and_output_weights=True,
+    )
+
+
+def hybrid_provider_for_opt(pre_process=True, post_process=True, *, seed=0, pattern, **kw):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    num_layers = len(pattern.replace('|', ''))
+    return HybridModel(
+        config=_opt_provider_config(num_layers, **kw),
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=4,
+        hybrid_layer_pattern=pattern,
+        pre_process=pre_process,
+        post_process=post_process,
+        position_embedding_type='rope',
+        share_embeddings_and_output_weights=True,
+    )
+
+
+def _inner_optimizers(optimizer):
+    if hasattr(optimizer, 'chained_optimizers'):
+        return [o for opt in optimizer.chained_optimizers for o in _inner_optimizers(opt)]
+    inner = getattr(optimizer, 'optimizer', None)
+    return [inner] if inner is not None else []
+
+
+def _optimizer_moment_fingerprint(optimizer):
+    """Sum of norms of every floating-point optimizer-state tensor (per rank)."""
+    total = 0.0
+    for inner in _inner_optimizers(optimizer):
+        for state in inner.state.values():
+            for value in state.values():
+                if torch.is_tensor(value) and value.is_floating_point():
+                    total += value.detach().double().norm().item()
+    return total
+
+
+class TestGPTToHybridOptimizerLoad:
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize('pattern', ['*-*-', 'M*-M*-'])
+    def test_gpt_optimizer_state_loads_into_hybrid(self, tmp_path_dist_ckpt, pattern):
+        layer_maps = gpt_compatible_layer_maps(pattern)
+        num_gpt_layers = layer_maps.num_gpt_layers
+
+        Utils.initialize_model_parallel(1, 1)
+        with TempNamedDir(tmp_path_dist_ckpt / 'gpt_hybrid_opt_interop') as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            with mock.patch(
+                'megatron.training.checkpointing.get_args', new=lambda: mock_args
+            ):
+                # Build a GPT model + distributed optimizer whose Adam moments are
+                # seeded to random values, then save a full checkpoint.
+                gpt_model, gpt_optimizer = setup_model_and_optimizer(
+                    seed=2,
+                    tp=1,
+                    pp=1,
+                    initialize_fn=partial(
+                        gpt_provider_for_opt, num_gpt_layers=num_gpt_layers
+                    ),
+                )
+                init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
+                mock_args.use_distributed_optimizer = True
+                mock_args.hidden_size = _OPT_HIDDEN
+                mock_args.num_attention_heads = _OPT_HEADS
+                mock_args.num_layers = num_gpt_layers
+                save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
+                Utils.destroy_model_parallel()
+
+                # Build a hybrid model + optimizer (independently seeded moments) and
+                # load the GPT checkpoint, translating model and optimizer state.
+                Utils.initialize_model_parallel(1, 1)
+                hybrid_model, hybrid_optimizer = setup_model_and_optimizer(
+                    seed=4,
+                    tp=1,
+                    pp=1,
+                    initialize_fn=partial(hybrid_provider_for_opt, pattern=pattern),
+                )
+                fresh_snapshot = _snapshot_fresh_layers(hybrid_model, layer_maps)
+                moments_before = _optimizer_moment_fingerprint(hybrid_optimizer)
+
+                init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
+                mock_args.use_distributed_optimizer = True
+                mock_args.finetune = True  # required for a GPT->hybrid load
+                mock_args.hybrid_layer_pattern = pattern
+                mock_args.hidden_size = _OPT_HIDDEN
+                mock_args.num_attention_heads = _OPT_HEADS
+                mock_args.num_layers = len(pattern.replace('|', ''))
+
+                iteration, _ = load_checkpoint(hybrid_model, hybrid_optimizer, None)
+
+                # Finetune semantics: iteration restarts even though the optimizer
+                # moments were warm-started.
+                assert iteration == 0
+                # The optimizer state was actually loaded (GPT-sourced moments
+                # overwrite the freshly seeded ones).
+                moments_after = _optimizer_moment_fingerprint(hybrid_optimizer)
+                assert abs(moments_after - moments_before) > 1e-6, (
+                    'optimizer state does not appear to have been loaded'
+                )
+                # Layers without a GPT counterpart keep their fresh weights.
+                _assert_fresh_layers_untouched(hybrid_model, layer_maps, fresh_snapshot)

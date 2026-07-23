@@ -27,6 +27,18 @@ state dict is retargeted at load time:
 The retargeted sharded state dict is then handed to the regular
 ``dist_checkpointing.load`` machinery, which reads the GPT checkpoint
 directly and reshards across any TP/PP/EP/ETP layout change on the way.
+
+The same retargeting also applies to the distributed optimizer's sharded
+state dict. In the model-space checkpoint formats (``fully_reshardable`` /
+``fully_sharded_model_space``) every optimizer-state ``ShardedTensor`` is built
+by copying the corresponding model param's metadata and prefixing its ``key``
+with ``optimizer.state.<state>.`` (see
+``DistributedOptimizer.sharded_param_state_*``). Those entries therefore carry
+the same ``decoder.layers.<i>.`` keys and sharding as the model tensors, so
+:func:`retarget_sharded_state_dict_to_gpt_checkpoint` rewrites them onto the GPT
+checkpoint identically -- optimizer moments and fp32 master params for
+attention/MLP layers load from the GPT run, while fresh layers (e.g. Mamba)
+keep their freshly initialized optimizer state via ``LocalNonpersistentObject``.
 """
 
 import re
@@ -199,9 +211,15 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
     with no GPT counterpart are replaced by ``LocalNonpersistentObject`` so the
     loaded state dict returns their current (freshly initialized) values.
 
+    The same routine handles the distributed optimizer's sharded state dict: its
+    per-parameter entries embed the model key (``optimizer.state.<state>.decoder.
+    layers.<i>...``) and mirror the model param's sharding, so they retarget the
+    same way, and fresh-layer optimizer state is likewise kept local.
+
     Args:
-        sharded_state_dict: one model chunk's sharded state dict, as produced
-            by ``model.sharded_state_dict()``.
+        sharded_state_dict: one model chunk's sharded state dict (as produced by
+            ``model.sharded_state_dict()``) or the matching optimizer sharded
+            state dict.
         layer_maps: maps from :func:`gpt_compatible_layer_maps` derived from
             the same pattern the model was built with.
     """

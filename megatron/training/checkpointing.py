@@ -1703,10 +1703,12 @@ def load_args_from_checkpoint(
 def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     """Detect a GPT (pure transformer) checkpoint being loaded into a HybridModel run.
 
-    Returns the layer maps used to retarget the run's sharded state dict at the
-    GPT checkpoint's keys (see ``megatron.core.models.hybrid.gpt_checkpoint_interop``),
-    or None when checkpoint and runtime already agree. Raises RuntimeError for
-    combinations that cannot be loaded.
+    Returns ``(layer_maps, load_optim)`` where ``layer_maps`` is used to retarget
+    the run's sharded state dict at the GPT checkpoint's keys (see
+    ``megatron.core.models.hybrid.gpt_checkpoint_interop``) and ``load_optim`` is
+    True when the GPT optimizer state should be translated and loaded as well.
+    Returns ``(None, False)`` when checkpoint and runtime already agree. Raises
+    RuntimeError for combinations that cannot be loaded.
     """
     from megatron.core.models.hybrid.gpt_checkpoint_interop import gpt_compatible_layer_maps
     from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -1716,7 +1718,7 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         ckpt_args, 'hybrid_override_pattern', None
     )
     if runtime_is_hybrid == bool(ckpt_pattern):
-        return None
+        return None, False
     if not runtime_is_hybrid:
         raise RuntimeError(
             f"The checkpoint was saved by a hybrid model run (hybrid layer pattern "
@@ -1732,12 +1734,12 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
             "--hybrid-layer-pattern so checkpoint layers can be paired with "
             "hybrid layer positions."
         )
-    if not args.finetune or not args.no_load_optim:
+    if not args.finetune:
         raise RuntimeError(
-            "Loading a GPT checkpoint into a hybrid model requires --finetune and "
-            "--no-load-optim: hybrid layers without a GPT counterpart keep their "
-            "fresh initialization, so optimizer state and iteration bookkeeping "
-            "from the GPT run do not carry over."
+            "Loading a GPT checkpoint into a hybrid model requires --finetune: the "
+            "hybrid architecture has a different layer count than the GPT checkpoint, "
+            "so iteration bookkeeping and the LR schedule restart fresh. Optimizer "
+            "state is still translated and loaded unless --no-load-optim is set."
         )
     try:
         layer_maps = gpt_compatible_layer_maps(args.hybrid_layer_pattern)
@@ -1752,13 +1754,27 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
             f"has num_layers={ckpt_num_layers}."
         )
 
+    # The optimizer state is loaded unless the user opts out or the GPT run saved
+    # no optimizer state. Fresh layers (e.g. Mamba) have no counterpart in the GPT
+    # checkpoint, so their optimizer state stays freshly initialized; warn about it.
+    load_optim = not args.no_load_optim and not getattr(ckpt_args, 'no_save_optim', False)
+    if load_optim and layer_maps.fresh_init:
+        print_rank_0(
+            f"> WARNING: {len(layer_maps.fresh_init)} hybrid layer(s) have no GPT "
+            f"counterpart (e.g. Mamba positions); their weights and optimizer state "
+            f"start from a fresh initialization while the GPT-sourced attention and "
+            f"MLP layers load their optimizer state. Pass --no-load-optim to start "
+            f"every layer's optimizer state fresh."
+        )
+
     print_rank_0(
         f"> loading a GPT checkpoint into the hybrid model: {layer_maps.num_gpt_layers} "
         f"GPT layers feed {len(layer_maps.attention_to_gpt)} attention and "
         f"{len(layer_maps.mlp_to_gpt)} MLP positions; {len(layer_maps.fresh_init)} "
-        f"hybrid layers keep their fresh initialization."
+        f"hybrid layers keep their fresh initialization"
+        + ("; optimizer state will be loaded." if load_optim else "; optimizer state starts fresh.")
     )
-    return layer_maps
+    return layer_maps, load_optim
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
@@ -1816,6 +1832,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
+    # Whether a GPT->hybrid load should also translate and load the optimizer state.
+    # Only set in the torch_dist path below; referenced by the optimizer-load gate.
+    gpt_compat_load_optim = False
     if ckpt_format == "torch_dist":
         ckpt_args = types.SimpleNamespace()
         if state_dict is not None and "args" in state_dict:
@@ -1845,11 +1864,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         # Preloaded state_dict is None when no checkpoint was found; nothing to
         # translate then (the run starts from scratch further down).
-        gpt_compat_layer_maps = (
+        gpt_compat_layer_maps, gpt_compat_load_optim = (
             _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model)
             if state_dict is not None
-            else None
+            else (None, False)
         )
+        gpt_compat_load_optim = gpt_compat_load_optim and not release
 
         # Determine if RNG state will be loaded
         if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune and not args.no_load_rng
@@ -1873,8 +1893,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
         print_rank_0(f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}')
 
-        # Determine if optimizer state will be loaded
-        if (not release and not args.finetune and not args.no_load_optim
+        # Determine if optimizer state will be loaded. For a GPT->hybrid load the
+        # optimizer state is retargeted at the GPT checkpoint even though --finetune
+        # is set (finetune only resets iteration and the LR schedule here).
+        if (not release and (not args.finetune or gpt_compat_load_optim)
+                and not args.no_load_optim
                 and not getattr(ckpt_args, 'no_save_optim', False)):
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
@@ -1889,6 +1912,22 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                                         if getattr(ckpt_args, 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
                     }
+                # Retargeting optimizer state onto a GPT checkpoint only works for the
+                # model-space formats, where each optimizer ShardedTensor carries the
+                # model param's key and sharding. Bucket-space formats key state by a
+                # flat buffer layout that the extra hybrid layers reshuffle.
+                if (gpt_compat_load_optim
+                        and sharded_sd_metadata['distrib_optim_sharding_type']
+                        not in ('fully_reshardable', 'fully_sharded_model_space')):
+                    raise RuntimeError(
+                        "Loading optimizer state from a GPT checkpoint into a hybrid model "
+                        "is only supported for model-space distributed-optimizer checkpoints "
+                        "(sharding type 'fully_reshardable' or 'fully_sharded_model_space'), "
+                        f"but the checkpoint uses "
+                        f"{sharded_sd_metadata['distrib_optim_sharding_type']!r}. Re-save the "
+                        "GPT checkpoint with --ckpt-fully-parallel-save, or pass --no-load-optim "
+                        "to start from a fresh optimizer."
+                    )
                 if (
                     ckpt_tp_pp != run_tp_pp
                     and sharded_sd_metadata['distrib_optim_sharding_type']
@@ -1959,9 +1998,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 retarget_sharded_state_dict_to_gpt_checkpoint,
             )
 
-            for sd_key, model_sd in load_kwargs['sharded_state_dict'].items():
-                if sd_key == 'model' or re.fullmatch(r'model\d+', sd_key):
-                    retarget_sharded_state_dict_to_gpt_checkpoint(model_sd, gpt_compat_layer_maps)
+            # The optimizer sharded state dict is built from the (hybrid) model sharded
+            # state dict, so its entries carry the same ``decoder.layers.<i>.`` keys and
+            # sharding; the same retargeting points them at the GPT checkpoint too.
+            for sd_key, sub_sd in load_kwargs['sharded_state_dict'].items():
+                is_model = sd_key == 'model' or re.fullmatch(r'model\d+', sd_key)
+                is_optim = gpt_compat_load_optim and (
+                    sd_key == 'optimizer' or re.fullmatch(r'optimizer\d+', sd_key)
+                )
+                if is_model or is_optim:
+                    retarget_sharded_state_dict_to_gpt_checkpoint(sub_sd, gpt_compat_layer_maps)
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
@@ -2123,7 +2169,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
-    if not release and not args.finetune and not args.no_load_optim:
+    if not release and (not args.finetune or gpt_compat_load_optim) and not args.no_load_optim:
         try:
             # Load state dict.
             if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
@@ -2151,8 +2197,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.load_parameter_state(optim_checkpoint_name,
                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
 
-            # Load scheduler.
-            if opt_param_scheduler is not None:
+            # Load scheduler. Skipped under --finetune (including a GPT->hybrid load):
+            # the LR schedule restarts fresh alongside the reset iteration count.
+            if opt_param_scheduler is not None and not args.finetune:
                 if 'lr_scheduler' in state_dict: # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
