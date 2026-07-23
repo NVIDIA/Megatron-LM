@@ -87,6 +87,28 @@ def test_all_gather_pipeline_prefetch_size():
     assert actual == [0, 1, 2]
 
 
+@pytest.mark.parametrize(
+    ("order", "start_buckets", "expected_buckets"),
+    [
+        (PrefetchOrder.FORWARD_PASS_ORDER, [0, 1], [0, 1, 2, 3, 4, 5]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, [6, 7], [2, 3, 4, 5, 6, 7]),
+    ],
+)
+def test_all_gather_pipeline_prefetch_units(order, start_buckets, expected_buckets):
+    """Unit-depth prefetch includes intervening non-unit buckets in both directions."""
+    unit_ids = [0, 0, None, 1, 1, None, 2, 2, 3, 3]
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        num_buckets=len(unit_ids),
+        parameter_groups=[SimpleNamespace(fsdp_unit_id=unit_id) for unit_id in unit_ids],
+        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(len(unit_ids))},
+    )
+
+    actual = pipeline._extend_by_fsdp_units(start_buckets, order, num_units=1)
+
+    assert actual == expected_buckets
+
+
 def destroy_device_mesh(device_mesh):
 
     # Teardown device mesh.
