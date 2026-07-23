@@ -360,10 +360,11 @@ jobs:
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Validate updated golden values
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
+        if: github.event_name == 'merge_group' || (startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push')
         env:
-          BASE_REF: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).base.ref }}
+          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
         run: |
+          BASE_REF="${BASE_REF#refs/heads/}"
           git fetch origin "$BASE_REF"
           mapfile -t GOLDEN_VALUES_FILES < <(
             git diff --name-only --diff-filter=ACMR \
