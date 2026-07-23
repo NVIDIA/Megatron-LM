@@ -111,16 +111,12 @@ def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int,
     if not HAVE_GTP:
         return gtp_fold
 
-    gtp_remat_group = getattr(pg_collection, 'gtp_remat', None) if pg_collection else None
-    if gtp_remat_group is None:
-        gtp_remat_group = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat"]
-        ).gtp_remat
-    egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None) if pg_collection else None
-    if egtp_remat_group is None:
-        egtp_remat_group = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["expt_gtp_remat"]
-        ).expt_gtp_remat
+    assert pg_collection is not None, (
+        "_build_gtp_replica_fold requires a pg_collection carrying gtp_remat/expt_gtp_remat; "
+        "the optimizer factory must materialize it before constructing the optimizer."
+    )
+    gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+    egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
 
     for model_chunk in model_chunks:
         for name, p in model_chunk.named_parameters():
