@@ -75,8 +75,24 @@ def _multimem_all_gather_kernel(
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    BARRIER_BEFORE: tl.constexpr,
 ):
     """Single-tensor multicast all-gather kernel."""
+    if BARRIER_BEFORE:
+        # Ensure every rank has finished reading the previous contents before
+        # this all-gather reuses the symmetric buffer. The usual RS -> AG
+        # sequence gets this ordering from the reduce-scatter; consecutive AGs
+        # must request it explicitly.
+        symm_mem_sync(
+            signal_pad_ptrs,
+            None,
+            RANK,
+            WORLD_SIZE,
+            hasPreviousMemAccess=True,
+            hasSubsequentMemAccess=True,
+        )
+        sync_threads()
+
     _ag_phase(
         local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
     )
@@ -232,6 +248,7 @@ def multimem_all_gather(
     input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
     byte_offset: int = 0,
+    barrier_before: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -261,6 +278,7 @@ def multimem_all_gather(
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
+        BARRIER_BEFORE=barrier_before,
         num_warps=config["num_warps"],
     )
 

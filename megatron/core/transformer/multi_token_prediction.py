@@ -1133,7 +1133,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # ranks after the linear projection.
         if InferenceMode.is_active():
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
-                hidden_states, self.tp_group, self.config
+                hidden_states, self.tp_group, self.config, barrier_before=True
             )
         else:
             hidden_states = gather_from_tensor_model_parallel_region(
