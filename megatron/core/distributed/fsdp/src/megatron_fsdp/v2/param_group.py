@@ -327,24 +327,26 @@ class ParameterGroup:
         self._full_grad_buffer_has_accumulated_grad = True
 
         grad_buffer = self.main_grad_buffer
+        storage = grad_buffer.storage_placements
         if is_last_backward or grad_buffer.inner_sharded:
-            inner_target = grad_buffer.storage_placements[1]
-            if self.sharding_strategy == "optim":
-                inner_target = Placement.DIRTY
-            grad_buffer.redistribute(
-                [grad_buffer.placements[0], inner_target],
-                stream=stream,
-                accumulate=self._reduced_grad_buffer_has_accumulated_grad,
+            inner_target = Placement.DIRTY if self.sharding_strategy == "optim" else storage[1]
+            comm_output = grad_buffer.redistribute(
+                [grad_buffer.placements[0], inner_target], stream=stream
             )
+            accumulate = self._reduced_grad_buffer_has_accumulated_grad
+            grad_buffer.commit_comm_output(comm_output, 1, stream=stream, accumulate=accumulate)
             self._reduced_grad_buffer_has_accumulated_grad = True
             if inner_target is not Placement.REPLICATE:
                 self._full_grad_buffer_has_accumulated_grad = False
 
         if is_last_backward and self.mesh.size(0) > 1:
-            outer_target = grad_buffer.storage_placements[0]
-            if self.outer_dp_sharding_strategy == "optim":
-                outer_target = Placement.DIRTY
-            grad_buffer.redistribute([outer_target, grad_buffer.placements[1]], stream=stream)
+            outer_target = (
+                Placement.DIRTY if self.outer_dp_sharding_strategy == "optim" else storage[0]
+            )
+            comm_output = grad_buffer.redistribute(
+                [outer_target, grad_buffer.placements[1]], stream=stream
+            )
+            grad_buffer.commit_comm_output(comm_output, 0, stream=stream)
 
     def release_grad_buffer(self):
         """Release the main gradient buffer to free memory."""
