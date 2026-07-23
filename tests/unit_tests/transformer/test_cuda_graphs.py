@@ -24,6 +24,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -35,6 +36,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    create_cudagraphs,
     is_cuda_graph_replay_suspended,
     suspend_cuda_graph_replay,
 )
@@ -445,6 +447,112 @@ class TestParallelTransformerBlockCudagraphs:
                 .cudagraph_manager.cudagraph_runners[0]
                 .fwd_graph
             )
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+class TestPackedSeqCudagraphs:
+    """Training CUDA graphs over thd input with padding between sequences.
+
+    The padded cu_seqlens describe a slot layout that differs from the actual lengths,
+    and pad_between_seqs is set explicitly so TE does spend a GPU sync inferring it.
+    cp_size == 2 additionally captures TE's ring-P2P context-parallel attention inside the graphs.
+    """
+
+    SEQ_LENGTHS = [7, 5]
+    SLOT_STARTS = [0, 8, 16]  # slot layout aligned to 2 * cp_size for every cp_size tested
+    BIN_SIZE = 32
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+
+    def _build_packed_seq_params(self, device):
+        # Actual boundaries: each sequence's real tokens inside its slot; the trailing bin
+        # padding [SLOT_STARTS[-1], BIN_SIZE) forms a ghost slot of pad tokens.
+        boundaries = [0]
+        for length in self.SEQ_LENGTHS:
+            boundaries.append(boundaries[-1] + length)
+        boundaries.append(boundaries[-1] + self.BIN_SIZE - self.SLOT_STARTS[-1])
+        cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=device)
+        cu_seqlens_padded = torch.tensor(
+            self.SLOT_STARTS + [self.BIN_SIZE], dtype=torch.int32, device=device
+        )
+        return PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=self.BIN_SIZE,
+            max_seqlen_kv=self.BIN_SIZE,
+            pad_between_seqs=True,
+        )
+
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    def test_thd_capture_with_pad_between_seqs(self, cp_size):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(context_parallel_size=cp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            context_parallel_size=cp_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            cuda_graph_impl="local",
+            use_cpu_initialization=True,
+        )
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
+        block.train()
+        # CUDA-graphed backward assumes DDP-style grad accumulation buffers.
+        for param in block.parameters():
+            param.main_grad = torch.zeros_like(param)
+
+        packed_seq_params = self._build_packed_seq_params(torch.device('cuda'))
+        # Each CP rank holds its 1/cp_size share of the bin's tokens.
+        hidden_states = torch.randn(
+            (self.BIN_SIZE // cp_size, 1, config.hidden_size),
+            dtype=torch.bfloat16,
+            device='cuda',
+            requires_grad=True,
+        )
+
+        eager_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        eager_out.sum().backward()
+
+        # This is the primary function under test.
+        create_cudagraphs()
+
+        for layer in block.layers:
+            runners = layer.cudagraph_manager.cudagraph_runners
+            assert len(runners) == 1
+            assert runners[0].fwd_graph is not None
+
+        graphed_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        assert torch.allclose(graphed_out.float(), eager_out.float(), rtol=1e-2, atol=1e-2)
+        graphed_out.sum().backward()
+
+        # Destroy captured graphs deterministically before parallel-state teardown.
+        for layer in block.layers:
+            for runner in layer.cudagraph_manager.cudagraph_runners:
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+        torch.cuda.synchronize()
 
 
 @pytest.mark.skipif(

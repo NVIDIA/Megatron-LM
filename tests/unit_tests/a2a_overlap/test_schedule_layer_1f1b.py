@@ -453,7 +453,12 @@ class TestA2AOverlap:
         Verifies all-to-all overlap optimization in MTP layer produces
         the same results as the reference implementation.
         """
-        extra_kwargs = {"mtp_num_layers": 1, "mtp_loss_scaling_factor": 1.1}
+        qk_layernorm = True
+        extra_kwargs = {
+            "mtp_num_layers": 1,
+            "mtp_loss_scaling_factor": 1.1,
+            "qk_layernorm": qk_layernorm,
+        }
         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8_recipe"] = fp8_flag[1]
@@ -466,7 +471,7 @@ class TestA2AOverlap:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
                 num_experts=16,
                 moe_grouped_gemm=True,
-                qk_layernorm=True,
+                qk_layernorm=qk_layernorm,
                 multi_latent_attention=True,
             )
             mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, True)

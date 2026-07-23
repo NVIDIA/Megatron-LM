@@ -1,4 +1,4 @@
-# DeepSeek-style proxy: 2 layers — first dense, second MoE with expert parallelism 4.
+# DeepSeek-style proxy: 8 layers — 3 dense, Rest MoE with expert parallelism 2.
 # Used for functional testing of dense+MoE hybrid and EP.
 ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
@@ -42,8 +42,8 @@ MODEL_ARGS:
   --use-mcore-models: true
   --sequence-parallel: true
   --disable-bias-linear: true
-  --micro-batch-size: 4
-  --global-batch-size: 32
+  --micro-batch-size: 32
+  --global-batch-size: 256
   --train-iters: 50
   --exit-duration-in-mins: 60
   --no-check-for-nan-in-loss-and-grad: true
@@ -62,7 +62,7 @@ MODEL_ARGS:
 
 
   # Network: 2 layers — first dense, second MoE
-  --num-layers: 2
+  --num-layers: 8
   --hidden-size: 512
   --ffn-hidden-size: 2048
   --num-attention-heads: 8
@@ -92,7 +92,7 @@ MODEL_ARGS:
   --adam-beta2: 0.95
   # MoE args (DeepSeek-style): 1 dense layer, 1 MoE layer, ep=4
   --num-experts: 8
-  --moe-layer-freq: ([0]*1+[1]*1)
+  --moe-layer-freq: ([0]*3+[1]*5)
   --moe-ffn-hidden-size: 1024
   --moe-shared-expert-intermediate-size: 1024
   --moe-router-load-balancing-type: seq_aux_loss

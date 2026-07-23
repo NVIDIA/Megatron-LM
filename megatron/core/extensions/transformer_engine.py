@@ -1808,6 +1808,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
 
+        if get_te_version() < PkgVersion("2.2.0"):
+            self.kept_packed_seq_params.discard("pad_between_seqs")
+
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
             assert is_te_min_version("2.9.0"), "qk-clip is only supported in TE 2.9.0 and later"
