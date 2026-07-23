@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from itertools import product
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +28,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
     fully_shard,
     fully_shard_model,
     fully_shard_optimizer,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+    AllGatherPipeline,
+    PrefetchOrder,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -57,6 +62,29 @@ MXFP8_BLOCKWISE_RECIPE = "mxfp8_blockwise"
 # Needed for `torch.distributed.checkpoint.{save,load}` because
 # multiple processes need to write to the same directory.
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
+
+
+def test_all_gather_pipeline_prefetch_size():
+    """The extracted prefetch heuristic stops after reaching the requested size."""
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        num_buckets=4,
+        ddp_config=SimpleNamespace(fsdp_double_buffer=False),
+        parameter_groups=[
+            SimpleNamespace(
+                fsdp_unit_id=bucket_id,
+                model_weight_buffer=SimpleNamespace(bucket_index=SimpleNamespace(size=6)),
+            )
+            for bucket_id in range(4)
+        ],
+        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(4)},
+    )
+
+    actual = pipeline._extend_by_prefetch_size(
+        [0], PrefetchOrder.FORWARD_PASS_ORDER, suggested_prefetch_size=10, double_buffer_units=set()
+    )
+
+    assert actual == [0, 1, 2]
 
 
 def destroy_device_mesh(device_mesh):

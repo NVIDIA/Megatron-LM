@@ -4280,7 +4280,7 @@ class AllGatherPipeline:
         self.buffer = param_and_grad_buffer
         self.ag_stream = ag_stream
         # Track the status of all-gather operations for each bucket.
-        self.param_gather_event_map = {}
+        self.param_gather_event_map: Dict[Tuple[int, bool], Tuple[Any, Callable[[], None]]] = {}
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
@@ -4377,6 +4377,96 @@ class AllGatherPipeline:
             f"bucket_can_be_released: {self.bucket_can_be_released}."
         )
 
+    def _extend_by_prefetch_size(
+        self,
+        bucket_ids: List[int],
+        prefetch_order: PrefetchOrder,
+        suggested_prefetch_size: Optional[int],
+        double_buffer_units: set,
+    ) -> List[int]:
+        """Extend a bucket list using the communication-size heuristic."""
+        parameter_groups = self.buffer.parameter_groups
+        result = list(bucket_ids)
+
+        def next_bucket_id():
+            if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
+                candidate = result[0] + 1
+                for existing_bucket_id in result[1:]:
+                    if existing_bucket_id != candidate:
+                        break
+                    candidate += 1
+            else:
+                candidate = result[-1] - 1
+                for existing_bucket_id in reversed(result[:-1]):
+                    if existing_bucket_id != candidate:
+                        break
+                    candidate -= 1
+            if candidate < 0 or candidate >= self.buffer.num_buckets:
+                return None
+            return candidate
+
+        if suggested_prefetch_size is None:
+            suggested_prefetch_size = 500_000_000
+
+        base_all_gather_size = sum(
+            parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
+            for bucket_id in result
+        )
+        bucket_id = next_bucket_id()
+        while bucket_id is not None:
+            prefetched_size = (
+                sum(
+                    parameter_groups[result_bucket_id].model_weight_buffer.bucket_index.size
+                    for result_bucket_id in result
+                )
+                - base_all_gather_size
+            )
+            if prefetched_size >= suggested_prefetch_size:
+                break
+
+            if self.buffer.ddp_config.fsdp_double_buffer:
+                fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
+                double_buffer_units.add(fsdp_unit_id)
+                if len(double_buffer_units) > 2:
+                    break
+
+            result.extend(self.buffer.bucket_to_bucket_group[bucket_id])
+            result = list(sorted(set(result)))
+            bucket_id = next_bucket_id()
+
+        return result
+
+    def _group_buckets(self, bucket_ids: List[int]) -> Dict[int, List[int]]:
+        """Group selected buckets by their coalesced collective group."""
+        grouped_buckets = {}
+        for bucket_id in bucket_ids:
+            group_id = self.bucket_to_bucket_group[bucket_id]
+            grouped_buckets.setdefault(group_id, []).append(bucket_id)
+        return grouped_buckets
+
+    def _launch_outer_bucket_group(self, buckets: List[int], bwd: bool) -> None:
+        """Launch one coalesced DP-Outer parameter gather."""
+        parameter_groups = self.buffer.parameter_groups
+        outer_stream = self.outer_fsdp_group_param_gather_stream
+        outer_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(outer_stream):
+            is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=is_expert_parallel
+            )
+            with _coalescing_manager(outer_fsdp_group, async_ops=False):
+                for bucket_id in buckets:
+                    inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
+                    shard_size = inner_dp_wbuf.data_size // outer_fsdp_group.size()
+                    rank = outer_fsdp_group.rank()
+                    torch.distributed.all_gather_into_tensor(
+                        output_tensor=inner_dp_wbuf.data,
+                        input_tensor=inner_dp_wbuf.data[
+                            rank * shard_size : (rank + 1) * shard_size
+                        ],
+                        group=outer_fsdp_group,
+                    )
+
     def all_gather_params(
         self,
         params: List[torch.Tensor],
@@ -4409,8 +4499,8 @@ class AllGatherPipeline:
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
+        double_buf_units = set()
         if self.buffer.ddp_config.fsdp_double_buffer:
-            double_buf_units = set()
             for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:
@@ -4429,8 +4519,7 @@ class AllGatherPipeline:
             if fsdp_unit_id is not None and fsdp_unit_id >= 0:
                 no_fsdp_units = False
 
-        # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
-        if prefetch and not (
+        should_prefetch = prefetch and not (
             # When double buffering, if parameters are not members of FSDP units,
             # we should skip pre-fetch to efficiently supply buffers from the pool.
             # Non-unit module pre-fetch can run inside other FSDP unit modules and
@@ -4439,73 +4528,11 @@ class AllGatherPipeline:
             # the maximum limit of 2 buffers allocated at any point in time.
             self.buffer.ddp_config.fsdp_double_buffer
             and no_fsdp_units
-        ):
-
-            def next_bucket_id(ag_buckets):
-                """
-                Search for the next bucket ID that is not in the list of all-gather buckets.
-                """
-                if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                    # Search from the initial bucket.
-                    bucket_id = ag_buckets[0] + 1
-                    for i in ag_buckets[1:]:
-                        if i != bucket_id:
-                            break
-                        bucket_id += 1
-                else:
-                    # Search from the last bucket.
-                    bucket_id = ag_buckets[-1] - 1
-                    for i in reversed(ag_buckets[:-1]):
-                        if i != bucket_id:
-                            break
-                        bucket_id -= 1
-                if bucket_id < 0 or bucket_id >= self.buffer.num_buckets:
-                    # Out of bounds, return None.
-                    return None
-                return bucket_id
-
-            def need_skip_prefetch(bucket_id):
-                # If use double buffer, we need to check if the next bucket
-                # is exceeding the coverage of the double buffer.
-                if self.buffer.ddp_config.fsdp_double_buffer:
-                    fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                    double_buf_units.add(fsdp_unit_id)
-                    if len(double_buf_units) > 2:
-                        # Prefetching the next bucket will exceed the coverage of
-                        # the double buffer, so we need to stop prefetching.
-                        return True
-                return False
-
-            if suggested_AG_prefetch_size is None:
-                # Default 500M
-                suggested_AG_prefetch_size = 500_000_000
-
-            base_all_gather_size = sum(
-                [parameter_groups[i].model_weight_buffer.bucket_index.size for i in ag_buckets]
+        )
+        if should_prefetch:
+            ag_buckets = self._extend_by_prefetch_size(
+                ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
             )
-            bucket_id = next_bucket_id(ag_buckets)
-            while bucket_id is not None:
-                prefetch_all_gather_size = (
-                    sum(
-                        [
-                            parameter_groups[i].model_weight_buffer.bucket_index.size
-                            for i in ag_buckets
-                        ]
-                    )
-                    - base_all_gather_size
-                )
-                if prefetch_all_gather_size >= suggested_AG_prefetch_size:
-                    # Reached the prefetch limit.
-                    break
-
-                if need_skip_prefetch(bucket_id):
-                    break
-
-                # Extend the list of all-gather buckets with another group of buckets.
-                ag_buckets.extend(self.buffer.bucket_to_bucket_group[bucket_id])
-                # Re-sort and find the next bucket not in the list.
-                ag_buckets = list(sorted(set(ag_buckets)))
-                bucket_id = next_bucket_id(ag_buckets)
 
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
@@ -4520,12 +4547,7 @@ class AllGatherPipeline:
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
-        bucket_group_to_buckets = {}
-        for bucket_id in ag_buckets:
-            group_id = self.bucket_to_bucket_group[bucket_id]
-            if group_id not in bucket_group_to_buckets:
-                bucket_group_to_buckets[group_id] = []
-            bucket_group_to_buckets[group_id].append(bucket_id)
+        bucket_group_to_buckets = self._group_buckets(ag_buckets)
 
         # Coalesce all-gather operations for all buckets in the same data-parallel-group
         for _, buckets in bucket_group_to_buckets.items():
@@ -4533,24 +4555,7 @@ class AllGatherPipeline:
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
             if outer_fsdp_group_param_gather:
-                self.outer_fsdp_group_param_gather_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.outer_fsdp_group_param_gather_stream):
-                    is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
-                    outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
-                        is_expert_parallel=is_expert_parallel
-                    )
-                    with _coalescing_manager(outer_fsdp_group, async_ops=False):
-                        for bucket_id in buckets:
-                            inner_dp_wbuf = self.get_fsdp_buffer(bucket_id, bwd=bwd)
-                            shard_size = inner_dp_wbuf.data_size // outer_fsdp_group.size()
-                            rank = outer_fsdp_group.rank()
-                            torch.distributed.all_gather_into_tensor(
-                                output_tensor=inner_dp_wbuf.data,
-                                input_tensor=inner_dp_wbuf.data[
-                                    rank * shard_size : (rank + 1) * shard_size
-                                ],
-                                group=outer_fsdp_group,
-                            )
+                self._launch_outer_bucket_group(buckets, bwd=bwd)
                 # Wait for the DP-Outer group all-gather to finish.
                 all_gather_stream.wait_stream(self.outer_fsdp_group_param_gather_stream)
 
