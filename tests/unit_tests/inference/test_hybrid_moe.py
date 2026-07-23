@@ -164,6 +164,7 @@ class _TestDynamicInferenceBase:
         use_cuda_graphs_for_non_decode_steps=True,
         max_requests=None,
         max_tokens=None,
+        cuda_graph_max_tokens=512,
     ):
         mamba_config = MambaInferenceStateConfig.from_model(model)
         return DynamicInferenceContext(
@@ -178,6 +179,7 @@ class _TestDynamicInferenceBase:
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
                 max_requests=max_requests,
                 max_tokens=max_tokens,
+                cuda_graph_max_tokens=cuda_graph_max_tokens,
             ),
         )
 
@@ -285,7 +287,7 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
         is_dummy = my_state == NONE
 
         model = self._build_model()
-        ctx = self._build_context(model, max_requests=64, max_tokens=512)
+        ctx = self._build_context(model, max_requests=64, max_tokens=512, cuda_graph_max_tokens=64)
 
         # Pre-capture every cuda graph in lockstep across EP ranks (mirrors
         # DynamicInferenceEngine.create_cuda_graphs in production). Without
@@ -428,7 +430,10 @@ class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
         # exceeded by a prefill-heavy rank.
         small_max_requests = 16
         ctx = self._build_context(
-            model, use_cuda_graphs_for_non_decode_steps=True, max_requests=small_max_requests
+            model,
+            use_cuda_graphs_for_non_decode_steps=True,
+            max_requests=small_max_requests,
+            cuda_graph_max_tokens=small_max_requests,
         )
 
         # Even EP ranks are dummy (no requests). Odd EP ranks get a state
