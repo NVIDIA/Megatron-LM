@@ -19,6 +19,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     _build_thd_cp_a2a_perm,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
+    torch_chunk_gated_delta_rule,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -231,6 +232,72 @@ class TestGatedDeltaNet:
             assert torch.equal(
                 rec_grads[name], base_grads[name]
             ), f"Grad not identical for {name} ({rank=})"
+
+    def test_deterministic_mode(self):
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        det_config = copy.deepcopy(self.transformer_config)
+        det_config.deterministic_mode = True
+
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=det_config
+        ).submodules
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        gdn = (
+            GatedDeltaNet(
+                det_config,
+                submodules=gdn_submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            .cuda()
+            .bfloat16()
+        )
+
+        # deterministic_mode must select the torch-native kernel, not FLA.
+        assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
+
+        micro_batch_size = 2
+        seq_length = 64
+        torch.manual_seed(0)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run():
+            hidden_states = base_input.clone().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().sum().backward()
+            grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            gdn.zero_grad(set_to_none=True)
+            return output.detach().clone(), grads, hidden_states.grad.detach().clone()
+
+        out1, grads1, input_grad1 = run()
+        out2, grads2, input_grad2 = run()
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(out1, out2), f"Output not reproducible ({rank=})"
+        assert torch.equal(input_grad1, input_grad2), f"Input grad not reproducible ({rank=})"
+        assert set(grads1.keys()) == set(grads2.keys())
+        for name in grads1:
+            assert torch.equal(
+                grads1[name], grads2[name]
+            ), f"Grad not reproducible for {name} ({rank=})"
 
     def test_module_construction(self):
         gdn = self.gdn
