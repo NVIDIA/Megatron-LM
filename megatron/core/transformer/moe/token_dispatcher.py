@@ -2,6 +2,7 @@
 
 import logging
 import os
+import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -19,6 +20,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    alloc_ep_symm_buffer,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
@@ -1404,6 +1406,34 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _StageDispatchBwdGrad(torch.autograd.Function):
+    """Zero-copy + 1F1B overlap only: redirect the dispatch-backward grad into the persistent symm
+    buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the overlap schedule the dispatch output is a detached leaf with multiple downstream
+    consumers, so autograd hands ``dispatch_bwd`` a non-symm AccumulateGrad clone. Inserting this
+    identity node as the sole consumer of ``recv_tokens`` moves that accumulation to *our* output;
+    the backward then does a single plain->symm copy into ``_zc_bwd_token_buf`` (which under overlap
+    is not the op-fuser's fc1-dgrad target -- see ``get_expert_zero_copy_buffers`` -- so it is free
+    to stage into). Forward is identity (no numeric effect)."""
+
+    @staticmethod
+    def forward(ctx, recv_tokens):  # type: ignore[override]
+        """Identity forward; returns ``recv_tokens`` unchanged."""
+        return recv_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
+        buf = _NCCLEPManager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        buf.copy_(grad)
+        return buf
+
+
 class _NCCLEPManager(_DispatchManager):
     """A manager class to handle dispatch/combine for MoE models using the NCCL Expert
     Parallelism backend, via TransformerEngine's transformer_engine.pytorch.ep API
@@ -1422,6 +1452,20 @@ class _NCCLEPManager(_DispatchManager):
     The TE NCCL EP context (a single EpBuffer) and the process-wide bootstrap are created
     lazily on the first dispatch, when the local token count is known.
     """
+
+    # Zero-copy shared symm buffers, allocated once and reused across all layers/microbatches
+    # (class-level so every per-layer manager shares one set). _zc_fwd_token_buf is the forward symm
+    # buffer combine reads (the fc2 output); _zc_bwd_token_buf holds the backward grad.
+    #  - fp8/fp4 (mxfp8 CuTe DSL grouped GEMM, Blackwell+): recv_tokens dies after FC1 quantizes it,
+    #    so _zc_fwd_token_buf doubles as the dispatch recv_tokens; mcore also holds the dispatch
+    #    probs (_zc_recv_topk_weights_buf) -- TE allocates nothing.
+    #  - bf16 (op-fuser GroupedLinear GEMM, Hopper+): recv_tokens is the saved activation and
+    #    can't double-duty, so TE pools the per-call recv_tokens/topk; _zc_fwd_token_buf holds only
+    #    the fc2 output.
+    # TODO: move all to TE pool based allocation when symm memory pool supports cuda graph
+    _zc_fwd_token_buf = None
+    _zc_bwd_token_buf = None
+    _zc_recv_topk_weights_buf = None
 
     def __init__(
         self,
@@ -1455,29 +1499,36 @@ class _NCCLEPManager(_DispatchManager):
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.static_shape = config.moe_ncclep_static_shape
-        if config.moe_ncclep_use_symm_mem:
-            raise NotImplementedError(
-                "moe_ncclep_use_symm_mem (symm-mem / zero-copy EP payload buffers) is not "
-                "supported yet."
+        self.zero_copy = config.moe_ncclep_zero_copy
+        self._zc_quant = self.zero_copy and bool(config.fp8 or config.fp4)
+        if self.zero_copy and not self.static_shape:
+            raise ValueError(
+                "moe_ncclep_zero_copy requires moe_ncclep_static_shape "
+                "(fixed [recv_capacity, hidden] symm buffers)."
             )
         if self.static_shape:
-            if torch.cuda.get_device_capability()[0] < 10:
+            # static shape needs a fused grouped GEMM that consumes ragged per-expert counts on
+            # device (no host-side split narrowing): moe_grouped_gemm selects the grouped experts
+            # and use_transformer_engine_op_fuser fuses FC1+act+FC2 over them (fp8/fp4 via the CuTe
+            # DSL fused grouped MLP, bf16 via the op-fuser GroupedLinear grouped-tensor path).
+            if not (config.use_transformer_engine_op_fuser and config.moe_grouped_gemm):
                 raise ValueError(
-                    "moe_ncclep_static_shape=True requires an sm100+ (Blackwell or later) GPU with "
-                    "a CuTe DSL / device-offset grouped GEMM; leave it False (dynamic shape) on "
-                    "older GPUs."
+                    "moe_ncclep_static_shape=True requires BOTH use_transformer_engine_op_fuser "
+                    "and moe_grouped_gemm (the fused grouped GEMM over device-side "
+                    "per-expert counts)."
                 )
-            if not (config.use_transformer_engine_op_fuser or config.moe_grouped_gemm):
-                raise ValueError(
-                    "moe_ncclep_static_shape=True requires the fused grouped GEMM; enable "
-                    "use_transformer_engine_op_fuser (or moe_grouped_gemm)."
-                )
-            if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-                raise ValueError(
-                    "moe_ncclep_static_shape=True requires the CuTe DSL grouped GEMM; set "
-                    "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume ragged "
-                    "per-expert counts on device)."
-                )
+            if config.fp8 or config.fp4:
+                if torch.cuda.get_device_capability()[0] < 10:
+                    raise ValueError(
+                        "moe_ncclep_static_shape=True with fp8/fp4 requires an sm100+ (Blackwell+) "
+                        "GPU for the CuTe DSL grouped GEMM; leave it False on older GPUs."
+                    )
+                if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
+                    raise ValueError(
+                        "moe_ncclep_static_shape=True with fp8/fp4 requires the CuTe DSL grouped "
+                        "GEMM; set NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must "
+                        "consume ragged per-expert counts on device)."
+                    )
 
         if nccl_ep_dispatch is None:
             raise ImportError(
@@ -1543,8 +1594,36 @@ class _NCCLEPManager(_DispatchManager):
                 if self.config.moe_flex_dispatcher_num_sms is not None
                 else 0
             ),
-            zero_copy=False,
+            zero_copy=self.zero_copy,
         )
+        if self.zero_copy and _NCCLEPManager._zc_bwd_token_buf is None:
+            # Allocate once, shared across all managers. These are all persistent.
+            if self.config.overlap_moe_expert_parallel_comm:
+                # The 1F1B overlap schedule detaches the dispatch input, so autograd hands the
+                # dispatch-backward a non-symm clone of the grad_input buffer
+                warnings.warn(
+                    "moe_ncclep_zero_copy + overlap_moe_expert_parallel_comm (1F1B EP overlap): "
+                    "dispatch-backward gradient is not symm-mem-backed under the overlap schedule, "
+                    "so it is staged into a symm buffer with one extra copy per dispatch-backward.",
+                    stacklevel=2,
+                )
+            assert (
+                not torch.cuda.is_current_stream_capturing()
+            ), "zero-copy symm buffers must be allocated before CUDA-graph capture"
+            rc, h = self._recv_capacity, self.hidden_dim
+            _NCCLEPManager._zc_bwd_token_buf = alloc_ep_symm_buffer(
+                (rc, h), torch.bfloat16, self.group
+            )
+            # The forward buffer combine reads (fc2 output). fp8 also feeds it to dispatch as
+            # recv_tokens (dead after FC1 quantize, so it double-duties); bf16 uses it only for fc2.
+            _NCCLEPManager._zc_fwd_token_buf = alloc_ep_symm_buffer(
+                (rc, h), torch.bfloat16, self.group
+            )
+            if self._zc_quant:
+                # fp8 also owns the dispatch probs buffer (bf16 pools it per-call in TE).
+                _NCCLEPManager._zc_recv_topk_weights_buf = alloc_ep_symm_buffer(
+                    (rc,), torch.float32, self.group
+                )
         self._bootstrapped = True
 
     def dispatch(
@@ -1573,10 +1652,20 @@ class _NCCLEPManager(_DispatchManager):
         #   tokens_per_expert: [num_local_experts]
         #   dispatched_probs: [recv_capacity_per_rank]
         recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
-            self._buffer, hidden_states, topk_idx, topk_weights
+            self._buffer,
+            hidden_states,
+            topk_idx,
+            topk_weights,
+            recv_tokens=_NCCLEPManager._zc_fwd_token_buf if self._zc_quant else None,
+            recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-        self.dispatched_probs = dispatched_probs
+        # fp8 zero-copy: dispatched_probs aliases the recv_topk_weights symm buffer, which the
+        # next layer's dispatch reuses; copy it out so it stays valid through this layer's backward.
+        # bf16 gets a fresh per-call pool buffer (not shared), so no copy is needed.
+        self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
+        if self.zero_copy and self.config.overlap_moe_expert_parallel_comm:
+            recv_tokens = _StageDispatchBwdGrad.apply(recv_tokens)
         return recv_tokens
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1615,7 +1704,10 @@ class _NCCLEPManager(_DispatchManager):
     ) -> torch.Tensor:
         # hidden_states: [recv_capacity_per_rank, H] -> [num_local_tokens, H]
         hidden_states = nccl_ep_combine(
-            self._buffer, hidden_states, num_local_tokens=self.num_local_tokens
+            self._buffer,
+            hidden_states,
+            num_local_tokens=self.num_local_tokens,
+            grad_out=_NCCLEPManager._zc_bwd_token_buf,
         )
         # Drop the buffer; backward keeps handle_mem alive via save_for_backward.
         self._buffer = None
@@ -1684,6 +1776,30 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
                 "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
             )
+
+    def get_expert_zero_copy_buffers(self):
+        """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the
+        experts write the fc2 output / fc1 dgrad into, so combine (fwd) and dispatch (bwd) read and
+        scatter them one-sided. ``(None, None)`` for every other backend/mode.
+
+        Returned detached: the op-fuser calls requires_grad_() on its output and returns it,
+        so handing it the persistent buffer would permanently mark the shared classvar as requiring
+        grad and break the next layer's reuse. The detached view shares storage (zero-copy intact).
+        """
+
+        def _detached(name):
+            buf = getattr(self._comm_manager, name, None)
+            return buf.detach() if buf is not None else None
+
+        # output_buffer (fc2 out / combine in) = _zc_fwd_token_buf; grad_input_buffer (fc1 dgrad /
+        # dispatch-bwd scatter) = _zc_bwd_token_buf.
+        # Under 1F1B overlap, feeding a symm grad_input_buffer is wasted: the overlap schedule's
+        # AccumulateGrad clones the fc1 dgrad into a plain buffer anyway. Return None so the
+        # op-fuser writes a plain dgrad;
+        dispatch_grad_input = (
+            None if self.config.overlap_moe_expert_parallel_comm else _detached("_zc_bwd_token_buf")
+        )
+        return _detached("_zc_fwd_token_buf"), dispatch_grad_input
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """

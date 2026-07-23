@@ -3,6 +3,7 @@ from contextlib import nullcontext
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
@@ -29,6 +30,29 @@ from tests.unit_tests.test_utilities import Utils
 
 # Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
 pytestmark = pytest.mark.flaky_in_dev
+
+
+def is_nccl_ep_zero_copy_available():
+    """Zero-copy needs the newer TE symm-mem APIs (symm_mem_alloc/is_symm_backed), absent in a plain
+    NCCL-EP build."""
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    if not HAVE_TE_EP:
+        return False
+    try:
+        from transformer_engine.pytorch.ep import is_symm_backed, symm_mem_alloc  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def is_op_fuser_available():
+    """The static-shape/zero-copy path runs the TE op-fuser grouped GEMM (needs TE>=2.14 ops)."""
+    try:
+        from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+    except ImportError:
+        return False
+    return is_te_min_version("2.14.0")
 
 
 def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
@@ -444,6 +468,69 @@ class TestA2AOverlap:
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.skipif(
+        not is_nccl_ep_zero_copy_available(), reason="NCCL EP zero-copy TE API is not available"
+    )
+    @pytest.mark.skipif(
+        not is_op_fuser_available(), reason="op-fuser (static-shape/zero-copy) needs TE>=2.14"
+    )
+    def test_transformer_layer_overlap_zero_copy(self):
+        """ncclEP zero-copy under 1F1B a2a overlap must match the non-overlap reference.
+
+        Validates the overlap dispatch-backward path (_StageDispatchBwdGrad staging into the symm
+        buffer + the free_input symm guard): zero-copy stays enabled in both runs, so this isolates
+        the overlap schedule. bf16 op-fuser (SwiGLU, tp=1) -- no fp8/Blackwell dependency.
+        """
+        extra_kwargs = {}
+        apply_flex_backend_kwargs(extra_kwargs, "flex", "ncclep")
+        extra_kwargs.update(
+            moe_ncclep_zero_copy=True,
+            moe_ncclep_static_shape=True,
+            use_transformer_engine_op_fuser=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            # gates the zero-copy dispatch-bwd staging (_StageDispatchBwdGrad); the a2a-overlap run
+            # exercises the 1F1B schedule that this flag represents in production.
+            overlap_moe_expert_parallel_comm=True,
+        )
+        config = get_test_config(extra_kwargs=extra_kwargs)
+        microbatches = 4
+        with deterministic_mode():
+            transformer_layer_spec = get_gpt_decoder_block_spec(
+                config=config, use_transformer_engine=True
+            )
+            gpt_model = GPTModel(
+                config=config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=100,
+                pre_process=True,
+                post_process=True,
+                max_sequence_length=300,
+            )
+            params = reset_model(gpt_model)
+            input_tensors = [build_data() for _ in range(microbatches)]
+
+            capture_ref = run_transformer_layer_ref_with_capture(
+                gpt_model, input_tensors, microbatches
+            )
+            reset_model(gpt_model, params)
+            capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
+                gpt_model, input_tensors, microbatches
+            )
+            comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
+            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+
+        # zero-copy sets process-global ncclEP state (ep bootstrap mode + shared symm classvars);
+        # reset so later non-zero-copy ncclEP tests in this process are not polluted.
+        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+        from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
+
+        nccl_ep_finalize()
+        _NCCLEPManager._zc_fwd_token_buf = None
+        _NCCLEPManager._zc_bwd_token_buf = None
+        _NCCLEPManager._zc_recv_topk_weights_buf = None
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
