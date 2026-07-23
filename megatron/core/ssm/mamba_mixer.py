@@ -26,6 +26,10 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.intermediate_extraction import (
+    scatter_intermediate_conv,
+    scatter_intermediate_ssm,
+)
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -649,6 +653,7 @@ class MambaMixer(MegatronModule):
         slot_allocator = context.mamba_slot_allocator
         intermediate_chunk_indices = metadata.intermediate_chunk_indices
         intermediate_abs_positions = metadata.intermediate_abs_positions
+        intermediate_real_count = metadata.intermediate_real_count
         intermediate_ssm_out = None
         intermediate_conv_out = None
         if slot_allocator is not None and mamba_layer_idx is not None:
@@ -664,9 +669,9 @@ class MambaMixer(MegatronModule):
             batch_indices=batch_indices,
             intermediate_chunk_indices=intermediate_chunk_indices,
             intermediate_abs_positions=intermediate_abs_positions,
+            intermediate_real_count=intermediate_real_count,
             intermediate_ssm_out=intermediate_ssm_out,
             intermediate_conv_out=intermediate_conv_out,
-            conv_gather_offsets=metadata.conv_gather_offsets,
             cu_chunk_seqlens=metadata.cu_chunk_seqlens,
             last_chunk_indices=metadata.last_chunk_indices,
             seq_idx_for_varlen=metadata.seq_idx_for_varlen,
@@ -778,9 +783,9 @@ class MambaMixer(MegatronModule):
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_chunk_indices: Optional[torch.Tensor] = None,
         intermediate_abs_positions: Optional[torch.Tensor] = None,
+        intermediate_real_count: Optional[torch.Tensor] = None,
         intermediate_ssm_out: Optional[torch.Tensor] = None,
         intermediate_conv_out: Optional[torch.Tensor] = None,
-        conv_gather_offsets: Optional[torch.Tensor] = None,
         cu_chunk_seqlens: Optional[torch.Tensor] = None,
         last_chunk_indices: Optional[torch.Tensor] = None,
         seq_idx_for_varlen: Optional[torch.Tensor] = None,
@@ -805,12 +810,13 @@ class MambaMixer(MegatronModule):
                 intermediate state extraction (fixed size, padded with 0).
             intermediate_abs_positions: Pre-allocated tensor of absolute token
                 positions for conv state extraction (fixed size, padded with d_conv).
+            intermediate_real_count: int32[1] GPU tensor holding the number of
+                meaningful entries in the intermediate buffers this step. Read
+                inside the Triton scatter kernels so padded slots cost nothing.
             intermediate_ssm_out: Output buffer for extracted SSM states
                 [max_intermediate_count, *ssm_shape].
             intermediate_conv_out: Output buffer for extracted conv states
                 [max_intermediate_count, *conv_shape].
-            conv_gather_offsets: Constant tensor [-d_conv, ..., -1] for gathering
-                conv states.
             cu_chunk_seqlens: Precomputed chunk boundaries from MambaMetadata.
             last_chunk_indices: Precomputed last chunk index per sequence.
             seq_idx_for_varlen: Precomputed request ID per chunk.
@@ -975,6 +981,13 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
+            # Extraction is enabled when the slot allocator wired buffers in via
+            # the caller. When enabled, the chunk scan returns its raw states so
+            # our Triton kernels do a fused gather+conditional-scatter directly,
+            # skipping the dense intermediate tensor and the padded-slot writes.
+            extract_intermediates = (
+                intermediate_chunk_indices is not None and intermediate_ssm_out is not None
+            )
             ssm_varlen_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
@@ -994,53 +1007,44 @@ class MambaMixer(MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=self.cp.get_dt_bias().float(),
                 initial_states=initial_ssm_state,
-                return_intermediate_states=False,
-                intermediate_chunk_indices=intermediate_chunk_indices,
+                return_raw_states=extract_intermediates,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 state_dtype=ssm_state.dtype,
             )
 
-            if intermediate_chunk_indices is not None:
-                ssm_varlen_states, intermediate_ssm_states = ssm_varlen_result
+            if extract_intermediates:
+                ssm_varlen_states, raw_ssm_states = ssm_varlen_result
             else:
                 ssm_varlen_states = ssm_varlen_result
-                intermediate_ssm_states = None
+                raw_ssm_states = None
 
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
             tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
 
-            # Write intermediate states to pre-allocated output buffers
-            # All tensor ops, no Python loops, fully CUDA graph compatible.
-            # The destination buffers are sized to the global max_intermediate_count
-            # but we only fill the per-graph-bucket prefix; readers consult
-            # per_request_intermediate_counts to know the real count.
-            if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
-                n = intermediate_ssm_states.shape[0]
-                intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
-
-                # Vectorized conv state extraction
-                # conv_gather_offsets: [d_conv] = [-d_conv, ..., -1]
-                gather_positions = (
-                    intermediate_abs_positions.unsqueeze(1).long()
-                    + conv_gather_offsets.unsqueeze(0).long()
-                )  # [n, d_conv]
-                # Clamp into the valid token range. Padding/warmup slots use the
-                # safe-default abs_position == d_conv, which yields gather indices
-                # [0..d_conv-1]; when the prefill sequence is shorter than d_conv
-                # (e.g. a small CUDA-graph warmup bucket with fewer than d_conv
-                # tokens), those indices overrun the token axis. Clamping keeps the
-                # gather in bounds. Real slots are always in range, so this is a
-                # no-op for them, and padding-slot results are never read (callers
-                # consult per_request_intermediate_counts).
-                seq_len = xBC_pre_conv.shape[1]
-                gather_positions = gather_positions.clamp_(0, seq_len - 1)
-                intermediate_conv = xBC_pre_conv[0, gather_positions, :]
-                # [n, d_conv, conv_dim]
-                intermediate_conv_out[:n].copy_(intermediate_conv.transpose(1, 2))
-                # [n, conv_dim, d_conv]
+            if extract_intermediates:
+                # Fused gather+conditional-scatter for SSM: read row
+                # raw_ssm_states[chunk_indices[i]] into intermediate_ssm_out[i],
+                # only for i < real_count.
+                scatter_intermediate_ssm(
+                    raw_ssm_states,
+                    intermediate_chunk_indices,
+                    intermediate_real_count,
+                    intermediate_ssm_out,
+                )
+                # Same pattern for conv: gather a length-d_conv window ending at
+                # abs_positions[i] (clamped into the valid token range) from
+                # xBC_pre_conv and scatter (transposed) into intermediate_conv_out[i],
+                # only for i < real_count.
+                scatter_intermediate_conv(
+                    xBC_pre_conv,
+                    intermediate_abs_positions,
+                    intermediate_real_count,
+                    intermediate_conv_out,
+                    d_conv=intermediate_conv_out.shape[-1],
+                )
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None
