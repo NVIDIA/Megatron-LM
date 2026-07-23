@@ -27,6 +27,7 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -78,6 +79,16 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+def test_copy_optimizer_param_metadata_preserves_allreduce():
+    source = torch.empty(1)
+    destination = torch.empty_like(source)
+    source.allreduce = False
+
+    copy_optimizer_param_metadata(destination, source)
+
+    assert destination.allreduce is False
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
@@ -505,6 +516,8 @@ def test_mtp_grad_separation():
     class MockOptimizer:
         """Minimal mock of MegatronOptimizer for testing grad filtering."""
 
+        _get_grad_for_grad_norm = MegatronOptimizer._get_grad_for_grad_norm
+        _include_param_in_grad_norm = MegatronOptimizer._include_param_in_grad_norm
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
 
@@ -550,6 +563,8 @@ def test_mtp_grad_separation_no_mtp_params():
     from megatron.core.optimizer.optimizer import MegatronOptimizer
 
     class MockOptimizer:
+        _get_grad_for_grad_norm = MegatronOptimizer._get_grad_for_grad_norm
+        _include_param_in_grad_norm = MegatronOptimizer._include_param_in_grad_norm
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
 
@@ -582,6 +597,8 @@ def test_unregistered_grad_norm_group_raises():
     from megatron.core.optimizer.optimizer import MegatronOptimizer
 
     class MockOptimizer:
+        _get_grad_for_grad_norm = MegatronOptimizer._get_grad_for_grad_norm
+        _include_param_in_grad_norm = MegatronOptimizer._include_param_in_grad_norm
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
 
@@ -633,16 +650,22 @@ def test_mtp_grad_clipping_uses_separate_norms():
     from megatron.core.optimizer.optimizer import MegatronOptimizer
 
     class MockOptimizer:
+        _get_grad_for_grad_norm = MegatronOptimizer._get_grad_for_grad_norm
+        _include_param_in_grad_norm = MegatronOptimizer._include_param_in_grad_norm
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
         get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
         has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
         _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
+        _maybe_record_grad_raw_moments_by_param = (
+            MegatronOptimizer._maybe_record_grad_raw_moments_by_param
+        )
         clip_grad_norm = MegatronOptimizer.clip_grad_norm
 
         def __init__(self, params):
             self.params = list(params)
             self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+            self._per_param_grad_raw_moments_requested = False
 
         def get_parameters(self):
             return self.params

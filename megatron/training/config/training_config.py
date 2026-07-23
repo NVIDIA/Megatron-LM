@@ -250,6 +250,39 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
+    log_param_stats_interval: int = 0
+    """Training-step interval for logging count and raw sums of powers 1-4 for each parameter
+    separately (keyed by parameter name) to JSONL statistics files. Values of 0 or less disable
+    logging."""
+
+    log_wgrad_stats_interval: int = 0
+    """Training-step interval for logging count and raw sums of powers 1-4 for each parameter's
+    pre-clipping gradient separately (keyed by parameter name) to JSONL statistics files. Values
+    of 0 or less disable logging."""
+
+    log_activation_stats_interval: int = 0
+    """Training-step interval for logging count and raw sums of powers 1-4 for activations keyed
+    by module site to JSONL statistics files. Will suspend CUDA graphs for the logged steps.
+    Values of 0 or less disable logging."""
+
+    log_dgrad_stats_interval: int = 0
+    """Training-step interval for logging count and raw sums of powers 1-4 for backward data
+    gradients keyed by module site to JSONL statistics files. Will suspend CUDA graphs for the
+    logged steps. Values of 0 or less disable logging."""
+
+    log_residual_stats_interval: int = 0
+    """Training-step interval for logging count and raw sums of powers 1-4 for the initial decoder
+    residual stream and each post-layer residual stream. Values of 0 or less disable logging."""
+
+    log_residual_grad_stats_interval: int = 0
+    """Training-step interval for logging count and raw sums of powers 1-4 for the backward
+    gradients of the initial decoder residual stream and each post-layer residual stream. Values
+    of 0 or less disable logging."""
+
+    statistics_log_dir: str | None = None
+    """Directory for high-cardinality JSONL statistics. If unset, statistics use
+    tensorboard_dir when available, then the --save directory as a fallback."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 

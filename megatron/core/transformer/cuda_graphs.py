@@ -8,14 +8,15 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
@@ -66,6 +67,9 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_CUDA_GRAPH_REPLAY_SUSPENDED: ContextVar[bool] = ContextVar(
+    "cuda_graph_replay_suspended", default=False
+)
 logger = logging.getLogger(__name__)
 
 
@@ -109,6 +113,21 @@ except ImportError:
 def is_graph_capturing():
     """Query if currently capturing."""
     return _IS_GRAPH_CAPTURING
+
+
+def is_cuda_graph_replay_suspended() -> bool:
+    """Return whether CUDA graph dispatch is temporarily suspended."""
+    return _CUDA_GRAPH_REPLAY_SUSPENDED.get()
+
+
+@contextmanager
+def suspend_cuda_graph_replay() -> Iterator[None]:
+    """Temporarily run graphable modules through their eager paths."""
+    token = _CUDA_GRAPH_REPLAY_SUSPENDED.set(True)
+    try:
+        yield
+    finally:
+        _CUDA_GRAPH_REPLAY_SUSPENDED.reset(token)
 
 
 def _set_capture_start():
@@ -1393,7 +1412,7 @@ class CudaGraphManager(torch.nn.Module):
             func = getattr(base_module, function_name)
 
             def wrapped_func(*args, eager=False, cache_key=None, **kwargs):
-                if eager:
+                if eager or is_cuda_graph_replay_suspended():
                     return func(*args, **kwargs)
                 out = self(base_module, args, kwargs, cache_key=cache_key)
                 # Unwrap single-element tuple to match the original function's return type.

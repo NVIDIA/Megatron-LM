@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.transformer.cuda_graphs import is_cuda_graph_replay_suspended
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
@@ -409,7 +410,11 @@ class _BackwardDWWrapper:
 
     def backward_dw(self):
         """Run eager or graphed backward wgrad callables for the wrapped layer."""
-        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
+        is_replay = (
+            hasattr(self.layer, 'cuda_graphs')
+            and self.layer.cuda_graphs
+            and not is_cuda_graph_replay_suspended()
+        )
         if self.shared_expert_dw_callable is not None and (
             not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
         ):

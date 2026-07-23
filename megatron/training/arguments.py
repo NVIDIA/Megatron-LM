@@ -385,6 +385,37 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def _validate_raw_moment_logging_args(args):
+    stats_logging_enabled = any(
+        interval > 0
+        for interval in (
+            args.log_param_stats_interval,
+            args.log_wgrad_stats_interval,
+            args.log_activation_stats_interval,
+            args.log_dgrad_stats_interval,
+            args.log_residual_stats_interval,
+            args.log_residual_grad_stats_interval,
+        )
+    )
+    if stats_logging_enabled and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+        raise ValueError(
+            'Raw-moment statistics logging is not supported with '
+            '--use-megatron-fsdp or --use-torch-fsdp2.'
+        )
+    if (
+        (
+            args.log_residual_stats_interval > 0
+            or args.log_residual_grad_stats_interval > 0
+        )
+        and args.overlap_moe_expert_parallel_comm
+    ):
+        raise ValueError(
+            'Residual and residual-gradient statistics logging is not supported with '
+            '--overlap-moe-expert-parallel-comm.'
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -625,6 +656,8 @@ def validate_args(args, defaults={}):
                                                  v2=getattr(args, key)))
         else:
             setattr(args, key, defaults[key])
+
+    _validate_raw_moment_logging_args(args)
 
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'

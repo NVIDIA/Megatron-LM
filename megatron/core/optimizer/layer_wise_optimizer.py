@@ -10,6 +10,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedStateDict
 from megatron.core.distributed.param_and_grad_buffer import group_params_for_buffers
+from megatron.core.per_parameter_stats import NamedTensorBucket, PerParameterStatRegistry
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
@@ -743,6 +744,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
         grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
         return grad_norm
+
+    def get_raw_moment_buckets_for_grad_norm(
+        self, registry: PerParameterStatRegistry
+    ) -> list[NamedTensorBucket]:
+        names = []
+        grads = []
+        for optimizer in self.chained_optimizers:
+            for name, param in optimizer.get_named_parameters_for_grad_norm(registry):
+                grad = optimizer._get_grad_for_grad_norm(param)
+                if not optimizer._include_param_in_grad_norm(param, grad):
+                    continue
+                names.append(name)
+                grads.append(grad.detach())
+
+        return [NamedTensorBucket(names, grads, (None,))]
 
     @torch.no_grad()
     def count_zeros(self):
