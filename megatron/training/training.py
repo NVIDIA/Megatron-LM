@@ -2484,6 +2484,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update learning rate.
     if update_successful:
+        # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+        # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so multiply it
+        # back in for the sample count.
         increment = (
             get_num_microbatches()
             * args.micro_batch_size
@@ -2620,7 +2623,9 @@ def training_log(
     if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
-    # Calculate batch size.
+    # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
+    # total_model_size at arguments.py:446); each gtp-remat peer consumes a distinct microbatch,
+    # so multiply it back in for the global sample count.
     batch_size = (
         args.micro_batch_size
         * args.data_parallel_size
@@ -4104,6 +4109,9 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
+    # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+    # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so include it in the
+    # global sample breadth we divide out to recover the microbatch count.
     eval_num_microbatches = eval_batch_size // (
         eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
     )
