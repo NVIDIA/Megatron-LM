@@ -2658,6 +2658,9 @@ def _add_training_args(parser):
                         help="Path to a file containing parameter-to-parameter-group mapping. "
                         "Provide a JSON file that specifies which parameters belong to which "
                         "parameter group for global coordination.")
+    group.add_argument('--optimizer-parameters-dump-dir', type=str, default=None,
+                       help='Directory for per-rank optimizer parameter dump JSON files. '
+                            'Each rank writes rank<N>.json.')
     group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads',
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',

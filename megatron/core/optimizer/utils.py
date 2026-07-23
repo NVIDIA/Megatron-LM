@@ -1,0 +1,96 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Optimizer utilities for dumping per-rank parameter sharding info to JSON.
+
+Useful for replaying optimizer steps in tests/microbenchmarks without
+re-running the model. The dump captures everything needed to reconstruct
+the parameter layout: global/local shape, per-param mesh, placements,
+dtype, and the QKV flag.
+
+Optimizer-agnostic: works with any PyTorch optimizer whose params are DTensors.
+"""
+
+import json
+import logging
+import os
+import pathlib
+from typing import Any
+
+import torch
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+
+logger = logging.getLogger(__name__)
+
+
+def dump_optimizer_parameters(
+    optimizer: torch.optim.Optimizer, dump_dir: str | os.PathLike
+) -> None:
+    """Write a per-rank JSON snapshot of `optimizer`'s parameter sharding.
+
+    Each rank writes its own ``rank<N>.json`` file under ``dump_dir``.
+
+    Args:
+        optimizer: any PyTorch optimizer over DTensor params.
+        dump_dir: output directory.
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # Preserve param-group structure (no hyperparameters; just the partition).
+    # Group hyperparameters (lr, betas, weight_decay, ...) are intentionally
+    # not recorded — callers that need them can write a sidecar file.
+    groups = [
+        {"params": [_dump_param(p) for p in group["params"]]} for group in optimizer.param_groups
+    ]
+    spec: dict[str, Any] = {"world_size": world_size, "rank": rank, "groups": groups}
+
+    out = pathlib.Path(dump_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rank_out = out / f"rank{rank}.json"
+    rank_out.write_text(json.dumps(spec, indent=2))
+    if rank == 0:
+        logger.info("Optimizer inputs dumped to %s", out)
+
+
+def _dump_param(p: DTensor) -> dict[str, Any]:
+    """Convert one optimizer param to a JSON-serializable dict."""
+    local = p.to_local()
+    mesh = p.device_mesh
+    out: dict[str, Any] = {
+        "global_shape": tuple(int(s) for s in p.shape),
+        "dtype": str(p.dtype),
+        "is_qkv": _is_qkv(p),
+        "local_shape": tuple(int(s) for s in local.shape),
+        "mesh_shape": tuple(int(s) for s in mesh.shape),
+        "mesh_dim_names": list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None,
+        "placements": [repr(pl) for pl in p.placements],
+    }
+    # Record the global rank IDs that form this param's mesh, flat in row-major
+    # order — only when they aren't the canonical ``range(mesh.numel())``. The
+    # full-world mesh always uses canonical ranks; sub-meshes (EP groups, etc.)
+    # generally don't. Omitting the canonical case keeps the dump compact while
+    # still letting consumers reconstruct the exact device assignment.
+    # ``mesh_shape`` gives the reshape when present.
+    mesh_ranks = mesh.mesh.flatten().tolist()
+    if mesh_ranks != list(range(len(mesh_ranks))):
+        out["mesh_ranks"] = mesh_ranks
+    return out
+
+
+def _is_qkv(p: torch.Tensor) -> bool:
+    return bool(getattr(p, "is_qkv", False)) or bool(
+        getattr(getattr(p, "orig_param", None), "is_qkv", False)
+    )
