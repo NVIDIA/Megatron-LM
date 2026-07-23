@@ -187,14 +187,14 @@ def _get_metadata_path(tokenizer_path: str) -> str:
 
 def _get_tokenizer_model_class(library: str, metadata: dict) -> MegatronTokenizerBase:
     """
-    Returns a class which corresponds to choosen tokenizer model type.
+    Returns a class which corresponds to chosen tokenizer model type.
 
     Args:
         library (str): tokenizer library.
         metadata (dict): tokenizer metadata.
 
     Returns:
-        MegatronTokenizerBase: class for choosen tokenizer model type.
+        MegatronTokenizerBase: class for chosen tokenizer model type.
     """
     # Return tokenizer class if it was specified in metadata.
     if metadata.get('tokenizer_class', None):
