@@ -1014,7 +1014,9 @@ class TestLifecycle:
         """A live optimizer-facing grad prevents a root-wide storage release."""
         torch.manual_seed(42)
         model = SimpleMLP(16).to(_device())
-        model = fully_shard(model)
+        # Keep an optimizer-facing gradient on every rank so the test's
+        # liveness precondition does not depend on the local shard being empty.
+        model = fully_shard(model, sharding_strategy="no_shard")
 
         model(torch.randn(2, 16, device=_device())).float().square().mean().backward()
         model.finish_grad_sync()
@@ -1034,9 +1036,11 @@ class TestLifecycle:
         """Plain optimizer zero-grad must not overlap stale grads with next unshard."""
         torch.manual_seed(42)
         model = TinyLLM(vocab=32, hidden=16, num_layers=2).to(_device())
+        # Replicated gradients make the storage assertions valid on every
+        # world size used by CI, including ranks that would own empty shards.
         for index, layer in enumerate(model.layers):
-            model.layers[index] = fully_shard(layer)
-        model = fully_shard(model)
+            model.layers[index] = fully_shard(layer, sharding_strategy="no_shard")
+        model = fully_shard(model, sharding_strategy="no_shard")
         optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
 
         x = torch.randint(0, 32, (2, 4), device=_device())
@@ -1084,7 +1088,9 @@ class TestLifecycle:
     def test_fused_adam_reuses_dist_grad_wrappers_across_steps(self):
         """Rebound DTensor grads retain optimizer-compatible shape and identity."""
         torch.manual_seed(42)
-        model = fully_shard(SimpleMLP(16).to(_device()))
+        # Wrapper identity is the behavior under test. Use replicated grads so
+        # every CI rank owns wrappers and follows the same iteration path.
+        model = fully_shard(SimpleMLP(16).to(_device()), sharding_strategy="no_shard")
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
         x = torch.randn(2, 16, device=_device())
         wrapper_ids = None
