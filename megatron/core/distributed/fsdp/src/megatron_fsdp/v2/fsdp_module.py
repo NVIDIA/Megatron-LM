@@ -51,7 +51,7 @@ def _unshard_weight_buffers(
             for weight_buffer in weight_buffers:
                 target_placements = weight_buffer.placements.copy()
                 target_placements[unshard_dim] = Placement.REPLICATE
-                weight_buffer.redistribute(target_placements, bind_params=False, stream=stream)
+                weight_buffer.redistribute(target_placements, stream=stream)
         if async_op and coalescing_event is not None:
             coalescing_event.wait()
 
@@ -61,7 +61,7 @@ def _unshard_weight_buffers(
 
     # Rebinding only updates tensor metadata and stays on the caller stream.
     for weight_buffer, full_buffer in zip(weight_buffers, full_buffers):
-        weight_buffer._bind_buffer_to_params(full_buffer)
+        weight_buffer.bind_params(full_buffer)
 
 
 def _select_unshard_stream(ctx, *, async_op: bool):

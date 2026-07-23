@@ -222,7 +222,7 @@ class ParameterGroup:
 
         for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
             if weight_buffer is not None and not weight_buffer.inner_sharded:
-                weight_buffer._bind_buffer_to_params(weight_buffer.data)
+                weight_buffer.bind_params(weight_buffer.data)
 
         # Create gradient buffer
         if self.requires_grad:
@@ -263,15 +263,13 @@ class ParameterGroup:
         for weight_buffer in self.weight_buffers_for_unshard(bwd_pass=bwd_pass):
             if self.outer_dp_sharding_strategy == "optim":
                 weight_buffer.redistribute(
-                    [Placement.REPLICATE, weight_buffer.placements[1]],
-                    bind_params=False,
-                    stream=stream,
+                    [Placement.REPLICATE, weight_buffer.placements[1]], stream=stream
                 )
             weight_buffer.redistribute(
-                [weight_buffer.placements[0], Placement.REPLICATE],
-                bind_params=bind_params,
-                stream=stream,
+                [weight_buffer.placements[0], Placement.REPLICATE], stream=stream
             )
+            if bind_params:
+                weight_buffer.bind_params()
         self.post_unshard(bwd_pass=bwd_pass)
 
     def has_unsharded_weight_buffers(self, bwd_pass: bool = False) -> bool:

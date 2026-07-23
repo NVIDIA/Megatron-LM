@@ -781,7 +781,7 @@ def quantize_main_weights_to_nvfp4(
         raise RuntimeError("FIXME: implement non-distributed NVFP4 quantization path")
 
     full_weight_buffer = wbuf.fetch_buffer([Placement.REPLICATE, Placement.REPLICATE])
-    wbuf._bind_buffer_to_params(full_weight_buffer)
+    wbuf.bind_params(full_weight_buffer)
 
     for param in model_params:
         item_id = param_idx[param]

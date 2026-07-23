@@ -257,11 +257,6 @@ class DataParallelBuffer:
                 torch.distributed.all_gather_into_tensor(
                     output_tensor=output_buffer, input_tensor=input_buffer, group=group
                 )
-            # Parameters can bind only after both mesh dimensions are replicated.
-            if kwargs.get("bind_params", False) and all(
-                placement is Placement.REPLICATE for placement in target_placements
-            ):
-                self._bind_buffer_to_params(output_buffer)
         elif self.placements[changed_axis] is Placement.PARTIAL:
             # Inner-DP shards accumulate across microbatches; outer-DP only reduces
             # the completed inner result and therefore always overwrites its output.
@@ -339,8 +334,11 @@ class DataParallelBuffer:
 
         self.placements[changed_axis] = target_placements[changed_axis]
 
-    def _bind_buffer_to_params(self, buffer: torch.Tensor) -> None:
-        """Bind the given buffer to the params according to the layout."""
+    def bind_params(self, buffer: Optional[torch.Tensor] = None) -> None:
+        """Bind parameters to a fully replicated buffer."""
+        if buffer is None:
+            assert self.is_unsharded(), "Cannot bind params from a sharded buffer"
+            buffer = self.fetch_buffer(self.placements)
         assert buffer.numel() == self.buffer_index.bucket_meta.size, (
             f"Buffer size {buffer.numel()} does not match expected size "
             f"{self.buffer_index.bucket_meta.size}"
