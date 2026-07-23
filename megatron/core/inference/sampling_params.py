@@ -34,15 +34,17 @@ class SamplingParams:
         None  # List of strings that will stop generation when produced
     )
     detokenize_stop_sequence: bool = False  # Keep stop words and EOD in generated text
-    streaming: bool = False  # Emit ENGINE_REPLY_PARTIAL per engine step.
+    streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
+    streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
 
     def __post_init__(self):
-        """Ensure backward compatibility for return_prompt_top_n_logprobs.
+        """Validate parameters and maintain backward compatibility.
 
         Sets return_prompt_top_n_logprobs based on skip_prompt_log_probs and top_n_logprobs:
         - return_prompt_top_n_logprobs = not skip_prompt_log_probs and top_n_logprobs > 0
         """
         self._sync_prompt_logprobs_fields()
+        self._validate_streaming_interval()
 
     def _sync_prompt_logprobs_fields(self):
         """Synchronize return_prompt_top_n_logprobs with skip_prompt_log_probs."""
@@ -60,6 +62,15 @@ class SamplingParams:
         else:
             self.return_prompt_top_n_logprobs = False
 
+    def _validate_streaming_interval(self):
+        """Validate the minimum number of tokens emitted in a streaming delta."""
+        if (
+            isinstance(self.streaming_interval, bool)
+            or not isinstance(self.streaming_interval, int)
+            or self.streaming_interval < 1
+        ):
+            raise ValueError("streaming_interval must be an integer greater than or equal to 1")
+
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to sampling params
 
@@ -76,6 +87,7 @@ class SamplingParams:
 
         # Synchronize fields after setting attributes
         self._sync_prompt_logprobs_fields()
+        self._validate_streaming_interval()
 
     def serialize(self) -> dict:
         """Return a dictionary that is msgpack-serializable."""

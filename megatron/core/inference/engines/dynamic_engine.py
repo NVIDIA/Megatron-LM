@@ -2022,7 +2022,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 continue
             already = self._partial_emit_lengths.get(rid, 0)
             total = len(request.generated_tokens)
-            if total > already:
+            streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
+            if total - already >= streaming_interval:
                 new_tokens = list(request.generated_tokens[already:])
                 partial = {"request_id": rid, "new_tokens": new_tokens}
                 if request.sampling_params.return_log_probs:

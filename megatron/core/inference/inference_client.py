@@ -140,10 +140,10 @@ class InferenceClient:
 
         Used by Dynamo directly and by the OpenAI-compatible HTTP frontend.
 
-        Returns an async iterator that yields one dict per engine step:
+        Returns an async iterator that yields incremental output dictionaries:
 
-        - ``{"partial": {"request_id": int, "new_tokens": list[int]}}`` for each
-          step that produced new tokens, in order.
+        - ``{"partial": {"request_id": int, "new_tokens": list[int]}}`` whenever
+          the request's streaming interval is reached, in order.
         - ``{"final": <full reply dict or DynamicInferenceRequest>}`` exactly once
           at the end. The iterator then stops.
 

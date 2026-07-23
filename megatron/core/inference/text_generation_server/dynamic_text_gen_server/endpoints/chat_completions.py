@@ -594,6 +594,7 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
+                streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)

@@ -661,6 +661,32 @@ def test_streaming_partials_remain_buffered_when_nonblocking_send_would_block():
     assert engine._partial_emit_lengths == {}
 
 
+def test_streaming_partials_buffer_until_token_interval():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._partial_emit_lengths = {}
+    request = types.SimpleNamespace(
+        generated_tokens=[11, 12],
+        generated_log_probs=None,
+        sampling_params=SamplingParams(
+            streaming=True, streaming_interval=3, return_log_probs=False
+        ),
+    )
+    engine.requests = {7: types.SimpleNamespace(record=[request])}
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine.socket_for_receiving_requests.poll.return_value = True
+
+    engine._try_send_streaming_partials()
+
+    engine.socket_for_receiving_requests.send.assert_not_called()
+    assert engine._partial_emit_lengths == {}
+
+    request.generated_tokens.append(13)
+    engine._try_send_streaming_partials()
+
+    engine.socket_for_receiving_requests.send.assert_called_once()
+    assert engine._partial_emit_lengths == {7: 3}
+
+
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod

@@ -108,6 +108,7 @@ try:
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
                 termination_id=-1 if ignore_eos else None,
+                streaming_interval=int(req.get("streaming_interval", 1)),
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -126,6 +127,7 @@ try:
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                 stop_words=sampling_params.stop_words,
                 termination_id=sampling_params.termination_id,
+                streaming_interval=sampling_params.streaming_interval,
             )
             if stream_requested:
                 tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
