@@ -38,6 +38,10 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.post_training.modelopt.checkpointing import (
+    save_modelopt_state,
+    save_sharded_modelopt_state,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
@@ -65,8 +69,6 @@ except ImportError:
 
 # [ModelOpt]: Import
 try:
-    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
-
     from megatron.post_training.utils import print_distributed_quant_summary
     has_nvidia_modelopt = True
 except Exception:
