@@ -8,6 +8,7 @@ import inspect
 import io
 import os
 import pickle
+import re
 import warnings
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
@@ -84,17 +85,34 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+_EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
 
 
 def _set_expert_parameter_attributes(
-    module: torch.nn.Module, parallel_mode: Optional[str], use_expert_groups: bool
+    module: torch.nn.Module, parallel_mode: Optional[str], use_expert_pgs: bool
 ) -> None:
-    """Set expert gradient-reduction and tensor-partition metadata."""
-    for name, param in module.named_parameters(recurse=False):
-        param.allreduce = not use_expert_groups
+    """Set process-group and tensor-partition metadata on an expert TE module.
 
-        is_weight = name == "weight" or (name.startswith("weight") and name[6:].isdigit())
-        is_bias = name == "bias" or (name.startswith("bias") and name[4:].isdigit())
+    ``allreduce=False`` selects EDP for gradient reduction.
+
+    Weights and biases, including TEGroupedLinear's numbered parameters, are also marked as
+    TP-partitioned according to ``parallel_mode``; row-parallel biases remain replicated.
+
+    Any parameter which is partitioned along TP or ETP is marked with ``tensor_model_parallel``,
+    which ensures that all shards contribute to the gradient norm.
+
+    Args:
+        module: Transformer Engine module whose direct parameters should be marked.
+        parallel_mode: Tensor-parallel mode used by the module (``"column"``, ``"row"``, or None).
+        use_expert_pgs: Whether to use EP/ETP/EDP process groups instead of TP/CP/DP.
+    """
+    for name, param in module.named_parameters(recurse=False):
+        param.allreduce = not use_expert_pgs
+
+        name_match = _EXPERT_PARAMETER_NAME_PATTERN.fullmatch(name)
+        parameter_kind = name_match.group(1) if name_match else None
+        is_weight = parameter_kind == "weight"
+        is_bias = parameter_kind == "bias"
         is_partitioned = parallel_mode in ("column", "row") and (
             is_weight or (parallel_mode == "column" and is_bias)
         )
@@ -876,7 +894,7 @@ class TELinear(te.pytorch.Linear):
             tp_size = get_pg_size(tp_group)
 
         self.expert_parallel = self.config.expert_model_parallel_size > 1
-        use_expert_groups = is_expert and (
+        use_expert_pgs = is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
         )
@@ -938,7 +956,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         if is_expert:
-            _set_expert_parameter_attributes(self, parallel_mode, use_expert_groups)
+            _set_expert_parameter_attributes(self, parallel_mode, use_expert_pgs)
         else:
             for param in self.parameters():
                 # Reduce the gradient on DP group
@@ -1336,11 +1354,11 @@ class TEColumnParallelLinear(TELinear):
                 setattr(self.bias, "allreduce", True)
 
         if is_expert:
-            use_expert_groups = (
+            use_expert_pgs = (
                 config.expert_model_parallel_size > 1
                 or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
             )
-            _set_expert_parameter_attributes(self, "column", use_expert_groups)
+            _set_expert_parameter_attributes(self, "column", use_expert_pgs)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -1582,11 +1600,11 @@ class TERowParallelLinear(TELinear):
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
 
         if is_expert:
-            use_expert_groups = (
+            use_expert_pgs = (
                 config.expert_model_parallel_size > 1
                 or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
             )
-            _set_expert_parameter_attributes(self, "row", use_expert_groups)
+            _set_expert_parameter_attributes(self, "row", use_expert_pgs)
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
@@ -2006,7 +2024,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
-            use_expert_groups = is_expert and (
+            use_expert_pgs = is_expert and (
                 self.expert_parallel
                 or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
             )
@@ -2076,7 +2094,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     **extra_kwargs,
                 )
 
-            _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_groups)
+            _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
 
             self._register_load_state_dict_pre_hook(
                 type(self)._normalize_grouped_parameter_keys, with_module=True
