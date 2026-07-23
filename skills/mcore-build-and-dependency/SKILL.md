@@ -23,6 +23,10 @@ up front before the longer workflow:
 - Default `dev` uses `docker/.ngc_version.dev` and the `dev` uv group; `lts`
   uses `docker/.ngc_version.lts` and the `lts` uv group. The `container::lts`
   PR label selects the LTS path; otherwise CI uses `dev`.
+- **`lts` is opt-in only when the user explicitly asks for it.** It is the older
+  long-term-support base, not a routine second lane — never attach
+  `container::lts`, build the LTS image, or run the `lts` uv group on your own
+  initiative, not even for a container or dependency change.
 - Install commands inside the container: `uv sync --locked --group dev --group test`,
   `uv sync --locked --only-group linting`, or
   `uv sync --locked --group lts --group test`.
@@ -68,11 +72,15 @@ differences below follow from it, they are not the point.
 > with the LTS pin set. To bump an LTS dependency, edit the version in
 > `docker/lts/requirements.txt` and rebuild `docker/Dockerfile.ci.lts`.
 
-**Use `dev` for everything unless you have a specific reason to test `lts`.**
-CI runs `dev` by default; attach `container::lts` to a PR only when verifying
-that a change still works on the older long-term-support PyTorch/CUDA base that
-LTS users run (e.g. a container or dependency upgrade). The `@pytest.mark.flaky_in_dev` marker skips tests in the
-`dev` environment; `@pytest.mark.flaky` skips them in `lts`.
+**Use `dev` for everything. `lts` is off-limits unless the user explicitly asks
+for it.** CI runs `dev` by default, and that is the only variant you touch on
+your own initiative. Treat `container::lts` as a high barrier, not a fallback: do
+**not** attach the label, build `docker/Dockerfile.ci.lts`, or run the `lts` uv
+group unless the user has explicitly requested LTS validation — not even for a
+container or dependency change. When they do ask, `container::lts` verifies the
+change still works on the older long-term-support PyTorch/CUDA base that LTS
+users run. The `@pytest.mark.flaky_in_dev` marker skips tests in the `dev`
+environment; `@pytest.mark.flaky` skips them in `lts`.
 
 ---
 
