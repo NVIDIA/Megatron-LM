@@ -74,7 +74,7 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 | Label | Effect |
 |-------|--------|
-| **`container::lts`** | Use the LTS base image instead of `dev` (combinable with any scope label) |
+| **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
 
 ### Which label to attach when opening a PR

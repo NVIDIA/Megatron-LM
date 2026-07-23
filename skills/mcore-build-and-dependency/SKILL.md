@@ -51,12 +51,16 @@ dependency.
 ## dev vs lts
 
 Two image variants exist, each with its own Dockerfile, selected by the
-`container::lts` PR label:
+`container::lts` PR label. The defining difference is the **base container**:
+`dev` tracks the latest NGC PyTorch release, while `lts` ("long-term support")
+pins the previous, still-supported NGC PyTorch/CUDA release. `container::lts`
+exists to verify a change still works on that older base — the dependency
+differences below follow from it, they are not the point.
 
 | Variant | Base image pin | Dockerfile | Where deps live | When used |
 |---------|---------------|------------|-----------------|-----------|
-| **`dev`** | `docker/.ngc_version.dev` | `docker/Dockerfile.ci.dev` | `pyproject.toml` `dev` extra (uv-resolved) | Default — CI, local development, most PRs |
-| **`lts`** | `docker/.ngc_version.lts` | `docker/Dockerfile.ci.lts` | `docker/lts/requirements.txt` (pinned, sourced from main's `uv.lock` at AUT-479) | Stability testing; excludes ModelOpt and other bleeding-edge extras |
+| **`dev`** | `docker/.ngc_version.dev` (latest NGC release) | `docker/Dockerfile.ci.dev` | `pyproject.toml` `dev` extra (uv-resolved) | Default — CI, local development, most PRs |
+| **`lts`** | `docker/.ngc_version.lts` (older long-term-support release) | `docker/Dockerfile.ci.lts` | `docker/lts/requirements.txt` (pinned, sourced from main's `uv.lock` at AUT-479) | Backward-compat lane — verify the change still runs on the older NGC base; extras not carried on it (ModelOpt, the CUDA-13 TransformerEngine build) are dropped |
 
 > LTS deps used to live in `[project.optional-dependencies].lts` in
 > `pyproject.toml`. They were moved into `docker/lts/requirements.txt` so
@@ -66,8 +70,8 @@ Two image variants exist, each with its own Dockerfile, selected by the
 
 **Use `dev` for everything unless you have a specific reason to test `lts`.**
 CI runs `dev` by default; attach `container::lts` to a PR only when verifying
-compatibility with the stable stack (e.g. a dependency upgrade that must not
-break LTS users). The `@pytest.mark.flaky_in_dev` marker skips tests in the
+that a change still works on the older long-term-support PyTorch/CUDA base that
+LTS users run (e.g. a container or dependency upgrade). The `@pytest.mark.flaky_in_dev` marker skips tests in the
 `dev` environment; `@pytest.mark.flaky` skips them in `lts`.
 
 ---
