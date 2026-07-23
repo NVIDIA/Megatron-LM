@@ -84,6 +84,21 @@ triage:slack_linear_followup:
       --linear-plan linear_action_plan_post.json
       --slack-bot-token "${MCORE_SLACK_BOT_TOKEN:-${ALERTMANAGER_TOKEN}}"
       --slack-channel-id "${MCORE_SLACK_CHANNEL_ID}"
+    - |
+      THREAD_TIMESTAMP="$(python -c 'import json; print(json.load(open("slack_notification.json")).get("thread_timestamp") or "")')"
+      if [[ -z "${THREAD_TIMESTAMP}" ]]; then
+        echo "No Slack thread timestamp; skipping detailed triage follow-ups."
+      else
+        nemo-ci-notify \
+          --config "${NEMO_CI_TRIAGE_CONFIG}" \
+          --module megatron_lm \
+          --only-followup \
+          --thread-ts "${THREAD_TIMESTAMP}" \
+          --failure-buckets failure_buckets.json \
+          --linear-report linear_status_report.json \
+          --action-plan linear_action_plan_post.json \
+          --slack-bot-token "${MCORE_SLACK_BOT_TOKEN:-${ALERTMANAGER_TOKEN}}"
+      fi
   rules:
     # Post the applied Linear actions under the functional-test notification.
     - if: >-
