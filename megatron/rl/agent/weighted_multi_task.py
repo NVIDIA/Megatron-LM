@@ -1,11 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import logging
 from typing import Any, Optional, Type
 
 import numpy as np
 
-from .. import import_class
+from .registry import get_agent_class
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -15,10 +16,13 @@ from .api import (
     EvaluationResponse,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     Rollout,
     RolloutGenerator,
     RolloutRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AgentConfig(AgentBaseModel):
@@ -73,7 +77,7 @@ class WeightedMultiTask(
 
         Args:
             config: List of dicts with keys:
-                - agent_type: String path to agent class
+                - agent_type: Registered agent name (see megatron.rl.agent.registry)
                 - agent_args: Dict of arguments to pass to agent constructor
                 - weight: Float weight for this agent
 
@@ -87,8 +91,7 @@ class WeightedMultiTask(
             agent_args = entry.get('agent_args', {})
             agent_args['parallel_generation_tasks'] = parallel_generation_tasks
 
-            # Import and instantiate the agent class
-            agent_type = import_class(entry['agent_type'])
+            agent_type = get_agent_class(entry['agent_type'])
             agent_configs.append(
                 AgentConfig(
                     agent_type=agent_type,
@@ -153,18 +156,17 @@ class WeightedMultiTask(
 
         return final_counts
 
-    async def group_rollout(
+    async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
-        submission_gate: asyncio.Semaphore | None = None,
-    ) -> list[Rollout]:
+    ) -> GroupRolloutParams:
         raise NotImplementedError(
             "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
         )
 
-    async def rollout(self, request: RolloutRequest) -> Rollout:
+    async def get_rollout_response(self, request, inference_request):
         raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_reward_rollouts instead to generate rollouts."
+            "WeightedMultiTask delegates to sub-agents; get_rollout_response is not used."
         )
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
@@ -202,6 +204,32 @@ class WeightedMultiTask(
             agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
         agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
+
+        # Snapshot the distribution for observability. Read back by rl_utils
+        # during per-iteration metric logging.
+        env_ids = [getattr(a, "env_id", f"agent_{i}") or f"agent_{i}"
+                   for i, a in enumerate(self.agents)]
+        self.latest_distribution = {
+            "env_ids": env_ids,
+            "agent_groups": list(agent_groups),
+            "agent_pgts": list(agent_pgts),
+            "agent_slots": agent_slots.tolist(),
+            "total_pgt": int(sum(agent_pgts)),
+            "num_groups": request.num_groups,
+        }
+        logger.info(
+            "WeightedMultiTask distribution: sub=%s cons=%s num_groups=%d "
+            "rollouts_per_group=%d total_pgt=%d per_agent="
+            + ", ".join(
+                f"{eid}(groups={g}, pgt={p}, slots={s:g})"
+                for eid, g, p, s in zip(env_ids, agent_groups, agent_pgts, agent_slots)
+            ),
+            request.submission_granularity,
+            request.consumption_granularity,
+            request.num_groups,
+            request.rollouts_per_group,
+            int(sum(agent_pgts)),
+        )
 
         # Create tasks for each agent with non-zero groups
         generators = []
