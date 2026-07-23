@@ -300,3 +300,93 @@ class TestCausalConv1dUpdate:
                 atol=1e-5,
                 rtol=1e-5,
             )
+
+    @pytest.mark.parametrize("width", [2, 3, 4])
+    def test_immediate_free_token_state_update(self, width):
+        """Immediate free-token update (state_len == width, the Mamba-2 case).
+
+        The free token (s == 0) window is written straight into the live
+        conv_state, drafted tokens (s >= 1) are checkpointed at intermediate
+        index s - 1, and outputs are identical to the standard path. Verified
+        against the standard path's full-window intermediate buffer.
+        """
+        torch.manual_seed(7)
+        B, seq_len, D = 2, 4, 64  # 1 free token + 3 drafted tokens
+        state_len = width
+        x = torch.randn(B, seq_len, D, device="cuda", dtype=torch.float32)
+        weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
+        bias = torch.randn(D, device="cuda", dtype=torch.float32)
+        conv_state_initial = torch.randn(B, D, state_len, device="cuda", dtype=torch.float32)
+
+        # Standard path: full (seq_len) intermediate buffer; conv_state rolls to the end.
+        cs_ref = conv_state_initial.clone()
+        int_ref = torch.zeros(B, seq_len, D, state_len, device="cuda", dtype=torch.float32)
+        out_ref = causal_conv1d_update(
+            x,
+            cs_ref,
+            weight,
+            bias=bias,
+            silu_activation="silu",
+            conv_state_indices=None,
+            intermediate_conv_states=int_ref,
+        )
+
+        # Immediate path: intermediate buffer has only seq_len - 1 (drafted) slots.
+        cs_imm = conv_state_initial.clone()
+        int_imm = torch.zeros(B, seq_len - 1, D, state_len, device="cuda", dtype=torch.float32)
+        out_imm = causal_conv1d_update(
+            x,
+            cs_imm,
+            weight,
+            bias=bias,
+            silu_activation="silu",
+            conv_state_indices=None,
+            intermediate_conv_states=int_imm,
+            immediate_state_update=True,
+        )
+
+        # Outputs are identical to the standard path.
+        torch.testing.assert_close(out_imm, out_ref, atol=1e-4, rtol=1e-4)
+        # Live conv_state holds the free-token (s == 0) window.
+        torch.testing.assert_close(cs_imm, int_ref[:, 0], atol=1e-5, rtol=1e-5)
+        # Drafted-token windows are shifted by one: int_imm[:, j] == int_ref[:, j + 1].
+        for j in range(seq_len - 1):
+            torch.testing.assert_close(int_imm[:, j], int_ref[:, j + 1], atol=1e-5, rtol=1e-5)
+
+    def test_immediate_state_update_requires_state_len_eq_width(self):
+        """The flag is only valid for state_len == width (Mamba-2)."""
+        B, seq_len, D, width, state_len = 2, 3, 64, 4, 8  # state_len != width
+        x = torch.randn(B, seq_len, D, device="cuda", dtype=torch.float32)
+        weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
+        conv_state = torch.randn(B, D, state_len, device="cuda", dtype=torch.float32)
+        int_states = torch.zeros(B, seq_len - 1, D, state_len, device="cuda", dtype=torch.float32)
+        with pytest.raises(AssertionError):
+            causal_conv1d_update(
+                x,
+                conv_state,
+                weight,
+                bias=None,
+                silu_activation=False,
+                conv_state_indices=None,
+                intermediate_conv_states=int_states,
+                immediate_state_update=True,
+            )
+
+    def test_immediate_state_update_requires_intermediate(self):
+        """The flag requires an intermediate buffer to be provided."""
+        B, seq_len, D, width = 2, 3, 64, 4
+        state_len = width
+        x = torch.randn(B, seq_len, D, device="cuda", dtype=torch.float32)
+        weight = torch.randn(D, width, device="cuda", dtype=torch.float32)
+        conv_state = torch.randn(B, D, state_len, device="cuda", dtype=torch.float32)
+        with pytest.raises(AssertionError):
+            causal_conv1d_update(
+                x,
+                conv_state,
+                weight,
+                bias=None,
+                silu_activation=False,
+                conv_state_indices=None,
+                intermediate_conv_states=None,
+                immediate_state_update=True,
+            )

@@ -299,6 +299,27 @@ class InferenceConfig:
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
+    mamba_immediate_free_token_state_update: bool = False
+    """For Mamba speculative decoding: when True, the guaranteed-accepted free token at
+    speculative position 0 (sampled from the target model in the previous step) has its conv/SSM
+    state written directly into the live state buffers during the decode forward pass, instead of
+    being checkpointed and rolled back. Only the drafted tokens are checkpointed, which shrinks the
+    intermediate Mamba state buffers by one slot and avoids a wasteful checkpoint. Requires the
+    Mamba conv state length to equal the conv width (``state_len == d_conv``), which holds for
+    Mamba-2. Has no effect when ``num_speculative_tokens == 0``."""
+
+    mamba_factorized_state_rollback: bool = False
+    """For Mamba speculative decoding: instead of checkpointing the full intermediate SSM state for
+    every drafted token, store the rank-1 factors ``(dx_t = delta_t * x_t, B_t, alpha_t)`` of each
+    per-step update and reconstruct the accepted state at rewind via a single fused GEMM
+    (``S <- (prod alpha) * S + sum c_t * dx_t (outer) B_t``). This shrinks the intermediate SSM
+    buffer from ``nheads*headdim*dstate`` to ``nheads*headdim + ngroups*dstate + nheads`` per token
+    (~100x for typical Mamba-2). Only affects the SSM state (the conv state is small and untouched;
+    its free-token handling is still governed by ``mamba_immediate_free_token_state_update``). The
+    free token (speculative position 0) is also factorized, so the live SSM state is not written
+    during the decode forward pass. Requires a per-head scalar ``A`` (Mamba-2 / TIE_HDIM). No effect
+    when ``num_speculative_tokens == 0``."""
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 

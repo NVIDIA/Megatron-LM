@@ -56,6 +56,7 @@ def causal_conv1d_update_kernel(
     HAS_BIAS: tl.constexpr,
     HAS_STATE_INDICES: tl.constexpr,
     HAS_INT_STATE: tl.constexpr,
+    IMMEDIATE_STATE_UPDATE: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
 ):
     """Triton implementation of causal_conv1d_update (kernel)."""
@@ -110,6 +111,106 @@ def causal_conv1d_update_kernel(
         w1 = tl.load(weight_ptrs + 1 * weight_width_stride, mask=mask).to(tl.float32)
         w2 = tl.load(weight_ptrs + 2 * weight_width_stride, mask=mask).to(tl.float32)
         w3 = tl.load(weight_ptrs + 3 * weight_width_stride, mask=mask).to(tl.float32)
+
+    # ------------------------------------------------------------------
+    # Immediate free-token update path (Mamba-2: state_len == WIDTH, which
+    # is asserted in the launcher when this flag is on).
+    #
+    # Speculative position 0 is the "free" token sampled from the target
+    # model in the previous step and is guaranteed to be accepted. We keep
+    # the conv window resident in registers so the live conv_state buffer can
+    # be frozen at the free-token window (written at s == 0) while later
+    # drafted-token windows (s >= 1) are checkpointed to the intermediate
+    # buffer at index s - 1. The post-sequence window is never written back
+    # to conv_state.
+    # ------------------------------------------------------------------
+    if HAS_INT_STATE and IMMEDIATE_STATE_UPDATE:
+        out_dtype = conv_state_ptrs.dtype.element_ty
+        # Load the initial window (the WIDTH most-recent prior inputs).
+        win_0 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
+        win_1 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
+        win_2 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
+        win_3 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
+        if WIDTH == 2:
+            win_0 = tl.load(conv_state_ptrs + 0 * conv_state_l_stride, mask=mask).to(tl.float32)
+            win_1 = tl.load(conv_state_ptrs + 1 * conv_state_l_stride, mask=mask).to(tl.float32)
+        elif WIDTH == 3:
+            win_0 = tl.load(conv_state_ptrs + 0 * conv_state_l_stride, mask=mask).to(tl.float32)
+            win_1 = tl.load(conv_state_ptrs + 1 * conv_state_l_stride, mask=mask).to(tl.float32)
+            win_2 = tl.load(conv_state_ptrs + 2 * conv_state_l_stride, mask=mask).to(tl.float32)
+        elif WIDTH == 4:
+            win_0 = tl.load(conv_state_ptrs + 0 * conv_state_l_stride, mask=mask).to(tl.float32)
+            win_1 = tl.load(conv_state_ptrs + 1 * conv_state_l_stride, mask=mask).to(tl.float32)
+            win_2 = tl.load(conv_state_ptrs + 2 * conv_state_l_stride, mask=mask).to(tl.float32)
+            win_3 = tl.load(conv_state_ptrs + 3 * conv_state_l_stride, mask=mask).to(tl.float32)
+
+        for s in range(seq_len):
+            x_ptrs = x_ptr + batch_id * x_b_stride + s * x_s_stride + channel_offsets * x_c_stride
+            out_ptrs = (
+                out_ptr
+                + batch_id * out_b_stride
+                + s * out_s_stride
+                + channel_offsets * out_c_stride
+            )
+            x_val = tl.load(x_ptrs, mask=mask).to(tl.float32)
+
+            # Shift the window left by one, append the new token, and convolve.
+            out_val = bias_val
+            if WIDTH == 2:
+                win_0 = win_1
+                win_1 = x_val
+                out_val += w0 * win_0 + w1 * win_1
+            elif WIDTH == 3:
+                win_0 = win_1
+                win_1 = win_2
+                win_2 = x_val
+                out_val += w0 * win_0 + w1 * win_1 + w2 * win_2
+            elif WIDTH == 4:
+                win_0 = win_1
+                win_1 = win_2
+                win_2 = win_3
+                win_3 = x_val
+                out_val += w0 * win_0 + w1 * win_1 + w2 * win_2 + w3 * win_3
+
+            if SILU_ACTIVATION:
+                out_val = out_val * tl.sigmoid(out_val)
+            tl.store(out_ptrs, out_val.to(out_ptrs.dtype.element_ty), mask=mask)
+
+            # The window now equals the conv state after consuming token s.
+            if s == 0:
+                # Free token: persist directly into the live conv_state buffer.
+                if WIDTH >= 2:
+                    tl.store(
+                        conv_state_ptrs + 0 * conv_state_l_stride, win_0.to(out_dtype), mask=mask
+                    )
+                    tl.store(
+                        conv_state_ptrs + 1 * conv_state_l_stride, win_1.to(out_dtype), mask=mask
+                    )
+                if WIDTH >= 3:
+                    tl.store(
+                        conv_state_ptrs + 2 * conv_state_l_stride, win_2.to(out_dtype), mask=mask
+                    )
+                if WIDTH >= 4:
+                    tl.store(
+                        conv_state_ptrs + 3 * conv_state_l_stride, win_3.to(out_dtype), mask=mask
+                    )
+            else:
+                # Drafted token: checkpoint into the intermediate buffer at s - 1.
+                int_base = (
+                    int_state_ptr
+                    + state_batch_coord * int_state_b_stride
+                    + (s - 1) * int_state_s_stride
+                    + channel_offsets * int_state_c_stride
+                )
+                idt = int_base.dtype.element_ty
+                if WIDTH >= 2:
+                    tl.store(int_base + 0 * int_state_l_stride, win_0.to(idt), mask=mask)
+                    tl.store(int_base + 1 * int_state_l_stride, win_1.to(idt), mask=mask)
+                if WIDTH >= 3:
+                    tl.store(int_base + 2 * int_state_l_stride, win_2.to(idt), mask=mask)
+                if WIDTH >= 4:
+                    tl.store(int_base + 3 * int_state_l_stride, win_3.to(idt), mask=mask)
+        return
 
     # Initialize independent x_vals to match unrolled float array
     x_val_0 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
@@ -237,8 +338,17 @@ def causal_conv1d_update(
     silu_activation: bool,
     conv_state_indices: torch.Tensor | None,
     intermediate_conv_states: torch.Tensor | None = None,
+    immediate_state_update: bool = False,
 ) -> torch.Tensor:
-    """Triton implementation of causal_conv1d_update (entrypoint)."""
+    """Triton implementation of causal_conv1d_update (entrypoint).
+
+    When ``immediate_state_update`` is True, sequence position 0 is treated as
+    the guaranteed-accepted "free" speculative token: its conv state is written
+    directly into ``conv_state`` and only positions 1..seq_len-1 are checkpointed
+    into ``intermediate_conv_states`` (at index s-1). This path only supports
+    ``state_len == width`` (the Mamba-2 configuration) and requires
+    ``intermediate_conv_states`` to be provided.
+    """
 
     # Check if input is 2D, temporarily treat as 3D for uniform processing
     is_2d = x.dim() == 2
@@ -249,6 +359,15 @@ def causal_conv1d_update(
     out = torch.empty_like(x)
     state_len = conv_state.shape[-1]
     width = weight.shape[-1]
+
+    if immediate_state_update:
+        assert (
+            intermediate_conv_states is not None
+        ), "immediate_state_update=True requires intermediate_conv_states"
+        assert state_len == width, (
+            "immediate_state_update=True only supports state_len == width (Mamba-2), "
+            f"got state_len={state_len}, width={width}"
+        )
 
     if bias is not None:
         bias_stride = bias.stride(0)
@@ -316,6 +435,7 @@ def causal_conv1d_update(
         HAS_BIAS=has_bias,
         HAS_STATE_INDICES=has_state_indices,
         HAS_INT_STATE=has_int_state,
+        IMMEDIATE_STATE_UPDATE=immediate_state_update,
         SILU_ACTIVATION=silu_activation == "silu",
     )
 

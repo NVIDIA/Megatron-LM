@@ -371,6 +371,47 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError(f"Cannot wait for transient state {state}")
         await event.wait()
 
+    def _warmup_factorized_state_rollback(self):
+        """Pre-trigger the factorized SSM-rollback autotune so the first real decode step
+        does not pay the one-time Triton tuning cost (which also clones the SSM state via
+        ``restore_value``). The autotune key is ``(headdim, dstate, window)`` — independent
+        of the request count — so a single representative call warms it for all steps.
+        """
+        context = self.context
+        if not (
+            getattr(context, "is_hybrid_model", False)
+            and getattr(context, "mamba_factorized_state_rollback", False)
+            and getattr(context, "num_speculative_tokens", 0) > 0
+        ):
+            return
+        from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+            mamba_state_factorized_rollback,
+        )
+
+        device = torch.cuda.current_device()
+        n = context.max_requests
+        # All-decode, every drafted token accepted (full window). The writes land in
+        # mamba_ssm_states, which is uninitialized at capture time and is re-zeroed /
+        # restored per request before use, so these dummy writes are harmless.
+        prefill_status = torch.zeros(n, dtype=torch.int32, device=device)
+        state_idx = torch.arange(n, dtype=torch.int64, device=device)
+        accepted_counts = torch.full(
+            (n,), context.num_speculative_tokens, dtype=torch.int64, device=device
+        )
+        with torch.inference_mode():
+            mamba_state_factorized_rollback(
+                factor_dx=context.mamba_factor_dx,
+                factor_B=context.mamba_factor_B,
+                factor_alpha=context.mamba_factor_alpha,
+                current_states=context.mamba_ssm_states,
+                prefill_status=prefill_status,
+                state_idx=state_idx,
+                accepted_counts=accepted_counts,
+                num_layers=context.num_mamba_layers,
+                nheads_per_group=context.mamba_nheads_per_group,
+            )
+        torch.cuda.synchronize()
+
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
 
@@ -389,6 +430,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
+
+        # Pre-warm the factorized SSM-rollback Triton autotune now (during graph capture)
+        # so the first real decode step does not pay the one-time tuning + restore_value cost.
+        self._warmup_factorized_state_rollback()
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
