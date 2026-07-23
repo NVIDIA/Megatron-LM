@@ -1661,7 +1661,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether the next step can use overlap ordering.
         """
-        if self.context.num_prefill_requests > 0:
+        if not self.context.can_prepare_requests():
             return False
         if not self.waiting_request_ids:
             return True

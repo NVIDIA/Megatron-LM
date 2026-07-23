@@ -230,6 +230,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         ),
         prepare_requests=mock.Mock(),
         commit_sampled_tokens=mock.Mock(),
+        update_requests=mock.Mock(return_value={}),
         resolve_requests=mock.Mock(
             return_value=(torch.empty(0, dtype=torch.int32), torch.arange(metadata_len))
         ),
@@ -277,7 +278,15 @@ def test_validate_async_sched_support_for_step_success(total_request_count):
     if total_request_count == 0:
         context.config.materialize_only_last_token_logits = False
 
-    controller._validate_async_sched_support_for_step()
+    controller._validate_async_sched_support_for_step(run_async_overlap=True)
+
+
+def test_validate_async_sched_support_for_step_allows_paused_no_overlap():
+    """Paused requests are handled by no-overlap lifecycle bookkeeping."""
+    context = _make_async_sched_context(total_request_count=2, paused_request_count=1)
+    controller = _make_async_sched_controller(context)
+
+    controller._validate_async_sched_support_for_step(run_async_overlap=False)
 
 
 def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
@@ -298,7 +307,7 @@ def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
     controller = _make_async_sched_controller(context, model_config)
     controller.num_speculative_tokens = 1
 
-    controller._validate_async_sched_support_for_step()
+    controller._validate_async_sched_support_for_step(run_async_overlap=True)
 
 
 @pytest.mark.parametrize("unsupported_case", ["paused_request", "chunked_prefill"])
@@ -311,7 +320,7 @@ def test_validate_async_sched_support_for_step_errors(unsupported_case):
         context.chunked_prefill_request_id = 0
 
     with pytest.raises(RuntimeError, match="Async scheduling"):
-        controller._validate_async_sched_support_for_step()
+        controller._validate_async_sched_support_for_step(run_async_overlap=True)
 
 
 def test_async_sched_logits_state_rejects_removed_ready_event():
@@ -606,7 +615,7 @@ def test_async_sched_router_returns_empty_result_without_active_requests():
     assert result == DynamicBatchControllerStepResult()
     assert not controller._async_sched_logits.is_valid
     assert controller._async_sched_logits.cuda_graph_request_count is None
-    controller._validate_async_sched_support_for_step.assert_called_once_with()
+    controller._validate_async_sched_support_for_step.assert_called_once_with(True)
 
 
 def test_run_async_sched_sample_reuses_gpu_buffer():
@@ -785,6 +794,8 @@ def test_async_sched_step_overlap_order():
             active_request_ids=context.request_ids.long(),
             finished_request_ids=torch.tensor([11], dtype=torch.int32),
             survivor_idxs=torch.tensor([0, 2]),
+            newly_paused_request_ids=None,
+            evict_request_ids=None,
         )
     )
 
@@ -907,6 +918,8 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             active_request_ids=context.request_ids.long(),
             finished_request_ids=torch.empty(0, dtype=torch.int32),
             survivor_idxs=torch.tensor([0]),
+            newly_paused_request_ids=None,
+            evict_request_ids=None,
         )
     )
     observed = []
@@ -955,8 +968,48 @@ def test_async_sched_initial_no_overlap_step_launches_primer_only():
     assert context.async_sched_step_count == 0
 
 
-def test_async_sched_no_overlap_resolves_before_prepare_and_admission():
-    """Prefill resolution rebuilds survivor decode rows before admitting new prompts."""
+def test_run_async_sched_update_requests_preserves_pre_update_output():
+    """Legacy bookkeeping may reorder working samples without corrupting step output."""
+    context = _make_async_sched_context(total_request_count=3, paused_request_count=1)
+    context.request_metadata["termination_id"] = torch.tensor([99, 99, 2])
+    context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
+    controller = _make_async_sched_controller(context)
+    sampled_tokens = torch.tensor([1, 2])
+    sampled_mtp_tokens = torch.tensor([[3, 4], [5, 6]])
+    accepted_tokens = torch.tensor([7, 8])
+    sample_result = SimpleNamespace(
+        sampled_tokens_cpu_view=sampled_tokens,
+        sampled_mtp_tokens_cpu_view=sampled_mtp_tokens,
+        accepted_tokens_cpu_view=accepted_tokens,
+    )
+
+    def update_requests(active_mask, mutable_samples, mutable_mtp_samples):
+        assert active_mask.tolist() == [1, 0]
+        mutable_samples.fill_(-1)
+        mutable_mtp_samples.fill_(-1)
+        return {
+            "newly_paused_request_ids": torch.tensor([11]),
+            "evict_request_ids": torch.tensor([10]),
+        }
+
+    context.update_requests.side_effect = update_requests
+
+    result = controller._run_async_sched_update_requests(
+        sample_result, resolved_sequence_lengths=torch.tensor([4, 4])
+    )
+
+    assert result.active_request_ids.tolist() == [11, 12]
+    assert result.finished_request_ids.tolist() == [12]
+    assert result.sampled_tokens_cpu.tolist() == [1, 2]
+    assert result.accepted_tokens_cpu.tolist() == [7, 8]
+    assert result.newly_paused_request_ids.tolist() == [11]
+    assert result.evict_request_ids.tolist() == [10]
+    assert sampled_tokens.tolist() == [1, 2]
+    assert sampled_mtp_tokens.tolist() == [[3, 4], [5, 6]]
+
+
+def test_async_sched_no_overlap_updates_before_admission():
+    """No-overlap completes legacy bookkeeping before admitting new prompts."""
     context = _make_async_sched_context(total_request_count=2)
     context.num_prefill_requests = 1
     controller = _make_async_sched_controller(context)
@@ -972,12 +1025,14 @@ def test_async_sched_no_overlap_resolves_before_prepare_and_admission():
         accepted_tokens_cpu_view=None,
         sample_cpu_ready_event="sample",
     )
-    resolve_result = SimpleNamespace(
+    request_result = SimpleNamespace(
         sampled_tokens_cpu=sampled_tokens,
         accepted_tokens_cpu=None,
         active_request_ids=context.request_ids.long(),
         finished_request_ids=torch.tensor([11]),
-        survivor_idxs=torch.tensor([0]),
+        survivor_idxs=None,
+        newly_paused_request_ids=torch.tensor([10]),
+        evict_request_ids=torch.tensor([11]),
     )
     input_ids = torch.empty(1, dtype=torch.int64)
     position_ids = torch.empty(1, dtype=torch.int64)
@@ -989,11 +1044,9 @@ def test_async_sched_no_overlap_resolves_before_prepare_and_admission():
     controller._run_async_sched_sample = mock.Mock(
         side_effect=lambda: call_order.append("sample") or sample_result
     )
-    controller._run_async_sched_resolve = mock.Mock(
-        side_effect=lambda *_: call_order.append("resolve") or resolve_result
+    controller._run_async_sched_update_requests = mock.Mock(
+        side_effect=lambda *_: call_order.append("update") or request_result
     )
-    context.prepare_requests = mock.Mock(side_effect=lambda: call_order.append("prepare"))
-    context.commit_sampled_tokens = mock.Mock(side_effect=lambda *_: call_order.append("commit"))
     controller._dynamic_step_context_init = mock.Mock(
         side_effect=lambda: call_order.append("context_init") or (input_ids, position_ids, None)
     )
@@ -1016,17 +1069,20 @@ def test_async_sched_no_overlap_resolves_before_prepare_and_admission():
         )
 
     assert result.output["sample"].tolist() == [1, 2]
+    assert result.output["newly_paused_request_ids"].tolist() == [10]
+    assert result.output["evict_request_ids"].tolist() == [11]
     assert call_order == [
         "sample",
         "wait:sample",
-        "resolve",
-        "prepare",
-        "commit",
+        "update",
         "admit",
         "context_init",
         "forward",
         "yield",
     ]
+    context.resolve_requests.assert_not_called()
+    context.prepare_requests.assert_not_called()
+    context.commit_sampled_tokens.assert_not_called()
 
 
 def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
@@ -1050,22 +1106,24 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         accepted_tokens_cpu_view=None,
         sample_cpu_ready_event=None,
     )
-    resolve_result = SimpleNamespace(
+    request_result = SimpleNamespace(
         sampled_tokens_cpu=sampled_tokens,
         accepted_tokens_cpu=None,
         active_request_ids=context.request_ids.long(),
         finished_request_ids=context.request_ids.clone(),
-        survivor_idxs=torch.empty(0, dtype=torch.int64),
+        survivor_idxs=None,
+        newly_paused_request_ids=None,
+        evict_request_ids=None,
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
     controller._synchronize_async_sched_event = mock.Mock()
 
-    def resolve_last_request(*_args):
+    def update_last_request(*_args):
         context.total_request_count = 0
         context.active_token_count = 0
-        return resolve_result
+        return request_result
 
-    controller._run_async_sched_resolve = mock.Mock(side_effect=resolve_last_request)
+    controller._run_async_sched_update_requests = mock.Mock(side_effect=update_last_request)
     controller._run_dummy_async_sched_base_step = mock.Mock()
     controller._run_async_sched_forward = mock.Mock()
 
@@ -1103,6 +1161,8 @@ def test_async_sched_mtp_overlap_step_order():
         active_request_ids=context.request_ids.long(),
         finished_request_ids=torch.empty(0, dtype=torch.int32),
         survivor_idxs=torch.tensor([2, 1]),
+        newly_paused_request_ids=None,
+        evict_request_ids=None,
     )
     input_ids = torch.empty(9, dtype=torch.int64)
     position_ids = torch.empty(9, dtype=torch.int64)

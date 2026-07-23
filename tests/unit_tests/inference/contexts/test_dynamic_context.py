@@ -1101,6 +1101,71 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    @pytest.mark.parametrize(
+        "num_speculative_tokens, last_block_offsets, active_avail, expected",
+        [
+            (0, [0, 1], 0, True),
+            (0, [3, 1], 0, False),
+            (0, [3, 1], 1, True),
+            (2, [1, 2], 1, False),
+            (2, [1, 2], 2, True),
+        ],
+    )
+    def test_async_sched_can_prepare_requests_exact_block_demand(
+        self, num_speculative_tokens, last_block_offsets, active_avail, expected
+    ):
+        """Overlap capacity counts only requests crossing a block boundary."""
+        ctx = self._get_async_sched_context(num_speculative_tokens=num_speculative_tokens)
+        self._setup_async_sched_decode_rows(
+            ctx, active_request_count=len(last_block_offsets), last_block_offsets=last_block_offsets
+        )
+        ctx.kv_block_allocator.get_active_avail = mock.Mock(return_value=active_avail)
+
+        assert ctx.can_prepare_requests() is expected
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    @pytest.mark.parametrize("state", ["prefill", "paused"])
+    def test_async_sched_cannot_prepare_requests_with_lifecycle_state(self, state):
+        """Overlap preparation rejects state requiring lifecycle bookkeeping."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(ctx, active_request_count=2)
+        if state == "prefill":
+            ctx.num_prefill_requests = 1
+        else:
+            ctx.paused_request_count = 1
+
+        assert not ctx.can_prepare_requests()
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    def test_async_sched_prepare_capacity_recovers_after_pause_resume(self):
+        """No-overlap bookkeeping restores overlap eligibility after resuming a request."""
+        ctx = self._get_async_sched_context()
+        self._setup_async_sched_decode_rows(
+            ctx, active_request_count=2, last_block_offsets=[ctx.block_size_tokens - 1, 0]
+        )
+        ctx.kv_block_allocator.active_count = ctx.kv_block_allocator.get_active_used()
+        ctx.kv_block_allocator.total_avail = 0
+        ctx.kv_block_allocator.paused_count = 100
+
+        assert not ctx.can_prepare_requests()
+
+        ctx.update_requests(
+            active_requests_mask=torch.tensor([1, 1]), new_tokens=torch.tensor([90, 91])
+        )
+
+        assert ctx.paused_request_count == 1
+        assert not ctx.can_prepare_requests()
+
+        ctx.kv_block_allocator.total_avail = 1
+        ctx.update_requests(active_requests_mask=torch.tensor([0]), new_tokens=torch.tensor([92]))
+
+        assert ctx.paused_request_count == 0
+        assert ctx.can_prepare_requests()
+
+    @pytest.mark.internal
+    @rounder_override(8)
     def test_async_sched_commit_sampled_tokens(self):
         """Async scheduling commits sampled CPU tokens after prepare."""
         ctx = self._get_async_sched_context()

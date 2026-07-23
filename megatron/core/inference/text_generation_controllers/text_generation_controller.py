@@ -133,14 +133,16 @@ class DynamicBatchControllerStepResult:
 
 
 @dataclass
-class _AsyncScheduleResolveResult:
-    """State produced by async scheduling request resolution."""
+class _AsyncScheduleRequestResult:
+    """Request state produced by async scheduling bookkeeping."""
 
     sampled_tokens_cpu: Tensor
     accepted_tokens_cpu: Optional[Tensor]
     active_request_ids: Tensor
     finished_request_ids: Tensor
-    survivor_idxs: Tensor
+    survivor_idxs: Optional[Tensor] = None
+    newly_paused_request_ids: Optional[Tensor] = None
+    evict_request_ids: Optional[Tensor] = None
 
 
 # pylint: disable=line-too-long
@@ -1871,8 +1873,11 @@ class TextGenerationController:
     # Begin async scheduling methods
     # -------------------------------------------------------------------------
 
-    def _validate_async_sched_support_for_step(self) -> None:
+    def _validate_async_sched_support_for_step(self, run_async_overlap: bool) -> None:
         """Validate controller/context state for async scheduling.
+
+        Args:
+            run_async_overlap (bool): Whether this step uses overlap ordering.
 
         Raises if the current step does not support async scheduling.
         """
@@ -1881,8 +1886,8 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return
 
-        if context.paused_request_count != 0:
-            raise RuntimeError("Async scheduling does not support paused requests.")
+        if run_async_overlap and context.paused_request_count != 0:
+            raise RuntimeError("Async scheduling overlap does not support paused requests.")
         if context.chunked_prefill_request_id != -1:
             raise RuntimeError("Async scheduling does not support chunked prefill.")
 
@@ -2297,7 +2302,7 @@ class TextGenerationController:
         sample_result: _AsyncScheduleSampleResult,
         resolved_sequence_lengths: Tensor,
         next_forward_done_event: Optional[torch.cuda.Event],
-    ) -> _AsyncScheduleResolveResult:
+    ) -> _AsyncScheduleRequestResult:
         """Resolve request state and compact speculative forward logits.
 
         Args:
@@ -2308,7 +2313,7 @@ class TextGenerationController:
                 successor forward completion, or `None` when no successor exists.
 
         Returns:
-            _AsyncScheduleResolveResult: Sampled tokens, resolved request row
+            _AsyncScheduleRequestResult: Sampled tokens, resolved request row
                 sets, and survivor indices.
         """
         context = self.inference_wrapped_model.inference_context
@@ -2342,7 +2347,7 @@ class TextGenerationController:
             self._compact_async_sched_logits(survivor_idxs)
 
         # Return the resolution result.
-        return _AsyncScheduleResolveResult(
+        return _AsyncScheduleRequestResult(
             sampled_tokens_cpu=sampled_tokens_cpu,
             accepted_tokens_cpu=accepted_tokens_cpu,
             active_request_ids=active_request_ids,
@@ -2350,9 +2355,57 @@ class TextGenerationController:
             survivor_idxs=survivor_idxs,
         )
 
+    def _run_async_sched_update_requests(
+        self, sample_result: _AsyncScheduleSampleResult, resolved_sequence_lengths: Tensor
+    ) -> _AsyncScheduleRequestResult:
+        """Run complete request lifecycle bookkeeping for a no-overlap step.
+
+        Args:
+            sample_result (_AsyncScheduleSampleResult): Sampling outputs in reusable CPU views.
+            resolved_sequence_lengths (Tensor): Sequence lengths after accepting
+                the current output.
+
+        Returns:
+            _AsyncScheduleRequestResult: Stable sampled output and lifecycle results.
+        """
+        context = self.inference_wrapped_model.inference_context
+
+        sampled_tokens_cpu = sample_result.sampled_tokens_cpu_view.clone()
+        accepted_tokens_cpu = (
+            sample_result.accepted_tokens_cpu_view.clone()
+            if sample_result.accepted_tokens_cpu_view is not None
+            else None
+        )
+        active_request_ids, finished_request_ids, active_request_mask = (
+            self._build_async_sched_request_state(sampled_tokens_cpu, resolved_sequence_lengths)
+        )
+
+        mutable_sampled_tokens_cpu = sampled_tokens_cpu.clone()
+        mutable_sampled_mtp_tokens_cpu = (
+            sample_result.sampled_mtp_tokens_cpu_view.clone()
+            if sample_result.sampled_mtp_tokens_cpu_view is not None
+            else None
+        )
+
+        range_push("update_requests")
+        update_result = context.update_requests(
+            active_request_mask, mutable_sampled_tokens_cpu, mutable_sampled_mtp_tokens_cpu
+        )
+        range_pop()
+        update_result = update_result or {}
+
+        return _AsyncScheduleRequestResult(
+            sampled_tokens_cpu=sampled_tokens_cpu,
+            accepted_tokens_cpu=accepted_tokens_cpu,
+            active_request_ids=active_request_ids,
+            finished_request_ids=finished_request_ids,
+            newly_paused_request_ids=update_result.get("newly_paused_request_ids"),
+            evict_request_ids=update_result.get("evict_request_ids"),
+        )
+
     def _build_async_sched_step_result(
         self,
-        resolve_result: _AsyncScheduleResolveResult,
+        request_result: _AsyncScheduleRequestResult,
         cuda_graph_request_count: Optional[int],
         *,
         count_compaction: bool,
@@ -2360,7 +2413,7 @@ class TextGenerationController:
         """Build the public result and update async-scheduling counters.
 
         Args:
-            resolve_result (_AsyncScheduleResolveResult): Completed request resolution.
+            request_result (_AsyncScheduleRequestResult): Completed request bookkeeping.
             cuda_graph_request_count (Optional[int]): CUDA graph request count used
                 by the consumed forward.
             count_compaction (bool): Whether finished requests discarded successor rows.
@@ -2370,18 +2423,18 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         context.async_sched_step_count += 1
-        if count_compaction and resolve_result.finished_request_ids.numel() > 0:
+        if count_compaction and request_result.finished_request_ids.numel() > 0:
             context.async_sched_compaction_step_count += 1
 
         return DynamicBatchControllerStepResult(
             output={
-                "active_request_ids": resolve_result.active_request_ids,
-                "finished_request_ids": resolve_result.finished_request_ids,
-                "sample": resolve_result.sampled_tokens_cpu,
+                "active_request_ids": request_result.active_request_ids,
+                "finished_request_ids": request_result.finished_request_ids,
+                "sample": request_result.sampled_tokens_cpu,
                 "finished_routing_block_ids": {},
-                "newly_paused_request_ids": None,
-                "evict_request_ids": None,
-                "accepted_tokens": resolve_result.accepted_tokens_cpu,
+                "newly_paused_request_ids": request_result.newly_paused_request_ids,
+                "evict_request_ids": request_result.evict_request_ids,
+                "accepted_tokens": request_result.accepted_tokens_cpu,
                 "log_probs": None,
                 "top_n_logprobs": None,
                 "cuda_graph_request_count": cuda_graph_request_count,
@@ -2391,10 +2444,10 @@ class TextGenerationController:
     async def _run_async_sched_step_no_overlap(
         self, *, schedule_waiting_requests: Optional[Callable[[], None]]
     ) -> DynamicBatchControllerStepResult:
-        """Run ``sample/MTP -> resolve -> prepare -> admit -> forward``.
+        """Run ``sample/MTP -> update -> admit -> forward``.
 
         The first call in an active chain has no pending output. It skips the
-        first three phases, admits requests, and launches a primer-only forward.
+        first two phases, admits requests, and launches a primer-only forward.
 
         Args:
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
@@ -2405,7 +2458,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         had_pending_forward = self._async_sched_logits.is_valid
-        resolve_result = None
+        request_result = None
         cuda_graph_request_count = None
 
         with torch.inference_mode():
@@ -2424,27 +2477,13 @@ class TextGenerationController:
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
 
                 # -------------------------------------------------------------------------
-                # Resolve
+                # Update
                 # -------------------------------------------------------------------------
                 resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
 
                 self._async_sched_logits.clear()
-                resolve_result = self._run_async_sched_resolve(
-                    sample_result, resolved_sequence_lengths, None
-                )
-
-                # -------------------------------------------------------------------------
-                # Prepare
-                # -------------------------------------------------------------------------
-                context.prepare_requests()
-                survivor_idxs = resolve_result.survivor_idxs
-                sampled_mtp_tokens_cpu = (
-                    sample_result.sampled_mtp_tokens_cpu_view[:, survivor_idxs]
-                    if sample_result.sampled_mtp_tokens_cpu_view is not None
-                    else None
-                )
-                context.commit_sampled_tokens(
-                    resolve_result.sampled_tokens_cpu[survivor_idxs], sampled_mtp_tokens_cpu
+                request_result = self._run_async_sched_update_requests(
+                    sample_result, resolved_sequence_lengths
                 )
 
             # -------------------------------------------------------------------------
@@ -2474,7 +2513,7 @@ class TextGenerationController:
             return DynamicBatchControllerStepResult(primer_only=True)
 
         result = self._build_async_sched_step_result(
-            resolve_result, cuda_graph_request_count, count_compaction=False
+            request_result, cuda_graph_request_count, count_compaction=False
         )
         await asyncio.sleep(0)
         return result
@@ -2819,7 +2858,7 @@ class TextGenerationController:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
         assert not skip_bookkeeping, "Async scheduling requires request bookkeeping."
-        self._validate_async_sched_support_for_step()
+        self._validate_async_sched_support_for_step(run_async_overlap)
 
         active_request_count = context.total_request_count - context.paused_request_count
         if context.active_token_count == 0 and active_request_count == 0 and run_async_overlap:
@@ -2852,7 +2891,7 @@ class TextGenerationController:
             context = self.inference_wrapped_model.inference_context
             result = loop.run_until_complete(
                 self.async_generate_output_tokens_dynamic_batch(
-                    run_async_overlap=context.num_prefill_requests == 0
+                    run_async_overlap=context.can_prepare_requests()
                 )
             )
             if not result.primer_only:

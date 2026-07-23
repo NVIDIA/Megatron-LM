@@ -23,6 +23,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
         is_hybrid_model=False,
         enable_prefix_caching=False,
         num_prefill_requests=0,
+        can_prepare_requests=mock.Mock(return_value=True),
     )
     model_config = SimpleNamespace(
         expert_model_parallel_size=1, num_moe_experts=None, moe_enable_routing_replay=False
@@ -114,18 +115,18 @@ def test_add_request_runs_async_sched_request_validation():
 
 
 @pytest.mark.parametrize(
-    "has_prefill, has_waiting, availability, expected",
+    "can_prepare, has_waiting, availability, expected",
     [
-        (True, False, (False, False, False), False),
-        (False, False, (True, True, True), True),
-        (False, True, (False, True, True), True),
-        (False, True, (True, True, True), False),
+        (False, False, (False, False, False), False),
+        (True, False, (True, True, True), True),
+        (True, True, (False, True, True), True),
+        (True, True, (True, True, True), False),
     ],
 )
-def test_should_run_async_sched_overlap(has_prefill, has_waiting, availability, expected):
+def test_should_run_async_sched_overlap(can_prepare, has_waiting, availability, expected):
     """The overlap probe observes prefill eligibility without admitting the request."""
     engine = _make_engine()
-    engine.context.num_prefill_requests = int(has_prefill)
+    engine.context.can_prepare_requests.return_value = can_prepare
     engine.context.check_availability = mock.Mock(return_value=availability)
     engine.waiting_request_ids = deque([10] if has_waiting else [])
     request = SimpleNamespace(remaining_prompt_tokens=[1, 2], cg_wait_iters=3)
@@ -133,6 +134,7 @@ def test_should_run_async_sched_overlap(has_prefill, has_waiting, availability, 
     engine._cg_admission_gating_active = mock.Mock(return_value=False)
 
     assert engine._should_run_async_sched_overlap() is expected
+    engine.context.can_prepare_requests.assert_called_once_with()
     assert list(engine.waiting_request_ids) == ([10] if has_waiting else [])
     assert request.cg_wait_iters == 3
 

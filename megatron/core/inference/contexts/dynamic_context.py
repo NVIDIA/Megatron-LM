@@ -3537,6 +3537,33 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
+    def _get_async_sched_rows_requiring_new_block(self) -> Tensor:
+        """Return active request rows that need a block during the next prepare.
+
+        Returns:
+            Tensor: Boolean mask over active request rows.
+        """
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        tokens_per_request = self.num_speculative_tokens + 1
+        return (
+            self.request_last_kv_block_offset[active_slice] + tokens_per_request
+            >= self.block_size_tokens
+        )
+
+    def can_prepare_requests(self) -> bool:
+        """Return whether requests can be prepared without lifecycle changes.
+
+        Returns:
+            bool: Whether all requests are active decode requests and the active
+                KV-block pool can satisfy the exact next-step allocation demand.
+        """
+        if self.num_prefill_requests != 0 or self.paused_request_count != 0:
+            return False
+
+        rows_requiring_new_block = self._get_async_sched_rows_requiring_new_block()
+        num_new_blocks = int(rows_requiring_new_block.sum().item())
+        return num_new_blocks <= self.kv_block_allocator.get_active_avail()
+
     def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
 
@@ -3559,7 +3586,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         tokens_per_request = self.num_speculative_tokens + 1
         last_block_offsets = self.request_last_kv_block_offset[active_slice]
         token_offsets = self._async_sched_token_offsets
-        rows_requiring_new_block = last_block_offsets + tokens_per_request >= self.block_size_tokens
+        rows_requiring_new_block = self._get_async_sched_rows_requiring_new_block()
         num_new_blocks = int(rows_requiring_new_block.sum().item())
 
         block_ids = None
