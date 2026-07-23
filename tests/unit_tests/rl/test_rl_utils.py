@@ -36,7 +36,6 @@ from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
-from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -114,8 +113,8 @@ class DummyMoELayer:
 def initialize_model_parallel(request, monkeypatch):
     """Fixture to initialize and destroy model parallel.
 
-    Parameters are passed via request.param as a tuple: (tp, pp)
-    Skips if world_size < tp * pp.
+    Parameters are passed via request.param as a tuple: (tp, pp) or (tp, pp, cp)
+    Skips if world_size < tp * pp * cp.
     """
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     monkeypatch.setenv("WANDB_MODE", "disabled")
@@ -123,11 +122,16 @@ def initialize_model_parallel(request, monkeypatch):
 
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
 
-    tp, pp = request.param
+    tp, pp = request.param[:2]
+    cp = request.param[2] if len(request.param) > 2 else 1
     world_size = Utils.world_size
-    Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp,
+        pipeline_model_parallel_size=pp,
+        context_parallel_size=cp,
+    )
     model_parallel_cuda_manual_seed(123)
-    dp = world_size // (tp * pp)
+    dp = world_size // (tp * pp * cp)
     yield world_size, dp, tp, pp
     Utils.destroy_model_parallel()
     destroy_global_vars()
@@ -986,24 +990,29 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [pytest.param((1, 1), id="tp1-pp1")],
+        [
+            pytest.param((1, 1), id="tp1-pp1"),
+            pytest.param((2, 1), id="tp2-pp1"),
+            pytest.param((1, 2), id="tp1-pp2"),
+            pytest.param((1, 1, 2), id="tp1-pp1-cp2"),
+        ],
         indirect=["initialize_model_parallel"],
     )
     def test_get_logprobs_cuda_graphs(self, initialize_model_parallel):
-        """Test that get_logprobs reuses CUDA graphs created during training forward pass.
+        """Training CUDA graphs recorded and reused through get_logprobs.
 
-        This test verifies that rl_utils.get_logprobs can reuse CUDA graphs by:
-        1. Running a training-style forward pass on some model to record CUDA graph runners.
-        2. Creating the CUDA graphs.
-        3. Running `get_logprobs` to verify it reuses the same forward graph from training.
+        The training-style pass goes through get_logprobs exactly like train_rl.py's
+        forward_step, so the recorded runners see the shapes production sees — under CP
+        that is the seq // cp local scatter and the explicit pad_between_seqs flag, and
+        capture includes TE's ring-P2P context-parallel attention. The reference-logprobs
+        pass must then replay those graphs without recording new runners.
         """
-
-        num_layers = 2
-
         world_size, dp, tp, pp = initialize_model_parallel
+        cp = world_size // (dp * tp * pp)
         self.create_test_args(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
+            context_parallel_size=cp,
             rl_training_cuda_graphs=True,
             cuda_graph_impl="local",
             bf16=True,
@@ -1012,9 +1021,12 @@ class TestRLUtils:
 
         # Create a model with training CUDA graphs enabled
         transformer_config = TransformerConfig(
-            num_layers=num_layers,
+            num_layers=2,
             hidden_size=64,
             num_attention_heads=4,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            context_parallel_size=cp,
             use_cpu_initialization=True,
             cuda_graph_impl="local",
             bf16=True,
@@ -1032,37 +1044,28 @@ class TestRLUtils:
         for param in wrapped_model.parameters():
             param.main_grad = torch.zeros_like(param)
 
-        # Create test inputs (batch_size=1 required for thd format with sequence packing)
+        # batch_size=1 required for thd format with sequence packing; seq_length divisible
+        # by 2 * cp, as TE's THD partitioning requires.
         batch_size = 1
-        seq_length = 16
+        seq_length = 32
         tokens = torch.randint(0, 256, (batch_size, seq_length), dtype=torch.long).cuda()
         position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
 
-        # Create packed_seq_params for dummy data
-        packed_seq_params = get_default_packed_seq_params(
-            seq_length=seq_length, max_sequences_per_bin=4, device=tokens.device
-        )
-
-        # Run a single training forward pass to record cudagraphs
-        output = wrapped_model(
-            tokens,
-            position_ids,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-            runtime_gather_output=True,
-            fp32_output=False,
+        # Training-style forward pass: like train_rl.py's forward_step it goes through
+        # get_logprobs (which scatters to seq // cp under CP), recording the runners.
+        output = rl_utils.get_logprobs(
+            wrapped_model, tokens, position_ids=position_ids, no_grad=False, sequence_packing=True
         )
 
         # Run backward to reset runner status from BWD_READY back to FWD_READY
-        # This is needed because get_logprobs runs in no_grad mode and expects FWD_READY
-        loss = output.sum()
-        loss.backward()
+        output.sum().backward()
 
         # Collect all CudaGraphManager instances and their runners
         cudagraph_managers = []
         for module in wrapped_model.modules():
             if hasattr(module, 'cudagraph_manager') and module.cudagraph_manager is not None:
                 cudagraph_managers.append(module.cudagraph_manager)
+        assert cudagraph_managers, "Expected CUDA graph managers on the transformer layers"
 
         # Record runner count before creating graphs
         runners_before = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
@@ -1073,8 +1076,8 @@ class TestRLUtils:
         for mgr in cudagraph_managers:
             for runner in mgr.cudagraph_runners:
                 assert runner.fwd_graph is not None, (
-                    f"Expected runner to have fwd_graph created after create_cudagraphs(), "
-                    f"but fwd_graph is None"
+                    "Expected runner to have fwd_graph created after create_cudagraphs(), "
+                    "but fwd_graph is None"
                 )
 
         # Now test `get_logprobs`; this should reuse the existing CUDA graphs
@@ -1092,9 +1095,12 @@ class TestRLUtils:
                 f"but got {count_after}. `get_logprobs` should not create new runners."
             )
 
-        # Verify outputs are valid
+        # Verify outputs are valid; only the last pipeline stage returns logprobs.
         assert output is not None, "Training forward pass should return valid output"
-        assert logprobs is not None, "get_logprobs should return valid output"
+        if is_pp_last_stage(model.pg_collection.pp):
+            assert logprobs.shape == (batch_size, seq_length - 1)
+        else:
+            assert logprobs is not None, "get_logprobs should return valid output"
 
         # Destroy all captured graphs deterministically
         for l in model.decoder.layers:
