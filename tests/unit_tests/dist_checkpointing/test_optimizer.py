@@ -79,6 +79,25 @@ class Model(torch.nn.Module):
         return sharded_state_dict
 
 
+class NativeFp32Model(torch.nn.Module):
+    """Three parameters that can be converted to an interleaved BF16/FP32/BF16 group."""
+
+    def __init__(self):
+        super().__init__()
+        self.pre = torch.nn.Linear(8, 8, bias=False)
+        self.gate = torch.nn.Parameter(torch.zeros(24, dtype=torch.float32))
+        self.post = torch.nn.Linear(8, 8, bias=False)
+        self.config = TransformerConfig(
+            hidden_size=8, num_attention_heads=1, num_layers=1, bf16=True
+        )
+
+    def sharded_state_dict(self):
+        return {
+            key: ShardedTensor.from_rank_offsets(key, value)
+            for key, value in self.state_dict(keep_vars=True).items()
+        }
+
+
 class SwigluFactoryModel(torch.nn.Module):
     def __init__(self, pp_separate_model: bool = False):
         super().__init__()
@@ -237,6 +256,59 @@ class TestOptimizer:
                 for layer_name in model_state_dict
             ]
         )
+
+    def test_float16_optimizer_with_native_fp32_params(self):
+        """Native FP32 state ids must remain correct between two BF16 parameters."""
+        from megatron.core.optimizer import OptimizerConfig
+        from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+        from megatron.core.transformer.module import (
+            convert_module_to_dtype_except_fp32_marked,
+            mark_keep_in_fp32,
+        )
+
+        Utils.initialize_model_parallel(1, 1)
+        model = NativeFp32Model().cuda()
+        model.gate = mark_keep_in_fp32(model.gate)
+        convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
+        assert model.pre.weight.dtype == torch.bfloat16
+        assert model.gate.dtype == torch.float32
+        assert model.post.weight.dtype == torch.bfloat16
+
+        # Use an explicit BF16/FP32/BF16 optimizer order. Module.parameters()
+        # would yield the root gate before parameters owned by child modules.
+        ordered_params = [model.pre.weight, model.gate, model.post.weight]
+        for param in ordered_params:
+            param.grad = torch.zeros_like(param)
+        inner_optim = Adam(ordered_params)
+        inner_optim.step()
+
+        optim = Float16OptimizerWithFloat16Params(
+            inner_optim,
+            OptimizerConfig(optimizer='adam', lr=1e-4, bf16=True),
+            None,
+            lambda opt, cfg: None,
+        )
+        sharded_state_dict = optim.sharded_state_dict(model.sharded_state_dict())
+
+        # FP32 main copies pair with the BF16 params only, in optimizer order.
+        fp32_params = sharded_state_dict['fp32_from_fp16_params'][0]
+        assert [(sharded.key, tuple(sharded.data.shape)) for sharded in fp32_params] == [
+            ('optimizer.state.fp32_param.pre.weight', (8, 8)),
+            ('optimizer.state.fp32_param.post.weight', (8, 8)),
+        ]
+
+        # Per-param state maps every param, including the native FP32 one, to the right key.
+        state = sharded_state_dict['optimizer']['state']
+        expected = {0: ('pre.weight', (8, 8)), 1: ('gate', (24,)), 2: ('post.weight', (8, 8))}
+        for param_id, (model_key, shape) in expected.items():
+            for state_key in ('exp_avg', 'exp_avg_sq'):
+                sharded = state[param_id][state_key]
+                assert sharded.key == f'optimizer.state.{state_key}.{model_key}', sharded.key
+                assert tuple(sharded.data.shape) == shape, (
+                    param_id,
+                    sharded.key,
+                    sharded.data.shape,
+                )
 
 
 def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
