@@ -188,6 +188,7 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
         self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
+        self.client_request_to_request_id = {}
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
