@@ -142,8 +142,10 @@ class TextGenerationController:
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             self.pp_group = pg_collection.pp
+            self.dp_group = pg_collection.dp
         else:
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
+            self.dp_group = parallel_state.get_data_parallel_group()
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
@@ -156,7 +158,12 @@ class TextGenerationController:
             self.vocab_size = unwrapped_model.vocab_size
 
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
+        # Set a unique generation seed for each DP rank. If the DP coordinator is random,
+        # then sending requests to different DP ranks will produce different output.
+        # Necessary to avoid generating the same output when a request / prompt is
+        # assigned to multiple DP ranks, which can corrupt RL training.
+        dp_rank = torch.distributed.get_rank(group=self.dp_group)
+        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed + dp_rank)
 
         if not self.num_speculative_tokens:
             self.num_mtp_depths = 0
