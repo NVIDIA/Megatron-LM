@@ -37,6 +37,22 @@ def rounder_override(n):
         DynamicInferenceContext.REQUEST_ROUNDER = original_request_rounder
 
 
+@pytest.mark.parametrize(
+    "using_cuda_graph, num_prefill_requests, padded_prefill_requests, expected",
+    [(False, 0, 1, True), (False, 1, 0, False), (True, 1, 0, True), (True, 0, 1, False)],
+)
+def test_is_decode_only_uses_current_execution_snapshot(
+    using_cuda_graph, num_prefill_requests, padded_prefill_requests, expected
+):
+    """Decode-only classification follows the eager or CUDA graph execution state."""
+    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    context._using_cuda_graph_this_step = using_cuda_graph
+    context.num_prefill_requests = num_prefill_requests
+    context.padded_batch_dimensions = mock.Mock(prefill_req_count=padded_prefill_requests)
+
+    assert context.is_decode_only() is expected
+
+
 class TestDynamicContext:
 
     @classmethod

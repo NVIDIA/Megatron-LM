@@ -44,6 +44,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    DecodeOnly,
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
@@ -145,6 +146,30 @@ def format_mem_bytes(mem_bytes):
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
+
+
+def _get_decode_only_log_state(
+    mode: AsyncScheduleMode, decode_only: DecodeOnly
+) -> Tuple[str, Optional[bool]]:
+    """Build the console label and color state for one inference step.
+
+    Args:
+        mode (AsyncScheduleMode): Active scheduling mode.
+        decode_only (DecodeOnly): Decode-only state for the consumed and launched forwards.
+
+    Returns:
+        Tuple[str, Optional[bool]]: Step label and whether to use decode coloring.
+    """
+    if mode == AsyncScheduleMode.LEGACY:
+        is_decode_only = bool(decode_only)
+        return ("decode" if is_decode_only else "non-decode"), is_decode_only
+
+    phase_labels = {None: "-", False: "P", True: "D"}
+    step_type = f"({phase_labels[decode_only.consumed]},{phase_labels[decode_only.launched]})"
+    color_decode_only = (
+        decode_only.launched if decode_only.launched is not None else decode_only.consumed
+    )
+    return step_type, color_decode_only
 
 
 def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
@@ -330,6 +355,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = None
 
         # Runtime state.
+        self.decode_only = DecodeOnly(consumed=None, launched=None)
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
         self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
@@ -1661,8 +1687,10 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether the next step can use overlap ordering.
         """
-        # Prefill transitions, paused requests, and insufficient KV capacity
-        # require complete lifecycle bookkeeping before preparing the next batch.
+        # No-overlap also handles the first decode-only forward after prefill:
+        # pending prefill output must be resolved before preparing its decode rows.
+        # Paused requests and insufficient KV capacity likewise require complete
+        # lifecycle bookkeeping before preparing the next batch.
         if not self.context.can_prepare_requests():
             return False
         if not self.waiting_request_ids:
@@ -1970,8 +1998,8 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             A tuple comprised of:
                 step_result (Optional[Dict]): The result of the step.
-                context_state (Dict): A tuple consisting of the state of the context.
-                is_decode_only, total/paused request count, active token count.
+                context_state (Dict): Decode-only state, total/paused request
+                    count, and active token count.
                 step_time (float): How long this step took.
         """
 
@@ -1982,11 +2010,11 @@ class DynamicInferenceEngine(AbstractEngine):
         mode = self.context.config.async_sched_mode
         if mode == AsyncScheduleMode.LEGACY:
             self.schedule_waiting_requests()
-            is_decode_only = self.context.is_decode_only()
+            step_nvtx_range = "Decode" if self.context.num_prefill_requests == 0 else "Prefill"
             controller_kwargs = {}
         elif mode == AsyncScheduleMode.ASYNC:
             run_async_overlap = self._should_run_async_sched_overlap()
-            is_decode_only = run_async_overlap
+            step_nvtx_range = "AsyncOverlap" if run_async_overlap else "AsyncNoOverlap"
             controller_kwargs = {
                 "run_async_overlap": run_async_overlap,
                 "schedule_waiting_requests": (
@@ -2007,7 +2035,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             pre_step_context_state = {
-                "is_decode_only": is_decode_only,
                 "max_requests": self.context.max_requests,
                 "total_request_count": self.context.total_request_count,
                 "paused_request_count": self.context.paused_request_count,
@@ -2024,15 +2051,15 @@ class DynamicInferenceEngine(AbstractEngine):
             }
 
         # Generate tokens.
-        nvtx_range_push("Prefill" if not is_decode_only else "Decode")
-        # TODO @TDE: Account for this line when overlapping forward and bookkeep.
-        self.is_decode_only = is_decode_only
+        nvtx_range_push(step_nvtx_range)
 
         if will_log_this_step:
             self.step_start_event.record()
         controller_result: DynamicBatchControllerStepResult = (
             await self.controller.async_generate_output_tokens_dynamic_batch(**controller_kwargs)
         )
+        self.decode_only = controller_result.decode_only
+        pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
         if will_log_this_step:
             self.step_end_event.record()
@@ -2043,7 +2070,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
-        nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
+        nvtx_range_pop(step_nvtx_range)
 
         if will_log_this_step:
             kvcache_util_stats = (
@@ -2076,7 +2103,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Args:
             step_result (Optional[Dict]): The result of the step.
-            context_state (Dict): is_decode_only, total/paused request count, active token count.
+            context_state (Dict): Decode-only state, total/paused request count,
+                and active token count.
             step_time (float): How long this step took.
 
         Returns:
@@ -2248,7 +2276,10 @@ class DynamicInferenceEngine(AbstractEngine):
             nvtx_range_push("cuda_memory_stats")
             mem = torch.cuda.memory_stats()
             nvtx_range_pop("cuda_memory_stats")
-            step_type = "decode" if context_state["is_decode_only"] else "non-decode"
+            decode_only = context_state["decode_only"]
+            step_type, color_decode_only = _get_decode_only_log_state(
+                self.context.config.async_sched_mode, decode_only
+            )
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
@@ -2341,7 +2372,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         msa.max_slots - msa.free_count,
                         msa.max_slots,
                     )
-            if context_state["is_decode_only"]:
+            if color_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
 

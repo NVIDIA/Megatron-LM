@@ -9,9 +9,10 @@ import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import EngineState, _get_decode_only_log_state
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    DecodeOnly,
     DynamicBatchControllerStepResult,
 )
 
@@ -158,15 +159,61 @@ def test_async_sched_overlap_probe_uses_non_mutating_cuda_graph_match():
 
 
 @pytest.mark.parametrize(
-    "mode, run_async_overlap, primer_only, expected_schedule_calls",
+    "mode, run_async_overlap, decode_only, primer_only, expected_schedule_calls, "
+    "expected_nvtx_range",
     [
-        (AsyncScheduleMode.LEGACY, None, False, 1),
-        (AsyncScheduleMode.ASYNC, True, False, 0),
-        (AsyncScheduleMode.ASYNC, False, True, 0),
+        (
+            AsyncScheduleMode.LEGACY,
+            None,
+            DecodeOnly(consumed=False, launched=False),
+            False,
+            1,
+            "Prefill",
+        ),
+        (
+            AsyncScheduleMode.LEGACY,
+            None,
+            DecodeOnly(consumed=True, launched=True),
+            False,
+            1,
+            "Decode",
+        ),
+        (
+            AsyncScheduleMode.ASYNC,
+            True,
+            DecodeOnly(consumed=True, launched=True),
+            False,
+            0,
+            "AsyncOverlap",
+        ),
+        (
+            AsyncScheduleMode.ASYNC,
+            False,
+            DecodeOnly(consumed=False, launched=True),
+            False,
+            0,
+            "AsyncNoOverlap",
+        ),
+        (
+            AsyncScheduleMode.ASYNC,
+            False,
+            DecodeOnly(consumed=None, launched=False),
+            True,
+            0,
+            "AsyncNoOverlap",
+        ),
+        (
+            AsyncScheduleMode.ASYNC,
+            False,
+            DecodeOnly(consumed=True, launched=None),
+            False,
+            0,
+            "AsyncNoOverlap",
+        ),
     ],
 )
 def test_async_forward_routes_one_controller_iteration(
-    mode, run_async_overlap, primer_only, expected_schedule_calls
+    mode, run_async_overlap, decode_only, primer_only, expected_schedule_calls, expected_nvtx_range
 ):
     """Primer-only work crosses the engine boundary without an internal controller loop."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
@@ -180,25 +227,37 @@ def test_async_forward_routes_one_controller_iteration(
         step_count=4,
         prefix_cache_lru_clock=7,
         active_token_count=2,
-        is_decode_only=mock.Mock(return_value=True),
+        num_prefill_requests=1 if expected_nvtx_range == "Prefill" else 0,
+        is_decode_only=mock.Mock(return_value=decode_only.launched),
     )
     output = None if primer_only else {"sample": "tokens"}
     engine.controller = SimpleNamespace(
         async_generate_output_tokens_dynamic_batch=mock.AsyncMock(
-            return_value=DynamicBatchControllerStepResult(output=output, primer_only=primer_only)
+            return_value=DynamicBatchControllerStepResult(
+                decode_only=decode_only, output=output, primer_only=primer_only
+            )
         )
     )
 
     with (
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_push"),
-        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"),
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.nvtx_range_push"
+        ) as nvtx_range_push,
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"
+        ) as nvtx_range_pop,
     ):
-        result, _, _ = asyncio.run(engine.async_forward())
+        result, context_state, _ = asyncio.run(engine.async_forward())
 
     assert result is output
+    assert context_state["decode_only"] == decode_only
+    assert engine.decode_only == decode_only
+    assert not hasattr(engine, "is_decode_only")
     assert engine.context.step_count == 5
     assert engine.context.prefix_cache_lru_clock == 8
     assert engine.schedule_waiting_requests.call_count == expected_schedule_calls
+    nvtx_range_push.assert_called_once_with(expected_nvtx_range)
+    nvtx_range_pop.assert_called_once_with(expected_nvtx_range)
     if mode == AsyncScheduleMode.LEGACY:
         engine._should_run_async_sched_overlap.assert_not_called()
         engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with()
@@ -210,3 +269,27 @@ def test_async_forward_routes_one_controller_iteration(
                 None if run_async_overlap else engine.schedule_waiting_requests
             ),
         )
+    engine.context.is_decode_only.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mode, decode_only, expected",
+    [
+        (
+            AsyncScheduleMode.LEGACY,
+            DecodeOnly(consumed=False, launched=False),
+            ("non-decode", False),
+        ),
+        (AsyncScheduleMode.LEGACY, DecodeOnly(consumed=True, launched=True), ("decode", True)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=False, launched=False), ("(P,P)", False)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=True), ("(D,D)", True)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=False, launched=True), ("(P,D)", True)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=False), ("(D,P)", False)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=None, launched=False), ("(-,P)", False)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=True, launched=None), ("(D,-)", True)),
+        (AsyncScheduleMode.ASYNC, DecodeOnly(consumed=None, launched=None), ("(-,-)", None)),
+    ],
+)
+def test_get_decode_only_log_state(mode, decode_only, expected):
+    """Console logging reports both async phases and colors the latest available phase."""
+    assert _get_decode_only_log_state(mode, decode_only) == expected

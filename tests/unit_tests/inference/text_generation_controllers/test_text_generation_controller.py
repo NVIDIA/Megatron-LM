@@ -34,6 +34,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleLogitsState,
+    DecodeOnly,
     DynamicBatchControllerStepResult,
     TextGenerationController,
 )
@@ -197,7 +198,7 @@ class TextGenerationControllerTestBase:
 
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     metadata_len = max(total_request_count, 1)
-    return SimpleNamespace(
+    context = SimpleNamespace(
         config=SimpleNamespace(
             materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.ASYNC
         ),
@@ -240,6 +241,8 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         using_cuda_graph_this_step=mock.Mock(return_value=False),
         max_requests=metadata_len,
     )
+    context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    return context
 
 
 def _make_async_sched_controller(context=None, model_config=None):
@@ -269,6 +272,62 @@ def _make_async_sched_controller(context=None, model_config=None):
         context.max_requests, dtype=torch.int64
     )
     return controller
+
+
+@pytest.mark.parametrize(
+    "consumed, launched, expected",
+    [
+        (False, False, False),
+        (True, True, True),
+        (None, None, ValueError),
+        (None, False, ValueError),
+        (None, True, ValueError),
+        (False, None, ValueError),
+        (True, None, ValueError),
+        (False, True, ValueError),
+        (True, False, ValueError),
+    ],
+)
+def test_decode_only_bool_requires_matching_forwards(consumed, launched, expected):
+    """Boolean conversion is valid only for matching consumed and launched forwards."""
+    decode_only = DecodeOnly(consumed=consumed, launched=launched)
+
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="ambiguous"):
+            bool(decode_only)
+    else:
+        assert bool(decode_only) is expected
+
+
+@pytest.mark.parametrize("num_prefill_requests, expected", [(1, False), (0, True)])
+def test_legacy_step_reports_matching_decode_only_state(num_prefill_requests, expected):
+    """Legacy consumes and launches the same computational batch."""
+    context = _make_async_sched_context(total_request_count=1)
+    context.config.async_sched_mode = AsyncScheduleMode.LEGACY
+    context.num_prefill_requests = num_prefill_requests
+    context.num_decode_requests = 1 - num_prefill_requests
+    context.kv_block_allocator = SimpleNamespace(store_routing_per_block=mock.Mock())
+    controller = _make_async_sched_controller(context)
+    controller._dynamic_step_context_init = mock.Mock(
+        return_value=(torch.tensor([1]), torch.tensor([0]), None)
+    )
+    controller._dynamic_step_forward_logits = mock.Mock()
+    controller._router_record_bookkeeping = mock.Mock(return_value=None)
+    controller._dynamic_step_log_probs_bookkeeping = mock.Mock(return_value=(False, False))
+    controller._dynamic_step_sample_logits = mock.Mock()
+    controller._dynamic_step_context_bookkeeping = mock.Mock(
+        return_value={"sample": torch.tensor([2])}
+    )
+
+    with mock.patch(
+        "megatron.core.inference.text_generation_controllers."
+        "text_generation_controller.get_moe_router_tracer",
+        return_value=None,
+    ):
+        result = asyncio.run(controller._run_legacy_step())
+
+    assert result.decode_only == DecodeOnly(consumed=expected, launched=expected)
+    assert result.output["sample"].tolist() == [2]
 
 
 @pytest.mark.parametrize("total_request_count", [0, 2])
@@ -610,7 +669,9 @@ def test_async_sched_router_returns_empty_result_without_active_requests():
 
     result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
-    assert result == DynamicBatchControllerStepResult()
+    assert result == DynamicBatchControllerStepResult(
+        decode_only=DecodeOnly(consumed=None, launched=None)
+    )
     assert not controller._async_sched_logits.is_valid
     assert controller._async_sched_logits.cuda_graph_request_count is None
     controller._validate_async_sched_support_for_step.assert_called_once_with(True)
@@ -808,6 +869,7 @@ def test_async_sched_step_overlap_order():
         result = asyncio.run(controller._run_async_sched_step_overlap())
 
     assert result.output["sample"].tolist() == sample_tokens.tolist()
+    assert result.decode_only == DecodeOnly(consumed=True, launched=True)
     assert result.output["cuda_graph_request_count"] == 7
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == 1
@@ -961,7 +1023,9 @@ def test_async_sched_initial_no_overlap_step_launches_primer_only():
         controller._run_async_sched_step_no_overlap(schedule_waiting_requests=admit_request)
     )
 
-    assert result == DynamicBatchControllerStepResult(primer_only=True)
+    assert result == DynamicBatchControllerStepResult(
+        decode_only=DecodeOnly(consumed=None, launched=False), primer_only=True
+    )
     assert call_order == ["admit", "primer", "wait:bookkeeping"]
     assert context.async_sched_step_count == 0
 
@@ -1006,10 +1070,15 @@ def test_run_async_sched_update_requests_preserves_pre_update_output():
     assert sampled_mtp_tokens.tolist() == [[3, 4], [5, 6]]
 
 
-def test_async_sched_no_overlap_updates_before_admission():
-    """No-overlap completes legacy bookkeeping before admitting new prompts."""
+@pytest.mark.parametrize(
+    "consumed_prefill_requests, launched_prefill_requests", [(1, 0), (1, 1), (0, 0), (0, 1)]
+)
+def test_async_sched_no_overlap_updates_before_admission(
+    consumed_prefill_requests, launched_prefill_requests
+):
+    """No-overlap classifies consumed and launched work around lifecycle updates."""
     context = _make_async_sched_context(total_request_count=2)
-    context.num_prefill_requests = 1
+    context.num_prefill_requests = consumed_prefill_requests
     controller = _make_async_sched_controller(context)
     controller._async_sched_logits = AsyncScheduleLogitsState(
         is_valid=True, cuda_graph_request_count=7
@@ -1042,9 +1111,13 @@ def test_async_sched_no_overlap_updates_before_admission():
     controller._run_async_sched_sample = mock.Mock(
         side_effect=lambda: call_order.append("sample") or sample_result
     )
-    controller._run_async_sched_update_requests = mock.Mock(
-        side_effect=lambda *_: call_order.append("update") or request_result
-    )
+
+    def update_request_state(*_args):
+        call_order.append("update")
+        context.num_prefill_requests = launched_prefill_requests
+        return request_result
+
+    controller._run_async_sched_update_requests = mock.Mock(side_effect=update_request_state)
     controller._dynamic_step_context_init = mock.Mock(
         side_effect=lambda: call_order.append("context_init") or (input_ids, position_ids, None)
     )
@@ -1069,6 +1142,9 @@ def test_async_sched_no_overlap_updates_before_admission():
     assert result.output["sample"].tolist() == [1, 2]
     assert result.output["newly_paused_request_ids"].tolist() == [10]
     assert result.output["evict_request_ids"].tolist() == [11]
+    assert result.decode_only == DecodeOnly(
+        consumed=consumed_prefill_requests == 0, launched=launched_prefill_requests == 0
+    )
     assert call_order == [
         "sample",
         "wait:sample",
@@ -1198,6 +1274,7 @@ def test_async_sched_mtp_overlap_step_order():
     result = asyncio.run(controller._run_async_sched_step_overlap_mtp())
 
     assert result.output["accepted_tokens"].tolist() == [9, 10, 11]
+    assert result.decode_only == DecodeOnly(consumed=True, launched=True)
     assert call_order == [
         "sample_mtp",
         "rewind",
@@ -1242,15 +1319,25 @@ def test_async_generate_output_tokens_dynamic_batch_routes(
     controller._async_sched_logits.is_valid = has_pending_logits
     controller.num_speculative_tokens = num_speculative_tokens
     controller._validate_async_sched_support_for_step = mock.Mock()
-    controller._run_legacy_step = mock.AsyncMock(return_value="legacy")
+    controller._run_legacy_step = mock.AsyncMock(
+        return_value=DynamicBatchControllerStepResult(
+            decode_only=DecodeOnly(consumed=True, launched=True), output="legacy"
+        )
+    )
     controller._run_async_sched_step_no_overlap = mock.AsyncMock(
-        return_value=DynamicBatchControllerStepResult(output="no_overlap")
+        return_value=DynamicBatchControllerStepResult(
+            decode_only=DecodeOnly(consumed=False, launched=True), output="no_overlap"
+        )
     )
     controller._run_async_sched_step_overlap = mock.AsyncMock(
-        return_value=DynamicBatchControllerStepResult(output="overlap")
+        return_value=DynamicBatchControllerStepResult(
+            decode_only=DecodeOnly(consumed=True, launched=True), output="overlap"
+        )
     )
     controller._run_async_sched_step_overlap_mtp = mock.AsyncMock(
-        return_value=DynamicBatchControllerStepResult(output="overlap_mtp")
+        return_value=DynamicBatchControllerStepResult(
+            decode_only=DecodeOnly(consumed=True, launched=True), output="overlap_mtp"
+        )
     )
     schedule_waiting_requests = mock.Mock()
 

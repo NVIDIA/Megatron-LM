@@ -118,14 +118,47 @@ class _AsyncScheduleSampleResult:
 
 
 @dataclass(frozen=True)
+class DecodeOnly:
+    """Decode-only state for the consumed and launched forwards.
+
+    Attributes:
+        consumed: Whether the consumed output came from a decode-only forward,
+            or ``None`` when no output was consumed.
+        launched: Whether the launched forward is decode-only, or ``None`` when
+            no real forward was launched.
+    """
+
+    consumed: Optional[bool]
+    launched: Optional[bool]
+
+    def __bool__(self) -> bool:
+        """Return the shared decode-only state when both forwards agree.
+
+        Returns:
+            bool: The common consumed and launched decode-only state.
+
+        Raises:
+            ValueError: If either forward is absent or the two states differ.
+        """
+        if self.consumed is None or self.launched is None or self.consumed != self.launched:
+            raise ValueError(
+                "Decode-only state is ambiguous: "
+                f"consumed={self.consumed}, launched={self.launched}."
+            )
+        return self.consumed
+
+
+@dataclass(frozen=True)
 class DynamicBatchControllerStepResult:
     """Result of one dynamic-batching controller step.
 
     Attributes:
+        decode_only: Decode-only state for the consumed and launched forwards.
         output: Sampled-step output, or ``None`` when no output was produced.
         primer_only: Whether the step launched only an async-scheduling primer.
     """
 
+    decode_only: DecodeOnly
     output: Optional[Dict] = None
     primer_only: bool = False
 
@@ -2389,6 +2422,7 @@ class TextGenerationController:
         self,
         request_result: _AsyncScheduleRequestResult,
         cuda_graph_request_count: Optional[int],
+        decode_only: DecodeOnly,
         *,
         count_compaction: bool,
     ) -> DynamicBatchControllerStepResult:
@@ -2398,6 +2432,8 @@ class TextGenerationController:
             request_result (_AsyncScheduleRequestResult): Completed request bookkeeping.
             cuda_graph_request_count (Optional[int]): CUDA graph request count used
                 by the consumed forward.
+            decode_only (DecodeOnly): Decode-only state for the consumed and
+                launched forwards.
             count_compaction (bool): Whether finished requests discarded successor rows.
 
         Returns:
@@ -2409,6 +2445,7 @@ class TextGenerationController:
             context.async_sched_compaction_step_count += 1
 
         return DynamicBatchControllerStepResult(
+            decode_only=decode_only,
             output={
                 "active_request_ids": request_result.active_request_ids,
                 "finished_request_ids": request_result.finished_request_ids,
@@ -2420,7 +2457,7 @@ class TextGenerationController:
                 "log_probs": None,
                 "top_n_logprobs": None,
                 "cuda_graph_request_count": cuda_graph_request_count,
-            }
+            },
         )
 
     async def _run_async_sched_step_no_overlap(
@@ -2440,6 +2477,8 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         had_pending_forward = self._async_sched_logits.is_valid
+        consumed_decode_only = context.is_decode_only() if had_pending_forward else None
+        launched_decode_only = None
         request_result = None
         cuda_graph_request_count = None
 
@@ -2482,20 +2521,23 @@ class TextGenerationController:
             if active_request_count > 0:
                 if had_pending_forward:
                     input_ids, position_ids, _ = self._dynamic_step_context_init()
+                    launched_decode_only = context.is_decode_only()
                     self._run_async_sched_forward(input_ids, position_ids)
                 else:
                     primer_launched, bookkeeping_done_event = self._run_async_sched_forward_primer()
                     assert primer_launched, "Initial no-overlap step must launch a forward primer."
+                    launched_decode_only = context.is_decode_only()
                     self._synchronize_async_sched_event(bookkeeping_done_event)
             elif had_pending_forward and self.model_config.expert_model_parallel_size > 1:
                 self._run_dummy_async_sched_base_step()
 
+        decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
         if not had_pending_forward:
             assert active_request_count > 0, "Async no-overlap admission did not add a request."
-            return DynamicBatchControllerStepResult(primer_only=True)
+            return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
         result = self._build_async_sched_step_result(
-            request_result, cuda_graph_request_count, count_compaction=False
+            request_result, cuda_graph_request_count, decode_only, count_compaction=False
         )
         await asyncio.sleep(0)
         return result
@@ -2508,6 +2550,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         assert self._async_sched_logits.is_valid, "Async overlap requires pending logits."
+        consumed_decode_only = context.is_decode_only()
 
         with torch.inference_mode():
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
@@ -2521,6 +2564,11 @@ class TextGenerationController:
             range_push("prepare_requests")
             input_ids_gpu_view, position_ids_gpu_view = self._run_async_sched_prepare()
             range_pop()
+            launched_decode_only = context.is_decode_only()
+            decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
+            assert (
+                consumed_decode_only and launched_decode_only
+            ), "Async overlap requires decode-only consumed and launched work."
 
             # -------------------------------------------------------------------------
             # Sample
@@ -2562,7 +2610,7 @@ class TextGenerationController:
             )
 
         result = self._build_async_sched_step_result(
-            resolve_result, cuda_graph_request_count, count_compaction=True
+            resolve_result, cuda_graph_request_count, decode_only, count_compaction=True
         )
 
         # Yield only after resolution is complete and forward N+1 is already submitted.
@@ -2577,6 +2625,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         assert self._async_sched_logits.is_valid, "Async MTP overlap requires pending logits."
+        consumed_decode_only = context.is_decode_only()
 
         with torch.inference_mode():
             cuda_graph_request_count = self._async_sched_logits.cuda_graph_request_count
@@ -2596,6 +2645,11 @@ class TextGenerationController:
             range_push("prepare_requests")
             input_ids_gpu_view, position_ids_gpu_view = self._run_async_sched_prepare()
             range_pop()
+            launched_decode_only = context.is_decode_only()
+            decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
+            assert (
+                consumed_decode_only and launched_decode_only
+            ), "Async MTP overlap requires decode-only consumed and launched work."
 
             # Populate the next forward with the sampled base and draft tokens.
             context.copy_async_sched_sample_to_forward(
@@ -2638,7 +2692,7 @@ class TextGenerationController:
             )
 
         result = self._build_async_sched_step_result(
-            resolve_result, cuda_graph_request_count, count_compaction=True
+            resolve_result, cuda_graph_request_count, decode_only, count_compaction=True
         )
         await asyncio.sleep(0)
         return result
@@ -2647,20 +2701,17 @@ class TextGenerationController:
     # End async scheduling methods
     # -------------------------------------------------------------------------
 
-    async def _run_legacy_step(self, skip_bookkeeping: Optional[bool] = False) -> Optional[Dict]:
+    async def _run_legacy_step(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
 
         Returns:
-            (Optional[Dict]): A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
-                sample (Tensor): New sample.
-                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
-                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+            DynamicBatchControllerStepResult: Legacy sampled-step output and its
+                decode-only state.
         """
         context = self.inference_wrapped_model.inference_context
         self._async_sched_logits.clear()
@@ -2668,10 +2719,13 @@ class TextGenerationController:
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
-            return None
+            return DynamicBatchControllerStepResult(
+                decode_only=DecodeOnly(consumed=None, launched=None)
+            )
 
         with torch.inference_mode():
             input_ids, position_ids, _ = self._dynamic_step_context_init()
+            is_decode_only = context.is_decode_only()
 
             cuda_graph_request_count = (
                 context.padded_active_request_count
@@ -2808,7 +2862,9 @@ class TextGenerationController:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
-            return ret
+            return DynamicBatchControllerStepResult(
+                decode_only=DecodeOnly(consumed=is_decode_only, launched=is_decode_only), output=ret
+            )
 
     async def async_generate_output_tokens_dynamic_batch(
         self,
@@ -2833,9 +2889,7 @@ class TextGenerationController:
         mode = context.config.async_sched_mode
 
         if mode == AsyncScheduleMode.LEGACY:
-            return DynamicBatchControllerStepResult(
-                output=await self._run_legacy_step(skip_bookkeeping)
-            )
+            return await self._run_legacy_step(skip_bookkeeping)
         if mode != AsyncScheduleMode.ASYNC:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
@@ -2845,7 +2899,9 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if context.active_token_count == 0 and active_request_count == 0 and run_async_overlap:
             self._async_sched_logits.clear()
-            return DynamicBatchControllerStepResult()
+            return DynamicBatchControllerStepResult(
+                decode_only=DecodeOnly(consumed=None, launched=None)
+            )
 
         if not run_async_overlap or not self._async_sched_logits.is_valid:
             return await self._run_async_sched_step_no_overlap(
