@@ -136,6 +136,12 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Paralel group of all GPUs in a distributed optimizer instance
 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
+# RankGenerator instances used to build the decoder and expert data-parallel
+# groups, cached so that create_all_gather_groups() can reproduce the same
+# rank membership instead of re-deriving it with different arguments.
+_DECODER_RANK_GENERATOR = None
+_EXPERT_DECODER_RANK_GENERATOR = None
+
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
@@ -814,6 +820,11 @@ def initialize_model_parallel(
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
     # Build the data-parallel groups.
+    global _DECODER_RANK_GENERATOR
+    global _EXPERT_DECODER_RANK_GENERATOR
+    _DECODER_RANK_GENERATOR = decoder_rank_generator
+    _EXPERT_DECODER_RANK_GENERATOR = expert_decoder_rank_generator
+
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
@@ -1371,18 +1382,21 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             "Call initialize_model_parallel() first."
         )
 
+    # Reuse the RankGenerator instances created by initialize_model_parallel()
+    # so that AG group membership always matches the actual DP/expert-DP
+    # groups, regardless of the order/rank_offset the caller used.
+    if _DECODER_RANK_GENERATOR is None or _EXPERT_DECODER_RANK_GENERATOR is None:
+        raise RuntimeError(
+            "create_all_gather_groups() requires the decoder rank generators cached by "
+            "initialize_model_parallel() to be set. Call initialize_model_parallel() first."
+        )
+
     rank = torch.distributed.get_rank()
-    pp_size = get_pipeline_model_parallel_world_size()
-    cp_size = get_context_parallel_world_size()
-    tp_size = get_tensor_model_parallel_world_size()
     ep_size = get_expert_model_parallel_world_size()
-    dp_size = get_data_parallel_world_size()
 
     # Create regular DP all-gather group
     dp_cp_ag_group = None
-    decoder_rank_gen = RankGenerator(
-        tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order='tp-cp-ep-dp-pp', rank_offset=0
-    )
+    decoder_rank_gen = _DECODER_RANK_GENERATOR
 
     for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
         group_with_cp_ag = create_group(
@@ -1397,18 +1411,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
     if for_expert_parallelism and ep_size > 1:
-        expert_tp_size = get_expert_tensor_parallel_world_size()
-        expert_dp_size = get_expert_data_parallel_world_size()
-
-        expert_rank_gen = RankGenerator(
-            tp=expert_tp_size,
-            ep=ep_size,
-            dp=expert_dp_size,
-            pp=pp_size,
-            cp=1,
-            order='tp-cp-ep-dp-pp',
-            rank_offset=0,
-        )
+        expert_rank_gen = _EXPERT_DECODER_RANK_GENERATOR
 
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
             expert_dp_ag = create_group(
@@ -2117,6 +2120,12 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _DECODER_RANK_GENERATOR
+    _DECODER_RANK_GENERATOR = None
+
+    global _EXPERT_DECODER_RANK_GENERATOR
+    _EXPERT_DECODER_RANK_GENERATOR = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
