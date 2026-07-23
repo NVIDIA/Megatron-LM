@@ -111,13 +111,11 @@ class MambaMetadata:
         self._intermediate_abs_positions_buffer = torch.full(
             (self.max_intermediate_count,), d_conv, dtype=torch.int32, device=self.device
         )
-        # Constant gather offsets for conv state extraction: [-d_conv, ..., -1]
-        if d_conv > 0:
-            self.conv_gather_offsets = torch.arange(
-                -d_conv, 0, dtype=torch.int32, device=self.device
-            )
-        else:
-            self.conv_gather_offsets = None
+        # Runtime real-count tensor read by the fused gather+scatter Triton
+        # kernels (intermediate_extraction.py). Fixed-address, rewritten each step
+        # so captured CUDA graphs stay valid while the kernels skip padded slots
+        # (pid_slot >= real_count).
+        self._intermediate_real_count_buffer = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         # Coalesced production path: pinned CPU views + shared GPU views bound
         # by DynamicInferenceContext so that the per-step Mamba metadata fields
@@ -180,6 +178,7 @@ class MambaMetadata:
         # Intermediate state extraction views
         self.intermediate_chunk_indices = None
         self.intermediate_abs_positions = None
+        self.intermediate_real_count = None
         self.intermediate_count = 0
         self.per_request_intermediate_counts = []
 
@@ -494,6 +493,11 @@ class MambaMetadata:
 
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            # Publish real_count to the fixed-address GPU tensor the scatter
+            # kernels consult. fill_ is async (no host sync) and keeps the tensor
+            # at the same address captured graphs reference.
+            self._intermediate_real_count_buffer.fill_(self.intermediate_count)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
             # (same rationale as padding comment above; abs_positions=d_conv may
@@ -505,6 +509,8 @@ class MambaMetadata:
             self.per_request_intermediate_counts = []
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            self._intermediate_real_count_buffer.fill_(0)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
 
     def compute_cpu_metadata(
         self,
