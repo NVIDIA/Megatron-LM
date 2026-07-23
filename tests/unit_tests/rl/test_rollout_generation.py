@@ -1,23 +1,25 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from megatron.rl.agent.api import (
+    EpisodeResult,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
     GroupRolloutParams,
     Rollout,
     RolloutGenerator,
     RolloutRequest,
+    TokenRollout,
 )
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
-from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw
+from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw, ReturnsTokens
 
 
 class MockInferenceInterface(ReturnsRaw):
@@ -68,22 +70,30 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         idx = self._call_count
         self._call_count += 1
         self.prepare_group_rollout_calls += 1
-        inference_request = request.inference_interface.prepare_request(
-            f"t{idx}", request.generation_args
-        )
 
-        async def build_rollout(response):
-            response_idx = int(response.response.content.removeprefix("t"))
-            return Rollout(
-                trajectory=[response.raw_text],
-                reward=float(response_idx),
-                env_id=self.env_id,
-                policy_epoch=[response.policy_epoch],
-                kv_cache_epoch=[response.kv_cache_epoch],
-                num_evictions=[response.num_evictions],
+        async def run_episode():
+            # Single-turn agent: the episode is one inference on the group's prompt.
+            turn_request = request.inference_interface.prepare_request(
+                f"t{idx}", request.generation_args
+            )
+            response = await self.get_rollout_response(request, turn_request)
+            return EpisodeResult(
+                responses=[response], conversation=[*turn_request.prompt, response.response]
             )
 
-        return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+        async def build_rollout(episode):
+            responses = episode.responses
+            reward = float(responses[-1].response.content.removeprefix("t"))
+            return Rollout(
+                trajectory=[r.raw_text for r in responses],
+                reward=reward,
+                env_id=self.env_id,
+                policy_epoch=[r.policy_epoch for r in responses],
+                kv_cache_epoch=[r.kv_cache_epoch for r in responses],
+                num_evictions=[r.num_evictions for r in responses],
+            )
+
+        return GroupRolloutParams(run_episode=run_episode, build_rollout=build_rollout)
 
 
 class CountingRewardAgent(RewardOnlyAgent):
@@ -348,3 +358,172 @@ class TestGroupedRollouts:
             assert min(agent_groups) == 0
             assert all(slots == 0 for slots in agent_slots)
             assert np.gcd.reduce(agent_slots) == 0
+
+
+def make_response(epochs, prompt_length, total_len, content="resp", finish_reason="stop"):
+    return InferenceResponse(
+        response=LLMChatMessage(role="assistant", content=content),
+        raw_text=content,
+        token_ids=list(range(total_len)),
+        prompt_length=prompt_length,
+        logprobs=[0.0] * (total_len - prompt_length),
+        finish_reason=finish_reason,
+        policy_epoch=epochs,
+        kv_cache_epoch=epochs,
+        num_evictions=0,
+    )
+
+
+# Conversation length -> response spec: length 1 is the first turn (the bare prompt), length 3
+# the second (assistant reply + observation appended).
+TWO_TURN_SCRIPT = {
+    1: dict(epochs=[(0, 5)], prompt_length=3, total_len=7, content="a0"),
+    3: dict(epochs=[(0, 5)], prompt_length=6, total_len=11, content="a1"),
+}
+
+# Both two-turn termination modes (env-signaled done, max_turns exhausted) must produce this
+# identical episode; only the env-consultation trace (observation_turns) differs per case.
+TWO_TURN_EXPECTED = dict(
+    seen_roles=[["user"], ["user", "assistant", "user"]],
+    reward_conv=[("user", "hello"), ("assistant", "a0"), ("user", "obs0"), ("assistant", "a1")],
+    rewarded=[("a1", "stop")],
+    genmask_sums=[4, 5],
+    policy_epoch=[[(0, 5)], [(0, 5)]],
+)
+
+
+class ScriptedInterface(ReturnsTokens, ReturnsRaw):
+    """Inference stub whose reply is a pure function of the request: the conversation length
+    maps to a response spec, so it stays deterministic under pipeline concurrency."""
+
+    by_prompt_length: dict = Field(default_factory=dict)
+    seen_conversations: list = Field(default_factory=list)
+
+    async def agenerate(self, request):
+        self.seen_conversations.append(list(request.prompt))
+        return make_response(**self.by_prompt_length[len(request.prompt)])
+
+
+class EpisodeAgent(RewardOnlyAgent):
+    """Configurable multi-turn agent.
+
+    `done_at_turn` controls when get_observation signals done: at every turn >= done_at_turn
+    it returns (None, True); None means it never signals done, so the episode ends only by
+    exhausting max_turns. Records get_reward calls and the conversation get_trajectory_reward saw.
+    """
+
+    env_id: str = "test"
+    max_turns: int = 1
+    done_at_turn: int | None = None
+    rewarded: list = Field(default_factory=list)
+    reward_conversation: list = Field(default_factory=list)
+    observation_turns: list = Field(default_factory=list)
+
+    async def get_prompt(self, validation):
+        return "hello", {"problem_id": "p0"}
+
+    async def get_observation(self, turn_idx, response, conversation, golden):
+        self.observation_turns.append(turn_idx)
+        if self.done_at_turn is not None and turn_idx >= self.done_at_turn:
+            return None, True
+        return f"obs{turn_idx}", False
+
+    async def get_reward(self, response, golden, finish_reason):
+        self.rewarded.append((response, finish_reason))
+        return 1.5
+
+    async def get_trajectory_reward(self, responses, conversation, golden):
+        self.reward_conversation.extend(conversation)
+        return await super().get_trajectory_reward(responses, conversation, golden)
+
+
+class TestMultiTurnEpisode:
+
+    @pytest.mark.parametrize("driver", ["reward_rollouts", "pipeline"])
+    @pytest.mark.parametrize(
+        "max_turns, done_at_turn, scripted, expected",
+        [
+            # Single turn: get_observation is never consulted (no continuation is possible).
+            pytest.param(
+                1,
+                None,
+                {1: dict(epochs=[(0, 7)], prompt_length=2, total_len=6, content="only")},
+                dict(
+                    seen_roles=[["user"]],
+                    reward_conv=[("user", "hello"), ("assistant", "only")],
+                    rewarded=[("only", "stop")],
+                    genmask_sums=[4],
+                    policy_epoch=[[(0, 7)]],
+                    observation_turns=[],
+                ),
+                id="single_turn",
+            ),
+            # Multi-turn ended by the environment: turn 0 yields an observation, turn 1 is done.
+            pytest.param(
+                3,
+                1,
+                TWO_TURN_SCRIPT,
+                dict(TWO_TURN_EXPECTED, observation_turns=[0, 1]),
+                id="multi_turn_env_done",
+            ),
+            # Ended by exhausting max_turns instead (env never signals done): the same episode,
+            # except get_observation must not run for the final allowed turn.
+            pytest.param(
+                2,
+                None,
+                TWO_TURN_SCRIPT,
+                dict(TWO_TURN_EXPECTED, observation_turns=[0]),
+                id="multi_turn_max_turns_exhausted",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_run_episode(self, driver, max_turns, done_at_turn, scripted, expected):
+        """Episodes grow the conversation each turn and collapse into one per-turn rollout,
+        identically through get_reward_rollouts and through the real _RolloutPipeline
+        (get_grouped_rollouts) -- the latter proving run_episode runs in the infer stage."""
+        iface = ScriptedInterface(by_prompt_length=scripted)
+        agent = EpisodeAgent(max_turns=max_turns, done_at_turn=done_at_turn)
+
+        if driver == "reward_rollouts":
+            rollouts = await agent.get_reward_rollouts(
+                RolloutRequest(num_rollouts=1, inference_interface=iface)
+            )
+        else:
+            groups = []
+
+            async def _drain():
+                async for group in agent.get_grouped_rollouts(
+                    GroupedRolloutRequest(
+                        num_groups=1, rollouts_per_group=1, inference_interface=iface
+                    )
+                ):
+                    groups.append(group)
+
+            # Bounded so a wedged pipeline fails fast instead of hanging.
+            await asyncio.wait_for(_drain(), timeout=5.0)
+            (group,) = groups
+            rollouts = group.rollouts
+        (rollout,) = rollouts
+
+        assert isinstance(rollout, TokenRollout)
+        assert rollout.reward == 1.5
+        assert rollout.problem_id == "p0"
+        # One trajectory entry per generated turn.
+        assert len(rollout.trajectory) == len(expected["genmask_sums"])
+        # Each turn's inference request = prior conversation (reply + observation appended).
+        assert [[m.role for m in conv] for conv in iface.seen_conversations] == expected[
+            "seen_roles"
+        ]
+        # Default trajectory reward scores only the final response.
+        assert agent.rewarded == expected["rewarded"]
+        # Per-turn generation masks cover exactly each turn's generated tokens.
+        assert [sum(mask) for mask in rollout.generation_mask] == expected["genmask_sums"]
+        # Per-turn (engine-frame) staleness nesting is preserved.
+        assert rollout.policy_epoch == expected["policy_epoch"]
+        assert rollout.kv_cache_epoch == expected["policy_epoch"]
+        # get_observation is consulted only when another generation is still possible -- never on
+        # the final allowed turn.
+        assert agent.observation_turns == expected["observation_turns"]
+        # get_trajectory_reward sees the full dialogue, ending on the final reply exactly once.
+        assert [(m.role, m.content) for m in agent.reward_conversation] == expected["reward_conv"]

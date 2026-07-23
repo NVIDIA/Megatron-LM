@@ -65,7 +65,6 @@ from megatron.rl.agent.api import (
     RewardEvaluationResult,
     Rollout,
     RolloutGroup,
-    Rollouts,
     TokenRollout,
 )
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
@@ -275,8 +274,8 @@ def verify_model_weights_swap(
 class RolloutStats:
     rewards: list[list[float]] # inner list is for a group
     env_ids: list[str] # same length as len(rewards)
-    turn_lens: list[list[int]] # token lengths of turns, grouped.
-    traj_lens: list[list[int]] # all turns comprise one trajectory.
+    turn_lens: list[list[int]] # tokens newly added by each turn, grouped.
+    traj_lens: list[list[int]] # the final sequence is the full trajectory.
     num_turns: None | list[list[int]] # num_turns per traj
     advantages: None | list[list[float]]
     min_piold_to_inf_prob: None | float
@@ -494,7 +493,10 @@ def align_unpacked_inference_logprobs(
 
     # We need to align old_logprobs and inference logprobs as the latter are only for generations
     for i, inf_logprobs in enumerate(inference_logprobs):
-        first_gen_idx = first_gen_tok[i]
+        if not gen_masks_for_alignment[i].any():
+            # No generation tokens; nothing to align.
+            continue
+        first_gen_idx = int(first_gen_tok[i])
         # We subtract -1 here because we append eod token on the train side, and we do not
         # get it from the inference. For the eod token, we reuse old_logprobs value.
         end_idx = min(first_gen_idx + len(inf_logprobs), padded_inference_logprobs.shape[1])
@@ -893,19 +895,37 @@ def compute_group_stats(
                 for turn_traj in rollout.trajectory:
                     detokenized_traj = tokenizer.detokenize(turn_traj)
                     lang_rl_log(
-                        f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} tokens] {detokenized_traj}"
+                        f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(turn_traj)} tokens] {detokenized_traj}"
                     )
-                    # TODO(vitalyk): how does multiturn change EOD/EOT?
-                    assert (len(turn_traj) == seq_len) or (
-                        turn_traj[-1] == tokenizer.eod
-                    ), f"Rollout is not the correct length: {len(turn_traj)} {turn_traj[-1]}\n{detokenized_traj}"
+                    # A turn must never exceed the model's context window.
+                    assert len(turn_traj) <= seq_len, (
+                        f"Rollout too long: {len(turn_traj)} > {seq_len} "
+                        f"(last token {turn_traj[-1]})\n{detokenized_traj}"
+                    )
+                    # A single-turn completion can only end in eod or be truncated at seq_len.
+                    # Multi-turn agents can additionally end a turn on a tool-call boundary.
+                    if len(rollout.trajectory) == 1:
+                        assert len(turn_traj) == seq_len or turn_traj[-1] == tokenizer.eod, (
+                            f"Single-turn rollout under seq_length must end in eod: "
+                            f"len={len(turn_traj)} last={turn_traj[-1]}\n{detokenized_traj}"
+                        )
             else:
                 lang_rl_log(
-                    f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} chars] {rollout.trajectory}"
+                    f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} turns] {rollout.trajectory}"
                 )
             group_num_turns.append(len(rollout.trajectory))
             group_rewards.append(rollout.reward)
-            roll_turn_lens = [len(t) for t in rollout.trajectory]
+            # Multi-turn TokenRollout turns re-encode the full prior conversation.
+            # Report the incremental tokens each turn adds (env observation + generation);
+            # these sum to the final conversation length.
+            # Single-turn and raw (string) rollouts can use the plain per-turn length.
+            if isinstance(rollout, TokenRollout) and len(rollout.trajectory) > 1:
+                cumulative = [len(t) for t in rollout.trajectory]
+                roll_turn_lens = [cumulative[0]] + [
+                    cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))
+                ]
+            else:
+                roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
             assert rollout.policy_epoch, "Rollout has no policy_epoch data"
@@ -1085,15 +1105,19 @@ def prep_wandb_metrics(
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
+        # Each turn in a trajectory is a cumulative sequence (prompt + all turns so far), so
+        # one row per rollout: the final turn already contains the whole conversation.
         metrics['rollouts'] = wandb_writer.Table(
             columns=['Trajectories', 'Tokens', 'Rewards'],
             rows=[
                 [
-                    tokenizer.detokenize(turn) if isinstance(r, TokenRollout) else turn,
+                    tokenizer.detokenize(r.trajectory[-1])
+                    if isinstance(r, TokenRollout)
+                    else r.trajectory[-1],
                     r.trajectory,
                     r.reward,
                 ]
-                for r in example_group for turn in r.trajectory
+                for r in example_group if r.trajectory
             ],
         )
     return metrics
@@ -1285,17 +1309,27 @@ def maybe_log_training_metrics(
     wandb_writer.log(metrics, step=current_iteration)
 
 
+PAD_TURN_UNIT = (None, -1)
+"""Special filler entry to pad rollout turns for logprobs calculation.
+Used to equalize per-rank trajectory counts without contributing to the loss."""
+
+
 def prepare_trajectories(
-    rollouts: Rollouts, tokenizer: MegatronTokenizer, seq_length: int, sequence_packing: bool, skip_bos_token: bool
+    rollout_turns: list[tuple[TokenRollout | Rollout | None, int]],
+    tokenizer: MegatronTokenizer,
+    seq_length: int,
+    skip_bos_token: bool,
 ):
     """Pad trajectories and extract the generation masks.
+
     Args:
-        rollouts: Rollouts to extract trajectories from.
+        rollout_turns: (rollout, turn_idx) pairs; each pair becomes one trajectory.
         tokenizer: Tokenizer to get the padding token and potentially tokenize.
         seq_length:  Maximum sequence length to pad to.
 
     Returns:
-        Trajectories and their generation masks.
+        Trajectories, their generation masks, and per-row inference logprobs
+        (unpadded tensor per real row, None per PAD row).
 
     Raises:
         ValueError:
@@ -1336,41 +1370,43 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
-    for rollout in rollouts:
-        # traj, gen mask and logprobs are lists now.
-        # each list entry is a turn, single-turn environments just have a single-element list.
-        # We assume that all lengths of the structs above have the same lengths (number of turns).
-
-        all_turns_trajectories = (
-            copy.deepcopy(rollout.trajectory)
+    for rollout, turn_idx in rollout_turns:
+        if rollout is None:
+            # PAD_TURN_UNIT: inert filler so all DP ranks hold the same number of
+            # trajectories. All pad tokens, nothing generated, no inference logprobs.
+            trajs.append([tokenizer.pad] * seq_length)
+            generation_masks.append([False] * seq_length)
+            inference_logprobs.append(None)
+            continue
+        # traj, gen mask and logprobs are per-turn lists on the rollout;
+        # single-turn environments just have single-element lists.
+        # We assume that all the structs above have the same lengths (number of turns).
+        trajectory = (
+            copy.deepcopy(rollout.trajectory[turn_idx])
             if isinstance(rollout, TokenRollout)
-            else tokenizer.tokenize(rollout.trajectory)
+            else tokenizer.tokenize(rollout.trajectory)[turn_idx]
         )
-        for turn_idx, trajectory in enumerate(all_turns_trajectories):
-            inf_logprobs = rollout.logprobs[turn_idx]
-            generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
-            length = len(trajectory)
-            assert length <= seq_length, "Rollout too long, how did this happen?"
-            if len(trajectory) < seq_length:
-                assert (
-                    trajectory[-1] == tokenizer.eod
-                ), "Trajectories under a seq_length limit should have eod token at the end."
+        inf_logprobs = rollout.logprobs[turn_idx]
+        generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
+        length = len(trajectory)
+        assert length <= seq_length, "Rollout too long, how did this happen?"
 
-            if length < seq_length:
-                trajectory.extend([tokenizer.pad] * (seq_length - length))
-                if generation_mask:
-                    generation_mask.extend([False] * (seq_length - length))
-            trajs.append(trajectory)
-            generation_masks.append(generation_mask)
+        if length < seq_length:
+            trajectory.extend([tokenizer.pad] * (seq_length - length))
+            if generation_mask:
+                generation_mask.extend([False] * (seq_length - length))
+        trajs.append(trajectory)
+        generation_masks.append(generation_mask)
 
-            if inf_logprobs is not None:
-                inf_logprobs_tensor = torch.Tensor(inf_logprobs)
-                # Don't pad individual logprobs here - padding happens later if needed
-                inference_logprobs.append(inf_logprobs_tensor)
-            else:
-                inference_logprobs.append(None)
+        if inf_logprobs is not None:
+            inf_logprobs_tensor = torch.Tensor(inf_logprobs)
+            # Don't pad individual logprobs here - padding happens later if needed
+            inference_logprobs.append(inf_logprobs_tensor)
+        else:
+            inference_logprobs.append(None)
 
-        env_id_counts[rollout.env_id] += 1
+        if turn_idx == 0:
+            env_id_counts[rollout.env_id] += 1
 
     if torch.distributed.is_initialized():
         logger.info(f"[{dist.get_rank()}] Rollout counts:")
@@ -1380,20 +1416,14 @@ def prepare_trajectories(
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
 
-    # Only process if we have inference_logprobs
-    if inference_logprobs and any(lp is not None for lp in inference_logprobs):
-        # We need to pad all logprobs to the same size for sequence packing.
-        # For non-packing mode, keep as list of tensors (unpadded)
-        # This preserves the original behavior where each sequence can have different lengths
-        if sequence_packing:
-            inference_logprobs = _pad_nonnull_with_zeros(inference_logprobs, seq_length)
-    else:
-        inference_logprobs = None
-
-    # Some sanity checks regarding the tokenization
+    # Some sanity checks regarding the tokenization. Pad units start with the pad
+    # token rather than bos, so the bos-equality check only applies to real rows.
+    real_rows = torch.tensor(
+        [rollout is not None for rollout, _ in rollout_turns], dtype=torch.bool
+    )
     if not skip_bos_token:
         assert (
-            tokenizer.bos is None or (trajs[:, 0] == tokenizer.bos).all()
+            tokenizer.bos is None or (trajs[real_rows][:, 0] == tokenizer.bos).all()
         ), "First token should be bos"
     else:
         assert (
@@ -1548,30 +1578,59 @@ def prepare_data_for_update(
         # We need this to correctly split the rollouts across dp groups.
         # And we do not actually need them grouped in anything below anyways.
         rollouts = [r for g in rollouts for r in g]
-        num_turns = [nt for g in group_stats.num_turns for nt in g]
-        total_turns_sampled = len(rollouts)
 
         # We might sample more than we consume in one step.
         samples_ratio_per_step = args.global_batch_size / (args.grpo_prompts_per_step * args.grpo_group_size)
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
-        if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
-            data_split_size = len(rollouts) // data_parallel_world_size
+        # Multi-turn rollouts contribute one trainable trajectory per turn, and turn counts vary.
+        # Flatten to single turns and split the turns across DP ranks.
+
+        # advantages is already one entry per turn, so it is sliced with the same range.
+        rollout_turns = [
+            (rollout, turn_idx)
+            for rollout in rollouts
+            for turn_idx in range(len(rollout.trajectory))
+        ]
+        if not rollout_turns:
+            raise RuntimeError(
+                f"prepare_data_for_update: 0 usable trajectories from {len(rollouts)} rollout(s). "
+                "All rollouts have empty trajectories."
+            )
+
+        data_parallel_world_size = mpu.get_data_parallel_world_size()
+        # The total turn count is data-dependent, so it needs to be padded.
+        pad_to_multiple = data_parallel_world_size * args.micro_batch_size
+        if pad_n := -len(rollout_turns) % pad_to_multiple:
+            rollout_turns = rollout_turns + [PAD_TURN_UNIT] * pad_n
+            advantages = global_advantages = torch.cat(
+                [advantages, torch.zeros(pad_n, dtype=advantages.dtype, device=advantages.device)]
+            )
+        total_turns_sampled = len(rollout_turns)
+
+        has_inference_logprobs = any(isinstance(rollout, TokenRollout) for rollout, _ in rollout_turns)
+
+        if data_parallel_world_size > 0:
+            data_split_size = len(rollout_turns) // data_parallel_world_size
             data_split_range = (
                 mpu.get_data_parallel_rank() * data_split_size,
                 (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
-            rollouts = rollouts[data_split_range[0] : data_split_range[1]]
-            local_num_turns = sum(num_turns[data_split_range[0] : data_split_range[1]])
-            steps_before = sum(num_turns[:data_split_range[0]])
-            advantages = advantages[steps_before:steps_before+local_num_turns]
+            rollout_turns = rollout_turns[data_split_range[0] : data_split_range[1]]
+            advantages = advantages[data_split_range[0] : data_split_range[1]]
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
         with nvtx_range("rl/prepare-trajectories", time=True):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
-                rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
+                rollout_turns, tokenizer, args.seq_length, args.rl_skip_bos_token,
             )
+        if not has_inference_logprobs:
+            inference_logprobs = None
+        elif sequence_packing:
+            # Pad each row to seq_length and stack; an all-PAD (all-None) local slice becomes an
+            # all-zero [num_rows, seq_length] tensor so this rank still joins the all_gather.
+            inference_logprobs = _pad_nonnull_with_zeros(inference_logprobs, args.seq_length)
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
@@ -1709,8 +1768,6 @@ def prepare_data_for_update(
 
                     # Store packed inference logprobs in packing context
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
-                    # Only mark as having inference logprobs for IS correction if enabled
-                    packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
             with nvtx_range("rl/create-dataloader", time=True):
                 # @vitalyk: This function also reconfigures the data loader to count the
                 # global_batch_size in the bins frame of reference.
@@ -2233,8 +2290,9 @@ def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) ->
         A padded tensor which is a stacked list of padded input tensors.
 
     """
-    if all([el is None for el in data]):
-        raise ValueError("At least one element of the data list should be not None.")
+    if all(el is None for el in data):
+        # All rows are PAD; return an all-zero tensor so that no DP rank stalls.
+        return torch.zeros((len(data), max_len))
     padded_data = []
     for chunk in data:
         if chunk is not None:
