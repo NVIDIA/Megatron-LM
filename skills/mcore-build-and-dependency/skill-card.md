@@ -1,5 +1,5 @@
 ## Description: <br>
-Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock. <br>
+Megatron-LM installation-path routing, container-based development setup, and dependency management. Covers choosing between the PyTorch NGC Container and bare-metal CUDA path, container setup, uv package management, and updating uv.lock. <br>
 
 This skill is ready for commercial/non-commercial use. <br>
 
@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-Developers and engineers setting up containerized development environments for Megatron-LM, managing Python dependencies with uv, and resolving build or dependency issues. <br>
+Developers and engineers choosing between the PyTorch NGC Container and a bare-metal CUDA host for Megatron-LM, managing Python dependencies with uv, and resolving build or dependency issues. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -21,6 +21,7 @@ Mitigation: Review and scan skill before deployment. <br>
 ## Reference(s): <br>
 - [Megatron-LM Repository](https://github.com/NVIDIA/Megatron-LM) <br>
 - [Megatron Core Developer Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html) <br>
+- [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/pytorch) <br>
 - [NVIDIA Pyxis](https://github.com/NVIDIA/pyxis) <br>
 - [NVIDIA Enroot](https://github.com/NVIDIA/enroot) <br>
 

@@ -1,0 +1,252 @@
+---
+name: mcore-transformer-engine-install
+description: Bare-metal CUDA installation and smoke testing for Transformer Engine with Megatron-LM. Use when installing Megatron with a pinned PyPI Transformer Engine version, debugging transformer-engine native builds, testing B200/GB200/RTX PRO Blackwell/H100/L4/L40S/A100 CUDA installs outside the NGC container, handling missing cmake/ninja/NCCL/cuDNN headers, or validating that transformer_engine.pytorch works with Megatron Core.
+---
+
+# MCore Transformer Engine Install
+
+## Answer-First Constants
+
+For text-only Transformer Engine install questions, give these facts first:
+
+- Prefer the NGC container when the user wants the supported, reproducible path.
+- For bare-metal installs, use `uv pip install`, not `uv sync`.
+- Default bare-metal installs should use a pinned PyPI Transformer Engine
+  version. Do not use `.[te]` for that path because this repository's uv source
+  configuration can route `transformer-engine` to the pinned Git source.
+- Install CUDA-enabled PyTorch and build tools before installing pinned
+  `transformer_engine[pytorch]` from PyPI.
+- Use `--no-build-isolation`; Transformer Engine imports PyTorch while building.
+- Set `NVTE_FRAMEWORK=pytorch` for Megatron installs so TE does not spend time
+  probing or building unrelated framework integrations.
+- Export NVIDIA wheel `include` and `lib` directories into `CPATH`,
+  `LIBRARY_PATH`, and `LD_LIBRARY_PATH` before the TE build.
+- A visible GPU and NVIDIA driver are not enough: native TE builds need a CUDA
+  Toolkit with an executable `nvcc`. Set `CUDA_PATH` to its root; the helper
+  adds `${CUDA_PATH}/bin` to `PATH`.
+- If `nvidia-smi` or a CUDA device probe fails inside an agent sandbox, treat it
+  as inconclusive. Re-run that read-only probe on the host after approval before
+  diagnosing a missing GPU or broken driver.
+- Do not download or install a CUDA Toolkit automatically when `nvcc` is
+  missing. Report the prerequisite and ask whether the user wants the PyTorch
+  NGC Container or a separately provisioned CUDA Toolkit.
+- Set `CUDNN_PATH` and `CUDNN_HOME` to the venv's cuDNN package when cuDNN comes
+  from Python wheels.
+- Limit parallel native compilation with `MAX_JOBS`, starting at `4`, and set
+  `NVTE_BUILD_THREADS_PER_JOB=1` if compilation is memory-heavy.
+- Warn users before the native TE build starts: even PyPI TE installs compile
+  native code locally and can take 10-15+ minutes or
+  longer depending on CPU resources, memory, cache state, and build
+  parallelism.
+- In automated installs and benchmarks, run the helper in the foreground. If
+  logs must be saved, use `set -o pipefail` with `tee`; avoid backgrounding the
+  install and polling with fixed `sleep` intervals because that inflates wall
+  time and command count after the build has already finished.
+- Use `install_te_pypi.sh --preflight` when checking CUDA, PyTorch, visible GPU
+  capability, selected TE architecture flags, cuDNN paths, disk space, or build
+  parallelism before starting the native TE build.
+- Run a CUDA TE smoke test immediately after install.
+
+Official TE install prerequisites to check before long debugging loops: Linux or
+WSL2, CUDA 12.1+ for Hopper/Ada/Ampere, CUDA 12.8+ for Blackwell, cuDNN 9.3+,
+GCC 9+ or Clang 10+ with C++17 support, Python 3.12 recommended, CMake 3.18+,
+Ninja, Git 2.17+, and pybind11 2.6.0+.
+
+## Fast Path
+
+From the Megatron-LM repo root on a CUDA host:
+
+```bash
+bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
+  --torch-backend cu128 \
+  --preflight
+```
+
+```bash
+bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
+  --torch-backend cu128
+```
+
+## Sandbox GPU Visibility
+
+Some agent sandboxes do not expose `/dev/nvidia*`, even when the host GPU and
+driver are healthy. If a sandboxed `nvidia-smi` reports that it cannot
+communicate with the driver, do not ask the user to repair the driver yet. Run
+this read-only check outside the sandbox after approval:
+
+```bash
+nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
+```
+
+Only a failed host-level check blocks the bare-metal installation. A successful
+host-level check means the remaining question is the CUDA Toolkit (`nvcc`), not
+GPU visibility.
+
+For automation that needs a log artifact, keep the install on the foreground
+critical path:
+
+```bash
+set -o pipefail
+bash skills/mcore-transformer-engine-install/scripts/install_te_pypi.sh \
+  --torch-backend cu128 2>&1 | tee artifacts/te-install.log
+```
+
+Do not background the helper and poll it with coarse fixed sleeps unless the
+execution environment has a hard command timeout. If backgrounding is
+unavoidable, poll at a short interval and check the exit file immediately after
+each sleep before running the smoke test.
+
+By default, the helper detects the first visible GPU after PyTorch is installed
+and sets `NVTE_CUDA_ARCHS` and `TORCH_CUDA_ARCH_LIST` from
+`torch.cuda.get_device_capability(0)`. Use `--cuda-arch b200`,
+`--cuda-arch rtx-pro-6000`, `--cuda-arch h100`, `--cuda-arch l4`, or
+`--cuda-arch a100` only when you need to override detection for a benchmark,
+cross-target build, or multi-GPU host where GPU 0 is not the target. B200/GB200
+maps to `NVTE_CUDA_ARCHS=100` and `TORCH_CUDA_ARCH_LIST=10.0`; RTX PRO
+Blackwell maps to `NVTE_CUDA_ARCHS=120` and `TORCH_CUDA_ARCH_LIST=12.0`;
+H100 maps to `90`/`9.0`; L4/L40S maps to `89`/`8.9`; A100 maps to `80`/`8.0`.
+Blackwell requires CUDA 12.8+. Use `--te-version` to bump the pinned PyPI
+Transformer Engine version after the smoke test is validated. The default TE spec is
+`transformer_engine[pytorch]==2.11.0`.
+
+The helper performs the full sequence: create `.venv`, install CUDA PyTorch and
+build dependencies, export NVIDIA wheel header/library paths, install Megatron
+editable without extras, install pinned PyPI `transformer_engine[pytorch]` with
+`--no-config --no-build-isolation`, then run a CUDA
+`transformer_engine.pytorch.Linear` smoke test. It prints a pre-build notice
+because the PyPI TE install can still compile locally and can take 10-15+
+minutes depending mostly on CPU resources, memory, cache state, and build
+parallelism. `--preflight` stops after the torch/bootstrap phase and prints the
+CUDA/PyTorch/GPU/header/path/disk/build settings that will be used before
+Megatron editable install or TE native compilation starts. Add `--extras
+training` only when the environment needs optional training dependencies such
+as tokenizers, Transformers, W&B, or related runtime packages.
+
+## Manual Flow
+
+Use this when editing commands by hand or explaining the install:
+
+```bash
+uv venv --python 3.12
+uv pip install --no-config --python .venv/bin/python --torch-backend=cu128 \
+  "torch==2.10.0" "setuptools>=80,<82" wheel packaging pybind11 Cython hatchling cmake ninja nvidia-mathdx numpy
+```
+
+Export headers and libraries from the NVIDIA wheels installed in the venv:
+
+```bash
+VENV_SITE="$(.venv/bin/python - <<'PY'
+import site
+
+print(site.getsitepackages()[0])
+PY
+)"
+for INCLUDE_DIR in "${VENV_SITE}"/nvidia/*/include; do
+  if [ -d "${INCLUDE_DIR}" ]; then
+    export CPATH="${INCLUDE_DIR}:${CPATH:-}"
+  fi
+done
+for LIB_DIR in "${VENV_SITE}"/nvidia/*/lib; do
+  if [ -d "${LIB_DIR}" ]; then
+    export LIBRARY_PATH="${LIB_DIR}:${LIBRARY_PATH:-}"
+    export LD_LIBRARY_PATH="${LIB_DIR}:${LD_LIBRARY_PATH:-}"
+  fi
+done
+CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+export CUDA_PATH="${CUDA_PATH:-${CUDA_HOME}}"
+if [ -d "${VENV_SITE}/nvidia/cudnn" ]; then
+  export CUDNN_PATH="${CUDNN_PATH:-${VENV_SITE}/nvidia/cudnn}"
+  export CUDNN_HOME="${CUDNN_HOME:-${CUDNN_PATH}}"
+  export LD_LIBRARY_PATH="${CUDNN_PATH}/lib:${LD_LIBRARY_PATH:-}"
+fi
+```
+
+Install Megatron and pinned PyPI TE:
+
+```bash
+uv pip install --no-config --python .venv/bin/python -e .
+
+# Optional: add training dependencies when needed.
+uv pip install --no-config --python .venv/bin/python -e ".[training]"
+
+read -r NVTE_CUDA_ARCHS TORCH_CUDA_ARCH_LIST < <(.venv/bin/python - <<'PY'
+import torch
+
+major, minor = torch.cuda.get_device_capability(0)
+print(f"{major}{minor} {major}.{minor}")
+PY
+)
+
+MAX_JOBS=4 NVTE_BUILD_THREADS_PER_JOB=1 NVTE_FRAMEWORK=pytorch \
+  NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" \
+  uv pip install --no-config --python .venv/bin/python --no-build-isolation \
+    "transformer_engine[pytorch]==2.11.0"
+```
+
+Override `NVTE_CUDA_ARCHS` and `TORCH_CUDA_ARCH_LIST` manually only when you
+need a fixed target, such as `100`/`10.0` for B200/GB200, `120`/`12.0` for
+RTX PRO Blackwell, `90`/`9.0` for H100, `89`/`8.9` for L4/L40S, or `80`/`8.0`
+for A100.
+
+Smoke test:
+
+```bash
+.venv/bin/python - <<'PY'
+import torch
+import megatron.core
+from transformer_engine.pytorch import Linear
+
+assert torch.cuda.is_available(), "CUDA is not visible to PyTorch"
+layer = Linear(8, 8).cuda()
+x = torch.randn(2, 8, device="cuda")
+y = layer(x)
+torch.cuda.synchronize()
+print("megatron cuda+te smoke: ok", y.shape)
+PY
+```
+
+If you installed `--extras training`, also verify the training package imports:
+
+```bash
+.venv/bin/python -c "import megatron.training"
+```
+
+## Testing a TE Fork
+
+For a throwaway fork test, change only the `transformer-engine` entry in
+`[tool.uv.sources]` in `pyproject.toml` to the fork URL and commit SHA, then run
+`skills/mcore-transformer-engine-install/scripts/install_te_source.sh`. Do not
+commit a fork URL to Megatron-LM unless the user explicitly wants that source
+change in the PR.
+
+For a committed dependency change, follow `mcore-build-and-dependency`: update
+`pyproject.toml`, run `uv lock` inside the container, and include the lockfile
+change. Source-install smoke tests can still use the helper in this skill.
+
+## Failure Map
+
+| Symptom | Likely cause | First fix |
+|---------|--------------|-----------|
+| `torch.cuda.is_available()` is false | CPU PyTorch wheel, hidden GPU, or driver/toolkit mismatch | Reinstall PyTorch with `--no-config --torch-backend=<cuXXX>` and check `nvidia-smi` |
+| `nvidia-smi` fails only in an agent sandbox | The sandbox does not expose NVIDIA device nodes | Re-run `nvidia-smi` on the host after approval; do not diagnose a broken driver from the sandbox result |
+| `cmake: command not found` or `ninja: command not found` | Build tools missing from the venv | Install `cmake ninja` before TE |
+| `nvcc` is missing or `CUDA_PATH` has no `bin/nvcc` | Driver-only host or incomplete toolkit | Ask whether to use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/pytorch) or provision a matching CUDA Toolkit, then set `CUDA_PATH` and rerun `--preflight` |
+| `fatal error: nccl.h: No such file or directory` | NVIDIA wheel headers not on include path | Export `${VENV_SITE}/nvidia/*/include` into `CPATH` |
+| `fatal error: cudnn.h: No such file or directory` | cuDNN wheel headers not on include path | Export NVIDIA include dirs and keep `--no-build-isolation` |
+| Linker cannot find CUDA/NCCL/cuDNN libraries | NVIDIA wheel libs not on library paths | Export `${VENV_SITE}/nvidia/*/lib` into `LIBRARY_PATH` and `LD_LIBRARY_PATH` |
+| Build dies or is killed | Native build exceeded memory | Lower `MAX_JOBS`, retry on a larger GPU host, or use the NGC container |
+| Build isolation imports fail | TE cannot see PyTorch/build deps in isolated env | Use `--no-build-isolation` after preinstalling build deps |
+| `CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED` | TE built against one cuDNN but runtime loads another | Set `CUDNN_PATH`, `CUDNN_HOME`, and `LD_LIBRARY_PATH` to the venv cuDNN package before building |
+| `uv` tries to clone TransformerEngine from GitHub | The command used `.[te]` or did not pass `--no-config` from a Megatron checkout | Use the PyPI helper or run `uv pip install --no-config --no-build-isolation "transformer_engine[pytorch]==<version>"` |
+| `ModuleNotFoundError: transformer_engine_torch` after install | TE native extension did not build or import | Re-run with the helper and inspect the first native build error |
+
+## Completion Criteria
+
+Do not call the bare-metal TE install done until all of these pass:
+
+1. `python -c "import torch; print(torch.cuda.is_available())"` prints `True`.
+2. `python -c "import transformer_engine.pytorch"` succeeds.
+3. The smoke test above runs a CUDA forward pass and synchronizes.
+4. `import megatron.core` succeeds in the same venv.
+5. If `--extras training` was installed, `import megatron.training` also
+   succeeds in the same venv.

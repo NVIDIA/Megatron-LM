@@ -1,0 +1,4 @@
+interface:
+  display_name: "MCore Transformer Engine Install"
+  short_description: "Install pinned PyPI TE for Megatron"
+  default_prompt: "Use $mcore-transformer-engine-install to install a pinned PyPI Transformer Engine version for Megatron."
