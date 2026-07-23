@@ -520,9 +520,9 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
-    ) -> Tensor:
+    ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
@@ -535,10 +535,16 @@ class GPTModel(LanguageModule):
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from routing computations.
-            output_processor (Callable, optional): Custom postprocess hook that receives
-                decoder hidden states and output-layer helpers, then returns the model output.
-            output_processor_context (Any, optional): User-defined context object forwarded to
-                `output_processor`.
+            output_processor (Callable, optional): Custom postprocess callback invoked after
+                decoder hidden states are available and before the default logits/loss path.
+                When provided, the callback result becomes the direct `GPTModel.forward` result.
+                The callback receives the context object using the `context` keyword.
+                `output_weight` is populated with the shared embedding/output weight when
+                embeddings and output weights are tied. For untied embeddings, `output_weight`
+                is None and the output projection weight remains available as
+                `output_layer.weight`.
+            output_processor_context (Any, optional): User-defined context object passed to
+                `output_processor` using the `context` keyword.
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -799,7 +805,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         *,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
         """Builds a computation schedule plan for the model.
@@ -829,8 +835,8 @@ class GPTModel(LanguageModule):
             padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
             output_processor (Callable, optional): Custom postprocess hook to run in the
                 schedule-plan postprocess node instead of the default logits/loss path.
-            output_processor_context (Any, optional): User-defined context object forwarded to
-                `output_processor`.
+            output_processor_context (Any, optional): User-defined context object passed to
+                `output_processor` using the `context` keyword.
 
         Returns:
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.

@@ -2,6 +2,7 @@
 
 import inspect
 import os
+from dataclasses import dataclass
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,12 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+@dataclass(frozen=True)
+class ProcessorResult:
+    payload: torch.Tensor
+    tag: str
 
 
 class TestGPTModel:
@@ -173,6 +180,127 @@ class TestGPTModel:
         assert seen["config"] is config
         assert seen["compute_language_model_loss"].__self__ is self.gpt_model
         assert seen["scale_logits"].__self__ is self.gpt_model
+
+    @pytest.mark.internal
+    def test_output_processor_forward_returns_structured_result(self):
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        self.gpt_model.cuda()
+        self.gpt_model.eval()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = (input_ids + 1) % self.gpt_model.vocab_size
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        sentinel_context = object()
+        created = {}
+        seen = {}
+
+        def output_processor(*, hidden_states, output_layer, output_weight, context, **kwargs):
+            assert context is sentinel_context
+            assert "output_processor_context" not in kwargs
+            seen["hidden_states"] = hidden_states
+            seen["output_layer"] = output_layer
+            seen["output_weight"] = output_weight
+            result = ProcessorResult(payload=hidden_states, tag="structured")
+            created["result"] = result
+            return result
+
+        with (
+            torch.no_grad(),
+            patch.object(
+                self.gpt_model.output_layer,
+                "forward",
+                side_effect=AssertionError("default logits path should not run"),
+            ) as output_layer_forward,
+        ):
+            output = self.gpt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                output_processor=output_processor,
+                output_processor_context=sentinel_context,
+            )
+
+        assert output is created["result"]
+        assert isinstance(output, ProcessorResult)
+        assert output.payload is seen["hidden_states"]
+        assert output.payload.shape == (
+            sequence_length,
+            micro_batch_size,
+            self.gpt_model.config.hidden_size,
+        )
+        assert output.tag == "structured"
+        assert seen["output_layer"] is self.gpt_model.output_layer
+        assert seen["output_weight"] is None
+        output_layer_forward.assert_not_called()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("share_embeddings_and_output_weights", [True, False])
+    def test_output_processor_output_weight_semantics(self, share_embeddings_and_output_weights):
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        if share_embeddings_and_output_weights:
+            transformer_config = TransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                embedding_init_method_std=1.0,
+            )
+            gpt_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+                share_embeddings_and_output_weights=True,
+            )
+        else:
+            gpt_model = self.gpt_model
+
+        gpt_model.cuda()
+        gpt_model.eval()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        sentinel_context = object()
+        seen = {}
+
+        def output_processor(*, hidden_states, output_layer, output_weight, context, **kwargs):
+            assert context is sentinel_context
+            assert "output_processor_context" not in kwargs
+            seen["output_layer"] = output_layer
+            seen["output_weight"] = output_weight
+            return hidden_states.sum()
+
+        with torch.no_grad():
+            output = gpt_model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                output_processor=output_processor,
+                output_processor_context=sentinel_context,
+            )
+
+        assert torch.is_tensor(output)
+        assert seen["output_layer"] is gpt_model.output_layer
+        if share_embeddings_and_output_weights:
+            assert seen["output_weight"] is gpt_model.shared_embedding_or_output_weight()
+        else:
+            assert seen["output_weight"] is None
+            assert seen["output_layer"].weight is not None
 
     @pytest.mark.internal
     def test_build_schedule_plan_threads_output_processor(self):
