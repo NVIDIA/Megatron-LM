@@ -3034,13 +3034,50 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._normalize_state_dict_for_grouped_params(state_dict_list[chunk_idx], model_chunk)
             self._synthesize_state_dict_params_for_model(state_dict_list[chunk_idx], model_chunk)
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
+
+            # Some layer specs declare a sharded_state_dict_keys_map that rewrites runtime
+            # parameter prefixes to canonical checkpoint prefixes (e.g. fused-LN MLA stores its
+            # LN scale/bias on linear_qkv_down_proj at runtime, but the checkpoint canonicalizes
+            # them to input_layernorm.*). Collect those rewrites so we can match a runtime param
+            # name against either its raw form or its canonical alternative.
+            canonical_rewrites = []
+            for layer_path, layer_module in model_chunk.named_modules():
+                cfg = getattr(layer_module, 'submodules_config', None)
+                if cfg is None:
+                    continue
+                key_map = getattr(cfg, 'sharded_state_dict_keys_map', None)
+                if not key_map:
+                    continue
+                layer_prefix = f"{layer_path}." if layer_path else ""
+                canonical_rewrites.append((layer_prefix, list(key_map.items())))
+
+            def _candidate_state_dict_names(name):
+                candidates = [name]
+                for layer_prefix, mappings in canonical_rewrites:
+                    if not name.startswith(layer_prefix):
+                        continue
+                    sub = name[len(layer_prefix) :]
+                    for old_prefix, new_prefix in mappings:
+                        if sub.startswith(old_prefix):
+                            candidates.append(
+                                f"{layer_prefix}{new_prefix}{sub[len(old_prefix) :]}"
+                            )
+                            break
+                return candidates
+
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
                     name = name[len("module.") :]
-                matched_keys = [k for k in names_in_state_dict if k.endswith(name)]
-                assert (
-                    len(matched_keys) == 1
-                ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
+                candidates = _candidate_state_dict_names(name)
+                matched_keys = []
+                for cand in candidates:
+                    matched_keys = [k for k in names_in_state_dict if k.endswith(cand)]
+                    if matched_keys:
+                        break
+                assert len(matched_keys) == 1, (
+                    f"Parameter {name} has {len(matched_keys)} matches in state dict "
+                    f"(tried candidates: {candidates})"
+                )
                 state_dict_param = state_dict_list[chunk_idx][matched_keys[0]]
                 assert model_param.shape == state_dict_param.shape
                 model_param_to_state_dict_param_map[model_param] = state_dict_param
