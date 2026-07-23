@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from torch.utils.data import DataLoader, TensorDataset
 from dataclasses import dataclass, field
 from megatron.core.utils import log_single_rank
-from megatron.training.global_vars import get_args, get_tokenizer
+from megatron.training.global_vars import get_tokenizer
 from megatron.training.utils import get_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core import mpu
@@ -390,8 +390,6 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
     Returns:
         PackedSeqParams configured as a single unpacked sequence.
     """
-
-    args = get_args()
 
     # Pad to the maximum number of sequences in the bin for the attention kernel.
     # We add 2 to account for the initial 0 and the final bin_size.

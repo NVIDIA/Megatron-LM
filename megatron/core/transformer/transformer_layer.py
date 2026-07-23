@@ -16,7 +16,13 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX,
+    PackedSeqParams,
+    build_packed_seq_params_from_cuda_graph_kwargs,
+    has_packed_seq_params_cuda_graph_kwargs,
+    split_packed_seq_params_for_cuda_graph,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
@@ -1135,6 +1141,110 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
+    def _set_te_cuda_graph_packed_seq_params_static_metadata(
+        self, static_metadata, tensor_kwarg_names=None
+    ):
+        """Store non-Tensor ``PackedSeqParams`` metadata used during TE graph capture."""
+        self._te_cuda_graph_packed_seq_params_static_metadata = dict(static_metadata)
+        self._te_cuda_graph_packed_seq_params_tensor_kwarg_names = (
+            None if tensor_kwarg_names is None else tuple(sorted(tensor_kwarg_names))
+        )
+
+    def _get_te_cuda_graph_packed_seq_params_static_metadata(self):
+        """Return the static ``PackedSeqParams`` metadata used for this TE graph."""
+        return getattr(self, '_te_cuda_graph_packed_seq_params_static_metadata', None)
+
+    def _validate_te_cuda_graph_packed_seq_params_static_metadata(self, static_metadata):
+        """Validate that replay uses the same static packed-sequence contract as capture."""
+        expected_static_metadata = self._get_te_cuda_graph_packed_seq_params_static_metadata()
+        assert expected_static_metadata is not None, (
+            "TE CUDA graph replay received packed_seq_params, but the graph was captured without "
+            "packed-sequence sample inputs. Recapture the graph with matching PackedSeqParams "
+            "static metadata."
+        )
+
+        mismatched_fields = []
+        for field_name in sorted(set(expected_static_metadata) | set(static_metadata)):
+            expected_value = expected_static_metadata.get(field_name)
+            actual_value = static_metadata.get(field_name)
+            if expected_value is actual_value:
+                continue
+            if expected_value != actual_value:
+                mismatched_fields.append(field_name)
+
+        assert not mismatched_fields, (
+            "TE CUDA graph replay received PackedSeqParams with static metadata that differs "
+            "from capture. Recapture the graph for changed fields: "
+            f"{', '.join(mismatched_fields)}."
+        )
+
+    def _get_te_cuda_graph_packed_seq_params_tensor_kwarg_names(self):
+        """Return flattened ``PackedSeqParams`` Tensor kwargs used for this TE graph."""
+        return getattr(self, '_te_cuda_graph_packed_seq_params_tensor_kwarg_names', None)
+
+    def _validate_te_cuda_graph_packed_seq_params_tensor_kwargs(self, tensor_kwargs):
+        """Validate replay uses the same flattened Tensor field set as capture."""
+        expected_names = self._get_te_cuda_graph_packed_seq_params_tensor_kwarg_names()
+        if expected_names is None:
+            return
+
+        expected_names = set(expected_names)
+        actual_names = set(tensor_kwargs)
+        missing_names = sorted(expected_names - actual_names)
+        extra_names = sorted(actual_names - expected_names)
+        assert not missing_names and not extra_names, (
+            "TE CUDA graph replay received PackedSeqParams with Tensor fields that differ "
+            "from capture. Recapture the graph for missing fields "
+            f"{missing_names} and extra fields {extra_names}."
+        )
+
+    def _rebuild_te_cuda_graph_packed_seq_params(self, kwargs):
+        """Rebuild ``PackedSeqParams`` from flattened TE graph capture kwargs."""
+        if not has_packed_seq_params_cuda_graph_kwargs(kwargs):
+            return
+
+        assert kwargs.get('packed_seq_params') is None, (
+            "PackedSeqParams must be passed either as flattened TE CUDA graph kwargs or as "
+            "packed_seq_params, but not both."
+        )
+        static_metadata = self._get_te_cuda_graph_packed_seq_params_static_metadata()
+        assert static_metadata is not None, (
+            "Flattened PackedSeqParams Tensor fields require static metadata captured on the "
+            "TransformerLayer."
+        )
+        tensor_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key.startswith(CUDA_GRAPH_PACKED_SEQ_PARAMS_PREFIX)
+        }
+        self._validate_te_cuda_graph_packed_seq_params_tensor_kwargs(tensor_kwargs)
+
+        kwargs['packed_seq_params'] = build_packed_seq_params_from_cuda_graph_kwargs(
+            kwargs, static_metadata
+        )
+
+    def _flatten_te_cuda_graph_packed_seq_params(self, kwargs):
+        """Flatten replay-time ``PackedSeqParams`` into Tensor kwargs for TE graphs."""
+        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        expected_static_metadata = self._get_te_cuda_graph_packed_seq_params_static_metadata()
+        if packed_seq_params is None:
+            assert expected_static_metadata is None, (
+                "TE CUDA graph was captured with packed_seq_params, so replay must also pass "
+                "packed_seq_params with matching static metadata."
+            )
+            return
+
+        tensor_kwargs, static_metadata = split_packed_seq_params_for_cuda_graph(packed_seq_params)
+        self._validate_te_cuda_graph_packed_seq_params_static_metadata(static_metadata)
+        self._validate_te_cuda_graph_packed_seq_params_tensor_kwargs(tensor_kwargs)
+
+        duplicate_keys = set(kwargs) & set(tensor_kwargs)
+        assert not duplicate_keys, (
+            "PackedSeqParams CUDA graph Tensor kwargs overlap with existing replay kwargs: "
+            f"{', '.join(sorted(duplicate_keys))}."
+        )
+        kwargs.update(tensor_kwargs)
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
@@ -1155,6 +1265,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = kwargs.pop("hidden_states")
                 hidden_states = self.off_interface.backward_record(hidden_states)
                 kwargs["hidden_states"] = hidden_states
+        self._rebuild_te_cuda_graph_packed_seq_params(kwargs)
+
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -1197,7 +1309,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         CUDA graph replay for this layer and microbatch `self.current_microbatch` using TE
         interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
         However, CUDA graph accepts only Tensor inputs.
-        Hence, `inference_context` and `packed_seq_params` are excluded from input list.
+        Hence, `inference_context` is excluded from input list. `packed_seq_params` is split
+        into Tensor graph inputs and static metadata when attention is in the graph scope.
         """
         context = None
         if (
@@ -1207,12 +1320,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
+        else:
+            self._flatten_te_cuda_graph_packed_seq_params(kwargs)
 
-        assert (kwargs.get('inference_context') is None) and (
-            kwargs.get('packed_seq_params') is None
-        ), (
+        assert kwargs.get('inference_context') is None, (
             "CUDA graph accepts only Tensor inputs. "
-            "inference_context and packed_seq_params are excluded from input list. "
+            "inference_context is excluded from input list; packed_seq_params must be "
+            "flattened into Tensor kwargs with matching static metadata. "
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
