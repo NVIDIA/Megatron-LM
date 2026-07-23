@@ -192,6 +192,9 @@ class TestMambaPrefixCachingE2E:
         prefix_caching_mamba_gb=2.0,
         request_rounder=4,
         num_cuda_graphs=None,
+        enable_chunked_prefill=False,
+        max_tokens=None,
+        max_requests=None,
     ):
         set_rounder(request_rounder)
         inference_config_kwargs = dict(
@@ -204,7 +207,12 @@ class TestMambaPrefixCachingE2E:
             unified_memory_level=0,
             num_cuda_graphs=num_cuda_graphs,
             sampling_backend='torch',
+            enable_chunked_prefill=enable_chunked_prefill,
         )
+        if max_tokens is not None:
+            inference_config_kwargs['max_tokens'] = max_tokens
+        if max_requests is not None:
+            inference_config_kwargs['max_requests'] = max_requests
         if enable_prefix_caching:
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
@@ -624,3 +632,75 @@ class TestMambaPrefixCachingE2E:
         assert req_G._mamba_num_matched_blocks == 0
         assert h_E0 in ctx.mamba_slot_allocator.hash_to_block_id
         assert finished[0] == finished[2]
+
+    @torch.inference_mode()
+    def test_mamba_chunked_prefill_unaligned_boundary_snapshot(self):
+        """Chunked prefill snapshots Mamba state at the last block boundary.
+
+        ``compute_and_store_offsets`` records a Mamba state snapshot at a KV-block
+        boundary only when that boundary is a whole multiple of the SSM chunk size
+        measured from the start of the current prefill chunk. Because the chunk
+        start equals ``finished_chunk_token_count`` on continuation chunks, this
+        holds exactly when every chunk boundary is block-aligned.
+
+        Here ``max_tokens`` (300) is intentionally not a multiple of the block size
+        (256), so the request spans several chunks and its last full-block boundary
+        (token 768) lands in a continuation chunk. The scheduler keeps each chunk
+        boundary block-aligned, so the final chunk begins at token 512 and the
+        token-768 snapshot is extracted and committed. A second request sharing the
+        768-token prefix then restores that state and skips those blocks.
+        """
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+
+        device = torch.cuda.current_device()
+        # 800-token prompt -> 3 full blocks (256/512/768) + a 32-token tail.
+        # The last full-block boundary (768) falls in the final continuation chunk.
+        prompt = torch.arange(9000, 9800, dtype=torch.int64, device=device)
+        assert len(prompt) == 800
+
+        engine = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            max_tokens=300,  # not a multiple of BLOCK_SIZE (256) -> forces unaligned cuts
+            max_requests=4,
+            request_rounder=4,
+        )
+        ctx = engine.context
+        # Sanity: the prompt genuinely spans multiple prefill chunks.
+        assert ctx.max_tokens < len(prompt)
+
+        # --- Seed request: fills the cache, no prior matches. ---
+        seed = self._make_request(0, prompt, enable_pc=True, num_tokens=4)
+        engine._add_request(seed)
+        while engine.has_unfinished_requests():
+            engine.step_modern()
+        # Seed has no prior cache, so no Mamba blocks are matched during its prefill.
+        assert seed._mamba_num_matched_blocks == 0
+
+        # block index 2 == the boundary at token 768 (768 // 256 - 1). The final
+        # chunk begins block-aligned at token 512, so (768 - 512) % 128 == 0 and
+        # the state at this boundary is extracted and committed.
+        assert len(seed.precomputed_block_hashes) == 3
+        last_block_hash = seed.precomputed_block_hashes[2]
+        assert (
+            last_block_hash in ctx.mamba_slot_allocator.hash_to_block_id
+        ), "Mamba snapshot at the last block boundary (token 768) was not recorded."
+
+        # --- Reuse request: shares the full 768-token prefix, should restore the
+        # cached Mamba state and skip those blocks entirely. ---
+        reuse_prompt = torch.cat(
+            [prompt[:768], torch.arange(9800, 9900, dtype=torch.int64, device=device)]
+        )
+        reuse = self._make_request(1, reuse_prompt, enable_pc=True, num_tokens=4)
+        engine._add_request(reuse)
+        while engine.has_unfinished_requests():
+            engine.step_modern()
+
+        assert reuse._mamba_num_matched_blocks == 3, (
+            "Reuse request should restore Mamba state from the token-768 snapshot "
+            f"(3 matched blocks), got {reuse._mamba_num_matched_blocks}."
+        )
