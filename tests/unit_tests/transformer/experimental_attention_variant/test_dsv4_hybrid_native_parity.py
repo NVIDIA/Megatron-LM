@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import gc
+import inspect
 import math
 import os
 
@@ -117,6 +118,7 @@ def _make_config(
     apply_dsa_kernel_fusion: bool = False,
     calculate_per_token_loss: bool = False,
     dsa_indexer_use_sparse_loss: bool = False,
+    dsa_indexer_precision: str = "bf16",
 ) -> MLATransformerConfig:
     shape = _DSV4_VARIANTS[variant]
     mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
@@ -142,6 +144,7 @@ def _make_config(
         dsa_indexer_topk=shape["dsa_indexer_topk"],
         dsa_indexer_loss_coeff=0.01,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+        dsa_indexer_precision=dsa_indexer_precision,
         calculate_per_token_loss=calculate_per_token_loss,
         add_bias_linear=False,
         bf16=True,
@@ -904,6 +907,68 @@ class TestDSv4HybridNativeParity:
         model_parallel_cuda_manual_seed(_SEED)
 
     def teardown_method(self):
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def test_mxfp8_indexer_attention_matches_native_reference(self):
+        """MXFP8 compact forward keeps the BF16 sparse-loss backward contract."""
+        _skip_if_real_kernels_unavailable()
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("MXFP8 compact indexer requires SM100+")
+
+        from cudnn import DSA
+
+        compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+        if (
+            compact_wrapper is None
+            or "q_scale" not in inspect.signature(compact_wrapper).parameters
+        ):
+            pytest.skip("installed cuDNN Frontend lacks MXFP8 compact indexer support")
+
+        config = _make_config(
+            "flash",
+            4,
+            apply_dsa_kernel_fusion=True,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_indexer_precision="mxfp8",
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
+        real_layer = build_module(
+            spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
+        ).cuda()
+        native_layer = NativeDSv4HybridAttention(config, 4).cuda()
+        real_params = _copy_real_params_to_native(real_layer, native_layer)
+
+        seqlen = 512
+        hidden_states = torch.randn(
+            seqlen, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
+        grad = torch.randn_like(hidden_states)
+
+        real_out, _ = real_layer(hidden_states=hidden_states, attention_mask=None)
+        native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
+        _assert_similarity(real_out.detach(), native_out.detach(), "mxfp8-indexer:out", eps=5e-3)
+
+        real_out.backward(grad)
+        native_out.backward(grad)
+        assert native_indexer_loss is not None
+        native_indexer_loss.backward()
+        _assert_similarity(
+            hidden_states.grad, hidden_states_native.grad, "mxfp8-indexer:hidden_grad", eps=3e-2
+        )
+
+        for name, native_param in native_layer.named_parameters():
+            real_param = real_params[name]
+            assert native_param.grad is not None, f"Missing native grad for {name}"
+            assert real_param.grad is not None, f"Missing real grad for {name}"
+            _assert_similarity(
+                real_param.grad, native_param.grad, f"mxfp8-indexer:param_grad:{name}", eps=3e-2
+            )
+
+        del real_layer, native_layer, real_params
+        del hidden_states, hidden_states_native, real_out, native_out, grad, native_indexer_loss
         gc.collect()
         torch.cuda.empty_cache()
 

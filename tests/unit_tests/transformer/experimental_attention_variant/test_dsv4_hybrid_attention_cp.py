@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import gc
+import inspect
 import os
 import statistics
 from contextlib import contextmanager, nullcontext
@@ -16,6 +17,7 @@ import megatron.core.parallel_state as parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.indexer_quantization import HAVE_TE_MXFP8, HAVE_TRITON
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
@@ -92,6 +94,36 @@ def _dsv4_cp_fused_kernels_available():
 _DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON = (
     "DSv4 fused DSA cases require SM90+, flash_mla, and cudnn.DSA"
 )
+
+_DSV4_CP_MXFP8_KERNELS_UNAVAILABLE_REASON = (
+    "DSv4 MXFP8 CP cases require SM100+, Transformer Engine MXFP8, Triton, "
+    "flash_mla, and a compatible cudnn.DSA compact wrapper"
+)
+
+
+def _dsv4_cp_mxfp8_kernels_available():
+    """Return whether this host exposes the full MXFP8 compact CP stack."""
+    if (
+        not _dsv4_cp_fused_kernels_available()
+        or torch.cuda.get_device_capability()[0] < 10
+        or not HAVE_TE_MXFP8
+        or not HAVE_TRITON
+    ):
+        return False
+    from cudnn import DSA
+
+    compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+    if not callable(compact_wrapper):
+        return False
+    required_parameters = {
+        "deterministic",
+        "precision",
+        "q_scale",
+        "k_scale",
+        "sf_vec_size",
+        "q_causal_offsets",
+    }
+    return required_parameters <= set(inspect.signature(compact_wrapper).parameters)
 
 
 class _ReferenceCPGroup:
@@ -270,6 +302,8 @@ def _make_dsv4_cp_config(
     dsa_indexer_use_sparse_loss=True,
     apply_dsa_kernel_fusion=True,
     apply_rope_fusion=True,
+    dsa_indexer_precision="bf16",
+    cuda_graph_impl="none",
 ):
     """Build the DSv4 flash attention config used by CP tests."""
     shape = _DSV4_VARIANTS[_DSV4_CP_TEST_VARIANT]
@@ -300,6 +334,16 @@ def _make_dsv4_cp_config(
         expert_model_parallel_size=1,
         apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
         apply_rope_fusion=apply_rope_fusion,
+        dsa_indexer_precision=dsa_indexer_precision,
+        cuda_graph_impl=cuda_graph_impl,
+        max_seqlen_per_dp_cp_rank=(
+            sum(_DSV4_CP_RAGGED_PADDED_SEG_LENS) // context_parallel_size
+            if cuda_graph_impl != "none" and context_parallel_size > 1
+            else None
+        ),
+        pad_packed_seq_alignment=(
+            "max" if cuda_graph_impl != "none" and context_parallel_size > 1 else None
+        ),
     )
 
 
@@ -646,6 +690,59 @@ class TestDSv4HybridAttentionTHDCP:
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
 
+    def test_thd_cp_mxfp8_matches_full_reference_forward_backward(self):
+        """MXFP8 CP top-k, loss, and gradients match the CP1 THD path."""
+        if not _dsv4_cp_mxfp8_kernels_available():
+            pytest.skip(_DSV4_CP_MXFP8_KERNELS_UNAVAILABLE_REASON)
+
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
+        torch.manual_seed(_SEED + 1600)
+        model_parallel_cuda_manual_seed(_SEED + 1600)
+        config_cp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size, dsa_indexer_precision="mxfp8"
+        )
+        config_ref = _make_dsv4_cp_config(context_parallel_size=1, dsa_indexer_precision="mxfp8")
+        cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda()
+        ref_attn = _build_attention(config_ref, layer_number=2, pg_collection=self.ref_pg).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+
+        full_hidden = torch.randn(
+            padded_tokens, 1, config_cp.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        _assert_cp_tensor_match(
+            local_out.detach(), ref_out.detach().index_select(0, local_idx), "layer=2:mxfp8:output"
+        )
+
+        grad = torch.randn_like(ref_out)
+        local_out.backward(grad.index_select(0, local_idx))
+        ref_out.backward(grad)
+        _assert_cp_tensor_match(
+            local_hidden.grad.detach(),
+            ref_hidden.grad.index_select(0, local_idx),
+            "layer=2:mxfp8:hidden_grad",
+        )
+
+        ref_params = dict(ref_attn.named_parameters())
+        for name, param in cp_attn.named_parameters():
+            ref_grad = ref_params[name].grad
+            assert param.grad is not None, f"Missing CP grad for {name}"
+            assert ref_grad is not None, f"Missing reference grad for {name}"
+            grad_sum = param.grad.detach().clone()
+            dist.all_reduce(grad_sum, group=self.pg.cp)
+            _assert_cp_tensor_match(grad_sum, ref_grad, f"layer=2:mxfp8:param_grad:{name}")
+
+        del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
+        _clear_cuda_test_state()
+
     def test_thd_cp_zero_indexer_loss_keeps_indexer_grads(self):
         """Zero indexer loss must still mark indexer grads ready for overlapped DDP."""
         packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
@@ -881,6 +978,75 @@ class TestDSv4HybridAttentionTHDCP:
 
             del eager_attn, test_grad, eager_hidden, graph_out, graph_hidden_grad
             _clear_cuda_test_state()
+
+    def test_thd_cp_mxfp8_cuda_graph_matches_eager_forward_backward(self):
+        """Workspace-backed MXFP8 CP capture matches eager forward/backward."""
+        if not _dsv4_cp_mxfp8_kernels_available():
+            pytest.skip(_DSV4_CP_MXFP8_KERNELS_UNAVAILABLE_REASON)
+
+        packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
+        torch.manual_seed(_SEED + 1700)
+        model_parallel_cuda_manual_seed(_SEED + 1700)
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_precision="mxfp8",
+            cuda_graph_impl="local",
+        )
+        graph_attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
+        eager_attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
+        graph_attn.train()
+        eager_attn.train()
+        _copy_module_parameters(graph_attn, eager_attn)
+
+        full_hidden = torch.randn(
+            padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        test_hidden = full_hidden.index_select(0, local_idx).detach().clone()
+        test_grad = torch.randn_like(test_hidden)
+        static_hidden = test_hidden.detach().clone().requires_grad_(True)
+        eager_hidden = test_hidden.detach().clone().requires_grad_(True)
+        static_grad = test_grad.detach().clone()
+
+        graph, graph_output = _capture_dsv4_attention_forward_backward(
+            graph_attn, static_hidden, static_grad, packed
+        )
+        workspace = graph_attn.core_attention._active_thd_compact_indexer_workspace
+        assert workspace is not None
+        assert workspace.geometry.precision == "mxfp8"
+        assert workspace.mxfp8 is not None
+        assert workspace.softmax_out is not None
+
+        with torch.no_grad():
+            static_hidden.copy_(test_hidden)
+            static_grad.copy_(test_grad)
+            _zero_existing_grads(graph_attn, static_hidden)
+        graph.replay()
+        torch.cuda.synchronize()
+        graph_out = graph_output.detach().clone()
+        graph_hidden_grad = static_hidden.grad.detach().clone()
+        graph_param_grads = {
+            name: param.grad.detach().clone()
+            for name, param in graph_attn.named_parameters()
+            if param.grad is not None
+        }
+
+        eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
+            eager_attn, eager_hidden, test_grad, packed
+        )
+        torch.cuda.synchronize()
+        assert graph_param_grads.keys() == eager_param_grads.keys()
+        _assert_cp_graph_bitwise_match(graph_out, eager_out, "layer=2:mxfp8_graph:output")
+        _assert_cp_graph_fused_grad_match(
+            graph_hidden_grad, eager_hidden_grad, "layer=2:mxfp8_graph:hidden_grad"
+        )
+        for name, graph_grad in graph_param_grads.items():
+            _assert_cp_graph_fused_grad_match(
+                graph_grad, eager_param_grads[name], f"layer=2:mxfp8_graph:param_grad:{name}"
+            )
+
+        del graph, graph_output, graph_attn, eager_attn, full_hidden, test_hidden, test_grad
+        del static_hidden, eager_hidden, static_grad, graph_out, graph_hidden_grad
+        _clear_cuda_test_state()
 
     @pytest.mark.parametrize(
         "layer_number", [2, 3], ids=["ratio_4_indexer", "ratio_128_compressor"]

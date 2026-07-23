@@ -688,6 +688,57 @@ class TestCompressedSparseAttentionCompressed:
             assert csa.indexer is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_bshd_compact_workspace_prepared_in_warmup_and_reused_in_capture(self, compress_ratio):
+        """CUDA capture reuses the BSHD workspace created during eager warmup."""
+        if compress_ratio != 4:
+            pytest.skip("compact indexer workspace applies only to ratio-4 layers")
+
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=self._get_layer_number(compress_ratio),
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=compress_ratio,
+        ).cuda()
+        previous_cuda_graph_impl = csa.config.cuda_graph_impl
+        csa.config.cuda_graph_impl = "local"
+        q = torch.empty(8, 1, 64, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(2, 1, 128, dtype=torch.bfloat16, device="cuda")
+        workspace = MagicMock()
+        workspace.matches_shape.return_value = True
+
+        try:
+            with (
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "bshd_compact_indexer_available",
+                    return_value=True,
+                ),
+                patch(
+                    "megatron.core.transformer.experimental_attention_variant.csa."
+                    "prepare_bshd_compact_indexer_workspace",
+                    return_value=workspace,
+                ) as prepare_workspace,
+                patch.object(torch.cuda, "is_current_stream_capturing", side_effect=[False, True]),
+            ):
+                warmup_workspace = csa._get_bshd_compact_indexer_workspace(q, k, topk=8, ratio=4)
+                capture_workspace = csa._get_bshd_compact_indexer_workspace(q, k, topk=8, ratio=4)
+
+            assert warmup_workspace is workspace
+            assert capture_workspace is workspace
+            assert csa._bshd_compact_indexer_workspaces == [workspace]
+            prepare_workspace.assert_called_once()
+            prepared_q, prepared_k = prepare_workspace.call_args.args
+            assert prepared_q.shape == (1, 8, 64, 128)
+            assert prepared_k.shape == (1, 2, 128)
+            workspace.matches_shape.assert_called_once()
+        finally:
+            csa.config.cuda_graph_impl = previous_cuda_graph_impl
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_forward(self, compress_ratio):
         """Test forward pass with compressed attention."""
         seq_len = 256

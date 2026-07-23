@@ -20,6 +20,7 @@ Coverage:
 
 from __future__ import annotations
 
+import inspect
 import math
 import sys
 import types
@@ -44,6 +45,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     fused_indexer_sparse_attn,
     indexer_topk,
     local_to_global_flat,
+    prepare_bshd_compact_indexer_workspace,
     prepare_thd_compact_indexer_workspace,
 )
 
@@ -1277,6 +1279,7 @@ class TestFusedIndexerSparseAttn:
                 loss_coeff=1.0,
                 sparse_loss=True,
                 kv_offset=s['skv'] - s['n_comp'],
+                deterministic=True,
             )
 
         # target = delta_0 and compact predict[0] = 0.25, so KL = log(4).
@@ -1289,6 +1292,51 @@ class TestFusedIndexerSparseAttn:
         assert compact_call.kwargs['precision'] == 'bf16'
         assert compact_call.kwargs['return_softmax'] is True
         assert compact_call.kwargs['topk_indices_global'] is False
+        assert compact_call.kwargs['deterministic'] is True
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_disabled_loss_uses_compact_without_softmax(self, reset_lazy_kernel_state):
+        """A disabled dense loss must not force dense-score materialization."""
+        s = self.SHAPES
+        topk = 2
+        inputs = self._make_inputs()
+        fake_dsa, _ = _install_full_dsa_mock(
+            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
+        )
+
+        def fake_compact(q_bshd, _k_bshd, _w_bsh, top_k, **kwargs):
+            return {
+                'indices': torch.zeros(
+                    q_bshd.shape[0], q_bshd.shape[1], top_k, dtype=torch.int32, device='cuda'
+                ),
+                'logits': torch.zeros(
+                    q_bshd.shape[0], q_bshd.shape[1], top_k, dtype=torch.float32, device='cuda'
+                ),
+            }
+
+        fake_dsa.indexer_forward_top_k_wrapper = MagicMock(side_effect=fake_compact)
+        with patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)):
+            _, indexer_loss = fused_indexer_sparse_attn(
+                **inputs,
+                indexer_topk=topk,
+                ratio=4,
+                softmax_scale=0.5,
+                loss_coeff=0.0,
+                sparse_loss=False,
+                kv_offset=s['skv'] - s['n_comp'],
+                deterministic=True,
+            )
+
+        assert torch.equal(indexer_loss, torch.zeros_like(indexer_loss))
+        fake_dsa.indexer_forward_wrapper.assert_not_called()
+        fake_dsa.indexer_top_k_wrapper.assert_not_called()
+        fake_dsa.sparse_indexer_score_recompute_wrapper.assert_not_called()
+        fake_dsa.sparse_attn_score_recompute_wrapper.assert_not_called()
+        fake_dsa.dense_attn_score_recompute_wrapper.assert_not_called()
+        fake_dsa.indexer_backward_wrapper.assert_not_called()
+        compact_call = fake_dsa.indexer_forward_top_k_wrapper.call_args
+        assert compact_call.kwargs['return_softmax'] is False
+        assert compact_call.kwargs['deterministic'] is True
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_sparse_path_fwd_output_bwd_grads_and_topk_clamp(self, reset_lazy_kernel_state):
@@ -1437,6 +1485,47 @@ class TestDenseFusedIndexerSparseAttn:
             k_indexer=k_indexer,
             weights=weights,
         )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dense_loss_uses_compact_topk_and_recomputes_scores(self, reset_lazy_kernel_state):
+        """Dense KL selection is independent from the compact Top-K dispatch."""
+        s = self.SHAPES
+        inputs = self._make_inputs()
+        fake_dsa, _ = _install_full_dsa_mock_dense(
+            b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
+        )
+
+        def fake_compact(q_bshd, _k_bshd, _w_bsh, top_k, **kwargs):
+            return {
+                'indices': torch.zeros(
+                    q_bshd.shape[0], q_bshd.shape[1], top_k, dtype=torch.int32, device='cuda'
+                ),
+                'logits': torch.zeros(
+                    q_bshd.shape[0], q_bshd.shape[1], top_k, dtype=torch.float32, device='cuda'
+                ),
+            }
+
+        fake_dsa.indexer_forward_top_k_wrapper = MagicMock(side_effect=fake_compact)
+        with patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)):
+            _, loss = fused_indexer_sparse_attn(
+                **inputs,
+                indexer_topk=2,
+                ratio=4,
+                softmax_scale=0.5,
+                indexer_softmax_scale=0.125,
+                loss_coeff=1.0,
+                sparse_loss=False,
+                kv_offset=s['skv'] - s['n_comp'],
+                deterministic=True,
+            )
+
+        assert torch.equal(loss, torch.zeros_like(loss))
+        fake_dsa.indexer_forward_wrapper.assert_not_called()
+        fake_dsa.indexer_forward_top_k_wrapper.assert_called_once()
+        fake_dsa.dense_indexer_score_recompute_wrapper.assert_called_once()
+        compact_call = fake_dsa.indexer_forward_top_k_wrapper.call_args
+        assert compact_call.kwargs['return_softmax'] is False
+        assert compact_call.kwargs['deterministic'] is True
 
     @pytest.mark.parametrize(
         "loss_coeff, target_kind, expected",
@@ -1705,6 +1794,45 @@ def _ref_indexer_full_score(
     s = (relu_qk * w_bsh_fp32.unsqueeze(-1)).sum(dim=2) * sm_scale  # (B, Sq, Sk)
     valid = _ratio_causal_valid_mask(Sq, Sk, ratio, s.device).unsqueeze(0)
     return torch.where(valid, s, torch.full_like(s, float('-inf')))
+
+
+def _dequantize_thd_indexer_mxfp8(
+    data: torch.Tensor, packed_scale: torch.Tensor, lengths: list[int], max_seqlen: int
+) -> torch.Tensor:
+    """Dequantize the packed THD MXFP8 representation for reference checks."""
+    has_heads = data.ndim == 3
+    num_heads = data.shape[-2] if has_heads else 1
+    head_dim = data.shape[-1]
+    scale_groups = head_dim // 32
+    _, _, padded_groups = packed_scale.shape
+
+    logical_rows = max_seqlen * num_heads
+    rows = torch.arange(logical_rows, device=data.device).view(-1, 1)
+    groups = torch.arange(scale_groups, device=data.device).view(1, -1)
+    tile_idx = (rows // 128) * (padded_groups // 4) + groups // 4
+    offsets = tile_idx * 512 + (rows % 32) * 16 + ((rows % 128) // 32) * 4 + groups % 4
+    bytes_per_batch = packed_scale.shape[1] * padded_groups
+    batch_offsets = torch.arange(len(lengths), device=data.device).view(-1, 1, 1)
+    offsets = offsets.unsqueeze(0) + batch_offsets * bytes_per_batch
+    logical_scale = (
+        packed_scale.view(torch.uint8)
+        .flatten()[offsets]
+        .contiguous()
+        .view(torch.float8_e8m0fnu)
+        .float()
+    )
+
+    result = torch.empty_like(data, dtype=torch.float32)
+    start = 0
+    for batch, length in enumerate(lengths):
+        values = data[start : start + length].float().reshape(length, num_heads, scale_groups, 32)
+        scale = logical_scale[batch, : length * num_heads].reshape(
+            length, num_heads, scale_groups, 1
+        )
+        dequantized = (values * scale).reshape(length, num_heads, head_dim)
+        result[start : start + length] = dequantized if has_heads else dequantized.squeeze(1)
+        start += length
+    return result
 
 
 def _ref_attn_full_score(
@@ -2223,8 +2351,9 @@ class TestRealKernelIndexerTopk:
                     f"actual {sorted(actual_set)} vs ref {sorted(ref_set)}"
                 )
 
-    def test_real_thd_compact_topk_cuda_graph_capture(self, reset_lazy_kernel_state):
-        """THD compact Top-K follows PR #370's warmup/buffer/replay contract."""
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+    def test_real_thd_compact_topk_cuda_graph_capture(self, precision, reset_lazy_kernel_state):
+        """THD compact Top-K follows the warmup/buffer/replay contract."""
         _skip_if_real_kernels_unavailable()
         if torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("compact THD indexer forward + Top-K requires SM100+")
@@ -2232,7 +2361,13 @@ class TestRealKernelIndexerTopk:
         from cudnn import DSA
 
         if not hasattr(DSA, 'compress_topk_cand_buffer_size_thd'):
-            pytest.skip("installed cuDNN Frontend lacks PR #370 THD workspace helper")
+            pytest.skip("installed cuDNN Frontend lacks the compact THD workspace helper")
+        compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+        if precision == "mxfp8" and (
+            compact_wrapper is None
+            or "q_scale" not in inspect.signature(compact_wrapper).parameters
+        ):
+            pytest.skip("installed cuDNN Frontend lacks compact MXFP8 indexer support")
 
         ratio, topk, idx_nh, idx_hd = 4, 16, 64, 128
         q_lens, k_lens = [64, 96], [16, 24]
@@ -2256,9 +2391,11 @@ class TestRealKernelIndexerTopk:
             max_seqlen_q=max(q_lens),
             max_seqlen_k=max(k_lens),
             return_softmax=True,
+            precision=precision,
         )
         assert workspace is not None
         assert workspace.softmax_out is not None
+        assert (workspace.mxfp8 is not None) == (precision == "mxfp8")
 
         def run():
             return dk._indexer_topk_core(
@@ -2274,6 +2411,7 @@ class TestRealKernelIndexerTopk:
                 use_compact=True,
                 return_softmax=True,
                 compact_workspace=workspace,
+                precision=precision,
             )
 
         # Match cuDNN Frontend's documented prerequisite: three eager calls on
@@ -2312,14 +2450,30 @@ class TestRealKernelIndexerTopk:
         torch.testing.assert_close(captured_softmax, eager_softmax)
 
         # Validate the replayed local-id Top-K sets and aligned logits against
-        # the dense packed-segment reference. Radix emission order is arbitrary.
+        # the matching dense packed-segment reference. For MXFP8 this must use
+        # dequantized Q/K and the already-scaled BF16 weights; comparing against
+        # the original BF16 inputs would measure expected quantization error.
+        if precision == "mxfp8":
+            assert workspace.mxfp8 is not None
+            ref_q = _dequantize_thd_indexer_mxfp8(
+                workspace.mxfp8.q_buffers.data, workspace.mxfp8.q_scale, q_lens, max(q_lens)
+            )
+            ref_k = _dequantize_thd_indexer_mxfp8(
+                workspace.mxfp8.k_buffers.data, workspace.mxfp8.k_scale, k_lens, max(k_lens)
+            )
+            ref_w, ref_sm_scale = w.float(), 1.0
+        else:
+            ref_q, ref_k = q.float(), k.float()
+            ref_w, ref_sm_scale = w_raw.float(), sm_scale
+
+        # Radix emission order is arbitrary.
         q_start = k_start = 0
         for q_len, k_len in zip(q_lens, k_lens):
             ref_scores = _ref_indexer_full_score(
-                q[q_start : q_start + q_len].unsqueeze(0).float(),
-                k[k_start : k_start + k_len].unsqueeze(0).float(),
-                w_raw[q_start : q_start + q_len].unsqueeze(0).float(),
-                sm_scale=sm_scale,
+                ref_q[q_start : q_start + q_len].unsqueeze(0),
+                ref_k[k_start : k_start + k_len].unsqueeze(0),
+                ref_w[q_start : q_start + q_len].unsqueeze(0),
+                sm_scale=ref_sm_scale,
                 ratio=ratio,
             )[0]
             for row in range(q_len):
@@ -2588,6 +2742,105 @@ class TestRealKernelFusedIndexerSparseAttn:
             f"abs diff = {(indexer_loss - loss_ref).abs().item():.3e}"
         )
 
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+    def test_full_bshd_cuda_graph_capture(self, precision, reset_lazy_kernel_state):
+        """Capture and replay the complete zero-loss BSHD fused forward."""
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("compact BSHD indexer forward + Top-K requires SM100+")
+
+        from cudnn import DSA
+
+        compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+        if not hasattr(DSA, "compress_topk_cand_buffer_size"):
+            pytest.skip("installed cuDNN Frontend lacks the compact BSHD workspace helper")
+        if (
+            compact_wrapper is None
+            or "deterministic" not in inspect.signature(compact_wrapper).parameters
+        ):
+            pytest.skip("installed cuDNN Frontend lacks deterministic compact Top-K")
+        if precision == "mxfp8" and "q_scale" not in inspect.signature(compact_wrapper).parameters:
+            pytest.skip("installed cuDNN Frontend lacks compact MXFP8 indexer support")
+
+        s = self.SHAPES
+        torch.manual_seed(31)
+        dev = 'cuda'
+        query = torch.randn(s['sq'], s['b'], s['np_'], s['d'], dtype=torch.bfloat16, device=dev)
+        kv_full = torch.randn(s['skv'], s['b'], s['d'], dtype=torch.bfloat16, device=dev)
+        attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev)
+        window_idxs = torch.randint(
+            0, s['sq'], (s['b'], s['sq'], s['win_topk']), dtype=torch.int32, device=dev
+        )
+        q_indexer = torch.randn(
+            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
+        )
+        k_indexer = torch.randn(s['n_comp'], s['b'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        weights = torch.randn(s['sq'], s['b'], s['idx_nh'], dtype=torch.bfloat16, device=dev)
+        kv_offset = s['skv'] - s['n_comp']
+        q_bshd = q_indexer.permute(1, 0, 2, 3).contiguous()
+        k_bsd = k_indexer.permute(1, 0, 2).contiguous()
+        workspace = prepare_bshd_compact_indexer_workspace(
+            q_bshd,
+            k_bsd,
+            topk=s['indexer_topk'],
+            ratio=s['ratio'],
+            return_softmax=False,
+            precision=precision,
+        )
+        assert workspace is not None
+        assert workspace.softmax_out is None
+        assert (workspace.mxfp8 is not None) == (precision == "mxfp8")
+
+        def run():
+            return fused_indexer_sparse_attn(
+                query,
+                kv_full,
+                attn_sink,
+                window_idxs,
+                q_indexer,
+                k_indexer,
+                weights,
+                indexer_topk=s['indexer_topk'],
+                ratio=s['ratio'],
+                softmax_scale=s['softmax_scale'],
+                indexer_softmax_scale=s['indexer_softmax_scale'],
+                loss_coeff=0.0,
+                sparse_loss=False,
+                kv_offset=kv_offset,
+                compact_workspace=workspace,
+                indexer_precision=precision,
+                deterministic=True,
+            )
+
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                eager_output, eager_loss = run()
+        torch.cuda.current_stream().wait_stream(side_stream)
+        eager_output = eager_output.clone()
+        eager_loss = eager_loss.clone()
+        eager_indices = workspace.out_indices.clone()
+        eager_logits = workspace.out_logits.clone()
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_output, captured_loss = run()
+
+        workspace.out_indices.fill_(-123)
+        workspace.out_logits.fill_(float('nan'))
+        captured_output.fill_(float('nan'))
+        captured_loss.fill_(float('nan'))
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(workspace.out_indices, eager_indices)
+        torch.testing.assert_close(workspace.out_logits, eager_logits)
+        torch.testing.assert_close(captured_output, eager_output)
+        assert torch.equal(captured_loss, eager_loss)
+        assert torch.equal(captured_loss, torch.zeros_like(captured_loss))
+
 
 # ===========================================================================
 # THD packed-sequence path
@@ -2815,6 +3068,7 @@ class TestThdWrapperDispatchAndValidation:
                 max_seqlen_q=3,
                 max_seqlen_kv=2,
                 q_causal_offsets=q_causal_offsets,
+                deterministic=True,
             )
         # THD return shape: (total_q, topk) + (total_q,).
         assert topk_idxs.shape == (total_q, 2)
@@ -2833,6 +3087,7 @@ class TestThdWrapperDispatchAndValidation:
         fake_dsa.indexer_forward_top_k_wrapper.return_value = {
             'indices': torch.zeros(q.shape[0], topk, dtype=torch.int32, device=q.device),
             'logits': torch.zeros(q.shape[0], topk, dtype=torch.float32, device=q.device),
+            'softmax': torch.full((q.shape[0], topk), 0.25, device=q.device),
         }
         dk._DSA = fake_dsa
 
@@ -2840,7 +3095,7 @@ class TestThdWrapperDispatchAndValidation:
             patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
             patch.object(torch.cuda, 'is_current_stream_capturing', return_value=False),
         ):
-            indices, lengths = indexer_topk(
+            indices, lengths, softmax = indexer_topk(
                 q,
                 k,
                 w,
@@ -2850,10 +3105,13 @@ class TestThdWrapperDispatchAndValidation:
                 max_seqlen_q=3,
                 max_seqlen_kv=2,
                 q_causal_offsets=q_causal_offsets,
+                deterministic=True,
+                return_softmax=True,
             )
 
         assert indices.shape == (q.shape[0], topk)
         assert torch.all(lengths == topk)
+        assert torch.equal(softmax, torch.full((q.shape[0], topk), 0.25, device=q.device))
         fake_dsa.indexer_forward_wrapper.assert_not_called()
         fake_dsa.indexer_top_k_wrapper.assert_not_called()
         compact_call = fake_dsa.indexer_forward_top_k_wrapper.call_args
@@ -2865,6 +3123,67 @@ class TestThdWrapperDispatchAndValidation:
         assert compact_call.kwargs['q_causal_offsets'] is q_causal_offsets
         assert compact_call.kwargs['precision'] == 'bf16'
         assert compact_call.kwargs['topk_indices_global'] is False
+        assert compact_call.kwargs['deterministic'] is True
+        assert compact_call.kwargs['return_softmax'] is True
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_topk_mxfp8_compact_dispatch(self, reset_lazy_kernel_state):
+        sq, b, heads, head_dim, sk, topk = 4, 1, 64, 128, 2, 2
+        q = torch.randn(sq, b, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(sk, b, head_dim, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(sq, b, heads, dtype=torch.bfloat16, device="cuda")
+        q_fp8 = torch.empty(b, sq, heads, head_dim, dtype=torch.float8_e4m3fn, device="cuda")
+        k_fp8 = torch.empty(b, sk, head_dim, dtype=torch.float8_e4m3fn, device="cuda")
+        q_scale = torch.empty(b, 256, 4, dtype=torch.float8_e8m0fnu, device="cuda")
+        k_scale = torch.empty(b, 128, 4, dtype=torch.float8_e8m0fnu, device="cuda")
+
+        fake_dsa = MagicMock(name="_DSA_mxfp8_compact_stub")
+        fake_dsa.indexer_forward_top_k_wrapper.return_value = {
+            "indices": torch.zeros(b * sq, topk, dtype=torch.int32, device="cuda"),
+            "logits": torch.zeros(b * sq, topk, dtype=torch.float32, device="cuda"),
+        }
+        dk._DSA = fake_dsa
+
+        with (
+            patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)),
+            patch.object(
+                dk, "quantize_indexer_mxfp8", side_effect=[(q_fp8, q_scale), (k_fp8, k_scale)]
+            ) as quantize,
+        ):
+            indices, lengths = indexer_topk(
+                q, k, w, topk=topk, ratio=4, precision="mxfp8", deterministic=True
+            )
+
+        assert indices.shape == (b, sq, topk)
+        assert torch.all(lengths == topk)
+        assert quantize.call_count == 2
+        fake_dsa.indexer_forward_wrapper.assert_not_called()
+        fake_dsa.indexer_top_k_wrapper.assert_not_called()
+        compact_call = fake_dsa.indexer_forward_top_k_wrapper.call_args
+        assert compact_call.args[0] is q_fp8
+        assert compact_call.args[1].data_ptr() == k_fp8.data_ptr()
+        assert compact_call.kwargs["precision"] == "mxfp8"
+        assert compact_call.kwargs["q_scale"] is q_scale
+        assert compact_call.kwargs["k_scale"] is k_scale
+        assert compact_call.kwargs["sf_vec_size"] == 32
+        assert compact_call.kwargs["deterministic"] is True
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_topk_mxfp8_never_falls_back(self, reset_lazy_kernel_state):
+        sq, b, heads, head_dim, sk = 4, 1, 64, 128, 2
+        q = torch.zeros(sq, b, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        k = torch.zeros(sk, b, head_dim, dtype=torch.bfloat16, device="cuda")
+        w = torch.zeros(sq, b, heads, dtype=torch.bfloat16, device="cuda")
+        fake_dsa = MagicMock(name="_DSA_without_compact_stub")
+        fake_dsa.indexer_forward_top_k_wrapper = None
+        dk._DSA = fake_dsa
+
+        with patch.object(torch.cuda, "get_device_capability", return_value=(10, 0)):
+            with pytest.raises(RuntimeError, match="MXFP8 compact indexer requires"):
+                indexer_topk(q, k, w, topk=2, precision="mxfp8")
+
+        fake_dsa.indexer_forward_wrapper.assert_not_called()
+        fake_dsa.indexer_top_k_wrapper.assert_not_called()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_indexer_topk_thd_capture_requires_preallocated_compact_workspace(
@@ -3097,8 +3416,14 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         indexer_softmax_scale=128**-0.5,
     )
 
-    @pytest.mark.parametrize('sparse_loss', [False, True], ids=['dense_loss', 'sparse_loss'])
-    def test_thd_single_segment_matches_sbhd_b1(self, sparse_loss, reset_lazy_kernel_state):
+    @pytest.mark.parametrize(
+        'sparse_loss,indexer_precision',
+        [(False, 'bf16'), (True, 'bf16'), (True, 'mxfp8')],
+        ids=['dense_loss', 'sparse_loss', 'sparse_loss_mxfp8'],
+    )
+    def test_thd_single_segment_matches_sbhd_b1(
+        self, sparse_loss, indexer_precision, reset_lazy_kernel_state
+    ):
         """B=1 THD invocation should match the equivalent SBHD-b=1 call
         on the same input tensors (just reshaped), for both dense-loss
         and sparse-loss Path B.
@@ -3141,6 +3466,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             loss_coeff=loss_coeff,
             sparse_loss=sparse_loss,
             kv_offset=kv_offset,
+            indexer_precision=indexer_precision,
         )
 
         # ---- THD equivalent --------------------------------------------------
@@ -3186,6 +3512,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             max_seqlen_q=s['sq'],
             max_seqlen_compressed_idx=s['n_comp'],
             compressed_kv=compressed_kv_thd,
+            indexer_precision=indexer_precision,
         )
 
         # SBHD and THD share the same underlying kernels; for B=1 the
@@ -3193,7 +3520,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         # indexer's radix top-K, which can shift a few scores at the
         # boundary. Use the same tolerance as the SBHD-vs-PyTorch test.
         assert torch.allclose(loss_thd, loss_sbhd, atol=5e-2, rtol=1e-1), (
-            f"sparse_loss={sparse_loss}: thd = {loss_thd.item():.6f}, "
+            f"sparse_loss={sparse_loss}, precision={indexer_precision}: thd = {loss_thd.item():.6f}, "
             f"sbhd = {loss_sbhd.item():.6f}, "
             f"abs diff = {(loss_thd - loss_sbhd).abs().item():.3e}"
         )

@@ -15,7 +15,14 @@ import torch.distributed as dist
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
-from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+    THDCompactIndexerWorkspace,
+    build_thd_compact_k_layout,
+    indexer_topk,
+    pack_thd_compact_k,
+)
+
+CPIndexerLayout = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 # =============================================================================
 # RoPE Wrappers
@@ -274,17 +281,19 @@ def prepare_cp_compressor_input(
 
 
 @torch.compile
-def _build_cp_indexer_layout(
+def build_cp_indexer_layout(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_compressed: torch.Tensor,
     global_start: int,
     local_rows: int,
+    total_k_rows: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the indexer's packed local-Q/full-K metadata."""
     # Each real Q segment intersects its sequence with this rank's row interval,
     # while K keeps the sequence's full compressed segment. The final synthetic
-    # segment holds CP capacity padding and has zero K rows. Causal offsets
-    # restore each non-empty local Q segment's position in the original sequence.
+    # segment owns the fixed-capacity K tail so the logical endpoint matches the
+    # physical buffer. Causal offsets restore each non-empty local Q segment's
+    # position in the original sequence.
     global_end = global_start + local_rows
     zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
     local_starts = cu_seqlens_q[:-1].clamp_min(global_start)
@@ -293,11 +302,36 @@ def _build_cp_indexer_layout(
     q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
     padding_q = (global_end - cu_seqlens_q[-1].clamp_min(global_start)).clamp_min(0)
     cu_q_topk = torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1)))
-    cu_k_topk = torch.cat((cu_seqlens_compressed, cu_seqlens_compressed[-1:]))
+    # The gathered K buffer has fixed CP capacity, which can exceed the number
+    # of valid compressed rows. Assign its tail to the synthetic padding
+    # segment so cu_k[-1] still matches the physical K tensor length.
+    k_capacity_end = cu_seqlens_compressed.new_full((1,), total_k_rows)
+    cu_k_topk = torch.cat((cu_seqlens_compressed, k_capacity_end))
     q_causal_offsets = torch.cat(
         (torch.where(q_lens > 0, local_starts - cu_seqlens_q[:-1], 0), zero)
     )
     return cu_q_topk, cu_k_topk, q_causal_offsets
+
+
+def build_cp_compact_indexer_layout(
+    logical_layout: CPIndexerLayout,
+    cu_seqlens_compressed: torch.Tensor,
+    total_k_rows: int,
+    ratio: int,
+) -> Tuple[CPIndexerLayout, torch.Tensor]:
+    """Pad each THD K segment with an invisible row for compact Top-K."""
+    cu_q_topk, _, q_causal_offsets = logical_layout
+    cu_k_topk, source_row_map = build_thd_compact_k_layout(
+        cu_q_topk, cu_seqlens_compressed, total_k_rows, ratio
+    )
+    return (cu_q_topk, cu_k_topk, q_causal_offsets), source_row_map
+
+
+def pack_cp_compact_indexer_k(
+    k_indexer_seq_major: torch.Tensor, source_row_map: torch.Tensor
+) -> torch.Tensor:
+    """Insert zero-valued, causally invisible K rows for compact THD."""
+    return pack_thd_compact_k(k_indexer_seq_major, source_row_map)
 
 
 def compute_cp_indexer_topk(
@@ -312,14 +346,20 @@ def compute_cp_indexer_topk(
     indexer_softmax_scale: float,
     max_seqlen_q: int,
     use_fused: bool,
-) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-    """Return local top-k and its local-Q/full-K packed layout."""
+    deterministic: bool = False,
+    precision: str = "bf16",
+    compact_workspace: Optional[THDCompactIndexerWorkspace] = None,
+    return_softmax: bool = False,
+    indexer_layout: Optional[CPIndexerLayout] = None,
+    logical_indexer_layout: Optional[CPIndexerLayout] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[CPIndexerLayout], Optional[torch.Tensor]]:
+    """Return local top-k, packed layout, and optional compact Top-K softmax."""
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
-        return None, None
+        return None, None, None
     max_seqlen_kv = int(max_seqlen_q) // int(ratio)
     if max_seqlen_kv == 0:
-        return None, None
+        return None, None, None
 
     global_start = int(global_start)
     l_local = q_indexer_local.shape[0]
@@ -329,9 +369,22 @@ def compute_cp_indexer_topk(
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
 
-    cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
-        cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
-    )
+    if logical_indexer_layout is None:
+        logical_indexer_layout = build_cp_indexer_layout(
+            cu_seqlens_q, cu_seqlens_compressed, global_start, l_local, k_indexer_seq_major.shape[0]
+        )
+    if not use_fused:
+        indexer_layout = logical_indexer_layout
+    elif indexer_layout is None:
+        indexer_layout, source_row_map = build_cp_compact_indexer_layout(
+            logical_indexer_layout, cu_seqlens_compressed, k_indexer_seq_major.shape[0], ratio
+        )
+        k_indexer_seq_major = pack_cp_compact_indexer_k(k_indexer_seq_major, source_row_map)
+
+    if use_fused:
+        # Each real segment has one or two invisible K padding rows.
+        max_seqlen_kv += 2
+    cu_q_topk, cu_k_topk, q_causal_offsets = indexer_layout
 
     if not use_fused:
         global_rows = torch.arange(
@@ -381,9 +434,9 @@ def compute_cp_indexer_topk(
             values, rows = torch.topk(scores, selected_width, dim=-1)
             local_rows = k_positions[rows].to(torch.int32)
             output[start:end, :selected_width] = torch.where(torch.isfinite(values), local_rows, -1)
-        return output, (cu_q_topk, cu_k_topk, q_causal_offsets)
+        return output, logical_indexer_layout, None
 
-    topk, _ = indexer_topk(
+    topk_result = indexer_topk(
         q_indexer_local,
         k_indexer_seq_major,
         weights_indexer_local,
@@ -395,5 +448,14 @@ def compute_cp_indexer_topk(
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_kv=int(max_seqlen_kv),
         q_causal_offsets=q_causal_offsets,
+        compact_workspace=compact_workspace,
+        precision=precision,
+        deterministic=deterministic,
+        return_softmax=return_softmax,
     )
-    return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
+    compact_predict = None
+    if return_softmax:
+        topk, _, compact_predict = topk_result
+    else:
+        topk, _ = topk_result
+    return topk, logical_indexer_layout, compact_predict
