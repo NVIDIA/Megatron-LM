@@ -31,11 +31,31 @@ def test_op_fuser_transformer_config_args_are_exposed():
     _add_network_size_args(parser)
 
     args = parser.parse_args(
-        ["--use-transformer-engine-op-fuser", "--moe-mlp-glu-interleave-size", "16"]
+        [
+            "--use-transformer-engine-op-fuser",
+            "--moe-mlp-glu-interleave-size",
+            "16",
+            "--moe-grouped-gemm-backend",
+            "grouped_tensor",
+        ]
     )
 
     assert args.use_transformer_engine_op_fuser is True
     assert args.moe_mlp_glu_interleave_size == 16
+    assert args.moe_grouped_gemm_backend == "grouped_tensor"
+
+
+def test_op_fuser_selects_grouped_tensor_backend():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+    )
+
+    assert config.moe_grouped_gemm_backend == "grouped_tensor"
 
 
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
@@ -218,6 +238,28 @@ def test_apply_bias_combines_per_expert_bias_and_probs():
 
     torch.testing.assert_close(output, expected)
     assert output.dtype == intermediate.dtype
+
+
+def test_apply_bias_combines_packed_grouped_bias_and_accumulates_gradient():
+    intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    packed_bias = torch.tensor([[10.0, 20.0], [100.0, 200.0]], requires_grad=True)
+    tokens_per_expert = torch.tensor([2, 1], dtype=torch.int64)
+    permuted_probs = torch.tensor([0.25, 0.5, 1.5])
+    expected = torch.tensor([[3.5, 7.0], [8.0, 14.0], [155.0, 306.0]])
+
+    output = TEGroupedMLP._apply_bias(
+        intermediate,
+        packed_bias,
+        tokens_per_expert,
+        permuted_probs,
+    )
+    output.sum().backward()
+
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(
+        packed_bias.grad,
+        torch.tensor([[0.75, 0.75], [1.5, 1.5]]),
+    )
 
 
 def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():

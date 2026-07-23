@@ -1916,6 +1916,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR_BACKEND = (
+        "grouped_gemm_backend"
+        in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+    )
+
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
@@ -2012,6 +2017,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 extra_kwargs["single_grouped_bias"] = getattr(
                     config, "moe_single_grouped_bias", False
                 )
+
+            if _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR_BACKEND:
+                extra_kwargs["grouped_gemm_backend"] = config.moe_grouped_gemm_backend
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
@@ -2507,6 +2515,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             )
 
 else:
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR_BACKEND = False
     TEGroupedLinear = None  # type: ignore[assignment, misc]
     TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
     TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
