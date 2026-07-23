@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Gradient clipping."""
 
@@ -240,9 +240,12 @@ def count_zeros_fp32(
             # If the parameter is managed by Megatron FSDP, the gradient is
             # an FSDP-sharded DTensor, and we should use the local shard.
             use_megatron_fsdp = True
-            grad = getattr(param, grad_attr)._local_tensor
-            num_zeros = grad.numel() - torch.count_nonzero(grad)
-            total_num_zeros += num_zeros
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
+            if is_not_shared and is_not_tp_duplicate:
+                grad = getattr(param, grad_attr)._local_tensor
+                num_zeros = grad.numel() - torch.count_nonzero(grad)
+                total_num_zeros += num_zeros
             continue
         is_not_shared = param_is_not_shared(param)
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
