@@ -1712,8 +1712,7 @@ dependencies = [
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "nvidia-cudnn-frontend", version = "1.25.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
     { name = "nvidia-cudnn-frontend", version = "1.25.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=0a14b7181d129d30e7bad34b8c3ed0a0c995e23d#0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "nvidia-cutlass-dsl", version = "4.4.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
-    { name = "nvidia-cutlass-dsl", version = "4.5.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "nvidia-cutlass-dsl" },
     { name = "nvidia-ml-py" },
     { name = "packaging" },
     { name = "requests" },
@@ -3192,6 +3191,7 @@ dev = [
     { name = "flashinfer-python" },
     { name = "hypercorn" },
     { name = "mamba-ssm" },
+    { name = "mcp" },
     { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "multi-storage-client" },
     { name = "nvidia-cudnn-frontend", version = "1.25.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=0a14b7181d129d30e7bad34b8c3ed0a0c995e23d#0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" }, extra = ["cutedsl"], marker = "extra == 'extra-13-megatron-core-dev'" },
@@ -3325,6 +3325,7 @@ requires-dist = [
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'dev'", specifier = "~=2.2" },
     { name = "mamba-ssm", marker = "extra == 'lts'", specifier = "~=2.2" },
+    { name = "mcp", marker = "extra == 'dev'", specifier = ">=1.15.0,<2.0.0" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=6.0" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'lts'", specifier = "~=6.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
@@ -4457,7 +4458,7 @@ resolution-markers = [
 cutedsl = [
     { name = "apache-tvm-ffi" },
     { name = "cuda-python" },
-    { name = "nvidia-cutlass-dsl", version = "4.5.0", source = { registry = "https://pypi.org/simple" }, extra = ["cu13"], marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "torch", marker = "sys_platform == 'never'" },
     { name = "torch-c-dlpack-ext" },
 ]
@@ -4534,77 +4535,10 @@ wheels = [
 
 [[package]]
 name = "nvidia-cutlass-dsl"
-version = "4.4.2"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.11' and platform_machine != 's390x'",
-    "python_full_version < '3.11' and platform_machine == 's390x'",
-]
-dependencies = [
-    { name = "nvidia-cutlass-dsl-libs-base", version = "4.4.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-lts'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a9/03/678dab0383db1ddfc449da216220f40404189eb36eeed9d87a4fa4bdb0e6/nvidia_cutlass_dsl-4.4.2-py3-none-any.whl", hash = "sha256:7cfb9ef19062b055b9372c7a627004724e2755e4c8b16c3cc88807d64501a4ae", size = 10167, upload-time = "2026-03-16T02:18:59.043Z" },
-]
-
-[[package]]
-name = "nvidia-cutlass-dsl"
 version = "4.5.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.11' and platform_machine != 's390x'",
-    "python_full_version < '3.11' and platform_machine == 's390x'",
-]
 dependencies = [
-    { name = "nvidia-cutlass-dsl-libs-base", version = "4.5.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "nvidia-cutlass-dsl-libs-base" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/a3/46fdf77d373b06bc65a0eda6c921c746985fb3e496c90a09be476291ea80/nvidia_cutlass_dsl-4.5.0-py3-none-any.whl", hash = "sha256:3b051fe02ca69422ab840e64d9865667aba288a3984a7ca4ccd038a82aef1344", size = 10178, upload-time = "2026-05-06T01:17:33.592Z" },
@@ -4617,91 +4551,13 @@ cu13 = [
 
 [[package]]
 name = "nvidia-cutlass-dsl-libs-base"
-version = "4.4.2"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.11' and platform_machine != 's390x'",
-    "python_full_version < '3.11' and platform_machine == 's390x'",
-]
-dependencies = [
-    { name = "cuda-python", marker = "extra == 'extra-13-megatron-core-lts'" },
-    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "typing-extensions", marker = "extra == 'extra-13-megatron-core-lts'" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/07/af1b456b5b6dd4a49e71a952a182a99fc863f70b9f78725324f89e0384e5/nvidia_cutlass_dsl_libs_base-4.4.2-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:06acb3acff3dcf4bf6630476efac7de94de30b988ded4fa00b647bbcec4224ff", size = 75471025, upload-time = "2026-03-16T02:23:49.61Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/12/f0770811d2874af7e04623d3baa83c445c49f38c00c4e5d20e1daae54b5d/nvidia_cutlass_dsl_libs_base-4.4.2-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:916bf612fba5fbc5162e300fe18196e960dac2328c1c1360c0939d3be05c7c71", size = 74355272, upload-time = "2026-03-16T02:24:44.22Z" },
-    { url = "https://files.pythonhosted.org/packages/60/bf/b9d0fd1ba281b111c941d9616dd9f98a509d84bf35076e60fef27ec7abd6/nvidia_cutlass_dsl_libs_base-4.4.2-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:261832dafe7579dc83cd3816ab9ea845e3de3737d876c215f01fb4edff1f4473", size = 75476977, upload-time = "2026-03-16T02:26:40.932Z" },
-    { url = "https://files.pythonhosted.org/packages/a5/23/86dda6d69a3fc29d0cde2a8b54c056ad69b73a6e5e230e18d906d2ec3b7c/nvidia_cutlass_dsl_libs_base-4.4.2-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:40c2352b2fcc80789a216cbeb9b2ee10c85c15de839cda8f5c1d18166b8249df", size = 74356100, upload-time = "2026-03-16T02:26:12.778Z" },
-    { url = "https://files.pythonhosted.org/packages/8e/7d/0df5e38d11e52cc72095a14d6448bc1c5d0d4b00b069a1189ca417fb225b/nvidia_cutlass_dsl_libs_base-4.4.2-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:2ec8812eeadcbb6fe20bda2e295ed9c00653f8253b78e33cf0ab65a47b829e73", size = 75473821, upload-time = "2026-03-16T02:27:08.371Z" },
-    { url = "https://files.pythonhosted.org/packages/56/98/e264964741d9cc9816625d9600d17a5249fd5cbd8c2d166fb0d0c34dfe5a/nvidia_cutlass_dsl_libs_base-4.4.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:22e37b58f7a6f2f43bba533c4df8a088012122e0b4e9a632eca23937adeafb39", size = 74355593, upload-time = "2026-03-16T02:25:11.762Z" },
-    { url = "https://files.pythonhosted.org/packages/1b/c9/2f17950ee2deb4b5f6b82f8155515a21792fe296e81bb638f164d8e2ca9b/nvidia_cutlass_dsl_libs_base-4.4.2-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:b59a052cbfb9a25747d1b6d413615456bea38d1f377da085af07c0d86a4c8b39", size = 75477304, upload-time = "2026-03-16T02:27:35.645Z" },
-    { url = "https://files.pythonhosted.org/packages/e1/68/27380038ebd9c8eab4be364e833fea144aef597704f44948921668f7adf4/nvidia_cutlass_dsl_libs_base-4.4.2-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:8e3324a33afa7424e93beae7e54a311e80db82b9e4ed4bba2aeeda1d6c888cd9", size = 74355765, upload-time = "2026-03-16T02:24:16.778Z" },
-    { url = "https://files.pythonhosted.org/packages/12/44/0dc7f2e5b5c65106a5bb05e60654f1a79abe92e27e9b00588a73cd26ca1f/nvidia_cutlass_dsl_libs_base-4.4.2-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:af96c1170569138b3cb965202907fbf5ab95d7c1dcc210952d00cdf9ab7b859a", size = 75472171, upload-time = "2026-03-16T02:28:03.136Z" },
-    { url = "https://files.pythonhosted.org/packages/4b/ae/0998f328b28b956d7eb399d16f4ee681ca318b306007264444a623e86c64/nvidia_cutlass_dsl_libs_base-4.4.2-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:95db0c8d1d56992e2f5c2dcd5b3baab0297bedc0cbcefc1e70b57acd934e7b23", size = 74356280, upload-time = "2026-03-16T02:25:43.789Z" },
-]
-
-[[package]]
-name = "nvidia-cutlass-dsl-libs-base"
 version = "4.5.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
-    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.11' and platform_machine != 's390x'",
-    "python_full_version < '3.11' and platform_machine == 's390x'",
-]
 dependencies = [
-    { name = "cuda-python", marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev'" },
-    { name = "typing-extensions", marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "cuda-python" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or extra == 'extra-13-megatron-core-dev'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "typing-extensions" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/04/4d/1d0dc5f36f929885417acfff02af94f61d49e6d34acb480c080d4d887555/nvidia_cutlass_dsl_libs_base-4.5.0-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:c78b18f2b44ca10a91bc76380ebd65bb7b86aa97a9330bae9b73eb0a1bc51d55", size = 75636580, upload-time = "2026-05-06T01:23:19.17Z" },
@@ -4723,7 +4579,7 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-python" },
     { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" } },
-    { name = "nvidia-cutlass-dsl-libs-base", version = "4.5.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "nvidia-cutlass-dsl-libs-base" },
     { name = "typing-extensions" },
 ]
 wheels = [
