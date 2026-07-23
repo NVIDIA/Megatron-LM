@@ -87,6 +87,12 @@ from megatron.core.optimizer_param_scheduler import (
     OptimizerParamScheduler,
     get_canonical_lr_for_logging,
 )
+from megatron.core.transformer.per_layer_profiling import (
+    log_per_layer_resource_usage,
+    per_layer_profiling_end_step,
+    per_layer_profiling_start_step,
+)
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.parallel_state import (
     create_all_gather_groups,
     destroy_global_memory_buffer,
@@ -2358,6 +2364,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if args.log_per_layer_profiling:
+            should_profile = (
+                iteration is not None
+                and args.log_memory_interval is not None
+                and iteration % args.log_memory_interval == 0
+            )
+            per_layer_profiling_start_step(model, should_profile)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -2372,6 +2385,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             p2p_communicator=p2p_communicator,
             pg_collection=pg_collection,
         )
+        if args.log_per_layer_profiling:
+            per_layer_profiling_end_step(model)
+
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2525,6 +2541,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    model=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2865,6 +2882,26 @@ def training_log(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
             )
+        if (
+            args.log_per_layer_profiling
+            and args.log_memory_interval is not None
+            and iteration % args.log_memory_interval == 0
+            and model is not None
+            and len(model) == 1
+        ):
+            model_chunk = unwrap_model(model[0])
+            decoder = getattr(model_chunk, "decoder", None)
+            profiler = getattr(decoder, "per_layer_profiler", None) if decoder is not None else None
+            if profiler is not None:
+                profiler.flush()
+                log_per_layer_resource_usage(
+                    profiler,
+                    layer_offset=get_transformer_layer_offset(
+                        decoder.config, decoder.vp_stage, get_pg_rank(decoder.pg_collection.pp)
+                    ),
+                    is_log_rank=(torch.distributed.get_rank() == 0),
+                )
+                profiler.reset()
         # Log RL profiling data if enabled (must be before timers.log which resets timers).
         # Token throughput metrics are read from RLRuntimeState automatically.
         if args.rl_profile:
@@ -3911,6 +3948,7 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            model=model,
         )
         is_first_iteration = False
 
