@@ -1043,7 +1043,7 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens = num_tokens
 
         padded_num_tokens = num_tokens
-        if self.config.moe_hybridep_pad_variable_tokens:
+        if self.config.moe_hybridep_pad_uneven_dispatch_inputs:
             # Use the actual tp_ep max so all ranks in the MoE communication
             # group pass the same token count to HybridEP.
             max_num_tokens_across_ep = torch.tensor(
