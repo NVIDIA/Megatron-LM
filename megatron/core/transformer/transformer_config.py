@@ -2676,9 +2676,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.mtp_num_layers is None or self.mtp_num_layers == 1
-            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            assert self.mtp_num_layers in (
+                None,
+                0,
+                1,
+            ), 'MTP supports at most one layer when enabling overlap_moe_expert_parallel_comm.'
 
             # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
             # configs are not yet safe under the 1F1B split and are gated here.

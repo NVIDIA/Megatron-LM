@@ -699,6 +699,7 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
     # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
+    fully_shard_optimizer(optimizer)
     x = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
 
     def train_iteration() -> torch.Tensor:
@@ -713,6 +714,48 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
 
     with pytest.raises(AssertionError):
         torch.testing.assert_close(second_loss, first_loss)
+
+
+def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
+    """Optimizer synchronization should run once per group, not once per microbatch."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = TinyModel().to(device=device, dtype=torch.bfloat16)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
+    sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
+
+    def make_count_sync(parameter_group):
+        sync_model_weight = parameter_group.sync_model_weight_from_main_weight
+
+        def count_sync():
+            sync_counts[parameter_group] += 1
+            sync_model_weight()
+
+        return count_sync
+
+    for parameter_group in parameter_groups:
+        monkeypatch.setattr(
+            parameter_group, "sync_model_weight_from_main_weight", make_count_sync(parameter_group)
+        )
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    inputs = torch.randn(3, 2, 8, device=device, dtype=torch.bfloat16)
+
+    for step in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_input in inputs:
+            (model(microbatch_input).sum() / len(inputs)).backward()
+
+        assert all(sync_count == step for sync_count in sync_counts.values())
+        optimizer.step()
+        assert all(sync_count == step + 1 for sync_count in sync_counts.values())
 
 
 def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setup):
