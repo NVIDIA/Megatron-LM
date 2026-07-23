@@ -1737,6 +1737,21 @@ def validate_args(args, defaults={}):
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
         )
+        if not args.freeze_all_layers and args.logits_save_frozen_ckpt is None:
+            warn_rank_0(
+                '--logits-save-dir without --freeze-all-layers or --logits-save-frozen-ckpt: the '
+                'LM loss is still computed and gradients will update the model while logits are '
+                'dumped. This is intended only when dumping logits during active training; for a '
+                'frozen-teacher dump pass --logits-save-frozen-ckpt (or --freeze-all-layers).'
+            )
+
+    if args.logits_save_frozen_ckpt is not None:
+        assert args.logits_save_dir is not None, (
+            '--logits-save-frozen-ckpt is meant for logits dumps; also set --logits-save-dir.'
+        )
+        # Frozen teacher weights never change, so imply --freeze-all-layers (which also skips
+        # writing weight checkpoints in save_checkpoint).
+        args.freeze_all_layers = True
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -3609,6 +3624,15 @@ def _add_logits_distillation_args(parser):
                             'cumulative mass. Default: 1.')
     group.add_argument('--logits-save-dir', type=str, default=None,
                        help='Directory to save logits.')
+    group.add_argument('--logits-save-frozen-ckpt', type=str, default=None,
+                       help='Directory with a frozen teacher checkpoint to load '
+                            'weights from for a logits dump. Implies '
+                            '--freeze-all-layers and skips writing weight '
+                            'checkpoints. The resume iteration is read '
+                            'automatically from the --load dir tracker file (0 if '
+                            'absent, i.e. a fresh dump), so identical back-to-back '
+                            'jobs walk the dataset forward with no manual '
+                            '--override-ckpt-iteration.')
     group.add_argument('--logits-save-dtype', type=str, default='fp16',
                        choices=['fp16', 'bf16', 'fp32'],
                        help='Dtype for on-disk top-K log-probabilities.')
