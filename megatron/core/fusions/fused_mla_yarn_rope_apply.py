@@ -132,14 +132,16 @@ def rotary_fwd_q_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_H": 1}),
-        triton.Config({"BLOCK_H": 2}),
-        triton.Config({"BLOCK_H": 4}),
-        triton.Config({"BLOCK_H": 8}),
-        triton.Config({"BLOCK_H": 16}),
-        triton.Config({"BLOCK_H": 32}),
-        triton.Config({"BLOCK_H": 64}),
-        triton.Config({"BLOCK_H": 128}),
+        # DO is converted from split to interleaved layout in-place. Keep each program
+        # single-warp so every source load is issued before any overlapping destination store.
+        triton.Config({"BLOCK_H": 1}, num_warps=1),
+        triton.Config({"BLOCK_H": 2}, num_warps=1),
+        triton.Config({"BLOCK_H": 4}, num_warps=1),
+        triton.Config({"BLOCK_H": 8}, num_warps=1),
+        triton.Config({"BLOCK_H": 16}, num_warps=1),
+        triton.Config({"BLOCK_H": 32}, num_warps=1),
+        triton.Config({"BLOCK_H": 64}, num_warps=1),
+        triton.Config({"BLOCK_H": 128}, num_warps=1),
     ],
     key=["emb_dim", "head_num"],
     restore_value=["DO"],
