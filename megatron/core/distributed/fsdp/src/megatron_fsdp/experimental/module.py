@@ -14,7 +14,7 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Literal, cast
 
 import torch
@@ -104,15 +104,17 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
-        axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-        assert axis_indices == tuple(
-            range(mesh.ndim)
-        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
+        # ``fully_shard`` accepts the full parallelism mesh, which may include axes
+        # FSDP does not shard over (for example the expert-parallel axis when
+        # composing with EP). ``Placements.dp_axes`` names only the data-parallel
+        # axes, so shard the group over that sub-mesh and leave the remaining axes
+        # untouched.
+        dp_mesh = _select_dp_mesh(mesh, placements.dp_axes)
         parameter_groups = [
             FsdpParameterGroup(
                 owning_module=self,
                 parameters=group_parameters,
-                mesh=mesh,
+                mesh=dp_mesh,
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
                 use_symm_mem=use_symm_mem,
@@ -356,6 +358,24 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, order)
+
+
+def _select_dp_mesh(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> DeviceMesh:
+    """Return the data-parallel sub-mesh that FSDP shards and communicates over.
+
+    ``dp_axes`` names the mesh axes FSDP shards over; any others (for example an
+    expert-parallel axis) are left untouched. When ``dp_axes`` spans the whole mesh,
+    ``mesh`` is returned unchanged -- this preserves plain-FSDP and HSDP behavior and
+    covers meshes without dim names. Otherwise the named sub-mesh is selected.
+    """
+    axis_indices = tuple(_axis_index(mesh, axis) for axis in dp_axes)
+    if axis_indices == tuple(range(mesh.ndim)):
+        return mesh
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None:
+        raise ValueError("Sharding over a subset of mesh axes requires a named DeviceMesh.")
+    # DeviceMesh sub-selection is by dim name only (integer indexing is unsupported).
+    return mesh[tuple(dim_names[index] for index in axis_indices)]
 
 
 def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
