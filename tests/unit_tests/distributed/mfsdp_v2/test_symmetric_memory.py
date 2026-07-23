@@ -4,8 +4,9 @@
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
@@ -14,17 +15,20 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
 )
+from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_kernels
 
 # Each sharded Linear's collective must be large enough that NCCL selects its
 # symmetric-memory (ncclSymk*) kernels over ring. Sub-KB collectives fall back to
 # ring on some platforms (e.g. CI with NCCL_NVLS_ENABLE=0), which would make the
-# symmetric-kernel assertions below fail; 1024-wide units (a few-MiB bf16 weight)
+# symmetric-kernel assertions below fail; 1024-wide layers (a few-MiB bf16 weight)
 # reliably engage the symmetric kernels.
 _HIDDEN = 1024
+_ALL_GATHER_OP_NAME_SUBSTRING = "allgather"
+_REDUCE_SCATTER_OP_NAME_SUBSTRING = "reduce_scatter"
 
 
 class TinyModel(nn.Module):
-    """Two separately shardable units, sized so NCCL selects symmetric-memory kernels."""
+    """Two separately shardable Linear modules, sized so NCCL selects symmetric-memory kernels."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -39,18 +43,6 @@ class TinyModel(nn.Module):
 
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
-
-
-def _kernels(prof: torch.profiler.profile) -> list[str]:
-    return [event.name for event in prof.events()]
-
-
-def _is_symmetric_kernel(kernel: str) -> bool:
-    return "ncclSymk" in kernel
-
-
-def _count_symmetric_kernels(kernels: list[str], subname: str) -> int:
-    return sum(1 for kernel in kernels if _is_symmetric_kernel(kernel) and subname in kernel)
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 3])
@@ -106,11 +98,11 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
 
         return losses
 
-    with profile(activities=[ProfilerActivity.CUDA]) as prof_without_symm_mem:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_without_symm_mem:
         losses_without_symm_mem = train(use_symm_mem=False)
         torch.cuda.synchronize()
 
-    with profile(activities=[ProfilerActivity.CUDA]) as prof_with_symm_mem:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_with_symm_mem:
         losses_with_symm_mem = train(use_symm_mem=True)
         torch.cuda.synchronize()
 
@@ -120,29 +112,125 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
         msg="Symmetric-memory FSDP losses did not match default FSDP losses.",
     )
 
-    kernels_without_symm_mem = _kernels(prof_without_symm_mem)
-    assert _count_symmetric_kernels(kernels_without_symm_mem, "AllGather") == 0
-    assert _count_symmetric_kernels(kernels_without_symm_mem, "ReduceScatter") == 0
+    allgather_kernels_without_symm_mem = collect_linked_kernels(
+        prof_without_symm_mem, _ALL_GATHER_OP_NAME_SUBSTRING
+    )
+    reduce_scatter_kernels_without_symm_mem = collect_linked_kernels(
+        prof_without_symm_mem, _REDUCE_SCATTER_OP_NAME_SUBSTRING
+    )
+    assert all("ncclSymk" not in kernel.name for kernel in allgather_kernels_without_symm_mem)
+    assert all("ncclSymk" not in kernel.name for kernel in reduce_scatter_kernels_without_symm_mem)
 
-    kernels_with_symm_mem = _kernels(prof_with_symm_mem)
+    allgather_kernels_with_symm_mem = collect_linked_kernels(
+        prof_with_symm_mem, _ALL_GATHER_OP_NAME_SUBSTRING
+    )
+    reduce_scatter_kernels_with_symm_mem = collect_linked_kernels(
+        prof_with_symm_mem, _REDUCE_SCATTER_OP_NAME_SUBSTRING
+    )
     # 2 sharded modules (fc1, fc2), one reduce-scatter each per microbatch step.
     expected_reduce_scatter_kernel_count = num_training_steps * num_microbatches * 2
-    nccl_kernels_with_symm_mem = [
-        kernel for kernel in kernels_with_symm_mem if "nccl" in kernel.lower()
-    ]
-    assert (
-        _count_symmetric_kernels(kernels_with_symm_mem, "ReduceScatter")
-        == expected_reduce_scatter_kernel_count
-    ), (
+    assert len(reduce_scatter_kernels_with_symm_mem) == expected_reduce_scatter_kernel_count, (
         "Unexpected NCCL symmetric-memory reduce-scatter kernel count. "
-        f"Observed NCCL kernels: {nccl_kernels_with_symm_mem[:20]}"
+        f"Observed reduce-scatter kernels: "
+        f"{[kernel.name for kernel in reduce_scatter_kernels_with_symm_mem[:20]]}"
+    )
+    assert all("ncclSymk" in kernel.name for kernel in reduce_scatter_kernels_with_symm_mem), (
+        "Expected all symmetric-memory reduce-scatter kernels to be ncclSymk kernels. "
+        f"Observed reduce-scatter kernels: "
+        f"{[kernel.name for kernel in reduce_scatter_kernels_with_symm_mem[:20]]}"
     )
 
-    expected_all_gather_kernel_count = 2 * expected_reduce_scatter_kernel_count
-    assert (
-        _count_symmetric_kernels(kernels_with_symm_mem, "AllGather")
-        == expected_all_gather_kernel_count
-    ), (
+    expected_allgather_kernel_count = 2 * expected_reduce_scatter_kernel_count
+    assert len(allgather_kernels_with_symm_mem) == expected_allgather_kernel_count, (
         "Unexpected NCCL symmetric-memory all-gather kernel count. "
-        f"Observed NCCL kernels: {nccl_kernels_with_symm_mem[:20]}"
+        f"Observed all-gather kernels: "
+        f"{[kernel.name for kernel in allgather_kernels_with_symm_mem[:20]]}"
     )
+    assert all("ncclSymk" in kernel.name for kernel in allgather_kernels_with_symm_mem), (
+        "Expected all symmetric-memory all-gather kernels to be ncclSymk kernels. "
+        f"Observed all-gather kernels: "
+        f"{[kernel.name for kernel in allgather_kernels_with_symm_mem[:20]]}"
+    )
+
+
+def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup):
+    """NCCL's zero-CTA policy runs the all-gather on the copy engine.
+
+    Zero-CTA offloads only pure data movement, so the all-gather emits no ``ncclSymk``
+    kernel (it becomes a copy-engine memcpy). The reduce-scatter's reduction cannot run on
+    the copy engine, so it stays a symmetric-memory kernel -- an SM-launched NVLS multicast
+    reduce (ncclSymkDevKernel_ReduceScatter_LDMC/LL).
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    # new_group requires a default process group. Initialize it here so this test works
+    # in isolation. Do not eagerly initialize it with device_id in the shared fixture:
+    # that can hang teardown after communicator splits; see
+    # https://github.com/pytorch/pytorch/issues/190396.
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+
+    # Dedicated communicator with NCCL's zero-CTA policy, scoped to this test so the rest
+    # of the bucket keeps default-CTA symmetric-memory kernels.
+    zero_cta_options = dist.ProcessGroupNCCL.Options()
+    zero_cta_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
+    dp_group = dist.new_group(backend="nccl", pg_options=zero_cta_options)
+    # NCCL window registration can fail when symmetric-memory rendezvous is the first
+    # operation on a communicator, so initialize this communicator explicitly.
+    dist.barrier(group=dp_group, device_ids=[device.index])
+    mesh = DeviceMesh.from_group(dp_group, device.type)
+
+    num_training_steps = 5
+    model = TinyModel().to(device=device, dtype=torch.bfloat16)
+    mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
+    fully_shard(
+        model.fc1,
+        mesh=mesh,
+        placements=_flat_placements(),
+        mixed_precision_policy=mixed_precision_policy,
+        use_symm_mem=True,
+    )
+    fully_shard(
+        model.fc2,
+        mesh=mesh,
+        placements=_flat_placements(),
+        mixed_precision_policy=mixed_precision_policy,
+        use_symm_mem=True,
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
+    x = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)
+    target = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(num_training_steps):
+            optimizer.zero_grad()
+            torch.nn.functional.mse_loss(model(x), target).backward()
+            optimizer.step()
+        torch.cuda.synchronize()
+
+    allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
+    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
+    # Zero-CTA moves the all-gather to the copy engine: no symmetric-memory all-gather kernel.
+    assert not allgather_kernels, (
+        f"Expected no symmetric-memory all-gather kernel under zero-CTA. "
+        f"Observed all-gather kernels: {[kernel.name for kernel in allgather_kernels[:20]]}"
+    )
+    # The reduce-scatter's reduction cannot run on the copy engine, so it stays a
+    # symmetric-memory kernel (an SM-launched NVLS multicast reduce): one per sharded
+    # module (fc1, fc2) per training step.
+    expected_reduce_scatter_kernel_count = num_training_steps * 2
+    assert len(reduce_scatter_kernels) == expected_reduce_scatter_kernel_count, (
+        f"Expected {expected_reduce_scatter_kernel_count} symmetric-memory reduce-scatter "
+        f"kernels under zero-CTA. Observed reduce-scatter kernels: "
+        f"{[kernel.name for kernel in reduce_scatter_kernels[:20]]}"
+    )
+    assert all("ncclSymk" in kernel.name for kernel in reduce_scatter_kernels), (
+        "Expected all zero-CTA reduce-scatter kernels to be ncclSymk kernels. "
+        f"Observed reduce-scatter kernels: {[kernel.name for kernel in reduce_scatter_kernels[:20]]}"
+    )
+
+    # Release the dedicated communicator (leaks only on a test failure above, which is fine).
+    dist.destroy_process_group(dp_group)
