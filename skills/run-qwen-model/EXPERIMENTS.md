@@ -49,6 +49,7 @@ Baseline order is mandatory:
 | VLLM-BASELINE | 2026-07-22 | Establish the fixed competitor target | none | 23,606.7 | n/a | Benchmark pass | 5547673 | Target established |
 | MCORE-BASELINE | 2026-07-22 | Establish the fixed EP4 starting point | `max_requests=256` | 12,346.1 | baseline | Benchmark pass | 5553135 | Starting point established |
 | QWEN-001 | 2026-07-22 | Single-kernel FC1+SwiGLU+FC2+topk-reduce mega-fusion beats the 4-kernel vLLM MoE path | `megatron/core/inference/moe/fused_moe_decode.py` (new), `dev/moe_fused/harness.py` (new) | microbench only | n/a (0.68–0.80× kernel) | Numerics pass (max_abs 2.6e-5, allclose) | session `qwen-moe-kernel` | Rejected — fused kernel 20–50% slower than reference; not integrated |
+| QWEN-002 | 2026-07-22 | Fusing SiLU(gate)*up into the FC1 GEMM epilogue (removing bounded_silu_mul + the 2N round-trip) speeds up the decode MoE path without hurting FC2 tiling | `vllm_fused_moe.py` (FUSE_SWIGLU), `experts.py` (`fuse_fc1_activation=True`), `dev/moe_fused/harness_fc1.py` (new) | e2e pending | **MoE path 1.24–1.27×** (141 vs 178 µs) | Numerics pass (max_abs 3.9e-5, allclose) | session `qwen-moe-kernel` | Accepted at microbench; wired into `_vllm_forward`; e2e throughput validation pending |
 
 ## Detailed records
 
@@ -114,6 +115,27 @@ Baseline order is mandatory:
 | Nsight artifacts | none (microbench) |
 | Result | Rejected — fused kernel is consistently 20–50% slower than the reference in every same-run comparison |
 | Next action | Root cause: one CTA per token-block serializes the H=2048 FC2 output loop (vs the reference's N-parallel multi-CTA GEMMs), 3× atomic traffic to `out`, and shared-memory pressure caps tile sizes; the HBM/launch savings are negligible under CUDA graphs. Pivot to either (a) partial FC1+SwiGLU epilogue fusion only, or (b) the 11.5% exposed NVLS all-gatherv/reduce-scatter-v communication |
+
+### QWEN-002 — FC1+SwiGLU epilogue fusion
+
+| Field | Value |
+|---|---|
+| Date | 2026-07-22 |
+| Hypothesis | The 4-kernel MoE path (FC1→2N intermediate→`bounded_silu_mul`→FC2→reduce) wastes a full HBM round-trip of the `[num_valid, 2N]` intermediate and a whole kernel launch. Computing gate & up in the same FC1 program and applying `SiLU(gate)*up` in the fp32 epilogue — writing the `[num_valid, N]` activated intermediate directly — removes both while keeping FC2's N-parallel tiling |
+| Code revision | branch `perf/moe-fused-decode-gemm`, dirty |
+| Changed files | `megatron/core/inference/moe/vllm_fused_moe.py` (add `FUSE_SWIGLU` constexpr to `_fused_moe_kernel`, `fuse_swiglu` to `_invoke_fused_moe_kernel`, `fuse_fc1_activation` path in `vllm_fused_moe`), `megatron/core/transformer/moe/experts.py` (`_vllm_forward` passes `fuse_fc1_activation=True`), `dev/moe_fused/harness_fc1.py` (new A/B harness) |
+| Runtime flags | vLLM grouped-GEMM backend, SwiGLU; microbench at Qwen3-30B decode shapes H=2048, moe_ffn=768, 32 local experts, top-8, 256 valid tokens |
+| Image | Cog dev image `ceecf5c304a5d8bd.sqsh` |
+| Checkpoint / tokenizer | n/a for microbench (synthetic weights; reference = unfused `vllm_fused_moe`) |
+| Hardware / layout | OCI `oci-hsg`, 1×GB200 (session `qwen-moe-kernel`) |
+| Workload | microbench, 10 warmup + 200 timed CUDA-event iters, 3 repeats |
+| Job / run | session `qwen-moe-kernel`, exec runs `fc1c…`/`fc1t…` |
+| Throughput | end-to-end not yet measured |
+| Latency / TPOT | MoE-path kernel: reference 174–182 µs vs fused 141–143 µs → **1.24–1.27×** (3 repeats) |
+| Correctness | Pass — fused vs unfused `vllm_fused_moe`: max_abs_diff 3.9e-5, `allclose(rtol=2e-2,atol=2e-2)` True |
+| Nsight artifacts | none yet (microbench) |
+| Result | Accepted at microbench level; unfused path unchanged (all edits guarded by the `FUSE_SWIGLU` compile-time constexpr) |
+| Next action | Run the fixed BS256/OSL1024 mcore benchmark to measure end-to-end throughput delta vs MCORE-BASELINE; MoE grouped-GEMM is 40.5% of decode busy time so expect a few % overall |
 
 Append records using this exact structure:
 

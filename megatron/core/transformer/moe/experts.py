@@ -1200,6 +1200,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map=routing_map,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+            # Fuse SiLU(gate)*up into the FC1 epilogue: removes the standalone
+            # bounded_silu_mul kernel and the 2N intermediate HBM round-trip.
+            # No-op for non-SwiGLU activations. ~1.25x on the decode MoE path.
+            fuse_fc1_activation=True,
         )
         return output, None
 
