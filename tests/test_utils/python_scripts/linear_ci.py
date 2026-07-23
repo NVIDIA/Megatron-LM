@@ -18,11 +18,18 @@ from nemo_ci_triage.agent import summarize_pipeline_failures as summarizer
 
 LINEAR_MODULE = "megatron_lm"
 _FUNCTIONAL_PREFIX = "functional:run_"
+_SMOKE_PREFIX = "functional:smoke-"
 
 
 def _variant_name(pipeline_name: str) -> str:
     """Return the stable environment/platform suffix of a functional bridge."""
-    return pipeline_name.removeprefix(_FUNCTIONAL_PREFIX).replace("_", "-")
+    if pipeline_name.startswith(_FUNCTIONAL_PREFIX):
+        variant = pipeline_name.removeprefix(_FUNCTIONAL_PREFIX)
+    elif pipeline_name.startswith(_SMOKE_PREFIX):
+        variant = f"smoke-{pipeline_name.removeprefix(_SMOKE_PREFIX)}"
+    else:
+        variant = pipeline_name
+    return variant.replace("_", "-")
 
 
 def _recipe_name(pipeline_name: str, config_name: str) -> str:

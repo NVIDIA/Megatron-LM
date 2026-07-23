@@ -128,18 +128,8 @@ def _mb(num_bytes: int) -> str:
 # work to its enclosing collective or matmul operation.
 _ALL_GATHER_OP_NAME_SUBSTRING = "allgather"
 _REDUCE_SCATTER_OP_NAME_SUBSTRING = "reduce_scatter"
+_ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
 _GEMM_OP_NAME_SUBSTRING = "aten::mm"
-
-
-def _nccl_events(cuda_events, *name_fragments):
-    """CUDA NCCL events whose name contains any of ``name_fragments`` (case-insensitive)."""
-    return [
-        event
-        for event in cuda_events
-        if "nccl" in event.name.lower()
-        and event.activity_type == "kernel"
-        and any(fragment in event.name.lower() for fragment in name_fragments)
-    ]
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 3])
@@ -279,11 +269,11 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
 
     ``fully_shard(model)`` makes the child units share a root context so their
     reductions run through the overlap path rather than as independent roots.
-    Counting NCCL events over a multi-microbatch step, the DP-inner reduce-scatter
+    Counting linked NCCL kernels over a multi-microbatch step, the DP-inner reduce-scatter
     fires once per microbatch per group while the DP-outer all-reduce that
     finalizes main_grad fires only on the last microbatch, so the reduce-scatter
     count is exactly ``num_microbatches`` times the all-reduce count. This asserts
-    on event counts only, not numerics.
+    on kernel counts only, not numerics.
     """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -326,17 +316,16 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
         train_one_step()
         torch.cuda.synchronize(device)
 
-    cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
-    reduce_scatter_events = _nccl_events(cuda_events, "reducescatter", "reduce_scatter")
-    all_reduce_events = _nccl_events(cuda_events, "allreduce")
+    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
+    allreduce_kernels = collect_linked_kernels(prof, _ALLREDUCE_OP_NAME_SUBSTRING)
     # One DP-outer all-reduce per parameter group -- each child layer plus the
     # root unit's bias -- fired only on the last microbatch. Plain DP fires none.
-    assert len(all_reduce_events) == num_children + 1, [event.name for event in cuda_events]
+    assert len(allreduce_kernels) == num_children + 1, [event.name for event in prof.events()]
     # DP-inner reduce-scatter runs every microbatch; the DP-outer all-reduce runs
     # only on the last, so the counts differ by exactly the microbatch factor.
-    assert len(reduce_scatter_events) == len(all_reduce_events) * num_microbatches, (
-        f"Expected reduce-scatter ({len(reduce_scatter_events)}) to be {num_microbatches}x "
-        f"the DP-outer all-reduce count ({len(all_reduce_events)})."
+    assert len(reduce_scatter_kernels) == len(allreduce_kernels) * num_microbatches, (
+        f"Expected reduce-scatter ({len(reduce_scatter_kernels)}) to be {num_microbatches}x "
+        f"the DP-outer all-reduce count ({len(allreduce_kernels)})."
     )
 
 
@@ -570,7 +559,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     assert len(gemm_kernels) >= 3 * num_children, (
         f"Expected at least {3 * num_children} kernels linked to GEMMs, got "
         f"{len(gemm_kernels)}: "
-        f"{[event.name for event in gemm_kernels]}"
+        f"{[kernel.name for kernel in gemm_kernels]}"
     )
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
@@ -582,16 +571,16 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     expected_allgather_kernel_count = 0 if use_symm_mem else 2 * num_sharded_modules
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
         f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
-        f"{len(allgather_kernels)}: {[event.name for event in allgather_kernels]}"
+        f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
     )
     assert len(reduce_scatter_kernels) == num_sharded_modules, (
         f"Expected {num_sharded_modules} reduce-scatter kernels, got "
-        f"{len(reduce_scatter_kernels)}: {[event.name for event in reduce_scatter_kernels]}"
+        f"{len(reduce_scatter_kernels)}: {[kernel.name for kernel in reduce_scatter_kernels]}"
     )
 
-    allgather_streams = {event.device_resource_id for event in allgather_kernels}
-    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_kernels}
-    gemm_streams = {event.device_resource_id for event in gemm_kernels}
+    allgather_streams = {kernel.device_resource_id for kernel in allgather_kernels}
+    reduce_scatter_streams = {kernel.device_resource_id for kernel in reduce_scatter_kernels}
+    gemm_streams = {kernel.device_resource_id for kernel in gemm_kernels}
     if allgather_kernels:
         assert len(allgather_streams) == 1
     assert len(reduce_scatter_streams) == 1
@@ -600,11 +589,11 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     assert reduce_scatter_streams.isdisjoint(gemm_streams)
 
     allgather_overlap_count = sum(
-        any(events_overlap(event, gemm) for gemm in gemm_kernels) for event in allgather_kernels
+        any(events_overlap(kernel, gemm) for gemm in gemm_kernels) for kernel in allgather_kernels
     )
     reduce_scatter_overlap_count = sum(
-        any(events_overlap(event, gemm) for gemm in gemm_kernels)
-        for event in reduce_scatter_kernels
+        any(events_overlap(kernel, gemm) for gemm in gemm_kernels)
+        for kernel in reduce_scatter_kernels
     )
     expected_allgather_overlap = 2 * (num_children - 1)
     expected_reduce_scatter_overlap = num_children - 1

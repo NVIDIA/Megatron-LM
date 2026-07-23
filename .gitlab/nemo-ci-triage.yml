@@ -7,6 +7,8 @@ gitlab:
 modules:
   megatron_lm:
     build_module: megatron-lm
+    channel_id_env: MCORE_SLACK_CHANNEL_ID
+    reconcile_proposal: true
     team_key: MCORE
     project_template: "MCore CI Testing"
     enable_linear_open: true
