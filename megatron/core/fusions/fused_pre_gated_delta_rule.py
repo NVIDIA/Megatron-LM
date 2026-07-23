@@ -187,7 +187,9 @@ def _conv_silu_project_kernel(
                 + batch_id * left_boundary_b_stride
                 + chan[None, :] * left_boundary_c_stride
             )
-            boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(tl.float32)
+            boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(
+                tl.float32
+            )
             x_val = tl.where(x_mask[:, None], x_val, boundary_val)
         w_tap = tl.load(weight_ptr + chan * weight_c_stride + i * weight_w_stride).to(tl.float32)
         acc += w_tap[None, :] * x_val
@@ -345,9 +347,7 @@ def _conv_silu_project_thd_kernel(
     s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
     s_mask = s_offs < seq_len
     global_s = global_token_offset + s_offs
-    seq_start, seq_end = _thd_seq_bounds(
-        cu_seqlens_ptr, global_s, global_seq_len, num_packed_seqs
-    )
+    seq_start, seq_end = _thd_seq_bounds(cu_seqlens_ptr, global_s, global_seq_len, num_packed_seqs)
 
     acc = tl.zeros([BLOCK_S, HEAD_DIM], dtype=tl.float32)
     for i in tl.static_range(K_W):
@@ -378,7 +378,9 @@ def _conv_silu_project_thd_kernel(
                 + batch_id * left_boundary_b_stride
                 + chan[None, :] * left_boundary_c_stride
             )
-            boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(tl.float32)
+            boundary_val = tl.load(boundary_ptr, mask=boundary_mask[:, None], other=0.0).to(
+                tl.float32
+            )
             x_val = tl.where(x_mask[:, None], x_val, boundary_val)
         w_tap = tl.load(weight_ptr + chan * weight_c_stride + i * weight_w_stride).to(tl.float32)
         acc += w_tap[None, :] * x_val
@@ -790,9 +792,9 @@ def _load_virtual_conv_input(
         + batch_id * qkvzba_b_stride
         + chan[None, :] * qkvzba_c_stride
     )
-    local_val = tl.load(
-        local_ptr, mask=local_mask[:, None] & chan_mask[None, :], other=0.0
-    ).to(tl.float32)
+    local_val = tl.load(local_ptr, mask=local_mask[:, None] & chan_mask[None, :], other=0.0).to(
+        tl.float32
+    )
     if HAS_LEFT_BOUNDARY:
         boundary_s = src + BOUNDARY
         boundary_mask = valid_src & (src < 0) & (boundary_s >= 0)
@@ -930,9 +932,7 @@ def _conv_silu_boundary_backward_kernel(
                 BOUNDARY,
             )
             w_tap = tl.load(
-                weight_ptr + chan * weight_c_stride + j * weight_w_stride,
-                mask=chan_mask,
-                other=0.0,
+                weight_ptr + chan * weight_c_stride + j * weight_w_stride, mask=chan_mask, other=0.0
             ).to(tl.float32)
             acc += x_tap * w_tap[None, :]
             if APPLY_MAIN_CORRECTION:
@@ -968,9 +968,7 @@ def _conv_silu_boundary_backward_kernel(
             d_base_acc = d_silu * base_silu_grad
             d_acc = tl.where(is_boundary_source[:, None], d_acc, d_acc - d_base_acc)
         w_i = tl.load(
-            weight_ptr + chan * weight_c_stride + i * weight_w_stride,
-            mask=chan_mask,
-            other=0.0,
+            weight_ptr + chan * weight_c_stride + i * weight_w_stride, mask=chan_mask, other=0.0
         ).to(tl.float32)
         d_src += d_acc * w_i[None, :]
         if APPLY_MAIN_CORRECTION:
@@ -994,9 +992,7 @@ def _conv_silu_boundary_backward_kernel(
             )
             d_w = tl.sum(d_acc * x_src, axis=0)
             tl.atomic_add(
-                d_weight_accum_ptr
-                + chan * d_weight_accum_c_stride
-                + i * d_weight_accum_w_stride,
+                d_weight_accum_ptr + chan * d_weight_accum_c_stride + i * d_weight_accum_w_stride,
                 d_w,
                 mask=chan_mask,
             )
@@ -1212,9 +1208,7 @@ def _finalize_pre_gdr_backward_kernel(
         tap = offs % weight_width
         chan = offs // weight_width
         d_weight_val = tl.load(
-            d_weight_accum_ptr
-            + chan * d_weight_accum_c_stride
-            + tap * d_weight_accum_w_stride,
+            d_weight_accum_ptr + chan * d_weight_accum_c_stride + tap * d_weight_accum_w_stride,
             mask=weight_mask,
             other=0.0,
         )
@@ -1243,9 +1237,9 @@ def _finalize_pre_gdr_backward_kernel(
             + chan * d_right_boundary_c_stride
         )
         d_qkvzba_val = tl.load(d_qkvzba_ptrs, mask=boundary_mask, other=0.0).to(tl.float32)
-        d_right_boundary_val = tl.load(
-            d_right_boundary_ptrs, mask=boundary_mask, other=0.0
-        ).to(tl.float32)
+        d_right_boundary_val = tl.load(d_right_boundary_ptrs, mask=boundary_mask, other=0.0).to(
+            tl.float32
+        )
         tl.store(d_qkvzba_ptrs, d_qkvzba_val + d_right_boundary_val, mask=boundary_mask)
 
     if CAST_A_LOG:
@@ -1665,11 +1659,7 @@ def _wait_for_streams(dst_stream: "torch.cuda.Stream", *src_streams: "torch.cuda
 
 @triton.jit
 def _chunkwise_cp_seq_idx_kernel(
-    cu_seqlens_ptr,
-    seq_idx_ptr,
-    local_start,
-    local_seq_len,
-    BLOCK_T: tl.constexpr,
+    cu_seqlens_ptr, seq_idx_ptr, local_start, local_seq_len, BLOCK_T: tl.constexpr
 ):
     """Fill local chunkwise-CP packed sequence ids without searchsorted."""
 
@@ -1680,9 +1670,7 @@ def _chunkwise_cp_seq_idx_kernel(
     seq_start = tl.load(cu_seqlens_ptr + pid_seq)
     seq_end = tl.load(cu_seqlens_ptr + pid_seq + 1)
     mask = (
-        (local_offsets < local_seq_len)
-        & (global_offsets >= seq_start)
-        & (global_offsets < seq_end)
+        (local_offsets < local_seq_len) & (global_offsets >= seq_start) & (global_offsets < seq_end)
     )
     tl.store(seq_idx_ptr + local_offsets, pid_seq, mask=mask)
 
@@ -1723,13 +1711,7 @@ def _resolve_chunkwise_cp_packed_seq_idx(cu_seqlens: Tensor, local_seq_len: int,
     block_t = 512
     grid = (cu_seqlens.shape[0] - 1, triton.cdiv(local_seq_len, block_t))
     _chunkwise_cp_seq_idx_kernel[grid](
-        cu_seqlens,
-        seq_idx,
-        local_start,
-        local_seq_len,
-        BLOCK_T=block_t,
-        num_warps=8,
-        num_stages=2,
+        cu_seqlens, seq_idx, local_start, local_seq_len, BLOCK_T=block_t, num_warps=8, num_stages=2
     )
     return seq_idx
 
@@ -1739,13 +1721,9 @@ def _cp_neighbor_global_ranks(cp_group) -> Tuple[int, int, Optional[int], Option
 
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    prev_rank = (
-        torch.distributed.get_global_rank(cp_group, cp_rank - 1) if cp_rank > 0 else None
-    )
+    prev_rank = torch.distributed.get_global_rank(cp_group, cp_rank - 1) if cp_rank > 0 else None
     next_rank = (
-        torch.distributed.get_global_rank(cp_group, cp_rank + 1)
-        if cp_rank < cp_size - 1
-        else None
+        torch.distributed.get_global_rank(cp_group, cp_rank + 1) if cp_rank < cp_size - 1 else None
     )
     return cp_size, cp_rank, prev_rank, next_rank
 
@@ -1864,18 +1842,7 @@ def _triton_pre_gated_delta_rule_forward(
     cu_seqlens: Optional[Tensor] = None,
     cp_group=None,
     cp_size: int = 1,
-) -> Tuple[
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Tensor,
-    Optional[Tensor],
-    int,
-    int,
-]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Optional[Tensor], int, int]:
     """Triton-backed forward for the pre-gated-delta-rule front-end.
 
     Returns ``(query, key, value, gate, beta, g, silu_qk_save, left_boundary,
@@ -1910,12 +1877,11 @@ def _triton_pre_gated_delta_rule_forward(
     global_token_offset = 0
     global_seq_len = seq_len
     if cp_active:
-        (
-            left_boundary,
-            left_boundary_recv_ops,
-            left_boundary_send_ops,
-            _left_boundary_send_buf,
-        ) = _start_left_boundary_exchange(qkvzba, conv_dim=conv_dim, boundary=boundary, cp_group=cp_group)
+        (left_boundary, left_boundary_recv_ops, left_boundary_send_ops, _left_boundary_send_buf) = (
+            _start_left_boundary_exchange(
+                qkvzba, conv_dim=conv_dim, boundary=boundary, cp_group=cp_group
+            )
+        )
         if is_packed_thd:
             global_token_offset = cp_rank * seq_len
             global_seq_len = seq_len * cp_size
@@ -2369,6 +2335,8 @@ def _triton_pre_gated_delta_rule_backward(
 
     d_qkvzba = torch.empty_like(qkvzba)
     overlap_boundary_grad_exchange = cp_group is not None and k_w > 1
+    d_A_log_fp32: Optional[Tensor] = None
+    d_dt_bias_fp32: Optional[Tensor] = None
 
     def _launch_g_beta_and_z_backward() -> Tuple[Tensor, Tensor]:
         # g + beta backward fully stores d_qkvzba's alpha + beta slices, plus
@@ -2472,14 +2440,12 @@ def _triton_pre_gated_delta_rule_backward(
             left_boundary_send_ops,
             _left_boundary_send_buf,
         ) = _start_boundary_grad_exchange(
-            qkvzba,
-            d_left_boundary,
-            conv_dim=conv_dim,
-            boundary=k_w - 1,
-            cp_group=cp_group,
+            qkvzba, d_left_boundary, conv_dim=conv_dim, boundary=k_w - 1, cp_group=cp_group
         )
         d_A_log_fp32, d_dt_bias_fp32 = _launch_g_beta_and_z_backward()
         _wait_distributed_ops(right_boundary_recv_ops)
+    assert d_A_log_fp32 is not None
+    assert d_dt_bias_fp32 is not None
     default_stream.wait_stream(g_beta_stream)
     d_weight, d_A_log, d_dt_bias = _triton_finalize_pre_gdr_backward(
         d_weight_accum,
@@ -2625,28 +2591,30 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             saved_idx += 1
         else:
             left_boundary = None
-        d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_boundary = _triton_pre_gated_delta_rule_backward(
-            qkvzba_for_backward,
-            conv1d_weight,
-            silu_qk_save,
-            dq,
-            dk,
-            dv,
-            dgate,
-            dbeta,
-            dg,
-            A_log,
-            dt_bias,
-            num_key_heads=ctx.num_key_heads,
-            num_value_heads=ctx.num_value_heads,
-            key_head_dim=ctx.key_head_dim,
-            value_head_dim=ctx.value_head_dim,
-            seq_idx=seq_idx,
-            left_boundary=left_boundary,
-            cu_seqlens=cu_seqlens,
-            global_token_offset=ctx.global_token_offset,
-            global_seq_len=ctx.global_seq_len,
-            cp_group=ctx.cp_group if ctx.cp_active else None,
+        d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_boundary = (
+            _triton_pre_gated_delta_rule_backward(
+                qkvzba_for_backward,
+                conv1d_weight,
+                silu_qk_save,
+                dq,
+                dk,
+                dv,
+                dgate,
+                dbeta,
+                dg,
+                A_log,
+                dt_bias,
+                num_key_heads=ctx.num_key_heads,
+                num_value_heads=ctx.num_value_heads,
+                key_head_dim=ctx.key_head_dim,
+                value_head_dim=ctx.value_head_dim,
+                seq_idx=seq_idx,
+                left_boundary=left_boundary,
+                cu_seqlens=cu_seqlens,
+                global_token_offset=ctx.global_token_offset,
+                global_seq_len=ctx.global_seq_len,
+                cp_group=ctx.cp_group if ctx.cp_active else None,
+            )
         )
         # Match forward inputs: (qkvzba, conv1d_weight, A_log, dt_bias,
         # cu_seqlens, seq_idx, cp_group, cp_size, num_key_heads, num_value_heads,

@@ -549,7 +549,8 @@ class GatedDeltaNet(MegatronModule):
             nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
             seq_idx = (
                 packed_seq_params.seq_idx
-                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                if packed_seq_params is not None
+                and packed_seq_params.qkv_format == 'thd'
                 and cp_size_chunkwise == 1
                 else None
             )
@@ -825,9 +826,7 @@ class GatedDeltaNet(MegatronModule):
             else None
         )
         A_log = get_parameter_local_cp_headwise(self.A_log, dim=0, cp_group=cp_group_headwise)
-        dt_bias = get_parameter_local_cp_headwise(
-            self.dt_bias, dim=0, cp_group=cp_group_headwise
-        )
+        dt_bias = get_parameter_local_cp_headwise(self.dt_bias, dim=0, cp_group=cp_group_headwise)
         num_key_heads = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
         num_value_heads = self.v_dim_local_tp // self.value_head_dim // cp_size_headwise
 

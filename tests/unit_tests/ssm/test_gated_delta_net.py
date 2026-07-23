@@ -1029,9 +1029,7 @@ class TestFusedPreGatedDeltaRule:
             requires_grad=True,
         )
         with torch.no_grad():
-            qkvzba[
-                :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
-            ] = 100.0
+            qkvzba[:, :, alpha_channel_offset : alpha_channel_offset + num_value_heads] = 100.0
             fused_gdn.A_log.zero_()
             fused_gdn.dt_bias.zero_()
         fused_gdn.zero_grad(set_to_none=True)
@@ -1454,9 +1452,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
         fused_gdn.load_state_dict(unfused_gdn.state_dict())
         hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=64)
         grad_output = torch.randn(
-            hidden_states.shape,
-            device=torch.cuda.current_device(),
-            dtype=torch.float32,
+            hidden_states.shape, device=torch.cuda.current_device(), dtype=torch.float32
         )
 
         unfused_output, unfused_dinput, unfused_grads = self._run_backward(
@@ -1531,9 +1527,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
         packed_seq_params = self._make_packed_seq_params([0, 96, 128])
         hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=128)
         grad_output = torch.randn(
-            hidden_states.shape,
-            device=torch.cuda.current_device(),
-            dtype=torch.float32,
+            hidden_states.shape, device=torch.cuda.current_device(), dtype=torch.float32
         )
 
         unfused_output, unfused_dinput, unfused_grads = self._run_backward(
@@ -1582,9 +1576,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
         packed_seq_params = self._make_packed_seq_params([0, 4, 12])
         hidden_states = self._make_hidden_states(unfused_gdn, seq_len_global=12)
         grad_output = torch.randn(
-            hidden_states.shape,
-            device=torch.cuda.current_device(),
-            dtype=torch.float32,
+            hidden_states.shape, device=torch.cuda.current_device(), dtype=torch.float32
         )
 
         unfused_output, unfused_dinput, unfused_grads = self._run_backward(
