@@ -814,9 +814,11 @@ def get_gpt_mtp_block_spec_for_backend(
         # pipeline stage.
         mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
         if len(mtp_layer_specs) > 0:
-            assert (
-                len(mtp_layer_specs) == config.mtp_num_layers
-            ), f"All MTP layers must reside in the same pipeline stage"
+            assert 0 < len(mtp_layer_specs) <= config.mtp_num_layers, (
+                f"MTP layer specs count ({len(mtp_layer_specs)}) must be between 1 and "
+                f"mtp_num_layers ({config.mtp_num_layers}). "
+                f"Use mtp_split layout to distribute layers across PP ranks."
+            )
 
     if len(mtp_layer_specs) > 0:
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
