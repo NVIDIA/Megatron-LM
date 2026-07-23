@@ -29,6 +29,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.cuda_graph_runner impor
     _prepare_compiled_modules_for_capture,
     _restore_compiled_modules_after_capture_failure,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import _pre_backward_setup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime.graph import (
@@ -129,13 +130,18 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
 
     reduce_calls = []
     release_calls = []
+    redistribute_calls = []
     dist_param = SimpleNamespace(dtype=param.dtype, grad=None)
     param_group = SimpleNamespace(
         requires_grad=True,
         sharding_strategy="optim_grads_params",
         enable_full_iteration_cuda_graph=False,
         main_grad_buffer=SimpleNamespace(
-            inner_sharded=True, redistribute=lambda *_args, **_kwargs: None
+            inner_sharded=True,
+            placements=[Placement.REPLICATE, Placement.FLAT],
+            redistribute=lambda placements, **_kwargs: redistribute_calls.append(
+                placements.copy()
+            ),
         ),
         mesh=SimpleNamespace(size=lambda _dim: 1),
         _full_grad_buffer_has_accumulated_grad=False,
@@ -158,6 +164,7 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         FSDPModule.reduce_grad(module)
 
     copy_mock.assert_not_called()
+    assert redistribute_calls == [[Placement.REPLICATE, Placement.PARTIAL]]
     assert param.grad is None
     assert reduce_calls == [True]
     assert release_calls == [True]
