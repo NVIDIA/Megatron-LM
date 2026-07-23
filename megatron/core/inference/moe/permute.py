@@ -35,7 +35,10 @@ _NUM_SMS: Optional[int] = None
 # Use the tl.histogram-based token-count kernel (one atomic per bin per CTA)
 # instead of the per-pair atomic_add kernel in the decode dispatch path.
 # Env-toggleable for A/B measurement; defaults on.
-_USE_HISTOGRAM_COUNT: bool = os.environ.get("MCORE_MOE_HISTOGRAM_COUNT", "1") == "1"
+# Default OFF: microbench showed the histogram variant is ~equal (0.96x) at decode
+# scale — the count kernel's cost is per-launch fixed overhead, not atomic
+# contention, so an in-kernel rewrite does not help. Kept opt-in for reference.
+_USE_HISTOGRAM_COUNT: bool = os.environ.get("MCORE_MOE_HISTOGRAM_COUNT", "0") == "1"
 
 
 def _get_num_sms(device: torch.device) -> int:
