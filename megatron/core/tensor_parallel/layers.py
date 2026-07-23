@@ -90,13 +90,14 @@ except:
 
 
 def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group=None):
-    """Return whether a parameter contributes a unique model-parallel shard.
+    """Return whether a parameter contributes to a unique model-parallel shard.
 
     Parameters reduced over expert data parallel groups use the expert tensor-parallel
     group for duplicate filtering. Other parameters use the regular tensor-parallel group.
     """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
+    # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
     if not getattr(param, "allreduce", True) and expert_tp_group is not None:
         tp_group = expert_tp_group
     # Prefer provided tp_group when available (new explicit path).
@@ -872,7 +873,7 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_pg_size(self.tp_group)
         rank = get_pg_rank(self.tp_group)
         self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
-        use_expert_groups = self.is_expert and (
+        use_expert_pgs = self.is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
         )
@@ -928,7 +929,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
-            setattr(self.weight, "allreduce", not use_expert_groups)
+            setattr(self.weight, "allreduce", not use_expert_pgs)
         else:
             self.weight = None
 
@@ -950,7 +951,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not use_expert_groups)
+            setattr(self.bias, "allreduce", not use_expert_pgs)
         else:
             self.register_parameter("bias", None)
 
@@ -1278,11 +1279,11 @@ class RowParallelLinear(torch.nn.Module):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
-        use_expert_groups = self.is_expert and (
+        use_expert_pgs = self.is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
         )
-        setattr(self.weight, "allreduce", not use_expert_groups)
+        setattr(self.weight, "allreduce", not use_expert_pgs)
 
         if bias:
             if config.use_cpu_initialization:
@@ -1300,7 +1301,7 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not use_expert_groups)
+            setattr(self.bias, "allreduce", not use_expert_pgs)
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)
