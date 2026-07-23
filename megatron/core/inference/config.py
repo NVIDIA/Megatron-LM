@@ -37,7 +37,7 @@ class MambaInferenceStateConfig:
     """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
 
     ssm_states_dtype: torch.dtype
-    """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
+    """The dtype to use for Mamba SSM state. Batch-invariant mode requires FP32."""
 
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
@@ -60,7 +60,16 @@ class MambaInferenceStateConfig:
             )
             if conv_states_dtype is None:
                 conv_states_dtype = model.config.params_dtype
-            if ssm_states_dtype is None:
+            if model.config.batch_invariant_mode:
+                if ssm_states_dtype not in (None, torch.float32):
+                    raise ValueError(
+                        "batch_invariant_mode requires FP32 Mamba SSM states; "
+                        f"got {ssm_states_dtype}."
+                    )
+                # State passing carries an unrounded FP32 boundary value across
+                # chunks. Rounding the cache to BF16 changes the next transition.
+                ssm_states_dtype = torch.float32
+            elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
             mamba_chunk_size = 128
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):

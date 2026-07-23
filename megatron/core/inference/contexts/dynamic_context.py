@@ -350,6 +350,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "batch_invariant_mode for Mamba dynamic inference only supports "
                     "one-token decode; set num_speculative_tokens=0."
                 )
+                assert self.mamba_ssm_states_dtype == torch.float32, (
+                    "batch_invariant_mode requires FP32 Mamba SSM states so state-passing "
+                    "boundaries are not rounded between decode chunks."
+                )
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the

@@ -83,16 +83,24 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             self.device, self.dtype,
         )
 
+    def _make_ssm_state(self, max_batch):
+        """Production BIK state cache: FP32 carry across Mamba chunks."""
+        return torch.zeros(
+            max_batch,
+            self.nh,
+            self.headdim,
+            self.dstate,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
     def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):
         """Run the prefill through the reference scan, store its ssm_state at
         the slot, and seed the batch-invariant buffer with the partial-chunk tail."""
         # Production batch-invariant prefill keeps ssm_state at a full Mamba chunk
         # boundary. Short prefills therefore keep the zero initial boundary;
         # longer prefills store the largest chunk-aligned prefix state.
-        ssm_state = torch.zeros(
-            max_batch, self.nh, self.headdim, self.dstate,
-            device=self.device, dtype=self.dtype,
-        )
+        ssm_state = self._make_ssm_state(max_batch)
         if prefill_len >= self.chunk_size:
             # Prefill on the largest chunk-aligned prefix; the tail goes in the buffer.
             aligned = (prefill_len // self.chunk_size) * self.chunk_size
@@ -101,7 +109,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 B[:, :aligned], C[:, :aligned], self.D, self.dt_bias, self.chunk_size,
                 initial_states=None,
             )
-            ssm_state[slot] = final[0].to(self.dtype)
+            ssm_state[slot] = final[0]
 
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
@@ -176,7 +184,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             return_intermediate_states=True,
             dt_softplus=True,
             dt_limit=(0.0, float("inf")),
-            state_dtype=self.dtype,
+            state_dtype=torch.float32,
         )
         final_state = chunk_states[last_chunk_indices]
         boundary_state = chunk_states[boundary_idx]
@@ -217,6 +225,55 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                     f"prefill_len={prefill_len}",
                 )
 
+    def test_rejects_bf16_state_cache(self):
+        """A rounded state cache cannot preserve carry across multiple chunks."""
+        x, dt, B, C = self._make_seq(1)
+        bufs = self._make_bufs(max_batch=2)
+        ssm_state = torch.zeros(
+            2,
+            self.nh,
+            self.headdim,
+            self.dstate,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        with self.assertRaisesRegex(AssertionError, "requires an FP32 SSM state cache"):
+            self._decode_one_step(bufs, x, dt, B, C, pos=0, slot=0, ssm_state=ssm_state)
+
+    def test_inference_config_uses_fp32_state_cache(self):
+        """BIK model-derived inference config cannot select a rounded state dtype."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from megatron.core.inference.config import MambaInferenceStateConfig
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                batch_invariant_mode=True,
+                params_dtype=torch.bfloat16,
+            )
+        )
+        decoder = SimpleNamespace(
+            layer_type_list=[Symbols.MAMBA],
+            layers=[SimpleNamespace(mixer=SimpleNamespace(chunk_size=self.chunk_size))],
+            mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
+        )
+        with patch(
+            "megatron.core.inference.config.get_attr_wrapped_model",
+            return_value=decoder,
+        ):
+            config = MambaInferenceStateConfig.from_model(model)
+            self.assertEqual(config.ssm_states_dtype, torch.float32)
+            with self.assertRaisesRegex(ValueError, "requires FP32 Mamba SSM states"):
+                MambaInferenceStateConfig.from_model(
+                    model,
+                    ssm_states_dtype=torch.bfloat16,
+                )
+            model.config.batch_invariant_mode = False
+            config = MambaInferenceStateConfig.from_model(model)
+            self.assertEqual(config.ssm_states_dtype, torch.bfloat16)
+
     def test_dynamic_prefill_uses_boundary_state_not_prompt_end_state(self):
         """Production prefill returns the prompt-end state too, but batch-invariant decode
         must keep the cache at the last full chunk boundary and put the tail in
@@ -233,11 +290,8 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 _, boundary_state = self._varlen_boundary_state_from_prefill(
                     x, dt, B, C, prefill_len
                 )
-                ssm_state = torch.randn(
-                    max_batch, self.nh, self.headdim, self.dstate,
-                    device=self.device, dtype=self.dtype,
-                )
-                ssm_state[slot] = boundary_state[0].to(self.dtype)
+                ssm_state = torch.randn_like(self._make_ssm_state(max_batch))
+                ssm_state[slot] = boundary_state[0]
 
                 bufs = self._make_bufs(max_batch)
                 cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
@@ -287,10 +341,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                     initial_states=first_boundary,
                 )
 
-                ssm_state = torch.zeros(
-                    max_batch, self.nh, self.headdim, self.dstate,
-                    device=self.device, dtype=self.dtype,
-                )
+                ssm_state = self._make_ssm_state(max_batch)
                 ssm_state[slot] = final_boundary[0]
                 bufs = self._make_bufs(max_batch)
                 cu = torch.tensor(
@@ -327,11 +378,8 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         )
 
         _, boundary_state = self._varlen_boundary_state_from_prefill(x, dt, B, C, prefill_len)
-        ssm_state = torch.zeros(
-            max_batch, self.nh, self.headdim, self.dstate,
-            device=self.device, dtype=self.dtype,
-        )
-        ssm_state[slot] = boundary_state[0].to(self.dtype)
+        ssm_state = self._make_ssm_state(max_batch)
+        ssm_state[slot] = boundary_state[0]
 
         nan_x = torch.full_like(x[0, :1], float("nan"))
         nan_dt = torch.full_like(dt[0, :1], float("nan"))
@@ -428,10 +476,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
         bufs = self._make_bufs(max_batch)
         # Per-slot seeding (each slot's prefill done independently).
-        ssm_state = torch.zeros(
-            max_batch, self.nh, self.headdim, self.dstate,
-            device=self.device, dtype=self.dtype,
-        )
+        ssm_state = self._make_ssm_state(max_batch)
         for slot, plen, x, dt, B, C in zip(
             slots, prefill_lens, x_per_slot, dt_per_slot, B_per_slot, C_per_slot,
         ):
@@ -579,14 +624,15 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         )
 
     def test_crossing_with_dominant_carried_state(self):
-        """Boundary crossing where the carried state dominates the output
+        """Repeated boundary crossings where the carried state dominates the output
         (weak decay: A ~ -0.01 → exp(dA_cs) ≈ 1). Guards the pipeline
-        ordering: the scan must consume the PRE-step boundary state, not the
-        one the fused snapshot writes during the same call — with strong
-        decay that corruption can round away in bf16 and hide."""
+        ordering and FP32 state-passing carry. With strong decay, either
+        corruption can round away in BF16 and hide."""
         max_batch, slot = 2, 0
         prefill_len = 20
-        n_decode = self.chunk_size + 5
+        # Cross twice: the second transition detects an accidental BF16
+        # store/reload of state passing's FP32 carry.
+        n_decode = 2 * self.chunk_size + 5
         total = prefill_len + n_decode
         x, dt, B, C = self._make_seq(total)
 
@@ -598,10 +644,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         )
 
         bufs = self._make_bufs(max_batch)
-        ssm_state = torch.zeros(
-            max_batch, self.nh, self.headdim, self.dstate,
-            device=self.device, dtype=self.dtype,
-        )
+        ssm_state = self._make_ssm_state(max_batch)
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
