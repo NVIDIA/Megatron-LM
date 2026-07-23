@@ -2006,12 +2006,23 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group_for_te = None
 
             if is_te_min_version("2.14.0"):
-                extra_kwargs["single_grouped_weight"] = getattr(
-                    config, "moe_single_grouped_weight", False
-                )
-                extra_kwargs["single_grouped_bias"] = getattr(
-                    config, "moe_single_grouped_bias", False
-                )
+                # Some TE 2.14 builds predate these keyword arguments. Cache the
+                # installed constructor signature instead of relying on the version alone.
+                global _TE_GROUPED_LINEAR_INIT_PARAMS
+                try:
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS
+                except NameError:
+                    grouped_linear_init_params = _TE_GROUPED_LINEAR_INIT_PARAMS = set(
+                        inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+                    )
+                if "single_grouped_weight" in grouped_linear_init_params:
+                    extra_kwargs["single_grouped_weight"] = getattr(
+                        config, "moe_single_grouped_weight", False
+                    )
+                if "single_grouped_bias" in grouped_linear_init_params:
+                    extra_kwargs["single_grouped_bias"] = getattr(
+                        config, "moe_single_grouped_bias", False
+                    )
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
             quant_config = get_quant_config_or_none(name, config.quant_recipe)

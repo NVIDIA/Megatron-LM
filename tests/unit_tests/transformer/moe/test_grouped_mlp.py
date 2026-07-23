@@ -38,6 +38,23 @@ def test_op_fuser_transformer_config_args_are_exposed():
     assert args.moe_mlp_glu_interleave_size == 16
 
 
+def test_clamped_swiglu_allows_te_op_fuser():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        activation_func_clamp_value=10.0,
+        use_transformer_engine_op_fuser=True,
+    )
+
+    assert config.activation_func_clamp_value == 10.0
+    assert config.use_transformer_engine_op_fuser is True
+
+
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
     interleaved = torch.tensor([[1, 2, 5, 6, 3, 4, 7, 8], [11, 12, 15, 16, 13, 14, 17, 18]])
     expected = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8], [11, 12, 13, 14, 15, 16, 17, 18]])
@@ -415,11 +432,21 @@ def _make_fake_te_namespace():
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     class FakeScaledClampedQGeGLU(torch.nn.Module):
-        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False, limit=None):
+        def __init__(
+            self,
+            glu_interleave_size,
+            *,
+            activation_recompute_in_mlp=False,
+            limit=None,
+            alpha=1.702,
+            glu_linear_offset=1.0,
+        ):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
             self.limit = limit
+            self.alpha = alpha
+            self.glu_linear_offset = glu_linear_offset
 
     class FakeScaledSReLU(torch.nn.Module):
         def __init__(self, *, activation_recompute_in_mlp=False):
@@ -447,8 +474,15 @@ def _make_fake_te_namespace():
     )
 
 
-def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
-    """quick_gelu + clamp value → ScaledClampedQGeGLU(limit=clamp)."""
+@pytest.mark.parametrize(
+    ("activation_func", "expected_alpha", "expected_offset"),
+    [(quick_gelu, 1.702, 1.0), (F.silu, 1.0, 0.0)],
+    ids=("quick-geglu", "clamped-swiglu"),
+)
+def test_make_fused_ops_uses_clamped_qgeglu(
+    monkeypatch, activation_func, expected_alpha, expected_offset
+):
+    """Clamped quick GeGLU and SwiGLU use the appropriate TE parameters."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
@@ -458,10 +492,10 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
         activation_func_clamp_value=7.0,
-        activation_func=quick_gelu,
+        activation_func=activation_func,
         gated_linear_unit=True,
     )
-    module.activation_func = quick_gelu
+    module.activation_func = activation_func
     module.activation_recompute = True
     common = dict(
         device="cuda",
@@ -483,6 +517,8 @@ def test_make_fused_ops_uses_clamped_qgeglu_for_quick_gelu(monkeypatch):
     assert activation.glu_interleave_size == 4
     assert activation.activation_recompute_in_mlp is True
     assert activation.limit == 7.0
+    assert activation.alpha == expected_alpha
+    assert activation.glu_linear_offset == expected_offset
 
 
 def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch):
@@ -573,12 +609,18 @@ def _install_fake_te_ops_modules(
 
 
 def _make_fused_impl_support_module(
-    FakeGroupedLinear, *, activation_func, gated_linear_unit, use_fused_weighted_squared_relu=False
+    FakeGroupedLinear,
+    *,
+    activation_func,
+    gated_linear_unit,
+    use_fused_weighted_squared_relu=False,
+    activation_func_clamp_value=None,
 ):
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
     module.config = SimpleNamespace(
         activation_func=activation_func,
+        activation_func_clamp_value=activation_func_clamp_value,
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
         moe_apply_probs_on_input=False,
@@ -632,6 +674,33 @@ def test_is_fused_impl_supported_requires_scaled_fc2_bias(monkeypatch):
     module.linear_fc2.use_bias = True
 
     assert module._is_fused_impl_supported() is False
+
+
+@pytest.mark.parametrize(
+    ("te_217_or_later", "include_clamped_qgeglu", "expected"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
+def test_is_fused_impl_supported_gates_clamped_swiglu(
+    monkeypatch, te_217_or_later, include_clamped_qgeglu, expected
+):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(
+        experts_module, "is_te_min_version", lambda version: version == "2.14.0" or te_217_or_later
+    )
+    _install_fake_te_ops_modules(
+        monkeypatch, fake_te, include_clamped_qgeglu=include_clamped_qgeglu
+    )
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        activation_func_clamp_value=10.0,
+    )
+
+    assert module._is_fused_impl_supported() is expected
 
 
 @pytest.mark.parametrize(
