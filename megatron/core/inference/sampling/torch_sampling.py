@@ -144,6 +144,8 @@ class TorchSampling(Sampling):
         n: int,
         context,
         *,
+        no_top_k: bool,
+        no_top_p: bool,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
         eager: bool = False,
@@ -155,6 +157,9 @@ class TorchSampling(Sampling):
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
+            no_top_k, no_top_p: Batch-level dispatch flags (part of the shared kernel
+                contract); ignored here since the exact per-bucket sort already handles
+                any top-k / top-p combination.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
@@ -164,8 +169,7 @@ class TorchSampling(Sampling):
         Returns:
             Sampled token ids of shape `[n]`.
         """
-        # CudaGraphManager consumes these args, if it exists.
-        del eager, cache_key
+        del eager, cache_key, no_top_k, no_top_p
 
         # Group active requests into sampling buckets by (temperature, top_k, top_p).
         active_request_count = context.total_request_count - context.paused_request_count
