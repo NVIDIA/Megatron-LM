@@ -38,7 +38,8 @@ class Sampling(ABC):
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
-            Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
+            Sampled token ids of shape `[n]`. CUDA graph callers may opt into a reusable static
+            buffer that is valid only until the same runner replays.
         """
         ...
 

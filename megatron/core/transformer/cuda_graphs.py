@@ -625,7 +625,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         runner.fwd_graph.replay()
 
-        if runner.is_last_layer:
+        if runner.is_last_layer and runner.clone_outputs:
             outputs = tuple(torch.clone(t) for t in runner.fwd_graph_output_surface)
             for output in outputs:
                 output.can_skip_replay_copy = False
@@ -682,6 +682,7 @@ class _CudaGraphRunner(torch.nn.Module):
         fwd_graph_input_kwargs: Dict[str, Any],
         func,
         need_backward,
+        clone_outputs,
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
@@ -715,6 +716,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.num_warmup_steps = 0
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
+        self.clone_outputs = clone_outputs
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
         self.is_first_layer = getattr(base_module, "is_first_layer", True)
         self.is_last_layer = getattr(base_module, "is_last_layer", True)
@@ -1369,6 +1371,7 @@ class CudaGraphManager(torch.nn.Module):
         pg_collection=None,
         inline_capture=False,
         num_warmup_steps=None,
+        clone_outputs=True,
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -1380,9 +1383,15 @@ class CudaGraphManager(torch.nn.Module):
                 `inference_context` is present in the kwargs of the forward call.
                 Setting this argument to True always forces the inline capture path to be taken.
             num_warmup_steps: If set, overrides the per-runner warmup step count.
+            clone_outputs: Clone graph outputs before returning them. Disable only for
+                forward-only callers that consume or copy the static output before replay.
         """
+        assert (
+            clone_outputs or not need_backward
+        ), "Static CUDA graph outputs require need_backward=False."
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
+        self._clone_outputs = clone_outputs
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -1491,6 +1500,7 @@ class CudaGraphManager(torch.nn.Module):
                         kwargs,
                         self.func,
                         self.need_backward,
+                        self._clone_outputs,
                     )
                     if self._num_warmup_steps is not None:
                         runner.num_warmup_steps = self._num_warmup_steps
@@ -1511,6 +1521,7 @@ class CudaGraphManager(torch.nn.Module):
                     kwargs,
                     self.func,
                     self.need_backward,
+                    self._clone_outputs,
                 )
                 self.cudagraph_runners.append(runner)
 

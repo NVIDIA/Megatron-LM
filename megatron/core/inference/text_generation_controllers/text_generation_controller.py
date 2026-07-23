@@ -23,6 +23,7 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
+from megatron.core.inference.ep_async_protocol import EPAsyncHandoffDecision, EPStepBeginDecision
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -71,6 +72,30 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+
+@dataclass(frozen=True)
+class _AsyncPendingForwardView:
+    """Request-row view for a pending speculative async forward."""
+
+    pending_request_ids: Tensor
+    cuda_graph_request_count: Optional[int]
+    current_request_ids: Optional[Tensor] = None
+    row_indices: Optional[Tensor] = None
+    row_indices_cpu: Optional[Tensor] = None
+    planned_request_query_lengths: Optional[Tensor] = None
+    planned_request_kv_length_offsets: Optional[Tensor] = None
+    planned_token_to_request_idx: Optional[Tensor] = None
+    planned_token_to_pos_ids: Optional[Tensor] = None
+    planned_token_to_block_idx: Optional[Tensor] = None
+    planned_token_to_local_position_within_kv_block: Optional[Tensor] = None
+    planned_mamba_read_indices: Optional[Tensor] = None
+    planned_mamba_write_indices: Optional[Tensor] = None
+
+    @property
+    def row_mapped(self) -> bool:
+        """Whether current rows must gather from different pending-forward rows."""
+        return self.row_indices is not None
 
 
 @dataclass
@@ -195,6 +220,15 @@ class TextGenerationController:
         """
         self._get_stop_word_finished_ids_callback = callback
 
+    def set_has_active_stop_words_callback(self, callback):
+        """Set a callback to test whether active requests use stop words."""
+        self._has_active_stop_words_callback = callback
+
+    def note_request_sampling_params(self, sampling_params: SamplingParams) -> None:
+        """Record request features that affect async scheduling hot-path checks."""
+        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+            self._async_logprob_requests_seen = True
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -207,12 +241,40 @@ class TextGenerationController:
 
         # Callback to get request IDs that should be marked as finished due to stop words
         self._get_stop_word_finished_ids_callback = None
+        self._has_active_stop_words_callback = None
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
 
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
+        self._async_scheduling_enabled = context.config.enable_async_scheduling
+        self._async_pending_forward = False
+        self._async_pending_cuda_graph_request_count = None
+        self._async_disable_reason = None
+        self._async_forward_launch_count = 0
+        self._async_deferred_mtp_release_count = 0
+        self._async_eligibility_check_count = 0
+        self._async_eligibility_pass_count = 0
+        self._async_disable_reason_counts: Dict[str, int] = {}
+        self._async_pending_forward_view = None
+        self._dummy_context_h2d_done_event = None
+        self._async_step_barrier_reason = None
+        self._async_admission_barrier_requested = False
+        self._async_logprob_requests_seen = False
+        self._async_row_mapped_forward_count = 0
+        self._async_discarded_forward_count = 0
+        self._async_add_deferral_count = 0
+        self._async_finish_boundary_count = 0
+        self._async_mtp_finish_boundary_count = 0
+        self._async_pause_boundary_count = 0
+        self._async_evict_boundary_count = 0
+        self._async_prepare_deferred_until_after_sampling = False
+        self._async_sample_slot_count = 2
+        self._async_current_sample_slot = 0
+        self._ep_async_protocol = None
+        self._ep_async_handoff_decided_this_step = False
+        self._ep_async_handoff_decision_this_step: Optional[EPAsyncHandoffDecision] = None
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -222,12 +284,31 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = None
         self._async_sched_logits = AsyncScheduleLogitsState()
-        # This buffer has a stable address across legacy-prefill, async-decode,
-        # and MTP routing. Sampling producers must copy into it rather than rebind it.
-        self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
-        self._async_sched_sample_values_cuda = torch.empty(
-            max_requests, dtype=logits_dtype, device=device
+        self._sampled_tokens_cuda_slots = torch.empty(
+            (self._async_sample_slot_count, max_requests), dtype=torch.int64, device=device
         )
+        self._sampling_gather_indices_cuda = torch.empty(
+            max_logits, dtype=torch.int64, device=device
+        )
+        self._async_sampled_tokens_cpu_slots = torch.empty(
+            (self._async_sample_slot_count, max_requests),
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        )
+        self._sampled_mtp_tokens_cuda_slots = None
+        self._async_sampled_mtp_tokens_cpu_slots = None
+        self._sampled_tokens_cuda = self._sampled_tokens_cuda_slots[0]
+        self._async_sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[0]
+        self._async_sample_source_ready_events = tuple(
+            torch.cuda.Event() for _ in range(self._async_sample_slot_count)
+        )
+        self._async_sample_ready_events = tuple(
+            torch.cuda.Event() for _ in range(self._async_sample_slot_count)
+        )
+        self._async_sample_source_ready_event = self._async_sample_source_ready_events[0]
+        self._async_sample_ready_event = self._async_sample_ready_events[0]
+        self._async_copy_stream = torch.cuda.Stream(device=device)
         self._async_sched_sampled_tokens_cpu_buffer = torch.empty(
             max_requests, dtype=torch.int64, device="cpu", pin_memory=True
         )
@@ -242,6 +323,11 @@ class TextGenerationController:
                 self.sampling_rng,
                 config=self.model_config,
                 enable_cuda_graph=self._enable_cuda_graph,
+                return_static_graph_outputs=(
+                    self._async_scheduling_enabled
+                    or getattr(context.config, "async_sched_mode", AsyncScheduleMode.LEGACY)
+                    != AsyncScheduleMode.LEGACY
+                ),
             )
         else:
             self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
@@ -253,6 +339,7 @@ class TextGenerationController:
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
         self._init_mtp_sampling_tensors()
+        self._select_async_sample_slot(0)
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -261,6 +348,7 @@ class TextGenerationController:
         """
         if not self.num_speculative_tokens:
             self._sampled_mtp_tokens_cuda = None
+            self._async_sampled_mtp_tokens_cpu = None
             self._accepted_tokens_per_request = None
             self._last_accepted_seq_indices = None
             return
@@ -268,9 +356,19 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         device = torch.cuda.current_device()
-        self._sampled_mtp_tokens_cuda = torch.empty(
-            [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
+        self._sampled_mtp_tokens_cuda_slots = torch.empty(
+            [self._async_sample_slot_count, self.num_speculative_tokens, max_requests],
+            dtype=torch.int64,
+            device=device,
         )
+        self._async_sampled_mtp_tokens_cpu_slots = torch.empty(
+            [self._async_sample_slot_count, self.num_speculative_tokens, max_requests],
+            dtype=torch.int64,
+            device='cpu',
+            pin_memory=True,
+        )
+        self._sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda_slots[0]
+        self._async_sampled_mtp_tokens_cpu = self._async_sampled_mtp_tokens_cpu_slots[0]
         self._accepted_tokens_per_request = (
             torch.ones(
                 [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
@@ -288,6 +386,19 @@ class TextGenerationController:
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
         )
+
+    def _select_async_sample_slot(self, sample_slot: int) -> None:
+        """Select the sampled-token buffers used by subsequent GPU sampling operations."""
+        self._async_current_sample_slot = sample_slot
+        self._sampled_tokens_cuda = self._sampled_tokens_cuda_slots[sample_slot]
+        self._async_sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[sample_slot]
+        self._async_sample_source_ready_event = self._async_sample_source_ready_events[sample_slot]
+        self._async_sample_ready_event = self._async_sample_ready_events[sample_slot]
+        if self.num_speculative_tokens > 0:
+            self._sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda_slots[sample_slot]
+            self._async_sampled_mtp_tokens_cpu = self._async_sampled_mtp_tokens_cpu_slots[
+                sample_slot
+            ]
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -615,13 +726,23 @@ class TextGenerationController:
 
         # Initialize attention state and optionally publish CPU bookkeeping to GPU.
         range_push("initialize_attention_state")
-        bookkeeping_done_event = context.initialize_attention_state(
+        context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
-            transfer_bookkeeping_to_gpu=transfer_bookkeeping_to_gpu,
-            record_bookkeeping_done_event=record_bookkeeping_done_event,
+            transfer_bookkeeping_to_gpu=False,
         )
         range_pop()
+
+        bookkeeping_done_event = None
+        if transfer_bookkeeping_to_gpu:
+            # Single batch CPU-to-GPU transfer of bookkeeping state.
+            range_push("transfer_bookkeeping_to_gpu")
+            bookkeeping_done_event = context.transfer_bookkeeping_to_gpu(
+                record_done_event=(record_bookkeeping_done_event or is_dummy_forward)
+            )
+            if is_dummy_forward:
+                self._dummy_context_h2d_done_event = bookkeeping_done_event
+            range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
 
@@ -697,6 +818,8 @@ class TextGenerationController:
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
             # logits shape: [1, seq_len, vocab_size]
+            if isinstance(logits, tuple):
+                logits = logits[0]
 
         if not context.config.materialize_only_last_token_logits:
             assert logits_seq_len == input_ids.shape[1]
@@ -773,14 +896,18 @@ class TextGenerationController:
             # don't need to re-upload prefill_status for the Mamba kernels.
             prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
             accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
-            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
-            ].to(cuda_device, non_blocking=True)
+            mamba_state_idx = context._mamba_base_indices(active_request_slice).to(
+                cuda_device, non_blocking=True
+            )
+            mamba_destination_state_idx = context._mamba_flat_indices(active_request_slice).to(
+                cuda_device, non_blocking=True
+            )
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
                 prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
+                destination_state_idx=mamba_destination_state_idx,
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
@@ -789,6 +916,7 @@ class TextGenerationController:
                 current_states=context.mamba_ssm_states,
                 prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
+                destination_state_idx=mamba_destination_state_idx,
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
@@ -929,8 +1057,12 @@ class TextGenerationController:
                 )
                 nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/forward")
 
-                # Strip padding from logits only. Hidden states stay padded+SP
+                # Gather logits for sampling. Hidden states stay padded+SP
                 # between depths to avoid redundant gather/scatter round-trips.
+                if self._sp_enabled:
+                    mtp_logits = gather_from_sequence_parallel_region(
+                        mtp_logits, group=self.inference_wrapped_model.tp_group
+                    )
                 mtp_logits = mtp_logits[:active_request_count]
 
                 # mtp_logits: [active_request_count, 1, vocab_size]
@@ -981,7 +1113,9 @@ class TextGenerationController:
             num_speculative_tokens=self.num_speculative_tokens,
         )
 
-    def _dynamic_step_sample_logits_and_verify_tokens(self, input_ids: Tensor):
+    def _dynamic_step_sample_logits_and_verify_tokens(
+        self, input_ids: Tensor, row_indices: Optional[Tensor] = None
+    ):
         """
         Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
         """
@@ -1009,21 +1143,36 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
-        # `speculative_required_logit_indices()` already returns padded indices when
-        # running a captured graph (`num_last_token_logits` uses the padded counts and
-        # `pad_active_slices` zero-pads the trailing slots), so the call site does not
-        # need to re-pad here.
+        # Keep the real prefix for verification. The graph-only gather view is normalized
+        # into fixed-size storage below, including after pending-forward row remapping.
         required_logit_indices = context.speculative_required_logit_indices()
+        pending_forward_logit_indices = required_logit_indices
+        stride = self.num_speculative_tokens + 1
+        if row_indices is not None:
+            pending_forward_logit_indices = (
+                row_indices.to(required_logit_indices.dtype).unsqueeze(1) * stride
+                + torch.arange(
+                    stride, device=row_indices.device, dtype=required_logit_indices.dtype
+                ).unsqueeze(0)
+            ).reshape(-1)
 
         if context.config.materialize_only_last_token_logits:
             # last_token_logits already selected exactly the required positions.
             sample_logits = logits.squeeze(0)
-            sample_gather_indices = None
+            sample_gather_indices = (
+                pending_forward_logit_indices if row_indices is not None else None
+            )
         else:
-            # Push the gather inside the captured kernel:
-            # pass the full per-token logits buffer (constant shape) plus the padded indices.
             sample_logits = logits.squeeze(0)
-            sample_gather_indices = required_logit_indices
+            sample_gather_indices = pending_forward_logit_indices
+        sample_token_count = sample_num_decode * stride + sample_num_prefill
+        actual_token_count = context.num_decode_requests * stride + context.num_prefill_requests
+        sample_gather_indices = self._normalize_sampling_gather_indices(
+            sample_gather_indices,
+            sample_token_count,
+            actual_token_count,
+            use_graph=use_graph_for_sampling,
+        )
         nvtx_range_pop("mtp-spec-decoding/verify/logit-indices")
 
         # Sample tokens from logits
@@ -1037,7 +1186,12 @@ class TextGenerationController:
             gather_indices=sample_gather_indices,
             eager=not use_graph_for_sampling,
             cache_key=(
-                ("sample_speculative", sample_num_decode, sample_num_prefill)
+                (
+                    "sample_speculative",
+                    sample_num_decode,
+                    sample_num_prefill,
+                    sample_gather_indices is not None,
+                )
                 if use_graph_for_sampling
                 else None
             ),
@@ -1049,7 +1203,7 @@ class TextGenerationController:
 
         # Verify speculative tokens against input tokens.
         nvtx_range_push("mtp-spec-decoding/verify/verify-tokens")
-        input_tokens_required = input_ids[0, required_logit_indices]
+        input_tokens_required = input_ids[0, required_logit_indices[:actual_token_count]]
         last_one_indices, accepted_tokens_mask, input_tokens_required = (
             self._verify_speculative_tokens(
                 output_tokens,
@@ -1065,7 +1219,7 @@ class TextGenerationController:
         self._prepare_speculative_tokens_for_next_forward_pass(
             num_decode_requests,
             output_tokens,
-            required_logit_indices,
+            pending_forward_logit_indices[:actual_token_count],
             last_one_indices,
             accepted_tokens_mask,
             input_tokens_required,
@@ -1106,13 +1260,39 @@ class TextGenerationController:
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
-    def _dynamic_step_sample_logits(self):
+    def _normalize_sampling_gather_indices(
+        self,
+        gather_indices: Optional[Tensor],
+        graph_count: int,
+        actual_count: int,
+        *,
+        use_graph: bool,
+    ) -> Optional[Tensor]:
+        """Pad gather indices into a stable graph input buffer."""
+        if gather_indices is None or not use_graph:
+            return gather_indices
+
+        assert gather_indices.numel() >= actual_count
+        assert graph_count <= self._sampling_gather_indices_cuda.numel()
+        graph_indices = self._sampling_gather_indices_cuda[:graph_count]
+        graph_indices.fill_(0)
+        graph_indices[:actual_count].copy_(gather_indices[:actual_count])
+        return graph_indices
+
+    def _dynamic_step_sample_logits(
+        self, sample_count: Optional[int] = None, row_indices: Optional[Tensor] = None
+    ) -> None:
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
 
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if sample_count is None
+            else sample_count
+        )
+
         use_graph = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
@@ -1121,12 +1301,18 @@ class TextGenerationController:
         # Padded count when running a captured graph (cache key buckets); actual otherwise.
         n = context.padded_active_request_count if use_graph else active_request_count
         # When `materialize_only_last_token_logits` is true the forward pass already
-        # selected the right rows. Otherwise we point the kernel at the per-request
-        # last-token positions via `gather_indices`; padded slots safely fan in to row 0.
-        gather_indices = (
-            None
-            if context.config.materialize_only_last_token_logits
-            else context.gpu_view.active_request_last_token_idxs
+        # selected the right rows. Otherwise point the kernel at per-request
+        # last-token positions. Row-mapped reuse remaps those gather indices.
+        if context.config.materialize_only_last_token_logits:
+            gather_indices = row_indices
+        elif context.is_decode_only():
+            gather_indices = row_indices
+        else:
+            gather_indices = context.gpu_view.active_request_last_token_idxs
+            if row_indices is not None:
+                gather_indices = gather_indices.index_select(0, row_indices)
+        gather_indices = self._normalize_sampling_gather_indices(
+            gather_indices, n, active_request_count, use_graph=use_graph
         )
         sampled_tokens_cuda = self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
@@ -1134,11 +1320,679 @@ class TextGenerationController:
             context,
             gather_indices=gather_indices,
             eager=not use_graph,
-            cache_key=("sample", n) if use_graph else None,
+            cache_key=("sample", n, gather_indices is not None) if use_graph else None,
         )
         self._sampled_tokens_cuda[:active_request_count].copy_(
             sampled_tokens_cuda[:active_request_count]
         )
+
+    def has_pending_async_forward(self) -> bool:
+        """Whether a speculative async forward has already been launched for the next step."""
+        return self._async_pending_forward
+
+    def set_ep_async_protocol(self, protocol) -> None:
+        """Attach the EP async protocol used by coordinator-driven EP decoding."""
+        self._ep_async_protocol = protocol
+
+    def request_async_admission_barrier(self) -> None:
+        """Stop chaining async forwards once so waiting requests can be admitted."""
+        self._async_add_deferral_count += 1
+        self._async_admission_barrier_requested = True
+
+    def set_async_step_barrier(self, reason: str) -> None:
+        """Prevent async launches for the current engine step."""
+        assert reason
+        self._async_step_barrier_reason = reason
+
+    def clear_async_step_barrier(self) -> None:
+        """Allow async launches after a temporary step barrier."""
+        self._async_step_barrier_reason = None
+
+    def get_async_scheduling_diagnostics(self) -> Dict[str, Any]:
+        """Return cheap async scheduling diagnostics for tests and benchmark logs."""
+        return {
+            "enabled": self._async_scheduling_enabled,
+            "pending_forward": self._async_pending_forward,
+            "step_barrier_reason": self._async_step_barrier_reason,
+            "eligibility_checks": self._async_eligibility_check_count,
+            "eligibility_passes": self._async_eligibility_pass_count,
+            "disable_reason_counts": dict(self._async_disable_reason_counts),
+            "last_disable_reason": self._async_disable_reason,
+            "forward_launches": self._async_forward_launch_count,
+            "ep_protocol": (
+                self._ep_async_protocol.diagnostics()
+                if self._ep_async_protocol is not None
+                else None
+            ),
+        }
+
+    def _record_async_eligibility_result(self, reason: Optional[str]) -> None:
+        """Record one async eligibility decision without synchronizing with the GPU."""
+        self._async_eligibility_check_count += 1
+        if reason is None:
+            self._async_eligibility_pass_count += 1
+        else:
+            self._record_async_disable_reason(reason)
+
+    def _record_async_disable_reason(self, reason: str) -> None:
+        """Count a reason that prevented an async launch after scheduling was considered."""
+        self._async_disable_reason_counts[reason] = (
+            self._async_disable_reason_counts.get(reason, 0) + 1
+        )
+
+    def _active_request_ids_cpu(self) -> Tensor:
+        """Return the current active request IDs in row order."""
+        context = self.inference_wrapped_model.inference_context
+        return context.request_ids[
+            context.paused_request_count : context.total_request_count
+        ].clone()
+
+    def _record_async_pending_forward_requests(
+        self, cuda_graph_request_count: Optional[int]
+    ) -> None:
+        """Remember the request-row order that a speculative forward is computing."""
+        context = self.inference_wrapped_model.inference_context
+        pending_request_ids = context.async_prepared_request_ids_cpu()
+        if pending_request_ids is None:
+            pending_request_ids = self._active_request_ids_cpu()
+        request_count = int(pending_request_ids.numel())
+        planned_layout = self._capture_pending_forward_layout(request_count)
+        self._async_pending_forward_view = _AsyncPendingForwardView(
+            pending_request_ids=pending_request_ids,
+            cuda_graph_request_count=cuda_graph_request_count,
+            **planned_layout,
+        )
+        context.clear_async_prepared_decode_plan()
+
+    def _pending_async_forward_matches_current_rows(self) -> bool:
+        """Return whether a pending speculative forward still has current row order."""
+        pending_view = self._async_pending_forward_view
+        if pending_view is None:
+            return True
+        return torch.equal(pending_view.pending_request_ids, self._active_request_ids_cpu())
+
+    def _capture_pending_forward_layout(self, request_count: int) -> Dict[str, Optional[Tensor]]:
+        """Snapshot the CPU-visible layout used by the prepared async forward."""
+        context = self.inference_wrapped_model.inference_context
+        tokens_per_request = self.num_speculative_tokens + 1
+        token_count = request_count * tokens_per_request
+
+        def _clone_optional(name: str, count: int) -> Optional[Tensor]:
+            value = getattr(context, name, None)
+            if value is None:
+                return None
+            return value[:count].clone()
+
+        layout = {
+            "planned_request_query_lengths": _clone_optional(
+                "_staging_request_query_lengths", request_count
+            ),
+            "planned_request_kv_length_offsets": _clone_optional(
+                "_staging_request_kv_length_offsets", request_count
+            ),
+            "planned_token_to_request_idx": None,
+            "planned_token_to_pos_ids": None,
+            "planned_token_to_block_idx": None,
+            "planned_token_to_local_position_within_kv_block": None,
+            "planned_mamba_read_indices": None,
+            "planned_mamba_write_indices": None,
+        }
+        if token_count <= 0:
+            return layout
+
+        for field in (
+            "token_to_request_idx",
+            "token_to_pos_ids",
+            "token_to_block_idx",
+            "token_to_local_position_within_kv_block",
+        ):
+            value = getattr(context, field, None)
+            if value is None:
+                continue
+            layout[f"planned_{field}"] = (
+                value[:token_count].view(request_count, tokens_per_request).clone()
+            )
+        if getattr(context, "is_hybrid_model", False):
+            for source, target in (
+                ("_cpu_mamba_batch_indices_decode", "planned_mamba_read_indices"),
+                ("_cpu_mamba_batch_indices_decode_write", "planned_mamba_write_indices"),
+            ):
+                value = getattr(context, source, None)
+                if value is not None:
+                    layout[target] = value[:request_count].clone()
+        return layout
+
+    def _pending_forward_layout_matches_current(
+        self, pending_view: _AsyncPendingForwardView
+    ) -> bool:
+        """Return whether the prepared async layout matches reconciled CPU state."""
+        planned_fields = (
+            pending_view.planned_request_query_lengths,
+            pending_view.planned_request_kv_length_offsets,
+            pending_view.planned_token_to_request_idx,
+            pending_view.planned_token_to_pos_ids,
+            pending_view.planned_token_to_block_idx,
+            pending_view.planned_token_to_local_position_within_kv_block,
+            pending_view.planned_mamba_read_indices,
+            pending_view.planned_mamba_write_indices,
+        )
+        if all(field is None for field in planned_fields):
+            return True
+
+        context = self.inference_wrapped_model.inference_context
+        current_request_ids = (
+            pending_view.current_request_ids
+            if pending_view.current_request_ids is not None
+            else self._active_request_ids_cpu()
+        )
+        request_count = int(current_request_ids.numel())
+        pending_request_count = int(pending_view.pending_request_ids.numel())
+        if request_count == 0 or pending_request_count < request_count:
+            return False
+
+        row_indices = pending_view.row_indices_cpu
+        if row_indices is None:
+            if pending_request_count != request_count:
+                return False
+            row_indices = torch.arange(request_count, dtype=torch.long, device='cpu')
+        else:
+            row_indices = row_indices.to(dtype=torch.long, device='cpu')
+            if row_indices.numel() != request_count:
+                return False
+            if bool((row_indices < 0).any()) or bool((row_indices >= pending_request_count).any()):
+                return False
+
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        if pending_view.planned_request_query_lengths is not None:
+            current_query_lengths = context.request_query_lengths[active_slice][:request_count]
+            planned_query_lengths = pending_view.planned_request_query_lengths.index_select(
+                0, row_indices
+            )
+            if not torch.equal(current_query_lengths, planned_query_lengths):
+                return False
+
+        if pending_view.planned_request_kv_length_offsets is not None:
+            current_kv_offsets = context.request_kv_length_offsets[active_slice][:request_count]
+            planned_kv_offsets = pending_view.planned_request_kv_length_offsets.index_select(
+                0, row_indices
+            )
+            if not torch.equal(current_kv_offsets, planned_kv_offsets):
+                return False
+
+        tokens_per_request = self.num_speculative_tokens + 1
+        token_count = request_count * tokens_per_request
+        if context.active_token_count != token_count:
+            return False
+
+        if pending_view.planned_token_to_request_idx is not None:
+            current_token_rows = (
+                context.token_to_request_idx[:token_count]
+                .view(request_count, tokens_per_request)
+                .to(dtype=torch.long, device='cpu')
+            )
+            planned_token_rows = pending_view.planned_token_to_request_idx.index_select(
+                0, row_indices
+            ).to(dtype=torch.long, device='cpu')
+            if (
+                bool((current_token_rows < 0).any())
+                or bool((current_token_rows >= request_count).any())
+                or bool((planned_token_rows < 0).any())
+                or bool((planned_token_rows >= pending_request_count).any())
+            ):
+                return False
+            current_token_request_ids = current_request_ids.index_select(
+                0, current_token_rows.reshape(-1)
+            ).view_as(current_token_rows)
+            planned_token_request_ids = pending_view.pending_request_ids.index_select(
+                0, planned_token_rows.reshape(-1)
+            ).view_as(planned_token_rows)
+            if not torch.equal(current_token_request_ids, planned_token_request_ids):
+                return False
+
+        for field in (
+            "token_to_pos_ids",
+            "token_to_block_idx",
+            "token_to_local_position_within_kv_block",
+        ):
+            planned = getattr(pending_view, f"planned_{field}")
+            if planned is None:
+                continue
+            current = getattr(context, field)[:token_count].view(request_count, tokens_per_request)
+            planned_in_current_order = planned.index_select(0, row_indices)
+            if not torch.equal(current, planned_in_current_order):
+                return False
+
+        if getattr(context, "is_hybrid_model", False):
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            if pending_view.planned_mamba_read_indices is not None:
+                current_read_indices = context._mamba_flat_indices(active_slice)[:request_count]
+                planned_read_indices = pending_view.planned_mamba_read_indices.index_select(
+                    0, row_indices
+                )
+                if not torch.equal(current_read_indices, planned_read_indices):
+                    return False
+            if pending_view.planned_mamba_write_indices is not None:
+                current_write_indices = context._mamba_flat_indices(
+                    active_slice, use_candidate_bank=True
+                )[:request_count]
+                planned_write_indices = pending_view.planned_mamba_write_indices.index_select(
+                    0, row_indices
+                )
+                if not torch.equal(current_write_indices, planned_write_indices):
+                    return False
+
+        return True
+
+    def _map_pending_forward_to_current_rows(
+        self, pending_view: _AsyncPendingForwardView
+    ) -> Optional[_AsyncPendingForwardView]:
+        """Resolve current request rows against the pending forward's row layout."""
+        current_request_ids = self._active_request_ids_cpu()
+        if current_request_ids.numel() == 0:
+            return None
+        if not self._pending_forward_graph_shape_matches_current(pending_view):
+            return None
+
+        pending_request_ids = pending_view.pending_request_ids
+        if torch.equal(pending_request_ids, current_request_ids):
+            current_view = _AsyncPendingForwardView(
+                pending_request_ids=pending_request_ids,
+                cuda_graph_request_count=pending_view.cuda_graph_request_count,
+                current_request_ids=current_request_ids,
+                planned_request_query_lengths=pending_view.planned_request_query_lengths,
+                planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
+                planned_token_to_request_idx=pending_view.planned_token_to_request_idx,
+                planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
+                planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
+                planned_token_to_local_position_within_kv_block=(
+                    pending_view.planned_token_to_local_position_within_kv_block
+                ),
+                planned_mamba_read_indices=pending_view.planned_mamba_read_indices,
+                planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
+            )
+            return (
+                current_view if self._pending_forward_layout_matches_current(current_view) else None
+            )
+        if pending_request_ids.numel() < current_request_ids.numel():
+            return None
+
+        pending_row_by_request_id = {
+            int(request_id): row for row, request_id in enumerate(pending_request_ids.tolist())
+        }
+        mapped_rows = []
+        for request_id in current_request_ids.tolist():
+            row = pending_row_by_request_id.get(int(request_id))
+            if row is None:
+                return None
+            mapped_rows.append(row)
+
+        row_indices_cpu = torch.tensor(mapped_rows, dtype=torch.long, device='cpu')
+        row_indices = torch.tensor(
+            mapped_rows, dtype=torch.long, device=torch.cuda.current_device()
+        )
+        current_view = _AsyncPendingForwardView(
+            pending_request_ids=pending_request_ids,
+            cuda_graph_request_count=pending_view.cuda_graph_request_count,
+            current_request_ids=current_request_ids,
+            row_indices=row_indices,
+            row_indices_cpu=row_indices_cpu,
+            planned_request_query_lengths=pending_view.planned_request_query_lengths,
+            planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
+            planned_token_to_request_idx=pending_view.planned_token_to_request_idx,
+            planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
+            planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
+            planned_token_to_local_position_within_kv_block=(
+                pending_view.planned_token_to_local_position_within_kv_block
+            ),
+            planned_mamba_read_indices=pending_view.planned_mamba_read_indices,
+            planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
+        )
+        return current_view if self._pending_forward_layout_matches_current(current_view) else None
+
+    def _pending_forward_graph_shape_matches_current(
+        self, pending_view: _AsyncPendingForwardView
+    ) -> bool:
+        """Return whether the pending forward used the graph shape current rows expect."""
+        context = self.inference_wrapped_model.inference_context
+        current_graph_request_count = (
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
+        )
+        return pending_view.cuda_graph_request_count == current_graph_request_count
+
+    def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
+        """Return whether the pending forward is reusable and whether row mapping is needed."""
+        pending_view = self._async_pending_forward_view
+        if pending_view is None:
+            return True, False
+
+        current_view = self._map_pending_forward_to_current_rows(pending_view)
+        if current_view is None:
+            return False, False
+        return True, current_view.row_mapped
+
+    def _resolve_pending_async_forward_view(self) -> Optional[_AsyncPendingForwardView]:
+        """Resolve the pending speculative forward's row layout for current consumers.
+
+        Returns ``None`` when a current request was not present in the pending
+        forward, meaning the pending forward cannot be safely reused.
+        """
+        pending_view = self._async_pending_forward_view
+        self._async_pending_forward_view = None
+        if pending_view is None:
+            return None
+
+        current_view = self._map_pending_forward_to_current_rows(pending_view)
+        if current_view is not None:
+            if current_view.row_mapped:
+                self._async_row_mapped_forward_count += 1
+            return current_view
+
+        self._async_discarded_forward_count += 1
+        return None
+
+    def _discard_pending_async_forward(self) -> None:
+        """Discard a pending async forward and release resources reserved for it."""
+        context = self.inference_wrapped_model.inference_context
+        if self._async_pending_forward:
+            context.release_deferred_async_resources()
+            self._async_pending_forward = False
+            self._async_pending_cuda_graph_request_count = None
+            self._async_pending_forward_view = None
+            self._async_discarded_forward_count += 1
+
+    def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
+        """Synchronize pending async state at the beginning of an EP work step."""
+        self._ep_async_handoff_decided_this_step = False
+        self._ep_async_handoff_decision_this_step = None
+        pending_forward_reusable = True
+        pending_forward_row_mapped = False
+        if self._async_pending_forward:
+            pending_forward_reusable, pending_forward_row_mapped = (
+                self._pending_async_forward_row_status()
+            )
+
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            return self._ep_async_protocol.decide_step_begin(
+                has_real_work=has_real_work,
+                has_pending_forward=self._async_pending_forward,
+                pending_forward_reusable=pending_forward_reusable,
+                pending_forward_row_mapped=pending_forward_row_mapped,
+            )
+
+        return EPStepBeginDecision(
+            step_id=-1,
+            has_real_work=has_real_work,
+            reuse_pending_forward=bool(self._async_pending_forward and pending_forward_reusable),
+            discard_pending_forward=bool(
+                self._async_pending_forward and not pending_forward_reusable
+            ),
+            row_mapped_forward=bool(self._async_pending_forward and pending_forward_row_mapped),
+        )
+
+    def _decide_ep_async_handoff(
+        self, *, has_real_work: bool, can_launch_async_handoff: bool
+    ) -> EPAsyncHandoffDecision:
+        """Synchronize whether this EP work step launches the async forward handoff."""
+        if self._ep_async_handoff_decision_this_step is not None:
+            return self._ep_async_handoff_decision_this_step
+
+        self._ep_async_handoff_decided_this_step = True
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            decision = self._ep_async_protocol.decide_async_handoff(
+                has_real_work=has_real_work, can_launch_async_handoff=can_launch_async_handoff
+            )
+            self._ep_async_handoff_decision_this_step = decision
+            return decision
+
+        decision = EPAsyncHandoffDecision(
+            step_id=-1,
+            has_real_work=has_real_work,
+            launch_async_forward=can_launch_async_handoff,
+            skip_async_forward=not can_launch_async_handoff,
+            any_launch_request=can_launch_async_handoff,
+            any_skip_request=not can_launch_async_handoff,
+        )
+        self._ep_async_handoff_decision_this_step = decision
+        return decision
+
+    def _ensure_ep_async_handoff_decided(self, *, has_real_work: bool) -> None:
+        """Publish an explicit EP async handoff skip when this step did not attempt one."""
+        if self._ep_async_handoff_decided_this_step:
+            return
+        self._decide_ep_async_handoff(has_real_work=has_real_work, can_launch_async_handoff=False)
+
+    def _wait_for_dummy_context_h2d(self) -> None:
+        """Wait for dummy metadata H2D before reusing its pinned CPU source buffer."""
+        h2d_done_event = self._dummy_context_h2d_done_event
+        if h2d_done_event is None:
+            return
+        h2d_done_event.synchronize()
+        self._dummy_context_h2d_done_event = None
+
+    def _try_launch_dummy_async_handoff(self) -> bool:
+        """Mirror the real-rank async forward handoff on an EP dummy rank."""
+        context = self.inference_wrapped_model.inference_context
+        self._async_disable_reason = self._dummy_async_handoff_disabled_reason()
+        self._record_async_eligibility_result(self._async_disable_reason)
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=False, can_launch_async_handoff=(self._async_disable_reason is None)
+        )
+        if self._async_disable_reason is not None:
+            return False
+        if not handoff_decision.launch_async_forward:
+            self._async_disable_reason = "ep async handoff skipped"
+            self._record_async_disable_reason(self._async_disable_reason)
+            return False
+
+        self._wait_for_dummy_context_h2d()
+        context.reset(preserve_prefix_cache=True)
+        range_push("ep_dummy_async_handoff")
+        try:
+            input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+            self._async_forward_launch_count += 1
+        finally:
+            range_pop()
+        return True
+
+    def _dynamic_step_sample_logits_to_next_input_ids(
+        self, sample_count: Optional[int] = None, row_indices: Optional[Tensor] = None
+    ) -> None:
+        """Sample logits and write sampled ids into next-step GPU inputs."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if sample_count is None
+            else sample_count
+        )
+        self._dynamic_step_sample_logits(sample_count=active_request_count, row_indices=row_indices)
+        self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
+
+    def _copy_sampled_decode_tokens_to_next_input_ids(
+        self, active_request_count: Optional[int] = None
+    ) -> None:
+        """Write sampled decode tokens into the next-step GPU input-id buffer."""
+        context = self.inference_wrapped_model.inference_context
+        if context.copy_async_prepared_decode_input_ids_from_samples(
+            self._sampled_tokens_cuda,
+            self._sampled_mtp_tokens_cuda,
+            num_speculative_tokens=self.num_speculative_tokens,
+        ):
+            return
+
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        tokens_per_request = self.num_speculative_tokens + 1
+        if tokens_per_request == 1:
+            context.gpu_view.token_to_input_ids[:active_request_count].copy_(
+                self._sampled_tokens_cuda[:active_request_count]
+            )
+            return
+
+        token_ids = context.gpu_view.token_to_input_ids[
+            : active_request_count * tokens_per_request
+        ].view(active_request_count, tokens_per_request)
+        token_ids[:, 0].copy_(self._sampled_tokens_cuda[:active_request_count])
+        token_ids[:, 1:].copy_(
+            self._sampled_mtp_tokens_cuda[:, :active_request_count].transpose(0, 1)
+        )
+
+    def _async_transfer_samples_to_cpu(
+        self,
+        active_request_count: int,
+        sample_source_ready_event: Optional[torch.cuda.Event] = None,
+        sample_slot: Optional[int] = None,
+    ) -> Tuple[Tensor, Optional[Tensor], torch.cuda.Event]:
+        """Copy sampled tokens to pinned CPU memory without blocking the default stream."""
+        sample_slot = self._async_current_sample_slot if sample_slot is None else sample_slot
+        sampled_tokens_cuda = self._sampled_tokens_cuda_slots[sample_slot]
+        sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[sample_slot]
+        if sample_source_ready_event is None:
+            current_stream = torch.cuda.current_stream()
+            sample_source_ready_event = self._async_sample_source_ready_events[sample_slot]
+            sample_source_ready_event.record(current_stream)
+        sample_ready_event = self._async_sample_ready_events[sample_slot]
+        with torch.cuda.stream(self._async_copy_stream):
+            self._async_copy_stream.wait_event(sample_source_ready_event)
+            sampled_tokens_cpu[:active_request_count].copy_(
+                sampled_tokens_cuda[:active_request_count], non_blocking=True
+            )
+            if self.num_speculative_tokens > 0:
+                self._async_sampled_mtp_tokens_cpu_slots[
+                    sample_slot, :, :active_request_count
+                ].copy_(
+                    self._sampled_mtp_tokens_cuda_slots[sample_slot, :, :active_request_count],
+                    non_blocking=True,
+                )
+            sample_ready_event.record(self._async_copy_stream)
+        sampled_mtp_tokens_cpu = (
+            self._async_sampled_mtp_tokens_cpu_slots[sample_slot, :, :active_request_count]
+            if self.num_speculative_tokens > 0
+            else None
+        )
+        return (
+            sampled_tokens_cpu[:active_request_count],
+            sampled_mtp_tokens_cpu,
+            sample_ready_event,
+        )
+
+    def _try_prepare_async_decode_before_sampling(self) -> bool:
+        """Prepare steady-state next-step metadata before current-step sampling."""
+        context = self.inference_wrapped_model.inference_context
+        self._async_disable_reason = self._async_scheduling_disabled_reason()
+        self._record_async_eligibility_result(self._async_disable_reason)
+        if self._async_disable_reason is not None:
+            self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
+            return False
+        range_push("async_prepare_next_step")
+        async_next_prepared = context.prepare_async_decode_next_step(pre_sampling=True)
+        range_pop()
+        if not async_next_prepared:
+            self._async_prepare_deferred_until_after_sampling = True
+            return False
+
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+        if handoff_decision.launch_async_forward:
+            return True
+
+        context.discard_async_prepared_decode_plan()
+        self._async_disable_reason = "ep async handoff skipped"
+        self._record_async_disable_reason(self._async_disable_reason)
+        return False
+
+    def _try_prepare_async_decode_after_sampling(self) -> bool:
+        """Prepare next-step metadata for an async forward launched after sampling."""
+        context = self.inference_wrapped_model.inference_context
+        self._async_disable_reason = self._async_scheduling_disabled_reason(allow_mtp=True)
+        self._record_async_eligibility_result(self._async_disable_reason)
+        if self._async_disable_reason is not None:
+            self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
+            return False
+
+        range_push("async_prepare_next_step")
+        async_next_prepared = context.prepare_async_decode_next_step()
+        range_pop()
+        if not async_next_prepared:
+            self._async_disable_reason = "failed to prepare next-step metadata"
+            self._record_async_disable_reason(self._async_disable_reason)
+            self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
+            return False
+
+        return True
+
+    def _confirm_prepared_ep_async_handoff(self) -> bool:
+        """Publish the EP handoff decision after next-step metadata and sample copy are queued."""
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+        if handoff_decision.launch_async_forward:
+            return True
+
+        context = self.inference_wrapped_model.inference_context
+        context.discard_async_prepared_decode_plan()
+        self._async_disable_reason = "ep async handoff skipped"
+        self._record_async_disable_reason(self._async_disable_reason)
+        return False
+
+    def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
+        """Return non-step-local reasons async scheduling is disabled, or None."""
+        if not self._async_scheduling_enabled:
+            return "disabled"
+        if self._async_step_barrier_reason is not None:
+            return self._async_step_barrier_reason
+        if not self._enable_cuda_graph:
+            return "requires local cuda graphs"
+        if self.model_config.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
+            return "requires block-scope inference cuda graphs"
+        if self.model_is_pipeline_parallel:
+            return "pipeline parallel is unsupported"
+        if self.num_speculative_tokens != 0 and not allow_mtp:
+            return "mtp pre-sampling graph is unsupported"
+        if self.num_speculative_tokens != 0 and self.num_mtp_depths != self.num_speculative_tokens:
+            return "not enough mtp heads"
+        return None
+
+    def _dummy_async_handoff_disabled_reason(self) -> Optional[str]:
+        """Return why a dummy EP rank cannot mirror an async handoff, or None.
+
+        Dummy EP ranks often have an empty/reset local context, so request-local
+        checks such as active request count and graph shape belong to real ranks.
+        The dummy rank must still join the handoff decision and mirror any
+        real-rank launch when the shared controller configuration supports it.
+        """
+        return self._async_scheduling_global_disabled_reason(allow_mtp=True)
+
+    def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
+        """Return why async scheduling cannot be used for the current step, or None."""
+        context = self.inference_wrapped_model.inference_context
+        disabled_reason = self._async_scheduling_global_disabled_reason(allow_mtp=allow_mtp)
+        if disabled_reason is not None:
+            return disabled_reason
+        if not context.is_decode_only():
+            return "not decode-only"
+        if not context.using_cuda_graph_this_step():
+            return "not using cuda graph"
+
+        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count <= 0:
+            return "no active requests"
+        if self._async_admission_barrier_requested:
+            self._async_admission_barrier_requested = False
+            return "waiting request admission deferred"
+
+        tokens_per_request = self.num_speculative_tokens + 1
+        if (
+            context.padded_batch_dimensions.token_count
+            != context.padded_batch_dimensions.decode_req_count * tokens_per_request
+        ):
+            return "cuda graph shape does not match decode stride"
+
+        return None
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -1153,6 +2007,30 @@ class TextGenerationController:
             (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
             (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
         )
+
+    def _active_requests_need_logprob_results(self) -> bool:
+        """Whether active requests need logits preserved for generated logprob bookkeeping."""
+        if not self._async_logprob_requests_seen:
+            return False
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count <= 0:
+            return False
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        return bool(
+            active_metadata["return_log_probs"][active_slice].any()
+            or (active_metadata["top_n_logprobs"][active_slice] > 0).any()
+        )
+
+    def _should_collect_dynamic_logprob_bookkeeping(
+        self, *, async_next_prepared: bool, pending_forward_reused: bool
+    ) -> bool:
+        """Whether this step needs sampling metadata for logprob calculation."""
+        if not (async_next_prepared or pending_forward_reused):
+            return True
+        return self._active_requests_need_logprob_results()
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -1213,26 +2091,67 @@ class TextGenerationController:
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
 
-    def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
+    def _retire_dynamic_forward_side_effects(self) -> None:
+        """Commit side effects produced by the most recent dynamic forward pass."""
+        context = self.inference_wrapped_model.inference_context
+
+        # Commit Mamba intermediate states before update_requests, which may
+        # swap request indices. The Python lists tracking EOS block IDs and
+        # intermediate offsets are not swapped along with tensors, so commit
+        # must run while indices are still valid.
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
+        # Collect flat routing indices and scatter them into per-block storage.
+        # Must be done before update_requests while token-to-block mappings are valid.
+        # Reconstruction happens from blocks at request completion.
+        routing_indices = self._router_record_bookkeeping()
+        context.kv_block_allocator.store_routing_per_block(routing_indices)
+
+        # Save routing indices.
+        tracer = get_moe_router_tracer()
+        if tracer is not None and routing_indices is not None:
+            layer_ids = [
+                r.layer_number
+                for r in RouterReplay.global_router_replay_instances
+                if r.layer_number is not None
+            ] or None
+            tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)
+            tracer.advance_step()
+
+    def _dynamic_step_calculate_log_probs(
+        self, row_indices: Optional[Tensor] = None
+    ) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         # This code cannot be reached when we are using speculative decode.
         assert self.num_speculative_tokens == 0
-        logits_seq_len = (
-            active_request_count
-            if context.config.materialize_only_last_token_logits
-            else context.padded_active_token_count
-        )
+        if row_indices is not None and not context.config.materialize_only_last_token_logits:
+            assert context.is_decode_only()
+            logits = self._all_logits_cuda.index_select(1, row_indices)
+            only_last_token_logits = True
+        else:
+            logits_seq_len = (
+                active_request_count
+                if context.config.materialize_only_last_token_logits
+                else context.padded_active_token_count
+            )
+            logits = self._all_logits_cuda[:, :logits_seq_len, :]
+            only_last_token_logits = context.config.materialize_only_last_token_logits
+            if row_indices is not None:
+                logits = logits.index_select(1, row_indices)
 
         return context.calculate_log_probs(
-            self._all_logits_cuda[:, :logits_seq_len, :],
+            logits,
             self._sampled_tokens_cuda[:active_request_count],
-            only_last_token_logits=context.config.materialize_only_last_token_logits,
+            only_last_token_logits=only_last_token_logits,
             sampling=self._sampling,
         )
 
-    def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:
+    def _dynamic_step_calculate_log_probs_speculative(
+        self, row_indices: Optional[Tensor] = None
+    ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs from logits for speculative decoding.
 
         For decode requests, computes log probs for each accepted speculative token
@@ -1265,7 +2184,14 @@ class TextGenerationController:
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
         logits_squeezed = logits.squeeze(0).float()
-        if only_last:
+        if row_indices is not None:
+            stride = self.num_speculative_tokens + 1
+            logits_squeezed = (
+                logits_squeezed.view(-1, stride, self.vocab_size)
+                .index_select(0, row_indices)
+                .reshape(-1, self.vocab_size)
+            )
+        if only_last or row_indices is not None:
             log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
         else:
             log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
@@ -1550,10 +2476,16 @@ class TextGenerationController:
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
+        step_begin_decision = self._decide_ep_step_begin(has_real_work=False)
 
-        # attempt to use cuda-graph if possible
-        input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._dynamic_step_forward_logits(input_ids, position_ids)
+        # Mirror only the GPU phases real ranks execute in this EP step. If
+        # real ranks are reusing a pending async forward, the base forward
+        # already ran in the previous step and dummy ranks must not issue an
+        # extra dummy base forward here.
+        if not step_begin_decision.reuse_pending_forward:
+            # attempt to use cuda-graph if possible
+            input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -1568,6 +2500,10 @@ class TextGenerationController:
         # all-to-all collectives. The dummy rank must participate in these
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
+
+        self._try_launch_dummy_async_handoff()
+
+        self._wait_for_dummy_context_h2d()
 
         # clear the context of any temporary state from the dummy forward, but
         # preserve prefix-cache state: a dummy forward runs when the engine is idle
@@ -1647,6 +2583,10 @@ class TextGenerationController:
                         else None
                     ),
                 )
+                if self._sp_enabled:
+                    mtp_logits = gather_from_sequence_parallel_region(
+                        mtp_logits, group=self.inference_wrapped_model.tp_group
+                    )
                 mtp_logits_2d = mtp_logits.squeeze(1)  # [padded_count, vocab_size]
 
             # Match the PP broadcast that real ranks do in _compute_serial_mtp_and_sample.
@@ -1677,7 +2617,13 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _dynamic_step_context_bookkeeping(
+        self,
+        sampled_tokens_cpu: Optional[Tensor] = None,
+        sampled_mtp_tokens_cpu: Optional[Tensor] = None,
+        sample_ready_event: Optional[torch.cuda.Event] = None,
+        h2d_done_event: Optional[torch.cuda.Event] = None,
+    ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Args:
@@ -1696,12 +2642,17 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
-        range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
-        )
-        range_pop()
+        if sampled_tokens_cpu is None:
+            # Batch GPU-to-CPU transfer of all sampled tokens.
+            range_push("transfer_samples_to_cpu")
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+                active_request_count
+            )
+            range_pop()
+        elif sample_ready_event is not None:
+            range_push("transfer_samples_to_cpu")
+            sample_ready_event.synchronize()
+            range_pop()
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
@@ -1716,12 +2667,23 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-        # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # active_request_metadata is CPU-pinned.
-        active_request_mask = (
-            sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        # These operands are CPU: sampled_tokens_cpu was D2H'd above, and
+        # active_request_metadata is CPU-pinned. Under MTP, termination can be
+        # hit by an accepted speculative token before the new base sample.
+        termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
+        termination_enabled = termination_ids >= 0
+        termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        if self.num_speculative_tokens > 0 and termination_enabled.any().item():
+            # Avoid a per-step CUDA sync in the common fixed-length MTP path.
+            # Accepted speculative tokens only need to be inspected when at
+            # least one active request can terminate by token id.
+            accepted_tokens_cpu = self._accepted_tokens_per_request[:active_request_count].cpu()
+            termination_hit |= termination_enabled & (
+                accepted_tokens_cpu == termination_ids[:, None]
+            ).any(dim=1)
+        active_request_mask = (~termination_hit).byte() & torch.less(
+            active_sequence_lengths, max_sequence_lengths
+        ).byte()
 
         # Mark requests as finished if they hit stop words
         # (detected in previous step's post_process_requests)
@@ -1737,7 +2699,6 @@ class TextGenerationController:
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
         finished_request_ids = context.request_ids[finished_idxs]
-
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
         finished_routing_block_ids = {}
@@ -1754,11 +2715,31 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
+        if h2d_done_event is not None:
+            h2d_done_event.synchronize()
+
         range_push("update_requests")
         update_result = context.update_requests(
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )
         range_pop()
+
+        if finished_request_ids.numel() > 0:
+            if self.num_speculative_tokens > 0:
+                self._async_mtp_finish_boundary_count += 1
+            else:
+                self._async_finish_boundary_count += 1
+        if update_result is not None:
+            newly_paused_request_ids = update_result.get("newly_paused_request_ids")
+            if newly_paused_request_ids is not None and newly_paused_request_ids.numel() > 0:
+                self._async_pause_boundary_count += 1
+            evict_request_ids = update_result.get("evict_request_ids")
+            if evict_request_ids is not None and evict_request_ids.numel() > 0:
+                self._async_evict_boundary_count += 1
+
+        returned_sample = (
+            sampled_tokens_cpu.clone() if sample_ready_event is not None else sampled_tokens_cpu
+        )
 
         return {
             "active_request_ids": active_request_ids,
@@ -1767,7 +2748,7 @@ class TextGenerationController:
             # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
             # the separate new_sample_copy). Returning the CPU copy avoids a
             # D2H sync when the engine later calls sample.tolist().
-            "sample": sampled_tokens_cpu,
+            "sample": returned_sample,
             "finished_routing_block_ids": finished_routing_block_ids,
             **(update_result or {}),
         }
@@ -1927,12 +2908,8 @@ class TextGenerationController:
 
         # Sample.
         range_push("sampling")
+        self._dynamic_step_sample_logits()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        torch.max(
-            self._all_logits_cuda.squeeze(0)[:active_request_count],
-            dim=-1,
-            out=(self._async_sched_sample_values_cuda[:active_request_count], sampled_tokens_gpu),
-        )
         if sampled_tokens_gpu.is_cuda:
             current_stream = torch.cuda.current_stream(sampled_tokens_gpu.device)
             self._async_sched_sample_gpu_ready_event.record(current_stream)
@@ -1967,7 +2944,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         return context.transfer_bookkeeping_to_gpu(
-            skip_token_input_ids=True, record_done_event=True
+            include_token_to_input_ids=False, record_done_event=True
         )
 
     def _run_async_sched_forward(
@@ -2243,49 +3220,81 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
+        async_next_prepared = False
+        async_sample_ready_event = None
+        async_h2d_done_event = None
+        async_sampled_tokens_cpu = None
+        async_sampled_mtp_tokens_cpu = None
+        deferred_mtp_blocks_to_release = None
+        deferred_mtp_release_mask = None
+        input_ids = None
+        cuda_graph_request_count = None
+        pending_forward_reused = False
+        pending_forward_view = None
+        pending_forward_row_indices = None
+        pending_forward_row_mapped = False
+        self._async_prepare_deferred_until_after_sampling = False
+        ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
+        if ep_step_begin_decision.discard_pending_forward:
+            self._discard_pending_async_forward()
+
         with torch.inference_mode():
-            input_ids, position_ids, _ = self._dynamic_step_context_init()
+            if self._async_pending_forward:
+                cuda_graph_request_count = self._async_pending_cuda_graph_request_count
+                self._async_pending_forward = False
+                self._async_pending_cuda_graph_request_count = None
+                pending_forward_view = self._resolve_pending_async_forward_view()
+                pending_forward_reused = pending_forward_view is not None
+                pending_forward_row_indices = (
+                    pending_forward_view.row_indices if pending_forward_view is not None else None
+                )
+                pending_forward_row_mapped = (
+                    pending_forward_view.row_mapped if pending_forward_view is not None else False
+                )
+                pending_forward_row_mapped = (
+                    pending_forward_row_mapped or ep_step_begin_decision.row_mapped_forward
+                )
+                if (
+                    pending_forward_reused
+                    and pending_forward_row_mapped
+                    and not context.config.materialize_only_last_token_logits
+                    and not context.is_decode_only()
+                ):
+                    pending_forward_reused = False
+                    pending_forward_view = None
+                    pending_forward_row_indices = None
+                    pending_forward_row_mapped = False
+                    self._async_discarded_forward_count += 1
+                if pending_forward_reused and context.is_hybrid_model:
+                    context.accept_async_mamba_state(pending_forward_view.current_request_ids)
+                context.release_deferred_async_resources()
+                if pending_forward_reused and self.num_speculative_tokens > 0:
+                    input_ids, _ = context.current_input_and_position_ids()
+            if not pending_forward_reused:
+                input_ids, position_ids, _ = self._dynamic_step_context_init()
 
-            cuda_graph_request_count = (
-                context.padded_active_request_count
-                if context.using_cuda_graph_this_step()
-                else None
-            )
+                cuda_graph_request_count = (
+                    context.padded_active_request_count
+                    if context.using_cuda_graph_this_step()
+                    else None
+                )
 
-            # Enable routing recording before forward pass if routing replay is enabled
-            config = self.inference_wrapped_model.model.config
-            if config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                # Enable routing recording before forward pass if routing replay is enabled
+                config = self.inference_wrapped_model.model.config
+                if config.moe_enable_routing_replay:
+                    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Forward pass produces only base logits. When speculative decoding is
-            # active, MTP logits are computed serially after verification.
-            range_push("forward_pass")
-            self._dynamic_step_forward_logits(input_ids, position_ids)
+                # Forward pass produces only base logits. When speculative decoding is
+                # active, MTP logits are computed serially after verification.
+                range_push("forward_pass")
+                self._dynamic_step_forward_logits(input_ids, position_ids)
+                self._retire_dynamic_forward_side_effects()
+                range_pop()
+            else:
+                self._retire_dynamic_forward_side_effects()
 
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
-
-            # Collect flat routing indices and scatter them into per-block storage.
-            # Must be done before update_requests while token-to-block mappings are valid.
-            # Reconstruction happens from blocks at request completion.
-            routing_indices = self._router_record_bookkeeping()
-            context.kv_block_allocator.store_routing_per_block(routing_indices)
-
-            # Save routing indices.
-            tracer = get_moe_router_tracer()
-            if tracer is not None and routing_indices is not None:
-                layer_ids = [
-                    r.layer_number
-                    for r in RouterReplay.global_router_replay_instances
-                    if r.layer_number is not None
-                ] or None
-                tracer.record_indices(torch.from_numpy(routing_indices), layer_ids=layer_ids)
-                tracer.advance_step()
-            range_pop()
+            if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
+                async_next_prepared = self._try_prepare_async_decode_before_sampling()
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -2294,16 +3303,33 @@ class TextGenerationController:
         # asynchronous.
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
+        if not async_next_prepared:
+            await asyncio.sleep(0)
 
         with torch.inference_mode():
             range_push("sampling")
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            if self._should_collect_dynamic_logprob_bookkeeping(
+                async_next_prepared=async_next_prepared,
+                pending_forward_reused=pending_forward_reused,
+            ):
+                return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            else:
+                return_log_probs = False
+                return_top_n_logprobs = False
 
-            if self.num_speculative_tokens > 0:
+            if async_next_prepared:
+                self._dynamic_step_sample_logits_to_next_input_ids()
+            elif pending_forward_reused and self.num_speculative_tokens == 0:
+                self._dynamic_step_sample_logits(row_indices=pending_forward_row_indices)
+                async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                if async_next_prepared:
+                    self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
+            elif self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
-                self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                self._dynamic_step_sample_logits_and_verify_tokens(
+                    input_ids, row_indices=pending_forward_row_indices
+                )
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
@@ -2321,29 +3347,88 @@ class TextGenerationController:
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
-                # Phase 4: Release freed blocks. Deferred from Phase 2 so the
-                # data-dependent boolean-mask sync overlaps with MTP GPU work.
-                context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+                async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                if async_next_prepared:
+                    self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
+                    deferred_mtp_blocks_to_release = blocks_to_release
+                    deferred_mtp_release_mask = remove_mask
+                else:
+                    # No async forward will cover this CPU work, so release before
+                    # ordinary request bookkeeping runs.
+                    context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+                if self._async_prepare_deferred_until_after_sampling:
+                    async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                    if async_next_prepared:
+                        self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
 
             log_probs = None
             top_n_logprobs = None
             if return_log_probs or return_top_n_logprobs:
+                logprob_row_indices = (
+                    pending_forward_row_indices if pending_forward_row_mapped else None
+                )
                 if self.num_speculative_tokens > 0:
                     log_probs, log_probs_tensor = (
-                        self._dynamic_step_calculate_log_probs_speculative()
+                        self._dynamic_step_calculate_log_probs_speculative(
+                            row_indices=logprob_row_indices
+                        )
                     )
                     if return_top_n_logprobs:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
                             log_probs_tensor
                         )
                 else:
-                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
+                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(
+                        row_indices=logprob_row_indices
+                    )
                     if return_top_n_logprobs:
                         top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                             log_probs_tensor
                         )
+
+            if async_next_prepared:
+                (
+                    async_sampled_tokens_cpu,
+                    async_sampled_mtp_tokens_cpu,
+                    async_sample_ready_event,
+                ) = self._async_transfer_samples_to_cpu(active_request_count)
+                if self._confirm_prepared_ep_async_handoff():
+                    context.publish_async_prepared_decode_plan()
+                    range_push("async_transfer_bookkeeping_to_gpu")
+                    async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
+                        include_token_to_input_ids=False,
+                        refresh_request_staging=False,
+                        record_done_event=True,
+                    )
+                    range_pop()
+                    range_push("async_forward_launch")
+                    next_input_ids, next_position_ids = context.current_input_and_position_ids()
+                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+                    self._async_forward_launch_count += 1
+                    self._async_pending_forward = True
+                    self._async_pending_cuda_graph_request_count = (
+                        context.padded_active_request_count
+                        if context.using_cuda_graph_this_step()
+                        else None
+                    )
+                    self._record_async_pending_forward_requests(
+                        self._async_pending_cuda_graph_request_count
+                    )
+                    context.mark_async_forward_in_flight()
+                    range_pop()
+
+            if deferred_mtp_blocks_to_release is not None:
+                range_push("mtp_deferred_release_memory_blocks")
+                context.kv_block_allocator.release_memory_blocks(
+                    deferred_mtp_blocks_to_release[deferred_mtp_release_mask]
+                )
+                self._async_deferred_mtp_release_count += 1
+                range_pop()
+
+            self._ensure_ep_async_handoff_decided(has_real_work=True)
+
             range_pop()
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
@@ -2358,13 +3443,32 @@ class TextGenerationController:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
                 # downstream consumers.
-                request_bookkeeping = {
-                    "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
-                }
+                if async_sampled_tokens_cpu is not None and async_sample_ready_event is not None:
+                    async_sample_ready_event.synchronize()
+                    request_bookkeeping = {"sample": async_sampled_tokens_cpu}
+                else:
+                    request_bookkeeping = {
+                        "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
+                    }
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                    sampled_tokens_cpu=async_sampled_tokens_cpu,
+                    sampled_mtp_tokens_cpu=async_sampled_mtp_tokens_cpu,
+                    sample_ready_event=async_sample_ready_event,
+                    h2d_done_event=async_h2d_done_event,
+                )
+
+                next_active_request_count = (
+                    context.total_request_count - context.paused_request_count
+                )
+                if self._async_pending_forward and next_active_request_count == 0:
+                    torch.cuda.current_stream().synchronize()
+                    context.release_deferred_async_resources()
+                    self._async_pending_forward = False
+                    self._async_pending_cuda_graph_request_count = None
+                    self._async_pending_forward_view = None
 
             ret = {
                 "accepted_tokens": (

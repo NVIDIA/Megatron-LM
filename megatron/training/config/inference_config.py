@@ -168,6 +168,9 @@ class InferenceSetupConfig:
     num_speculative_tokens: int = 0
     """Number of speculative tokens generated during decode."""
 
+    inference_dynamic_batching_enable_async_scheduling: bool = False
+    """Enable async scheduling for eligible dynamic batching decode steps."""
+
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -358,6 +361,7 @@ class InferenceSetupConfig:
             ),
             track_paused_request_events=self.inference_dynamic_batching_track_paused_request_events,
             enable_chunked_prefill=self.enable_chunked_prefill,
+            enable_async_scheduling=self.inference_dynamic_batching_enable_async_scheduling,
             enable_prefix_caching=self.inference_dynamic_batching_enable_prefix_caching,
             prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(
                 self.inference_dynamic_batching_prefix_caching_eviction_policy

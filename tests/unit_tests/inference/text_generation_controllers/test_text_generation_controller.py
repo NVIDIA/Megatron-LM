@@ -16,6 +16,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -45,6 +46,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -77,6 +79,7 @@ class TextGenerationControllerTestBase:
         hybrid_layer_pattern: str = None,
         sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
+        enable_async_scheduling: bool = False,
     ):
         if use_training_random_init:
             # This is necessary to induce the training behavior which permutes the random seed
@@ -174,6 +177,7 @@ class TextGenerationControllerTestBase:
                     max_requests=max_requests,
                     mamba_inference_state_config=mamba_inference_state_config,
                     sampling_backend=sampling_backend,
+                    enable_async_scheduling=enable_async_scheduling,
                 ),
             )
 
@@ -251,9 +255,6 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._enable_cuda_graph = False
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
-    controller._async_sched_sample_values_cuda = torch.empty(
-        context.max_requests, dtype=model_config.params_dtype
-    )
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -263,6 +264,9 @@ def _make_async_sched_controller(context=None, model_config=None):
 @pytest.mark.parametrize("total_request_count", [0, 2])
 def test_validate_async_sched_support_for_step_success(total_request_count):
     context = _make_async_sched_context(total_request_count=total_request_count)
+    if total_request_count:
+        context.request_metadata["top_k"][:2] = torch.tensor([4, 0])
+        context.request_metadata["top_p"][:2] = torch.tensor([0.0, 0.9])
     controller = _make_async_sched_controller(context)
     if total_request_count == 0:
         context.config.materialize_only_last_token_logits = False
@@ -386,9 +390,9 @@ def test_dynamic_step_context_init_returns_bookkeeping_event():
     context.initialize_attention_state.assert_called_once_with(
         construct_graph_dimensions=None,
         is_expert_parallel_dummy_cuda_graph_step=False,
-        transfer_bookkeeping_to_gpu=True,
-        record_bookkeeping_done_event=True,
+        transfer_bookkeeping_to_gpu=False,
     )
+    context.transfer_bookkeeping_to_gpu.assert_called_once_with(record_done_event=True)
     assert torch.equal(returned_input_ids, input_ids)
     assert torch.equal(returned_position_ids, position_ids)
     assert bookkeeping_done_event == "bookkeeping"
@@ -425,7 +429,7 @@ def test_run_async_sched_publish_bookkeeping_skips_gpu_input_ids():
     done_event = controller._run_async_sched_publish_bookkeeping()
 
     context.transfer_bookkeeping_to_gpu.assert_called_once_with(
-        skip_token_input_ids=True, record_done_event=True
+        include_token_to_input_ids=False, record_done_event=True
     )
     assert done_event == "bookkeeping"
 
@@ -517,13 +521,14 @@ def test_async_sched_step_returns_none_without_active_requests():
 def test_run_async_sched_sample_reuses_gpu_buffer():
     context = _make_async_sched_context(total_request_count=3)
     controller = _make_async_sched_controller(context)
-    controller._all_logits_cuda = torch.zeros(1, 3, 5)
     expected_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
-    for idx, token in enumerate(expected_tokens.tolist()):
-        controller._all_logits_cuda[0, idx, token] = 10.0
+    controller._dynamic_step_sample_logits = mock.Mock(
+        side_effect=lambda: controller._sampled_tokens_cuda.copy_(expected_tokens)
+    )
 
     sampled_tokens_gpu = controller._run_async_sched_sample()
 
+    controller._dynamic_step_sample_logits.assert_called_once_with()
     assert sampled_tokens_gpu.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
     assert torch.equal(sampled_tokens_gpu, expected_tokens)
 
@@ -534,11 +539,12 @@ def test_run_async_sched_sample_records_gpu_ready_event():
     controller = _make_async_sched_controller(context)
     controller._all_logits_cuda = torch.zeros(1, 3, 5, device="cuda")
     controller._sampled_tokens_cuda = torch.empty(3, dtype=torch.int64, device="cuda")
-    controller._async_sched_sample_values_cuda = torch.empty(3, device="cuda")
+    controller._dynamic_step_sample_logits = mock.Mock()
     controller._async_sched_sample_gpu_ready_event = mock.Mock()
 
     controller._run_async_sched_sample()
 
+    controller._dynamic_step_sample_logits.assert_called_once_with()
     controller._async_sched_sample_gpu_ready_event.record.assert_called_once_with(
         torch.cuda.current_stream()
     )
@@ -768,6 +774,9 @@ def test_async_sched_step_wires_sampling_through_resolution(
     sampled_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     for row, token in enumerate(sampled_tokens.tolist()):
         controller._all_logits_cuda[0, row, token] = 10.0
+    controller._dynamic_step_sample_logits = mock.Mock(
+        side_effect=lambda: controller._sampled_tokens_cuda.copy_(sampled_tokens)
+    )
 
     input_ids_gpu_view = torch.empty(3, dtype=torch.int64)
     position_ids_gpu_view = torch.empty(3, dtype=torch.int64)
@@ -795,6 +804,7 @@ def test_async_sched_step_wires_sampling_through_resolution(
     assert context.resolve_requests.call_args.args[0].tolist() == expected_mask
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == expected_compaction_count
+    controller._dynamic_step_sample_logits.assert_called_once_with()
 
 
 def test_async_sched_step_yields_after_resolution_outside_inference_mode():
@@ -892,6 +902,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
     def teardown_method(self, method):
         InferenceMode.unset_active()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        CudaGraphManager.global_mempool = None
 
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)
@@ -1070,6 +1084,94 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert torch.all(
             sampled_logits >= expected_min_values
         ), f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_async_flashinfer_sampling_cuda_graph_capture_and_replay(self):
+        pytest.importorskip("flashinfer")
+        active_request_count = 2
+        graph_request_count = 4
+        self.setup_model(
+            torch.float32,
+            batch_size=graph_request_count,
+            static=False,
+            materialize_only_last_token_logits=True,
+            sampling_backend="flashinfer",
+            cuda_graph_impl="local",
+            enable_async_scheduling=True,
+        )
+
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.total_request_count = active_request_count
+        context.paused_request_count = 0
+        context.num_prefill_requests = 0
+        context.padded_batch_dimensions = InferenceBatchDimensions(
+            token_count=graph_request_count,
+            prefill_req_count=0,
+            decode_req_count=graph_request_count,
+        )
+        context.padded_active_token_count = graph_request_count
+        context.padded_active_request_count = graph_request_count
+        context._using_cuda_graph_this_step = True
+        context._async_prepared_request_count = active_request_count
+        context._async_prepared_decode_input_is_identity = True
+
+        context.active_request_metadata["temperature"][:active_request_count].fill_(1.0)
+        context.active_request_metadata["top_k"][:active_request_count].fill_(1)
+        context.active_request_metadata["top_p"][:active_request_count].fill_(0.0)
+        context.pad_active_slices()
+        context.transfer_bookkeeping_to_gpu()
+
+        def set_greedy_targets(targets):
+            padded_targets = torch.zeros(
+                graph_request_count, dtype=torch.long, device=controller._all_logits_cuda.device
+            )
+            padded_targets[:active_request_count].copy_(targets)
+            controller._all_logits_cuda.fill_(-1000.0)
+            controller._all_logits_cuda[
+                0, torch.arange(graph_request_count, device=padded_targets.device), padded_targets
+            ] = 1000.0
+
+        first_targets = torch.tensor([11, 23], dtype=torch.long, device="cuda")
+        set_greedy_targets(first_targets)
+        controller._select_async_sample_slot(0)
+        controller._dynamic_step_sample_logits_to_next_input_ids()
+
+        graph_manager = controller._sampling._sample_graph_manager
+        assert graph_manager is not None
+        assert len(graph_manager.cudagraph_runners) == 1
+        runner = graph_manager.cudagraph_runners[0]
+        assert runner.fwd_graph_recorded
+        assert runner.clone_outputs is False
+        static_output_ptr = runner.fwd_graph_output_surface[0].data_ptr()
+        assert torch.equal(
+            controller._sampled_tokens_cuda_slots[0, :active_request_count], first_targets
+        )
+        assert torch.equal(
+            context.gpu_view.token_to_input_ids[:active_request_count], first_targets
+        )
+
+        second_targets = torch.tensor([37, 41], dtype=torch.long, device="cuda")
+        set_greedy_targets(second_targets)
+        context.gpu_view.token_to_input_ids[:active_request_count].fill_(-1)
+        controller._select_async_sample_slot(1)
+        controller._dynamic_step_sample_logits_to_next_input_ids()
+
+        assert len(graph_manager.cudagraph_runners) == 1
+        assert runner.fwd_graph_output_surface[0].data_ptr() == static_output_ptr
+        assert torch.equal(
+            runner.fwd_graph_output_surface[0][:active_request_count], second_targets
+        )
+        assert torch.equal(
+            controller._sampled_tokens_cuda_slots[0, :active_request_count], first_targets
+        )
+        assert torch.equal(
+            controller._sampled_tokens_cuda_slots[1, :active_request_count], second_targets
+        )
+        assert torch.equal(
+            context.gpu_view.token_to_input_ids[:active_request_count], second_targets
+        )
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
