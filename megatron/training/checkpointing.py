@@ -577,8 +577,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     checkpoint_name = get_checkpoint_name(save_dir, iteration, release=release, pipeline_parallel=pipeline_parallel,
         tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=return_base_dir)
 
-    # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
-    maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
+    # Save dataloader state if the external dataloader supports it.
+    maybe_save_dataloader_state(
+        train_data_iterator,
+        iteration,
+        getattr(args, "dataloader_save", None),
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_group=dp_group,
+    )
 
     # Save distributed optimizer's custom parameter state.
     if (
@@ -999,12 +1006,19 @@ def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=F
         remove_iter_ckpts(rm_iter_ckpts)
 
 
-def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path):
+def maybe_save_dataloader_state(
+    train_iterator,
+    iteration,
+    dataloader_save_path,
+    *,
+    tp_group=None,
+    pp_group=None,
+    dp_group=None,
+):
     """Saves dataloader state if the dataloader supports it.
 
-    Currently, this is only used by Megatron Energon dataloader (multimodal) to store its state at a
-    specific iteration. The Megatron built-in dataloader (text-only) creates index files upfront
-    to track its state.
+    External dataloaders use this to store state at a specific iteration. The Megatron built-in
+    dataloader creates index files upfront to track its state.
 
     If the provided dataloader has `save_state` method, then it is called to save the state.
     Otherwise, no state is saved.
@@ -1013,6 +1027,9 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
         train_iterator (iterable): Train dataloader.
         iteration (int): Current iteration.
         dataloader_save_path (str): Path where the dataloader state is saved.
+        tp_group (ProcessGroup): Tensor-parallel group, or MPU fallback when unset.
+        pp_group (ProcessGroup): Pipeline-parallel group, or MPU fallback when unset.
+        dp_group (ProcessGroup): Data-parallel group, or MPU fallback when unset.
     """
     # If no dataloader or saving path is provided, exit early, otherwise, raise an error.
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == "":
@@ -1023,25 +1040,48 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
         raise RuntimeError(f"Could not find a save_state for the train_iterator of type {type(train_iterator)}")
 
     # Save dataloader state for each data parallel rank only once.
-    first_rank = mpu.is_pipeline_first_stage(ignore_virtual=True) and mpu.get_tensor_model_parallel_rank() == 0
+    first_rank = (
+        get_pg_rank(pp_group) == 0
+        if pp_group is not None
+        else mpu.is_pipeline_first_stage(ignore_virtual=True)
+    ) and (
+        get_pg_rank(tp_group) == 0
+        if tp_group is not None
+        else mpu.get_tensor_model_parallel_rank() == 0
+    )
     if not first_rank:
         return
 
-    dp_rank = mpu.get_data_parallel_rank()
+    dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+    train_dataloader_state_dict = train_iterator.iterable.save_state()
     if dp_rank == 0:
         print(f"saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}")
-    train_dataloader_state_dict = train_iterator.iterable.save_state()
     data_state_save_path = get_checkpoint_name(
-        dataloader_save_path, iteration,
-        basename=f'train_dataloader_dprank{dp_rank:03d}.pt'
+        dataloader_save_path,
+        iteration,
+        pipeline_parallel=(
+            get_pg_size(pp_group) > 1
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_world_size() > 1
+        ),
+        # Dataloader state is sharded only by DP rank. Keep it in the canonical TP0/PP0 directory.
+        tensor_rank=0,
+        pipeline_rank=0,
+        expert_parallel=False,
+        expert_rank=0,
+        basename=f'train_dataloader_dprank{dp_rank:03d}.pt',
     )
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
+    torch.distributed.barrier(group=data_parallel_group)
 
-    if mpu.get_data_parallel_rank() == 0:
+    if dp_rank == 0:
         ensure_directory_exists(data_state_save_path)
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    torch.distributed.barrier(group=data_parallel_group)
+
+    if train_dataloader_state_dict is None:
+        return
 
     dataloader_save_dict = {}
     dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
