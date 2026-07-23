@@ -53,6 +53,7 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     a = KVBlockAllocator(ctx, total_count=TOTAL_COUNT, paused_count=PAUSED_COUNT)
     # Initial state: TOTAL_COUNT - 1 (dummy block) available, nothing used.
     assert a.total_avail == TOTAL_COUNT - 1
+    assert a.get_allocatable_block_count() == TOTAL_COUNT - 1
     assert a.get_total_used() == 0
     # is_memory_available short-circuits True when free pool has enough.
     assert a.is_memory_available(5) is True
@@ -72,6 +73,7 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     # Free pool exhausted: without prefix caching there's no eviction path,
     # so both is_memory_available and allocate_memory_blocks return failure.
     small_alloc = KVBlockAllocator(ctx, total_count=4, paused_count=1)  # total_avail = 3
+    assert small_alloc.get_allocatable_block_count() == 3
     assert small_alloc.is_memory_available(5) is False
     assert small_alloc.allocate_memory_blocks(5) is None
 
@@ -180,6 +182,7 @@ def test_prefix_caching_allocate_and_hash_registration():
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
     )
+    assert small.get_allocatable_block_count() == 3
     assert small.is_memory_available(5) is False
 
 
@@ -452,11 +455,14 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     assert int(a.get_evictable_block_count()) == 2
 
     # Both evictable blocks count toward availability by default.
+    assert a.get_allocatable_block_count() == 2
     assert a.is_memory_available(2) is True
     # Excluding one (it will be pinned) leaves only one usable for the request.
+    assert a.get_allocatable_block_count(potential_matched_count=1) == 1
     assert a.is_memory_available(2, potential_matched_count=1) is False
     assert a.is_memory_available(1, potential_matched_count=1) is True
     # Excluding all evictable blocks leaves nothing to satisfy a new block.
+    assert a.get_allocatable_block_count(potential_matched_count=2) == 0
     assert a.is_memory_available(1, potential_matched_count=2) is False
 
 

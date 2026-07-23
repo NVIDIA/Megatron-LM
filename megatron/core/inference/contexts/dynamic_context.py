@@ -3392,10 +3392,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Add +1 ONLY to the block counts of requests that finished their previous memory block
             paused_block_counts += needs_new_block
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-            resume_request_count = min(
-                torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
-                self.kv_block_allocator.total_avail,
-            )
+            resume_request_count = torch.nonzero(
+                paused_block_counts_cumsum <= active_block_count_avail
+            ).numel()
 
             # Constrain resumptions by the maximum allowed active requests and tokens
             max_allowed_active = min(
@@ -3403,6 +3402,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             allowed_to_resume = max(0, max_allowed_active - active_request_count)
             resume_request_count = min(resume_request_count, allowed_to_resume)
+
+            # Independently constrain resumptions by physical block availability.
+            # Some requests (for example, force-paused requests) need no new
+            # block, so compare cumulative new blocks rather than request count.
+            if resume_request_count > 0:
+                new_block_counts_cumsum = needs_new_block[:resume_request_count].cumsum(dim=0)
+                if new_block_counts_cumsum[-1].item() > self.kv_block_allocator.total_avail:
+                    allocatable_block_count = self.kv_block_allocator.get_allocatable_block_count()
+                    resume_request_count = torch.nonzero(
+                        new_block_counts_cumsum <= allocatable_block_count
+                    ).numel()
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
@@ -3418,8 +3428,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_new_blocks = needs_new_block.sum().item()
 
             if num_new_blocks > 0:
-                assert num_new_blocks <= self.kv_block_allocator.total_avail
                 block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+                assert (
+                    block_ids is not None and block_ids.numel() == num_new_blocks
+                ), f"failed to allocate {num_new_blocks} blocks for resumed requests"
 
                 # Apply updates only to the requests that required a new block
                 relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)

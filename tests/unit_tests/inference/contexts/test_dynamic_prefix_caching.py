@@ -113,6 +113,24 @@ class PrefixCachingTestBase:
         return [ctx.request_to_kv_block_ids[req_idx][i].item() for i in range(n)]
 
     @staticmethod
+    def _fill_pool_with_one_evictable_block(ctx):
+        """Exhaust the free pool while leaving exactly one LRU block evictable."""
+        alloc = ctx.kv_block_allocator
+        drained_block_ids = alloc.allocate_memory_blocks(alloc.total_avail)
+        assert drained_block_ids is not None and drained_block_ids.numel() > 0
+
+        cached_block_id = drained_block_ids[0].item()
+        cached_hash = 1
+        while cached_hash in alloc.kv_hash_to_block_id:
+            cached_hash += 1
+        alloc.register_kv_block_hashes([cached_block_id], [cached_hash], parent_hashes=[0])
+        alloc.release_memory_blocks(drained_block_ids[:1])
+
+        assert alloc.total_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 1
+        return cached_block_id, cached_hash
+
+    @staticmethod
     def _mamba_allocate_and_register(ctx, bids):
         """Allocate Mamba cache slots and register hashes for a list of block IDs."""
         msa = ctx.mamba_slot_allocator
@@ -538,6 +556,73 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         # SX (the sole evictable block) can satisfy H2; reserving the pinned
         # matches would wrongly report the request as un-addable.
         assert kv_cache_available is True
+
+    @pytest.mark.internal
+    def test_resume_boundary_crossing_evicts_lru_block_when_free_pool_empty(self):
+        """A boundary-crossing request resumes from LRU capacity at total_avail=0."""
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        ctx.add_request(self._req(ctx, self._prompt(bs)))
+        original_block_id = self._block_ids(ctx, 0, 1)[0]
+        assert ctx.request_last_kv_block_offset[0].item() == bs - 1
+        assert alloc.block_ref_counts[original_block_id].item() == 1
+
+        cached_block_id, cached_hash = self._fill_pool_with_one_evictable_block(ctx)
+
+        result = ctx.update_requests(
+            torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32),
+            torch.tensor([123], device=torch.cuda.current_device()),
+        )
+
+        new_block_id = ctx.request_last_kv_block_id[0].item()
+        assert result["newly_paused_request_ids"].numel() == 0
+        assert result["evict_request_ids"] is None
+        assert ctx.paused_request_count == 0
+        assert ctx.total_request_count == 1
+        assert ctx.request_kv_block_counts[0].item() == 2
+        assert new_block_id == cached_block_id
+        assert new_block_id != original_block_id
+        assert cached_hash not in alloc.kv_hash_to_block_id
+        assert alloc.block_hashes[new_block_id].item() == -1
+        assert alloc.block_ref_counts[original_block_id].item() == 1
+        assert alloc.block_ref_counts[new_block_id].item() == 1
+        assert alloc.total_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 0
+        assert ctx.token_to_block_idx[0].item() == new_block_id
+
+    @pytest.mark.internal
+    def test_resume_counts_new_blocks_independently_from_requests(self):
+        """With LIFO needs [0, 1, 1], one evictable block resumes exactly two requests."""
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        ctx.add_request(self._req(ctx, self._prompt(bs), request_id=1))
+        ctx.add_request(self._req(ctx, self._prompt(bs, offset=1000), request_id=2))
+        ctx.add_request(self._req(ctx, self._prompt(bs - 1, offset=2000), request_id=3))
+        original_last_block_ids = ctx.request_last_kv_block_id[:3].clone()
+
+        ctx.paused_request_count = 3
+        needs_new_block_lifo = ctx.request_last_kv_block_offset[:3].flip(dims=[0]) >= bs - 1
+        assert needs_new_block_lifo.tolist() == [False, True, True]
+
+        cached_block_id, cached_hash = self._fill_pool_with_one_evictable_block(ctx)
+        active_request_count, newly_paused_request_ids = ctx.resume_paused_requests(0, None)
+
+        assert active_request_count == 2
+        assert newly_paused_request_ids is None
+        assert ctx.paused_request_count == 1
+        assert ctx.total_request_count == 3
+        assert ctx.request_kv_block_counts[:3].tolist() == [1, 2, 1]
+        assert ctx.request_last_kv_block_id[0].item() == original_last_block_ids[0].item()
+        assert ctx.request_last_kv_block_id[1].item() == cached_block_id
+        assert ctx.request_last_kv_block_id[2].item() == original_last_block_ids[2].item()
+        assert cached_hash not in alloc.kv_hash_to_block_id
+        assert alloc.block_ref_counts[cached_block_id].item() == 1
+        assert alloc.total_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 0
 
     @pytest.mark.internal
     def test_ref_count_refzero(self):
