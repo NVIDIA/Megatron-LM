@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from copy import deepcopy
 from itertools import product
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,6 +28,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
     fully_shard,
     fully_shard_model,
     fully_shard_optimizer,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+    AllGatherPipeline,
+    BucketStatus,
+    PrefetchOrder,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -57,6 +63,51 @@ MXFP8_BLOCKWISE_RECIPE = "mxfp8_blockwise"
 # Needed for `torch.distributed.checkpoint.{save,load}` because
 # multiple processes need to write to the same directory.
 SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
+
+
+def test_all_gather_pipeline_prefetch_size():
+    """The extracted prefetch heuristic stops after reaching the requested size."""
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        num_buckets=4,
+        ddp_config=SimpleNamespace(fsdp_double_buffer=False),
+        parameter_groups=[
+            SimpleNamespace(
+                fsdp_unit_id=bucket_id,
+                model_weight_buffer=SimpleNamespace(bucket_index=SimpleNamespace(size=6)),
+            )
+            for bucket_id in range(4)
+        ],
+        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(4)},
+    )
+
+    actual = pipeline._extend_by_prefetch_size(
+        [0], PrefetchOrder.FORWARD_PASS_ORDER, suggested_prefetch_size=10, double_buffer_units=set()
+    )
+
+    assert actual == [0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("order", "start_buckets", "expected_buckets"),
+    [
+        (PrefetchOrder.FORWARD_PASS_ORDER, [0, 1], [0, 1, 2, 3, 4, 5]),
+        (PrefetchOrder.BACKWARD_PASS_ORDER, [6, 7], [2, 3, 4, 5, 6, 7]),
+    ],
+)
+def test_all_gather_pipeline_prefetch_units(order, start_buckets, expected_buckets):
+    """Unit-depth prefetch includes intervening non-unit buckets in both directions."""
+    unit_ids = [0, 0, None, 1, 1, None, 2, 2, 3, 3]
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        num_buckets=len(unit_ids),
+        parameter_groups=[SimpleNamespace(fsdp_unit_id=unit_id) for unit_id in unit_ids],
+        bucket_to_bucket_group={bucket_id: [bucket_id] for bucket_id in range(len(unit_ids))},
+    )
+
+    actual = pipeline._extend_by_fsdp_units(start_buckets, order, num_units=1)
+
+    assert actual == expected_buckets
 
 
 def destroy_device_mesh(device_mesh):
@@ -276,6 +327,58 @@ class TestMegatronFsdpFullyShard:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.4.0'),
+        reason="Requires DTensor and DeviceMesh support in PyTorch 2.4.0 or later.",
+    )
+    def test_hfsdp_param_gather_overlap(self):
+        """HFSDP stages DP-Outer two units ahead and DP-Inner one unit ahead."""
+        if Utils.world_size != 8:
+            pytest.skip("Requires 8 GPUs for a 2x4 HFSDP mesh.")
+
+        device_mesh = build_distributed_environment((2, 4, 1, 1))
+        model = ToyCNN(height=DIM_SIZE, width=DIM_SIZE, num_layers=4).cuda()
+        fsdp_model = fully_shard_model(
+            module=model,
+            device_mesh=device_mesh,
+            dp_shard_dim=DP_SHARD,
+            dp_outer_dim=DP_OUTER,
+            tp_dim=TP,
+            hybrid_fsdp_group=device_mesh[HSDP].get_group(),
+            fsdp_unit_modules=[torch.nn.Conv2d, torch.nn.Linear],
+            zero_dp_strategy=OPTIM_GRADS_PARAMS,
+            outer_dp_sharding_strategy=OPTIM,
+            hfsdp_param_gather_overlap=True,
+        )
+        optimizer = fully_shard_optimizer(Adam(fsdp_model.parameters(), lr=0.01))
+
+        fsdp_model.synchronize_param_gather()
+        fsdp_model.start_param_sync()
+        pipeline = fsdp_model.all_gather_pipeline
+        parameter_groups = fsdp_model.param_and_grad_buffer.parameter_groups
+        inner_units = {
+            parameter_groups[bucket_id].fsdp_unit_id
+            for (bucket_id, _), status in pipeline.bucket_status.items()
+            if status == BucketStatus.COMMUNICATING
+            and parameter_groups[bucket_id].fsdp_unit_id is not None
+        }
+        outer_units = {
+            parameter_groups[bucket_id].fsdp_unit_id
+            for bucket_id, _ in pipeline.outer_bucket_ready_events
+            if parameter_groups[bucket_id].fsdp_unit_id is not None
+        }
+        assert len(inner_units) == 2
+        assert len(outer_units) == 3
+
+        inputs = torch.randn(1, 3, DIM_SIZE, DIM_SIZE, device="cuda")
+        loss = fsdp_model(inputs).square().mean()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        assert torch.isfinite(loss)
+
+        destroy_device_mesh(device_mesh)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
