@@ -134,6 +134,10 @@ def batch_invariant_decode_buffered_scan(
         "batch-invariant Mamba decode assumes one new token per request "
         "per call (no speculative decoding)."
     )
+    assert ssm_state.dtype == torch.float32, (
+        "batch-invariant Mamba decode requires an FP32 SSM state cache to preserve "
+        "the state-passing carry across chunk boundaries."
+    )
     output_capacity = buffers.out.shape[0]
     assert decode_batch_size <= output_capacity, (
         f"decode batch size {decode_batch_size} exceeds the output buffer capacity "
