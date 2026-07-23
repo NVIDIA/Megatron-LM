@@ -38,7 +38,8 @@ def safe_get_rank() -> int:
 
         warnings.warn(
             "Could not determine rank from torch.distributed, RANK, or SLURM_PROCID. "
-            "Defaulting to rank 0."
+            "Defaulting to rank 0.",
+            stacklevel=2,
         )
         return 0
     except (ValueError, TypeError):
@@ -69,7 +70,8 @@ def safe_get_world_size() -> int:
 
     warnings.warn(
         "Could not determine world size from torch.distributed, WORLD_SIZE, or SLURM_NTASKS. "
-        "Defaulting to world size 1."
+        "Defaulting to world size 1.",
+        stacklevel=2,
     )
     return 1
 
