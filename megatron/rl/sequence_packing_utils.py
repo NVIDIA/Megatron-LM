@@ -521,6 +521,7 @@ def pack_inference_logprobs(
             seq_to_local_bin[seq_idx] = local_bin_idx
 
     # Align and pack inference logprobs based on generation masks
+    device = packed_inference_logprobs.device
     for seq_idx in range(len(inference_logprobs)):
         if seq_idx not in seq_to_local_bin:
             continue  # Skip sequences not on this rank
@@ -532,29 +533,25 @@ def pack_inference_logprobs(
         seq_pos_in_bin = seq_positions.index(seq_idx)
         seq_start = packing_info.seq_starts[local_bin_idx][seq_pos_in_bin]
 
-        # Get generation mask for this sequence to find where generation starts
-        gen_mask = generation_masks[seq_idx]
-        # Find first generation token (accounting for the shift in get_logprobs)
-        first_gen_idx = gen_mask.int().argmax().item() - 1
-
         # Get the inference logprobs for this sequence
-        if isinstance(inference_logprobs[seq_idx], torch.Tensor):
-            seq_inf_logprobs = inference_logprobs[seq_idx]
-        else:
+        if not isinstance(inference_logprobs[seq_idx], torch.Tensor):
             continue  # Skip if no inference logprobs
+        seq_inf_logprobs = inference_logprobs[seq_idx].to(device)
 
-        # Calculate where to place inference logprobs in the packed tensor
-        # The inference logprobs start at the first generated token position
-        pack_start = seq_start + first_gen_idx
-        pack_end = min(
-            pack_start + len(seq_inf_logprobs), seq_start + packing_info.seq_lengths[seq_idx] - 1
-        )
-        actual_len = pack_end - pack_start
-
-        if actual_len > 0 and pack_end <= bin_size - 1:
-            packed_inference_logprobs[local_bin_idx, pack_start:pack_end] = seq_inf_logprobs[
-                :actual_len
-            ]
+        # Scatter logprobs to their generated token slots. Generation can span MULTIPLE regions
+        # for multi-turn rollouts (generation interleaved with observations), so place each
+        # logprob at the slot for its token: a token at local position `p` occupies packed slot
+        # `seq_start + (p - 1)` (`get_logprobs()` shifts by one).
+        gen_positions = generation_masks[seq_idx].nonzero(as_tuple=True)[0].to(device)
+        if gen_positions.numel() == 0:
+            continue
+        target = seq_start + gen_positions - 1
+        n = min(seq_inf_logprobs.numel(), target.numel())
+        target = target[:n]
+        # Keep within this sequence's logprob span in the bin.
+        seq_lp_end = seq_start + packing_info.seq_lengths[seq_idx] - 1
+        in_range = (target >= seq_start) & (target < seq_lp_end)
+        packed_inference_logprobs[local_bin_idx, target[in_range]] = seq_inf_logprobs[:n][in_range]
 
     return packed_inference_logprobs
 

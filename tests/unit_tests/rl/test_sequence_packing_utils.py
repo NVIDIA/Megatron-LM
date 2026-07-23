@@ -409,6 +409,40 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
     assert group_stats.mean_piold_to_inf_prob is None
 
 
+def test_pack_inference_logprobs_multi_region():
+    """pack_inference_logprobs scatters each logprob to its generated token's slot, including
+    multi-region (multi-turn) masks with gaps, and reduces to contiguous placement otherwise.
+    The logprob of a token at sequence position p lands at packed index seq_start + p - 1."""
+    bin_size = 8
+    # Bin 0 holds two length-4 sequences: seq 0 at offset 0, seq 1 at offset 4.
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[[0, 1]],
+        seq_starts={0: [0, 4]},
+        seq_lengths=[4, 4],
+        seq_to_bin_idx=[0, 0],
+        packing_algo='fifo',
+    )
+    # seq 0: MULTI-region (generated at positions 1 and 3, gap at 2 — e.g. an observation).
+    # seq 1: single contiguous region (generated at positions 1, 2).
+    generation_masks = torch.tensor(
+        [
+            [False, True, False, True, False, False, False, False],
+            [False, True, True, False, False, False, False, False],
+        ]
+    )
+    inference_logprobs = [torch.tensor([0.1, 0.2]), torch.tensor([0.3, 0.4])]
+
+    packed = sequence_packing_utils.pack_inference_logprobs(
+        inference_logprobs, packing_info, generation_masks, bin_size
+    )
+
+    # seq 0 (start 0): positions 1,3 -> indices 0,2 (gap index 1 stays 0).
+    # seq 1 (start 4): positions 1,2 -> indices 4,5.
+    expected = torch.tensor([[0.1, 0.0, 0.2, 0.0, 0.3, 0.4, 0.0]])
+    assert packed.shape == (1, bin_size - 1)
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+
+
 def test_packing_observability_metrics():
     """Test various observability metrics related to sequence packing."""
 
