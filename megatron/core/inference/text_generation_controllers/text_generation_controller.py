@@ -82,9 +82,7 @@ class AsyncScheduleLogitsState:
     token_row_indices: Optional[Tensor] = None
 
     def set_pending(
-        self,
-        cuda_graph_request_count: Optional[int],
-        token_row_indices: Optional[Tensor] = None,
+        self, cuda_graph_request_count: Optional[int], token_row_indices: Optional[Tensor] = None
     ) -> None:
         """Record logits submitted for the next sample.
 
@@ -1913,8 +1911,7 @@ class TextGenerationController:
                 else None
             )
             self._async_sched_logits.set_pending(
-                self._async_sched_logits.cuda_graph_request_count,
-                survivor_token_row_indices,
+                self._async_sched_logits.cuda_graph_request_count, survivor_token_row_indices
             )
             return
 
@@ -1936,8 +1933,7 @@ class TextGenerationController:
             self._all_logits_cuda = compacted_logits
 
         self._async_sched_logits.set_pending(
-            self._async_sched_logits.cuda_graph_request_count,
-            survivor_token_row_indices,
+            self._async_sched_logits.cuda_graph_request_count, survivor_token_row_indices
         )
 
     def _record_fresh_async_sched_event(

@@ -509,9 +509,7 @@ def test_run_dummy_async_sched_base_step_does_not_record_event():
     controller = _make_async_sched_controller(context)
     input_ids = torch.tensor([[10]])
     position_ids = torch.tensor([[0]])
-    controller._dynamic_step_context_init = mock.Mock(
-        return_value=(input_ids, position_ids, None)
-    )
+    controller._dynamic_step_context_init = mock.Mock(return_value=(input_ids, position_ids, None))
     controller._run_dummy_base_forward = mock.Mock()
     controller._record_fresh_async_sched_event = mock.Mock()
 
