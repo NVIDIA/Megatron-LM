@@ -45,7 +45,8 @@ from megatron.lite.primitive.modules.lora import (
     normalize_lora_config,
     trainable_param_stats,
 )
-from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.parallel import ParallelState, init_parallel, zigzag_slice_for_cp
+from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -135,8 +136,21 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
 
 
 def _forward_step_bshd(model: nn.Module, batch: PackedBatch) -> dict:
+    ps = parallel_state_from_model(model) or ParallelState()
+    input_ids = batch.input_ids.reshape(1, -1)
     labels = batch.labels.reshape(1, -1) if batch.labels is not None else None
-    return model(input_ids=batch.input_ids.reshape(1, -1), labels=labels, packed_seq_params=None)
+    loss_mask = batch.loss_mask.reshape(1, -1) if batch.loss_mask is not None else None
+    if ps.cp_size > 1:
+        # GQAttention's non-THD branch expects CP-zigzag-sharded inputs, and
+        # unpack_forward_output() reconstructs zigzag-CP outputs; match both.
+        input_ids = zigzag_slice_for_cp(input_ids, ps.cp_rank, ps.cp_size, seq_dim=1)
+        if labels is not None:
+            labels = zigzag_slice_for_cp(labels, ps.cp_rank, ps.cp_size, seq_dim=1)
+        if loss_mask is not None:
+            loss_mask = zigzag_slice_for_cp(loss_mask, ps.cp_rank, ps.cp_size, seq_dim=1)
+    return model(
+        input_ids=input_ids, labels=labels, loss_mask=loss_mask, packed_seq_params=None
+    )
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
