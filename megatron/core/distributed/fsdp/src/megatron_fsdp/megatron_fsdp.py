@@ -1498,7 +1498,7 @@ class MegatronFSDP(torch.nn.Module):
         self._replace_param_with_raw_if_needed()
         with torch.autograd.profiler.record_function("CustomFSDP.forward"):
             # Call the forward pass of the wrapped module.
-            output = self.module.forward(*inputs, **kwargs)
+            output = self.module(*inputs, **kwargs)
             return output
 
 

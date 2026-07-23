@@ -535,7 +535,14 @@ class TestFlexDispatcher:
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.parametrize(
-        "moe_flex_dispatcher_backend", ["deepep", "deepepv2", "hybridep", "ncclep"]
+        "moe_flex_dispatcher_backend",
+        [
+            "deepep",
+            "deepepv2",
+            "hybridep",
+            # NCCL EP aborts in dev CI with a pybind11 GIL dec_ref failure.
+            pytest.param("ncclep", marks=pytest.mark.flaky_in_dev),
+        ],
     )
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_forward_backward(

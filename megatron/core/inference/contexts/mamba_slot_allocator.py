@@ -58,7 +58,10 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors (GPU - accessed by Mamba CUDA kernels).
+        # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
+        # one slot per cached block boundary, reused across requests. Sized to
+        # `max_slots`; the budget accounting in DynamicInferenceContext refers to
+        # these as the "durable" buffers.
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
@@ -100,8 +103,13 @@ class MambaSlotAllocator:
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
+        # Pre-allocated "scratch" output buffers for CUDA graph compatible
+        # extraction (GPU): per-step staging that the kernel writes intermediate
+        # states into before commit copies them to the durable cache above. Sized
+        # by the per-step token budget computed once on the context; the budget
+        # accounting in DynamicInferenceContext refers to these as the "scratch"
+        # buffers.
+        self.max_intermediate_count = context.max_mamba_intermediate_states_per_step
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
@@ -402,24 +410,38 @@ class MambaSlotAllocator:
             overall_required_blocks: Total blocks needed for this request.
         """
         ctx = self.context
+        bs = ctx.block_size_tokens
         prompt_len = len(req.prompt_tokens)
-        num_kv_matched = num_matched_blocks
-        kv_div_abs = num_kv_matched * ctx.block_size_tokens
-        last_aligned_abs = (prompt_len // ctx.block_size_tokens) * ctx.block_size_tokens
-        seq_len = prefill_chunk_length - skip_tokens  # effective prefill length
 
-        # Compute relative offsets (relative to prefill start after skip)
-        kv_div_rel = kv_div_abs - skip_tokens
-        last_aligned_rel = last_aligned_abs - skip_tokens
-        penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
-        penultimate_rel = penultimate_abs - skip_tokens
+        # Absolute token position (from the prompt start) where THIS chunk's
+        # computed tokens begin. The first chunk computes from `skip_tokens` (the
+        # prefix that was skipped); continuation chunks compute from
+        # `finished_chunk_token_count` (with skip_tokens == 0). Framing the
+        # boundary offsets against this chunk start -- rather than assuming the
+        # first chunk -- lets us extract Mamba state at block boundaries that fall
+        # in ANY chunk. In particular the last complete block of a multi-chunk
+        # prompt lives in a continuation chunk; it was previously unreachable, so
+        # non-block-aligned prompts never cached a usable resume boundary and
+        # later turns could not skip prefill.
+        chunk_start = req.finished_chunk_token_count + skip_tokens
+        seq_len = prefill_chunk_length - skip_tokens  # tokens computed this chunk
+        is_last_chunk = req.finished_chunk_token_count + prefill_chunk_length >= prompt_len
 
-        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
-        mamba_chunk_size = 128
+        # Candidate absolute block boundaries at which to cache Mamba state.
+        kv_div_abs = num_matched_blocks * bs
+        last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
+        penultimate_abs = (overall_required_blocks - 1) * bs
 
-        # Build offset list: include if > 0, < seq_len, and % mamba_chunk_size == 0
+        # SSM chunk size the mamba kernel actually runs with. States can only be
+        # extracted at multiples of this value, and it must match the value used
+        # in MambaMetadata (offset -> chunk-index conversion) to stay consistent.
+        mamba_chunk_size = ctx.mamba_chunk_size
+
+        # Keep only boundaries that land inside this chunk's computed tokens and on
+        # a mamba-chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
-        for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
+        for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
+            offset = abs_pos - chunk_start
             if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
                 offsets_set.add(offset)
 
@@ -428,8 +450,8 @@ class MambaSlotAllocator:
 
         # CPU bookkeeping writes (no GPU kernel launches).
         if count > 0:
-            abs_tokens_cpu = torch.tensor([skip_tokens + o for o in offsets], dtype=torch.int64)
-            block_indices_cpu = abs_tokens_cpu // ctx.block_size_tokens - 1
+            abs_tokens_cpu = torch.tensor([chunk_start + o for o in offsets], dtype=torch.int64)
+            block_indices_cpu = abs_tokens_cpu // bs - 1
             bids_cpu = ctx.request_to_kv_block_ids[current_id][block_indices_cpu]
 
             self._intermediate_offsets_cpu[current_id, :count] = torch.tensor(
@@ -439,9 +461,13 @@ class MambaSlotAllocator:
             self._has_intermediates = True
         self._intermediate_counts_cpu[current_id] = count
 
-        # Block-aligned EOS: prompt_len is exactly block-aligned
-        if last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // ctx.block_size_tokens - 1
+        # Block-aligned EOS: when the prompt length is exactly block-aligned, the
+        # request's live final state IS the last block boundary's state and can be
+        # cached directly. Only valid on the final chunk (otherwise the live state
+        # is mid-prompt). Non-block-aligned prompts cache their last complete block
+        # via the intermediate-extraction path above instead.
+        if is_last_chunk and last_aligned_abs == prompt_len and prompt_len > 0:
+            last_block_idx = prompt_len // bs - 1
             if last_block_idx >= 0:
                 self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
                     last_block_idx

@@ -18,6 +18,7 @@ class Symbols:
     GDN = 'G'
     ATTENTION = "*"
     DS_ATTENTION = "D"
+    MLA = "+"
     CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
     HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
     WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0; no compressor/indexer)
@@ -25,9 +26,9 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, CSA, HCA, WINDOW, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW, MLP, MOE}
     # MLA-based attention layers (incompatible with standard '*' attention in one model).
-    MLA_ATTENTION = {DS_ATTENTION, CSA, HCA, WINDOW}
+    MLA_ATTENTION = {DS_ATTENTION, MLA, CSA, HCA, WINDOW}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -297,8 +298,8 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
-    # Disallow standard Attention ('*') mixed with any MLA-based attention (D/C/H/W).
-    # MLA variants (DSA / CSA / HCA / Window) may freely coexist with each other.
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
+    # MLA variants (MLA / DSA / CSA / HCA / Window) may freely coexist with each other.
     if Symbols.ATTENTION in pattern and any(s in pattern for s in Symbols.MLA_ATTENTION):
         raise ValueError(
             "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
@@ -328,7 +329,7 @@ def validate_segment_layers(segment: str) -> List[str]:
                 f"one of {Symbols.VALID_LAYERS}"
             )
 
-    # Disallow standard Attention ('*') mixed with any MLA-based attention (D/C/H/W).
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
     if Symbols.ATTENTION in segment and any(s in segment for s in Symbols.MLA_ATTENTION):
         raise ValueError(
             "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"

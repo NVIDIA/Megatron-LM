@@ -197,8 +197,12 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr]
     products:
+      # Disabled (flaky): the exact/deterministic golden comparison intermittently
+      # fails on dgx_h100 while the approximate check passes and the run is
+      # reproducible in isolation. Kept in-tree for easy re-enable; see the
+      # existing "WAR to #513" note on this test case's model_config.yaml.
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]

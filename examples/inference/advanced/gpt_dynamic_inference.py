@@ -120,7 +120,7 @@ def run_inference(
         nonlocal num_requests_added
         _request = requests[num_requests_added]
         engine.add_request(num_requests_added, _request.prompt_text, _request.sampling_params)
-        _request.time_start = get_curr_time()
+        _request.time_start = get_curr_time(do_broadcast=False)
         _request.state = "started"
         num_requests_added += 1
         tbar.update(1)
@@ -149,14 +149,14 @@ def run_inference(
                 step_times["prefill"].append(step_time)
 
             # Append output tokens.
-            output_start = get_curr_time()
+            output_start = get_curr_time(do_broadcast=False)
             for finished_request_record in finished_request_records:
 
                 finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
-                request.time_end = get_curr_time()
+                request.time_end = get_curr_time(do_broadcast=False)
                 request.state = "finished"
                 request.request_id = finished_request.request_id
                 request.events = finished_request.events
@@ -186,16 +186,16 @@ def run_inference(
                 if not finished_request.sampling_params.skip_prompt_log_probs:
                     request.prompt_top_n_logprobs = finished_request.prompt_top_n_logprobs
                 num_requests_finished += 1
-            output_times.append(get_curr_time() - output_start)
+            output_times.append(get_curr_time(do_broadcast=False) - output_start)
 
     if batch_ranges is not None:
         # Batch-drain mode: add all requests in a batch, drain, then next batch.
         for batch_idx, (batch_start, batch_end) in enumerate(batch_ranges):
             # Add all requests in current batch.
-            add_start = get_curr_time()
+            add_start = get_curr_time(do_broadcast=False)
             while num_requests_added < batch_end:
                 _add_request()
-            add_times.append(get_curr_time() - add_start)
+            add_times.append(get_curr_time(do_broadcast=False) - add_start)
 
             # Step until all active requests finish (drain).
             while engine.has_unfinished_requests():
@@ -213,7 +213,7 @@ def run_inference(
         # Original mode: add requests per step based on arrival time or count.
         while True:
             # Add requests.
-            add_start = get_curr_time()
+            add_start = get_curr_time(do_broadcast=False)
             if args.incoming_requests_per_step is None:
                 # Add requests with 'earlier' arrival time.
                 while num_requests_added < num_requests_total:
@@ -226,7 +226,7 @@ def run_inference(
                     min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
                 ):
                     _add_request()
-            add_times.append(get_curr_time() - add_start)
+            add_times.append(get_curr_time(do_broadcast=False) - add_start)
 
             # Step inference engine (i.e., generate a token for each active request).
             # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
@@ -476,7 +476,9 @@ def main():
             # Attach peak memory metrics; the functional test only validates these
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
-            json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
+            json_results["lifetime_prefill_token_count"] = (
+                engine.context.lifetime_prefill_token_count
+            )
             json_results["async_sched_step_count"] = engine.context.async_sched_step_count
             json_results["async_sched_compaction_step_count"] = (
                 engine.context.async_sched_compaction_step_count

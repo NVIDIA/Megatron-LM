@@ -1736,11 +1736,13 @@ def prepare_data_for_update(
                 if inference_logprobs is not None:
                     # Pack the inference logprobs using the helper function
                     # We do this for logging purposes even if is_correction is disabled
-                    packed_inference_logprobs = pack_inference_logprobs(
-                        inference_logprobs=packing_context.original_inference_logprobs,
-                        packing_info=packing_context.packing_info,
-                        generation_masks=packing_context.original_generation_masks,
-                        bin_size=args.seq_length,
+                    packed_inference_logprobs, packed_inference_filled_mask = (
+                        pack_inference_logprobs(
+                            inference_logprobs=packing_context.original_inference_logprobs,
+                            packing_info=packing_context.packing_info,
+                            generation_masks=packing_context.original_generation_masks,
+                            bin_size=args.seq_length,
+                        )
                     )
 
                     # Compute statistics for logging using packed data
@@ -1749,7 +1751,9 @@ def prepare_data_for_update(
                         packed_inference_logprobs=packed_inference_logprobs,
                         packed_loss_mask=packing_context.packed_loss_mask,
                         group_stats=group_stats,
+                        filled_mask=packed_inference_filled_mask,
                     )
+
 
                     # Store packed inference logprobs in packing context
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
