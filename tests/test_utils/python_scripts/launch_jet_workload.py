@@ -665,12 +665,13 @@ def main(
 
             n_iteration += 1
 
-    send_slack_alert(
-        test_case=test_case,
-        context="max attempts exhausted",
-        n_iteration=n_iteration,
-        n_attempts=n_attempts,
-    )
+    if test_type == "release":
+        send_slack_alert(
+            test_case=test_case,
+            context="max attempts exhausted",
+            n_iteration=n_iteration,
+            n_attempts=n_attempts,
+        )
     telemetrics_and_exit(
         success=False,
         test_case=test_case,
