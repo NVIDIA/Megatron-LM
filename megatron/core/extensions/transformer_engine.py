@@ -2284,6 +2284,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 return [state] * self.num_gemms
 
             state = self._decode_extra_state(state)
+            if state is None:
+                return [torch.empty(0, dtype=torch.uint8)] * self.num_gemms
             extra_states = []
             extra_fp8_variables = state["extra_fp8_variables"]
             extra_fp8_variables["num_gemms"] = 1
