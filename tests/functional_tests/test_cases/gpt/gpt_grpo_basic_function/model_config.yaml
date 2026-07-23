@@ -86,6 +86,7 @@ MODEL_ARGS:
   --grpo-entropy-term-weight: 0.0
   --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_basic_function/env_config.yaml
   --rl-partial-rollouts: true
+  --rl-generation-lag: 0
   --use-checkpoint-args: true
   --dist-ckpt-strictness: log_unexpected
   --perform-rl-step: true

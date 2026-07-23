@@ -18,7 +18,7 @@ from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import get_pg_size, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -28,7 +28,7 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
-from ..rollout_granularity import get_rl_parallel_generation_tasks
+from ..rollout_granularity import get_rl_parallel_generation_tasks, resolve_rl_generation_lag
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
+        if args.rl_partial_rollouts:
+            resolve_rl_generation_lag(
+                args,
+                dp_size=get_pg_size(inference_engine.pg_collection.dp),
+                max_requests=inference_engine.context.max_requests,
+            )
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -137,11 +143,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        concurrency_limit = (
-            args.grpo_prompts_per_step
-            * args.grpo_group_size
-            * get_rl_parallel_generation_tasks(args)
-        )
+        # One connection per concurrent inference request: each in-flight generation
+        # task holds one submission unit's worth of rollouts.
+        rollouts_per_task = {
+            "B": args.grpo_prompts_per_step * args.grpo_group_size,
+            "G": args.grpo_group_size,
+            "R": 1,
+        }[args.rl_submission_granularity]
+        concurrency_limit = get_rl_parallel_generation_tasks(args) * rollouts_per_task
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
             max_keepalive_connections=concurrency_limit,
