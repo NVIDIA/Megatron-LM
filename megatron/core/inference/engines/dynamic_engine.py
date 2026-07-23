@@ -2009,6 +2009,47 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return result, context_state, step_time
 
+    def _try_send_streaming_partials(self) -> None:
+        """Send pending token deltas without blocking the inference loop."""
+        if not self.socket_for_receiving_requests.poll(timeout=0, flags=zmq.POLLOUT):
+            return
+
+        partials: list = []
+        emit_lengths: Dict[int, int] = {}
+        for rid, entry in self.requests.items():
+            request = entry.record[-1]
+            if not getattr(request.sampling_params, "streaming", False):
+                continue
+            already = self._partial_emit_lengths.get(rid, 0)
+            total = len(request.generated_tokens)
+            if total > already:
+                new_tokens = list(request.generated_tokens[already:])
+                partial = {"request_id": rid, "new_tokens": new_tokens}
+                if request.sampling_params.return_log_probs:
+                    partial["new_log_probs"] = list(
+                        (request.generated_log_probs or [])[already:]
+                    )
+                partials.append(partial)
+                emit_lengths[rid] = total
+
+        if not partials:
+            return
+
+        payload = msgpack.packb(
+            [Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True
+        )
+        nvtx_range_push("coordinator_streaming")
+        try:
+            self.socket_for_receiving_requests.send(payload, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            # Leave emit lengths unchanged so the unsent tokens are included
+            # in the next delta once the socket becomes writable.
+            return
+        finally:
+            nvtx_range_pop("coordinator_streaming")
+
+        self._partial_emit_lengths.update(emit_lengths)
+
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
@@ -2119,28 +2160,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # emit lengths are dropped here rather than in the loop.
             for record in finished_request_records:
                 self._partial_emit_lengths.pop(record.requests[-1].request_id, None)
-            partials: list = []
-            for rid, entry in self.requests.items():
-                request = entry.record[-1]
-                if not getattr(request.sampling_params, "streaming", False):
-                    continue
-                already = self._partial_emit_lengths.get(rid, 0)
-                total = len(request.generated_tokens)
-                if total > already:
-                    new_tokens = list(request.generated_tokens[already:])
-                    partial = {"request_id": rid, "new_tokens": new_tokens}
-                    if request.sampling_params.return_log_probs:
-                        partial["new_log_probs"] = list(
-                            (request.generated_log_probs or [])[already:]
-                        )
-                    partials.append(partial)
-                    self._partial_emit_lengths[rid] = total
-            if partials:
-                nvtx_range_push("coordinator_streaming")
-                self.socket_for_receiving_requests.send(
-                    msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
-                )
-                nvtx_range_pop("coordinator_streaming")
+            self._try_send_streaming_partials()
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:

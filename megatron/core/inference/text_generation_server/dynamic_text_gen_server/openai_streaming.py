@@ -128,10 +128,6 @@ async def openai_stream(streams, tokenizer, *, chat, return_log_probs=False, inc
                     else None
                 ),
                 "finish_reason": None,
-                "generation_token_ids": list(state["tokens"]),
-                "generation_log_probs": list(state["log_probs"]),
-                "generated_text": full_text,
-                "generated_length": len(state["tokens"]),
             }
             choice["delta" if chat else "text"] = {"content": delta} if chat else delta
             yield sse([choice])

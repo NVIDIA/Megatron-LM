@@ -17,7 +17,7 @@ class _Tokenizer:
         return "".join(chr(ord("a") + token - 1) for token in tokens)
 
 
-async def test_openai_stream_exposes_cumulative_tokens_and_log_probs():
+async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     stream = AsyncStream(request_id=1, cancel=lambda: None)
     stream.put({"partial": {"request_id": 1, "new_tokens": [1, 2], "new_log_probs": [-0.1, -0.2]}})
     # Token 3 models a token completed before the engine's final reply and
@@ -45,16 +45,22 @@ async def test_openai_stream_exposes_cumulative_tokens_and_log_probs():
 
     first, reconciled, finished, usage = payloads
     assert first["choices"][0]["text"] == "ab"
-    assert first["choices"][0]["generation_token_ids"] == [1, 2]
-    assert first["choices"][0]["generation_log_probs"] == [-0.1, -0.2]
-    assert first["choices"][0]["generated_text"] == "ab"
-    assert first["choices"][0]["generated_length"] == 2
+    assert "generation_token_ids" not in first["choices"][0]
+    assert "generation_log_probs" not in first["choices"][0]
+    assert "generated_text" not in first["choices"][0]
+    assert "generated_length" not in first["choices"][0]
     assert first["choices"][0]["logprobs"]["token_logprobs"] == [-0.1, -0.2]
     assert first["choices"][0]["logprobs"]["text_offset"] == [0, 1]
     assert reconciled["choices"][0]["text"] == "c"
-    assert reconciled["choices"][0]["generation_token_ids"] == [1, 2, 3]
-    assert reconciled["choices"][0]["generation_log_probs"] == [-0.1, -0.2, -0.3]
+    assert "generation_token_ids" not in reconciled["choices"][0]
+    assert "generation_log_probs" not in reconciled["choices"][0]
+    assert "generated_text" not in reconciled["choices"][0]
+    assert "generated_length" not in reconciled["choices"][0]
     assert finished["choices"][0]["finish_reason"] == "length"
+    assert finished["choices"][0]["generation_token_ids"] == [1, 2, 3]
+    assert finished["choices"][0]["generation_log_probs"] == [-0.1, -0.2, -0.3]
+    assert finished["choices"][0]["generated_text"] == "abc"
+    assert finished["choices"][0]["generated_length"] == 3
     assert usage["usage"] == {
         "prompt_tokens": 2,
         "completion_tokens": 3,
