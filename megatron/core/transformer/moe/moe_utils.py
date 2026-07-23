@@ -911,9 +911,9 @@ def compute_routing_scores_for_aux_loss(
         score_function (str): The score function to use. Can be "softmax", "sigmoid"
                               or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.

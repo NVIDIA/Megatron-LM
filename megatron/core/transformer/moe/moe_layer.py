@@ -611,9 +611,9 @@ class MoELayer(BaseMoELayer):
 
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [seq_length, bsz]. True = padding,
+                                                   False = valid. Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
