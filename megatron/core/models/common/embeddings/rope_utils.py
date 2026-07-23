@@ -95,6 +95,8 @@ def _apply_rotary_pos_emb_bshd(
     rotary_interleaved: bool = False,
     mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
+    inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
     multi_latent_attention: Optional[bool] = None,
 ) -> Tensor:
     """Apply rotary positional embedding to input tensor T.
@@ -118,6 +120,13 @@ def _apply_rotary_pos_emb_bshd(
         )
         mla_rotary_interleaved = multi_latent_attention
 
+    # Some callers may pass freqs with an extra singleton axis, e.g.
+    # t: [s, b, d] and freqs: [s, 1, 1, d]. In that case, broadcasting would
+    # accidentally expand to [s, s, b, d]. Squeeze the extra singleton axis to
+    # keep freqs rank aligned with t.
+    if freqs.dim() == t.dim() + 1 and freqs.size(-2) == 1:
+        freqs = freqs.squeeze(-2)
+
     rot_dim = freqs.shape[-1]
 
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
@@ -132,8 +141,18 @@ def _apply_rotary_pos_emb_bshd(
     # second part is sine component, need to change signs with _rotate_half method
     cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
     sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+    if inverse:
+        sin_ = -sin_
 
     t = (t * cos_) + (_rotate_half(t, rotary_interleaved) * sin_)
+
+    # Fallback to original permutation
+    # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
+    # The existing MLA code is safe because the dot product is permutation-invariant.
+    if mla_rotary_interleaved and mla_output_remove_interleaving:
+        x1, x2 = torch.chunk(t, 2, dim=-1)
+        t = torch.stack((x1, x2), dim=-1).flatten(start_dim=-2)
+
     return torch.cat((t, t_pass), dim=-1)
 
 
@@ -193,20 +212,27 @@ def _apply_rotary_pos_emb_thd(
     rotary_interleaved: bool = False,
     mla_rotary_interleaved: bool = False,
     mscale: float = 1.0,
+    inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
+    max_seqlen: Optional[int] = None,
 ) -> Tensor:
-    """A baseline implementation of applying RoPE for `thd` format.
+    """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
+
+    Replaces the original Python-loop + .tolist() implementation with vectorized
+    CUDA operations. No GPU->CPU syncs, compatible with CUDA Graph capture.
 
     Args:
-        t (Tensor): Input tensor T is of shape [t, h, d]
-        cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
-        with shape [b + 1] and dtype torch.int32.
-        freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
-        cp_group (torch.distributed.ProcessGroup): The context parallel group
+        t (Tensor): Input tensor of shape [total_tokens, h, d]
+        cu_seqlens (Tensor): Cumulative sequence lengths, shape [num_seqs + 1], int32.
+        freqs (Tensor): RoPE frequencies, shape [max_s, 1, 1, d] or [total_tokens, 1, 1, d]
+        cp_group: Context parallel group
+        max_seqlen: Global max sequence length for this packed batch when known. Supplying it
+            avoids the compatibility-path host sync used by legacy callers.
 
     Returns:
-        Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
+        Tensor: Shape [total_tokens, h, d]. Input with RoPE applied.
     """
     if multi_latent_attention is not None:
         warnings.warn(
@@ -219,53 +245,71 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
-    sequence_splits = torch.split(t, seqlens)
-    total_seqlen = int(cu_seqlens[-1].item())
-    has_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == total_seqlen
+    total_tokens = t.shape[0]
+    device = t.device
 
-    # Handle two different frequency tensor formats:
-    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains positions for the whole packed
-    #    batch. Each sequence must therefore use its cu_seqlens offset when selecting the local CP
-    #    front/back slices. For example, with cu_seqlens=[0, 4, 8], cp_size=2, rank 0 should use
-    #    positions [0, 3, 4, 7], not [0, 3, 0, 3].
-    # 2. Otherwise: freqs contains only max sequence length positions. Each packed sequence should
-    #    reuse positions starting from 0, preserving the legacy THD behavior.
-    if has_packed_freqs:
-        # CASE 1: Exact mapping with offsets
-        local_freqs = []
-        for i, x in enumerate(sequence_splits):
-            # cu_seqlens[i] is the starting offset of this sequence in the original batch
-            seq_start_offset = cu_seqlens[i].item()
-            local_freqs.append(
-                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
-            )
-        freqs = torch.cat(local_freqs, dim=0)
-        return _apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-        ).squeeze(1)
+    token_pos = torch.arange(total_tokens, device=device, dtype=torch.int64)
 
-    # CASE 2: Traditional mapping without offsets. Apply RoPE one sequence at a time so the second
-    # and later packed sequences do not look like continuations of the first sequence.
-    output = torch.empty_like(t)
-    output_offset = 0
-    for x in sequence_splits:
-        freq_slice = _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs)
-        output_slice = _apply_rotary_pos_emb_bshd(
-            x.unsqueeze(1),
-            freq_slice,
-            rotary_interleaved=rotary_interleaved,
-            mla_rotary_interleaved=mla_rotary_interleaved,
-            mscale=mscale,
-        ).squeeze(1)
-        output.narrow(0, output_offset, x.size(0)).copy_(output_slice)
-        output_offset += x.size(0)
+    # `cu_seqlens` describes the global packed sequence. With CP, `t` is already
+    # CP-partitioned, so build a local cumulative-length view before assigning
+    # local tokens to packed sequences.
+    cu_seqlens_i64 = cu_seqlens.to(torch.int64)
+    global_seq_lens = cu_seqlens_i64[1:] - cu_seqlens_i64[:-1]
+    local_seq_lens = global_seq_lens // cp_size if cp_size > 1 else global_seq_lens
+    local_cu_seqlens = torch.zeros_like(cu_seqlens_i64)
+    local_cu_seqlens[1:] = torch.cumsum(local_seq_lens, dim=0)
 
-    return output
+    # `searchsorted(..., right=True) - 1` returns the local sequence index. The
+    # clamp guards padded tokens that sit beyond the final real local token; they
+    # get a harmless frequency and are later masked out.
+    seq_idx = torch.searchsorted(local_cu_seqlens, token_pos, right=True) - 1
+    seq_idx = seq_idx.clamp(min=0, max=cu_seqlens.shape[0] - 2)
+
+    local_seq_start = local_cu_seqlens[seq_idx]
+    local_pos = token_pos - local_seq_start
+    local_seq_len = local_seq_lens[seq_idx]
+    global_seq_start = cu_seqlens_i64[seq_idx]
+
+    if cp_size > 1:
+        cp_seg = local_seq_len // 2
+        full_seqlen = local_seq_len * cp_size
+        is_first_half = local_pos < cp_seg
+        freq_pos = torch.where(
+            is_first_half,
+            cp_rank * cp_seg + local_pos,
+            full_seqlen - (cp_rank + 1) * cp_seg + (local_pos - cp_seg),
+        )
+    else:
+        freq_pos = local_pos.to(torch.int64)
+
+    if max_seqlen is None:
+        # Backward compatibility for callers that predate ``max_seqlen``. This retains
+        # the old packed-frequency semantics at the cost of a GPU-to-CPU sync. Updated
+        # training paths pass ``max_seqlen`` and stay CUDA-graph safe.
+        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == int(cu_seqlens[-1].item())
+    else:
+        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
+    if exact_packed_freqs:
+        # `freqs` covers all positions across all sequences (used for non-1D
+        # RoPE / VLMs); shift by the per-sequence start offset so each token
+        # samples its absolute position. When `freqs` only spans one max-len
+        # sequence, no shift is needed.
+        freq_pos = freq_pos + global_seq_start
+
+    # Padded positions can sit outside the frequency table. Clamp them into
+    # range; downstream padding masks exclude those positions from the result.
+    freq_pos = freq_pos.clamp(min=0, max=freqs.shape[0] - 1)
+    freqs_packed = freqs[freq_pos]
+
+    return _apply_rotary_pos_emb_bshd(
+        t.unsqueeze(1),
+        freqs_packed,
+        rotary_interleaved=rotary_interleaved,
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        mscale=mscale,
+        inverse=inverse,
+        mla_output_remove_interleaving=mla_output_remove_interleaving,
+    ).squeeze(1)
 
 
 def apply_rotary_pos_emb(
@@ -276,6 +320,9 @@ def apply_rotary_pos_emb(
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
     mla_rotary_interleaved: bool = False,
+    inverse: bool = False,
+    mla_output_remove_interleaving: bool = False,
+    max_seqlen: Optional[int] = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -312,6 +359,12 @@ def apply_rotary_pos_emb(
                     "Using unfused implementation."
                 )
                 use_unfused = True
+            if inverse:
+                warnings.warn(
+                    "inverse RoPE is not supported by TE's fused RoPE. "
+                    "Using unfused implementation."
+                )
+                use_unfused = True
             if not use_unfused:
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
@@ -333,6 +386,8 @@ def apply_rotary_pos_emb(
             rotary_interleaved=config.rotary_interleaved,
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         )
     else:
         return _apply_rotary_pos_emb_thd(
@@ -343,6 +398,9 @@ def apply_rotary_pos_emb(
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             cp_group=cp_group,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
+            max_seqlen=max_seqlen,
         )
 
 
