@@ -2743,6 +2743,31 @@ def train_step(
     timers = get_timers()
     num_microbatches = get_num_microbatches()
 
+    offload_optimizer_states = getattr(args, 'offload_optimizer_states', False)
+    if offload_optimizer_states:
+        # Reload optimizer states as late as possible so the H2D transfer can overlap
+        # with gradient finalization. Preserve custom finalize hooks installed by a
+        # model builder, and avoid wrapping the hook again on every training step.
+        finalize_model_grads_func = getattr(config, 'finalize_model_grads_func', None)
+        if (
+            getattr(finalize_model_grads_func, '_optimizer_state_offload_wrapped_optimizer', None)
+            is not optimizer
+        ):
+            base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
+
+            def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance.reload_offloaded_states()
+                return base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
+
+            setattr(
+                finalize_model_grads_with_state_reload,
+                '_optimizer_state_offload_wrapped_optimizer',
+                optimizer,
+            )
+            config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+
     rerun_state_machine = get_rerun_state_machine()
     packed_data_iterator = None
     has_wrapped_data_iterator = False
@@ -2765,6 +2790,12 @@ def train_step(
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
+        # Start the D2H transfer before zeroing gradients to maximize overlap.
+        if offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.offload_states()
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2805,6 +2836,13 @@ def train_step(
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
+
+        # Master weights must remain resident until any main-param copy above is
+        # complete. Releasing here keeps optimizer memory out of forward/backward.
+        if offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.release_offloaded_gpu_states()
 
         # Forward pass.
         if save_activations_in_this_iteration:

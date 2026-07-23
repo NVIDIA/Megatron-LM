@@ -71,6 +71,85 @@ def test_train_step_defaults_to_none():
     assert captured["p2p_communicator"] is None and captured["pg_collection"] is None
 
 
+def test_train_step_drives_optimizer_state_offload_lifecycle():
+    """The standard train path must offload, release, and reload optimizer states."""
+    events = []
+
+    class FakeDistributedOptimizer:
+        def offload_states(self):
+            events.append("offload")
+
+        def release_offloaded_gpu_states(self):
+            events.append("release")
+
+        def reload_offloaded_states(self):
+            events.append("reload")
+
+    args = SimpleNamespace(
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        offload_optimizer_states=True,
+        seq_length=8,
+        global_batch_size=1,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+        empty_unused_memory_level=0,
+    )
+    dist_optimizer = FakeDistributedOptimizer()
+    optimizer = SimpleNamespace(
+        chained_optimizers=[dist_optimizer, object()], zero_grad=lambda: events.append("zero_grad")
+    )
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False, zero_grad_buffer=lambda: events.append("zero_grad_buffer")
+        )
+    ]
+    config = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        finalize_model_grads_func=lambda *args, **kwargs: events.append("finalize"),
+    )
+
+    def forward_backward(**kwargs):
+        events.append("forward_backward")
+        config.finalize_model_grads_func()
+        return []
+
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
+        mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
+        mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod, "get_moe_router_tracer", return_value=None),
+        mock.patch.object(training_mod, "DistributedOptimizer", FakeDistributedOptimizer),
+    ):
+        training_mod.train_step(
+            forward_step_func=lambda *args, **kwargs: None,
+            data_iterator=iter([]),
+            model=model,
+            optimizer=optimizer,
+            opt_param_scheduler=None,
+            config=config,
+            forward_backward_func=forward_backward,
+            iteration=0,
+        )
+
+    assert events == [
+        "offload",
+        "zero_grad_buffer",
+        "zero_grad",
+        "release",
+        "forward_backward",
+        "reload",
+        "finalize",
+    ]
+
+
 def test_train_step_wraps_sequence_packing_after_rerun_check():
     """The rerun machine must see the original iterator before dynamic-CP packs it."""
     args = SimpleNamespace(
