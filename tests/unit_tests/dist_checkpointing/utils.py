@@ -18,9 +18,9 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
@@ -185,6 +185,7 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
+    muon_scalar_optimizer='adam',
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -226,27 +227,47 @@ def setup_model_and_optimizer(
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
+        muon_scalar_optimizer=muon_scalar_optimizer,
     )
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
+    elif optimizer_type == 'lion':
+        config.lr = 1e-4
     optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
+    def _init_states(optimizer):
+        # In hybrid LayerWise + DistOpt mode the top-level ChainedOptimizer
+        # wraps another ChainedOptimizer (LayerWise) alongside DistOpt; recurse
+        # so the Muon Float16 sub-optimizers inside LayerWise still get their
+        # state seeded. Optimizers without ``init_state_fn`` (DistOpt) seed
+        # their state elsewhere and are skipped here.
+        if isinstance(optimizer, ChainedOptimizer):
+            for child_optimizer in optimizer.chained_optimizers:
+                _init_states(child_optimizer)
+            return
+        if not hasattr(optimizer, 'init_state_fn'):
+            return
+        if not hasattr(optimizer, 'optimizer'):
+            optimizer.init_state_fn(optimizer)
+        else:
+            optimizer.init_state_fn(optimizer.optimizer)
+
     if isinstance(optimizer, ChainedOptimizer):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+        _init_states(optimizer)
     else:
+        if hasattr(optimizer, 'optimizer_state_keys'):
+            state_keys = optimizer.optimizer_state_keys
+        else:
+            state_keys = ("exp_avg", "exp_avg_sq")
         for group in optimizer.optimizer.param_groups:
             for p in group['params']:
                 if len(optimizer.optimizer.state[p]) == 0:
-                    optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+                    for key in state_keys:
+                        optimizer.optimizer.state[p][key] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
     CachedMetadataFileSystemReader.clear_metadata_cache()

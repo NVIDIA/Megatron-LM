@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
@@ -9,6 +9,8 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
+from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -25,7 +27,8 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -144,7 +147,10 @@ class GPTModel(LanguageModule):
         self.rotary_scaling = rope_scaling
         self.mtp_block_spec = mtp_block_spec
         self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
-            self.config, ignore_virtual=False, vp_stage=vp_stage
+            layout=self.config.pipeline_model_parallel_layout,
+            mtp_num_layers=self.config.mtp_num_layers,
+            ignore_virtual=False,
+            vp_stage=vp_stage,
         )
 
         if self.pre_process or self.mtp_process:
@@ -244,7 +250,12 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            output_layer_cls = (
+                TELMHeadColumnParallelLinear
+                if is_mxfp8_output_proj_active(config)
+                else tensor_parallel.ColumnParallelLinear
+            )
+            self.output_layer = output_layer_cls(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -321,6 +332,12 @@ class GPTModel(LanguageModule):
                     f"input_ids shape {input_ids.shape}"
                 )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                # The embedding skips SP scatter for models whose outer wrapper scatters instead
+                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
@@ -414,13 +431,7 @@ class GPTModel(LanguageModule):
         if (
             in_inference_mode
             and inference_context is not None
-            and (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            and (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context.is_static_batching()
         ):
             current_batch_size = input_ids.shape[0]
@@ -469,20 +480,30 @@ class GPTModel(LanguageModule):
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
         off_interface.init_chunk_handler(
+            pp_rank=self.pg_collection.pp.rank(),
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction=self.config.activation_offload_fraction,
+            max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
-                off_interface.mark_not_offloadable(param)
+                off_interface.mark_not_offload(param)
             if self.mtp_process:
                 for param in self.mtp.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             if self.post_process:
                 for param in self.output_layer.parameters():
-                    off_interface.mark_not_offloadable(param)
+                    off_interface.mark_not_offload(param)
             self.disable_param_offloading = False
+
+    def preprocess_for_paged_stash(self):
+        """Preprocess for paged stash."""
+        return paged_stash_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
+        )
 
     def forward(
         self,
@@ -521,6 +542,9 @@ class GPTModel(LanguageModule):
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -650,11 +674,18 @@ class GPTModel(LanguageModule):
 
         if self.config.mtp_num_layers:
             assert self.config.mtp_num_layers > 0
-            if in_inference_mode or is_spec_decode:
+            if is_spec_decode:
                 # Cache decoder hidden states for serial MTP computation
                 # after speculative token verification.
-                self._decoder_hidden_states_cache = hidden_states
-            else:
+                assert inference_context is not None
+                if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                    assert inference_context.mtp_decoder_hidden_states is not None
+                    inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                        hidden_states
+                    )
+                else:
+                    inference_context.mtp_decoder_hidden_states = hidden_states
+            elif not in_inference_mode:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
@@ -667,8 +698,10 @@ class GPTModel(LanguageModule):
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
                     cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
         sequence_parallel_override = False
 
@@ -805,6 +838,8 @@ class GPTModel(LanguageModule):
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
 
         from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 

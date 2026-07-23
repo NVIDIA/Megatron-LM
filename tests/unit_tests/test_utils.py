@@ -14,6 +14,7 @@ import torch
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
@@ -22,6 +23,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
+from megatron.training.utils.common_utils import get_local_rank_preinit
 from tests.unit_tests.test_utilities import Utils
 
 success_string = "hello,world"
@@ -48,6 +50,24 @@ def test_divide_properly():
 def test_divide_improperly():
     with pytest.raises(AssertionError):
         util.divide(4, 5)
+
+
+@pytest.mark.skipif(not util.HAVE_PACKAGING, reason="packaging is not installed")
+@pytest.mark.parametrize("check_equality", [True, False])
+def test_is_flashinfer_min_version(check_equality):
+    from packaging.version import Version as PkgVersion
+
+    with patch.object(util, "get_flashinfer_version", return_value=PkgVersion("0.6.5")):
+        # check_equality=False exercised the path that used to reference an
+        # undefined name and raise NameError instead of returning a bool.
+        assert util.is_flashinfer_min_version("0.6.4", check_equality=check_equality) is True
+        assert util.is_flashinfer_min_version("0.7.0", check_equality=check_equality) is False
+        assert (
+            util.is_flashinfer_min_version("0.6.5", check_equality=check_equality) is check_equality
+        )
+
+    with patch.object(util, "get_flashinfer_version", return_value=None):
+        assert util.is_flashinfer_min_version("0.6.4", check_equality=check_equality) is False
 
 
 def test_experimental_cls_init():
@@ -92,6 +112,43 @@ def test_global_memory_buffer():
     obtained_tensor = global_memory_buffer.get_tensor((3, 2), torch.float32, "test_tensor")
     expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=torch.cuda.current_device())
     assert obtained_tensor.shape == expected_tensor.shape
+
+
+def test_global_memory_buffer_stable_after_presizing():
+    """Regression test for CUDA-graph corruption via GlobalMemoryBuffer growth.
+
+    ``get_tensor`` is grow-only: it only reallocates the backing buffer when the
+    cached one is missing or too small. Megatron's dynamic inference engine relies
+    on this to keep a CUDA-graph-captured all-gather buffer's address stable -- it
+    pre-sizes the buffer to the worst case before capturing graphs. If a *larger*
+    request later reallocated the buffer, the freed address (still written by a
+    captured graph on replay) would be recycled and silently corrupted.
+
+    This asserts the invariant the fix depends on: once sized to the max, any
+    smaller request reuses the SAME storage (stable device address); a larger
+    request is the only thing that reallocates.
+    """
+    gmb = util.GlobalMemoryBuffer()
+    device = torch.cuda.current_device()
+
+    # Pre-size to the worst case (mirrors create_cuda_graphs priming).
+    max_tensor = gmb.get_tensor((128,), torch.float32, "mpu")
+    presized_ptr = max_tensor.untyped_storage().data_ptr()
+
+    # Every smaller-or-equal request must reuse the same backing storage, i.e. the
+    # captured address never moves and is never freed.
+    for shape in [(128,), (64,), (1,), (100,)]:
+        t = gmb.get_tensor(shape, torch.float32, "mpu")
+        assert t.untyped_storage().data_ptr() == presized_ptr, (
+            f"get_tensor({shape}) reallocated the 'mpu' buffer after pre-sizing; "
+            "a captured CUDA graph would write to the freed address."
+        )
+
+    # Sanity: a request larger than the pre-sized buffer is the only case that
+    # reallocates. (This is exactly the condition the engine avoids by pre-sizing
+    # to context.max_tokens * hidden_size before graph capture.)
+    grown = gmb.get_tensor((256,), torch.float32, "mpu")
+    assert grown.untyped_storage().data_ptr() != presized_ptr
 
 
 def test_make_viewless_tensor():
@@ -470,3 +527,188 @@ def test_straggler_detector():
     util.StragglerDetector._configured = False
     # Teardown.
     _deinit_distributed()
+
+
+class TestGetWorldSizeSafe:
+    """Test get_world_size_safe function."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_world_size")
+    def test_initialized_torch_distributed(self, mock_get_world_size, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is initialized."""
+        mock_is_initialized.return_value = True
+        mock_get_world_size.return_value = 4
+
+        result = safe_get_world_size()
+
+        assert result == 4
+        mock_is_initialized.assert_called_once()
+        mock_get_world_size.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "8"})
+    def test_uninitialized_torch_distributed_with_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized but WORLD_SIZE env var exists."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 8
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_uninitialized_torch_distributed_no_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized and no WORLD_SIZE env var."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 1
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "invalid"})
+    def test_invalid_world_size_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe with invalid WORLD_SIZE environment variable."""
+        mock_is_initialized.return_value = False
+
+        with pytest.raises(ValueError):
+            safe_get_world_size()
+
+
+class TestGetLocalRankPreinit:
+    """Test get_local_rank_preinit function."""
+
+    @patch.dict(os.environ, {"LOCAL_RANK": "3"}, clear=True)
+    def test_uses_local_rank_env_var(self):
+        assert get_local_rank_preinit() == 3
+
+    @patch.dict(
+        os.environ, {"LOCAL_RANK": "2", "SLURM_NTASKS": "8", "SLURM_LOCALID": "5"}, clear=True
+    )
+    def test_local_rank_takes_precedence_over_slurm(self):
+        assert get_local_rank_preinit() == 2
+
+    @patch.dict(os.environ, {"SLURM_NTASKS": "8", "SLURM_LOCALID": "6"}, clear=True)
+    def test_falls_back_to_slurm_localid(self):
+        assert get_local_rank_preinit() == 6
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_defaults_to_zero_with_warning(self):
+        with pytest.warns(UserWarning, match="Could not determine local rank"):
+            assert get_local_rank_preinit() == 0
+
+
+class TestSingleGroupReductionHelpers:
+    """The optional ``group=`` on the reduction helpers, exercised with a HyperCommGrid-derived
+    process group (no ``parallel_state`` init — the MIMO use case) plus a default→mpu fallback."""
+
+    @staticmethod
+    def _ranks(group):
+        return torch.distributed.get_process_group_ranks(group)
+
+    def test_explicit_grid_group(self):
+        """Helpers reduce correctly over a group built from a HyperCommGrid, no parallel_state."""
+        from megatron.core.hyper_comm_grid import HyperCommGrid
+        from megatron.training.utils.common_utils import (
+            average_losses_across_data_parallel_group,
+            logical_and_across_model_parallel_group,
+            reduce_max_stat_across_model_parallel_group,
+        )
+
+        Utils.initialize_distributed()  # torch.distributed only; NOT initialize_model_parallel
+        world = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        # tp=2 over the world: "tp" groups stand in for a model-parallel group, "dp" for data.
+        grid = HyperCommGrid([2, world // 2], ["tp", "dp"], backend="nccl")
+        grid.create_pg(["tp"])
+        grid.create_pg(["dp"])
+        mp_group, dp_group = grid.get_pg("tp"), grid.get_pg("dp")
+        mp_ranks, dp_ranks = self._ranks(mp_group), self._ranks(dp_group)
+        try:
+            # reduce_max: MAX over the grid mp group.
+            assert reduce_max_stat_across_model_parallel_group(
+                float(rank), group=mp_group
+            ) == float(max(mp_ranks))
+
+            # logical_and: True iff every member is True (only the lowest mp rank passes True).
+            flag = rank == min(mp_ranks)
+            expected_and = all(r == min(mp_ranks) for r in mp_ranks)
+            assert logical_and_across_model_parallel_group(flag, group=mp_group) is expected_and
+
+            # average: SUM-then-divide over the grid dp group -> mean of member ranks.
+            loss = torch.tensor(float(rank), device=torch.cuda.current_device())
+            out = average_losses_across_data_parallel_group([loss], group=dp_group)
+            torch.testing.assert_close(
+                out.cpu(), torch.tensor([sum(dp_ranks) / len(dp_ranks)], dtype=torch.float32)
+            )
+        finally:
+            grid.destroy()
+
+    def test_default_falls_back_to_mpu(self):
+        """With no ``group=``, helpers read the mpu global (back-compat for non-MIMO callers)."""
+        from megatron.core import parallel_state as mpu
+        from megatron.training.utils.common_utils import reduce_max_stat_across_model_parallel_group
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        rank = torch.distributed.get_rank()
+        explicit = reduce_max_stat_across_model_parallel_group(
+            float(rank), group=mpu.get_model_parallel_group()
+        )
+        default = reduce_max_stat_across_model_parallel_group(float(rank))
+        assert default == explicit
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
+class TestTrainStepReductionThreading:
+    """train_step's reductions over a per-module ProcessGroupCollection's mp/pp/dp_cp groups."""
+
+    @staticmethod
+    def _ranks(group):
+        return torch.distributed.get_process_group_ranks(group)
+
+    def test_grid_threaded_reductions(self):
+        from megatron.core.hyper_comm_grid import HyperCommGrid
+        from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+        from megatron.training.utils.common_utils import (
+            logical_and_across_model_parallel_group,
+            reduce_max_stat_across_model_parallel_group,
+        )
+
+        Utils.initialize_distributed()  # torch.distributed only; NOT initialize_model_parallel
+        rank = torch.distributed.get_rank()
+        # tp=2,pp=2,dp=2 over the world: mp == tp+pp, dp_cp == dp.
+        grid = HyperCommGrid([2, 2, 2], ["tp", "pp", "dp"], backend="nccl")
+        grid.create_pg(["tp", "pp"])
+        grid.create_pg(["pp"])
+        grid.create_pg(["dp"])
+        mp_group = grid.get_pg(["tp", "pp"])
+        pp_group = grid.get_pg(["pp"])
+        dp_cp_group = grid.get_pg(["dp"])
+        mp_ranks = self._ranks(mp_group)
+        pp_ranks = self._ranks(pp_group)
+        dp_cp_ranks = self._ranks(dp_cp_group)
+        try:
+            # reduce_max (grad_norm / num_zeros): MAX over the grid mp group.
+            assert reduce_max_stat_across_model_parallel_group(
+                float(rank), group=mp_group
+            ) == float(max(mp_ranks))
+
+            # logical_and (update_successful): True iff every mp member is True.
+            flag = rank != min(mp_ranks)  # one rank dissents -> AND is False on the whole group.
+            assert logical_and_across_model_parallel_group(flag, group=mp_group) is False
+
+            # is_pp_last_stage: True only on the highest rank of the pp group.
+            assert is_pp_last_stage(pp_group) is (rank == max(pp_ranks))
+
+            # per-key loss all-reduce: SUM over the grid dp_cp group.
+            val = torch.tensor([float(rank), 1.0], device=torch.cuda.current_device())
+            torch.distributed.all_reduce(val, group=dp_cp_group)
+            expected = torch.tensor(
+                [float(sum(dp_cp_ranks)), float(len(dp_cp_ranks))], dtype=torch.float32
+            )
+            torch.testing.assert_close(val.cpu(), expected)
+        finally:
+            grid.destroy()

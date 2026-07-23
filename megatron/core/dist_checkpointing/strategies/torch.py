@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
 import inspect
@@ -831,6 +831,14 @@ def _get_filesystem_reader(
 ) -> FileSystemReader:
     if MultiStorageClientFeature.is_enabled():
         msc = MultiStorageClientFeature.import_package()
+        if cache_metadata:
+            warnings.warn(
+                "MSC is enabled: returning msc.torch.MultiStorageFileSystemReader instead of "
+                "CachedMetadataFileSystemReader. The cache_metadata=True request "
+                "(e.g. ckpt_assume_constant_structure=True) will be ignored and metadata "
+                "will be re-read on every load. Pass --enable-msc only when this is intended.",
+                stacklevel=2,
+            )
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
     if cache_metadata:
@@ -843,9 +851,10 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False):
+    def __init__(self, cache_metadata: bool = False, checkpoint_name: str = None):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        self.checkpoint_name = checkpoint_name
 
     def load(
         self,
@@ -1015,16 +1024,16 @@ class TorchDistLoadShardedStrategy:
             except AttributeError:
                 os.sync()
         ## move the old metadata
-        fs_writer.fs.rename(fs_writer.metadata_path, old_path)
+        fs_writer.fs.rename(metadata_filename, old_path)
         try:
             ## rename the new metadata
-            fs_writer.fs.rename(tmp_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(tmp_path, metadata_filename)
 
             ## finally, remove the files we want to drop
             for f in files_to_remove:
-                fs_writer.fs.rm_file(checkpoint_dir / f)
+                fs_writer.fs.rm_file(Path(checkpoint_dir) / f)
         except Exception as e:
-            fs_writer.fs.rename(old_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(old_path, metadata_filename)
             raise e
         else:
             fs_writer.fs.rm_file(old_path)

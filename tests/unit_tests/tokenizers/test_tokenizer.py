@@ -8,6 +8,8 @@ import torch
 from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
     from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import (
@@ -17,6 +19,8 @@ try:
 except Exception:
     HAVE_TRANSFORMERS = False
     HuggingFaceTokenizer = None
+
+from megatron.training.config.training_config import TokenizerConfig
 
 
 def get_conversation():
@@ -466,9 +470,178 @@ def test_sft_tokenizer():
     ), "failed to tokenize conversation and return target tokens"
 
 
+# ------------------------------------------------------------------------
+# Unit tests for TokenizerConfig
+# ------------------------------------------------------------------------
+
+
+class TestTokenizerConfig:
+    def test_config_success(self):
+        tokenizer_model = "/path/to/tokenizer"
+        tokenizer_type = "HuggingFaceTokenizer"
+        metadata_path = "/path/to/metadata.json"
+        pad_vocab_size = False
+        chat_template = get_chat_template()
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            metadata_path=metadata_path,
+            pad_vocab_size=pad_vocab_size,
+            chat_template=chat_template,
+        )
+
+        assert config.tokenizer_model == tokenizer_model
+        assert config.metadata_path == metadata_path
+        assert config.pad_vocab_size == pad_vocab_size
+        assert config.chat_template == chat_template
+
+    def test_config_failure(self):
+        tokenizer_model = "/path/to/tokenizer"
+        tokenizer_type = "HuggingFaceTokenizer"
+        metadata_path = "/path/to/metadata.json"
+
+        with pytest.raises(TypeError, match="got an unexpected keyword argument"):
+            TokenizerConfig(
+                tokenizer_model=tokenizer_model,
+                tokenizer_type=tokenizer_type,
+                metadata_path=metadata_path,
+                random_arg=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for build_tokenizer function
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTokenizer:
+    def test_build_hf_tokenizer(self):
+        tokenizer_model = "/opt/data/tokenizers/huggingface"
+        tokenizer_type = "HuggingFaceTokenizer"
+        chat_template = get_chat_template()
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            pad_vocab_size=False,
+            chat_template=chat_template,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "huggingface"
+        assert tokenizer.chat_template == chat_template
+        assert tokenizer._tokenizer.include_special_tokens == True
+
+    def test_build_megatron_tokenizer(self):
+        special_tokens = [f'<extra_id_{i}>' for i in range(100)]
+        vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
+        merges_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
+
+        config = TokenizerConfig(
+            tokenizer_type="GPT2BPETokenizer",
+            vocab_file=vocab_file,
+            merge_file=merges_file,
+            special_tokens=special_tokens,
+            pad_vocab_size=False,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "megatron"
+        assert tokenizer.chat_template == None
+
+    def test_build_sp_tokenizer(self):
+        tokenizer_model = "/opt/data/tokenizers/sentencepiece/tokenizer.model"
+        chat_template = get_chat_template()
+        metadata_path = {
+            "library": "sentencepiece",
+            "model_type": "gpt",
+            "chat_template": chat_template,
+        }
+
+        config = TokenizerConfig(
+            tokenizer_type="SentencePieceTokenizer",
+            tokenizer_model=tokenizer_model,
+            metadata_path=metadata_path,
+            pad_vocab_size=False,
+            tokenizer_sentencepiece_ignore_extra_whitespaces=False,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "sentencepiece"
+        assert tokenizer.chat_template == chat_template
+        assert tokenizer._tokenizer.legacy == False
+        assert tokenizer._tokenizer.ignore_extra_whitespaces == False
+
+    def test_build_tiktoken_tokenizer(self):
+        chat_template = get_chat_template()
+        vocab_size = 32000
+        special_tokens = ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>", "<test>"]
+
+        config = TokenizerConfig(
+            tokenizer_type="TikTokenizer",
+            tokenizer_model="/opt/data/tokenizers/tiktoken/tiktoken.vocab.json",
+            pad_vocab_size=False,
+            tiktoken_pattern="v1",
+            chat_template=chat_template,
+            vocab_size=vocab_size,
+            special_tokens=special_tokens,
+            tiktoken_num_special_tokens=len(special_tokens),
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "tiktoken"
+        assert tokenizer.chat_template == chat_template
+        assert tokenizer.vocab_size == vocab_size
+        assert tokenizer._tokenizer.special_tokens == special_tokens
+
+    def test_build_null_tokenizer(self):
+        vocab_size = 1000
+        null_tokenizer_eod_id = 11
+        null_tokenizer_pad_id = 111
+
+        config = TokenizerConfig(
+            tokenizer_type="NullTokenizer",
+            vocab_size=vocab_size,
+            null_tokenizer_eod_id=null_tokenizer_eod_id,
+            null_tokenizer_pad_id=null_tokenizer_pad_id,
+            pad_vocab_size=False,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "null-text"
+        assert tokenizer.vocab_size == vocab_size
+        assert tokenizer.eod == tokenizer._tokenizer._eod_id == null_tokenizer_eod_id
+        assert tokenizer.pad_id == tokenizer._tokenizer._pad_id == null_tokenizer_pad_id
+
+    def test_build_null_multimodal_tokenizer(self):
+        vocab_size = 1111
+
+        config = TokenizerConfig(
+            tokenizer_type="NullMultimodalTokenizer", vocab_size=vocab_size, pad_vocab_size=False
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "null-multimodal"
+        assert tokenizer.vocab_size == (vocab_size + 1)
+
+    def test_tokenizer_failure(self):
+        config = TokenizerConfig(tokenizer_type="UnknownTokenizer")
+
+        with pytest.raises(ValueError, match="tokenizer_type UnknownTokenizer is not supported"):
+            tokenizer = build_tokenizer(config)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for SFTTokenizer._extract_token_ids (no GPU / real tokenizer needed)
 # ---------------------------------------------------------------------------
+
 
 try:
     from megatron.core.tokenizers.text.libraries.sft_tokenizer import SFTTokenizer
@@ -522,3 +695,30 @@ class TestExtractTokenIds:
     # --- 2D raw ndarray (1, seq_len) — the bug fixed in this PR ---
     def test_2d_ndarray_batch1(self):
         self._check(np.array([_IDS]))  # shape (1, 5)
+
+
+class TestAbstractTokenizerSpecialIdAliases:
+    """Regression tests for the special-id property aliases on
+    ``MegatronTokenizerTextAbstract`` (cls_id / sep_id / pad_id / bos_id / eos_id / mask_id).
+
+    Each alias previously checked ``hasattr(self, '<name>_id')`` and returned
+    ``self.<name>_id`` — i.e. it re-entered itself — so accessing an alias that a
+    subclass did not override raised ``RecursionError`` instead of returning the
+    backing short-name attribute (``self.cls`` ...) or a clean ``AttributeError``.
+    ``ByteLevelTokenizer`` overrides pad_id/bos_id/eos_id but not cls_id/sep_id/mask_id,
+    so those reach the base implementation and exercise the shared fix.
+    """
+
+    def test_unoverridden_alias_raises_attributeerror_not_recursion(self):
+        tok = ByteLevelTokenizer(vocab_size=512)
+        # No backing short-name attribute -> a clean AttributeError, not RecursionError.
+        for name in ("cls_id", "sep_id", "mask_id"):
+            with pytest.raises(AttributeError):
+                getattr(tok, name)
+
+    def test_alias_returns_backing_short_name_attribute(self):
+        tok = ByteLevelTokenizer(vocab_size=512)
+        tok.cls, tok.sep, tok.mask = 5, 6, 7
+        assert tok.cls_id == 5
+        assert tok.sep_id == 6
+        assert tok.mask_id == 7

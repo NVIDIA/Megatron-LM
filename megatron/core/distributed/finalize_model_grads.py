@@ -326,9 +326,16 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 or "global_aux_loss" in config.moe_router_load_balancing_type
             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
+            if getattr(module, 'qb_beta_accum', None) is not None:
+                module.qb_beta_accum.zero_()
+                module.qb_beta_count.zero_()
 
 
-def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+def _update_router_expert_bias(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
     """
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
@@ -341,7 +348,11 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
             # cases where only the student is in training mode but the teacher is in eval mode
             # when using online knoweldge-distillation with Model-Optimizer. In this case, we want
             # to avoid updating teacher's expert_bias.
-            if hasattr(module, 'expert_bias') and module.training:
+            if (
+                hasattr(module, 'expert_bias')
+                and module.training
+                and not getattr(module, 'frozen_expert_bias', False)
+            ):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
@@ -350,11 +361,56 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
     stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+        stacked_tokens_per_expert,
+        stacked_expert_bias,
+        config.moe_router_bias_update_rate,
+        tp_dp_cp_group=tp_dp_cp_group,
     )
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
+
+
+def _update_router_qb_beta(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """Update the quantile-balancing per-expert bias once per global batch.
+
+    Averages each router's accumulated quantile (qb_beta_accum/qb_beta_count) across
+    DP, EMA-blends it with the current qb_beta, re-centers, and writes it back.
+    """
+    qb_beta_list = []
+    qb_beta_accum_list = []
+    qb_beta_count_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if getattr(module, 'qb_beta_accum', None) is not None and module.training:
+                qb_beta_list.append(module.qb_beta)
+                qb_beta_accum_list.append(module.qb_beta_accum)
+                qb_beta_count_list.append(module.qb_beta_count)
+
+    if len(qb_beta_list) == 0:
+        return
+
+    stacked_beta = torch.stack(qb_beta_list, dim=0)
+    local_avg_list = [
+        accum / count.clamp(min=1).to(accum.dtype)
+        for accum, count in zip(qb_beta_accum_list, qb_beta_count_list)
+    ]
+    stacked_local_avg = torch.stack(local_avg_list, dim=0)
+
+    torch.distributed.all_reduce(
+        stacked_local_avg, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group
+    )
+
+    ema = config.moe_router_quantile_balancing_ema
+    stacked_new_beta = ema * stacked_beta + (1.0 - ema) * stacked_local_avg
+    stacked_new_beta = stacked_new_beta - stacked_new_beta.mean(dim=-1, keepdim=True)
+
+    for qb_beta, new_beta in zip(qb_beta_list, stacked_new_beta):
+        qb_beta.copy_(new_beta)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
@@ -448,6 +504,7 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
+    tp_dp_cp_group = None
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
         assert hasattr(pg_collection, 'pp')
@@ -466,6 +523,11 @@ def finalize_model_grads(
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
         assert hasattr(pg_collection, 'dp_cp')
+        if config.moe_router_enable_expert_bias:
+            assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
+                "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
+            )
+            tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
         embd_group = pg_collection.embd
@@ -519,7 +581,14 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        _update_router_expert_bias(model, config)
+        if pg_collection is None:
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
+
+    if config.moe_router_load_balancing_type == "quantile_balancing":
+        _update_router_qb_beta(model, config, dp_cp_group=dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 
@@ -536,7 +605,10 @@ def finalize_model_grads(
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+
+        # Clamp to avoid div-by-zero without a host-side branch on a device tensor,
+        # which would otherwise cause a sync that is illegal during CUDA graph capture.
+        safe_num_tokens = torch.clamp(num_tokens, min=1)
+        scaling = 1.0 / safe_num_tokens
         for model_chunk in model:
-            if num_tokens > 0:
-                scaling = 1.0 / num_tokens
-                model_chunk.scale_gradients(scaling)
+            model_chunk.scale_gradients(scaling)

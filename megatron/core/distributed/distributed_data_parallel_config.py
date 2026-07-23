@@ -154,7 +154,9 @@ class DistributedDataParallelConfig:
     If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
     parameter all-gather and computation, helping to better hide the
-    initial communication cost.
+    initial communication cost. Should be deactivated when using
+    full-iteration CG, or partial CG if AG/RS is launched beyond the
+    CG capture scope but is waited on during the capture scope.
     """
 
     outer_dp_sharding_strategy: str = 'no_shard'
@@ -213,6 +215,37 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    megatron_fsdp_cuda_graph_mode: bool = False
+    """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
+    not dereferencing `param.grad` after the optimizer step to preserve references for
+    CUDA graph replay. Can affect memory utilization in some cases, such as when the
+    gradient shard is not a view of the Megatron-FSDP sharded gradient buffer, so
+    FusedAdam(use_decoupled_grad=True) + megatron_fsdp_use_decoupled_grad=True or
+    setting megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype is
+    recommended to avoid casting the gradient to the parameter precision and creating
+    a casted-copy of the gradient shard that cannot be dereferenced due to replay.
+    """
+
+    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
+      This feature increases the overlap between parameter all-gather and forward computation,
+      at the cost of more frequent communication calls.
+      For MXFP8, this approach helps save memory during fine-grained activation
+      recomputation, because MXFP8 forward and backward passes use different
+      parameter representations (rowwise data for forward, colwise data for backward).
+      In this mode, only the rowwise parameters of modules involved in recomputation
+      will be unsharded.
+    """
+
+    megatron_fsdp_max_pool_double_buffer: bool = False
+    """
+    Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+    FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+    user buffer registration and CUDA graph replay for models with asymmetrical
+    FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+    """
+
     def __post_init__(self):
         import os
 
@@ -236,3 +269,7 @@ class DistributedDataParallelConfig:
         if self.num_buckets is not None:
             assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
+
+        if self.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of double-buffer allocator.
+            self.fsdp_double_buffer = True

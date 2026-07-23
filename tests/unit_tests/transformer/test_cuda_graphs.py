@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -23,6 +23,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -34,8 +35,9 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    create_cudagraphs,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
@@ -44,6 +46,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
+from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -55,6 +58,329 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, _ = check_fp8_support()
+
+
+def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
+    return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
+
+    warning_messages = []
+    print_messages = []
+
+    monkeypatch.setattr(
+        training_arguments, "warn_rank_0", lambda msg, *args, **kwargs: warning_messages.append(msg)
+    )
+    monkeypatch.setattr(
+        training_arguments, "print_rank_0", lambda msg, *args, **kwargs: print_messages.append(msg)
+    )
+    monkeypatch.setattr(sys, "argv", ["test_cuda_graphs.py", *(cli_args or [])])
+
+    args = parse_args()
+    args.num_layers = 2
+    args.vocab_size = 256
+    args.hidden_size = 64
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 128
+    args.seq_length = 128
+    args.micro_batch_size = 1
+
+    for key, value in overrides.items():
+        setattr(args, key, value)
+
+    args = validate_args(args)
+    return args, warning_messages, print_messages
+
+
+class TestCudaGraphConfigAndArguments:
+    def test_local_impl_defaults_to_layer_scope(self):
+        cfg = _base_cuda_graph_config(cuda_graph_impl='local')
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+    def test_local_impl_allows_expert_activation_offload_scope(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+            fine_grained_activation_offloading=True,
+            offload_modules=['expert_fc1', 'moe_act'],
+            num_moe_experts=4,
+        )
+
+        assert cfg.cuda_graph_impl == 'local'
+        assert CudaGraphModule.attn in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_router in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_preprocess in cfg.cuda_graph_modules
+
+    def test_local_impl_rejects_unsupported_activation_offload_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['qkv_linear'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.attn],
+                fine_grained_activation_offloading=True,
+                offload_modules=['qkv_linear'],
+            )
+
+    def test_local_impl_rejects_full_layer_graph_with_activation_offload(self):
+        with pytest.raises(
+            AssertionError, match="not supported with whole-layer CUDA graph capture"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[],
+                fine_grained_activation_offloading=True,
+                offload_modules=['expert_fc1'],
+            )
+
+    def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['mlp_norm'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.moe_router],
+                fine_grained_activation_offloading=True,
+                offload_modules=['mlp_norm'],
+                num_moe_experts=4,
+            )
+
+    def test_full_iteration_impl_requires_empty_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match='cuda_graph_modules must be empty when cuda_graph_impl="full_iteration"',
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration', cuda_graph_modules=[CudaGraphModule.attn]
+            )
+
+    def test_full_iteration_scope_string_in_config_migrated(self):
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl='local', cuda_graph_modules='full_iteration'
+            )
+        assert cfg.cuda_graph_impl == 'full_iteration'
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_full_iteration_inference_scope_string_in_config_migrated(self):
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl='local', cuda_graph_modules='full_iteration_inference'
+            )
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_full_iteration_inference_scope_string_noops_without_local_impl(self):
+        with pytest.warns(DeprecationWarning, match="has no effect"):
+            cfg = _base_cuda_graph_config(cuda_graph_modules='full_iteration_inference')
+        assert cfg.cuda_graph_impl == 'none'
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_full_iteration_scope_rejects_conflicting_new_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_modules='full_iteration' cannot be combined with "
+            "inference_cuda_graph_scope='block'",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules='full_iteration',
+                inference_cuda_graph_scope='block',
+            )
+
+    def test_deprecated_full_iteration_inference_scope_rejects_conflicting_new_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_modules='full_iteration_inference' cannot be combined with "
+            "inference_cuda_graph_scope='layer'",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules='full_iteration_inference',
+                inference_cuda_graph_scope='layer',
+            )
+
+    def test_enable_cuda_graph_flag_migrates_to_local_impl(self, monkeypatch):
+        args, _, print_messages = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--enable-cuda-graph']
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert any("--enable-cuda-graph is deprecated" in msg for msg in print_messages)
+
+    def test_full_iteration_inference_scope_cli_migrates_to_block_scope(self, monkeypatch):
+        args, warning_messages, _ = _validated_cuda_graph_cli_args(
+            monkeypatch,
+            ['--cuda-graph-impl', 'local', '--cuda-graph-modules', 'full_iteration_inference'],
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert args.cuda_graph_modules == []
+        assert any(
+            "--cuda-graph-modules 'full_iteration_inference' is deprecated" in msg
+            for msg in warning_messages
+        )
+
+    def test_full_iteration_inference_scope_cli_noops_without_local_impl(self, monkeypatch):
+        args, warning_messages, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-scope', 'full_iteration_inference']
+        )
+        assert args.cuda_graph_impl == 'none'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert args.cuda_graph_modules == []
+        assert any("has no effect when --cuda-graph-impl=none" in msg for msg in warning_messages)
+
+    def test_full_iteration_inference_scope_cli_rejects_conflicting_new_scope(self, monkeypatch):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_modules='full_iteration_inference' cannot be combined with "
+            "inference_cuda_graph_scope='layer'",
+        ):
+            _validated_cuda_graph_cli_args(
+                monkeypatch,
+                [
+                    '--cuda-graph-impl',
+                    'local',
+                    '--cuda-graph-modules',
+                    'full_iteration_inference',
+                    '--inference-cuda-graph-scope',
+                    'layer',
+                ],
+            )
+
+    def test_new_scope_cli_accepts_block(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'local', '--inference-cuda-graph-scope', 'block']
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+    def test_new_scope_cli_accepts_layer(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'local', '--inference-cuda-graph-scope', 'layer']
+        )
+        assert args.cuda_graph_impl == 'local'
+        assert args.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+    def test_removed_module_scoped_scope_name_is_not_accepted(self, monkeypatch):
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                'test_cuda_graphs.py',
+                '--cuda-graph-impl',
+                'local',
+                '--inference-cuda-graph-scope',
+                'module_scoped',
+            ],
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    def test_removed_old_inference_bool_flag_is_not_accepted(self, monkeypatch):
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        monkeypatch.setattr(
+            sys, "argv", ['test_cuda_graphs.py', '--inference-use-full-iteration-cuda-graph']
+        )
+        with pytest.raises(SystemExit):
+            parse_args()
+
+    # --- Backward compat: cuda_graph_scope → cuda_graph_modules rename ---
+
+    def test_deprecated_cuda_graph_scope_kwarg_migrates_to_modules(self):
+        with pytest.warns(DeprecationWarning, match="cuda_graph_scope is deprecated"):
+            cfg = _base_cuda_graph_config(cuda_graph_scope=['attn'])
+        assert cfg.cuda_graph_modules == [CudaGraphModule.attn]
+        assert cfg.cuda_graph_scope is None
+
+    def test_new_cuda_graph_modules_does_not_populate_deprecated_scope(self):
+        cfg = _base_cuda_graph_config(cuda_graph_modules=['attn', 'mlp'])
+        assert cfg.cuda_graph_modules == [CudaGraphModule.attn, CudaGraphModule.mlp]
+        assert cfg.cuda_graph_scope is None
+
+    def test_new_full_iteration_impl_does_not_populate_deprecated_scope(self):
+        cfg = _base_cuda_graph_config(cuda_graph_impl='full_iteration', cuda_graph_modules=[])
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_cli_migrates_to_modules(self, monkeypatch):
+        args, warning_messages, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'local', '--cuda-graph-scope', 'attn']
+        )
+        assert args.cuda_graph_modules == [CudaGraphModule.attn]
+        assert any('--cuda-graph-scope is deprecated' in msg for msg in warning_messages)
+
+    def test_cuda_graph_scope_is_standalone_class_for_pickle_compat(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        # CudaGraphScope is preserved as a standalone class (not an alias) so that
+        # pre-refactor checkpoints can be deserialized without value-collision errors.
+        assert CudaGraphScope is not CudaGraphModule
+        assert CudaGraphScope.attn.value == 2  # original ordinals preserved
+        assert CudaGraphScope.mamba.value == 7
+
+    def test_cuda_graph_scope_and_inference_scope_in_safe_globals(self):
+        from megatron.core.safe_globals import SAFE_GLOBALS
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        assert CudaGraphScope in SAFE_GLOBALS
+        assert InferenceCudaGraphScope in SAFE_GLOBALS
+
+    def test_deprecated_cuda_graph_scope_enum_instance_migrates_to_modules(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning, match="cuda_graph_scope is deprecated"):
+            cfg = _base_cuda_graph_config(cuda_graph_scope=[CudaGraphScope.attn])
+        assert cfg.cuda_graph_modules == [CudaGraphModule.attn]
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_full_iteration_enum_migrates_to_impl(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning):
+            cfg = _base_cuda_graph_config(cuda_graph_scope=[CudaGraphScope.full_iteration])
+        assert cfg.cuda_graph_impl == "full_iteration"
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_full_iteration_inference_enum_migrates_to_scope(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl="local", cuda_graph_scope=[CudaGraphScope.full_iteration_inference]
+            )
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
+
+    def test_deprecated_cuda_graph_scope_full_iteration_inference_noops_without_local_impl(self):
+        from megatron.core.transformer.enums import CudaGraphScope
+
+        with pytest.warns(DeprecationWarning, match="has no effect"):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_scope=[CudaGraphScope.full_iteration_inference]
+            )
+        assert cfg.cuda_graph_impl == "none"
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert cfg.cuda_graph_modules == []
+        assert cfg.cuda_graph_scope is None
 
 
 class TestParallelTransformerBlockCudagraphs:
@@ -118,6 +444,112 @@ class TestParallelTransformerBlockCudagraphs:
                 .cudagraph_manager.cudagraph_runners[0]
                 .fwd_graph
             )
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+class TestPackedSeqCudagraphs:
+    """Training CUDA graphs over thd input with padding between sequences.
+
+    The padded cu_seqlens describe a slot layout that differs from the actual lengths,
+    and pad_between_seqs is set explicitly so TE does spend a GPU sync inferring it.
+    cp_size == 2 additionally captures TE's ring-P2P context-parallel attention inside the graphs.
+    """
+
+    SEQ_LENGTHS = [7, 5]
+    SLOT_STARTS = [0, 8, 16]  # slot layout aligned to 2 * cp_size for every cp_size tested
+    BIN_SIZE = 32
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+
+    def _build_packed_seq_params(self, device):
+        # Actual boundaries: each sequence's real tokens inside its slot; the trailing bin
+        # padding [SLOT_STARTS[-1], BIN_SIZE) forms a ghost slot of pad tokens.
+        boundaries = [0]
+        for length in self.SEQ_LENGTHS:
+            boundaries.append(boundaries[-1] + length)
+        boundaries.append(boundaries[-1] + self.BIN_SIZE - self.SLOT_STARTS[-1])
+        cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=device)
+        cu_seqlens_padded = torch.tensor(
+            self.SLOT_STARTS + [self.BIN_SIZE], dtype=torch.int32, device=device
+        )
+        return PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=self.BIN_SIZE,
+            max_seqlen_kv=self.BIN_SIZE,
+            pad_between_seqs=True,
+        )
+
+    @pytest.mark.parametrize("cp_size", [1, 2])
+    def test_thd_capture_with_pad_between_seqs(self, cp_size):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(context_parallel_size=cp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            context_parallel_size=cp_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            cuda_graph_impl="local",
+            use_cpu_initialization=True,
+        )
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
+        block.train()
+        # CUDA-graphed backward assumes DDP-style grad accumulation buffers.
+        for param in block.parameters():
+            param.main_grad = torch.zeros_like(param)
+
+        packed_seq_params = self._build_packed_seq_params(torch.device('cuda'))
+        # Each CP rank holds its 1/cp_size share of the bin's tokens.
+        hidden_states = torch.randn(
+            (self.BIN_SIZE // cp_size, 1, config.hidden_size),
+            dtype=torch.bfloat16,
+            device='cuda',
+            requires_grad=True,
+        )
+
+        eager_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        eager_out.sum().backward()
+
+        # This is the primary function under test.
+        create_cudagraphs()
+
+        for layer in block.layers:
+            runners = layer.cudagraph_manager.cudagraph_runners
+            assert len(runners) == 1
+            assert runners[0].fwd_graph is not None
+
+        graphed_out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        assert torch.allclose(graphed_out.float(), eager_out.float(), rtol=1e-2, atol=1e-2)
+        graphed_out.sum().backward()
+
+        # Destroy captured graphs deterministically before parallel-state teardown.
+        for layer in block.layers:
+            for runner in layer.cudagraph_manager.cudagraph_runners:
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+        torch.cuda.synchronize()
 
 
 @pytest.mark.skipif(
@@ -376,6 +808,9 @@ class TestLLaVACudaGraph:
 
         # Move model to CUDA
         self.llava_model.cuda()
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in self.llava_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         set_current_microbatch(self.llava_model.vision_model, 1)
         set_current_microbatch(self.llava_model.language_model, 1)
@@ -809,6 +1244,12 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
+def is_nccl_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    return HAVE_TE_EP
+
+
 class TestPartialCudaGraph:
     """Test that CUDA graph outputs match non-CUDA graph outputs for various scopes."""
 
@@ -877,7 +1318,7 @@ class TestPartialCudaGraph:
         )
 
     def create_test_args(
-        self, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_size, **kwargs
+        self, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -922,7 +1363,7 @@ class TestPartialCudaGraph:
 
         # CUDA graph settings
         args.cuda_graph_impl = cuda_graph_impl
-        args.cuda_graph_scope = cuda_graph_scope
+        args.cuda_graph_modules = cuda_graph_modules
         args.cuda_graph_warmup_steps = cuda_graph_warmup_steps
 
         # fp8 settings
@@ -953,11 +1394,11 @@ class TestPartialCudaGraph:
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def _run_test_helper(
-        self, ep_size, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, **kwargs
+        self, ep_size, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, **kwargs
     ):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
-            cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_size, **kwargs
+            cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs
         )
 
         set_args(args)
@@ -969,7 +1410,7 @@ class TestPartialCudaGraph:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -1031,7 +1472,7 @@ class TestPartialCudaGraph:
     )
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep", "ncclep"])
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(
@@ -1053,37 +1494,48 @@ class TestPartialCudaGraph:
                 pytest.skip("Hybrid EP is not available")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
+        elif moe_dispatcher_type == "ncclep":
+            if not is_nccl_ep_available():
+                pytest.skip("NCCL EP is not available")
+            if ep_size < 2:
+                pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
+            # ncclep sizes a per-rank recv buffer from this and overflow hard-traps; size generously.
+            extra_kwargs["moe_expert_rank_capacity_factor"] = 8.0
         else:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
         if not moe_dropless_dispatcher:
-            if moe_dispatcher_type == "deepep":
-                pytest.skip("Deep EP doesn't support drop&pad MoE")
+            if moe_dispatcher_type in ("deepep", "ncclep"):
+                pytest.skip(f"{moe_dispatcher_type} doesn't support drop&pad MoE")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
         loss_list_ref = self._run_test_helper(ep_size, "none", None, 0, **extra_kwargs)
-        for cuda_graph_scope in [
+        for cuda_graph_modules in [
             None,
-            [CudaGraphScope.attn],
-            [CudaGraphScope.moe],
-            [CudaGraphScope.mlp, CudaGraphScope.moe_router],
+            [CudaGraphModule.attn],
+            [CudaGraphModule.moe],
+            [CudaGraphModule.mlp, CudaGraphModule.moe_router],
             [
-                CudaGraphScope.attn,
-                CudaGraphScope.mlp,
-                CudaGraphScope.moe_router,
-                CudaGraphScope.moe_preprocess,
+                CudaGraphModule.attn,
+                CudaGraphModule.mlp,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
             ],
         ]:
-            if (moe_dropless_dispatcher or moe_dispatcher_type == "hybridep") and (
-                cuda_graph_scope is None or CudaGraphScope.moe in cuda_graph_scope
+            if (moe_dropless_dispatcher or moe_dispatcher_type in ("hybridep", "ncclep")) and (
+                cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules
             ):
-                # Dropless MoE or Hybrid EP doesn't work with "moe" scope cudagraph. Skip.
+                # Dropless MoE or a dynamic-shape flex backend (Hybrid EP / NCCL EP) can't be
+                # captured at the "moe" scope (the dispatch does a device-to-host sync). Skip;
+                # the surrounding compute submodules are still graphed.
                 continue
             cuda_graph_warmup_steps = 3
             loss_list = self._run_test_helper(
                 ep_size,
                 "transformer_engine",
-                cuda_graph_scope,
+                cuda_graph_modules,
                 cuda_graph_warmup_steps,
                 **extra_kwargs,
             )
@@ -1091,6 +1543,10 @@ class TestPartialCudaGraph:
 
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
+        if moe_dispatcher_type == "ncclep":
+            from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+
+            nccl_ep_finalize()
         Utils.destroy_model_parallel()
 
 
@@ -1257,6 +1713,49 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+
+class TestSkipFp8WeightUpdateTensor:
+    """Regression test for the TE 2.15 ``set_skip_fp8_weight_update_tensor`` removal."""
+
+    @staticmethod
+    def _read_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        getter = getattr(FP8GlobalStateManager, "get_skip_fp8_weight_update_tensor", None)
+        if getter is not None:
+            return getter()
+        return FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor
+
+    @staticmethod
+    def _reset_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        if "skip_fp8_weight_update_tensor" in vars(FP8GlobalStateManager):
+            FP8GlobalStateManager.skip_fp8_weight_update_tensor = None
+        qstate = getattr(FP8GlobalStateManager, "quantization_state", None)
+        if qstate is not None and hasattr(qstate, "skip_fp8_weight_update_tensor"):
+            qstate.skip_fp8_weight_update_tensor = None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_sets_value_in_place(self):
+        """Helper writes the right value and reuses the same storage across calls."""
+        from megatron.core.transformer.cuda_graphs import _set_skip_fp8_weight_update_tensor
+
+        self._reset_skip_tensor()
+        try:
+            _set_skip_fp8_weight_update_tensor(True)
+            t = self._read_skip_tensor()
+            assert t.shape == (1,) and t.dtype == torch.float32 and t.is_cuda
+            assert t.item() == 1.0
+
+            # data_ptr must stay stable so captured cudagraphs read the same address.
+            ptr = t.data_ptr()
+            _set_skip_fp8_weight_update_tensor(False)
+            assert self._read_skip_tensor().data_ptr() == ptr
+            assert self._read_skip_tensor().item() == 0.0
+        finally:
+            self._reset_skip_tensor()
 
 
 if __name__ == "__main__":
