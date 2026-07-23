@@ -26,6 +26,7 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.package_info import __version__ as mcore_version
@@ -61,7 +62,7 @@ from megatron.training import (
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -99,6 +100,19 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
+
+    if args.sequence_packing_scheduler is not None:
+        return get_batch_on_this_rank_for_sequence_packing(
+            data_iterator,
+            vpp_size=config.virtual_pipeline_model_parallel_size,
+            mtp_on_this_rank=mtp_on_this_rank_func(
+                layout=config.pipeline_model_parallel_layout,
+                mtp_num_layers=config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=vp_stage,
+            ),
+            vp_stage=vp_stage,
+        )
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -294,44 +308,61 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator', log_level=2).start()
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        (
-            attention_mask,
-            cu_seqlens,
-            cu_seqlens_padded,
-            hybrid_cp_group,
-            labels,
-            local_cp_size,
-            loss_mask,
-            max_seqlen,
-            position_ids,
-            tokens,
-        ) = get_batch(data_iterator, vp_stage)
+        batch = get_batch(data_iterator, vp_stage)
 
-    packed_seq_params = None
-    if cu_seqlens is not None:
-        # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
-        # for consistency, but PackedSeqParams and TE expect 1-D.
-        cu_seqlens = cu_seqlens.squeeze(0)
-        if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
-        # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
-        # attention only computes work for real tokens within each chunk.
-        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-        cu_seqlens_for_params = (
-            cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-        )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_for_params,
-            cu_seqlens_kv=cu_seqlens_for_params,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(max_seqlen.item()),
-            max_seqlen_kv=int(max_seqlen.item()),
-            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-            cp_group=hybrid_cp_group,
-            tokens_per_sample=args.seq_length,
-        )
+        if len(batch) == 7:
+            (
+                tokens,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                packed_seq_params,
+                padding_mask,
+            ) = batch
+        elif len(batch) == 6:
+            tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = batch
+            padding_mask = None
+        else:
+            (
+                attention_mask,
+                cu_seqlens,
+                cu_seqlens_padded,
+                hybrid_cp_group,
+                labels,
+                local_cp_size,
+                loss_mask,
+                max_seqlen,
+                position_ids,
+                tokens,
+            ) = batch
+
+            padding_mask = None
+            packed_seq_params = None
+            if cu_seqlens is not None:
+                # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
+                # for consistency, but PackedSeqParams and TE expect 1-D.
+                cu_seqlens = cu_seqlens.squeeze(0)
+                if cu_seqlens_padded is not None:
+                    cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
+                # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
+                # attention only computes work for real tokens within each chunk.
+                update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+                cu_seqlens_for_params = (
+                    cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+                )  # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
+                packed_seq_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens_for_params,
+                    cu_seqlens_kv=cu_seqlens_for_params,
+                    cu_seqlens_q_padded=cu_seqlens_padded,
+                    cu_seqlens_kv_padded=cu_seqlens_padded,
+                    max_seqlen_q=int(max_seqlen.item()),
+                    max_seqlen_kv=int(max_seqlen.item()),
+                    local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
+                    cp_group=hybrid_cp_group,
+                    tokens_per_sample=args.seq_length,
+                )
 
     timers('batch-generator').stop()
 
@@ -341,7 +372,13 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 args.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             schedule_plan = model.build_schedule_plan(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
             return schedule_plan, partial(loss_func, loss_mask, model=model)
         else:
@@ -352,6 +389,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 labels=labels,
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -415,6 +453,8 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,
+        "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
+        "sequence_packing_scheduler": args.sequence_packing_scheduler,
     }
 
     # add FIM args to the config
@@ -453,7 +493,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     is_packed_sequence = False
     if args.sft:
-        dataset_type = SFTDataset
+        if args.mock_data:
+            dataset_type = MockSFTDataset
+        else:
+            dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
     else:
         if args.mock_data:
