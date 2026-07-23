@@ -2179,13 +2179,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Print context state.
         nvtx_range_push("console_logging")
-        if (
+        logging_interval_elapsed = (
             self.logging_step_interval > 0
             and self.context.step_count % self.logging_step_interval == 0
-        ):
+        )
+        should_log_console = logging_interval_elapsed and logging.getLogger().isEnabledFor(
+            logging.INFO
+        )
+        if logging_interval_elapsed:
             nvtx_range_push("cuda_memory_stats")
-            mem = torch.cuda.memory_stats()
-            nvtx_range_pop("cuda_memory_stats")
+            try:
+                if should_log_console:
+                    mem = torch.cuda.memory_stats()
+            finally:
+                nvtx_range_pop("cuda_memory_stats")
+        if should_log_console:
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "

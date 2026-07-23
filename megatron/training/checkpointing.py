@@ -14,7 +14,7 @@ import types
 from argparse import Namespace
 from datetime import datetime
 from enum import Enum, auto
-from logging import getLogger
+from logging import DEBUG, getLogger
 from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional, Union
@@ -99,7 +99,13 @@ def finalize_deletion_processes(blocking=False):
     finished = []
     for proc in _deletion_processes:
         if not proc.is_alive() or blocking:
-            logger.debug(f"Joining deletion process {proc.pid} (blocking={blocking}, is_alive={proc.is_alive()})")
+            if logger.isEnabledFor(DEBUG):
+                logger.debug(
+                    "Joining deletion process %s (blocking=%s, is_alive=%s)",
+                    proc.pid,
+                    blocking,
+                    proc.is_alive(),
+                )
             proc.join()
             finished.append(proc)
     for proc in finished:

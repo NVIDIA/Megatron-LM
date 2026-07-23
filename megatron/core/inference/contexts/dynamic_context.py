@@ -739,87 +739,91 @@ class DynamicInferenceContext(BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
-        active_blocks = self.kv_block_allocator.active_count
-        total_blocks = self.kv_block_allocator.total_count
-        paused_blocks = self.kv_block_allocator.paused_count
-        active_kv_bytes = active_blocks * self.block_size_bytes
-        total_kv_bytes = total_blocks * self.block_size_bytes
-        paused_kv_bytes = paused_blocks * self.block_size_bytes
+        if (
+            inference_config._verbose
+            and logging.getLogger().isEnabledFor(logging.INFO)
+            and torch.distributed.get_rank() == 0
+        ):
+            active_blocks = self.kv_block_allocator.active_count
+            total_blocks = self.kv_block_allocator.total_count
+            paused_blocks = self.kv_block_allocator.paused_count
+            active_kv_bytes = active_blocks * self.block_size_bytes
+            total_kv_bytes = total_blocks * self.block_size_bytes
+            paused_kv_bytes = paused_blocks * self.block_size_bytes
 
-        log_lines = [
-            "DynamicInferenceContext: configuration summary",
-            f"  max_requests:            {self.max_requests}",
-            f"  max_tokens:              {self.max_tokens}",
-            f"  max_sequence_length:     {self.max_sequence_length}",
-            f"  block_size_tokens:       {self.block_size_tokens}",
-            f"  max_kv_blocks_per_req:   {self.max_kv_block_count}",
-            f"  KV cache:",
-            f"    block_size_bytes:      {get_mem_size_str(self.block_size_bytes)}",
-            f"    active_blocks:         {active_blocks} ({get_mem_size_str(active_kv_bytes)})",
-            f"    paused_blocks:         {paused_blocks} ({get_mem_size_str(paused_kv_bytes)})",
-            f"    total_blocks:          {total_blocks} ({get_mem_size_str(total_kv_bytes)})",
-        ]
-
-        if self.is_hybrid_model:
-            mamba_conv_bytes = (
-                math.prod(self.mamba_conv_states_shape)
-                * self.mamba_conv_states_dtype.itemsize
-                * self.num_mamba_layers
-            )
-            mamba_ssm_bytes = (
-                math.prod(self.mamba_ssm_states_shape)
-                * self.mamba_ssm_states_dtype.itemsize
-                * self.num_mamba_layers
-            )
-            mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
-            mamba_total_bytes = mamba_bytes_per_req * self.max_requests
-            log_lines += [
-                f"  Mamba states:",
-                f"    num_mamba_layers:      {self.num_mamba_layers}",
-                f"    conv_state_shape:      {self.mamba_conv_states_shape}",
-                f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
-                f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
-                f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
+            log_lines = [
+                "DynamicInferenceContext: configuration summary",
+                f"  max_requests:            {self.max_requests}",
+                f"  max_tokens:              {self.max_tokens}",
+                f"  max_sequence_length:     {self.max_sequence_length}",
+                f"  block_size_tokens:       {self.block_size_tokens}",
+                f"  max_kv_blocks_per_req:   {self.max_kv_block_count}",
+                f"  KV cache:",
+                f"    block_size_bytes:      {get_mem_size_str(self.block_size_bytes)}",
+                f"    active_blocks:         {active_blocks} ({get_mem_size_str(active_kv_bytes)})",
+                f"    paused_blocks:         {paused_blocks} ({get_mem_size_str(paused_kv_bytes)})",
+                f"    total_blocks:          {total_blocks} ({get_mem_size_str(total_kv_bytes)})",
             ]
 
-            if self.num_speculative_tokens > 0:
-                spec_multiplier = self.num_speculative_tokens + 1
-                spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
-                spec_total_bytes = spec_bytes_per_req * self.max_requests
+            if self.is_hybrid_model:
+                mamba_conv_bytes = (
+                    math.prod(self.mamba_conv_states_shape)
+                    * self.mamba_conv_states_dtype.itemsize
+                    * self.num_mamba_layers
+                )
+                mamba_ssm_bytes = (
+                    math.prod(self.mamba_ssm_states_shape)
+                    * self.mamba_ssm_states_dtype.itemsize
+                    * self.num_mamba_layers
+                )
+                mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
+                mamba_total_bytes = mamba_bytes_per_req * self.max_requests
                 log_lines += [
-                    f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
-                    f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
-                    f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
+                    f"  Mamba states:",
+                    f"    num_mamba_layers:      {self.num_mamba_layers}",
+                    f"    conv_state_shape:      {self.mamba_conv_states_shape}",
+                    f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
+                    f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
+                    f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
                 ]
 
-            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
-            if (
-                inference_config.enable_prefix_caching
-                and prefix_caching_mamba_gb is not None
-                and prefix_caching_mamba_gb > 0
-            ):
-                prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                # Mirror the split done in _allocate_mamba_cache so this preview
-                # matches what is actually allocated: the "scratch" buffers
-                # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
-                # budget first, then the rest sizes the "durable" cache
-                # (ssm_states/conv_states). mamba_bytes_per_req is the shared
-                # per-slot footprint of both.
-                scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
-                scratch_bytes = scratch_slots * mamba_bytes_per_req
-                durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
-                durable_slots = max(durable_slots, 0)
-                log_lines += [
-                    f"  Mamba prefix cache:",
-                    f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
-                    f"    extraction_scratch:    {scratch_slots} slots "
-                    f"({get_mem_size_str(scratch_bytes)})",
-                    f"    durable_slots:         {durable_slots} "
-                    f"({get_mem_size_str(durable_slots * mamba_bytes_per_req)})",
-                    f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
-                ]
+                if self.num_speculative_tokens > 0:
+                    spec_multiplier = self.num_speculative_tokens + 1
+                    spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
+                    spec_total_bytes = spec_bytes_per_req * self.max_requests
+                    log_lines += [
+                        f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
+                        f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
+                        f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
+                    ]
 
-        if inference_config._verbose and torch.distributed.get_rank() == 0:
+                prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+                if (
+                    inference_config.enable_prefix_caching
+                    and prefix_caching_mamba_gb is not None
+                    and prefix_caching_mamba_gb > 0
+                ):
+                    prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
+                    # Mirror the split done in _allocate_mamba_cache so this preview
+                    # matches what is actually allocated: the "scratch" buffers
+                    # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
+                    # budget first, then the rest sizes the "durable" cache
+                    # (ssm_states/conv_states). mamba_bytes_per_req is the shared
+                    # per-slot footprint of both.
+                    scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+                    scratch_bytes = scratch_slots * mamba_bytes_per_req
+                    durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
+                    durable_slots = max(durable_slots, 0)
+                    log_lines += [
+                        f"  Mamba prefix cache:",
+                        f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
+                        f"    extraction_scratch:    {scratch_slots} slots "
+                        f"({get_mem_size_str(scratch_bytes)})",
+                        f"    durable_slots:         {durable_slots} "
+                        f"({get_mem_size_str(durable_slots * mamba_bytes_per_req)})",
+                        f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
+                    ]
+
             logging.info("\n".join(log_lines))
 
     def _allocate_memory_buffer(self):
@@ -1385,12 +1389,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Need to bring back the memory block before we reset it.
             if self._uses_torch_memory_saver:
                 tag = self.TMS_TAG
-                if torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == 0 and logging.getLogger().isEnabledFor(
+                    logging.INFO
+                ):
                     logging.info(
                         "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
                     )
                 torch_memory_saver.resume(tag)
-                if torch.distributed.get_rank() == 0:
+                if torch.distributed.get_rank() == 0 and logging.getLogger().isEnabledFor(
+                    logging.INFO
+                ):
                     logging.info(
                         "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
                     )
@@ -1423,12 +1431,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self._uses_torch_memory_saver:
             tag = self.TMS_TAG
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == 0 and logging.getLogger().isEnabledFor(logging.INFO):
                 logging.info(
                     "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
                 )
             torch_memory_saver.pause(tag)
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == 0 and logging.getLogger().isEnabledFor(logging.INFO):
                 logging.info(
                     "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
                 )

@@ -67,7 +67,7 @@ def get_param_id_to_sharded_param_map(
         if id(ten.data) in param_to_id_map:
             id_to_sharded_param_map[param_to_id_map[id(ten.data)]] = ten
         else:
-            logger.debug(f'{ten} is not tracked by the optimizer')
+            logger.debug('%s is not tracked by the optimizer', ten)
 
     if not id_to_sharded_param_map:
         log_single_rank(

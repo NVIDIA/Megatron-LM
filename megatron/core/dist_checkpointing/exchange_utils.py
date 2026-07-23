@@ -11,6 +11,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, c
 import numpy as np
 import torch
 
+from megatron.core._rank_utils import safe_get_rank
+
 from .core import CheckpointingException
 from .dict_utils import nested_values
 from .mapping import ShardedStateDict, ShardedTensor, is_main_replica
@@ -401,8 +403,6 @@ def exchange_loaded_tensors_gather_object(
             previously loaded tensors (from `loaded_tensors` input)
 
     """
-    from ..utils import log_single_rank
-
     all_loaded_tensors_list = [None] * torch.distributed.get_world_size(group=parallelization_group)
     torch.distributed.all_gather_object(
         all_loaded_tensors_list, loaded_tensors, group=parallelization_group
@@ -413,11 +413,11 @@ def exchange_loaded_tensors_gather_object(
     # Error checks
     if len(all_loaded_tensors) != sum(map(len, all_loaded_tensors_list)):
         err_msg = "Duplicate shard ids loaded by different ranks"
-        log_single_rank(
-            logger,
-            logging.ERROR,
-            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_tensors_list]}",
-        )
+        if logger.isEnabledFor(logging.ERROR) and safe_get_rank() == 0:
+            shard_ids_by_rank = [
+                rank_loaded_tensors.keys() for rank_loaded_tensors in all_loaded_tensors_list
+            ]
+            logger.error("%s. Shards ids by rank: %s", err_msg, shard_ids_by_rank)
         raise CheckpointingException(err_msg)
 
     return all_loaded_tensors
@@ -436,8 +436,6 @@ def exchange_loaded_objects_gather_object(
         Dict[_ShardId, Any]: dictionary mapping shard ids to objects needed by this rank to
          load a given state dict.
     """
-    from ..utils import log_single_rank
-
     all_loaded_objects_list = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(all_loaded_objects_list, loaded_objects, group=None)
     all_loaded_objects_list = cast(List[Dict[_ShardId, Any]], all_loaded_objects_list)
@@ -446,11 +444,11 @@ def exchange_loaded_objects_gather_object(
     # Error checks
     if len(all_loaded_objects) != sum(map(len, all_loaded_objects_list)):
         err_msg = "Duplicate shard ids loaded by different ranks"
-        log_single_rank(
-            logger,
-            logging.ERROR,
-            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_objects_list]}",
-        )
+        if logger.isEnabledFor(logging.ERROR) and safe_get_rank() == 0:
+            shard_ids_by_rank = [
+                rank_loaded_objects.keys() for rank_loaded_objects in all_loaded_objects_list
+            ]
+            logger.error("%s. Shards ids by rank: %s", err_msg, shard_ids_by_rank)
         raise CheckpointingException(err_msg)
 
     return all_loaded_objects
