@@ -9,23 +9,29 @@
 
 # Data Loading at Scale
 
-This guide covers how Megatron's data pipeline works and how to configure it for efficient training at 256 nodes and beyond. At this scale, the primary bottlenecks are **index building** and **barrier synchronization** -- not raw data bandwidth.
+This guide covers how Megatron's data pipeline works and how to configure it for efficient training at 256 nodes and beyond. At this scale, the primary bottlenecks are **index building** and **barrier synchronization** rather than raw data bandwidth.
 
 ## How Data Loading Works
 
 Understanding the architecture helps explain why specific flags matter.
 
-Megatron builds three index arrays for each dataset: a **document index** (shuffled document order), a **sample index** (mapping samples to document offsets), and a **shuffle index** (final sample permutation). This happens once during initialization:
+Megatron builds three index arrays for each dataset:
+
+- **Document index**: shuffles the document order
+- **Sample index**: maps samples to document offsets
+- **Shuffle index**: permutes the final sample order
+
+These arrays are built once during initialization:
 
 1. **Rank 0** builds all three indices and writes them to a cache directory as `.npy` files.
 2. All ranks synchronize at a `torch.distributed.barrier()`.
 3. **All other ranks** load the cached indices via memory-mapped reads (`numpy.load(mmap_mode='r')`).
 
-After initialization, data access is **read-only and lock-free**. Each data-parallel rank consumes a disjoint subset of samples, and no cross-rank coordination is needed during training because all ranks derive the same deterministic permutation from a shared random seed.
+After initialization, data access is **read-only and lock-free**. Each data-parallel (DP) rank consumes a disjoint subset of samples, and training requires no cross-rank coordination because all ranks derive the same deterministic permutation from a shared random seed.
 
 ## The Problem at 256+ Nodes
 
-Three things break down at large node counts:
+Two things break down at large node counts:
 
 1. **Barrier synchronization**: All ranks block while rank 0 builds indices. On a 512-node job, this means 4,095 GPUs sit idle.
 2. **Simultaneous memory-mapping**: All ranks `mmap` three large `.npy` files at once after the barrier, causing a burst of page faults and I/O.
@@ -36,7 +42,7 @@ Before tuning data loading, establish a performance ceiling by running with `--m
 
 ## Recommended Configuration
 
-### Step 1: Consolidate dataset files
+### Step 1: Consolidate Dataset Files
 
 A common issue at scale is having datasets split across many small file prefixes. Thousands of 100 MB files perform significantly worse than tens of 10 GB+ files, both for building dataset caches and for runtime file access.
 
@@ -50,7 +56,7 @@ python tools/merge_datasets.py \
 
 **Target at least 10 GB per file.** This reduces the number of file descriptors, metadata lookups, and index-building work at initialization.
 
-### Step 2: Pre-build the dataset cache
+### Step 2: Pre-Build the Dataset Cache
 
 Build the GPT dataset cache as a separate step before training. This avoids the usual "rank 0 builds, everyone else waits" startup path and is the recommended workflow for large jobs:
 
@@ -72,9 +78,9 @@ If your later training job does not set `--global-batch-size`, or you are prepar
 
 This keeps the prepared cache aligned with the sample counts expected by training.
 
-> **Unsupported configurations:** `tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`. Using any of these will cause the script to exit with an error.
+> **Unsupported configurations:** `tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`. Using any of these causes the script to exit with an error.
 
-### Step 3: Optionally pre-build per-dataset metadata
+### Step 3: Optionally Pre-Build Per-Dataset Metadata
 
 When blending many datasets, generate the `--per-dataset-sequences-path` JSON ahead of time to avoid one metadata read per file prefix at startup:
 
@@ -84,7 +90,7 @@ python tools/build_sequences_per_dataset.py \
     --per-dataset-sequences-path sequences.json
 ```
 
-### Step 4: Launch training with optimized data loading
+### Step 4: Launch Training with Optimized Data Loading
 
 Once the cache is ready, enable the fast-path flags:
 
@@ -98,18 +104,18 @@ torchrun --nproc_per_node=8 --nnodes=512 ... pretrain_gpt.py \
     ...
 ```
 
-### Flag reference
+### Flag Reference
 
 | Flag | Default | Recommendation | What it does |
 |------|---------|----------------|-------------|
 | `--dataloader-fast-cache-load` | off | **On** | Skips the rank-0 barrier by assuming the cache already exists. All ranks build their dataset views in parallel. This is the single biggest win at scale. |
-| `--dataloader-defer-npy-index-mmap` | off | **On** | Defers memory-mapping of `.npy` index files until first access. When combined with `--num-workers > 0`, index loading is overlapped with the training iteration rather than blocking startup. |
+| `--dataloader-defer-npy-index-mmap` | off | **On** | Defers memory-mapping of `.npy` index files until first access. When combined with `--num-workers > 0`, index loading overlaps with the training iteration rather than blocking startup. |
 | `--per-dataset-sequences-path` | None | **Set when blending many datasets** | Points to a JSON file mapping each dataset path to its `(sequence_count, document_count)`. Replaces per-file metadata reads with a single JSON lookup. Generate with `tools/build_sequences_per_dataset.py`. |
 | `--data-cache-path` | None | **Set** | Directory where index `.npy` files are cached. Must be on shared storage for multi-node jobs so all ranks can read it. |
 | `--num-workers` | 2 | **Keep as small as necessary** | Number of DataLoader worker processes. The goal is to satisfy: *time to process a batch > time to prepare a batch*. This hides dataloader work behind the training step. Increasing beyond what's needed wastes CPU and memory. |
 | `--no-mmap-bin-files` | mmap on | **Test both** | Memory-mapping `.bin` files leverages the OS page cache, but the optimal setting is filesystem-dependent. Some large-scale production configurations disable mmap. Test with and without to determine what works best for your storage. |
 
-### Object storage (S3 / Multi-Storage Client)
+### Object Storage (S3 / Multi-Storage Client (MSC))
 
 When data lives on S3 or MSC rather than a POSIX filesystem:
 
