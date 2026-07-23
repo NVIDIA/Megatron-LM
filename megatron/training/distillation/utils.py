@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import tarfile
@@ -58,18 +59,14 @@ MSC_PREFIX = "msc://"
 #   cp   – saved CP rank
 #   dp   – DP rank
 #   iter – trailing iteration number *I*
-BATCHED_TAR_RE = re.compile(
-    r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
-)
+BATCHED_TAR_RE = re.compile(r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$")
 
 # v2 batched tar filenames: ``dp{D}__{start}-{end}.tar``, where ``start``
 # (inclusive) / ``end`` (exclusive) are the global sample-count range this
 # DP rank's shard covers -- the same "sample index" space
 # ``LogprobsReshardPlan`` computes internally.  No CP prefix; v2 shards are
 # always CP-agnostic.
-V2_BATCHED_TAR_RE = re.compile(
-    r"^dp(?P<dp>\d+)__(?P<start>\d+)-(?P<end>\d+)\.tar$"
-)
+V2_BATCHED_TAR_RE = re.compile(r"^dp(?P<dp>\d+)__(?P<start>\d+)-(?P<end>\d+)\.tar$")
 
 # Name of the metadata member written as the first entry of every batched
 # tar. Contains the dataset-identity hash and the fields that produced it.
@@ -79,9 +76,7 @@ LOGPROBS_TAR_MEMBER_SUFFIX = ".pt.zst"
 
 # Matches compressed iteration payload members inside a v1 batched tar
 # archive (legacy; kept for :class:`LegacyTeacherTarDataset`).
-LOGPROBS_TAR_MEMBER_RE = re.compile(
-    rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$"
-)
+LOGPROBS_TAR_MEMBER_RE = re.compile(rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$")
 
 # Matches compressed sample-range payload members inside a v2 batched tar
 # archive: ``{start}-{end}.pt.zst``, mirroring ``V2_BATCHED_TAR_RE``.
@@ -224,9 +219,7 @@ def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True)
     listing = _storage_glob_rank0(os.path.join(root, "*.tar"), cached=cached)
 
     return [
-        str(path)
-        for path in listing
-        if fnmatch.fnmatch(storage_basename(str(path)), name_pattern)
+        str(path) for path in listing if fnmatch.fnmatch(storage_basename(str(path)), name_pattern)
     ]
 
 
@@ -295,9 +288,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     identifiers["blend"] = _blend_identifiers(args)
 
     description = json.dumps(identifiers, sort_keys=False, separators=(',', ':'))
-    md5_hex = hashlib.md5(
-        description.encode("utf-8"), usedforsecurity=False
-    ).hexdigest()
+    md5_hex = hashlib.md5(description.encode("utf-8"), usedforsecurity=False).hexdigest()
     return md5_hex, dict(identifiers)
 
 
@@ -359,9 +350,7 @@ def slice_tensor_for_cp_rank(tensor: torch.Tensor, cp_rank: int, cp_size: int) -
     view_shape = (2 * cp_size, chunk_size, *tensor.shape[1:])
     chunks = tensor.view(*view_shape)
     index = torch.tensor(
-        [cp_rank, 2 * cp_size - cp_rank - 1],
-        dtype=torch.long,
-        device=tensor.device,
+        [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long, device=tensor.device
     )
     local = chunks.index_select(0, index)
     return local.reshape(2 * chunk_size, *tensor.shape[1:]).contiguous()
@@ -431,9 +420,11 @@ def v2_unpack_indices(low_bits: torch.Tensor, packed_bit_17: torch.Tensor) -> to
     ``(seq, samples_per_dp_per_iter, K)`` shape needed to reshape the unpacked
     bits -- no separate shape field is required.
     """
-    bit_17 = torch.from_numpy(
-        np.unpackbits(packed_bit_17.numpy(), count=low_bits.numel())
-    ).reshape(low_bits.shape).long()
+    bit_17 = (
+        torch.from_numpy(np.unpackbits(packed_bit_17.numpy(), count=low_bits.numel()))
+        .reshape(low_bits.shape)
+        .long()
+    )
     return (bit_17 << 16) | low_bits.long()
 
 
@@ -475,10 +466,7 @@ def parse_logprobs_metadata(data: bytes) -> Dict[str, Any]:
 
 
 def _verify_logprobs_metadata(
-    data: bytes,
-    *,
-    tar_path: str,
-    expected_hash: Optional[str],
+    data: bytes, *, tar_path: str, expected_hash: Optional[str]
 ) -> Dict[str, Any]:
     """Parse the per-tar ``_meta.json`` and validate its dataset hash.
 
@@ -534,9 +522,7 @@ def iter_logprobs_tar_entries(
                     if extracted is None:
                         raise RuntimeError(f"Could not read metadata member in '{tar_path}'")
                     meta = _verify_logprobs_metadata(
-                        extracted.read(),
-                        tar_path=tar_path,
-                        expected_hash=expected_hash,
+                        extracted.read(), tar_path=tar_path, expected_hash=expected_hash
                     )
                     if metadata_out is not None:
                         metadata_out.append(meta)
@@ -559,13 +545,8 @@ def iter_logprobs_tar_entries(
 
                 extracted = tar.extractfile(member)
                 if extracted is None:
-                    raise RuntimeError(
-                        f"Could not read log-probs member '{name}' in '{tar_path}'"
-                    )
-                yield LogprobsTarEntry(
-                    iteration=iteration,
-                    data=extracted.read(),
-                )
+                    raise RuntimeError(f"Could not read log-probs member '{name}' in '{tar_path}'")
+                yield LogprobsTarEntry(iteration=iteration, data=extracted.read())
 
     if expected_hash is not None and not metadata_seen:
         raise RuntimeError(
@@ -604,9 +585,7 @@ def v2_iter_logprobs_tar_entries(
                     if extracted is None:
                         raise RuntimeError(f"Could not read metadata member in '{tar_path}'")
                     meta = _verify_logprobs_metadata(
-                        extracted.read(),
-                        tar_path=tar_path,
-                        expected_hash=expected_hash,
+                        extracted.read(), tar_path=tar_path, expected_hash=expected_hash
                     )
                     if metadata_out is not None:
                         metadata_out.append(meta)
@@ -630,13 +609,9 @@ def v2_iter_logprobs_tar_entries(
 
                 extracted = tar.extractfile(member)
                 if extracted is None:
-                    raise RuntimeError(
-                        f"Could not read log-probs member '{name}' in '{tar_path}'"
-                    )
+                    raise RuntimeError(f"Could not read log-probs member '{name}' in '{tar_path}'")
                 yield V2LogprobsTarEntry(
-                    start_sample=member_start,
-                    end_sample=member_end,
-                    data=extracted.read(),
+                    start_sample=member_start, end_sample=member_end, data=extracted.read()
                 )
 
     if expected_hash is not None and not metadata_seen:
@@ -684,9 +659,7 @@ def peek_first_logprobs_metadata(logprobs_dir: str) -> Optional[Dict[str, Any]]:
     tar.  Returns ``None`` if no tars are present yet.
     """
     tars = storage_glob_with_caching(logprobs_dir, "*.tar")
-    return _broadcast_without_pp(
-        lambda: peek_logprobs_metadata(tars[0]) if tars else None
-    )
+    return _broadcast_without_pp(lambda: peek_logprobs_metadata(tars[0]) if tars else None)
 
 
 def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
@@ -722,8 +695,7 @@ def decode_logprobs_payload(data: bytes) -> Tuple[Any, Any]:
         return values, indices
     # ---- v1 LEGACY (remove with LegacyTeacherTarDataset) ----
     indices_list = [
-        unpack_indices(low, bit17)
-        for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
+        unpack_indices(low, bit17) for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
     ]
     return tensors["values"], indices_list
 
@@ -862,21 +834,13 @@ def load_log_probs_from_tar(tar_path: str, iteration: int):
         if entry.iteration > iteration:
             break
 
-    raise FileNotFoundError(
-        f"No log-probs member found for iteration {iteration} in '{tar_path}'"
-    )
+    raise FileNotFoundError(f"No log-probs member found for iteration {iteration} in '{tar_path}'")
 
 
 class TarShardPrefetcher:
     """Asynchronously materialize whole tar shards into the MSC cache."""
 
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        depth: int = 2,
-        max_workers: Optional[int] = None,
-    ):
+    def __init__(self, *, enabled: bool, depth: int = 2, max_workers: Optional[int] = None):
         self.enabled = bool(enabled and depth > 0)
         self.depth = depth
 
@@ -946,6 +910,7 @@ class TarShardPrefetcher:
 #  Resharding plan (MBS / DP / GBS change between save and load)
 # ---------------------------------------------------------------------------
 
+
 # Yielded by ``LogprobsReshardPlan.sources_for_microbatch``.
 class _ReshardSource(NamedTuple):
     iter_save: int
@@ -965,9 +930,10 @@ class LogprobsReshardPlan:
     unit-test.
 
     Construction validates the "integer multiples in either direction"
-    restriction on each of {MBS, DP, GBS} plus the Megatron
-    ``gbs % (mbs * dp) == 0`` invariant on both sides, raising
-    :class:`ValueError` with a precise diagnostic on failure.
+    restriction on MBS and GBS plus the Megatron ``gbs % (mbs * dp) == 0``
+    invariant on both sides, raising :class:`ValueError` with a precise
+    diagnostic on failure.  DP may change between any two sizes that satisfy
+    those global-batch divisibility invariants.
 
     The math relies on ``MegatronPretrainingSampler``'s mapping: within a
     saved iteration, the monolith's row ``r`` at saved DP rank ``d_save``
@@ -996,11 +962,6 @@ class LogprobsReshardPlan:
         if self.mbs_save % self.mbs_load != 0 and self.mbs_load % self.mbs_save != 0:
             raise ValueError(
                 f"mbs_save ({self.mbs_save}) and mbs_load ({self.mbs_load}) must "
-                "be integer multiples of one another for cached-logits resharding."
-            )
-        if self.dp_save % self.dp_load != 0 and self.dp_load % self.dp_save != 0:
-            raise ValueError(
-                f"dp_save ({self.dp_save}) and dp_load ({self.dp_load}) must "
                 "be integer multiples of one another for cached-logits resharding."
             )
         if self.gbs_load % (self.mbs_load * self.dp_load) != 0:
@@ -1032,21 +993,18 @@ class LogprobsReshardPlan:
     def needed_d_saves(self, d_load: int) -> List[int]:
         """Sorted list of saved DP ranks that this load DP rank ever reads from.
 
-        The pattern is ``gbs_save``-periodic, so a single load iteration
-        (i_load = 0) is enough to enumerate the full set.
+        Source selection is ``gbs_save``-periodic in global-sample space.
+        When ``gbs_load < gbs_save``, multiple load iterations can occupy
+        different phases of one saved iteration, so enumerate a full phase
+        period rather than assuming load iteration zero sees every source.
         """
         needed: set[int] = set()
-        # Step by mbs_save so we observe every d_save value the microbatches
-        # span (only relevant when mbs_load > mbs_save).
-        for m_load in range(self.num_mb_load):
-            base = (m_load * self.dp_load + d_load) * self.mbs_load
-            for o in range(0, self.mbs_load, self.mbs_save):
-                x_save = (base + o) % self.gbs_save
-                needed.add((x_save // self.mbs_save) % self.dp_save)
-            # The last partial M_save block (if any) is captured above because
-            # the step is M_save and o stops at mbs_load - mbs_load % mbs_save.
-            # If mbs_load < mbs_save the loop runs once for o=0 only, which is
-            # correct: the whole microbatch lives in one M_save block.
+        period = self.gbs_save // math.gcd(self.gbs_save, self.gbs_load)
+        for i_load in range(period):
+            for m_load in range(self.num_mb_load):
+                needed.update(
+                    src.d_save for src in self.sources_for_microbatch(i_load, m_load, d_load)
+                )
         return sorted(needed)
 
     def sources_for_microbatch(
@@ -1055,10 +1013,9 @@ class LogprobsReshardPlan:
         """Yield the saved (iter, DP rank, row range) tuples that cover one
         load microbatch's ``mbs_load`` contiguous global samples, in order.
 
-        With the integer-multiples restriction enforced by
-        :meth:`__post_init__` each yielded fragment maps to a contiguous
-        slice of one saved shard's monolith (``tensor[:, a:b, :]``), so the
-        loader's per-step assembly is at worst a small ``torch.cat``.
+        Each yielded fragment maps to a contiguous slice of one saved shard's
+        monolith (``tensor[:, a:b, :]``), so the loader's per-step assembly is
+        at worst a small ``torch.cat``.
         """
         b = (m_load * self.dp_load + d_load) * self.mbs_load
         g = i_load * self.gbs_load + b
@@ -1067,17 +1024,12 @@ class LogprobsReshardPlan:
             i_save = g // self.gbs_save
             x_save = g % self.gbs_save
             d_save = (x_save // self.mbs_save) % self.dp_save
-            row_offset = (
-                (x_save // self.mbs_save) // self.dp_save * self.mbs_save
-                + (x_save % self.mbs_save)
+            row_offset = (x_save // self.mbs_save) // self.dp_save * self.mbs_save + (
+                x_save % self.mbs_save
             )
             # Stop the fragment at the nearest M_save boundary (d_save changes
             # past it) or at the saved-iter boundary (i_save changes past it).
-            chunk = min(
-                remaining,
-                self.mbs_save - (x_save % self.mbs_save),
-                self.gbs_save - x_save,
-            )
+            chunk = min(remaining, self.mbs_save - (x_save % self.mbs_save), self.gbs_save - x_save)
             yield _ReshardSource(i_save, d_save, row_offset, row_offset + chunk)
             g += chunk
             remaining -= chunk
