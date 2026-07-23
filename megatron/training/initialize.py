@@ -116,7 +116,9 @@ def initialize_megatron(
                 args.data_parallel_random_init,
                 args.te_rng_tracker,
                 args.inference_rng_tracker,
-                use_cudagraphable_rng=args.cuda_graph_impl != "none",
+                use_cudagraphable_rng=(
+                    args.cuda_graph_impl != "none" or args.mfsdp_cuda_graph_modules
+                ),
                 pp_group=seed_pp_group,
                 dp_group=seed_dp_group,
                 tp_group=seed_tp_group,
@@ -263,8 +265,9 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+def _initialize_distributed(
+    get_embedding_ranks, get_position_embedding_ranks, store, skip_model_parallel_init=False
+):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -421,11 +424,17 @@ def _set_random_seed(
     """
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+        pp_rank = (
+            get_pg_rank(pp_group)
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_rank()
+        )
         seed = seed_ + (100 * pp_rank)
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            dp_rank = (
+                get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            )
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)

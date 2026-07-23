@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -106,8 +106,8 @@ def is_submodule(module, parent_module, strict=True):
     return False
 
 
-def find_megatron_fsdp(model):
-    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+def _find_megatron_fsdp_v1(model):
+    """Walk the model wrapper chain to find a MegatronFSDP v1 instance, if any."""
     # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
     # this module during its own initialization, so a top-level import of
     # MegatronFSDP here would fail with a partially-initialized module error.
@@ -120,6 +120,120 @@ def find_megatron_fsdp(model):
         if isinstance(m, MegatronFSDP):
             return m
         m = getattr(m, 'module', None)
+    return None
+
+
+class _MegatronFSDP2DDPConfigProxy:
+    """Expose the DDP config field consumed by the EP-overlap schedule."""
+
+    def __init__(self, root_module):
+        self.root_module = root_module
+
+    @property
+    def data_parallel_sharding_strategy(self):
+        """Return the first v2 parameter group's sharding strategy."""
+        for module in self.root_module.modules():
+            if hasattr(module, '_fsdp_param_groups'):
+                for param_group in module._fsdp_param_groups:
+                    return param_group.sharding_strategy
+        return "no_shard"
+
+
+class _MegatronFSDP2CompatProxy:
+    """Present the v1 schedule interface for a Megatron FSDP v2 root.
+
+    ``combined_1f1b`` predates v2 and intentionally remains unaware of its
+    hook implementation. This proxy implements only the v1 attributes that
+    schedule consumes and delegates them to the corresponding v2 lifecycle
+    hooks.
+    """
+
+    def __init__(self, root_module):
+        self.root_module = root_module
+        self.ddp_config = _MegatronFSDP2DDPConfigProxy(root_module)
+
+    def _replace_param_with_raw_if_needed(self):
+        """No-op: v2 parameters are installed by its fine-grained hooks."""
+
+    def pre_backward(self):
+        """Run the v2 pre-backward setup expected by the overlap schedule."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_pre_backward_setup,
+        )
+
+        mfsdp_pre_backward_setup(self.root_module, skip_final_callback=True)
+
+    def post_backward(self):
+        """Run the v2 post-backward callback expected by the overlap schedule."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_backward_final_callback,
+        )
+
+        mfsdp_post_backward_final_callback(self.root_module)
+
+    def post_forward_release_module(self, module, *unused):
+        """Release a module through the v2 post-forward hook."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_forward_hook,
+        )
+
+        return mfsdp_post_forward_hook(module, *unused)
+
+    def post_backward_release_module(self, module, *unused):
+        """Release a module through the v2 post-backward hook."""
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import (
+            mfsdp_post_backward_hook,
+        )
+
+        return mfsdp_post_backward_hook(module)
+
+
+def _find_megatron_fsdp_v2_root(model):
+    """Return the root Megatron FSDP v2 module, or ``None`` if absent."""
+    if model is None:
+        return None
+
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+    found_fsdp_modules = []
+    for module in model.modules():
+        if isinstance(module, FSDPModule):
+            found_fsdp_modules.append(module)
+            if getattr(module._fsdp_state, '_is_root', False):
+                return module
+
+    if found_fsdp_modules:
+        raise RuntimeError(
+            "Found Megatron FSDP v2 modules but none marked as root. "
+            "Ensure the root FSDP module has _fsdp_state._is_root = True. "
+            "This is normally set by fully_shard() on the outermost module. "
+            f"v2 modules found: {[m.__class__.__name__ for m in found_fsdp_modules[:5]]}"
+        )
+
+    return None
+
+
+def find_megatron_fsdp(model):
+    """Return the Megatron FSDP wrapper expected by generic schedules.
+
+    V1 already implements the schedule-facing interface. V2 returns a cached
+    compatibility proxy so callers do not need version-specific branches.
+    """
+    fsdp_v1 = _find_megatron_fsdp_v1(model)
+    if fsdp_v1 is not None:
+        return fsdp_v1
+
+    fsdp_v2_root = _find_megatron_fsdp_v2_root(model)
+    if fsdp_v2_root is not None:
+        proxy = getattr(fsdp_v2_root, '_megatron_fsdp_v1_compat_proxy', None)
+        if proxy is None:
+            proxy = _MegatronFSDP2CompatProxy(fsdp_v2_root)
+            fsdp_v2_root._megatron_fsdp_v1_compat_proxy = proxy
+        return proxy
+
     return None
 
 
@@ -865,5 +979,7 @@ def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
     """
     Check if tensor parallelism is being used based on the distributed index.
     """
+    if dist_index.tp_dim is None:
+        return False
     tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
     return tp_mesh.mesh.numel() > 1
