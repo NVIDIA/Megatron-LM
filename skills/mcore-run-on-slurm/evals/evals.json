@@ -1,1 +1,33 @@
-[]
+{
+  "skill": "mcore-run-on-slurm",
+  "cases": [
+    {
+      "id": "mcore-slurm-two-node-launch",
+      "question": "Write the essential launch setup for a two-node Megatron-LM SLURM job with eight GPUs per node.",
+      "expected_skill": "mcore-run-on-slurm",
+      "expected_script": null,
+      "ground_truth": "Use one srun task per node from a shared worktree, derive the rendezvous environment from SLURM, and launch 16 workers through uv run python -m torch.distributed.run with explicit node rank and rendezvous arguments.",
+      "expected_behavior": [
+        "Routes to mcore-run-on-slurm",
+        "Uses a shared worktree path visible to both nodes",
+        "Sets MASTER_ADDR from the first SLURM hostname and defines MASTER_PORT",
+        "Sets NNODES=2, GPUS_PER_NODE=8, and WORLD_SIZE=16",
+        "Uses one srun task per node and uv run python -m torch.distributed.run",
+        "Passes nnodes, nproc-per-node, node-rank, master-addr, and master-port"
+      ]
+    },
+    {
+      "id": "mcore-slurm-rank-failure-diagnosis",
+      "question": "Rank 0 ends in an NCCL timeout, but rank 5 logged a Python shape traceback several seconds earlier. Which failure should I investigate first?",
+      "expected_skill": "mcore-run-on-slurm",
+      "expected_script": null,
+      "ground_truth": "Inspect every rank and treat the earliest non-NCCL Python traceback as the likely root cause; later NCCL timeouts are commonly downstream symptoms.",
+      "expected_behavior": [
+        "Routes to mcore-run-on-slurm",
+        "Prioritizes the earlier rank 5 Python traceback",
+        "Treats the later NCCL timeout as a downstream symptom",
+        "Checks world-size and parallelism divisibility for a shape-related failure"
+      ]
+    }
+  ]
+}

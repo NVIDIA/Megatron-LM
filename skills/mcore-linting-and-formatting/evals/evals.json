@@ -1,1 +1,31 @@
-[]
+{
+  "skill": "mcore-linting-and-formatting",
+  "cases": [
+    {
+      "id": "mcore-linting-check-only",
+      "question": "Check all Megatron-LM formatting and linting before I open a PR, but do not modify any files.",
+      "expected_skill": "mcore-linting-and-formatting",
+      "expected_script": null,
+      "ground_truth": "Run tools/autoformat.sh in check-only mode against main with documentation checks enabled.",
+      "expected_behavior": [
+        "Routes to mcore-linting-and-formatting",
+        "Uses BASE_REF=main",
+        "Uses CHECK_ONLY=true",
+        "Uses SKIP_DOCS=false",
+        "Runs bash tools/autoformat.sh without applying fixes"
+      ]
+    },
+    {
+      "id": "mcore-linting-fix-import-order",
+      "question": "I changed imports in megatron/core/foo.py and tests/unit_tests/test_foo.py. What must I run before committing?",
+      "expected_skill": "mcore-linting-and-formatting",
+      "expected_script": null,
+      "ground_truth": "Run uv run isort on both edited Python files before committing.",
+      "expected_behavior": [
+        "Routes to mcore-linting-and-formatting",
+        "Runs uv run isort on both named files",
+        "Does not suggest manually sorting the imports"
+      ]
+    }
+  ]
+}
