@@ -600,6 +600,56 @@ def test_unregistered_grad_norm_group_raises():
         MockOptimizer([param]).get_grads_for_grad_norm()
 
 
+def test_gdn_grad_separation():
+    """GatedDeltaNet in_proj params (group 'gated_delta_net') split from the main norm."""
+    from megatron.core.optimizer.optimizer import GDN_GRAD_NORM_GROUP, MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        main_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        gdn_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
+        for p in gdn_params:
+            p.grad_norm_group = GDN_GRAD_NORM_GROUP
+        for p in main_params + gdn_params:
+            p.grad = torch.randn_like(p)
+
+        mock_opt = MockOptimizer(main_params + gdn_params)
+        assert len(mock_opt.get_grads_for_grad_norm()) == 2
+        assert len(mock_opt.get_grads_for_grad_norm(GDN_GRAD_NORM_GROUP)) == 2
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_register_grad_norm_group():
+    """register_grad_norm_group makes a new group valid for tagging (and is idempotent)."""
+    from megatron.core.optimizer import optimizer as opt_mod
+    from megatron.core.optimizer.optimizer import register_grad_norm_group
+
+    name = 'custom_isolated_group'
+    assert name not in opt_mod.SEPARATE_GRAD_NORM_GROUPS
+    try:
+        register_grad_norm_group(name)
+        assert name in opt_mod.SEPARATE_GRAD_NORM_GROUPS
+        n_before = len(opt_mod.SEPARATE_GRAD_NORM_GROUPS)
+        register_grad_norm_group(name)  # idempotent: no duplicate
+        assert len(opt_mod.SEPARATE_GRAD_NORM_GROUPS) == n_before
+        opt_mod._validate_grad_norm_group(name)  # no longer raises
+    finally:
+        if name in opt_mod.SEPARATE_GRAD_NORM_GROUPS:
+            opt_mod.SEPARATE_GRAD_NORM_GROUPS.remove(name)
+
+
 def test_has_grad_norm_group():
     """has_grad_norm_group reflects whether any param is in the requested group."""
     from megatron.core.optimizer.optimizer import MegatronOptimizer
