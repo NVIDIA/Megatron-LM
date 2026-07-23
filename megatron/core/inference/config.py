@@ -369,6 +369,15 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
+    offset_sampling_seed_by_dp_rank: bool = True
+    """
+    If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
+    sampling RNG. This gives each DP rank a unique generation seed so that the same prompt
+    routed to different ranks produces different samples (important for RL training).
+    If False (or `ModelParallelConfig.deterministic_mode` / `--deterministic-mode` is
+    enabled), then all DP ranks share the same sampling / generation seed.
+    """
+
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     """Mode used to schedule dynamic batching inference work."""
 

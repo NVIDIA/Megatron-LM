@@ -157,13 +157,20 @@ class TextGenerationController:
         else:
             self.vocab_size = unwrapped_model.vocab_size
 
+        # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
+        # unique generation seed (avoids identical samples when the same prompt is
+        # assigned to multiple DP ranks, which can corrupt RL training). Controlled by
+        # InferenceConfig.offset_sampling_seed_by_dp_rank, but deactivated when enabling
+        # --deterministic-mode (model_config.deterministic_mode).
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        # Set a unique generation seed for each DP rank. If the DP coordinator is random,
-        # then sending requests to different DP ranks will produce different output.
-        # Necessary to avoid generating the same output when a request / prompt is
-        # assigned to multiple DP ranks, which can corrupt RL training.
-        dp_rank = torch.distributed.get_rank(group=self.dp_group)
-        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed + dp_rank)
+        seed = self.model_config.inference_sampling_seed
+        offset_by_dp = (
+            inference_config.offset_sampling_seed_by_dp_rank
+            and not self.model_config.deterministic_mode
+        )
+        if offset_by_dp:
+            seed += torch.distributed.get_rank(group=self.dp_group)
+        self.sampling_rng.manual_seed(seed)
 
         if not self.num_speculative_tokens:
             self.num_mtp_depths = 0
