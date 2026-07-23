@@ -185,3 +185,128 @@ def triton_append_key_value_cache(
         # Compile-time constant
         BLOCK_SIZE_H=BLOCK_SIZE_H,
     )
+
+
+@triton.jit
+def _append_mla_latent_cache_kernel(
+    # --- Pointers to Tensors ---
+    key_ptr,
+    cache_ptr,
+    block_idx_ptr,
+    local_kv_seq_idx_ptr,
+    # --- Strides for Tensor Memory Layout ---
+    stride_key_token,
+    stride_key_dim,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_dim,
+    # --- Other Parameters ---
+    n_tokens: tl.int32,
+    latent_dim: tl.int32,
+    # --- Compile-Time Constants ---
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Triton kernel to append compressed MLA latent vectors to the paged latent KV cache.
+
+    Each program handles a tile of tokens and latent-dimension columns. Per-token
+    block/local mappings are consumed from the existing ContextGPUView state.
+    """
+
+    token_pid = tl.program_id(0)
+    dim_pid = tl.program_id(1)
+
+    offs_m = token_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = dim_pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_m = offs_m < n_tokens
+    mask = mask_m[:, None] & (offs_d[None, :] < latent_dim)
+
+    block_idx = tl.load(block_idx_ptr + offs_m, mask=mask_m, other=0).to(tl.int64)
+    local_pos = tl.load(local_kv_seq_idx_ptr + offs_m, mask=mask_m, other=0).to(tl.int64)
+
+    key_offsets = offs_m[:, None] * stride_key_token + offs_d[None, :] * stride_key_dim
+    values = tl.load(key_ptr + key_offsets, mask=mask, other=0.0)
+
+    cache_offsets = (
+        block_idx[:, None] * stride_cache_block
+        + local_pos[:, None] * stride_cache_pos
+        + offs_d[None, :] * stride_cache_dim
+    )
+    tl.store(cache_ptr + cache_offsets, values, mask=mask)
+
+
+def triton_append_mla_latent_cache(
+    layer_number: int,
+    key: Tensor,
+    memory_buffer: Tensor,
+    padded_active_token_count: int,
+    token_to_block_idx: Tensor,
+    token_to_local_position_within_kv_block: Tensor,
+) -> bool:
+    """
+    Append MLA latent KV cache using a standalone Triton kernel.
+
+    Args:
+        layer_number (int): Attention layer number (0-based).
+        key (Tensor): MLA latent tensor of shape (tokens, latent_dim) or
+            (tokens, 1, latent_dim).
+        memory_buffer (Tensor): The 4D MLA latent cache tensor to write to.
+        padded_active_token_count (int): Number of active + padding tokens to process.
+        token_to_block_idx (Tensor): Tensor mapping token index to cache block index.
+        token_to_local_position_within_kv_block (Tensor): Tensor mapping token index to
+            its position within a block.
+
+    Returns:
+        bool: True when the Triton path handled the append, False when callers should
+        fall back to the PyTorch indexed-assignment path.
+    """
+    if not HAVE_TRITON:
+        return False
+    if (
+        key.device.type != 'cuda'
+        or memory_buffer.device.type != 'cuda'
+        or token_to_block_idx.device.type != 'cuda'
+        or token_to_local_position_within_kv_block.device.type != 'cuda'
+    ):
+        return False
+    if memory_buffer.dim() != 4:
+        return False
+    if key.dim() == 3 and key.size(1) == 1:
+        key = key.squeeze(1)
+    if key.dim() != 2:
+        return False
+
+    n_tokens = padded_active_token_count
+    if n_tokens == 0:
+        return True
+    if key.size(0) < n_tokens:
+        return False
+
+    layer_cache = memory_buffer[layer_number]
+    latent_dim = key.size(-1)
+    if layer_cache.dim() != 3 or layer_cache.size(-1) != latent_dim:
+        return False
+
+    BLOCK_M = 16
+    BLOCK_D = 64
+    grid = (triton.cdiv(n_tokens, BLOCK_M), triton.cdiv(latent_dim, BLOCK_D))
+    cache_strides = layer_cache.stride()
+
+    _append_mla_latent_cache_kernel[grid](
+        key,
+        layer_cache,
+        token_to_block_idx,
+        token_to_local_position_within_kv_block,
+        key.stride(0),
+        key.stride(1),
+        cache_strides[0],
+        cache_strides[1],
+        cache_strides[2],
+        n_tokens=n_tokens,
+        latent_dim=latent_dim,
+        BLOCK_M=BLOCK_M,
+        BLOCK_D=BLOCK_D,
+        num_warps=4,
+    )
+    return True
