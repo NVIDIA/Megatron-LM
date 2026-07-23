@@ -74,23 +74,29 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     params_data = []
     moe_params_data = []
     sharded_params_data = []
+    sharded_moe_params_data = []
     data_parallel_group = None
+    tp_group = mpu.get_tensor_model_parallel_group()
+    expert_tp_group = mpu.get_expert_tensor_parallel_group()
 
     for model_chunk in model:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            is_expert = not getattr(param, 'allreduce', True)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
+                param, tp_group=tp_group, expert_tp_group=expert_tp_group
+            )
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
-            if not getattr(param, 'allreduce', True):
+            if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
                 if args.bf16:
                     if not force_create_fp32_copy and hasattr(param, 'main_param'):
                         if getattr(param, 'main_param_sharded', False):
                             if param.main_param is not None:
-                                sharded_params_data.append(param.main_param)
+                                sharded_moe_params_data.append(param.main_param)
                         else:
                             moe_params_data.append(param.main_param)
                     else:
@@ -169,6 +175,25 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
     else:
         moe_norm_2 = torch.zeros_like(norm_2)
+
+    # Distributed optimizer shards expert main parameters over expert DP rather than
+    # regular DP, so reduce their contribution separately before the model-parallel sum.
+    if len(sharded_moe_params_data) > 0:
+        sharded_moe_norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [sharded_moe_params_data],
+            False,  # no per-parameter norm.
+        )
+        sharded_moe_norm_2 = sharded_moe_norm * sharded_moe_norm
+    else:
+        sharded_moe_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    torch.distributed.all_reduce(
+        sharded_moe_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_expert_data_parallel_group(),
+    )
+    moe_norm_2 += sharded_moe_norm_2
 
     # Reduce norm across model parallel groups (dense and expert).
     # Dense params should sum across all model-parallel GPUs (tensor + pipeline).

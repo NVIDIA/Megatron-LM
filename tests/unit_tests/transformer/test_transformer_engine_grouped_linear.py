@@ -36,6 +36,44 @@ def _empty_load_args():
     return {}, True, [], [], []
 
 
+@pytest.mark.parametrize(("parallel_mode", "partition_dim"), (("column", 0), ("row", 1)))
+def test_expert_parameter_attributes_use_expert_topology(parallel_mode, partition_dim):
+    module = torch.nn.Module()
+    module.register_parameter("weight0", torch.nn.Parameter(torch.empty(4, 4)))
+    module.register_parameter("bias0", torch.nn.Parameter(torch.empty(4)))
+
+    te_ext._set_expert_parameter_attributes(
+        module, parallel_mode=parallel_mode, use_expert_pgs=True
+    )
+
+    assert module.weight0.allreduce is False
+    assert module.weight0.tensor_model_parallel is True
+    assert module.weight0.partition_dim == partition_dim
+    assert module.bias0.allreduce is False
+    assert module.bias0.tensor_model_parallel is (parallel_mode == "column")
+
+
+@pytest.mark.parametrize(
+    ("name", "is_partitioned"),
+    (
+        ("weight", True),
+        ("weight12", True),
+        ("bias", True),
+        ("bias12", True),
+        ("weight_scale", False),
+        ("bias_extra", False),
+    ),
+)
+def test_expert_parameter_attributes_match_parameter_names(name, is_partitioned):
+    module = torch.nn.Module()
+    module.register_parameter(name, torch.nn.Parameter(torch.empty(4)))
+
+    te_ext._set_expert_parameter_attributes(module, parallel_mode="column", use_expert_pgs=True)
+
+    param = module.get_parameter(name)
+    assert getattr(param, "tensor_model_parallel", False) is is_partitioned
+
+
 def test_split_grouped_checkpoint_tensor_uses_quantized_members():
     module = _grouped_linear_stub(num_gemms=2)
     members = [torch.tensor([1, 2]), torch.tensor([3, 4])]
