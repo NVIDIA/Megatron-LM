@@ -520,6 +520,7 @@ def test_run_dummy_async_sched_base_step_does_not_record_event():
     assert result is None
     controller._run_dummy_base_forward.assert_called_once_with(input_ids, position_ids)
     controller._record_fresh_async_sched_event.assert_not_called()
+    context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
 
 
 @pytest.mark.parametrize("is_valid", [False, True])
@@ -552,7 +553,7 @@ def test_run_async_sched_forward_primer(is_valid):
     "mode, expected_order",
     [(AsyncScheduleMode.LEGACY, ["base", "mtp"]), (AsyncScheduleMode.ASYNC, ["mtp", "base"])],
 )
-def test_dummy_step_matches_mode_forward_order(mode, expected_order):
+def test_dummy_forward_matches_mode_forward_order(mode, expected_order):
     """Real and idle EP ranks issue MTP and base collectives in the same order."""
     context = _make_async_sched_context()
     context.config.async_sched_mode = mode
@@ -560,15 +561,14 @@ def test_dummy_step_matches_mode_forward_order(mode, expected_order):
     input_ids = torch.tensor([[1]])
     position_ids = torch.tensor([[0]])
     order = []
+    controller._dynamic_step_context_init = mock.Mock(return_value=(input_ids, position_ids, None))
     controller._run_dummy_base_forward = mock.Mock(side_effect=lambda *_: order.append("base"))
     controller._run_dummy_serial_mtp_forward = mock.Mock(side_effect=lambda: order.append("mtp"))
 
-    if mode == AsyncScheduleMode.LEGACY:
-        controller._run_dummy_legacy_step(input_ids, position_ids)
-    else:
-        controller._run_dummy_async_sched_step(input_ids, position_ids)
+    controller.dummy_forward()
 
     assert order == expected_order
+    context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
 
 
 @pytest.mark.parametrize(
@@ -1310,6 +1310,83 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
     def teardown_method(self, method):
         InferenceMode.unset_active()
+
+    @pytest.mark.internal
+    def test_async_sched_no_overlap_pauses_boundary_request(self):
+        """No-overlap uses real lifecycle bookkeeping before forwarding survivors."""
+        self.setup_model(
+            torch.float32, batch_size=2, static=False, block_size_tokens=4, max_requests=2
+        )
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.reset()
+
+        active_slice = slice(0, 2)
+        context.total_request_count = 2
+        context.active_token_count = 2
+        context.request_ids[active_slice] = torch.tensor([10, 11], dtype=torch.int32)
+        context.request_in_prefill_status_tensor[active_slice] = 0
+        context.request_query_lengths[active_slice] = 1
+        context.request_output_lengths[active_slice] = 16
+        context.request_kv_length_offsets[active_slice] = 3
+        context.request_last_kv_block_offset[active_slice] = torch.tensor(
+            [context.block_size_tokens - 1, 0], dtype=torch.int32
+        )
+        context.request_metadata["termination_id"][active_slice] = 99
+
+        block_ids = context.kv_block_allocator.allocate_memory_blocks(2)
+        context.request_to_kv_block_ids[active_slice, 0] = block_ids
+        context.request_last_kv_block_id[active_slice] = block_ids
+        context.request_kv_block_counts[active_slice] = 1
+        context.token_to_input_ids[active_slice] = torch.tensor([80, 81])
+
+        # Leave room in paused storage but no capacity to keep both requests active.
+        context.kv_block_allocator.active_count = context.kv_block_allocator.get_active_used()
+        context.kv_block_allocator.paused_count = 2
+        context.kv_block_allocator.total_avail = 0
+
+        sampled_tokens = torch.tensor([90, 91], dtype=torch.int64)
+        controller._async_sched_logits = AsyncScheduleLogitsState(
+            is_valid=True, cuda_graph_request_count=2
+        )
+        controller._run_async_sched_sample = mock.Mock(
+            return_value=SimpleNamespace(
+                sampled_tokens_gpu=sampled_tokens,
+                sampled_tokens_cpu_view=sampled_tokens,
+                sampled_mtp_tokens_gpu=None,
+                sampled_mtp_tokens_cpu_view=None,
+                accepted_tokens_cpu_view=None,
+                sample_cpu_ready_event=None,
+            )
+        )
+        forward_input_ids = torch.tensor([91])
+        forward_position_ids = torch.tensor([4])
+
+        def initialize_survivor_forward():
+            assert context.paused_request_count == 1
+            assert context.request_ids[:2].tolist() == [10, 11]
+            assert context.token_to_input_ids[0].item() == 91
+            return forward_input_ids, forward_position_ids, None
+
+        controller._dynamic_step_context_init = mock.Mock(side_effect=initialize_survivor_forward)
+        controller._run_async_sched_forward = mock.Mock()
+
+        result = asyncio.run(
+            controller._run_async_sched_step_no_overlap(schedule_waiting_requests=None)
+        ).output
+
+        assert result["sample"].tolist() == [90, 91]
+        assert result["finished_request_ids"].numel() == 0
+        assert result["newly_paused_request_ids"].flatten().tolist() == [10]
+        assert result["evict_request_ids"] is None
+        assert context.paused_request_count == 1
+        active_request_ids = context.request_ids[
+            context.paused_request_count : context.total_request_count
+        ]
+        assert active_request_ids.tolist() == [11]
+        controller._run_async_sched_forward.assert_called_once_with(
+            forward_input_ids, forward_position_ids
+        )
 
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)

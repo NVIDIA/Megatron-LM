@@ -1661,6 +1661,8 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             bool: Whether the next step can use overlap ordering.
         """
+        # Prefill transitions, paused requests, and insufficient KV capacity
+        # require complete lifecycle bookkeeping before preparing the next batch.
         if not self.context.can_prepare_requests():
             return False
         if not self.waiting_request_ids:

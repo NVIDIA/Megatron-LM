@@ -2638,7 +2638,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-    def reset_metadata(self, preserve_prefix_cache: bool = False) -> None:
+    def reset_metadata(
+        self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
+    ) -> None:
         """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
 
         This must be called after ``initialize_all_tensors()`` and after any
@@ -2651,17 +2653,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 step state -- wiping the allocator there would destroy cross-request prefix
                 reuse for any subsequent request (the engine idles between requests at low
                 concurrency, especially with EP > 1).
+            preserve_counters: When True, keep engine-step, prefix-cache clock,
+                prefill-token, and async-scheduling counters intact.
         """
-        # No cache to preserve when prefix caching is off: fall back to a full
-        # reset so the disabled path is byte-identical to the original behavior.
+        # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
 
         # Reset request/token counts.
         self.total_request_count = 0
         self.active_token_count = 0
-        self.lifetime_prefill_token_count = 0
-        self.async_sched_step_count = 0
-        self.async_sched_compaction_step_count = 0
+        if not preserve_counters:
+            self.lifetime_prefill_token_count = 0
+            self.async_sched_step_count = 0
+            self.async_sched_compaction_step_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -2690,7 +2694,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def reset(self, preserve_prefix_cache: bool = False) -> None:
+    def reset(
+        self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
+    ) -> None:
         """Reset entire context.
 
         This method does:
@@ -2704,28 +2710,26 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Args:
             preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache
-                state (hash indices, cached blocks/slots, LRU clock) intact. Used by
+                state (hash indices and cached blocks/slots) intact. Used by
                 the idle ``dummy_forward`` path so an idle step between requests does
                 not destroy cross-request prefix reuse.
+            preserve_counters: When True, keep engine-step, prefix-cache clock,
+                prefill-token, and async-scheduling counters intact.
         """
-        # No cache to preserve when prefix caching is off: fall back to a full
-        # reset so the disabled path is byte-identical to the original behavior.
+        # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
         self.reset_tensors()
-        self.reset_metadata(preserve_prefix_cache=preserve_prefix_cache)
+        self.reset_metadata(
+            preserve_prefix_cache=preserve_prefix_cache, preserve_counters=preserve_counters
+        )
 
-        # Reset lifetime counters (not reset in reset_metadata, which is also
-        # called during suspend/resume where these must persist).
-        if not preserve_prefix_cache:
+        if not preserve_counters:
             self.step_count = 0
             self.prefix_cache_lru_clock = 0
 
-            # Reset Mamba cache state
-            if self.mamba_slot_allocator is not None:
-                self.mamba_slot_allocator.reset()
-        # When preserving prefix cache (idle dummy_forward), keep step_count
-        # monotonic so the engine's periodic logging cadence
-        # (step_count % logging_step_interval) still fires for short requests.
+        # Reset Mamba cache state.
+        if not preserve_prefix_cache and self.mamba_slot_allocator is not None:
+            self.mamba_slot_allocator.reset()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None

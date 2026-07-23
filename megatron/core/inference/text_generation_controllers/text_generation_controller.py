@@ -1753,8 +1753,8 @@ class TextGenerationController:
                 f"Unexpected async scheduling mode: {context.config.async_sched_mode}"
             )
 
-        # Clear temporary dummy state while preserving reusable prefix state.
-        context.reset(preserve_prefix_cache=True)
+        # Clear temporary dummy state while preserving reusable prefix state and counters.
+        context.reset(preserve_prefix_cache=True, preserve_counters=True)
 
     def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
         """Batch GPU-to-CPU transfer of sampled tokens.
@@ -2257,24 +2257,10 @@ class TextGenerationController:
     def _run_dummy_async_sched_base_step(self) -> None:
         """Run the base-forward half of an async EP step after local work finishes."""
         context = self.inference_wrapped_model.inference_context
-        saved_counters = (
-            context.step_count,
-            context.prefix_cache_lru_clock,
-            context.lifetime_prefill_token_count,
-            context.async_sched_step_count,
-            context.async_sched_compaction_step_count,
-        )
 
         input_ids, position_ids, _ = self._dynamic_step_context_init(is_dummy_forward=True)
         self._run_dummy_base_forward(input_ids, position_ids)
-        context.reset(preserve_prefix_cache=True)
-        (
-            context.step_count,
-            context.prefix_cache_lru_clock,
-            context.lifetime_prefill_token_count,
-            context.async_sched_step_count,
-            context.async_sched_compaction_step_count,
-        ) = saved_counters
+        context.reset(preserve_prefix_cache=True, preserve_counters=True)
 
     def _run_async_sched_forward_primer(self) -> Tuple[bool, Optional[torch.cuda.Event]]:
         """Launch the initial forward when no valid logits state exists.
