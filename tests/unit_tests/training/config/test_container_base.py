@@ -203,7 +203,7 @@ class TestConfigContainer_FromYaml:
         with pytest.raises(FileNotFoundError, match="YAML file not found"):
             TestConfigContainer.from_yaml("non_existent_file.yaml")
 
-    @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
+    @patch("megatron.core.msc_utils.MultiStorageClientFeature.is_enabled")
     @patch("omegaconf.OmegaConf")
     @patch("builtins.open", new_callable=mock_open)
     @patch("os.path.exists")
@@ -243,7 +243,7 @@ class TestConfigContainer_FromYaml:
             assert result.name == "yaml_config"
             assert result.value == 500
 
-    @patch("megatron.training.config.container.MultiStorageClientFeature.is_enabled")
+    @patch("megatron.core.msc_utils.MultiStorageClientFeature.is_enabled")
     @patch("os.path.exists")
     def test_from_yaml_with_mode(self, mock_exists, mock_msc):
         """Test from_yaml with different instantiation modes."""
