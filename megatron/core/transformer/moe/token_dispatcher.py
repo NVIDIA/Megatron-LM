@@ -19,6 +19,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    HYBRIDEP_TOKEN_ALIGNMENT,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
@@ -1039,11 +1040,49 @@ class _HybridEPManager(_DispatchManager):
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+        # HybridEP dispatch expects equal per-rank input sizes. When requested,
+        # variable token counts are padded to the group-wide max and trimmed in combine.
+        self._original_num_tokens: Optional[int] = None
+        self._padded_num_tokens: Optional[int] = None
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
-        self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
-        self.token_probs = probs.reshape(num_tokens, self.num_experts)
+        self._original_num_tokens = num_tokens
+
+        padded_num_tokens = num_tokens
+        if self.config.moe_hybridep_pad_uneven_dispatch_inputs:
+            if (
+                self.config.sequence_packing_scheduler is not None
+                and (torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling())
+            ):
+                # CUDA graph path: upstream sequence packing has already padded
+                # routing_map to a static per-rank length. Skip the collective
+                # and host synchronization while tracing or capturing.
+                padded_num_tokens = num_tokens
+            else:
+                # Use the actual tp_ep max so all ranks in the MoE communication
+                # group pass the same token count to HybridEP.
+                max_num_tokens_across_ep = torch.tensor(
+                    [num_tokens], device=routing_map.device, dtype=torch.long
+                )
+                torch.distributed.all_reduce(
+                    max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
+                )
+                padded_num_tokens = int(max_num_tokens_across_ep.item())
+            padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
+        self._padded_num_tokens = padded_num_tokens
+
+        routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        probs = probs.reshape(num_tokens, self.num_experts)
+        if padded_num_tokens > num_tokens:
+            pad_rows = padded_num_tokens - num_tokens
+            routing_map = torch.cat(
+                [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
+            )
+            probs = torch.cat([probs, probs.new_zeros((pad_rows, self.num_experts))], dim=0)
+
+        self.routing_map = routing_map
+        self.token_probs = probs
 
         if self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)
@@ -1051,7 +1090,7 @@ class _HybridEPManager(_DispatchManager):
             # budget). Tokens above this budget are dropped inside HybridEP; dispatch then
             # sets overflow_flag on the handle (accumulated in over_budget in dispatch()).
             budget = int(
-                routing_map.shape[0]
+                padded_num_tokens
                 * self.config.moe_router_topk
                 * self.moe_expert_rank_capacity_factor
             )
@@ -1062,7 +1101,7 @@ class _HybridEPManager(_DispatchManager):
         # in dispatch) and does not drop tokens or report overflow.
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
-            num_out_tokens = num_tokens * self.config.moe_router_topk
+            num_out_tokens = padded_num_tokens * self.config.moe_router_topk
             # Drop and pad the input to capacity.
             self.capacity = get_capacity(
                 num_tokens=num_out_tokens,
@@ -1091,6 +1130,11 @@ class _HybridEPManager(_DispatchManager):
             self.token_probs = self.token_probs.float()  # downcast or upcast
         if self.config.fp8 or self.config.fp4:
             self.pad_multiple = get_align_size_for_quantization(self.config)
+        if self._padded_num_tokens is not None and hidden_states.shape[0] < self._padded_num_tokens:
+            pad_rows = self._padded_num_tokens - hidden_states.shape[0]
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
+            )
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
@@ -1137,12 +1181,20 @@ class _HybridEPManager(_DispatchManager):
             pad_multiple=self.pad_multiple,
             fused=self.config.moe_permute_fusion_into_hybridep,
         )
+        if (
+            self._padded_num_tokens is not None
+            and self._original_num_tokens is not None
+            and hidden_states.shape[0] > self._original_num_tokens
+        ):
+            hidden_states = hidden_states[: self._original_num_tokens]
         # Release the used handle/num_permuted_tokens which could change in each iteration.
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
+        self._original_num_tokens = None
+        self._padded_num_tokens = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:

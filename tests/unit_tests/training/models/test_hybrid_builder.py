@@ -210,6 +210,20 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
+    def test_callable_spec_receives_transformer_config(self, mock_model, *_):
+        module_spec = ModuleSpec(module=object)
+        spec_factory = Mock(return_value=module_spec)
+        self.config.__dict__["hybrid_stack_spec"] = spec_factory
+
+        self.builder.build_model(self.pg, pre_process=True, post_process=True)
+
+        spec_factory.assert_called_once_with(self.config.transformer)
+        assert mock_model.call_args.kwargs["hybrid_stack_spec"] is module_spec
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
     def test_spec_none_uses_default_te_spec(self, mock_model, *_):
         # Default config: hybrid_stack_spec=None, restore_modelopt_state=False,
         # transformer_impl != "inference_optimized" → falls through to default TE spec.

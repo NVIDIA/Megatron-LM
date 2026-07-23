@@ -204,6 +204,26 @@ If the later training job does not specify `--global-batch-size` (which is neede
 
 `tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`.
 
+## Packing Scheduler
+
+The packing scheduler reschedules variable-length sequences across DPxCP ranks to improve GPU utilization. It is built around the following modules:
+
+### `data_schedule`
+
+This module contains the high-level scheduling logic and entry points:
+
+- **`BasePackingScheduler`**: Abstract base class for packing schedulers. Defines the interface for `get_groups_and_subsamples()` (scheduling algorithm) and `run()` (full scheduling pipeline including fetch, schedule, reroute, pack, TP synchronization, and VPP handling).
+
+- **`DpBalancedScheduler`**: A concrete scheduler that packs sequences in their original order until reaching the max sequence length limit per DPxCP rank. Supports aligning the number of microbatches to DP size and VPP stage multiples.
+
+- **`wrap_data_iterator()`**: Top-level entry point that wraps an existing `data_iterator`. Every TP-rank-0 PP stage schedules its local iterator, while scalar schedule results are synchronized inside each TP group. It returns the packed iterator, updated number of microbatches, and FLOPs statistics.
+
+- **`get_batch_on_this_rank_for_sequence_packing()`**: Fetches a packed microbatch on TP rank 0, broadcasts it within the TP group, constructs `PackedSeqParams` (with `cu_seqlens`, `max_seqlen`, `qkv_format=thd`), and optionally partitions sequences across CP ranks using Transformer Engine's `thd_get_partitioned_indices`.
+
+### `data_schedule_utils.py`
+
+This module contains the utility functions used by the schedulers.
+
 ## Fast DataLoader initialization
 
 Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags:

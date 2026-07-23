@@ -13,6 +13,7 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    _normalize_dsv4_hybrid_csa_compress_ratios,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.config import PretrainConfigContainer
@@ -81,6 +82,56 @@ class ConfigWithLiteral:
 
     precision: Literal[16, 32] = 32
     """Precision level"""
+
+
+class TestDSv4HybridRatioNormalization:
+    pattern = "WEC-|H-C-/W-"
+    compact = [0, 4, 128, 4, 0]
+    full = [0, 0, 4, 0, 128, 0, 4, 0, 0, 0]
+
+    def test_derives_compact_and_full_ratios(self):
+        args = Namespace(
+            experimental_attention_variant="dsv4_hybrid", csa_compress_ratios=None
+        )
+        config_kwargs = {}
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, self.pattern)
+
+        assert args.csa_compress_ratios == self.compact
+        assert config_kwargs["csa_compress_ratios"] == self.full
+
+    def test_expands_compact_cli_ratios(self):
+        args = Namespace(
+            experimental_attention_variant="dsv4_hybrid",
+            csa_compress_ratios=list(self.compact),
+        )
+        config_kwargs = {}
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, self.pattern)
+
+        assert args.csa_compress_ratios == self.compact
+        assert config_kwargs["csa_compress_ratios"] == self.full
+
+    def test_rejects_ratio_that_disagrees_with_symbol(self):
+        args = Namespace(
+            experimental_attention_variant="dsv4_hybrid",
+            csa_compress_ratios=[0, 128, 128, 4, 0],
+        )
+
+        with pytest.raises(AssertionError, match="expected 4"):
+            _normalize_dsv4_hybrid_csa_compress_ratios(args, {}, self.pattern)
+
+    def test_preserves_array_driven_d_ratio(self):
+        args = Namespace(
+            experimental_attention_variant="dsv4_hybrid",
+            csa_compress_ratios=[128, 4, 0],
+        )
+        config_kwargs = {}
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, config_kwargs, "D-C/D")
+
+        assert args.csa_compress_ratios == [128, 4, 0]
+        assert config_kwargs["csa_compress_ratios"] == [128, 0, 4, 0]
 
 
 class TestArgumentGroupFactoryBasic:

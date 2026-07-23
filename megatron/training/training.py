@@ -42,7 +42,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -254,6 +254,7 @@ stimer = StragglerDetector()
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
+_seqlen_stats_are_global: bool = False
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -315,7 +316,7 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -334,6 +335,25 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     _seqlen_stats_in_iteration[0] += seqlens.sum()
     _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
     _seqlen_stats_active = True
+    _seqlen_stats_are_global = False
+
+
+def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
+    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if total_real_tokens is None or seqlen_squared_sum is None:
+        return
+    if _seqlen_stats_in_iteration is None:
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else 'cpu'
+        )
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    _seqlen_stats_in_iteration[0] = float(total_real_tokens)
+    _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
+    _seqlen_stats_active = True
+    _seqlen_stats_are_global = True
 
 
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
@@ -354,20 +374,23 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         fuse onto one device tensor and consume issues a single 2-element
         all-reduce.
 
-    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
-    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
+    Sync cost: at most one all-reduce of a 2-element ``float64`` tensor and one
+    host sync (``tolist()``). Scheduler-provided global values skip the all-reduce;
+    inactive BSHD iterations skip both.
 
-    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
-    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
-    factor of ``TP * CP * PP``, which we divide out.
+    For locally accumulated values, all ranks within one DP group see identical
+    ``cu_seqlens``. The world all-reduce therefore overcounts by ``TP * CP * PP``,
+    which we divide out.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if not _seqlen_stats_active:
         # BSHD path: never allocated the tensor; tell the caller to use the
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+    if _seqlen_stats_are_global:
+        dedup = 1
+    elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
@@ -383,7 +406,106 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
+
+
+def _dsv4_hybrid_self_attention_flops(
+    *,
+    hidden_size,
+    num_attention_heads,
+    v_head_dim,
+    q_lora_rank,
+    o_groups,
+    o_lora_rank,
+    csa_window_size,
+    seq_length,
+    n_layers_r0,
+    n_layers_r4,
+    n_layers_r128,
+    dsa_indexer_n_heads,
+    dsa_indexer_head_dim,
+    dsa_indexer_topk,
+):
+    """Return token-linear and L-squared DSv4 HybridModel attention coefficients.
+
+    Ratio-zero layers use window attention, ratio-four layers add learned sparse
+    selection over compressed KV, and ratio-128 layers attend to all compressed
+    KV. Expansion factors for fused multiply-add and forward/backward are left
+    to the caller.
+    """
+    n_attn_layers = n_layers_r0 + n_layers_r4 + n_layers_r128
+
+    # DSv4 uses a joint hidden-to-v_head_dim KV projection and grouped low-rank
+    # output projection, rather than generic MLA's dense output projection.
+    q_term = q_lora_rank * (hidden_size + num_attention_heads * v_head_dim + 1)
+    kv_term = hidden_size * v_head_dim + v_head_dim
+    o_term = (
+        num_attention_heads * v_head_dim * o_lora_rank
+        + o_groups * o_lora_rank * hidden_size
+    )
+    mla_projection_term = (q_term + kv_term + o_term) * n_attn_layers
+
+    sparse_r0 = (
+        n_layers_r0 * num_attention_heads * csa_window_size * v_head_dim * 2
+    )
+    sparse_r128_window = (
+        n_layers_r128 * num_attention_heads * csa_window_size * v_head_dim * 2
+    )
+    sparse_r128_core = n_layers_r128 * num_attention_heads * v_head_dim / 128
+
+    # The main compressor has wkv and wgate projections. Ratio-four layers use
+    # two overlapping compressor windows; ratio-128 layers use one.
+    compressor_term = (
+        n_layers_r4 * hidden_size * (2 * v_head_dim) * 2
+        + n_layers_r128 * hidden_size * v_head_dim * 2
+    )
+
+    if n_layers_r4:
+        assert dsa_indexer_n_heads is not None
+        assert dsa_indexer_head_dim is not None
+        assert dsa_indexer_topk is not None
+
+        # Packed iterations can contain shorter subsequences, but the scheduler
+        # exposes only aggregate sum(L) and sum(L^2). Use configured seq_length
+        # for the ratio-four effective-top-k approximation.
+        effective_topk = min(dsa_indexer_topk, seq_length // 4)
+        average_compressed_tokens = effective_topk * (
+            1 - effective_topk * 4 / (2 * seq_length)
+        )
+        sparse_r4 = (
+            n_layers_r4
+            * num_attention_heads
+            * (csa_window_size + average_compressed_tokens)
+            * v_head_dim
+            * 2
+        )
+        indexer_token_term = (
+            n_layers_r4 * hidden_size * (2 * dsa_indexer_head_dim) * 2
+            + n_layers_r4
+            * q_lora_rank
+            * dsa_indexer_n_heads
+            * dsa_indexer_head_dim
+            + n_layers_r4 * hidden_size * dsa_indexer_n_heads
+        )
+        indexer_core_term = (
+            n_layers_r4 * dsa_indexer_n_heads * dsa_indexer_head_dim / 4
+        )
+    else:
+        sparse_r4 = 0
+        indexer_token_term = 0
+        indexer_core_term = 0
+
+    token_linear = (
+        mla_projection_term
+        + sparse_r0
+        + sparse_r4
+        + sparse_r128_window
+        + compressor_term
+        + indexer_token_term
+    )
+    core = sparse_r128_core + indexer_core_term
+    return token_linear, core
 
 
 def num_floating_point_operations(
@@ -523,12 +645,49 @@ def num_floating_point_operations(
                      gdn_qk_head_dim=128, gdn_v_head_dim=128,
                      gdn_num_qk_heads=16, gdn_num_v_heads=32,
                      gdn_conv_kernel_dim=4,
-                     vocab_size=256000, mtp_num_layers=0):
+                     vocab_size=256000, mtp_num_layers=0,
+                     experimental_attention_variant=None,
+                     q_lora_rank=None, v_head_dim=None,
+                     o_groups=None, o_lora_rank=None,
+                     csa_window_size=None, seq_length=None,
+                     dsv4_n_layers_r0=0, dsv4_n_layers_r4=0, dsv4_n_layers_r128=0,
+                     dsa_indexer_n_heads=None, dsa_indexer_head_dim=None,
+                     dsa_indexer_topk=None):
         """Calculate total FLOPs for the hybrid model."""
+        if experimental_attention_variant == "dsv4_hybrid":
+            token_term, core_term = _dsv4_hybrid_self_attention_flops(
+                hidden_size=hidden_size,
+                num_attention_heads=num_attn_heads,
+                v_head_dim=v_head_dim,
+                q_lora_rank=q_lora_rank,
+                o_groups=o_groups,
+                o_lora_rank=o_lora_rank,
+                csa_window_size=csa_window_size,
+                seq_length=seq_length,
+                n_layers_r0=dsv4_n_layers_r0,
+                n_layers_r4=dsv4_n_layers_r4,
+                n_layers_r128=dsv4_n_layers_r128,
+                dsa_indexer_n_heads=dsa_indexer_n_heads,
+                dsa_indexer_head_dim=dsa_indexer_head_dim,
+                dsa_indexer_topk=dsa_indexer_topk,
+            )
+            # FMA expansion is applied here; the final *3 accounts for
+            # forward, weight-gradient, and data-gradient work.
+            attention_flops = 2 * (
+                token_term * total_tokens + core_term * seqlen_squared_sum
+            )
+        else:
+            attention_flops = num_attn_layers * attn_layer_flops(
+                total_tokens,
+                seqlen_squared_sum,
+                hidden_size,
+                num_attn_heads,
+                gqa,
+                gqa_groups,
+                kv_channels,
+            )
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
-                                                   hidden_size, num_attn_heads, gqa,
-                                                   gqa_groups, kv_channels) +
+                attention_flops +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_layer_flops(total_tokens, hidden_size,
@@ -541,6 +700,8 @@ def num_floating_point_operations(
                                                   gdn_qk_head_dim, gdn_v_head_dim,
                                                   gdn_num_qk_heads, gdn_num_v_heads,
                                                   gdn_conv_kernel_dim) +
+                # MTP eh_norm, final_norm, and eh projection.
+                (2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size**2) * total_tokens) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
@@ -853,11 +1014,26 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
+        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
+                layer_counts
             )
         )
+        dsv4_n_layers_r0 = 0
+        dsv4_n_layers_r4 = 0
+        dsv4_n_layers_r128 = 0
+        if args.experimental_attention_variant == "dsv4_hybrid":
+            dsv4_n_layers_r0 = layer_counts[Symbols.WINDOW]
+            dsv4_n_layers_r4 = layer_counts[Symbols.CSA]
+            dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
+            dsv4_num_attention_layers = (
+                dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128
+            )
+            assert (
+                num_attn_layers == 0 and layer_counts[Symbols.DS_ATTENTION] == 0
+            ), "dsv4_hybrid supports only Window/CSA/HCA attention layers."
+            num_attn_layers = dsv4_num_attention_layers
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -895,6 +1071,19 @@ def num_floating_point_operations(
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            experimental_attention_variant=args.experimental_attention_variant,
+            q_lora_rank=args.q_lora_rank,
+            v_head_dim=args.v_head_dim,
+            o_groups=getattr(args, "o_groups", None),
+            o_lora_rank=getattr(args, "o_lora_rank", None),
+            csa_window_size=getattr(args, "csa_window_size", None),
+            seq_length=args.seq_length,
+            dsv4_n_layers_r0=dsv4_n_layers_r0,
+            dsv4_n_layers_r4=dsv4_n_layers_r4,
+            dsv4_n_layers_r128=dsv4_n_layers_r128,
+            dsa_indexer_n_heads=getattr(args, "dsa_indexer_n_heads", None),
+            dsa_indexer_head_dim=getattr(args, "dsa_indexer_head_dim", None),
+            dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -2297,6 +2486,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """
     args = get_args()
     timers = get_timers()
+    scheduled_num_microbatches = get_num_microbatches()
 
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
@@ -2309,7 +2499,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    source_data_iterator = data_iterator
+    while rerun_state_machine.should_run_forward_backward(source_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2351,6 +2542,26 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            scheduler_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+            assert isinstance(scheduler_pg_collection, ProcessGroupCollection), (
+                "sequence packing requires the model to expose a ProcessGroupCollection"
+            )
+            (
+                scheduled_data_iterator,
+                scheduled_num_microbatches,
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            ) = wrap_data_iterator(
+                source_data_iterator,
+                config,
+                get_num_microbatches(),
+                pg_collection=scheduler_pg_collection,
+            )
+        else:
+            scheduled_data_iterator = source_data_iterator
+            scheduled_num_microbatches = get_num_microbatches()
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -2360,9 +2571,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
+            data_iterator=scheduled_data_iterator,
             model=model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=scheduled_num_microbatches,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
@@ -2372,6 +2583,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             p2p_communicator=p2p_communicator,
             pg_collection=pg_collection,
         )
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            # The HybridModel forward path also records local cu_seqlens stats.
+            # Overwrite those after forward/backward with the scheduler's
+            # already-global values so consume() neither double-counts nor
+            # issues another all-reduce.
+            set_seqlen_stats_in_iteration(
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2411,7 +2631,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            scheduled_num_microbatches,
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -2505,8 +2735,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            scheduled_num_microbatches,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return (
+        {},
+        skipped_iter,
+        should_checkpoint,
+        should_exit,
+        exit_code,
+        grad_norm,
+        num_zeros_in_grad,
+        log_max_attention_logit,
+        scheduled_num_microbatches,
+    )
 
 
 def training_log(
@@ -2525,6 +2766,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2694,7 +2936,7 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -2705,14 +2947,24 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
+        moe_layer_freq = args.moe_layer_freq
+        mtp_num_layers = args.mtp_num_layers
         if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                parse_hybrid_pattern,
             )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+
+            parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            main_pattern = (parsed_hybrid_pattern.main_pattern or "").replace(Symbols.PIPE, "")
+            layers = len(main_pattern) + parsed_hybrid_pattern.mtp_num_depths
+            moe_layer_freq = [int(layer_type == Symbols.MOE) for layer_type in main_pattern]
+            moe_layer_freq.extend(
+                parsed_hybrid_pattern.mtp_pattern.count(Symbols.MOE)
+                for _ in range(parsed_hybrid_pattern.mtp_num_depths)
+            )
+            # The full Hybrid pattern above already accounts for each MTP depth.
+            mtp_num_layers = None
         else:
             layers = args.num_layers
 
@@ -2725,28 +2977,35 @@ def training_log(
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
-            moe_layer_freq=args.moe_layer_freq,
-            mtp_num_layers=args.mtp_num_layers,
+            moe_layer_freq=moe_layer_freq,
+            mtp_num_layers=mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
 
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
-        indexer_loss_scale = 1 / get_num_microbatches()
+        indexer_loss_scale = 1 / (num_microbatches or get_num_microbatches())
+        assert isinstance(
+            pg_collection, ProcessGroupCollection
+        ), "DSA indexer logging requires a ProcessGroupCollection"
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
+            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers + (args.mtp_num_layers or 0),
+            csa_compress_ratios=args.csa_compress_ratios,
+            preserve_groups=args.cuda_graph_impl == "transformer_engine",
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3625,12 +3884,22 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        cuda_graph_sample_packed_seq_params = None
+        if has_rl_utils and args.perform_rl_step:
+            cuda_graph_sample_packed_seq_params = rl_utils.get_rl_packed_seq_params_for_cuda_graph(
+                seq_length=args.seq_length,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                sequence_packing=args.rl_use_sequence_packing,
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+            )
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            sample_packed_seq_params=cuda_graph_sample_packed_seq_params,
+            thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
     # Run training iterations till done.
@@ -3671,7 +3940,7 @@ def train(
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
         # as it intentionally reconfigures microbatches
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing:
+            if args.rl_use_sequence_packing or args.sequence_packing_scheduler is not None:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
@@ -3709,6 +3978,9 @@ def train(
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
+            assert (
+                getattr(config, "sequence_packing_scheduler", None) is None
+            ), "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -3755,6 +4027,7 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            num_microbatches = get_num_microbatches()
         else:
             ft_integration.on_training_step_start()
             (
@@ -3766,6 +4039,7 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                num_microbatches,
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                 pg_collection=pg_collection,
@@ -3911,6 +4185,7 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            num_microbatches=num_microbatches,
         )
         is_first_iteration = False
 
@@ -4151,11 +4426,31 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if getattr(config, "sequence_packing_scheduler", None) is not None:
+                assert isinstance(
+                    eval_pgc, ProcessGroupCollection
+                ), "sequence packing requires the model to expose a ProcessGroupCollection"
+                try:
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            pg_collection=eval_pgc,
+                        )
+                    )
+                except StopIteration:
+                    ft_integration.on_eval_step_end()
+                    config.timers = get_timers()
+                    break
+            else:
+                packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=packed_data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
+                num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -4607,4 +4902,34 @@ def should_disable_forward_pre_hook(args):
             or getattr(args, 'use_layer_wise_distributed_optimizer', False)
         )
         and args.overlap_param_gather
+    )
+
+
+def _get_thd_sequence_length_upper_bound(args):
+    """Return the padded per-sample THD length upper bound for graph sizing."""
+    max_sequence_length = getattr(args, "seq_length", None)
+    if getattr(args, "use_varlen_dataset", False):
+        mock_config_spec = getattr(args, "varlen_mock_dataset_config_json", None)
+        if mock_config_spec is not None:
+            from megatron.training.datasets.utils import load_json_arg
+
+            mock_config = load_json_arg(mock_config_spec)
+            if isinstance(mock_config, dict) and mock_config.get("max_seq_len") is not None:
+                max_sequence_length = int(mock_config["max_seq_len"])
+
+    if max_sequence_length is None:
+        return None
+    if getattr(args, "seq_length", None) is not None:
+        max_sequence_length = min(int(max_sequence_length), int(args.seq_length))
+
+    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+    cp_padding = cp_size * 2 if cp_size > 1 else 1
+    sp_padding = (
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        if getattr(args, "sequence_parallel", False)
+        else 1
+    )
+    padding_granularity = cp_padding * sp_padding
+    return int(
+        math.ceil(max_sequence_length / padding_granularity) * padding_granularity
     )

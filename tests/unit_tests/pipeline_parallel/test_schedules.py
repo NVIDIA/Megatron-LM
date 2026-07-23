@@ -377,7 +377,8 @@ def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
     )
 
 
-def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
+@pytest.mark.parametrize("variant", ["dsa", "dsv4_hybrid"])
+def test_indexer_loss_scale_defaults_from_variant_without_mutating_config(variant):
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
     )
@@ -385,7 +386,7 @@ def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
     config = SimpleNamespace(
         calculate_per_token_loss=True,
         experimental_attention_variant_loss_scale_func=None,
-        experimental_attention_variant='dsa',
+        experimental_attention_variant=variant,
         grad_scale_func=lambda tensor: tensor * 7.0,
         num_moe_experts=None,
         mtp_num_layers=None,

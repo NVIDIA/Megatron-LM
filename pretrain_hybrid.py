@@ -25,10 +25,11 @@ import torch
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -62,6 +63,12 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.datasets.utils import load_json_arg
+from megatron.training.datasets.varlen_dataset import (
+    MockVarlenDataset,
+    VarlenDataset,
+    VarlenDatasetConfig,
+)
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -94,7 +101,7 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, pg_collection=None):
     """Generate a batch."""
 
     args = get_args()
@@ -113,12 +120,44 @@ def get_batch(data_iterator, vp_stage=None):
     )
     is_hybrid_cp = args.hybrid_context_parallel
 
+    if args.sequence_packing_scheduler is not None:
+        (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            packed_seq_params,
+            padding_mask,
+        ) = get_batch_on_this_rank_for_sequence_packing(
+            data_iterator,
+            vpp_size=config.virtual_pipeline_model_parallel_size,
+            mtp_on_this_rank=mtp_on_this_rank,
+            vp_stage=vp_stage,
+            pg_collection=pg_collection,
+            config=config,
+        )
+        return (
+            attention_mask,
+            None,
+            None,
+            None,
+            labels,
+            None,
+            loss_mask,
+            None,
+            position_ids,
+            tokens,
+            padding_mask,
+            packed_seq_params,
+        )
+
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        return [None for _ in BATCH_KEYS]
+        return [None for _ in BATCH_KEYS] + [None, None]
 
     batch = {}
     if tp_rank == 0:
@@ -162,6 +201,8 @@ def get_batch(data_iterator, vp_stage=None):
             batch['max_seqlen'],
             None,
             None,
+            None,
+            None,
         )
 
     batch = get_batch_on_this_cp_rank(
@@ -178,7 +219,7 @@ def get_batch(data_iterator, vp_stage=None):
     # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
     # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
     # the historical sorted(batch.keys()) order.
-    return [batch[key] for key in BATCH_KEYS]
+    return [batch[key] for key in BATCH_KEYS] + [None, None]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -284,6 +325,7 @@ def forward_step(data_iterator, model: HybridModel):
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -291,6 +333,7 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        pg_collection = get_attr_wrapped_model(model, "pg_collection")
         (
             attention_mask,
             cu_seqlens,
@@ -302,12 +345,16 @@ def forward_step(data_iterator, model: HybridModel):
             max_seqlen,
             position_ids,
             tokens,
-        ) = get_batch(data_iterator, vp_stage)
+            padding_mask,
+            packed_seq_params,
+        ) = get_batch(data_iterator, vp_stage, pg_collection)
 
-    packed_seq_params = None
-    if cu_seqlens is not None:
-        # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
-        # for consistency, but PackedSeqParams and TE expect 1-D.
+    if packed_seq_params is not None:
+        if packed_seq_params.cu_seqlens_q is not None:
+            update_seqlen_stats_from_cu_seqlens(packed_seq_params.cu_seqlens_q)
+    elif cu_seqlens is not None:
+        # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
+        # PackedSeqParams and TE attention expect 1-D tensors.
         cu_seqlens = cu_seqlens.squeeze(0)
         if cu_seqlens_padded is not None:
             cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
@@ -339,6 +386,7 @@ def forward_step(data_iterator, model: HybridModel):
             labels=labels,
             packed_seq_params=packed_seq_params,
             loss_mask=loss_mask,
+            padding_mask=padding_mask,
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -375,7 +423,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         with open(args.per_dataset_sequences_path, "r") as f:
             sequences_per_dataset = json.load(f)
 
-    return GPTDatasetConfig(
+    data_args = dict(
         random_seed=args.seed,
         sequence_length=args.seq_length,
         blend=blend,
@@ -404,6 +452,17 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         inter_document_masking=args.dataloader_inter_document_masking,
     )
 
+    if args.use_varlen_dataset:
+        data_args["mock_dataset_config"] = (
+            load_json_arg(args.varlen_mock_dataset_config_json)
+            if args.varlen_mock_dataset_config_json is not None
+            else None
+        )
+        data_args["sbhd_validation"] = args.varlen_sbhd_validation
+        return VarlenDatasetConfig(**data_args)
+
+    return GPTDatasetConfig(**data_args)
+
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train test and validation datasets.
@@ -412,19 +471,20 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
     args = get_args()
-    config = core_gpt_dataset_config_from_args(args)
 
     is_packed_sequence = False
     if args.sft:
         dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
+    elif args.use_varlen_dataset:
+        dataset_type = MockVarlenDataset if args.mock_data else VarlenDataset
+        is_packed_sequence = not args.varlen_sbhd_validation
     else:
-        if args.mock_data:
-            dataset_type = MockGPTDataset
-        else:
-            dataset_type = GPTDataset
+        dataset_type = MockGPTDataset if args.mock_data else GPTDataset
 
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
+    config = core_gpt_dataset_config_from_args(args)
+
+    print_rank_0("> building train, validation, and test datasets for HybridModel ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
@@ -433,7 +493,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         config,
     ).build()
 
-    print_rank_0("> finished creating GPT datasets ...")
+    print_rank_0("> finished creating HybridModel datasets ...")
 
     return train_ds, valid_ds, test_ds
 

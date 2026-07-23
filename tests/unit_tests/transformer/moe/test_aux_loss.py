@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -11,6 +13,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.moe import router as router_module
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
@@ -37,6 +40,50 @@ try:
     )
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+def test_per_token_aux_loss_scales_by_exact_reduced_valid_token_count():
+    """Rank-skewed padding must use the reduced count, not local_count * group_size."""
+    router = TopKRouter.__new__(TopKRouter)
+    torch.nn.Module.__init__(router)
+    router.config = SimpleNamespace(
+        mtp_num_layers=None,
+        mtp_use_repeated_layer=False,
+        num_layers=2,
+    )
+    router.is_mtp_layer = False
+    router.layer_number = 1
+    router.mtp_layer_number = None
+    router.calculate_per_token_loss = True
+
+    activation = torch.ones(2)
+    aux_loss = torch.tensor(0.5)
+    reduce_group = mock.sentinel.reduce_group
+
+    def add_remote_valid_tokens(token_count, group):
+        assert group is reduce_group
+        token_count.add_(3)
+
+    tracker = mock.MagicMock()
+    with (
+        mock.patch.object(torch.distributed, "all_reduce", side_effect=add_remote_valid_tokens),
+        mock.patch.object(router_module, "get_moe_metrics_tracker", return_value=tracker),
+        mock.patch.object(
+            router_module.MoEAuxLossAutoScaler, "apply", return_value=activation
+        ) as attach,
+    ):
+        result = router.attach_and_log_load_balancing_loss(
+            activation,
+            aux_loss_coeff=0.1,
+            aux_loss=aux_loss,
+            aux_loss_name="load_balancing_loss",
+            reduce_group=reduce_group,
+            valid_token_count=2,
+            aux_loss_scale_reduce_groups=(reduce_group,),
+        )
+
+    assert result is activation
+    torch.testing.assert_close(attach.call_args.args[1], torch.tensor(2.5))
 
 
 class AuxlossTestContainer(MoEModelTestContainer):

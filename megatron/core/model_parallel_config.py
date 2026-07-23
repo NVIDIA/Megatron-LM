@@ -2,9 +2,21 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, ContextManager, Literal, Optional
+from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
+
+
+def _parse_pad_packed_seq_alignment(value):
+    """Parse THD packed-sequence padding alignment."""
+    if value == "max":
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pad_packed_seq_alignment must be 'max' or a positive integer alignment."
+        ) from exc
 
 
 @dataclass
@@ -59,7 +71,7 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when hybrid_context_parallel or sequence_packing_scheduler is enabled.
     """
 
     hybrid_context_parallel: bool = False
@@ -68,6 +80,27 @@ class ModelParallelConfig:
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     """
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
+    """
+    Scheduler for packing variable-length THD batches.
+    dp_balanced: DP-balanced scheduler for sequence packing.
+    """
+
+    pad_packed_seq_alignment: Optional[Union[int, Literal["max"]]] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--pad-packed-seq-alignment"],
+                "type": _parse_pad_packed_seq_alignment,
+            }
+        },
+    )
+    """Pad packed THD tensors to ``max_seqlen_per_dp_cp_rank`` (``"max"``)
+    or to a positive integer alignment after packing."""
+
+    pad_packed_seq_by_appending_dummy_seq: bool = True
+    """Represent the post-pack padding tail as a dummy THD sequence."""
 
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
@@ -423,6 +456,27 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.pad_packed_seq_alignment is not None:
+            self.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+                self.pad_packed_seq_alignment
+            )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be set when "
+                    "pad_packed_seq_alignment is enabled."
+                )
+            if self.pad_packed_seq_alignment != "max":
+                if self.pad_packed_seq_alignment <= 0:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must be 'max' or a positive integer alignment."
+                    )
+                if self.pad_packed_seq_alignment > self.max_seqlen_per_dp_cp_rank:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must not exceed "
+                        f"max_seqlen_per_dp_cp_rank ({self.max_seqlen_per_dp_cp_rank}), "
+                        f"got {self.pad_packed_seq_alignment}."
+                    )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")

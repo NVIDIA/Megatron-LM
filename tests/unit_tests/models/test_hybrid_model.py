@@ -49,6 +49,52 @@ def test_hybrid_logging_process_groups_are_paired():
         _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
 
 
+class _EchoHybridDecoder(torch.nn.Module):
+    def forward(self, hidden_states, **_kwargs):
+        return hidden_states
+
+
+class _RecordingMTP(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.padding_mask = None
+
+    def forward(self, hidden_states, padding_mask=None, **_kwargs):
+        self.padding_mask = padding_mask
+        return hidden_states
+
+
+def test_hybrid_model_forwards_padding_mask_to_mtp():
+    model = HybridModel.__new__(HybridModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        fine_grained_activation_offloading=False,
+        moe_paged_stash=False,
+        moe_n_hash_layers=0,
+    )
+    model.position_embedding_type = "none"
+    model.decoder = _EchoHybridDecoder()
+    model.mtp = _RecordingMTP()
+    model.embedding = None
+    model.mtp_process = True
+    model.post_process = False
+    model.share_embeddings_and_output_weights = False
+    hidden_states = torch.randn(4, 2, 8)
+    padding_mask = torch.tensor(
+        [[False, False, True, True], [False, True, False, True]], dtype=torch.bool
+    )
+
+    model(
+        input_ids=torch.zeros((2, 4), dtype=torch.long),
+        position_ids=torch.arange(4).repeat(2, 1),
+        attention_mask=None,
+        decoder_input=hidden_states,
+        padding_mask=padding_mask,
+    )
+
+    assert model.mtp.padding_mask is padding_mask
+
+
 @pytest.mark.skipif(
     not is_torch_min_version("2.4.0"),
     reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",

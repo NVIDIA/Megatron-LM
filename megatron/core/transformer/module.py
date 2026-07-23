@@ -234,6 +234,13 @@ class GraphableMegatronModule(MegatronModule):
             return
         self.cuda_graphs[cg_index].backward_dw()
 
+    def _is_thd_cuda_graph(self):
+        """Return whether this layer uses static THD Transformer Engine graphs."""
+        return (
+            getattr(self.config, 'sequence_packing_scheduler', None) is not None
+            and self.config.cuda_graph_impl == "transformer_engine"
+        )
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the layer.
@@ -245,22 +252,35 @@ class GraphableMegatronModule(MegatronModule):
             Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
         """
         # Calculate data shape related values.
-        context_parallel_size = self.config.context_parallel_size
-        slen_per_cp = seq_length // context_parallel_size
         sequence_parallel = self.config.sequence_parallel
         tensor_model_parallel_size = self.config.tensor_model_parallel_size
-        slen_per_cptp = (
-            slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
-        )
+        if self._is_thd_cuda_graph():
+            assert self.config.max_seqlen_per_dp_cp_rank is not None, (
+                "max_seqlen_per_dp_cp_rank must be set for THD CUDA graphs."
+            )
+            sequence_length = self.config.max_seqlen_per_dp_cp_rank
+            batch_size = 1
+        else:
+            sequence_length = seq_length // self.config.context_parallel_size
+            batch_size = micro_batch_size
+        if sequence_parallel:
+            sequence_length //= tensor_model_parallel_size
 
-        static_inputs = {}
-        static_inputs["hidden_states"] = torch.ones(
-            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
-            dtype=torch.bfloat16,
-            requires_grad=True,
-            device=torch.cuda.current_device(),
-        )
-        return static_inputs
+        if self.config.bf16:
+            dtype = torch.bfloat16
+        elif self.config.fp16:
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+        return {
+            "hidden_states": torch.ones(
+                (sequence_length, batch_size, self.config.hidden_size),
+                dtype=dtype,
+                requires_grad=True,
+                device=torch.cuda.current_device(),
+            )
+        }
 
     def setup_manual_hooks(self, make_hook_func):
         """
@@ -433,6 +453,40 @@ def float16_to_fp32(val):
     return conversion_helper(val, float_conversion)
 
 
+def mark_keep_in_fp32(tensor: torch.Tensor) -> torch.Tensor:
+    """Mark a parameter or buffer so that ``Float16Module`` keeps it in FP32.
+
+    Args:
+        tensor: The parameter or buffer to mark.
+
+    Returns:
+        The same tensor, for call-site convenience.
+    """
+    tensor.keep_in_fp32 = True
+    return tensor
+
+
+def convert_module_to_dtype_except_fp32_marked(
+    module: torch.nn.Module, dtype: torch.dtype
+) -> torch.nn.Module:
+    """Cast floating-point parameters and buffers except those marked to stay in FP32.
+
+    Args:
+        module: The module to convert in place.
+        dtype: The target floating-point dtype.
+
+    Returns:
+        The converted module.
+    """
+    return module._apply(
+        lambda tensor: (
+            tensor.to(dtype)
+            if tensor.is_floating_point() and not getattr(tensor, 'keep_in_fp32', False)
+            else tensor
+        )
+    )
+
+
 class Float16Module(MegatronModule):
     """Float 16 Module.
 
@@ -455,13 +509,17 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
-            self.add_module('module', module.half())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.half)
+            )
 
             def float16_convertor(val):
                 return val.half()
 
         elif self.bf16:
-            self.add_module('module', module.bfloat16())
+            self.add_module(
+                'module', convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
+            )
 
             def float16_convertor(val):
                 return val.bfloat16()

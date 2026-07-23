@@ -1,5 +1,7 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+from dataclasses import replace
 from functools import partial
+from typing import Optional
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -9,6 +11,7 @@ from megatron.core.extensions.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
@@ -35,6 +38,9 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.dsv4_module_specs import (
+    get_dsv4_hybrid_module_spec_for_backend,
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -77,7 +83,11 @@ _hybrid_mtp_block_spec = ModuleSpec(
                 submodules=MultiTokenPredictionLayerSubmodules(
                     enorm=TENorm,
                     hnorm=TENorm,
+                    # Hybrid MTP selects the combined projection normally and
+                    # per-stream projections when mHC is enabled.
                     eh_proj=TEColumnParallelLinear,
+                    e_proj=TEColumnParallelLinear,
+                    h_proj=TEColumnParallelLinear,
                     mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                     layer_norm=TENorm,
                 ),
@@ -296,7 +306,10 @@ hybrid_inference_stack_spec = ModuleSpec(
                         submodules=MultiTokenPredictionLayerSubmodules(
                             enorm=TENorm,
                             hnorm=TENorm,
+                            # Keep both projection forms available for Hybrid MTP.
                             eh_proj=InferenceColumnParallelLinear,
+                            e_proj=InferenceColumnParallelLinear,
+                            h_proj=InferenceColumnParallelLinear,
                             mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                             layer_norm=TENorm,
                         ),
@@ -311,3 +324,42 @@ hybrid_inference_stack_spec = ModuleSpec(
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
+
+
+def hybrid_dsv4_stack_spec(config: TransformerConfig) -> ModuleSpec:
+    """Build a HybridStack whose D/C/H/W symbols use DeepSeek-V4 attention.
+
+    D reads its compression ratio from ``config.csa_compress_ratios``. C, H, and W
+    encode fixed ratios 4, 128, and 0 respectively.
+    """
+    assert config.transformer_impl == "transformer_engine", (
+        "DSv4 HybridModel currently supports only the transformer-engine implementation."
+    )
+    dsv4_attention = get_dsv4_hybrid_module_spec_for_backend(
+        config=config, backend=TESpecProvider()
+    )
+
+    def wrap_dsv4_layer(compress_ratio: Optional[int] = None) -> ModuleSpec:
+        attention = dsv4_attention
+        if compress_ratio is not None:
+            attention = replace(
+                dsv4_attention,
+                params={**dsv4_attention.params, "compress_ratio": compress_ratio},
+            )
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=attention,
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        )
+
+    submodules = replace(
+        hybrid_stack_spec.submodules,
+        dsa_layer=wrap_dsv4_layer(),
+        csa_layer=wrap_dsv4_layer(compress_ratio=4),
+        hca_layer=wrap_dsv4_layer(compress_ratio=128),
+        window_layer=wrap_dsv4_layer(compress_ratio=0),
+    )
+    return ModuleSpec(module=HybridStack, submodules=submodules)

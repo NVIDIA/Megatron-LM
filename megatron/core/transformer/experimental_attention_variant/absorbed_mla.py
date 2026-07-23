@@ -146,6 +146,7 @@ class AbsorbedMLASelfAttention(Attention):
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -160,6 +161,7 @@ class AbsorbedMLASelfAttention(Attention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"
@@ -442,8 +444,11 @@ class AbsorbedMLASelfAttention(Attention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
             else:
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
         else:
             cu_seqlens_q = cu_seqlens_kv = None
+            rope_max_seqlen_q = rope_max_seqlen_kv = None
 
         # =========================================
         # Q down projection
@@ -631,6 +636,7 @@ class AbsorbedMLASelfAttention(Attention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_max_seqlen_q,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -641,6 +647,7 @@ class AbsorbedMLASelfAttention(Attention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_max_seqlen_kv,
                 )
 
                 # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]

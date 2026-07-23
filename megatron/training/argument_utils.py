@@ -274,6 +274,90 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
+    """Normalize compact HybridModel ratios into a full per-layer config list."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    variant = kw_args.get(
+        'experimental_attention_variant', getattr(args, 'experimental_attention_variant', None)
+    )
+    if variant != 'dsv4_hybrid':
+        return
+
+    fixed_ratio_map = {Symbols.WINDOW: 0, Symbols.CSA: 4, Symbols.HCA: 128}
+    ratio_symbols = set(fixed_ratio_map) | {Symbols.DS_ATTENTION}
+    sections = pattern.split(Symbols.MTP_SEPARATOR)
+    layers = ''.join(section.replace(Symbols.PIPE, '') for section in sections)
+    attention_symbols = [symbol for symbol in layers if symbol in ratio_symbols]
+    compact_len = len(attention_symbols)
+    full_len = len(layers)
+
+    def pad_compact_ratios(provided):
+        compact = []
+        full = []
+        compact_iter = iter(provided)
+        for symbol in layers:
+            if symbol in ratio_symbols:
+                ratio = next(compact_iter)
+                if symbol in fixed_ratio_map:
+                    expected = fixed_ratio_map[symbol]
+                    assert ratio == expected, (
+                        f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
+                        f"'{symbol}', expected {expected}."
+                    )
+                else:
+                    assert ratio in (0, 4, 128), (
+                        f"csa_compress_ratios has invalid array-driven D ratio {ratio}."
+                    )
+                compact.append(ratio)
+                full.append(ratio)
+            else:
+                full.append(0)
+        return compact, full
+
+    # Keep the CLI/checkpoint value compact while providing TransformerConfig with a
+    # full list indexed by global decoder/MTP layer number.
+    if getattr(args, 'csa_compress_ratios', None) is None:
+        compact_ratios = [fixed_ratio_map.get(symbol, 0) for symbol in attention_symbols]
+        args.csa_compress_ratios, kw_args['csa_compress_ratios'] = pad_compact_ratios(
+            compact_ratios
+        )
+        return
+
+    provided = list(args.csa_compress_ratios)
+    if len(provided) == compact_len:
+        args.csa_compress_ratios, kw_args['csa_compress_ratios'] = pad_compact_ratios(provided)
+    elif len(provided) == full_len:
+        compact = []
+        for ratio, symbol in zip(provided, layers):
+            if symbol in ratio_symbols:
+                if symbol in fixed_ratio_map:
+                    expected = fixed_ratio_map[symbol]
+                    assert ratio == expected, (
+                        f"csa_compress_ratios has ratio {ratio} for hybrid symbol "
+                        f"'{symbol}', expected {expected}."
+                    )
+                else:
+                    assert ratio in (0, 4, 128), (
+                        f"csa_compress_ratios has invalid array-driven D ratio {ratio}."
+                    )
+                compact.append(ratio)
+            else:
+                assert ratio == 0, (
+                    "csa_compress_ratios should not pad non-attention hybrid symbol "
+                    f"'{symbol}' with non-zero ratio {ratio}."
+                )
+        args.csa_compress_ratios = compact
+        kw_args['csa_compress_ratios'] = provided
+    else:
+        raise AssertionError(
+            f"csa_compress_ratios length ({len(provided)}) must equal either the "
+            f"number of D/W/C/H attention symbols ({compact_len}) or the legacy "
+            f"number of all layers in the hybrid pattern ({full_len}) for pattern "
+            f"'{pattern}'."
+        )
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -306,6 +390,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
+    kw_args['actual_vocab_size'] = args.padded_vocab_size
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
@@ -345,8 +430,19 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+
+        pattern = args.hybrid_layer_pattern
+        has_dsv4_csa = any(
+            symbol in pattern for symbol in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA)
+        )
+        has_dsa = Symbols.DS_ATTENTION in pattern
+        if getattr(args, 'experimental_attention_variant', None) is None:
+            if has_dsv4_csa:
+                kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+            elif has_dsa:
+                kw_args['experimental_attention_variant'] = 'dsa'
+
+        _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
 
     kw_args['inference_sampling_seed'] = args.seed
 

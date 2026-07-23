@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
@@ -28,7 +29,8 @@ from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.hyper_connection import learned_output_contract
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -134,7 +136,9 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+def roll_tensor(
+    tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None, fill_value=0
+):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -157,6 +161,8 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
                                falls back to standard rolling behavior.
         packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
                                             If provided, respects sequence boundaries.
+        fill_value: Value to fill at boundary positions where the original sequence has
+                    no data (default 0). For a padding mask, pass ``True``.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
@@ -165,12 +171,14 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
 
     # Handle packed sequences cases
     if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+        return _roll_tensor_packed_seq(
+            tensor, shifts, dims, packed_seq_params, cp_group, fill_value=fill_value
+        )
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        rolled_tensor.select(dims, shifts).fill_(0)
+        rolled_tensor.select(dims, shifts).fill_(fill_value)
         return rolled_tensor, rolled_tensor.sum()
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
@@ -207,8 +215,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
         ops.append(req_recv_second_part)
     else:
-        # Inserted elements are set to be 0.0.
-        tensor_recv_list[1] = 0
+        tensor_recv_list[1] = fill_value
     if local_rank != len(global_ranks) - 1:
         req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
         ops.append(req_recv_first_part)
@@ -235,7 +242,9 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     return rolled_tensor, rolled_tensor.sum()
 
 
-def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None):
+def _roll_tensor_packed_seq(
+    tensor, shifts, dims, packed_seq_params, cp_group=None, fill_value=0
+):
     """Roll tensor with packed sequence support.
     This function handles rolling for packed sequences by respecting sequence boundaries
     """
@@ -246,23 +255,51 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         dims == -1 or dims == tensor.dim() - 1
     ), "Packed sequence roll only supports the last dimension."
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
-    cu_seqlens = packed_seq_params.cu_seqlens_q
+    # Prefer the padded cumulative seqlens because, with CP, the local THD layout is
+    # produced by `tex.thd_get_partitioned_indices(cu_seqlens_padded, ...)` and requires
+    # each per-sequence padded length to be divisible by 2*cp_size. Indexing with the
+    # unpadded cu_seqlens then produces wrong local boundaries when seqlens are not
+    # already multiples of 2*cp_size (e.g. odd seqlens).
+    cu_seqlens = (
+        packed_seq_params.cu_seqlens_q_padded
+        if getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is not None
+        else packed_seq_params.cu_seqlens_q
+    )
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
-
-    rolled_tensor = tensor.clone()
 
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
+        rolled_tensor = tensor.clone()
         # CP disabled: roll each packed sequence independently within its boundaries
         for i in range(len(cu_seqlens) - 1):
             start_idx = cu_seqlens[i]
             end_idx = cu_seqlens[i + 1]
             seq_slice = tensor[..., start_idx:end_idx]
             rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
-            # Zero out the last position(s) that would cross sequence boundaries
-            rolled_seq[..., shifts:] = 0
+            rolled_seq[..., shifts:] = fill_value
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
         return rolled_tensor, rolled_tensor.sum()
+
+    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+    if cp_partition_mode == 'zigzag':
+        rolled_tensor = _roll_tensor_packed_seq_zigzag_cp(
+            tensor, shifts, dims, cu_seqlens, cp_group, fill_value=fill_value
+        )
+        return rolled_tensor, rolled_tensor.sum()
+    if cp_partition_mode == 'contiguous':
+        rolled_tensor = _roll_tensor_packed_seq_contiguous_cp(
+            tensor, dims, cu_seqlens, cp_group, fill_value=fill_value
+        )
+        return rolled_tensor, rolled_tensor.sum()
+    raise ValueError(f"Unsupported packed sequence CP partition mode: {cp_partition_mode}")
+
+
+def _roll_tensor_packed_seq_zigzag_cp(
+    tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0
+):
+    """Roll a zigzag-CP THD shard without crossing packed sequence boundaries."""
+    cp_size = cp_group.size()
+    rolled_tensor = tensor.clone()
 
     # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
     local_rank = torch.distributed.get_rank(group=cp_group)
@@ -312,7 +349,7 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
             ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
         else:
-            tensor_recv_list[1].zero_()
+            tensor_recv_list[1].fill_(fill_value)
 
         if local_rank != cp_size - 1:
             ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
@@ -336,7 +373,56 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # update the rolled tensor
         rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
-    return rolled_tensor, rolled_tensor.sum()
+    return rolled_tensor
+
+
+def _roll_tensor_packed_seq_contiguous_cp(
+    tensor, dims, cu_seqlens, cp_group, fill_value=0
+):
+    """Roll a contiguous-CP THD shard without crossing packed sequence boundaries."""
+    local_seq_len = tensor.size(dims)
+    rolled_tensor = torch.roll(tensor, shifts=-1, dims=dims)
+    if local_seq_len == 0:
+        return rolled_tensor
+
+    cp_size = cp_group.size()
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    if cu.numel() > 1:
+        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+        cu = cu[nonduplicate_boundaries]
+    if cu.numel() <= 1:
+        rolled_tensor.fill_(fill_value)
+        return rolled_tensor
+
+    global_start = local_rank * local_seq_len
+    global_positions = global_start + torch.arange(local_seq_len, device=tensor.device)
+    seq_idx = torch.bucketize(global_positions, cu[1:], right=True).clamp(max=cu.numel() - 2)
+    seq_ends = cu[1:][seq_idx]
+    valid_next = (global_positions < cu[-1]) & (global_positions + 1 < seq_ends)
+
+    rolled_tensor[..., ~valid_next] = fill_value
+
+    recv_next_first = torch.empty_like(tensor.select(dims, 0))
+    ops = []
+    if local_rank < cp_size - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(torch.distributed.irecv(tensor=recv_next_first, src=next_rank))
+    if local_rank > 0:
+        prev_rank = global_ranks[local_rank - 1]
+        send_first = tensor.select(dims, 0).contiguous()
+        ops.append(torch.distributed.isend(tensor=send_first, dst=prev_rank))
+    for op in ops:
+        op.wait()
+
+    if local_rank < cp_size - 1:
+        last = rolled_tensor.select(dims, -1)
+        last.copy_(torch.where(valid_next[-1], recv_next_first, last))
+
+    return rolled_tensor
 
 
 class MTPLossLoggingHelper:
@@ -573,6 +659,8 @@ class MultiTokenPredictionLayerSubmodules:
     layer_norm: LayerNormBuilder
 
     eh_proj: Union[ModuleSpec, type] = None
+    e_proj: Union[ModuleSpec, type] = None
+    h_proj: Union[ModuleSpec, type] = None
     mtp_model_layer: Union[ModuleSpec, type] = None
 
 
@@ -591,7 +679,8 @@ def get_mtp_layer_spec(
 
 
 def get_mtp_layer_spec_for_backend(
-    mtp_model_layer_spec: ModuleSpec, backend: BackendSpecProvider
+    mtp_model_layer_spec: ModuleSpec,
+    backend: BackendSpecProvider,
 ) -> ModuleSpec:
     """Get the MTP layer spec.
 
@@ -944,6 +1033,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 stacklevel=2,
             )
             hybrid_submodules = mamba_submodules
+        if self.config.enable_hyper_connections and (
+            mtp_layer_pattern is None or hybrid_submodules is None
+        ):
+            raise ValueError(
+                "Multi-token prediction with hyper connections requires the HybridModel "
+                "MTP contract: both mtp_layer_pattern and hybrid_submodules must be provided."
+            )
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
@@ -951,6 +1047,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
+        self.mhc_enabled = self.config.enable_hyper_connections
 
         # Validate attention mask type if using transformer-based inner layers
         if self.submodules.mtp_model_layer is not None and hasattr(
@@ -992,25 +1089,51 @@ class MultiTokenPredictionLayer(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
 
-        # For the linear projection at the (k - 1)-th MTP layer, the input is the concatenation
-        # of the i-th token's hidden states and the (i + K)-th token's decoder input,
-        # so the input's shape is [s, b, 2*h].
-        # The output will be send to the following transformer layer,
-        # so the output's shape should be [s, b, h].
-        self.eh_proj = build_module(
-            self.submodules.eh_proj,
-            self.config.hidden_size * 2,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=False,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="mtp_eh_proj",
-            tp_group=pg_collection.tp if pg_collection is not None else None,
-            name=(name + ".eh_proj") if name is not None else None,
-        )
+        if self.mhc_enabled:
+            projection_kwargs = {
+                "config": self.config,
+                "init_method": self.config.init_method,
+                "gather_output": False,
+                "bias": False,
+                "skip_bias_add": False,
+                "is_expert": False,
+                "tp_group": pg_collection.tp if pg_collection is not None else None,
+            }
+            self.e_proj = build_module(
+                self.submodules.e_proj,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                tp_comm_buffer_name="mtp_e_proj",
+                name=(name + ".e_proj") if name is not None else None,
+                **projection_kwargs,
+            )
+            self.h_proj = build_module(
+                self.submodules.h_proj,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                tp_comm_buffer_name="mtp_h_proj",
+                name=(name + ".h_proj") if name is not None else None,
+                **projection_kwargs,
+            )
+            self.eh_proj = None
+        else:
+            # Combine each hidden state with the corresponding future-token embedding.
+            self.eh_proj = build_module(
+                self.submodules.eh_proj,
+                self.config.hidden_size * 2,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="mtp_eh_proj",
+                tp_group=pg_collection.tp if pg_collection is not None else None,
+                name=(name + ".eh_proj") if name is not None else None,
+            )
+            self.e_proj = None
+            self.h_proj = None
 
         # Build inner layers: two possible paths
         # 1. Hybrid path: use HybridStack for hybrid pattern support
@@ -1029,6 +1152,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                mtp_layer_number=self.layer_number,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -1051,6 +1175,17 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        if self.mhc_enabled:
+            hc_mult = self.config.num_residual_streams
+            hc_dim = self.config.hidden_size * hc_mult
+            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+            nn.init.xavier_uniform_(self.hc_head_fn)
+            if self.config.sequence_parallel:
+                setattr(self.hc_head_fn, "sequence_parallel", True)
+                setattr(self.hc_head_base, "sequence_parallel", True)
+                setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
 
     def _get_embeddings(
@@ -1099,6 +1234,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
+                fill_value=True,
             )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
@@ -1123,25 +1259,48 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         decoder_input = apply_module(self.enorm)(decoder_input)
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
-        hidden_states = apply_module(self.hnorm)(hidden_states)
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-        # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
-        # and the (i + K)-th token's embedding, and combine them with linear projection.
-        hidden_states = torch.cat((decoder_input, hidden_states), -1)
-        hidden_states, _ = self.eh_proj(hidden_states)
-        # For tensor parallel we need to gather the tensor across the model-parallel
-        # ranks after the linear projection.
-        if InferenceMode.is_active():
-            hidden_states = inference_all_gather_from_tensor_model_parallel_region(
-                hidden_states, self.tp_group, self.config
+
+        if self.mhc_enabled:
+            n = self.config.num_residual_streams
+            h = self.config.hidden_size
+            seq_len, batch_size, _ = hidden_states.shape
+            hidden_streams = hidden_states.view(seq_len, batch_size, n, h)
+            hidden_streams = apply_module(self.hnorm)(hidden_streams)
+            hidden_streams = make_viewless_tensor(
+                inp=hidden_streams, requires_grad=True, keep_graph=True
             )
+            embedded, _ = self.e_proj(decoder_input)
+            embedded = gather_from_tensor_model_parallel_region(embedded, group=self.tp_group)
+            projected_hidden, _ = self.h_proj(hidden_streams)
+            projected_hidden = gather_from_tensor_model_parallel_region(
+                projected_hidden, group=self.tp_group
+            )
+            seq_len, batch_size, n, h = projected_hidden.shape
+            embedded = embedded.unsqueeze(2).expand(seq_len, batch_size, n, h)
+            hidden_states = (embedded + projected_hidden).reshape(seq_len, batch_size, n * h)
+            if self.sequence_parallel:
+                hidden_states = scatter_to_sequence_parallel_region(
+                    hidden_states, group=self.tp_group
+                )
         else:
-            hidden_states = gather_from_tensor_model_parallel_region(
-                hidden_states, group=self.tp_group
+            hidden_states = apply_module(self.hnorm)(hidden_states)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
             )
-        # For sequence parallel, scatter after linear_fc and before transformer layer.
-        if self.sequence_parallel:
-            hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)
+            hidden_states = torch.cat((decoder_input, hidden_states), -1)
+            hidden_states, _ = self.eh_proj(hidden_states)
+            if InferenceMode.is_active():
+                hidden_states = inference_all_gather_from_tensor_model_parallel_region(
+                    hidden_states, self.tp_group, self.config
+                )
+            else:
+                hidden_states = gather_from_tensor_model_parallel_region(
+                    hidden_states, group=self.tp_group
+                )
+            if self.sequence_parallel:
+                hidden_states = scatter_to_sequence_parallel_region(
+                    hidden_states, group=self.tp_group
+                )
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -1212,7 +1371,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                         padding_mask=padding_mask,
                     )
 
-        hidden_states = self._postprocess(hidden_states)
+        if not self.mhc_enabled:
+            hidden_states = self._postprocess(hidden_states)
 
         return hidden_states
 
@@ -1220,6 +1380,16 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         Postprocesses the output of the transformer layers.
         """
+
+        if self.mhc_enabled:
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
 
         # Layer norm before shared head layer.
         hidden_states = apply_module(self.final_layernorm)(hidden_states)
@@ -1793,6 +1963,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
+        mhc_multistream: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -1800,6 +1971,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         Args:
             hidden_states (Tensor): Hidden states for input token with the shape [s, b, h]
                 where s is the sequence length, b is the batch size, and h is the hidden size.
+            mhc_multistream (Tensor, optional): Pre-contraction decoder output [s, b, n*h]
+                used as the input to MTP depths when hyper connections are enabled.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
 
@@ -1809,7 +1982,11 @@ class MultiTokenPredictionBlock(MegatronModule):
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-        hidden_states = hidden_states_list[offset]
+        if mhc_multistream is not None:
+            mhc_chunks = list(torch.chunk(mhc_multistream, 1 + offset, dim=0))
+            hidden_states = mhc_chunks[offset]
+        else:
+            hidden_states = hidden_states_list[offset]
 
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
@@ -1832,9 +2009,11 @@ class MultiTokenPredictionBlock(MegatronModule):
                 **(extra_block_kwargs or {}),
             )
 
-            # append the output hidden states of the current mtp layer
-            # to the hidden_states_list
-            hidden_states_list.append(hidden_states)
+            if mhc_multistream is not None:
+                mhc_chunks.append(hidden_states)
+                hidden_states_list.append(self.layers[layer_idx]._postprocess(hidden_states))
+            else:
+                hidden_states_list.append(hidden_states)
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
