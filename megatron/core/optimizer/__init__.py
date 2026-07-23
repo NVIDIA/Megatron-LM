@@ -57,6 +57,7 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
+from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
@@ -1046,6 +1047,30 @@ def get_megatron_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
+    if is_mfsdp_v2:
+        if len(model_chunks) != 1:
+            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
+        if config.optimizer != "adam":
+            raise ValueError("MFSDP v2 currently supports only Adam/AdamW.")
+        if config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 does not use Megatron's DistributedOptimizer.")
+        if config.overlap_param_gather_with_optimizer_step:
+            raise ValueError("MFSDP v2 does not support optimizer-step parameter-gather overlap.")
+        unsupported_optimizer_features = {
+            "optimizer CPU offload": config.optimizer_cpu_offload,
+            "precision-aware optimizer": config.use_precision_aware_optimizer,
+            "layer-wise distributed optimizer": config.use_layer_wise_distributed_optimizer,
+            "optimizer CUDA graphs": config.optimizer_cuda_graph,
+        }
+        enabled_optimizer_features = [
+            name for name, enabled in unsupported_optimizer_features.items() if enabled
+        ]
+        if enabled_optimizer_features:
+            raise ValueError(
+                "MFSDP v2 does not currently support " + ", ".join(enabled_optimizer_features) + "."
+            )
+
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
         all_dense_model_chunks = [[model_chunks[0]], model_chunks[1:]]
@@ -1090,14 +1115,20 @@ def get_megatron_optimizer(
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
-            param_groups, buffers = _get_param_groups_and_buffers(
-                model_chunk,
-                model_chunk_offset=model_chunk_offset,
-                config=config,
-                config_overrides=config_overrides,
-                filter_fn=lambda g: True,
-                buffer_name='buffers',
-            )
+            if is_mfsdp_v2:
+                param_groups = _get_param_groups(model_chunk, config, config_overrides)
+                buffers = None
+                if any(group['is_expert_parallel'] for group in param_groups):
+                    raise ValueError("MFSDP v2 does not currently support expert parameters.")
+            else:
+                param_groups, buffers = _get_param_groups_and_buffers(
+                    model_chunk,
+                    model_chunk_offset=model_chunk_offset,
+                    config=config,
+                    config_overrides=config_overrides,
+                    filter_fn=lambda g: True,
+                    buffer_name='buffers',
+                )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
                 config=config,
