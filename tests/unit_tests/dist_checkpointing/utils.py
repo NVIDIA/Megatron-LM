@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
 from typing import Any, Callable, Tuple, Union
@@ -185,6 +185,8 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
+    ddp_bucket_size=None,
+    grad_reduce_in_fp32=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -205,6 +207,10 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.ddp_bucket_size = ddp_bucket_size
+        # grad_reduce_in_fp32 -> ddp_config grad_dtype=fp32 while params stay bf16, i.e. the
+        # mixed-dtype (bf16, fp32) gradient buffer / optimizer-state bucket.
+        mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -304,6 +310,8 @@ def setup_moe_model_and_optimizer(
     use_glu=False,
     optimizer='adam',
     use_param_layout=False,
+    ddp_bucket_size=None,
+    grad_reduce_in_fp32=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -320,6 +328,17 @@ def setup_moe_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.ddp_bucket_size = ddp_bucket_size
+        # ``resolve_ddp_bucket_size`` (megatron/training/training.py) discards an explicit
+        # bucket_size unless overlap_grad_reduce is on -- otherwise the whole buffer is a
+        # single bucket. Turning overlap on (no backward is run here) lets ddp_bucket_size
+        # split the sibling DistOpt buffer into many small buckets so some DP rank owns a
+        # shard made only of inter-param alignment padding -> the empty-bucket-synth path.
+        if ddp_bucket_size is not None:
+            mock_args.overlap_grad_reduce = True
+        # grad_reduce_in_fp32 -> ddp_config grad_dtype=fp32 while params stay bf16, i.e. the
+        # mixed-dtype (bf16, fp32) gradient buffer / optimizer-state bucket.
+        mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -355,12 +374,25 @@ def setup_moe_model_and_optimizer(
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
+    def _init_states(opt):
+        # In the decoupled compact LayerWise + DistOpt layout the top-level
+        # ChainedOptimizer wraps another ChainedOptimizer (LayerWise, which has no
+        # ``init_state_fn``) alongside a sibling DistOpt; recurse so the Muon
+        # Float16 sub-optimizers still get seeded, and skip optimizers without
+        # ``init_state_fn`` (DistOpt seeds its state elsewhere).
+        if isinstance(opt, ChainedOptimizer):
+            for child in opt.chained_optimizers:
+                _init_states(child)
+            return
+        if not hasattr(opt, 'init_state_fn'):
+            return
+        if not hasattr(opt, 'optimizer'):
+            opt.init_state_fn(opt)
+        else:
+            opt.init_state_fn(opt.optimizer)
+
     if optimizer_type in ('muon', 'dist_muon'):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+        _init_states(optimizer)
     else:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:

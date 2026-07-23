@@ -1875,10 +1875,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         change during DP resharding - we want the checkpoint tensor to always have size
         `gbuf_world_numel_unpadded` which means everything except for the last padding above.
         """
+        # Deferred import to avoid a circular import (layer_wise_optimizer lazily
+        # imports DistributedOptimizer).
+        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
+
         data_parallel_rank = self.data_parallel_group.rank()
         data_parallel_world_size = self.data_parallel_group.size()
 
         state = self.get_parameter_state_dp_reshardable()
+
+        # Canonical padding template: the optimizer-state keys (``param``, ``exp_avg``,
+        # ``exp_avg_sq``, ...) and their dtypes/devices are identical for every param
+        # this optimizer owns (all fp32 master/optimizer states), so a single template
+        # captured from any non-empty bucket -- across all gbufs, before the loop below
+        # mutates ``state`` in place -- lets an empty shard synthesize valid padding
+        # ShardedTensors even when it owns nothing anywhere in its own (gbuf, dtype).
+        pad_template = None
+        for _g in range(len(self.gbuf_ranges)):
+            for _bs_all in state[_g].values():
+                for _bs in _bs_all:
+                    if _bs:
+                        pad_template = {
+                            k: (v.dtype, v.device)
+                            for k, v in _bs[0].items()
+                            if isinstance(v, torch.Tensor)
+                        }
+                        break
+                if pad_template is not None:
+                    break
+            if pad_template is not None:
+                break
+
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
             key = (
@@ -1910,9 +1937,65 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
                     )
 
-                    # The global ckpt tensors must be fully covered.
-                    # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    # In the decoupled compact LayerWise (Muon) layout this sibling
+                    # DistributedOptimizer's ``self.buffers`` also contains the non-DistOpt
+                    # LayerWise-managed buffers (the 2D Muon weights, incl. the fp8 param-gather
+                    # buffers). Their optimizer state is saved by the LayerWise child under its own
+                    # keys, and this optimizer owns none of their params, so every DP rank's shard
+                    # is empty here. Skip such buckets entirely -- mirroring
+                    # ``start_param_sync_for_bucket_group_subset`` -- so we neither emit garbage
+                    # padding ShardedTensors for them nor leave an uncovered key. ``default_for_
+                    # untagged=False`` keeps pure-DistOpt (untagged) runs unchanged.
+                    bucket = self.buffers[gbuf_idx].buckets[bucket_idx]
+                    if _bucket_is_managed_by_layer_wise_optimizer(
+                        bucket, default_for_untagged=False
+                    ):
+                        continue
+
+                    # The global ckpt tensors must be fully covered; we add extra empty padding if
+                    # necessary. A DistOpt bucket is padded to lcm(dp, 128), so with the small
+                    # sibling buffers (embeddings / biases / layernorms) of the decoupled compact
+                    # LayerWise Muon layout at higher DP a rank can own a shard made up only of
+                    # bucket padding -- e.g. leading padding before the first param when that param
+                    # lives on a higher rank -- so its param_map, and thus bucket_state, is empty.
+                    # A shard entirely past the unpadded end lies outside the saved tensor and is
+                    # skipped; a shard that still overlaps [0, gbuf_world_numel_unpadded) must emit
+                    # a single padding ShardedTensor for that overlap so coverage stays complete.
+                    if not bucket_state:
+                        world_shard_start = data_parallel_rank * gbuf_local_numel
+                        if world_shard_start >= gbuf_world_numel_unpadded:
+                            # Shard lies entirely past the unpadded end (trailing bucket
+                            # padding), so it is outside the saved tensor -- nothing to emit.
+                            continue
+                        pad_len = min(
+                            gbuf_local_numel, gbuf_world_numel_unpadded - world_shard_start
+                        )
+                        # Synthesize a single padding ShardedTensor covering this shard's overlap
+                        # with [0, gbuf_world_numel_unpadded). Use ``pad_template`` (captured before
+                        # the loop mutated ``state`` into ShardedTensors) so the padding carries the
+                        # correct optimizer-state keys/dtypes even on a rank that owns nothing
+                        # anywhere in this (gbuf, dtype). ``pad_template`` is None only when the
+                        # whole optimizer owns nothing, in which case there is no tensor to cover.
+                        if pad_template is None:
+                            continue
+                        bucket_state = [
+                            {
+                                **{
+                                    k: torch.empty(pad_len, dtype=_dt, device=_dev)
+                                    for k, (_dt, _dev) in pad_template.items()
+                                },
+                                'gbuf_local_start': 0,
+                                'gbuf_local_end': pad_len,
+                                'padding': True,
+                            }
+                        ]
+                        # Write the synthesized shard back into ``state`` (returned below).
+                        # For owning ranks ``bucket_state`` aliases the list element in ``state``
+                        # and is mutated in place; the empty-bucket branch rebinds ``bucket_state``
+                        # to a fresh list, so without this store-back the synthesized padding
+                        # ShardedTensors never reach ``state`` and the shard is dropped from the
+                        # global plan -> coverage gap -> DCP validation failure.
+                        gbuf_range_map_for_all_buckets[bucket_idx] = bucket_state
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}
@@ -2079,6 +2162,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Inverse of the `get_parameter_state_dp_reshardable` method.
         """
+        # Deferred import to avoid a circular import (see save counterpart).
+        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
+
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
@@ -2091,6 +2177,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                    # LayerWise-managed buckets are saved by the LayerWise child, not here
+                    # (see the save counterpart); this optimizer emits no ShardedTensor for
+                    # them, so skip them on load too.
+                    if _bucket_is_managed_by_layer_wise_optimizer(
+                        self.buffers[gbuf_idx].buckets[bucket_idx], default_for_untagged=False
+                    ):
+                        continue
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
                     bucket_state = [
                         bucket_state_elem
