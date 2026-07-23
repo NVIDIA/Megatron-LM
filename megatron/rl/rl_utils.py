@@ -1595,16 +1595,19 @@ def prepare_data_for_update(
                 data_loader = DataLoader(dataset, batch_size=1)
                 logprobs_batch_size = 1
         else:
-            # Always compute standard masks for the original data (we'll need them later)
+            # Compute the loss mask and position ids for the original data (we'll need them later).
+            # No dense attention mask: the forward pass masks via PackedSeqParams (see
+            # get_logprobs), even when sequence packing is disabled.
             with nvtx_range("rl/get-ltor-masks", time=True):
                 _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
                     trajs,
                     tokenizer.eod,
                     tokenizer.pad,
                     args.reset_position_ids,
-                    args.reset_attention_mask,
+                    reset_attention_mask=False,
                     eod_mask_loss=False,
                     pad_mask_loss=True,
+                    create_attention_mask=False,
                 )
                 original_loss_mask[~generation_masks] = 0.0
                 compute_trajs = trajs
