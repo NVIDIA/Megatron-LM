@@ -52,7 +52,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "$IMAGE_TYPE" != "lts" ]; then
         FLASH_MLA_GROUP="--group no_pypi_wheels"
         export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
-            CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
+            CFLAGS="-I/usr/local/cuda/include/cccl -DNDEBUG" \
+            CXXFLAGS="-I/usr/local/cuda/include/cccl -DNDEBUG"
     fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build

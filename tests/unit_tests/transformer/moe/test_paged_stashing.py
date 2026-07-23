@@ -449,8 +449,6 @@ class TestNcclEpPagedStashing:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.
-    @pytest.mark.flaky_in_dev
     @pytest.mark.internal
     def test_forward_backward_4_layers(self):
         """Test paged stashing with 4 MoE layers on ncclep static shape: two passes match."""
