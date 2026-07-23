@@ -13,6 +13,7 @@ so no core module uses GTP symbols without TE.
 try:
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         HAVE_TE,
+        GTP_CONFIG,
         GTPChain,
         GTPEmbeddingWeight,
         attach_gtp_to_presharded_module,
@@ -24,8 +25,11 @@ try:
         gtp_native_fp8_load_context,
         gtp_remat_shard_dim0,
         is_gtp_param,
+        initialize_graph_wgrad_rings,
         make_sharded_tensors_for_checkpoint_with_gtp_remat,
         set_cuda_graph_mempool,
+        track_gtp_capture_comms,
+        update_gtp_config,
         wait_async_comms,
         wait_for_gtp_grad_reduction_on_current_stream,
         wrap_module_params_gtp,
@@ -40,6 +44,7 @@ except ImportError:
 
 __all__ = [
     "HAVE_GTP",
+    "GTP_CONFIG",
     "GTPChain",
     "GTPEmbeddingWeight",
     "attach_gtp_to_presharded_module",
@@ -51,8 +56,11 @@ __all__ = [
     "gtp_native_fp8_load_context",
     "gtp_remat_shard_dim0",
     "is_gtp_param",
+    "initialize_graph_wgrad_rings",
     "make_sharded_tensors_for_checkpoint_with_gtp_remat",
     "set_cuda_graph_mempool",
+    "track_gtp_capture_comms",
+    "update_gtp_config",
     "wait_async_comms",
     "wait_for_gtp_grad_reduction_on_current_stream",
     "wrap_module_params_gtp",

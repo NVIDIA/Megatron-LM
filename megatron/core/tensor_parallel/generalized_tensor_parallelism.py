@@ -270,10 +270,92 @@ class GTPWeightState(Enum):
 _GTP_CACHE = None
 _GTP_PARAMS = []
 
+# Stable wgrad storage used by partial CUDA graphs. Slots are allocated outside
+# graph capture and retained here, so the shared CUDA graph pool cannot reuse an
+# in-flight reduce-scatter input for another graph's temporary workspace.
+_GRAPH_WGRAD_RINGS: Dict[tuple, list] = {}
+
+
+@dataclass
+class _GraphWgradRingSlot:
+    """One persistent wgrad slot guarded by its RS-completion event."""
+
+    tensor: torch.Tensor
+    ready_event: torch.cuda.Event
+    key: tuple
+    index: int
+
+
 # Global set of GTPShardedParam with in-flight async comms (AG or RS).
 _inflight_comm_params: set = set()
 _AG_STREAMS: Dict[str, torch.cuda.Stream] = {}
 _RS_STREAMS: Dict[str, torch.cuda.Stream] = {}
+
+
+@dataclass
+class GTPCaptureCommState:
+    """Async GTP work issued while capturing one CUDA graph."""
+
+    params: list = field(default_factory=list)
+    ag_streams: list = field(default_factory=list)
+    rs_streams: list = field(default_factory=list)
+    wgrad_ring_slots: list = field(default_factory=list)
+    _param_ids: set = field(default_factory=set)
+    _ag_stream_ids: set = field(default_factory=set)
+    _rs_stream_ids: set = field(default_factory=set)
+    _wgrad_ring_slot_params: dict = field(default_factory=dict)
+
+    def register(self, param, reduce_scatter: bool) -> None:
+        param_id = id(param)
+        if param_id not in self._param_ids:
+            self._param_ids.add(param_id)
+            self.params.append(param)
+
+        stream = (
+            get_rs_stream(param.chain_id, param.group)
+            if reduce_scatter
+            else get_ag_stream(param.chain_id, param.group)
+        )
+        stream_id = id(stream)
+        streams = self.rs_streams if reduce_scatter else self.ag_streams
+        stream_ids = self._rs_stream_ids if reduce_scatter else self._ag_stream_ids
+        if stream_id not in stream_ids:
+            stream_ids.add(stream_id)
+            streams.append(stream)
+
+    def register_wgrad_ring_slot(self, slot: _GraphWgradRingSlot, param) -> None:
+        """Track slots used by this graph and reject unsafe intra-graph aliasing."""
+        slot_id = id(slot)
+        param_id = id(param)
+        prior_param_id = self._wgrad_ring_slot_params.get(slot_id)
+        if prior_param_id is not None and prior_param_id != param_id:
+            raise RuntimeError(
+                "One CUDA graph writes the same GTP wgrad ring slot for multiple "
+                "parameters; increase GTP_CONFIG.graph_wgrad_ring_size"
+            )
+        if prior_param_id is None:
+            self._wgrad_ring_slot_params[slot_id] = param_id
+            self.wgrad_ring_slots.append(slot)
+
+
+_ACTIVE_CAPTURE_COMM_STATE: Optional[GTPCaptureCommState] = None
+
+
+@contextmanager
+def track_gtp_capture_comms():
+    """Track async GTP work owned by one CUDA-graph capture."""
+
+    global _ACTIVE_CAPTURE_COMM_STATE
+    if _ACTIVE_CAPTURE_COMM_STATE is not None:
+        raise RuntimeError("Nested GTP CUDA-graph communication tracking is unsupported")
+
+    state = GTPCaptureCommState()
+    _ACTIVE_CAPTURE_COMM_STATE = state
+    try:
+        yield state
+    finally:
+        _ACTIVE_CAPTURE_COMM_STATE = None
+
 
 # Wgrad input buffer pool, keyed by (shape, dtype). UNGRAPHED-only: GRAPHED
 # wgrad bufs need address stability for CG replay and are not pool-recycled.
@@ -358,6 +440,109 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
     return _RS_STREAMS[key]
 
 
+def initialize_graph_wgrad_rings() -> None:
+    """Allocate bounded, persistent inputs for cross-graph asynchronous RS.
+
+    Local CUDA graphs share one private memory pool and may therefore alias
+    temporary allocations across captures. GTP intentionally lets a graph's
+    asynchronous wgrad RS outlive the graph's early completion event, so its
+    input must not be graph-pool scratch. This function gives async GRAPHED
+    parameters fixed wgrad outputs allocated before capture.
+
+    Slots are shared across layers only within one communication scheduling
+    domain. A two-slot ring retains one graph of overlap without allocating one
+    full unsharded wgrad per layer.
+    """
+    if (
+        not GTP_CONFIG.cross_cg_overlap
+        or _FULL_ITERATION
+        or not GTP_CONFIG.async_reduction
+        or _GRAPH_WGRAD_RINGS
+    ):
+        return
+
+    ring_size = GTP_CONFIG.graph_wgrad_ring_size
+    if ring_size < 1:
+        raise ValueError("GTP_CONFIG.graph_wgrad_ring_size must be at least 1")
+
+    params_by_key = defaultdict(list)
+    seen_params = set()
+    for chain_param in _GTP_PARAMS:
+        if not is_gtp_param(chain_param):
+            continue
+        if chain_param.chain_id != GTPChain.GRAPHED.value or chain_param.prev_w is None:
+            continue
+        for param in chain_param._weights:
+            if id(param) in seen_params:
+                continue
+            seen_params.add(id(param))
+            if not hasattr(param, "main_grad"):
+                raise RuntimeError(
+                    "GTP wgrad rings must be initialized after DDP creates param.main_grad"
+                )
+            key = (
+                _stream_key(param.chain_id, param.group),
+                param._unsharded_shape,
+                param._unsharded_shape_padded,
+                param.main_grad.dtype,
+                param.expert_idx,
+            )
+            params_by_key[key].append(param)
+
+    total_bytes = 0
+    buffer_count = 0
+    new_slots = []
+    for key, params in params_by_key.items():
+        slot_count = min(ring_size, len(params))
+        slots = []
+        exemplar = params[0]
+        for slot_index in range(slot_count):
+            tensor = torch.empty(
+                exemplar._unsharded_shape_padded,
+                dtype=exemplar.main_grad.dtype,
+                device=exemplar.device,
+                memory_format=torch.contiguous_format,
+            )
+            if exemplar.pad_length > 0:
+                tensor.narrow(
+                    0, exemplar._unsharded_shape[0], exemplar.pad_length
+                ).zero_()
+            slot = _GraphWgradRingSlot(
+                tensor=tensor,
+                ready_event=torch.cuda.Event(external=True),
+                key=key,
+                index=slot_index,
+            )
+            slots.append(slot)
+            new_slots.append(slot)
+            total_bytes += tensor.numel() * tensor.element_size()
+            buffer_count += 1
+        _GRAPH_WGRAD_RINGS[key] = slots
+        for param_index, param in enumerate(params):
+            slot = slots[param_index % slot_count]
+            param._gtp_graph_wgrad_ring_slot = slot
+            if param.pad_length > 0:
+                param._gtp_graph_wgrad_ring_view = slot.tensor.narrow(
+                    0, 0, param._unsharded_shape[0]
+                )
+            else:
+                param._gtp_graph_wgrad_ring_view = slot.tensor
+
+    # Mark every slot initially available. Later generations are recorded on
+    # the RS stream after NCCL has finished reading the slot.
+    for slot in new_slots:
+        slot.ready_event.record()
+    if new_slots:
+        torch.cuda.current_stream().synchronize()
+
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[GTP Wgrad Ring] allocated {buffer_count} buffers "
+        f"({total_bytes / 1024**2:.1f} MB), ring_size={ring_size}",
+    )
+
+
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
@@ -405,6 +590,12 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
+    # Let a local CUDA graph release its successor before this graph's GTP
+    # reduce-scatter has finished. Disable to drain RS before graph completion.
+    cross_cg_overlap: bool = True
+    # Persistent wgrad slots per scheduling/shape domain for partial-CG async
+    # reduce-scatter. Two slots allow graph N+1 compute to overlap graph N's RS.
+    graph_wgrad_ring_size: int = 2
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -786,6 +977,8 @@ class GTPShardHandle:
         self.gtp_shards = gtp_shards
         self.reduce_scatter = reduce_scatter
         _inflight_comm_params.add(gtp_shards[0])
+        if _ACTIVE_CAPTURE_COMM_STATE is not None:
+            _ACTIVE_CAPTURE_COMM_STATE.register(gtp_shards[0], reduce_scatter)
 
     def wait(self):
         """Wait on the underlying NCCL work and update the shards' state."""
@@ -1069,18 +1262,29 @@ class GTPShardedParam(torch.nn.Parameter):
         self._buf_parity = 1 - (getattr(prev, "_buf_parity", None) or 0)
 
     def _get_cache_key(self, dtype, fwd: bool, reduce_scatter: bool) -> tuple:
-        """Build cache key from output shape + dtype.
+        """Build a cache key that includes the communication scheduling domain.
 
-        Weights with matching gathered shape and dtype share a buffer. For experts gathered
-        in parallel, self.expert_idx keeps each distinct; same-indexed experts across layers share.
+        Buffers may be reused only by operations serialized on the same GTP
+        chain and process group. GRAPHED and UNGRAPHED chains use independent
+        streams, as do collectives on different process groups, so sharing
+        across either boundary can race even when shape and dtype match.
 
-        Grouped one-block-ahead chains additionally fold in a double-buffer parity so a prefetched
-        layer N+1 weight never lands in the buffer that layer N is still consuming (see
-        ``_GTP_GROUPED_BUF_PARITY_COUNTER``).
+        Within one scheduling domain, weights with matching gathered shape and
+        dtype share a buffer.
+        For expert weights gathered in parallel, self.expert_idx distinguishes them so
+        each gets a distinct buffer, while same-indexed experts across layers share.
+
+        Grouped one-block-ahead chains additionally fold in the logical fc1/fc2
+        chain and a double-buffer parity. This keeps simultaneously live fc1/fc2
+        weights distinct and prevents a prefetched layer N+1 weight from
+        overwriting the buffer still consumed by layer N.
         """
+
+        scheduling_domain = _stream_key(self.chain_id, self.group)
 
         if not isinstance(dtype, torch.dtype):
             key = (
+                scheduling_domain,
                 self._unsharded_shape_padded,
                 dtype,
                 fwd,
@@ -1089,7 +1293,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 reduce_scatter,
             )
         else:
-            key = (self._unsharded_shape_padded, dtype, self.expert_idx, reduce_scatter)
+            key = (
+                scheduling_domain,
+                self._unsharded_shape_padded,
+                dtype,
+                self.expert_idx,
+                reduce_scatter,
+            )
         if _chain_is_grouped(self.chain_id):
             # chain_id keeps fc1/fc2 apart (both can be in flight at once, even if same-shaped);
             # parity alternates consecutive blocks between two buffers.
@@ -1519,7 +1729,16 @@ class GTPShardedParam(torch.nn.Parameter):
         return self.all_gather_and_prefetch(**kwargs)
 
     def get_wgrad_tensor(self):
-        """Pool-allocate a wgrad scratch tensor of unsharded shape for the bwd GEMM."""
+        """Return a logical-shape view of stable ring storage or ordinary scratch."""
+        ring_slot = (
+            getattr(self, "_gtp_graph_wgrad_ring_slot", None)
+            if GTP_CONFIG.cross_cg_overlap
+            else None
+        )
+        if ring_slot is not None:
+            if _ACTIVE_CAPTURE_COMM_STATE is not None:
+                _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_ring_slot(ring_slot, self)
+            return self._gtp_graph_wgrad_ring_view
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
     def register_grad_accum_hook(
@@ -1571,6 +1790,7 @@ class GTPShardedParam(torch.nn.Parameter):
         with torch.cuda.stream(rs_stream):
             if self._wgrad_rs_handle is not None:
                 self._wgrad_rs_handle.wait()
+                self._record_graph_wgrad_ring_slots_ready()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
                 if finalize_grad:
@@ -1603,6 +1823,18 @@ class GTPShardedParam(torch.nn.Parameter):
                 for buf in bufs:
                     _wgrad_pool_put(buf)
             setattr(self, attr, None)
+
+    def _record_graph_wgrad_ring_slots_ready(self) -> None:
+        """Publish that this RS has finished reading its persistent input slots."""
+        if not GTP_CONFIG.cross_cg_overlap:
+            return
+        seen = set()
+        for weight in self._weights:
+            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
+            if slot is None or id(slot) in seen:
+                continue
+            seen.add(id(slot))
+            slot.ready_event.record()
 
     def _prescale_wgrads_for_mean_rs(self, wgrads):
         """Pre-scale wgrad by 1/gtp_remat so the SUM reduce-scatter yields the gtp_remat mean.
@@ -1665,8 +1897,7 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 w._set_rs_state(new_rs_state)
 
-        if self.pad_length > 0:
-            wgrads = [torch.nn.functional.pad(w, (0, 0, 0, self.pad_length)) for w in wgrads]
+        wgrads = self._prepare_wgrad_reduce_scatter_inputs(wgrads)
 
         if async_op:
             dtypes = [w.dtype for w in wgrads]
@@ -1752,6 +1983,40 @@ class GTPShardedParam(torch.nn.Parameter):
             nvtx_range_pop(f"{nvtx_label}.batched_gtp_rs")
 
             return outputs, cm if async_op else None
+
+    def _prepare_wgrad_reduce_scatter_inputs(self, wgrads):
+        """Return alignment-padded RS inputs with stable ownership when ring-backed.
+
+        A ring slot owns the full padded tensor. The wgrad GEMM writes only its
+        logical prefix, while the zero tail remains untouched. If a caller did
+        not produce wgrad directly into that prefix, copy it there before RS.
+        """
+        prepared = []
+        for weight, wgrad in zip(self._weights, wgrads):
+            slot = (
+                getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
+                if GTP_CONFIG.cross_cg_overlap
+                else None
+            )
+            if slot is None:
+                if weight.pad_length > 0:
+                    wgrad = torch.nn.functional.pad(
+                        wgrad, (0, 0, 0, weight.pad_length)
+                    )
+                prepared.append(wgrad)
+                continue
+
+            logical_view = weight._gtp_graph_wgrad_ring_view
+            if tuple(wgrad.shape) != tuple(logical_view.shape):
+                raise RuntimeError(
+                    f"GTP wgrad shape {tuple(wgrad.shape)} does not match ring view "
+                    f"{tuple(logical_view.shape)} for {weight._debug_name}"
+                )
+            if wgrad.data_ptr() != logical_view.data_ptr():
+                logical_view.copy_(wgrad)
+            prepared.append(slot.tensor)
+
+        return prepared
 
     def wgrad_reduce_scatter(self, wgrad, nvtx_label=None):
         """Reduce-scatter wgrad(s): sync for the last weight, async+deferred for others.
@@ -2037,13 +2302,17 @@ class GTPWeightCache:
         return slot.buf
 
     def release(self, ticket: int):
-        """Return the buffer to the pool (ticket stays valid).
+        """Release a reusable buffer to the pool while keeping its ticket valid.
 
-        slot.buf is intentionally NOT cleared: get() must stay idempotent so CUDA-graph-captured
-        buffers keep their fixed address across replays.
+        Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never
+        cleared so every CUDA-graph ticket retains a stable address across replays.
         """
         slot = self._slots[ticket]
         if slot.buf is None:
+            return
+        # Independently replayed graphs may overlap, so a captured RS output
+        # must not be recycled into another fixed-address ticket.
+        if slot.chain_id == GTPChain.GRAPHED.value and slot.reduce_scatter:
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
@@ -2067,7 +2336,10 @@ def get_global_GTP_cache() -> GTPWeightCache:
 
 
 def wait_async_comms(
-    chain_id: str = None, skip_rs: bool = False, finalize_after_drain: bool = False
+    chain_id: str = None,
+    skip_rs: bool = False,
+    finalize_after_drain: bool = False,
+    params: Optional[List[GTPShardedParam]] = None,
 ):
     """Drain in-flight GTP async AG / RS handles.
 
@@ -2084,12 +2356,16 @@ def wait_async_comms(
                  NCCL RS) so it starts during AG drain rather than after,
                  avoiding SM-saturation that blocks cross-graph overlap.
                  Falls back to caller-stream accumulation if no RS handle.
+        params: If specified, drain only async work issued by the owning CUDA
+                graph. Outside graph capture, the process-global in-flight set
+                remains the default.
 
     Per-param side effects:
         * _already_ag_drained = True   (if an AG handle was drained)
         * _already_finalized  = True   (if finalize_after_drain=True)
     """
-    for param in list(_inflight_comm_params):
+    comm_params = list(_inflight_comm_params) if params is None else params
+    for param in comm_params:
         if (
             chain_id is not None
             and getattr(param, "chain_id", GTPChain.UNGRAPHED.value) != chain_id
@@ -2105,14 +2381,20 @@ def wait_async_comms(
             param._wait_recompute_param_gather()
             param._recompute_already_drained = True
         if not skip_rs:
+            had_rs = param._wgrad_rs_handle is not None
+            rs_was_in_scope = (
+                had_rs
+                if params is not None
+                else any(w._rs_ticket is not None for w in param._weights)
+            )
             param._wait_reduce_scatter(finalize_grad=finalize_after_drain)
             # Fallback inline-accumulation: only when finalize is requested, _wait_reduce_scatter
             # didn't already finalize, and an RS actually ran (rs_ticket set). Skips pure-AG
             # prefetches in _inflight_comm_params (no wgrad).
             need_fallback_accumulation = (
                 finalize_after_drain
+                and rs_was_in_scope
                 and not getattr(param, "_already_finalized", False)
-                and any(w._rs_ticket is not None for w in param._weights)
             )
             if need_fallback_accumulation:
                 cache = get_global_GTP_cache()
