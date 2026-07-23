@@ -4281,6 +4281,8 @@ class AllGatherPipeline:
         self.ag_stream = ag_stream
         # Track the status of all-gather operations for each bucket.
         self.param_gather_event_map: Dict[Tuple[int, bool], Tuple[Any, Callable[[], None]]] = {}
+        # One DP-Outer event may be shared by all buckets in a coalesced group.
+        self.outer_bucket_ready_events: Dict[Tuple[int, bool], torch.cuda.Event] = {}
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
@@ -4348,6 +4350,15 @@ class AllGatherPipeline:
                 bucket_id, bwd = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
 
+        # A prefetched DP-Outer gather may not have reached DP-Inner if execution
+        # stopped early. It must finish before the optimizer updates its buffer.
+        synchronized_events = set()
+        for event in self.outer_bucket_ready_events.values():
+            if id(event) not in synchronized_events:
+                event.synchronize()
+                synchronized_events.add(id(event))
+        self.outer_bucket_ready_events.clear()
+
         for bucket_id in range(self.num_buckets):
             is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
@@ -4376,6 +4387,42 @@ class AllGatherPipeline:
             f"The bucket can be released table is in an abnormal state, not safe to reset. "
             f"bucket_can_be_released: {self.bucket_can_be_released}."
         )
+
+    def _extend_by_fsdp_units(
+        self, bucket_ids: List[int], prefetch_order: PrefetchOrder, num_units: int
+    ) -> List[int]:
+        """Extend a bucket list through ``num_units`` subsequent FSDP units."""
+        if num_units <= 0:
+            return list(sorted(set(bucket_ids)))
+
+        parameter_groups = self.buffer.parameter_groups
+        result = set(bucket_ids)
+        seen_units = {
+            parameter_groups[bucket_id].fsdp_unit_id
+            for bucket_id in result
+            if parameter_groups[bucket_id].fsdp_unit_id is not None
+        }
+        new_units = 0
+        step = 1 if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER else -1
+        bucket_id = (max(result) + 1) if step > 0 else (min(result) - 1)
+
+        while 0 <= bucket_id < self.buffer.num_buckets:
+            bucket_group = self.buffer.bucket_to_bucket_group[bucket_id]
+            group_units = {
+                parameter_groups[group_bucket_id].fsdp_unit_id
+                for group_bucket_id in bucket_group
+                if parameter_groups[group_bucket_id].fsdp_unit_id is not None
+            }
+            unseen_units = group_units - seen_units
+            if unseen_units and new_units >= num_units:
+                break
+
+            result.update(bucket_group)
+            seen_units.update(unseen_units)
+            new_units += len(unseen_units)
+            bucket_id = (max(result) + 1) if step > 0 else (min(result) - 1)
+
+        return list(sorted(result))
 
     def _extend_by_prefetch_size(
         self,
@@ -4444,11 +4491,14 @@ class AllGatherPipeline:
             grouped_buckets.setdefault(group_id, []).append(bucket_id)
         return grouped_buckets
 
-    def _launch_outer_bucket_group(self, buckets: List[int], bwd: bool) -> None:
-        """Launch one coalesced DP-Outer parameter gather."""
+    def _launch_outer_bucket_group(
+        self, buckets: List[int], bwd: bool, record_ready_event: bool = False
+    ) -> Optional[torch.cuda.Event]:
+        """Launch one coalesced DP-Outer gather and optionally record its completion."""
         parameter_groups = self.buffer.parameter_groups
         outer_stream = self.outer_fsdp_group_param_gather_stream
         outer_stream.wait_stream(torch.cuda.current_stream())
+        ready_event = None
         with torch.cuda.stream(outer_stream):
             is_expert_parallel = parameter_groups[buckets[0]].is_expert_param
             outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
@@ -4466,6 +4516,23 @@ class AllGatherPipeline:
                         ],
                         group=outer_fsdp_group,
                     )
+            if record_ready_event:
+                ready_event = torch.cuda.Event()
+                ready_event.record(outer_stream)
+        return ready_event
+
+    def _launch_outer_prefetches(self, bucket_ids: List[int], bwd: bool) -> None:
+        """Launch DP-Outer gathers that have not already been scheduled."""
+        pending_bucket_ids = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if self.get_bucket_key(bucket_id, bwd) not in self.outer_bucket_ready_events
+        ]
+        for buckets in self._group_buckets(pending_bucket_ids).values():
+            ready_event = self._launch_outer_bucket_group(buckets, bwd=bwd, record_ready_event=True)
+            assert ready_event is not None
+            for bucket_id in buckets:
+                self.outer_bucket_ready_events[self.get_bucket_key(bucket_id, bwd)] = ready_event
 
     def all_gather_params(
         self,
@@ -4529,10 +4596,30 @@ class AllGatherPipeline:
             self.buffer.ddp_config.fsdp_double_buffer
             and no_fsdp_units
         )
-        if should_prefetch:
+        # Activated by configuration in a follow-up change.
+        pipeline_hfsdp_gathers = False
+        outer_ag_buckets = []
+
+        if pipeline_hfsdp_gathers:
+            if should_prefetch:
+                inner_prefetch_units = 1
+                if self.buffer.ddp_config.fsdp_double_buffer:
+                    inner_prefetch_units = min(1, max(0, 2 - len(double_buf_units)))
+                ag_buckets = self._extend_by_fsdp_units(
+                    ag_buckets, prefetch_order, inner_prefetch_units
+                )
+
+            if outer_fsdp_group_param_gather:
+                outer_ag_buckets = self._extend_by_fsdp_units(
+                    ag_buckets, prefetch_order, 1 if should_prefetch else 0
+                )
+        elif should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
                 ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
             )
+
+        if outer_ag_buckets:
+            self._launch_outer_prefetches(outer_ag_buckets, bwd)
 
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
@@ -4554,7 +4641,16 @@ class AllGatherPipeline:
             all_gather_stream = (
                 self.ag_stream if self.ag_stream is not None else torch.cuda.current_stream()
             )
-            if outer_fsdp_group_param_gather:
+            if pipeline_hfsdp_gathers:
+                # Wait only for these buckets. The DP-Outer stream may continue
+                # prefetching the next FSDP unit while DP-Inner gathers this one.
+                for bucket_id in buckets:
+                    outer_event = self.outer_bucket_ready_events.get(
+                        self.get_bucket_key(bucket_id, bwd)
+                    )
+                    if outer_event is not None:
+                        all_gather_stream.wait_event(outer_event)
+            elif outer_fsdp_group_param_gather:
                 self._launch_outer_bucket_group(buckets, bwd=bwd)
                 # Wait for the DP-Outer group all-gather to finish.
                 all_gather_stream.wait_stream(self.outer_fsdp_group_param_gather_stream)
