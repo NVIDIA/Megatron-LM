@@ -290,6 +290,41 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             conversation=conversation, chat_template=chat_template, **kwargs
         )
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate character offsets for each token in the given text.
+
+        Uses the fast tokenizer's offset mapping when available.
+        Falls back to a sequential search when using a slow tokenizer.
+
+        Args:
+            ids (list[int]): token IDs.
+            text (str): the original text that was tokenized.
+
+        Returns:
+            list[int]: character offset of each token in *text*.
+        """
+        # Fast path: HF fast tokenizers can produce offset mappings directly.
+        if getattr(self.tokenizer, 'is_fast', False):
+            encoding = self.tokenizer(
+                text, return_offsets_mapping=True, add_special_tokens=False
+            )
+            offset_mapping = encoding.get("offset_mapping", None)
+            if offset_mapping is not None and len(offset_mapping) == len(ids):
+                return [start for start, _ in offset_mapping]
+
+        # Fallback: reconstruct offsets by decoding tokens one-by-one.
+        offsets = []
+        cursor = 0
+        for token_id in ids:
+            piece = self.tokenizer.decode([token_id])
+            idx = text.find(piece, cursor)
+            if idx != -1:
+                offsets.append(idx)
+                cursor = idx + len(piece)
+            else:
+                offsets.append(cursor)
+        return offsets
+
     @property
     def vocab(self) -> list:
         """Returns tokenizer vocab values."""

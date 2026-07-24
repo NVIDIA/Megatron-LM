@@ -128,6 +128,25 @@ class ByteLevelTokenizer(MegatronTokenizerTextAbstract):
         """Adds special tokens to the tokenizer."""
         raise NotImplementedError("This method is not supported for byte-level tokenizers.")
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate character offsets for each byte-token.
+
+        Each token corresponds to one UTF-8 byte, so the offset of byte *i*
+        is the number of complete characters encoded by bytes 0 .. i-1.
+
+        Args:
+            ids (list[int]): token IDs (byte values).
+            text (str): the original text that was tokenized.
+
+        Returns:
+            list[int]: character offset of each token in *text*.
+        """
+        encoded = text.encode('utf-8')
+        offsets = []
+        for byte_idx in range(len(ids)):
+            offsets.append(len(encoded[:byte_idx].decode('utf-8', errors='ignore')))
+        return offsets
+
     @property
     def pad_id(self):
         """
