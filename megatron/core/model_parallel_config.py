@@ -59,7 +59,7 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when hybrid_context_parallel or sequence_packing_scheduler is enabled.
     """
 
     hybrid_context_parallel: bool = False
@@ -67,6 +67,12 @@ class ModelParallelConfig:
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    """
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
+    """
+    Scheduler for packing variable-length THD batches.
+    dp_balanced: DP-balanced scheduler for sequence packing.
     """
 
     expert_model_parallel_size: int = 1

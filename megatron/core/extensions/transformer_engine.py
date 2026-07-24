@@ -3396,3 +3396,16 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(
+    cu_seqlens: torch.Tensor, total_tokens: int, cp_size: int, cp_rank: int
+) -> torch.Tensor:
+    """Get partitioned indices for THD data in context parallelism."""
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
