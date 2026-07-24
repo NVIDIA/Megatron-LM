@@ -875,6 +875,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    moe_hybridep_pad_uneven_dispatch_inputs: bool = False
+    """Pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
+    Enable when local HybridEP input token counts can differ across ranks, for example
+    with dynamically packed THD inputs. Leave disabled when dispatcher inputs are
+    already padded to equal token counts.
+    """
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
