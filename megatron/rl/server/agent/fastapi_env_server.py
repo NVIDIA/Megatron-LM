@@ -121,6 +121,7 @@ class FastAPIEnvServer(EnvironmentServer):
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
+        env_index: int = 0,
     ) -> GroupRolloutParams:
         raise NotImplementedError(
             "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."

@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import copy
 import gc
 
@@ -68,11 +69,11 @@ from megatron.rl.agent.api import (
     Rollouts,
     TokenRollout,
 )
+from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
-from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
     get_default_packed_seq_params,
@@ -531,19 +532,19 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
-def get_agent(args, parallel_generation_tasks: int | None = None):
-    """Get an agent based on environment configuration.
+def get_agent(args):
+    """Build the rollout agent tree from the environment configuration.
 
-    If args.langrl_env_config is provided, uses weighted environment selection.
-    Otherwise falls back to legacy single environment selection.
+    Args:
+        args: Megatron args; reads langrl_env_config (weighted env YAML).
+
+    Returns:
+        A WeightedMultiTask routing across the configured environments.
     """
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
 
-    return WeightedMultiTask.from_config(
-        config,
-        parallel_generation_tasks=parallel_generation_tasks,
-    )
+    return WeightedMultiTask.from_config(config)
 
 
 _INFERENCE_INTERFACE = None
@@ -563,14 +564,23 @@ def get_inference_interface(args, loop, model):
 
 
 _ROLLOUT_GENERATOR = None
-_ROLLOUT_AGENT = None
+_ROLLOUT_PIPELINE = None
 
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
-    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
+    """Return the rollout group iterator for this step.
+
+    Args:
+        args: Megatron args (granularities, generation lag, sampling params).
+        inference_interface: Raw-text-capable inference interface for the request.
+        n_prompts: Groups per trainer batch (request.num_groups).
+        samples_per_group: Rollouts per group.
+
+    Returns:
+        The async iterator produced by RolloutPipeline.run().
+    """
+    global _ROLLOUT_GENERATOR, _ROLLOUT_PIPELINE
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
-        parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
-        agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
             streaming=streaming,
@@ -586,26 +596,52 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             submission_granularity=args.rl_submission_granularity,
             consumption_granularity=args.rl_consumption_granularity,
         )
-        # Keep the agent handle so metric logging can read the live rollout
-        # pipelines (see _collect_rollout_pipeline_metrics).
-        _ROLLOUT_AGENT = agent
-        _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
+        # Keep the pipeline handle so metric logging can read its queues, gate
+        # state, and per-env counters (see _collect_rollout_pipeline_metrics).
+        _ROLLOUT_PIPELINE = RolloutPipeline(
+            agent=get_agent(args),
+            request=request,
+            # Submission gate depth in trainer batches; the pipeline scales
+            # it to submission units.
+            parallel_generation_tasks=args.rl_generation_lag + 1,
+        )
+        _ROLLOUT_GENERATOR = _ROLLOUT_PIPELINE.run()
     return _ROLLOUT_GENERATOR
 
 
-def get_environment_rollouts(
-    model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
+def can_skip_inference(partial_rollouts: bool) -> bool:
+    """Return True when a full batch of rollout groups is already banked; no context switch."""
+    if not partial_rollouts or _ROLLOUT_PIPELINE is None:
+        return False
+    skip = False
+    if torch.distributed.get_rank() == 0:
+        loop = get_asyncio_loop()
+        for _ in range(2 * _ROLLOUT_PIPELINE.gran_policy.num_groups_per_batch + 16):
+            loop.run_until_complete(asyncio.sleep(0))
+        skip = _ROLLOUT_PIPELINE.ready_batches >= 1
+    result = [skip]
+    torch.distributed.broadcast_object_list(result, src=0)
+    return result[0]
+
+
+def colocated_inference(
+    model: LanguageModule,
+    inference_model: LanguageModule,
+    optimizer: MegatronOptimizer,
+    n_prompts: int,
+    samples_per_group: int
 ):
-    """Sample environment rollouts from an LLM.
+    """Swap to the inference engine and collect rollout groups from it.
 
     Args:
         model: Model to sample from.
-        inference_model: Inference model to use for inference.
+        inference_model: Separate inference model to refit and sample from, if any.
+        optimizer: Optimizer to offload to CPU before the switch when configured.
         n_prompts: Number of prompts to sample for across *all* data parallel workers.
         samples_per_group: Amount of trajectories per prompt.
 
     Returns:
-        GroupedRollouts object which is a nested list with each element being a list of rollouts of a group.
+        Collected rollout groups on rank 0; placeholder data on other ranks.
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -672,10 +708,6 @@ def get_environment_rollouts(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
-                    # In deterministic mode, sort rollouts by problem_id for consistent ordering
-                    # regardless of completion order due to system timing jitter.
-                    if torch.are_deterministic_algorithms_enabled():
-                        rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
                         while True:
                             try:
@@ -687,20 +719,76 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        with nvtx_range("rl/sync-rollouts", time=True):
-            # Wait for Rollouts to be collected
-            # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
-            torch.distributed.broadcast_object_list(rollouts, src=0)
-        logger.debug(f"Got rollouts on rank {rank}")
+    return rollouts
 
-    if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
-        with open(
-            lang_rl_log_dir
-            + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-            + f'{Path(args.langrl_env_config).stem}.json',
-            'w',
-        ) as f:
-            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
+
+def get_environment_rollouts(
+    model: LanguageModule,
+    inference_model: LanguageModule,
+    optimizer: MegatronOptimizer,
+    n_prompts: int,
+    samples_per_group: int,
+    run_inference: bool = True,
+):
+    """Sample environment rollouts from an LLM.
+
+    Args:
+        model: Model to sample from.
+        inference_model: Inference model to use for inference.
+        n_prompts: Number of prompts to sample for across *all* data parallel workers.
+        samples_per_group: Amount of trajectories per prompt.
+        run_inference: If True, swap to the inference engine to collect rollouts.
+            If False, consume a batch already banked by the rollout pipeline.
+
+    Returns:
+        GroupedRollouts: nested list with each element being a list of rollouts of a group.
+    """
+    args = get_args()
+    nvtx_range = get_nvtx_range()
+    rank = torch.distributed.get_rank()
+
+    if run_inference:
+        rollouts = colocated_inference(
+            model, inference_model, optimizer, n_prompts, samples_per_group
+        )
+    elif rank == 0:
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Consuming {n_prompts} buffered rollout groups without inference, "
+            f"Iteration {args.curr_iteration}...",
+        )
+        loop = get_asyncio_loop()
+        rollouts = [
+            loop.run_until_complete(anext(_ROLLOUT_GENERATOR)) for _ in range(n_prompts)
+        ]
+    else:
+        # Just set up space to collect the rollouts
+        rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
+
+    if rank == 0 and torch.are_deterministic_algorithms_enabled():
+        # In deterministic mode, sort rollouts by problem_id for consistent ordering
+        # regardless of completion order due to system timing jitter.
+        rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
+
+    with nvtx_range("rl/sync-rollouts", time=True):
+        # Wait for Rollouts to be collected
+        # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
+        torch.distributed.broadcast_object_list(rollouts, src=0)
+    logger.debug(f"Got rollouts on rank {rank}")
+
+    if lang_rl_log_dir:
+        inference_pg_collection = get_attr_wrapped_model(
+            (inference_model if inference_model is not None else model)[0], "pg_collection"
+        )
+        if rank == get_pg_rank(inference_pg_collection.tp):
+            with open(
+                lang_rl_log_dir
+                + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
+                + f'{Path(args.langrl_env_config).stem}.json',
+                'w',
+            ) as f:
+                json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1100,91 +1188,100 @@ def prep_wandb_metrics(
 
 
 def _collect_rollout_pipeline_metrics() -> dict:
-    """Snapshot per-pipeline instrumentation into wandb-loggable scalars.
+    """Snapshot pipeline instrumentation into wandb-loggable scalars.
 
-    Walks the live rollout agent (set by get_rollout_generator) and, for each
-    sub-agent with an active _RolloutPipeline, reads queue sizes, gate state,
-    per-stage dwell times, and rate counters. Accumulators are reset after
-    reading; point-in-time values (queue sizes, gate held) are re-read next
-    call. Keys follow the existing f"{env_id}_{metric}" convention.
+    Reads the RolloutPipeline held by get_rollout_generator: queue sizes, gate
+    state, per-stage dwell times, and rate counters, plus per-env group
+    counters for multi-env agents. Accumulators are reset after reading;
+    point-in-time values (queue sizes, gate held) are re-read next call.
+
+    Returns:
+        Metric name -> value dict; empty when no pipeline exists yet.
     """
-    if _ROLLOUT_AGENT is None:
+    if _ROLLOUT_PIPELINE is None:
         return {}
-    sub_agents = (
-        _ROLLOUT_AGENT.agents
-        if isinstance(_ROLLOUT_AGENT, WeightedMultiTask)
-        else [_ROLLOUT_AGENT]
-    )
+    pipeline = _ROLLOUT_PIPELINE
+    dist = getattr(pipeline.agent, "latest_distribution", None)
     metrics: dict = {}
-    for sub_agent in sub_agents:
-        pipeline = getattr(sub_agent, "_active_pipeline", None)
-        if pipeline is None:
-            continue
-        env_id = getattr(sub_agent, "env_id", "") or "rollout"
-        gate = pipeline.gate
-        metrics.update({
-            # Queue sizes and gate held are point-in-time reads.
-            f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
-            f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
-            f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
-            f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
-            f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
-            f"{env_id}_pipeline_gate_capacity": gate.capacity,
-            f"{env_id}_pipeline_gate_held": gate.held,
-            f"{env_id}_pipeline_gate_utilization": (
-                gate.held / gate.capacity if gate.capacity else 0.0
-            ),
-            # Counters below accumulate since the previous collection.
-            f"{env_id}_pipeline_gate_prepare_blocked_seconds": gate.prepare_blocked_seconds,
-            f"{env_id}_pipeline_gate_acquire_calls": gate.acquire_calls,
-            f"{env_id}_pipeline_gate_release_calls": gate.release_calls,
-            f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
-            f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
-            f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
-            f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
-        })
-        for name, samples in (
-            ("infer_queue_dwell", pipeline.infer_queue_dwell),
-            ("engine_dwell", pipeline.engine_dwell),
-            ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
-            ("output_queue_dwell", pipeline.output_queue_dwell),
-        ):
-            if samples:
-                arr = np.asarray(samples, dtype=np.float64)
-                metrics[f"{env_id}_pipeline_mean_{name}_s"] = float(arr.mean())
-                metrics[f"{env_id}_pipeline_max_{name}_s"] = float(arr.max())
-                metrics[f"{env_id}_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
-                metrics[f"{env_id}_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
-        # Reset accumulators; queue sizes and gate held are point-in-time.
-        pipeline.infer_queue_dwell = []
-        pipeline.engine_dwell = []
-        pipeline.assemble_queue_dwell = []
-        pipeline.output_queue_dwell = []
-        pipeline.prepared_count = 0
-        pipeline.inferred_count = 0
-        pipeline.assembled_count = 0
-        pipeline.yielded_count = 0
-        gate.prepare_blocked_seconds = 0.0
-        gate.acquire_calls = 0
-        gate.release_calls = 0
+    gate = pipeline.gate
+    metrics.update({
+        # Queue sizes and gate held are point-in-time reads.
+        "rollout_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
+        "rollout_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
+        "rollout_pipeline_output_queue_size": pipeline.output_queue.qsize(),
+        "rollout_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
+        "rollout_pipeline_consume_pending_groups": len(pipeline._consume_pending),
+        "rollout_pipeline_ready_batches": pipeline.ready_batches,
+        "rollout_pipeline_gate_capacity": gate.capacity,
+        "rollout_pipeline_gate_held": gate.held,
+        "rollout_pipeline_gate_utilization": (
+            gate.held / gate.capacity if gate.capacity else 0.0
+        ),
+        # Counters below accumulate since the previous collection.
+        "rollout_pipeline_gate_prepare_blocked_seconds": gate.prepare_blocked_seconds,
+        "rollout_pipeline_gate_acquire_calls": gate.acquire_calls,
+        "rollout_pipeline_gate_release_calls": gate.release_calls,
+        "rollout_pipeline_prepared_count": pipeline.prepared_count,
+        "rollout_pipeline_inferred_count": pipeline.inferred_count,
+        "rollout_pipeline_assembled_count": pipeline.assembled_count,
+        "rollout_pipeline_yielded_count": pipeline.yielded_count,
+    })
+    for name, samples in (
+        ("infer_queue_dwell", pipeline.infer_queue_dwell),
+        ("engine_dwell", pipeline.engine_dwell),
+        ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
+        ("output_queue_dwell", pipeline.output_queue_dwell),
+    ):
+        if samples:
+            arr = np.asarray(samples, dtype=np.float64)
+            metrics[f"rollout_pipeline_mean_{name}_s"] = float(arr.mean())
+            metrics[f"rollout_pipeline_max_{name}_s"] = float(arr.max())
+            metrics[f"rollout_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
+            metrics[f"rollout_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
+    # Per-env group counters, mapped from env_index to env_id via the
+    # multi-env layout (active envs, in layout order).
+    if dist:
+        active_env_ids = [
+            env_id
+            for env_id, groups in zip(dist["env_ids"], dist["agent_groups"])
+            if groups > 0
+        ]
+        for env_index, env_id in enumerate(active_env_ids):
+            metrics[f"{env_id}_prepared_groups"] = (
+                pipeline.prepared_groups_per_env[env_index]
+            )
+            metrics[f"{env_id}_assembled_groups"] = (
+                pipeline.assembled_groups_per_env[env_index]
+            )
+            metrics[f"{env_id}_yielded_groups"] = (
+                pipeline.yielded_groups_per_env[env_index]
+            )
+    # Reset accumulators; queue sizes and gate held are point-in-time.
+    pipeline.infer_queue_dwell = []
+    pipeline.engine_dwell = []
+    pipeline.assemble_queue_dwell = []
+    pipeline.output_queue_dwell = []
+    pipeline.prepared_count = 0
+    pipeline.inferred_count = 0
+    pipeline.assembled_count = 0
+    pipeline.yielded_count = 0
+    pipeline.prepared_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
+    pipeline.assembled_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
+    pipeline.yielded_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
+    gate.prepare_blocked_seconds = 0.0
+    gate.acquire_calls = 0
+    gate.release_calls = 0
 
-    # WeightedMultiTask work distribution (agent_slots / agent_pgts).
-    dist = getattr(_ROLLOUT_AGENT, "latest_distribution", None)
+    # WeightedMultiTask per-batch group distribution.
     if dist:
         # An env_id can appear more than once in the config (e.g. an active
         # entry plus an evaluation-only twin with zero weight). Sum per
         # env_id so the zero twin does not overwrite the active entry.
         per_env: dict = {}
-        for env_id, groups, pgt, slots in zip(
-            dist["env_ids"], dist["agent_groups"], dist["agent_pgts"], dist["agent_slots"]
-        ):
-            g, p, s = per_env.get(env_id, (0, 0, 0.0))
-            per_env[env_id] = (g + groups, p + pgt, s + slots)
-        for env_id, (groups, pgt, slots) in per_env.items():
+        for env_id, groups in zip(dist["env_ids"], dist["agent_groups"]):
+            per_env[env_id] = per_env.get(env_id, 0) + groups
+        for env_id, groups in per_env.items():
             metrics[f"{env_id}_agent_groups"] = groups
-            metrics[f"{env_id}_agent_pgts"] = pgt
-            metrics[f"{env_id}_agent_slots"] = slots
-        metrics["multitask_total_pgt"] = dist["total_pgt"]
     return metrics
 
 
@@ -1785,6 +1882,7 @@ def get_grpo_data_iterator(
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
     optimizer_is_on_cpu: bool = False,
+    partial_rollouts: bool = False,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -1804,7 +1902,9 @@ def get_grpo_data_iterator(
         sequence_packing: Use sequence packing if True.
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
-        optimizer_is_on_cpu: If True, the optimizer was offloaded to CPU and must be restored.
+        optimizer_is_on_cpu: If True, the optimizer is offloaded to CPU during inference.
+        partial_rollouts: If True, skip the inference context switch when the rollout
+            pipeline already holds a full batch of finished groups.
 
     Returns:
         RerunDataIterator for the current training step
@@ -1820,8 +1920,10 @@ def get_grpo_data_iterator(
         (grpo_iterations * global_batches_per_collection)
     ):
 
+        run_inference = not can_skip_inference(partial_rollouts)
         rollouts = get_environment_rollouts(
-            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
+            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size,
+            run_inference=run_inference,
         )
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
@@ -1831,7 +1933,9 @@ def get_grpo_data_iterator(
             sequence_packing=sequence_packing,
             is_correction=is_correction,
         )
-        if optimizer_is_on_cpu:
+        # The optimizer is offloaded inside colocated_inference, so there is
+        # nothing to restore when the inference context switch was skipped.
+        if optimizer_is_on_cpu and run_inference:
             nvtx_range = get_nvtx_range()
             with nvtx_range("rl/restore-optimizer-after-inference", time=True):
                 with nvtx_range("rl/restore/grad-buffers", time=True):
@@ -2192,13 +2296,13 @@ def megatron_rl_inference_mode(
 def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
-    global _ROLLOUT_AGENT
+    global _ROLLOUT_PIPELINE
 
     if _ROLLOUT_GENERATOR is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
         _ROLLOUT_GENERATOR = None
-    _ROLLOUT_AGENT = None
+    _ROLLOUT_PIPELINE = None
 
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
