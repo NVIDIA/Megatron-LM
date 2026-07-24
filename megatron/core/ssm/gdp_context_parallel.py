@@ -21,9 +21,13 @@ Strategy for householder-multiplied tensors (V, K, b):
     copy is independently partitioned by heads across CP ranks.
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from einops import repeat
@@ -33,6 +37,8 @@ except ImportError:
     HAVE_EINOPS = False
 
 # Re-use the load balancing and all-to-all helpers from the existing module.
+# The load-balancing helpers already handle packed (THD) input via their
+# ``packed_seq_params`` argument, so GDP just threads it through below.
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -128,7 +134,9 @@ class GDPContextParallel:
             self.group_repeat_count = 1
             self.ngroups_local_tpcp = self.ngroups_local_tp // self.cp_size
 
-    def pre_conv_ssm(self, input_: torch.Tensor) -> torch.Tensor:
+    def pre_conv_ssm(
+        self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> torch.Tensor:
         """
         All-to-all from sequence-partitioned to head-partitioned layout, before conv + SSM.
 
@@ -140,6 +148,10 @@ class GDPContextParallel:
             [z, V, K, Q, b, a] with sizes
             [d_inner/cp, d_inner/cp*M, ngroups_cp*d_state*M,
              ngroups_cp*d_state, nheads/cp*M, nheads/cp]
+
+        ``packed_seq_params`` must be passed for THD/SFT input — without it
+        the post-all-to-all undo uses the non-packed zigzag pattern, which
+        scrambles token order across pack boundaries.
         """
         if self.cp_size == 1:
             return input_
@@ -209,17 +221,20 @@ class GDPContextParallel:
         a = _all_to_all_cp2hp(a, self.cp_group)
 
         output = torch.cat([z, V, K, Q, b_proj, a], dim=-1)
-        output = _undo_attention_load_balancing(output, self.cp_size)
+        output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
 
         return output
 
-    def post_conv_ssm(self, input_: torch.Tensor) -> torch.Tensor:
+    def post_conv_ssm(
+        self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> torch.Tensor:
         """Method to be applied after the conv + SSM (on y and z, which have no M dim)."""
         if self.cp_size == 1:
             return input_
         else:
             return _all_to_all_hp2cp(
-                _redo_attention_load_balancing(input_, self.cp_size), self.cp_group
+                _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params),
+                self.cp_group,
             )
 
     def conv1d(self, input_: torch.Tensor) -> torch.Tensor:
