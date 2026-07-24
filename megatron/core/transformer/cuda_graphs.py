@@ -2582,7 +2582,13 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
+            from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
+
+            te_whole_moe_paged_stash = (
+                self.config.moe_paged_stash
+                and CudaGraphModule.moe in self.config.cuda_graph_modules
+            )
+            with rng_context, paged_stash_te_graph_capture(te_whole_moe_paged_stash):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
