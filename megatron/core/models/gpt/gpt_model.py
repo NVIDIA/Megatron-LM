@@ -8,6 +8,14 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel_layout import (
+    CpPartitionMode,
+    convert_cp_partition_mode_nested,
+    get_or_build_thd_cp_partition_route,
+    get_packed_seq_params_cp_partition_cu_seqlens,
+    prebuild_thd_cp_partition_route_cache,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
@@ -111,6 +119,7 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -227,6 +236,7 @@ class GPTModel(LanguageModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
         if self.mtp_process:
@@ -309,6 +319,14 @@ class GPTModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    def get_input_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode used for this model chunk's batch tensors."""
+        return self.decoder.get_input_cp_partition_mode()
+
+    def get_output_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode produced by this model chunk's decoder."""
+        return self.decoder.get_stage_exit_cp_partition_mode()
+
     def _preprocess(
         self,
         input_ids: Tensor,
@@ -364,6 +382,7 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
+        cp_partition_mode = self.get_input_cp_partition_mode()
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -404,6 +423,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    cp_partition_mode=cp_partition_mode,
                 )
         elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
@@ -415,6 +435,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    cp_partition_mode=cp_partition_mode,
                 )
             else:
                 raise NotImplementedError(
@@ -427,6 +448,7 @@ class GPTModel(LanguageModule):
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    cp_partition_mode=cp_partition_mode,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -555,6 +577,24 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        experimental_thd_cp_full_iter_cuda_graph = (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and self.config.context_parallel_size > 1
+            and self.config.cuda_graph_impl == "full_iteration"
+            and self.config.experimental_attention_variant is not None
+        )
+        # TODO: Use GIN to make experimental-attention A2A CP layout routing compatible
+        # with full-iteration CUDA graph capture.
+        assert not experimental_thd_cp_full_iter_cuda_graph, (
+            "Full-iteration CUDA graph is not supported with THD context parallelism "
+            "for experimental attention variants."
+        )
+
+        prebuild_thd_cp_partition_route_cache(
+            packed_seq_params, resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        )
+
         preproc_output = self._preprocess(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -673,6 +713,94 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
+
+        needs_batch_layout = self.post_process or (
+            mtp_in_postprocess and not (in_inference_mode or is_spec_decode)
+        )
+        if needs_batch_layout:
+            target_partition_mode = self.get_input_cp_partition_mode()
+            input_partition_mode = target_partition_mode
+            current_partition_mode = self.get_output_cp_partition_mode()
+            cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            cu_seqlens = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
+            if self.config.mtp_num_layers:
+                if cp_group is not None and cp_group.size() > 1:
+                    target_partition_mode = "zigzag"
+            hidden_thd_cp_partition_route = get_or_build_thd_cp_partition_route(
+                packed_seq_params,
+                cp_group,
+                current_partition_mode,
+                target_partition_mode,
+                cu_seqlens=cu_seqlens,
+                device=hidden_states.device,
+            )
+            hidden_conversion_kwargs = {
+                "source_partition_mode": current_partition_mode,
+                "target_partition_mode": target_partition_mode,
+                "cu_seqlens": cu_seqlens,
+                "sequence_parallel": self.config.sequence_parallel,
+                "tp_group": self.pg_collection.tp,
+                "tp_cp_group": getattr(self.pg_collection, "tp_cp", None),
+                "thd_cp_partition_route": hidden_thd_cp_partition_route,
+            }
+            hidden_states = convert_cp_partition_mode_nested(
+                hidden_states,
+                cp_group,
+                seq_dim=0,
+                **hidden_conversion_kwargs,
+            )
+            if mhc_multistream is not None:
+                mhc_multistream = convert_cp_partition_mode_nested(
+                    mhc_multistream,
+                    cp_group,
+                    seq_dim=0,
+                    **hidden_conversion_kwargs,
+                )
+            if input_partition_mode != target_partition_mode:
+                if attention_mask is not None:
+                    raise NotImplementedError(
+                        "Changing CP partition mode for MTP with an explicit attention_mask "
+                        "is not supported yet."
+                    )
+
+                cp_conversion_kwargs = {
+                    "source_partition_mode": input_partition_mode,
+                    "target_partition_mode": target_partition_mode,
+                    "cu_seqlens": cu_seqlens,
+                    "thd_cp_partition_route": get_or_build_thd_cp_partition_route(
+                        packed_seq_params,
+                        cp_group,
+                        input_partition_mode,
+                        target_partition_mode,
+                        cu_seqlens=cu_seqlens,
+                        device=hidden_states.device,
+                    ),
+                }
+                input_ids = convert_cp_partition_mode_nested(
+                    input_ids, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                position_ids = convert_cp_partition_mode_nested(
+                    position_ids, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                labels = convert_cp_partition_mode_nested(
+                    labels, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                loss_mask = convert_cp_partition_mode_nested(
+                    loss_mask, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                padding_mask = convert_cp_partition_mode_nested(
+                    padding_mask, cp_group, seq_dim=-1, **cp_conversion_kwargs
+                )
+                # THD RoPE tables stay in global packed-token order; only SBHD
+                # RoPE tensors are CP-rank local and need layout conversion.
+                if packed_seq_params is None:
+                    rotary_pos_emb = convert_cp_partition_mode_nested(
+                        rotary_pos_emb, cp_group, seq_dim=0, **cp_conversion_kwargs
+                    )
+                packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, target_partition_mode
+                )
+
         if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,

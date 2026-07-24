@@ -1,6 +1,9 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    get_hybrid_stage_input_cp_partition_mode_for_stage,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
@@ -75,6 +78,15 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 
+    cp_stage_entry_partition_mode = get_hybrid_stage_input_cp_partition_mode_for_stage(
+        config,
+        args.hybrid_layer_pattern,
+        getattr(pg_collection, "pp", None),
+        vp_stage,
+        first_stage_layers=config.num_layers_in_first_pipeline_stage,
+        last_stage_layers=config.num_layers_in_last_pipeline_stage,
+    )
+
     model = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
@@ -91,6 +103,7 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         rotary_base=args.rotary_base,
         pg_collection=pg_collection,
         vp_stage=vp_stage,
+        cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):

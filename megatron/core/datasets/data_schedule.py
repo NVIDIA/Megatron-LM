@@ -566,6 +566,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     dynamic_cp: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
     config=None,
+    cp_partition_mode: Optional[str] = None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -573,8 +574,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
-        config: Model config used for CP partitioning and optional THD packed-sequence padding.
-            When None, CP partitioning defaults to zigzag and no padding is applied.
+        config: Model config used for optional THD packed-sequence padding.
+            When None, padding is disabled.
+        cp_partition_mode: CP partition mode requested by the current model chunk input.
+            Required when this batch is partitioned across multiple CP ranks.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -630,7 +633,12 @@ def get_batch_on_this_rank_for_sequence_packing(
             group_size=local_cp_size_val
         )
 
-    cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
+    if cp_partition_mode is None:
+        if cp_group.size() > 1:
+            raise ValueError(
+                "cp_partition_mode must be provided when sequence-packing batches are "
+                "partitioned across multiple context-parallel ranks."
+            )
     contiguous_cp_local_target_len = None
     pad_alignment = (
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None

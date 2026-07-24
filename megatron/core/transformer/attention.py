@@ -11,6 +11,9 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import (
+    get_required_cp_partition_mode_for_layer,
+)
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -313,6 +316,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.cp_comm_type = cp_comm_type
         self.batch_invariant_mode = config.batch_invariant_mode
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
@@ -443,6 +447,40 @@ class Attention(MegatronModule, ABC):
         if getattr(self.config, 'rotary_base_per_layer', None):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
+
+    def _get_cp_partition_mode(self):
+        """Return the concrete CP partition mode this attention module expects."""
+        cp_partition_mode = get_required_cp_partition_mode_for_layer(
+            self, self.config, cp_comm_type=self.cp_comm_type
+        )
+        if cp_partition_mode is None:
+            raise ValueError(
+                f"{self.__class__.__name__} must declare a concrete CP partition mode."
+            )
+        return cp_partition_mode
+
+    def _validate_packed_seq_params_cp_partition_mode(
+        self,
+        packed_seq_params: Optional[PackedSeqParams],
+        expected_cp_partition_mode: str,
+    ) -> None:
+        """Validate block-provided THD CP partition metadata against this attention."""
+        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+            return
+        cp_group = packed_seq_params.cp_group if packed_seq_params.cp_group is not None else None
+        if cp_group is None:
+            cp_group = self.pg_collection.cp if hasattr(self.pg_collection, 'cp') else None
+        if cp_group is None or get_pg_size(cp_group) <= 1:
+            return
+
+        actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+        if actual_cp_partition_mode != expected_cp_partition_mode:
+            raise ValueError(
+                f"{self.__class__.__name__} requires cp_partition_mode="
+                f"{expected_cp_partition_mode!r}, but packed_seq_params has "
+                f"{actual_cp_partition_mode!r}. CP partition conversion must be handled "
+                "by TransformerBlock before entering attention."
+            )
 
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
@@ -1360,6 +1398,10 @@ class Attention(MegatronModule, ABC):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        expected_cp_partition_mode = self._get_cp_partition_mode()
+        self._validate_packed_seq_params_cp_partition_mode(
+            packed_seq_params, expected_cp_partition_mode
+        )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1545,8 +1587,10 @@ class Attention(MegatronModule, ABC):
             not self.config.flash_decode or inference_context is None
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
+            cp_partition_mode = expected_cp_partition_mode
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                cp_partition_mode = packed_seq_params.cp_partition_mode
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:
@@ -1572,6 +1616,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
+                            cp_partition_mode=cp_partition_mode,
                             max_seqlen=rope_max_seqlen_q,
                         )
                     else:
@@ -1591,6 +1636,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
+                        cp_partition_mode=cp_partition_mode,
                         max_seqlen=rope_max_seqlen_kv,
                     )
             else:

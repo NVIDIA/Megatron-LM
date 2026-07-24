@@ -228,7 +228,6 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         cp=_MockCPGroup(size=4, rank=cp_rank),
     )
     config = SimpleNamespace(
-        cp_partition_mode="contiguous",
         pad_packed_seq_alignment=alignment,
         max_seqlen_per_dp_cp_rank=8,
         thd_max_packed_sequences=None,
@@ -287,7 +286,11 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
     )
 
     result = get_batch_on_this_rank_for_sequence_packing(
-        data_iterator=iter([batch]), dynamic_cp=True, pg_collection=pg_collection, config=config
+        data_iterator=iter([batch]),
+        dynamic_cp=True,
+        pg_collection=pg_collection,
+        config=config,
+        cp_partition_mode="contiguous",
     )
 
     local_tokens, _, _, _, _, packed_seq_params, padding_mask = result

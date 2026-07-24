@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from megatron.core.context_parallel_layout import CpPartitionMode
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -199,6 +200,176 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
                 counts[char] += parsed.mtp_num_depths
 
     return counts
+
+
+def get_hybrid_layer_cp_partition_mode(
+    layer_symbol: str, config
+) -> Optional[CpPartitionMode]:
+    """Return the CP partition mode required by one hybrid layer symbol.
+
+    ``None`` means the layer is token-layout agnostic and can preserve whatever
+    CP partition mode it receives.
+    """
+    if layer_symbol == Symbols.MAMBA:
+        # MambaContextParallel currently undoes/redoes Megatron's attention
+        # load-balancing layout internally, so it expects zigzag inputs.
+        return "zigzag"
+    if layer_symbol == Symbols.GDN:
+        mode = getattr(config, "linear_cp_mode", "chunkwise")
+        if mode == "chunkwise":
+            return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
+        raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
+    if layer_symbol == Symbols.ATTENTION:
+        return "zigzag"
+    if layer_symbol == Symbols.DS_ATTENTION:
+        if getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid":
+            return "contiguous"
+        return "zigzag"
+    if layer_symbol in {Symbols.CSA, Symbols.HCA, Symbols.WINDOW}:
+        return "contiguous"
+    if layer_symbol in {Symbols.MLP, Symbols.MOE}:
+        return None
+    raise ValueError(f"Unsupported hybrid layer symbol {layer_symbol!r}.")
+
+
+def get_hybrid_stage_input_cp_partition_mode(
+    config,
+    hybrid_layer_pattern: Optional[str],
+    stage_layer_offset: int,
+) -> Optional[CpPartitionMode]:
+    """Return the CP partition mode expected at one HybridModel stage input."""
+    parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+    main_pattern = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
+    layer_layouts = [
+        get_hybrid_layer_cp_partition_mode(layer_symbol, config)
+        for layer_symbol in main_pattern
+    ]
+
+    current_partition_mode = None
+    for required_partition_mode in layer_layouts[:stage_layer_offset]:
+        if required_partition_mode is not None:
+            current_partition_mode = required_partition_mode
+
+    if current_partition_mode is None:
+        for required_partition_mode in layer_layouts[stage_layer_offset:]:
+            if required_partition_mode is not None:
+                current_partition_mode = required_partition_mode
+                break
+
+    return current_partition_mode
+
+
+def get_hybrid_stage_input_cp_partition_mode_for_stage(
+    config,
+    hybrid_layer_pattern: Optional[str],
+    pp_group: Optional[torch.distributed.ProcessGroup],
+    vp_stage: Optional[int],
+    *,
+    first_stage_layers: Optional[int] = None,
+    last_stage_layers: Optional[int] = None,
+) -> Optional[CpPartitionMode]:
+    """Return the CP partition mode expected at one hybrid PP/VPP stage input."""
+    parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+    layer_offset = get_hybrid_stage_layer_offset(
+        parsed.main_pattern or '',
+        pp_group,
+        vp_stage,
+        first_stage_layers=first_stage_layers,
+        last_stage_layers=last_stage_layers,
+    )
+    return get_hybrid_stage_input_cp_partition_mode(config, hybrid_layer_pattern, layer_offset)
+
+
+def get_hybrid_stage_layer_offset(
+    main_pattern: str,
+    pp_group: Optional[torch.distributed.ProcessGroup],
+    vp_stage: Optional[int],
+    *,
+    first_stage_layers: Optional[int] = None,
+    last_stage_layers: Optional[int] = None,
+) -> int:
+    """Return the global main-layer offset for one hybrid PP/VPP stage without logging."""
+    segments = main_pattern.split(Symbols.PIPE) if main_pattern else ['']
+
+    pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
+    pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1
+
+    if len(segments) > 1 and (first_stage_layers is not None or last_stage_layers is not None):
+        raise ValueError(
+            "Cannot specify num_layers_in_first_pipeline_stage or "
+            "num_layers_in_last_pipeline_stage when hybrid_layer_pattern "
+            "contains pipe ('|') separators. The pipeline layout is already "
+            "explicitly defined by the pipe separators."
+        )
+
+    if len(segments) == 1 and pp_size > 1:
+        if vp_stage is not None:
+            raise ValueError(
+                "Virtual pipeline parallelism (vp_stage != None) is not supported "
+                "when hybrid_layer_pattern has no pipe ('|') separators. "
+                "Add '|' separators to define explicit pipeline/virtual-pipeline "
+                "stage boundaries."
+            )
+        layer_type_list = validate_segment_layers(segments[0])
+        num_layers = len(layer_type_list)
+
+        if first_stage_layers is not None or last_stage_layers is not None:
+            first = first_stage_layers or 0
+            last = last_stage_layers or 0
+            middle_num_layers = num_layers - first - last
+            middle_stages = pp_size - sum(
+                1 for x in (first_stage_layers, last_stage_layers) if x is not None
+            )
+            if middle_stages > 0:
+                if middle_num_layers % middle_stages != 0:
+                    raise ValueError(
+                        f"Middle layers ({middle_num_layers}) must be evenly divisible "
+                        f"by middle pipeline stages ({middle_stages})."
+                    )
+                layers_per_middle = middle_num_layers // middle_stages
+            else:
+                layers_per_middle = 0
+
+            is_first = first_stage_layers is not None and pp_rank == 0
+            is_last = last_stage_layers is not None and pp_rank == pp_size - 1
+
+            if is_first:
+                return 0
+            if is_last:
+                return num_layers - last
+
+            middle_rank = pp_rank if first_stage_layers is None else pp_rank - 1
+            return middle_rank * layers_per_middle + first
+
+        if num_layers % pp_size != 0:
+            raise ValueError(
+                f"Number of layers ({num_layers}) must be evenly divisible "
+                f"by pipeline-model-parallel-size ({pp_size}) when no pipe "
+                f"separators are specified in the pattern."
+            )
+        return pp_rank * (num_layers // pp_size)
+
+    if len(segments) > 1 and len(segments) % pp_size != 0:
+        raise ValueError(
+            f"The number of pipe-delimited segments ({len(segments)}) in "
+            f"hybrid_layer_pattern must be evenly divisible by "
+            f"pipeline_model_parallel_size ({pp_size})."
+        )
+
+    vp_rel = vp_stage if vp_stage is not None else 0
+    segment_index = vp_rel * pp_size + pp_rank
+    if segment_index >= len(segments):
+        raise ValueError(
+            f"Pipeline segment index {segment_index} (pp_rank={pp_rank}, "
+            f"vp_stage={vp_rel}) is out of range for {len(segments)} segments. "
+            f"The pattern does not define enough pipe-delimited segments for "
+            f"the current PP/VPP configuration."
+        )
+
+    validate_segment_layers(segments[segment_index])
+    return sum(len(segments[i]) for i in range(segment_index))
 
 
 def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:

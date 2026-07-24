@@ -6,6 +6,9 @@ from typing import Any, Callable, ClassVar, Literal, override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    get_hybrid_stage_input_cp_partition_mode_for_stage,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -175,6 +178,14 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         post_process = (
             post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
         )
+        cp_stage_entry_partition_mode = get_hybrid_stage_input_cp_partition_mode_for_stage(
+            self._model_config.transformer,
+            self._model_config.hybrid_layer_pattern,
+            pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self._model_config.transformer.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self._model_config.transformer.num_layers_in_last_pipeline_stage,
+        )
         return HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -192,6 +203,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             post_process=post_process,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
     def build_distributed_models(

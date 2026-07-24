@@ -182,6 +182,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_partition_mode="zigzag",
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -201,18 +202,35 @@ class RotaryEmbedding(nn.Module):
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            emb = get_pos_emb_on_this_cp_rank(
+                emb, 0, cp_group, cp_partition_mode=cp_partition_mode
+            )
 
         return emb
 
-    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
+    def _set_cos_sin_cache(
+        self,
+        seq_len,
+        offset,
+        dtype,
+        packed_seq=False,
+        cp_group=None,
+        cp_partition_mode="zigzag",
+    ):
         """Materialize cached cos/sin tensors for ``[seq_len, ..., dim]``."""
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = packed_seq
+        self.cp_partition_mode_cached = cp_partition_mode
 
-        emb = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
+        emb = self.forward(
+            seq_len,
+            offset,
+            packed_seq=packed_seq,
+            cp_group=cp_group,
+            cp_partition_mode=cp_partition_mode,
+        )
         self.register_buffer("cos_cached", emb.cos().to(dtype).contiguous(), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype).contiguous(), persistent=False)
 
@@ -223,6 +241,7 @@ class RotaryEmbedding(nn.Module):
         dtype=torch.get_default_dtype(),
         packed_seq=False,
         cp_group=None,
+        cp_partition_mode="zigzag",
         mscale=None,
     ):
         """Get cached cos and sin values.
@@ -242,8 +261,11 @@ class RotaryEmbedding(nn.Module):
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
+            or cp_partition_mode != getattr(self, "cp_partition_mode_cached", None)
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group)
+            self._set_cos_sin_cache(
+                seq_len, offset, dtype, packed_seq, cp_group, cp_partition_mode
+            )
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
@@ -382,6 +404,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         mrope_section: List[int],
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_partition_mode="zigzag",
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -442,5 +465,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         if cp_group is not None and cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            emb = get_pos_emb_on_this_cp_rank(
+                emb, 0, cp_group, cp_partition_mode=cp_partition_mode
+            )
         return emb

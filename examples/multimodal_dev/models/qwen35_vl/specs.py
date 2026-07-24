@@ -19,8 +19,39 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _call_rope_helper(helper, *args, **kwargs):
+    """Call a RoPE helper while tolerating small API drift across MCore versions."""
+    from inspect import signature
+
+    supported = signature(helper).parameters
+    if kwargs.get("cp_partition_mode", "zigzag") != "zigzag":
+        required = ("cp_partition_mode", "max_seqlen")
+        missing = [name for name in required if name not in supported]
+        if missing:
+            raise RuntimeError(
+                f"{helper.__name__} does not support {missing}, so it cannot safely "
+                f"apply RoPE for cp_partition_mode={kwargs['cp_partition_mode']!r}."
+            )
+        if kwargs.get("max_seqlen") is None:
+            raise RuntimeError(
+                f"{helper.__name__} requires max_seqlen for "
+                f"cp_partition_mode={kwargs['cp_partition_mode']!r}."
+            )
+    return helper(*args, **{k: v for k, v in kwargs.items() if k in supported})
+
+
 def _apply_rope_fp32(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t,
+    freqs,
+    config,
+    cu_seqlens=None,
+    mscale=1.0,
+    cp_group=None,
+    mla_rotary_interleaved=False,
+    inverse=False,
+    mla_output_remove_interleaving=False,
+    cp_partition_mode="zigzag",
+    max_seqlen=None,
 ):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
@@ -37,31 +68,38 @@ def _apply_rope_fp32(
     t_fp32 = t.float()
 
     if cu_seqlens is None:
-        out = _apply_rotary_pos_emb_bshd(
+        out = _call_rope_helper(
+            _apply_rotary_pos_emb_bshd,
             t_fp32,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
         )
     else:
         if cp_group is None:
             cp_group = parallel_state.get_context_parallel_group()
-        out = _apply_rotary_pos_emb_thd(
+        out = _call_rope_helper(
+            _apply_rotary_pos_emb_thd,
             t_fp32,
             cu_seqlens,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
+            mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             cp_group=cp_group,
+            cp_partition_mode=cp_partition_mode,
+            inverse=inverse,
+            mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
         )
     return out.to(orig_dtype)
 
 
 def _apply_rope_fp32_no_cp(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, **kwargs
 ):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
@@ -71,13 +109,7 @@ def _apply_rope_fp32_no_cp(
     trivial group so the vision RoPE sees the full packed sequence.
     """
     return _apply_rope_fp32(
-        t,
-        freqs,
-        config,
-        cu_seqlens,
-        mscale,
-        cp_group=_NO_CP_GROUP,
-        max_seqlen=max_seqlen,
+        t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP, **kwargs,
     )
 
 

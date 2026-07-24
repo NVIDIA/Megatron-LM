@@ -2,6 +2,7 @@
 
 from typing import List, Optional
 
+from megatron.core.context_parallel_layout import CpPartitionMode
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
@@ -410,6 +411,77 @@ def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -
     """Check if the experimental attention variant is a linear attention variant."""
     linear_attention_variants = ["gated_delta_net"]
     return experimental_attention_variant in linear_attention_variants
+
+
+def get_experimental_attention_variant_layer_cp_partition_mode_pattern(
+    config: TransformerConfig,
+) -> List[Optional[CpPartitionMode]]:
+    """Return per-layer CP partition-mode requirements for experimental GPT specs."""
+    if config.experimental_attention_variant is None:
+        return ["zigzag"] * config.num_layers
+
+    experimental_attention_pattern = [0] * config.num_layers
+    if is_linear_attention_variant(config.experimental_attention_variant):
+        experimental_attention_pattern = get_linear_attention_pattern(config=config)
+    else:
+        experimental_attention_pattern = [1] * config.num_layers
+
+    experimental_layout = _get_experimental_attention_variant_cp_partition_mode(config)
+    return [
+        experimental_layout if uses_experimental_attention else "zigzag"
+        for uses_experimental_attention in experimental_attention_pattern
+    ]
+
+
+def get_experimental_attention_variant_stage_input_cp_partition_mode(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> Optional[CpPartitionMode]:
+    """Return the CP partition mode expected at one experimental GPT stage input."""
+    layer_layouts = get_experimental_attention_variant_layer_cp_partition_mode_pattern(config)
+
+    if config.pipeline_model_parallel_layout is not None:
+        stage_layer_offset = config.pipeline_model_parallel_layout.get_layer_offset(
+            layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
+        )
+    elif config.pipeline_model_parallel_size == 1 and pp_rank is None:
+        stage_layer_offset = 0
+    else:
+        stage_layer_offset = get_transformer_layer_offset(
+            config, vp_stage=vp_stage, pp_rank=pp_rank
+        )
+
+    current_partition_mode = None
+    for required_partition_mode in layer_layouts[:stage_layer_offset]:
+        if required_partition_mode is not None:
+            current_partition_mode = required_partition_mode
+
+    if current_partition_mode is None:
+        for required_partition_mode in layer_layouts[stage_layer_offset:]:
+            if required_partition_mode is not None:
+                current_partition_mode = required_partition_mode
+                break
+
+    return current_partition_mode
+
+
+def _get_experimental_attention_variant_cp_partition_mode(
+    config: TransformerConfig,
+) -> CpPartitionMode:
+    """Return the CP partition mode required by the experimental attention variant."""
+    if config.experimental_attention_variant == "gated_delta_net":
+        mode = getattr(config, "linear_cp_mode", "chunkwise")
+        if mode == "chunkwise":
+            return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
+        raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
+    if config.experimental_attention_variant == "dsv4_hybrid":
+        return "contiguous"
+    if config.experimental_attention_variant == "dsa":
+        return "zigzag"
+    raise ValueError(
+        f"Invalid experimental attention variant: {config.experimental_attention_variant}"
+    )
 
 
 def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:

@@ -571,8 +571,6 @@ class TestDecomposeReconstruct:
             )
         }
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
-        # Use the non-default mode so losing it during reconstruction is observable.
-        layer.config.cp_partition_mode = "contiguous"
         kw = {'packed_seq_params': psp, 'other': 'kept'}
         TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
         assert 'packed_seq_params' not in kw and 'cu_seqlens_q' in kw
@@ -580,7 +578,7 @@ class TestDecomposeReconstruct:
         r = kw['packed_seq_params']
         assert r.qkv_format == 'thd' and r.max_seqlen_q == 128
         assert r.pad_between_seqs is False
-        assert r.cp_partition_mode == "contiguous"
+        assert r.cp_partition_mode is None
         for k, v in orig.items():
             assert torch.equal(getattr(r, k), v)
 
