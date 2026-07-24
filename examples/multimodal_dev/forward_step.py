@@ -168,6 +168,142 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def _segment_bounds(seq_lens: Optional[torch.Tensor], sample_len: int) -> list[tuple[int, int]]:
+    """Per-segment (start, end) bounds of a sample's token axis.
+
+    ``seq_lens`` is the optional per-sample segment-length vector emitted by
+    the packed_window dataset mode; ``None`` means one segment spanning the
+    whole sample.
+    """
+    if seq_lens is None:
+        return [(0, sample_len)]
+    lengths = [int(length) for length in seq_lens.tolist()]
+    if any(length <= 0 for length in lengths):
+        raise ValueError(f"seq_lens must be positive, got {lengths}.")
+    if sum(lengths) != sample_len:
+        raise ValueError(
+            f"seq_lens sum {sum(lengths)} does not match the sample length {sample_len}."
+        )
+    ends = list(accumulate(lengths))
+    return list(zip([0] + ends[:-1], ends))
+
+
+def _append_cu_boundary(cu_seqlens: Optional[torch.Tensor], end: int) -> Optional[torch.Tensor]:
+    """Append one cumulative sequence boundary on the existing device."""
+    if cu_seqlens is None:
+        return None
+    boundary = torch.full((1,), int(end), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    return torch.cat((cu_seqlens, boundary), dim=0)
+
+
+def _pad_multimodal_thd_batch(
+    packed_batch: Dict[str, Any],
+    packed_seq_params: PackedSeqParams,
+    *,
+    pad_alignment: Any,
+    max_seqlen_per_dp_cp_rank: Optional[int],
+    pad_by_appending_dummy_seq: bool,
+    cp_size: int,
+    tp_size: int,
+    sequence_parallel: bool,
+) -> tuple[Dict[str, Any], PackedSeqParams]:
+    """Pad a pre-CP multimodal THD batch using CP-local alignment semantics.
+
+    The core scheduler pads tensors after CP partitioning, but the multimodal
+    path packs the complete global token buffer before model-side CP slicing.
+    Resolve the requested target in CP-local coordinates, convert it back to a
+    global target, and represent the physical tail as one ordinary dummy THD
+    sequence.  The dummy logical and padded lengths are kept equal even when
+    real samples already contain inter-sequence alignment padding.
+    """
+    if not pad_by_appending_dummy_seq:
+        raise ValueError(
+            "multimodal packed THD requires "
+            "--pad-packed-seq-by-appending-dummy-seq when "
+            "--pad-packed-seq-alignment is enabled"
+        )
+
+    global_actual = int(packed_batch["input_ids"].shape[-1])
+    metadata_actual = int(packed_seq_params.cu_seqlens_q_padded[-1].item())
+    if metadata_actual != global_actual:
+        raise ValueError(
+            "multimodal packed THD metadata does not cover the token buffer: "
+            f"cu_seqlens_q_padded[-1]={metadata_actual}, tokens={global_actual}"
+        )
+    if global_actual % cp_size != 0:
+        raise ValueError(f"global packed length {global_actual} must be divisible by CP={cp_size}")
+
+    local_actual = global_actual // cp_size
+    parallel_multiple = (2 if cp_size > 1 else 1) * (tp_size if sequence_parallel else 1)
+
+    if pad_alignment == "max":
+        if max_seqlen_per_dp_cp_rank is None:
+            raise ValueError(
+                "--max-seqlen-per-dp-cp-rank is required when " "--pad-packed-seq-alignment=max"
+            )
+        local_target = int(max_seqlen_per_dp_cp_rank)
+        if local_target % parallel_multiple != 0:
+            raise ValueError(
+                f"CP-local packed target {local_target} must be divisible by "
+                f"the CP/SP alignment {parallel_multiple}"
+            )
+    else:
+        if isinstance(pad_alignment, bool):
+            raise ValueError("--pad-packed-seq-alignment must be a positive integer or 'max'")
+        user_alignment = int(pad_alignment)
+        if user_alignment <= 0:
+            raise ValueError("--pad-packed-seq-alignment must be a positive integer or 'max'")
+        effective_alignment = math.lcm(user_alignment, parallel_multiple)
+        local_target = math.ceil(local_actual / effective_alignment) * effective_alignment
+
+    if local_target < local_actual:
+        raise ValueError(
+            f"CP-local packed length {local_actual} exceeds target {local_target}; "
+            "increase --max-seqlen-per-dp-cp-rank"
+        )
+
+    global_target = local_target * cp_size
+    physical_tail = global_target - global_actual
+    if physical_tail == 0:
+        packed_seq_params.pad_between_seqs = False
+        return packed_batch, packed_seq_params
+
+    if cp_size > 1 and physical_tail % (2 * cp_size) != 0:
+        raise ValueError(f"dummy THD tail {physical_tail} must be divisible by 2*CP={2 * cp_size}")
+
+    packed_batch["input_ids"] = F.pad(packed_batch["input_ids"], (0, physical_tail), value=0)
+    packed_batch["labels"] = F.pad(packed_batch["labels"], (0, physical_tail), value=-100)
+    packed_batch["loss_mask"] = F.pad(packed_batch["loss_mask"], (0, physical_tail), value=0)
+    padding_tail = torch.ones(
+        (*packed_batch["padding_mask"].shape[:-1], physical_tail),
+        dtype=torch.bool,
+        device=packed_batch["padding_mask"].device,
+    )
+    packed_batch["padding_mask"] = torch.cat((packed_batch["padding_mask"], padding_tail), dim=-1)
+
+    logical_q_end = int(packed_seq_params.cu_seqlens_q[-1].item()) + physical_tail
+    logical_kv_end = int(packed_seq_params.cu_seqlens_kv[-1].item()) + physical_tail
+    packed_seq_params = PackedSeqParams(
+        qkv_format=packed_seq_params.qkv_format,
+        cu_seqlens_q=_append_cu_boundary(packed_seq_params.cu_seqlens_q, logical_q_end),
+        cu_seqlens_kv=_append_cu_boundary(packed_seq_params.cu_seqlens_kv, logical_kv_end),
+        cu_seqlens_q_padded=_append_cu_boundary(
+            packed_seq_params.cu_seqlens_q_padded, global_target
+        ),
+        cu_seqlens_kv_padded=_append_cu_boundary(
+            packed_seq_params.cu_seqlens_kv_padded, global_target
+        ),
+        max_seqlen_q=max(int(packed_seq_params.max_seqlen_q), physical_tail),
+        max_seqlen_kv=max(int(packed_seq_params.max_seqlen_kv), physical_tail),
+        local_cp_size=packed_seq_params.local_cp_size,
+        cp_group=packed_seq_params.cp_group,
+        total_tokens=global_target,
+        pad_between_seqs=False,
+        cp_partition_mode=packed_seq_params.cp_partition_mode,
+    )
+    return packed_batch, packed_seq_params
+
+
 def pack_or_pad_batch(
     batch: Optional[list[Dict[str, Any]]],
     use_packed_sequence: bool = False,
@@ -192,9 +328,10 @@ def pack_or_pad_batch(
     # get_args() itself raises in test contexts where megatron globals are
     # not initialised.
     try:
-        has_sp = bool(getattr(get_args(), "sequence_parallel", False))
+        args = get_args()
     except AssertionError:
-        has_sp = False
+        args = None
+    has_sp = bool(getattr(args, "sequence_parallel", False))
 
     if cp_size > 1:
         divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
@@ -211,16 +348,32 @@ def pack_or_pad_batch(
             seqlens_list, seqlens_padded_list = [], []
 
             for sample in batch:
-                seqlen = sample["input_ids"].shape[0]
+                sample_len = sample["input_ids"].shape[0]
                 assert (
                     sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
-                target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
-                seqlens_list.append(seqlen)
-                seqlens_padded_list.append(target_len)
+                # A sample may carry multiple document segments (packed_window
+                # mode). Each segment becomes its own logical sequence: it is
+                # spliced into cu_seqlens and padded independently to the
+                # CP/SP alignment, so the physical layout always matches
+                # cu_seqlens_padded. Vision payloads stay sample-level:
+                # placeholder order inside the tokens already matches the
+                # pixel row order.
+                bounds = _segment_bounds(sample.get("seq_lens"), sample_len)
+                for start, end in bounds:
+                    seqlen = end - start
+                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                    input_ids_list.append(
+                        F.pad(sample["input_ids"][start:end], (0, target_len - seqlen), value=0)
+                    )
+                    labels_list.append(
+                        F.pad(sample["labels"][start:end], (0, target_len - seqlen), value=-100)
+                    )
+                    loss_mask_list.append(
+                        F.pad(sample["loss_mask"][start:end], (0, target_len - seqlen), value=0)
+                    )
+                    seqlens_list.append(seqlen)
+                    seqlens_padded_list.append(target_len)
                 pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
@@ -262,7 +415,7 @@ def pack_or_pad_batch(
         max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
         total_tokens = int(cu_seqlens_padded_t[-1].item())
 
-        packed_batch["packed_seq_params"] = PackedSeqParams(
+        packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_t,
             cu_seqlens_kv=cu_seqlens_t,
@@ -271,7 +424,31 @@ def pack_or_pad_batch(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
+            pad_between_seqs=False,
         )
+
+        if getattr(args, "cuda_graph_impl", "none") != "none":
+            raise ValueError(
+                "pretrain_multimodal packed THD does not yet support CUDA Graph; "
+                "the graph path currently requires the core sequence-packing scheduler"
+            )
+
+        pad_alignment = getattr(args, "pad_packed_seq_alignment", None)
+        if pad_alignment is not None:
+            packed_batch, packed_seq_params = _pad_multimodal_thd_batch(
+                packed_batch,
+                packed_seq_params,
+                pad_alignment=pad_alignment,
+                max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
+                pad_by_appending_dummy_seq=getattr(
+                    args, "pad_packed_seq_by_appending_dummy_seq", True
+                ),
+                cp_size=cp_size,
+                tp_size=tp_size,
+                sequence_parallel=has_sp,
+            )
+
+        packed_batch["packed_seq_params"] = packed_seq_params
         return packed_batch
 
     # ---------- padded (BSHD) branch ----------
@@ -280,6 +457,14 @@ def pack_or_pad_batch(
 
     if is_src:
         assert batch is not None, "source TP rank must provide a batch"
+        if any(
+            sample.get("seq_lens") is not None and sample["seq_lens"].numel() > 1
+            for sample in batch
+        ):
+            raise ValueError(
+                "Multi-segment packed_window samples require --use-packed-sequence "
+                "(THD); the padded BSHD layout has no segment representation."
+            )
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
         target_seqlens = min(max_seqlens, seq_length)
         # Round target seqlen up to the parallelism alignment factor so the
