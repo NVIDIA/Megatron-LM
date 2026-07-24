@@ -56,9 +56,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    # Limit both package-level and per-package compiler concurrency on ARM.
+    # Limit per-package compiler concurrency on ARM.
     if [ "$(uname -m)" = "aarch64" ]; then
-        export UV_CONCURRENT_BUILDS=1 MAX_JOBS=8
+        export MAX_JOBS=8
     fi
     uv sync -v \
         --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
