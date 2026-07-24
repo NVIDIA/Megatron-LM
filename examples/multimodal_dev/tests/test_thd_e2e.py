@@ -241,6 +241,67 @@ def test_multimodal_forward_partitions_cp_before_scattering_sequence_parallel(mo
     assert model.language_model.forward_kwargs["input_ids"].tolist() == [[10, 97, 16, 17]]
 
 
+def test_multimodal_forward_keeps_vision_grads_alive_without_images(monkeypatch):
+    """An image-free training microbatch still runs a zero-weight vision pass."""
+    from examples.multimodal_dev.models import base
+
+    events = []
+
+    class _FakeVision(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.spatial_merge_size = 2
+
+        def forward(self, pixel_values, image_grid_thw):
+            events.append(("vision", tuple(pixel_values.shape), image_grid_thw.tolist()))
+            return torch.zeros(1, 2)
+
+    class _FakeLanguage(torch.nn.Module):
+        def embedding(self, input_ids, position_ids):
+            return torch.arange(8, dtype=torch.float32).view(4, 1, 2)
+
+        def forward(self, **kwargs):
+            return kwargs["decoder_input"]
+
+    model = base.MultimodalModel.__new__(base.MultimodalModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(sequence_parallel=False)
+    model.image_token_id = 97
+    model.vision_model = _FakeVision()
+    model.language_model = _FakeLanguage()
+    model.train()
+
+    monkeypatch.setattr(base.parallel_state, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(base.parallel_state, "get_context_parallel_world_size", lambda: 1)
+
+    input_ids = torch.tensor([[10, 11, 12, 13]], dtype=torch.long)
+    forward_kwargs = dict(
+        input_ids=input_ids,
+        position_ids=torch.arange(4).unsqueeze(0),
+        labels=input_ids.clone(),
+        loss_mask=torch.ones_like(input_ids, dtype=torch.float32),
+        padding_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        pixel_values=torch.empty(0, 24),
+        image_grid_thw=torch.empty(0, 3, dtype=torch.long),
+        packed_seq_params=None,
+    )
+    output = model(**forward_kwargs)
+
+    # One minimal 4-patch dummy image keeps vision params in the graph while
+    # its zero-weighted scalar leaves the decoder input numerically unchanged.
+    assert events == [("vision", (4, 24), [[1, 2, 2]])]
+    assert torch.equal(output, torch.arange(8, dtype=torch.float32).view(4, 1, 2))
+
+    # The dummy pass must also run in eval: under Megatron-FSDP the vision
+    # tower's parameter unshard is a collective, so an image-free rank that
+    # skips the tower deadlocks the image-bearing ranks' all-gathers.
+    events.clear()
+    model.eval()
+    with torch.no_grad():
+        model(**forward_kwargs)
+    assert events == [("vision", (4, 24), [[1, 2, 2]])]
+
+
 # ===================================================================
 # pack_or_pad_batch — packed (THD) mode
 # ===================================================================

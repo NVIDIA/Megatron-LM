@@ -72,7 +72,10 @@ def _broadcast_tensor(tensor, src, group, device):
 
     if tensor is None:
         tensor = torch.empty(shape, dtype=dtype, device=device)
-    torch.distributed.broadcast(tensor, src, group=group)
+    # Zero-element tensors (e.g. pixel_values of a text-only microbatch) are
+    # fully described by the shape broadcast above; skip the data collective.
+    if tensor.numel() > 0:
+        torch.distributed.broadcast(tensor, src, group=group)
     return tensor
 
 

@@ -169,6 +169,28 @@ class MultimodalModel(MegatronModule):
         combined = combined.transpose(0, 1).contiguous()
         return combined
 
+    def _empty_vision_grad_anchor(self, pixel_values: Tensor) -> Tensor:
+        """Zero-valued scalar that keeps the vision tower live on image-free ranks.
+
+        An image-free microbatch (text-only samples) would otherwise skip the
+        vision tower entirely, which breaks two per-rank lockstep contracts:
+        in training, its parameters would produce no grads while image-bearing
+        ranks reduce real grads (bucketed grad sync requires every param to
+        register a grad); and under Megatron-FSDP the tower's per-module
+        parameter unshard is itself a collective, so a rank that never enters
+        the vision forward deadlocks the others' all-gathers — in evaluation
+        just as much as in training. Run the tower on one minimal dummy image
+        and fold a zero-weighted scalar into the decoder input instead.
+        """
+        merge = int(getattr(self.vision_model, "spatial_merge_size", 2))
+        dummy_pixels = torch.zeros(
+            (merge * merge, pixel_values.shape[-1]),
+            dtype=pixel_values.dtype,
+            device=pixel_values.device,
+        )
+        dummy_grid = torch.tensor([[1, merge, merge]], dtype=torch.long, device=pixel_values.device)
+        return self.vision_model(dummy_pixels, dummy_grid).sum() * 0.0
+
     def compute_position_ids(
         self, input_ids: Tensor, image_grid_thw: Optional[Tensor] = None, packed_seq_params=None
     ) -> Tensor:
@@ -337,8 +359,12 @@ class MultimodalModel(MegatronModule):
             )
 
         vision_embeddings = None
+        vision_grad_anchor = None
         if self.vision_model is not None and pixel_values is not None:
-            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            if pixel_values.shape[0] > 0:
+                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            else:
+                vision_grad_anchor = self._empty_vision_grad_anchor(pixel_values)
 
         if decoder_input is None and self.language_model is not None:
             text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
@@ -353,6 +379,8 @@ class MultimodalModel(MegatronModule):
                 )
             else:
                 decoder_input = text_embeddings
+            if vision_grad_anchor is not None:
+                decoder_input = decoder_input + vision_grad_anchor
 
         (
             decoder_input, input_ids, labels, loss_mask,
