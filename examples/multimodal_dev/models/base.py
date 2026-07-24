@@ -241,31 +241,65 @@ class MultimodalModel(MegatronModule):
         Returns ``(vision_embeddings | None, vision_grad_anchor | None)``.
         """
         chunk_patches = int(getattr(self, "vision_encoder_chunk_patches", 0) or 0)
+        pool = getattr(self, "vision_noise_pool", None)
+        streaming = pixel_values is None
+        if streaming:
+            # Synthetic-streaming profile: the dataset ships geometry only;
+            # every chunk input is a read-only VIEW into one preallocated
+            # noise pool, so autograd-saved conv inputs alias a single
+            # storage and retained-input memory is O(pool), independent of
+            # the window payload.
+            if pool is None:
+                raise RuntimeError(
+                    "Streaming vision payload (no pixel_values) requires the "
+                    "vision_noise_pool buffer; enable "
+                    "--mock-synthetic-streaming-pixels so the provider registers it."
+                )
+            if chunk_patches <= 0:
+                raise RuntimeError(
+                    "Streaming vision payloads require --vision-encoder-chunk-patches "
+                    "> 0; the pool holds at most one chunk."
+                )
         if chunk_patches <= 0:
             if pixel_values.shape[0] > 0:
                 return self.vision_model(pixel_values, image_grid_thw), None
             return None, self._empty_vision_grad_anchor(pixel_values)
 
-        slices = (
-            _vision_chunk_slices(image_grid_thw, chunk_patches) if pixel_values.shape[0] > 0 else []
+        reference = pool if streaming else pixel_values
+        has_payload = (
+            image_grid_thw is not None and image_grid_thw.shape[0] > 0
+            if streaming
+            else pixel_values.shape[0] > 0
         )
+        slices = _vision_chunk_slices(image_grid_thw, chunk_patches) if has_payload else []
         k_local = len(slices)
         k_global = k_local
         group = getattr(self, "vision_lockstep_group", None)
         if group is not None and torch.distributed.is_initialized():
-            counts = torch.tensor([k_local], dtype=torch.long, device=pixel_values.device)
+            counts = torch.tensor([k_local], dtype=torch.long, device=reference.device)
             torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.MAX, group=group)
             k_global = int(counts.item())
         if self.training:
             k_global = max(k_global, 1)
 
-        embeddings = [
-            self.vision_model(pixel_values[row_lo:row_hi], image_grid_thw[image_lo:image_hi])
-            for image_lo, image_hi, row_lo, row_hi in slices
-        ]
+        embeddings = []
+        for image_lo, image_hi, row_lo, row_hi in slices:
+            rows = row_hi - row_lo
+            if streaming:
+                if rows > pool.shape[0]:
+                    raise RuntimeError(
+                        f"Vision chunk needs {rows} raw patch rows but the noise "
+                        f"pool holds {pool.shape[0]}; keep "
+                        "--max-vision-patches-per-image <= "
+                        "--vision-encoder-chunk-patches."
+                    )
+                chunk_pixels = pool[:rows]
+            else:
+                chunk_pixels = pixel_values[row_lo:row_hi]
+            embeddings.append(self.vision_model(chunk_pixels, image_grid_thw[image_lo:image_hi]))
         anchor = None
         for _ in range(k_global - k_local):
-            dummy = self._empty_vision_grad_anchor(pixel_values)
+            dummy = self._empty_vision_grad_anchor(reference)
             anchor = dummy if anchor is None else anchor + dummy
         return (torch.cat(embeddings) if embeddings else None), anchor
 
@@ -448,7 +482,10 @@ class MultimodalModel(MegatronModule):
 
         vision_embeddings = None
         vision_grad_anchor = None
-        if self.vision_model is not None and pixel_values is not None:
+        if self.vision_model is not None and (
+            pixel_values is not None
+            or (image_grid_thw is not None and getattr(self, "vision_noise_pool", None) is not None)
+        ):
             vision_embeddings, vision_grad_anchor = self._vision_forward(
                 pixel_values, image_grid_thw
             )

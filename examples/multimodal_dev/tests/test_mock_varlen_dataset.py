@@ -174,6 +174,24 @@ class TestPackedWindowDataset:
         with pytest.raises(ValueError, match="buckets"):
             _make_dataset(image_size_config=None)
 
+    def test_streaming_mode_omits_pixel_values(self):
+        eager = _make_dataset()
+        streaming = _make_dataset(streaming_pixels=True)
+        for idx in range(len(streaming)):
+            sample = streaming[idx]
+            assert "pixel_values" not in sample
+            assert sample.keys() == {
+                "input_ids",
+                "labels",
+                "loss_mask",
+                "image_grid_thw",
+                "seq_lens",
+            }
+            # Geometry and tokens are identical to the eager profile.
+            reference = eager[idx]
+            for key in sample:
+                assert torch.equal(sample[key], reference[key]), key
+
     @pytest.mark.parametrize(
         ("image_size_config", "message"),
         [
@@ -307,6 +325,29 @@ class TestPackedWindowProvider:
         )
         with pytest.raises(ValueError, match="--sequence-packing-scheduler"):
             train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+    def test_streaming_requires_chunked_encoder(self, monkeypatch):
+        monkeypatch.setattr(
+            megatron.training,
+            "get_args",
+            lambda: _provider_args(
+                mock_synthetic_streaming_pixels=True, vision_encoder_chunk_patches=0
+            ),
+        )
+        with pytest.raises(ValueError, match="--vision-encoder-chunk-patches"):
+            train_valid_test_varlen_datasets_provider((1, 1, 1))
+
+    def test_streaming_flag_reaches_the_dataset(self, monkeypatch):
+        monkeypatch.setattr(
+            megatron.training,
+            "get_args",
+            lambda: _provider_args(
+                mock_synthetic_streaming_pixels=True, vision_encoder_chunk_patches=1024
+            ),
+        )
+        train_ds, _, _ = train_valid_test_varlen_datasets_provider((2, 1, 1))
+        assert train_ds.streaming_pixels
+        assert "pixel_values" not in train_ds[0]
 
     def test_requires_packed_sequence(self, monkeypatch):
         monkeypatch.setattr(

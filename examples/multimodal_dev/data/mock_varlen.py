@@ -69,6 +69,7 @@ class PackedWindowQwen35VLDataset(Dataset):
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         image_size_config: dict[str, Any] | None = None,
         max_raw_patches_per_window: int | None = None,
+        streaming_pixels: bool = False,
         patch_size: int = 16,
         temporal_patch_size: int = 2,
         spatial_merge_size: int = 2,
@@ -160,6 +161,7 @@ class PackedWindowQwen35VLDataset(Dataset):
         self.max_raw_patches_per_window = (
             int(max_raw_patches_per_window) if max_raw_patches_per_window is not None else None
         )
+        self.streaming_pixels = bool(streaming_pixels)
         # The plan pool bounds construction time and memory independently of
         # the virtual dataset length Megatron requests for the full training
         # schedule: indices wrap onto the pool for the window LAYOUT while
@@ -243,6 +245,16 @@ class PackedWindowQwen35VLDataset(Dataset):
         loss_mask[target_is_special] = 0.0
 
         if window.atoms:
+            image_grid_thw = torch.tensor(
+                [self.grids[atom.bucket_index] for atom in window.atoms], dtype=torch.long
+            )
+        else:
+            image_grid_thw = torch.empty((0, 3), dtype=torch.long)
+        if self.streaming_pixels:
+            # Synthetic-streaming profile: geometry only. The model
+            # materializes chunk inputs as views into its noise pool.
+            pixel_values = None
+        elif window.atoms:
             # One preallocated buffer, filled per image: no per-image tensor
             # list + concat, so the host peak is the payload itself rather
             # than twice the payload.
@@ -253,12 +265,8 @@ class PackedWindowQwen35VLDataset(Dataset):
                     generator=self._generator(idx, stream=_PIXEL_VALUE_STREAM, item=ordinal)
                 )
                 row += atom.raw_patches
-            image_grid_thw = torch.tensor(
-                [self.grids[atom.bucket_index] for atom in window.atoms], dtype=torch.long
-            )
         else:
             pixel_values = torch.empty((0, self.pixel_dim), dtype=torch.float32)
-            image_grid_thw = torch.empty((0, 3), dtype=torch.long)
 
         seq_lens = torch.tensor([length for _, length in window.segments], dtype=torch.long)
         if int(seq_lens.sum().item()) != self.seq_length:
@@ -267,14 +275,16 @@ class PackedWindowQwen35VLDataset(Dataset):
                 f"expected {self.seq_length}."
             )
 
-        return {
+        sample = {
             "input_ids": input_ids,
             "labels": labels,
             "loss_mask": loss_mask,
-            "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
             "seq_lens": seq_lens,
         }
+        if pixel_values is not None:
+            sample["pixel_values"] = pixel_values
+        return sample
 
 
 def train_valid_test_varlen_datasets_provider(
@@ -335,6 +345,12 @@ def train_valid_test_varlen_datasets_provider(
             "sample modes were removed; use --dataset-provider mock for "
             "fixed-shape data)."
         )
+    streaming_pixels = bool(getattr(args, "mock_synthetic_streaming_pixels", False))
+    if streaming_pixels and int(getattr(args, "vision_encoder_chunk_patches", 0) or 0) <= 0:
+        raise ValueError(
+            "--mock-synthetic-streaming-pixels requires "
+            "--vision-encoder-chunk-patches > 0 (the noise pool holds one chunk)."
+        )
     micro_batch_size = int(getattr(args, "micro_batch_size", 1) or 1)
     if micro_batch_size != 1:
         raise ValueError(
@@ -352,6 +368,7 @@ def train_valid_test_varlen_datasets_provider(
         # Mirror the packer guard at the dataset so over-budget windows fail
         # before pixels are materialized on the host.
         max_raw_patches_per_window=getattr(args, "max_vision_patches_per_microbatch", None),
+        streaming_pixels=streaming_pixels,
     )
     seed = int(getattr(args, "seed", 1234))
     return tuple(

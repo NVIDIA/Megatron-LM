@@ -125,6 +125,62 @@ class TestChunkedEncoderEquality:
             torch.testing.assert_close(p_chk, p_ref, rtol=1e-4, atol=1e-6, msg=name)
 
 
+@pytest.mark.skipif(_WORLD != 1, reason="single-rank memory proof")
+class TestStreamingPoolMemory:
+    """Reviewer P0-5 proof: retained conv inputs alias ONE pool storage,
+    so input-retention memory does not grow with the chunk count."""
+
+    def _run(self, encoder, grids, chunk_patches, pool):
+        outputs = []
+        for image_lo, image_hi, row_lo, row_hi in _vision_chunk_slices(grids, chunk_patches):
+            outputs.append(encoder(pool[: row_hi - row_lo], grids[image_lo:image_hi]))
+        return torch.cat(outputs)
+
+    def test_chunk_inputs_share_one_storage(self):
+        encoder = _small_encoder()
+        pool = torch.randn(1024, 3 * 2 * 16 * 16, device="cuda")
+        grids = torch.tensor([[1, 16, 16]] * 8, dtype=torch.long, device="cuda")  # 8 chunks
+        seen = []
+        inner_forward = encoder.forward
+
+        def spy(pixel_values, grid_thw):
+            seen.append(pixel_values.untyped_storage().data_ptr())
+            return inner_forward(pixel_values, grid_thw)
+
+        encoder.forward = spy
+        self._run(encoder, grids, chunk_patches=256, pool=pool)
+        assert len(seen) == 8
+        assert set(seen) == {pool.untyped_storage().data_ptr()}
+
+    def test_retained_input_memory_does_not_scale_with_chunks(self):
+        # Same per-chunk size; 2 vs 16 chunks. Eager fresh inputs would
+        # retain 8x more pixel memory; pool views retain O(pool).
+        encoder = _small_encoder()
+        pixel_dim = 3 * 2 * 16 * 16
+        pool = torch.randn(256, pixel_dim, device="cuda")
+
+        def measure(num_chunks):
+            grids = torch.tensor([[1, 16, 16]] * num_chunks, dtype=torch.long, device="cuda")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            baseline = torch.cuda.memory_allocated()
+            out = self._run(encoder, grids, chunk_patches=256, pool=pool)
+            torch.cuda.synchronize()
+            retained = torch.cuda.memory_allocated() - baseline
+            out.sum().backward()
+            encoder.zero_grad(set_to_none=True)
+            return retained, out.shape[0]
+
+        retained_2, tokens_2 = measure(2)
+        retained_16, tokens_16 = measure(16)
+        # Retained memory grows with activations/outputs (proportional to
+        # tokens) but must NOT additionally grow by the pixel payload:
+        # 16 chunks of fresh inputs would add >= 14 * pool_bytes.
+        pool_bytes = pool.numel() * pool.element_size()
+        activation_scaling = retained_2 * (tokens_16 / tokens_2)
+        assert retained_16 < activation_scaling + 4 * pool_bytes
+
+
 @pytest.mark.skipif(_WORLD != 2, reason="two-rank lockstep")
 class TestTwoRankLockstep:
     def _model(self, training):

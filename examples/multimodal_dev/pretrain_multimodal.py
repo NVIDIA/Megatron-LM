@@ -101,6 +101,30 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
             with_context_parallel=True
         )
 
+    # Synthetic-streaming pixels (Phase B): ONE read-only noise pool of
+    # exactly one chunk; every vision chunk input is a view into it, so
+    # autograd-saved conv inputs alias a single storage (retained-input
+    # memory is O(pool), independent of the window payload). Registered as
+    # a non-persistent buffer: never checkpointed, moves with the model.
+    if getattr(args, "mock_synthetic_streaming_pixels", False):
+        chunk_patches = int(getattr(args, "vision_encoder_chunk_patches", 0) or 0)
+        if chunk_patches <= 0:
+            raise ValueError(
+                "--mock-synthetic-streaming-pixels requires " "--vision-encoder-chunk-patches > 0."
+            )
+        pixel_dim = (
+            int(getattr(args, "vision_in_channels", 3))
+            * int(getattr(args, "vision_temporal_patch_size", 2))
+            * int(getattr(args, "vision_patch_size", 16)) ** 2
+        )
+        pool_dtype = torch.bfloat16 if args.bf16 else torch.half if args.fp16 else torch.float32
+        generator = torch.Generator().manual_seed(int(getattr(args, "seed", 1234)))
+        model.register_buffer(
+            "vision_noise_pool",
+            torch.randn(chunk_patches, pixel_dim, generator=generator).to(pool_dtype),
+            persistent=False,
+        )
+
     return model
 
 

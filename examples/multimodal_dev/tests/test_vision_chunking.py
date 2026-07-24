@@ -53,9 +53,11 @@ class _PerImageFakeVision:
 
     def __init__(self):
         self.calls = []
+        self.pixel_tensors = []
 
     def __call__(self, pixel_values, image_grid_thw):
         self.calls.append((tuple(pixel_values.shape), image_grid_thw.tolist()))
+        self.pixel_tensors.append(pixel_values)
         outputs = []
         row = 0
         for t, h, w in image_grid_thw.tolist():
@@ -65,12 +67,14 @@ class _PerImageFakeVision:
         return torch.cat(outputs) if outputs else pixel_values[:0]
 
 
-def _make_model(chunk_patches, *, training=True, group=None):
+def _make_model(chunk_patches, *, training=True, group=None, pool=None):
     model = MultimodalModel.__new__(MultimodalModel)
     model.vision_model = _PerImageFakeVision()
     model.vision_encoder_chunk_patches = chunk_patches
     model.vision_lockstep_group = group
     model.training = training
+    if pool is not None:
+        model.vision_noise_pool = pool
     return model
 
 
@@ -150,4 +154,39 @@ class TestLockstep:
         model = _make_model(0, training=True)
         embeddings, anchor = model._vision_forward(torch.empty(0, 6), _grids())
         assert embeddings is None and anchor is not None
+        assert len(model.vision_model.calls) == 1
+
+
+class TestStreamingNoisePool:
+    def test_every_chunk_input_aliases_the_pool_storage(self):
+        pool = torch.randn(8, 6)
+        grids = _grids((2, 2), (2, 2), (2, 2))  # 3 x 4 patches, chunk 8 -> 2 chunks
+        model = _make_model(8, pool=pool)
+        embeddings, anchor = model._vision_forward(None, grids)
+
+        assert embeddings is not None and anchor is None
+        pool_ptr = pool.untyped_storage().data_ptr()
+        for shape, _ in model.vision_model.calls:
+            assert shape[1] == 6
+        for pixels in model.vision_model.pixel_tensors:
+            assert pixels.untyped_storage().data_ptr() == pool_ptr
+
+    def test_streaming_without_pool_or_chunking_fails(self):
+        grids = _grids((2, 2))
+        with pytest.raises(RuntimeError, match="vision_noise_pool"):
+            _make_model(8, pool=None)._vision_forward(None, grids)
+        with pytest.raises(RuntimeError, match="chunk-patches"):
+            _make_model(0, pool=torch.randn(8, 6))._vision_forward(None, grids)
+
+    def test_chunk_larger_than_pool_fails_loudly(self):
+        grids = _grids((10, 2))  # 20-patch image > 8-row pool
+        model = _make_model(8, pool=torch.randn(8, 6))
+        with pytest.raises(RuntimeError, match="noise\npool|noise pool"):
+            model._vision_forward(None, grids)
+
+    def test_streaming_image_free_training_runs_one_dummy(self):
+        model = _make_model(8, pool=torch.randn(8, 6), training=True)
+        embeddings, anchor = model._vision_forward(None, _grids())
+        assert embeddings is None
+        assert anchor is not None and float(anchor) == 0.0
         assert len(model.vision_model.calls) == 1

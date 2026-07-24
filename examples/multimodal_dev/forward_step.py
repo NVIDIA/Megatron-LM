@@ -393,6 +393,16 @@ def pack_or_pad_batch(
             pixel_values_list, image_grid_thw_list = [], []
             seqlens_list, seqlens_padded_list = [], []
 
+            # Synthetic-streaming samples carry geometry only (no
+            # pixel_values); the whole microbatch must agree.
+            pixel_free = ["pixel_values" not in sample for sample in batch]
+            if any(pixel_free) and not all(pixel_free):
+                raise ValueError(
+                    "Mixed eager and streaming samples in one microbatch: "
+                    "every sample must either carry pixel_values or none may."
+                )
+            is_streaming = bool(batch) and all(pixel_free)
+
             for sample in batch:
                 sample_len = sample["input_ids"].shape[0]
                 assert (
@@ -420,7 +430,8 @@ def pack_or_pad_batch(
                     )
                     seqlens_list.append(seqlen)
                     seqlens_padded_list.append(target_len)
-                pixel_values_list.append(sample["pixel_values"])
+                if not is_streaming:
+                    pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
@@ -443,10 +454,11 @@ def pack_or_pad_batch(
             packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
             packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
-            packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+            if not is_streaming:
+                packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
             _check_vision_patch_budget(
-                packed_batch["pixel_values"], packed_batch["image_grid_thw"], args
+                packed_batch.get("pixel_values"), packed_batch["image_grid_thw"], args
             )
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
@@ -513,6 +525,12 @@ def pack_or_pad_batch(
             raise ValueError(
                 "Multi-segment packed_window samples require --use-packed-sequence "
                 "(THD); the padded BSHD layout has no segment representation."
+            )
+        if any("pixel_values" not in sample for sample in batch):
+            raise ValueError(
+                "Synthetic-streaming (pixel-free) samples require "
+                "--use-packed-sequence; the padded BSHD branch has no "
+                "streaming representation."
             )
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
         target_seqlens = min(max_seqlens, seq_length)

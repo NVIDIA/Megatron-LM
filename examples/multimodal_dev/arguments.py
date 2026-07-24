@@ -112,6 +112,21 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mock-synthetic-streaming-pixels",
+        action="store_true",
+        default=False,
+        help=(
+            "Phase B synthetic-streaming profile: the mock dataset emits "
+            "geometry only (no pixel_values) and the model materializes each "
+            "vision chunk's input as read-only views into one GPU-resident "
+            "noise pool, eliminating the host-side pixel payload, its "
+            "DataLoader/broadcast cost, and autograd input retention. "
+            "Requires --vision-encoder-chunk-patches > 0. This is a GPU "
+            "compute stress profile; it does NOT measure real dataloader/"
+            "H2D behavior — use the eager path for that."
+        ),
+    )
+    group.add_argument(
         "--max-vision-patches-per-microbatch",
         type=int,
         default=None,
