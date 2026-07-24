@@ -109,6 +109,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "ffn_hidden_size": 1856,
     "finalize_model_grads_func": None,
     "first_last_layers_bf16": False,
+    "flash_attention_version": None,
     "flash_decode": False,
     "fp16": False,
     "fp32_residual_connection": False,

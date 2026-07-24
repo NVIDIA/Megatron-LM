@@ -861,7 +861,10 @@ def validate_args(args, defaults={}):
             )
 
     # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    if args.hybrid_layer_pattern and (
+            Symbols.MLA in args.hybrid_layer_pattern
+            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -1081,6 +1084,17 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
+        if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
+            # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
+            # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
+            # grouped backing storage remapped instead; quantized grouped tensors also need
+            # grouped scale/amax handling. DDP has a separate GroupedTensor-aware path.
+            raise ValueError(
+                "Megatron-FSDP does not currently support moe_single_grouped_weight or "
+                "moe_single_grouped_bias. Disable single grouped MoE parameters or use the "
+                "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
+                "GroupedTensor param buffers."
+            )
         # Optimizer compatibility check.
         assert args.optimizer in ('sgd', 'adam'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
@@ -1978,9 +1992,10 @@ def _add_inference_args(parser):
                        'covers both the durable cache (the ssm_states/conv_states '
                        'slots reused across requests) and the per-step extraction '
                        'scratch (the intermediate_ssm_out/intermediate_conv_out '
-                       'buffers, sized to 3 * max_requests slots); the scratch is '
-                       'reserved first, so a larger max_requests leaves fewer durable '
-                       'slots.')
+                       'buffers, sized to min(ceil(max_tokens / block_size), '
+                       '3 * max_requests) slots); the scratch is reserved first, so a '
+                       'smaller max_tokens (or max_requests) shrinks the scratch and '
+                       'leaves more durable slots.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
@@ -2000,11 +2015,13 @@ def _add_inference_args(parser):
                             'is requested but the package is not installed.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='legacy',
-                       choices=['legacy', 'serial'],
+                       choices=['legacy', 'serial', 'overlap'],
                        help='Async scheduling mode for dynamic batching. '
                             '"legacy" (default) preserves the existing resolve-before-prepare '
                             'path. "serial" speculatively prepares and forwards decode-only '
-                            'steps before resolving finished requests.')
+                            'steps before resolving finished requests. "overlap" uses the same '
+                            'async scheduling path while overlapping prepare/sample and '
+                            'forward/resolve phases.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
