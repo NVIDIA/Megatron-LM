@@ -872,7 +872,9 @@ def process_mtp_loss(
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
-        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        mtp_loss_scale = (
+            config.mtp_ce_loss_scale * config.mtp_loss_scaling_factor / config.mtp_num_layers
+        )
         if config.calculate_per_token_loss:
             # When calculate_per_token_loss is enabled, finalize_model_grads will
             # divide all gradients by total_num_tokens (from main loss).

@@ -1628,6 +1628,25 @@ def validate_args(args, defaults={}):
             'Logits are flushed as an async request in the checkpoint queue.'
         )
 
+    if args.logits_save_mtp:
+        assert args.logits_save_dir is not None, '--logits-save-mtp requires --logits-save-dir.'
+        assert args.mtp_num_layers and args.mtp_num_layers > 0, (
+            '--logits-save-mtp requires --mtp-num-layers > 0.'
+        )
+
+    if args.logits_load_mtp:
+        assert args.logits_load_dir is not None, '--logits-load-mtp requires --logits-load-dir.'
+        assert args.mtp_num_layers and args.mtp_num_layers > 0, (
+            '--logits-load-mtp requires --mtp-num-layers > 0.'
+        )
+        # MTP heads use their own KD alpha, defaulting to the main-head alpha.
+        if args.logits_load_mtp_kd_alpha is None:
+            args.logits_load_mtp_kd_alpha = args.logits_load_kd_loss_alpha
+        # Mirror the main head: apply the (1-alpha_mtp) share of the native per-depth MTP
+        # cross-entropy at its source (process_mtp_loss), so the combined MTP objective
+        # is (1-alpha_mtp)*MTP_CE + alpha_mtp*MTP_KD. Flows to config.mtp_ce_loss_scale.
+        args.mtp_ce_loss_scale = 1.0 - args.logits_load_mtp_kd_alpha
+
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
             warn_rank_0(
@@ -3493,6 +3512,10 @@ def _add_logits_distillation_args(parser):
     group.add_argument('--logits-save-dtype', type=str, default='fp16',
                        choices=['fp16', 'bf16', 'fp32'],
                        help='Dtype for on-disk top-K log-probabilities.')
+    group.add_argument('--logits-save-mtp', action='store_true', default=False,
+                       help='Also save the Multi-Token-Prediction (MTP) head logits, '
+                            'not just the main LM head. Requires --mtp-num-layers > 0. '
+                            'Stored data grows by a factor of (1 + mtp_num_layers).')
     group.add_argument('--logits-load-dir', type=str, default=None,
                        help='Directory to load logits.')
     group.add_argument('--logits-load-decode-threads', type=int, default=4,
@@ -3512,6 +3535,18 @@ def _add_logits_distillation_args(parser):
                        default=False,
                        help='When set, KD loss errors are logged as warnings and '
                             'training falls back to LM-only loss instead of crashing.')
+    group.add_argument('--logits-load-mtp', action='store_true', default=False,
+                       help='Also distill the Multi-Token-Prediction (MTP) head logits. '
+                            'Requires --mtp-num-layers > 0 and a teacher save produced with '
+                            '--logits-save-mtp (matching mtp_num_layers). Per MTP head the '
+                            'objective mirrors the main head: (1-alpha)*native MTP CE + '
+                            'alpha*MTP-KD, weighted by mtp_loss_scaling_factor/mtp_num_layers.')
+    group.add_argument('--logits-load-mtp-kd-alpha', type=float, default=None,
+                       help='KD loss alpha applied to the MTP heads (the main head keeps '
+                            '--logits-load-kd-loss-alpha). Per MTP head the objective is '
+                            '(1-alpha_mtp)*native MTP CE + alpha_mtp*MTP-KD. Defaults to '
+                            '--logits-load-kd-loss-alpha when unset. Only used with '
+                            '--logits-load-mtp.')
     return parser
 
 

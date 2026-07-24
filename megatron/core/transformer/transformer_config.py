@@ -87,6 +87,12 @@ class TransformerConfig(ModelParallelConfig):
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
 
+    mtp_ce_loss_scale: float = 1.0
+    """Extra multiplier applied to the native per-depth MTP cross-entropy loss.
+    Defaults to 1.0 (no change). Set below 1.0 when blending the MTP CE loss with an
+    external MTP objective (e.g. offline cached-logits knowledge distillation, which sets
+    this to ``1 - kd_loss_alpha`` so the combined per-head objective mirrors the main head)."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.

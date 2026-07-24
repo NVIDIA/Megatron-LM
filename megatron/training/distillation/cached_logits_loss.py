@@ -57,7 +57,7 @@ Usage example
 import concurrent.futures
 import logging
 from collections import deque
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -66,6 +66,7 @@ import torch.utils.data
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 from megatron.training.distillation.utils_logits import (
   BATCHED_TAR_RE,
@@ -97,11 +98,26 @@ def get_student_logits_capture() -> Optional["StudentLogitsCapture"]:
 
 
 class StudentLogitsCapture:
-    """Forward-hook helper that keeps the latest differentiable student logits."""
+    """Forward-hook helper that keeps the differentiable student logits.
+
+    The shared ``output_layer`` fires once per head in firing order
+    ``[mtp_0 .. mtp_{N-1}, main]`` (main last). We accumulate the heads of the
+    in-flight microbatch and finalize them when the main head fires:
+
+    * :meth:`pop` returns the main-head logits (unchanged single-head behavior).
+    * :meth:`pop_all` returns the full ordered head list for MTP distillation.
+    """
 
     def __init__(self):
         self._logits: Optional[torch.Tensor] = None
+        self._heads: Optional[List[torch.Tensor]] = None
+        self._curr_heads: List[torch.Tensor] = []
         self._hook_handles: List[Any] = []
+
+        # Firing-order bookkeeping (mirrors the teacher-side saver).
+        args = get_args()
+        self._mtp_num_layers = getattr(args, "mtp_num_layers", None) or 0
+        self._curr_mtp_passes = 0
 
     def attach_hooks(self, model: LanguageModule) -> None:
         """Attach forward hooks to the model's output layer."""
@@ -119,11 +135,19 @@ class StudentLogitsCapture:
     ) -> None:
         if not module.training:
             return
-        # NOTE: Assumes main head runs after MTP layers, overwriting this value prior to pop().
-        self._logits = output[0] if isinstance(output, tuple) else output
+        logits = output[0] if isinstance(output, tuple) else output
+        self._curr_heads.append(logits)
+        if self._curr_mtp_passes == self._mtp_num_layers:
+            # Main head (last firing) — finalize this microbatch's heads.
+            self._logits = logits
+            self._heads = self._curr_heads
+            self._curr_heads = []
+            self._curr_mtp_passes = 0
+        else:
+            self._curr_mtp_passes += 1
 
     def pop(self) -> torch.Tensor:
-        """Return captured logits and clear the reference for the next forward."""
+        """Return the main-head logits and clear state for the next forward."""
         if self._logits is None:
             raise RuntimeError(
                 "No student logits were captured for cached-logits KD. "
@@ -131,7 +155,20 @@ class StudentLogitsCapture:
             )
         logits = self._logits
         self._logits = None
+        self._heads = None
         return logits
+
+    def pop_all(self) -> List[torch.Tensor]:
+        """Return all captured head logits ``[mtp_0 .. mtp_{N-1}, main]`` and clear."""
+        if self._heads is None:
+            raise RuntimeError(
+                "No student head logits were captured for multi-head cached-logits KD. "
+                "Attach StudentLogitsCapture to the model output layer during setup."
+            )
+        heads = self._heads
+        self._heads = None
+        self._logits = None
+        return heads
 
     def remove_hooks(self) -> None:
         """Remove all registered hooks and clear captured state."""
@@ -139,6 +176,9 @@ class StudentLogitsCapture:
             handle.remove()
         self._hook_handles.clear()
         self._logits = None
+        self._heads = None
+        self._curr_heads = []
+        self._curr_mtp_passes = 0
 
 
 def _compute_dp_remapping(
@@ -247,11 +287,15 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         decode_threads: int = 1,
         decode_lookahead: Optional[int] = None,
         msc_prefetch_depth: int = 2,
+        expected_num_heads: Optional[int] = None,
     ):
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
         self.dp_rank = dp_rank
         self.start_iteration = start_iteration
+        # Expected number of saved heads (1 main + mtp_num_layers). When set, each
+        # tar's _meta.json num_heads is verified against it before any decode.
+        self._expected_num_heads = expected_num_heads
 
         self._remote_logprobs = is_remote_storage_path(logprobs_dir)
         self._msc_prefetch_depth = max(0, msc_prefetch_depth)
@@ -411,8 +455,13 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         self,
         entry: LogprobsTarEntry,
     ) -> Tuple[int, List[torch.Tensor], List[torch.Tensor]]:
-        """Decode one raw tar payload into logical iteration tensors."""
-        values_list, indices_list = decode_logprobs_payload(entry.data)
+        """Decode one raw tar payload into logical iteration tensors.
+
+        For the multi-head (MTP) format each microbatch element is itself a
+        per-head list ordered ``[mtp_0 .. mtp_{N-1}, main]``; it flows through
+        the DP slice/interleave helpers as an opaque per-microbatch element.
+        """
+        values_list, indices_list, _num_heads = decode_logprobs_payload(entry.data)
         return entry.iteration, values_list, indices_list
 
     def _iter_entries_parallel(
@@ -461,6 +510,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             url,
             start_iteration=self.start_iteration,
             expected_hash=self._expected_hash,
+            expected_num_heads=self._expected_num_heads,
         )
         if pool is None:
             for entry in entries:
@@ -654,11 +704,14 @@ class CachedLogitsKDLoss:
         decode_threads: int = 1,
         prefetch_factor: int = 2,
         msc_prefetch_depth: int = 2,
+        num_heads: int = 1,
     ):
         self.logprobs_dir = logprobs_dir
         self._decode_threads = decode_threads
         self._prefetch_factor = prefetch_factor
         self._msc_prefetch_depth = msc_prefetch_depth
+        # Number of distilled heads: 1 (main only) or 1 + mtp_num_layers.
+        self.num_heads = num_heads
 
         # ---- parallel-state bookkeeping ----
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -693,6 +746,7 @@ class CachedLogitsKDLoss:
             start_iteration=start_iteration,
             decode_threads=self._decode_threads,
             msc_prefetch_depth=self._msc_prefetch_depth,
+            expected_num_heads=self.num_heads,
         )
         # Remote shard discovery uses rank-0 collectives, so it must run in the
         # main training process rather than a DataLoader worker.
@@ -724,25 +778,47 @@ class CachedLogitsKDLoss:
         self._current_indices = indices_list
         self._microbatch_counter = 0
 
-    def __call__(
+    def _kd_for_head(
         self,
         student_logits: torch.Tensor,
+        teacher_values: torch.Tensor,
+        teacher_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Move one head's teacher top-K to GPU and compute its sparse KL."""
+        teacher_values = teacher_values.to(student_logits.device, non_blocking=True)
+        teacher_indices = teacher_indices.to(student_logits.device, non_blocking=True)
+        return topk_kl_div(
+            student_logits,
+            teacher_values,
+            teacher_indices,
+            self.tp_size,
+            self.tp_rank,
+            self.tp_group,
+            add_ghost_token=True,
+        )
+
+    def __call__(
+        self,
+        student_logits: Union[torch.Tensor, List[torch.Tensor]],
         iteration: Optional[int] = None,
         microbatch_idx: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Compute KL-divergence loss for one microbatch.
 
         Args:
-            student_logits: ``(seq_len, batch, local_vocab_size)`` – raw
-                (pre-softmax) student logits from this TP rank's vocab shard.
+            student_logits: raw (pre-softmax) student logits from this TP rank's
+                vocab shard, shape ``(seq_len, batch, local_vocab_size)``. For the
+                multi-head case (``num_heads > 1``) this is a per-head list ordered
+                ``[mtp_0 .. mtp_{N-1}, main]``.
             iteration: Training iteration.  Defaults to ``args.curr_iteration``.
             microbatch_idx: Microbatch index within the current iteration.
                 Defaults to an auto-incremented counter that resets on each
                 new iteration.
 
         Returns:
-            Tensor of shape ``(batch, seq_len)`` – per-token forward KL
-            divergence (unreduced).
+            For ``num_heads == 1`` a tensor of shape ``(batch, seq_len)`` – the
+            per-token forward KL. For ``num_heads > 1`` a per-head list of such
+            tensors in the same ``[mtp_0 .. mtp_{N-1}, main]`` order.
         """
         # ---- resolve iteration ----
         if iteration is None:
@@ -769,27 +845,27 @@ class CachedLogitsKDLoss:
                 f"iteration {iteration}."
             )
 
-        # ---- move teacher data to GPU (non-blocking: tensors are pinned) ----
-        teacher_values = self._current_values[microbatch_idx].to(
-            student_logits.device, non_blocking=True
-        )
-        teacher_indices = self._current_indices[microbatch_idx].to(
-            student_logits.device, non_blocking=True
-        )
-
         logger.debug("[TP%s-CP%s-DP%s]: Iter_%s Batch_%s",
                      self.tp_rank, self.cp_rank, self.dp_rank, iteration, microbatch_idx)
 
-        # ---- compute loss ----
-        return topk_kl_div(
-            student_logits,
-            teacher_values,
-            teacher_indices,
-            self.tp_size,
-            self.tp_rank,
-            self.tp_group,
-            add_ghost_token=True,
-        )
+        teacher_values = self._current_values[microbatch_idx]
+        teacher_indices = self._current_indices[microbatch_idx]
+
+        # ---- single-head (main only): unchanged behavior ----
+        if self.num_heads == 1:
+            return self._kd_for_head(student_logits, teacher_values, teacher_indices)
+
+        # ---- multi-head: one sparse KL per head, in [mtp_0..mtp_{N-1}, main] order ----
+        if not isinstance(student_logits, (list, tuple)) or len(student_logits) != self.num_heads:
+            raise ValueError(
+                f"Expected {self.num_heads} student head logits for multi-head KD, "
+                f"got {type(student_logits).__name__} with "
+                f"{len(student_logits) if isinstance(student_logits, (list, tuple)) else 'N/A'} entries."
+            )
+        return [
+            self._kd_for_head(student_logits[h], teacher_values[h], teacher_indices[h])
+            for h in range(self.num_heads)
+        ]
 
 # ---------------------------------------------------------------------------
 #  Main callable wrapper to pass to Megatron LM training loop
@@ -804,6 +880,7 @@ class LossFuncCallable:
         kd_loss_alpha: float = 0.5,
         ignore_errors: bool = False,
         msc_prefetch_depth: int = 2,
+        load_mtp: bool = False,
     ):
         self.logprobs_dir = logprobs_dir
         self.decode_threads = decode_threads
@@ -812,6 +889,20 @@ class LossFuncCallable:
         self.kd_func = None
         self.alpha = kd_loss_alpha
         self.ignore_errors = ignore_errors
+
+        # MTP-head distillation. When enabled, distill all 1 + mtp_num_layers heads
+        # and mirror the main head per MTP depth: (1-alpha_mtp)*native MTP CE (scaled at
+        # the source via config.mtp_ce_loss_scale) + alpha_mtp*MTP-KD, weighted by
+        # mtp_loss_scaling_factor / mtp_num_layers to match the native MTP objective.
+        # alpha_mtp is --logits-load-mtp-kd-alpha, falling back to the main-head alpha.
+        args = get_args()
+        mtp_num_layers = getattr(args, "mtp_num_layers", None) or 0
+        self.load_mtp = bool(load_mtp) and mtp_num_layers > 0
+        self.mtp_num_layers = mtp_num_layers
+        self.mtp_loss_scaling_factor = getattr(args, "mtp_loss_scaling_factor", 0.1) or 0.0
+        mtp_alpha = getattr(args, "logits_load_mtp_kd_alpha", None)
+        self.mtp_alpha = kd_loss_alpha if mtp_alpha is None else mtp_alpha
+        self.num_heads = 1 + (self.mtp_num_layers if self.load_mtp else 0)
 
     @staticmethod
     def _mask_loss(output_tensor, loss_mask):
@@ -835,7 +926,10 @@ class LossFuncCallable:
                 decode_threads=self.decode_threads,
                 prefetch_factor=self.prefetch_factor,
                 msc_prefetch_depth=self.msc_prefetch_depth,
+                num_heads=self.num_heads,
             )
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
 
         # LM loss
         loss_lm = self._mask_loss(output_tensor, loss_mask)
@@ -855,12 +949,27 @@ class LossFuncCallable:
                     "Cached-logits KD requires StudentLogitsCapture to be attached "
                     "to the model output layer during setup."
                 )
-            logits = logits_capture.pop()
 
-            loss_kd = self.kd_func(logits)
-            loss_kd = self._mask_loss(loss_kd, loss_mask)
-            # Requires extra TP reduction
-            dist.all_reduce(loss_kd, group=parallel_state.get_tensor_model_parallel_group())
+            loss_mtp_kd = None
+            if self.num_heads == 1:
+                logits = logits_capture.pop()
+                loss_kd = self._mask_loss(self.kd_func(logits), loss_mask)
+                dist.all_reduce(loss_kd, group=tp_group)  # extra TP reduction
+            else:
+                # Ordered [mtp_0 .. mtp_{N-1}, main]; the main head is last.
+                head_logits = logits_capture.pop_all()
+                kd_per_head = self.kd_func(head_logits)
+                loss_kd = self._mask_loss(kd_per_head[-1], loss_mask)
+                dist.all_reduce(loss_kd, group=tp_group)
+
+                # MTP heads: sum masked per-head KL, TP-reduced, then weight like the
+                # native MTP objective (mtp_loss_scaling_factor / mtp_num_layers).
+                loss_mtp_kd = output_tensor.new_zeros(())
+                for head_kl in kd_per_head[:-1]:
+                    head_loss = self._mask_loss(head_kl, loss_mask)
+                    dist.all_reduce(head_loss, group=tp_group)
+                    loss_mtp_kd = loss_mtp_kd + head_loss
+                loss_mtp_kd = (self.mtp_loss_scaling_factor / self.mtp_num_layers) * loss_mtp_kd
         except Exception as e:
             if not self.ignore_errors:
                 raise
@@ -871,6 +980,13 @@ class LossFuncCallable:
         report["logits distillation loss"] = torch.cat([loss_kd.clone().detach().view(1), num_tokens.view(1)])
 
         loss_total = (1 - self.alpha) * loss_lm + self.alpha * loss_kd
+        if loss_mtp_kd is not None:
+            # Add the alpha_mtp-weighted MTP-head KD. The (1-alpha_mtp) share of the native
+            # per-depth MTP CE is applied at the source via config.mtp_ce_loss_scale.
+            report["mtp distillation loss"] = torch.cat(
+                [loss_mtp_kd.clone().detach().view(1), num_tokens.view(1)]
+            )
+            loss_total = loss_total + self.mtp_alpha * loss_mtp_kd
         report["total loss"] = torch.cat([loss_total.clone().detach().view(1), num_tokens.view(1)])
 
         return loss_total, num_tokens, report
