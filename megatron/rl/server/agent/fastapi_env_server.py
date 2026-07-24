@@ -121,6 +121,7 @@ class FastAPIEnvServer(EnvironmentServer):
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
+        env_index: int = 0,
     ) -> GroupRolloutParams:
         raise NotImplementedError(
             "FastAPIEnvServer overrides get_grouped_rollouts; prepare_group_rollout is not used."
@@ -141,7 +142,6 @@ class FastAPIEnvServer(EnvironmentServer):
         assert (
             request.submission_granularity != "R"
         ), "FastAPIEnvServer does not support rollout submission granularity"
-        assert not request.streaming, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient() as client:

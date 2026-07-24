@@ -35,7 +35,6 @@ from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
 from megatron.rl.inference import ReturnsRaw
-from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -174,70 +173,47 @@ class TestRLUtils:
         assert args.rl_consumption_granularity == "B"
         assert args.rl_generation_lag == 0
         assert not hasattr(args, "rl_parallel_generation_tasks")
-        assert get_rl_parallel_generation_tasks(args) == 1
 
     @pytest.mark.parametrize(
-        "submission_granularity, generation_lag, expected_parallel_generation_tasks",
+        "submission_granularity",
         [
-            pytest.param("B", 0, 1, id="batch"),
-            pytest.param("B", 2, 3, id="batch_with_lag"),
-            pytest.param("G", 0, 8, id="group"),
-            pytest.param("G", 2, 24, id="group_with_lag"),
-            pytest.param("R", 0, 32, id="rollout"),
-            pytest.param("R", 2, 96, id="rollout_with_lag"),
-        ],
-    )
-    def test_get_rl_parallel_generation_tasks(
-        self, submission_granularity, generation_lag, expected_parallel_generation_tasks
-    ):
-        args = SimpleNamespace(
-            rl_submission_granularity=submission_granularity,
-            rl_generation_lag=generation_lag,
-            grpo_prompts_per_step=8,
-            grpo_group_size=4,
-        )
-
-        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
-
-    @pytest.mark.parametrize(
-        "rl_partial_rollouts, submission_granularity",
-        [
-            pytest.param(False, "B", id="non_streaming_batch"),
-            pytest.param(True, "B", id="streaming_batch"),
-            pytest.param(True, "G", id="streaming_group"),
-            pytest.param(True, "R", id="streaming_rollout"),
+            pytest.param("B", id="batch"),
+            pytest.param("G", id="group"),
+            pytest.param("E", id="env"),
+            pytest.param("R", id="rollout"),
         ],
     )
     def test_get_rollout_generator_keeps_num_groups_at_trainer_batch_size(
-        self, monkeypatch, rl_partial_rollouts, submission_granularity
+        self, monkeypatch, submission_granularity
     ):
         """Regression for the removed ``num_groups=1`` streaming override.
 
         Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
-        streamed with a non-batch submission granularity. For a multi-environment
-        agent that collapses the per-env group distribution so some environments
-        receive zero groups (and a degenerate all-zero ``agent_slots``), stalling
-        ``get_grouped_rollouts``. ``num_groups`` must stay at the trainer batch size
-        (``n_prompts``) regardless of streaming or submission granularity.
+        streamed with a non-batch submission granularity, collapsing the per-env
+        group layout so some environments received zero groups. ``num_groups``
+        must stay at the trainer batch size (``n_prompts``) regardless of
+        submission granularity.
         """
         n_prompts = 8
         captured = {}
         rollout_generator = object()
+        agent = MagicMock()
 
-        class Agent:
-            def get_grouped_rollouts(self, request):
+        class FakePipeline:
+            def __init__(self, agent, request, parallel_generation_tasks):
+                captured["agent"] = agent
                 captured["request"] = request
+                captured["parallel_generation_tasks"] = parallel_generation_tasks
+
+            def run(self):
                 return rollout_generator
 
-        def get_agent(_args, parallel_generation_tasks=None):
-            captured["parallel_generation_tasks"] = parallel_generation_tasks
-            return Agent()
-
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
-        monkeypatch.setattr(rl_utils, "get_agent", get_agent)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", None)
+        monkeypatch.setattr(rl_utils, "get_agent", lambda _args: agent)
+        monkeypatch.setattr(rl_utils, "RolloutPipeline", FakePipeline)
 
         args = SimpleNamespace(
-            rl_partial_rollouts=rl_partial_rollouts,
             rl_submission_granularity=submission_granularity,
             rl_consumption_granularity="B",
             rl_generation_lag=0,
@@ -255,8 +231,11 @@ class TestRLUtils:
         )
 
         assert result is rollout_generator
+        assert captured["agent"] is agent
         assert captured["request"].num_groups == n_prompts
-        assert captured["request"].streaming == rl_partial_rollouts
+        # The gate depth handed to the pipeline is lag + 1 trainer batches,
+        # independent of submission granularity.
+        assert captured["parallel_generation_tasks"] == args.rl_generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
 
     @pytest.mark.parametrize(
@@ -269,18 +248,23 @@ class TestRLUtils:
             ),
             pytest.param(
                 {"rl_submission_granularity": "R"},
-                "Rollout submission granularity requires streaming grouped rollouts",
+                "--rl-submission-granularity R requires --rl-partial-rollouts",
                 id="rollout_submission_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_submission_granularity": "G", "rl_consumption_granularity": "G"},
+                "--rl-submission-granularity G requires --rl-partial-rollouts",
+                id="group_submission_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_submission_granularity": "E", "rl_consumption_granularity": "E"},
+                "--rl-submission-granularity E requires --rl-partial-rollouts",
+                id="env_submission_requires_partial_rollouts",
             ),
             pytest.param(
                 {"rl_consumption_granularity": "R"},
                 "--rl-consumption-granularity R is not currently supported",
                 id="rollout_consumption_unsupported",
-            ),
-            pytest.param(
-                {"rl_submission_granularity": "B", "rl_consumption_granularity": "G"},
-                "--rl-submission-granularity B with --rl-consumption-granularity G",
-                id="batch_submit_group_consume_unsupported",
             ),
         ],
     )
