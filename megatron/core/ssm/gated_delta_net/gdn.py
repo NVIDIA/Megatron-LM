@@ -31,8 +31,8 @@ class GatedDeltaNet(_GDNBase):
     # pylint: disable=missing-class-docstring
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
-        # QK, V, alpha, beta, gate
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
+        # alpha, beta
+        self.in_proj_extra_dim = self.num_value_heads * 2
 
         # Per-section sizes (and names) of the in_proj output, local to this TP rank.
         # Used for the CP head permutation (pre-a2a), for splitting the projection

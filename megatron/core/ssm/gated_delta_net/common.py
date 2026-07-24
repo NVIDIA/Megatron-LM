@@ -10,7 +10,7 @@
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
@@ -67,6 +67,26 @@ class GatedDeltaNetSubmodules:
     out_proj: Union[ModuleSpec, type] = IdentityOp
 
 
+class GatedDeltaRuleInterface(Protocol):
+    """
+    Unified typing protocol for GDN core computation interfaces.
+    """
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        scale: float | None = None,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
+
+
 class _GDNBase(MegatronModule):
     """Common base class for the Gated Delta Net (GDN) family of layers.
 
@@ -77,10 +97,14 @@ class _GDNBase(MegatronModule):
 
     dt_bias_dim: int
     a_log_dim: int
+    in_proj_qkvg_dim: int
+    in_proj_extra_dim: int
+    in_proj_dim: int
+
     dt_bias: nn.Parameter
     A_log: nn.Parameter
 
-    gated_delta_rule: Callable[..., tuple[torch.Tensor, torch.Tensor | None]]
+    gated_delta_rule: GatedDeltaRuleInterface
 
     def __init__(
         self,
@@ -158,7 +182,7 @@ class _GDNBase(MegatronModule):
         attrs_to_check = (
             "dt_bias_dim",
             "a_log_dim",
-            "in_proj_dim",
+            "in_proj_extra_dim",
             "in_proj_split_names",
             "in_proj_split_sections",
             "feat_dim_split",
@@ -167,6 +191,9 @@ class _GDNBase(MegatronModule):
         self._setup_variant_attrs()
         for attr in attrs_to_check:
             assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
+        # QK, V, gate, shared across all variants
+        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
