@@ -592,19 +592,31 @@ class GatedDeltaProductMixer(MegatronModule):
             sharded_state_dict[f"{prefix}in_proj.weight"],
         )
 
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.d_inner_local_tp,
-                self.d_inner_local_tp * self.num_householder,
-                self.ngroups_local_tp * self.d_state * self.num_householder,
-                self.ngroups_local_tp * self.d_state,
-                self.nheads_local_tp * self.num_householder,
-                self.nheads_local_tp,
-            ],
-            ["z", "V", "K", "Q", "b", "a"],
-            0,
+        # V, K, and b are laid out householder-major on every TP rank:
+        #
+        #   rank r: [M0-local-r, M1-local-r, ..., M(M-1)-local-r]
+        #
+        # Treating the entire M-expanded block as one TP shard would make a
+        # resharded TP=1 tensor rank-major instead:
+        #
+        #   [rank0-all-M, rank1-all-M, ...]
+        #
+        # That ordering is incompatible with the forward rearranges, which
+        # expect [M0-all-ranks, M1-all-ranks, ...].  Give every householder
+        # copy its own checkpoint key so DCP concatenates TP shards within a
+        # copy before the copies are concatenated by the factory merge.
+        in_proj_split_sections, in_proj_split_names = _get_in_proj_checkpoint_split_layout(
+            self.d_inner_local_tp,
+            self.ngroups_local_tp * self.d_state,
+            self.nheads_local_tp,
+            self.num_householder,
         )
+        for in_proj_param in ["in_proj.weight", "in_proj.bias"]:
+            key = f"{prefix}{in_proj_param}"
+            if key in sharded_state_dict:
+                sharded_state_dict[key] = _split_tensor_factory(
+                    sharded_state_dict[key], in_proj_split_sections, in_proj_split_names, 0
+                )
 
         conv_dim = (
             self.d_inner_local_tp * self.num_householder
@@ -615,19 +627,57 @@ class GatedDeltaProductMixer(MegatronModule):
             sharded_state_dict[f"{prefix}conv1d.weight"],
         )
 
-        for conv_layer_name in ["conv1d.weight"]:
-            sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
-                sharded_state_dict[f"{prefix}{conv_layer_name}"],
-                [
-                    self.d_inner_local_tp * self.num_householder,
-                    self.ngroups_local_tp * self.d_state * self.num_householder,
-                    self.ngroups_local_tp * self.d_state,
-                ],
-                ["V", "K", "Q"],
-                0,
-            )
+        conv_split_sections, conv_split_names = _get_conv_checkpoint_split_layout(
+            self.d_inner_local_tp, self.ngroups_local_tp * self.d_state, self.num_householder
+        )
+        for conv_param in ["conv1d.weight", "conv1d.bias"]:
+            key = f"{prefix}{conv_param}"
+            if key in sharded_state_dict:
+                sharded_state_dict[key] = _split_tensor_factory(
+                    sharded_state_dict[key], conv_split_sections, conv_split_names, 0
+                )
 
         return sharded_state_dict
+
+
+def _get_in_proj_checkpoint_split_layout(
+    d_inner_local_tp: int, group_state_local_tp: int, nheads_local_tp: int, num_householder: int
+) -> Tuple[List[int], List[str]]:
+    """Return TP-reshardable splits for the packed ``[z,V,K,Q,b,a]`` projection."""
+    sections = (
+        [d_inner_local_tp]
+        + [d_inner_local_tp] * num_householder
+        + [group_state_local_tp] * num_householder
+        + [group_state_local_tp]
+        + [nheads_local_tp] * num_householder
+        + [nheads_local_tp]
+    )
+    names = (
+        ["z"]
+        + [f"V{i}" for i in range(num_householder)]
+        + [f"K{i}" for i in range(num_householder)]
+        + ["Q"]
+        + [f"b{i}" for i in range(num_householder)]
+        + ["a"]
+    )
+    return sections, names
+
+
+def _get_conv_checkpoint_split_layout(
+    d_inner_local_tp: int, group_state_local_tp: int, num_householder: int
+) -> Tuple[List[int], List[str]]:
+    """Return TP-reshardable splits for the packed ``[V,K,Q]`` convolution."""
+    sections = (
+        [d_inner_local_tp] * num_householder
+        + [group_state_local_tp] * num_householder
+        + [group_state_local_tp]
+    )
+    names = (
+        [f"V{i}" for i in range(num_householder)]
+        + [f"K{i}" for i in range(num_householder)]
+        + ["Q"]
+    )
+    return sections, names
 
 
 def _split_tensor_factory(
