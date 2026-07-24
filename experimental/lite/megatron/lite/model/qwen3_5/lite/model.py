@@ -7,6 +7,7 @@ and uses Megatron Lite parallel, TE, RoPE, and MoE primitives directly.
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 
 import torch
@@ -325,6 +326,31 @@ def _ensure_mrope_position_ids(position_ids: torch.Tensor | None) -> torch.Tenso
     raise ValueError("Qwen3.5 MRoPE expects position_ids shape (B,S), (1,B,S), or (3,B,S).")
 
 
+def _apply_attention_backend_override(backend: str | None) -> None:
+    # Direct protocol users pass None.  Restore TE's automatic selection in
+    # that case so a previously constructed model cannot leak its choice into
+    # Qwen3.5.  The runtime passes an explicit override when one is configured.
+    if backend is None:
+        backend = "auto"
+    env = {
+        "auto": ("1", "1", "1"),
+        "flash": ("1", "0", "0"),
+        "fused": ("0", "1", "0"),
+        "unfused": ("0", "0", "1"),
+        "local": ("0", "0", "1"),
+    }.get(backend)
+    if env is None:
+        raise ValueError(
+            "attention_backend_override must be one of "
+            "{'auto', 'flash', 'fused', 'unfused', 'local'}"
+        )
+    (
+        os.environ["NVTE_FLASH_ATTN"],
+        os.environ["NVTE_FUSED_ATTN"],
+        os.environ["NVTE_UNFUSED_ATTN"],
+    ) = env
+
+
 class Qwen35Model(nn.Module):
     def __init__(
         self,
@@ -344,7 +370,7 @@ class Qwen35Model(nn.Module):
         gdn_cp_mode: str = "headwise",
     ):
         super().__init__()
-        del attention_backend_override
+        _apply_attention_backend_override(attention_backend_override)
         self.config = config
         self.train_config = train_config
         self.ps = ps
