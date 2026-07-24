@@ -1084,10 +1084,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
             )
             request.sampling_params.num_tokens_total = None
+
+        # The last block in the KV cache is a dummy block that cannot be allocated.
+        # Speculative decoding pre-allocates multiple blocks; need to prevent last block from use.
+        prompt_length = len(request.prompt_tokens)
+        usable_blocks = max(
+            (self.context.max_sequence_length - 1) // self.context.block_size_tokens, 1
+        )
+        sequence_budget = min(
+            self.context.max_sequence_length,
+            usable_blocks * self.context.block_size_tokens - self.context.num_speculative_tokens,
+        )
+        remaining_tokens = max(sequence_budget - prompt_length, 0)
         if request.sampling_params.num_tokens_to_generate is None:
-            request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
-                request.prompt_tokens
-            )
+            request.sampling_params.num_tokens_to_generate = remaining_tokens
         if request.sampling_params.termination_id is None:
             try:
                 eod = self.controller.tokenizer.eod
@@ -1102,8 +1112,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Clamp large `num_tokens_to_generate` instead of rejecting the request.
         # This is included for compatibility with other frameworks.
-        remaining_tokens = self.context.max_sequence_length - len(request.prompt_tokens)
-        if request.sampling_params.num_tokens_to_generate < 0 or remaining_tokens < 0:
+        # Prompts longer than `max_sequence_length` itself are a hard failure.
+        if (
+            request.sampling_params.num_tokens_to_generate < 0
+            or prompt_length > self.context.max_sequence_length
+        ):
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
         elif request.sampling_params.num_tokens_to_generate > remaining_tokens:
@@ -1112,7 +1125,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.rank == 0:
                 warnings.warn(
                     f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
-                    f"which exceeds the maximum sequence length of the engine. "
+                    f"which exceeds the engine's usable sequence budget. "
                     f"Clamping num_tokens_to_generate to {remaining_tokens}."
                 )
 
