@@ -421,6 +421,45 @@ class TestMultiTokenPredictionLayer:
         else:
             assert output_weight.grad is not None
 
+    def test_process_mtp_loss_all_masked_positions_have_zero_gradient(self):
+        """An all-zero mask must make MTP a finite no-op, including after mask rolling."""
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len, 1, config.hidden_size, requires_grad=True
+        )
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return torch.matmul(hidden, weight.t()), None
+
+        def compute_language_model_loss(labels, logits):
+            return logits.square().sum(dim=-1).transpose(0, 1)
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.zeros(1, seq_len),
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+        )
+        result.sum().backward()
+
+        assert torch.isfinite(result).all()
+        assert torch.count_nonzero(hidden_states.grad[seq_len:]) == 0
+        assert output_weight.grad is not None
+        assert torch.count_nonzero(output_weight.grad) == 0
+
 
 class TestMultiTokenPrediction:
     def setup_method(self, method):
