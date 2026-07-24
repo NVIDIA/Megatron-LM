@@ -1722,13 +1722,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """
         submodules = super()._get_submodules_under_cudagraphs()
 
-        if not self.config.cuda_graph_scope:
+        if not self.config.cuda_graph_modules:
             return submodules
 
-        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+        if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
         # HC layer rejects MoE MLPs in __init__, so only the dense (mlp) scope applies.
-        if CudaGraphScope.mlp in self.config.cuda_graph_scope:
+        if CudaGraphModule.mlp in self.config.cuda_graph_modules:
             submodules.append(self.mlp_hyper_connection)
         return submodules
 
