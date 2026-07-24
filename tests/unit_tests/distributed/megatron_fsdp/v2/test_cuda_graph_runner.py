@@ -139,9 +139,7 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         main_grad_buffer=SimpleNamespace(
             inner_sharded=True,
             placements=[Placement.REPLICATE, Placement.FLAT],
-            redistribute=lambda placements, **_kwargs: redistribute_calls.append(
-                placements.copy()
-            ),
+            redistribute=lambda placements, **_kwargs: redistribute_calls.append(placements.copy()),
         ),
         mesh=SimpleNamespace(size=lambda _dim: 1),
         _full_grad_buffer_has_accumulated_grad=False,
