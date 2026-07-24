@@ -368,6 +368,57 @@ class TestClipQK:
         # current_max_attn_logits should be reset
         assert attention.core_attention.current_max_attn_logits is None
 
+    def test_clip_qk_with_tensor_parallelism(self):
+        """Test clip_qk with TP > 1 and GQA configuration."""
+        Utils.destroy_model_parallel()
+        tp_size = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        # GQA configuration: 8 attention heads, 4 query groups (2 heads per group)
+        # With TP=2, each rank gets 2 query groups
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=8,
+            num_query_groups=4,
+            use_cpu_initialization=False,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+            tensor_model_parallel_size=tp_size,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Verify the attention layer has correct partition sizes
+        assert attention.num_query_groups_per_partition == 2  # 4 groups / 2 TP ranks
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set current_max_attn_logits above threshold for all heads (4 heads per node)
+        # This will trigger the clip_qk logic and call _clip_linear_qkv
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [150.0, 160.0, 170.0, 180.0], device='cuda'
+        )
+
+        # Call clip_qk - this should not raise shape errors with TP > 1
+        try:
+            attention.clip_qk()
+        except Exception as e:
+            pytest.fail(f"clip_qk raised an exception with TP={tp_size} and GQA: {e}")
+
+        # Weights should be updated
+        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+
 
 @pytest.mark.parametrize("output_gate", [False, True])
 class TestSelfAttention:
