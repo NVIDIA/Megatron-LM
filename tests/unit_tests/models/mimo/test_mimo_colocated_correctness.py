@@ -68,7 +68,6 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.utils import unwrap_model
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
-    build_no_sync_func,
     create_all_embedding_groups,
     create_hypercomm_grid,
     destroy_all_grids,
@@ -167,7 +166,7 @@ def _set_deterministic_env():
 
 
 def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg):
-    """Attach no_sync plus the production grad-sync hooks to a MimoModel.
+    """Attach the production no-sync and grad-sync hooks to a MimoModel.
 
     Delegates the finalize/grad-scale wiring to ``configure_grad_sync`` (the real
     examples/mimo path), so this test's dp1-reference assertions validate that
@@ -175,7 +174,6 @@ def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg)
     mean: all-reduce ``total_num_tokens`` over the LLM DP group to get ``N_global``,
     finalize each submodule over its own group, then ``scale_gradients(1/N_global)``.
     """
-    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
     topology = SimpleNamespace(
         grids=module_to_grid_map,
         module_pgs={
@@ -183,7 +181,9 @@ def _wire_training_hooks(mimo_model, module_to_grid_map, language_pg, vision_pg)
             **{name: vision_pg for name in mimo_model.modality_submodules},
         },
     )
-    configure_grad_sync(SimpleNamespace(), mimo_model, topology)
+    configure_grad_sync(
+        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=False), mimo_model, topology
+    )
 
 
 def _generate_and_broadcast_global_batches(
