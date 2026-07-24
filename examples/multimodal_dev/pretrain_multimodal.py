@@ -76,7 +76,14 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     if getattr(args, "recompute_vision", False):
         vision_config.recompute_granularity = "full"
         vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+        # One recompute block spanning the WHOLE tower: uniform blocks of
+        # size num_layers save only the block input (the patch-embed
+        # output) instead of every layer's input. At heavy long-window
+        # payloads the per-layer saves dominate vision memory
+        # (raw_patches x vision_hidden x num_layers, e.g. ~20 GiB for a
+        # 400K-raw-patch 128K window) while a single block keeps one such
+        # tensor; the recompute FLOPs are the same either way.
+        vision_config.recompute_num_layers = vision_config.num_layers
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")
