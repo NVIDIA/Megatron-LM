@@ -4360,12 +4360,16 @@ class AllGatherPipeline:
 
         # A prefetched DP-Outer gather may not have reached DP-Inner if execution
         # stopped early. It must finish before the optimizer updates its buffer.
-        synchronized_events = set()
-        for event in self.outer_bucket_ready_events.values():
-            if id(event) not in synchronized_events:
-                event.synchronize()
-                synchronized_events.add(id(event))
-        self.outer_bucket_ready_events.clear()
+        # Use a device-side wait (not event.synchronize()): host sync is illegal on
+        # events recorded during CUDA graph capture / full-iteration CUDA graphs.
+        if self.outer_bucket_ready_events:
+            current_stream = torch.cuda.current_stream()
+            synchronized_events = set()
+            for event in self.outer_bucket_ready_events.values():
+                if id(event) not in synchronized_events:
+                    current_stream.wait_event(event)
+                    synchronized_events.add(id(event))
+            self.outer_bucket_ready_events.clear()
 
         for bucket_id in range(self.num_buckets):
             is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
