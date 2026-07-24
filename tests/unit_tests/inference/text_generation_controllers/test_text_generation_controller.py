@@ -1071,6 +1071,69 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             sampled_logits >= expected_min_values
         ), f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"
 
+    def test_dynamic_sampling_keeps_sampled_tokens_buffer_full_capacity(self):
+        """`_sampled_tokens_cuda` is a single `max_requests` buffer written in place by
+        every sampling path. The non-speculative path (`_dynamic_step_sample_logits`)
+        writes its `active_request_count` prefix, and the async-scheduling path
+        (`_run_async_sched_sample`) writes its own prefix via `torch.max(out=...)`. The
+        buffer must retain its full capacity across successive steps regardless of each
+        step's active count, so a later step with more active requests than an earlier
+        one still has an in-bounds destination.
+
+        Drive a small-batch non-speculative sample followed by a larger-batch async
+        sample through the same buffer, and confirm the buffer keeps its capacity and
+        identity and the larger async write lands correctly.
+        """
+        self.setup_model(
+            torch.float32, batch_size=8, static=False, materialize_only_last_token_logits=True
+        )
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        controller = self.text_generation_controller
+
+        capacity = controller._sampled_tokens_cuda.numel()
+        buffer_ptr = controller._sampled_tokens_cuda.data_ptr()
+        small_count, large_count = 2, 5
+        assert large_count < capacity
+
+        # Non-speculative sample over a small active batch. top_k == 1 makes the torch
+        # backend short-circuit to argmax, so the sampled token is deterministic.
+        context.active_request_metadata["temperature"][:small_count].fill_(1.0)
+        context.active_request_metadata["top_k"][:small_count].fill_(1)
+        context.active_request_metadata["top_p"][:small_count].fill_(0.0)
+        context.padded_active_token_count = small_count
+        context.request_query_lengths = torch.ones(small_count, dtype=torch.int32, device="cuda")
+        context.paused_request_count = 0
+        context.total_request_count = small_count
+        context.num_prefill_requests = 0
+        context.pad_active_slices()
+
+        small_expected = torch.tensor([3, 4], device="cuda")
+        small_logits = torch.zeros(1, small_count, self.vocab_size, device="cuda")
+        for row, col in enumerate(small_expected.tolist()):
+            small_logits[0, row, col] = 10.0
+        controller._all_logits_cuda = small_logits
+        controller._dynamic_step_sample_logits()
+
+        assert controller._sampled_tokens_cuda.numel() == capacity
+        assert controller._sampled_tokens_cuda.data_ptr() == buffer_ptr
+        assert torch.equal(controller._sampled_tokens_cuda[:small_count], small_expected)
+
+        # Async-scheduling sample over a larger active batch through the same buffer;
+        # its `torch.max(out=...)` destination is `_sampled_tokens_cuda[:large_count]`.
+        context.total_request_count = large_count
+        context.paused_request_count = 0
+        large_expected = torch.tensor([0, 1, 2, 3, 4], device="cuda")
+        large_logits = torch.zeros(1, large_count, self.vocab_size, device="cuda")
+        for row, col in enumerate(large_expected.tolist()):
+            large_logits[0, row, col] = 10.0
+        controller._all_logits_cuda = large_logits
+
+        sampled = controller._run_async_sched_sample()
+
+        assert sampled.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
+        assert controller._sampled_tokens_cuda.numel() == capacity
+        assert torch.equal(sampled, large_expected)
+
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
         "symmetric_ar_type",
