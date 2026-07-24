@@ -147,10 +147,32 @@ class KVBlockAllocator:
         """Compute number of paused blocks available."""
         return self.paused_count - self.get_paused_used()
 
+    def get_allocatable_block_count(self, potential_matched_count: int = 0) -> int:
+        """Get the number of blocks available for allocation.
+
+        Includes both free pool blocks and registered, evictable cached blocks.
+
+        Args:
+            potential_matched_count (int): Number of currently-evictable cached
+                blocks to subtract because the caller will pin them before
+                allocating. Must not exceed the evictable block count.
+
+        Returns:
+            Number of blocks available for allocation.
+        """
+        if (
+            not self.enable_prefix_caching
+            or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
+        ):
+            return self.total_avail
+
+        evictable_count = int(self.get_evictable_block_count()) - potential_matched_count
+        return self.total_avail + evictable_count
+
     def is_memory_available(self, num_blocks: int, potential_matched_count: int = 0) -> bool:
         """Check if memory blocks are available.
 
-        Includes both free pool blocks and evictable cached blocks (ref_count == 0).
+        Includes both free pool blocks and registered, evictable cached blocks.
 
         Args:
             num_blocks (int): Number of blocks to check.
@@ -168,13 +190,7 @@ class KVBlockAllocator:
         # Fast path: avoid expensive evictable count computation when free pool suffices
         if self.total_avail >= num_blocks:
             return True
-        if not self.enable_prefix_caching:
-            return False
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
-            return False  # RZ: no cached blocks to evict
-        # Also count evictable cached blocks, excluding those the caller will pin.
-        evictable_count = int(self.get_evictable_block_count()) - potential_matched_count
-        return (self.total_avail + evictable_count) >= num_blocks
+        return self.get_allocatable_block_count(potential_matched_count) >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
