@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -115,9 +116,14 @@ class LanguageModule(MegatronModule):
             env_variable_name: str, expected_value: int, attn_type: AttnBackend
         ) -> None:
             current_value = os.getenv(env_variable_name)
-            assert current_value is None or current_value == str(
-                expected_value
-            ), f'{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash/fused/unfused/auto/local). Default is auto.'
+            if current_value is not None and current_value != str(expected_value):
+                warnings.warn(
+                    f"{env_variable_name} is set to {current_value}, but attention backend "
+                    f"{attn_type.name} expects {expected_value}. Overriding to {expected_value}. "
+                    f"To silence this warning, unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN, and "
+                    f"NVTE_UNFUSED_ATTN or use --attention-backend to match your environment.",
+                    stacklevel=3,
+                )
             os.environ[env_variable_name] = str(expected_value)
 
         if self.config.attention_backend == AttnBackend.local:
