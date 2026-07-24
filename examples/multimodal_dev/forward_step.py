@@ -171,6 +171,42 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def _check_vision_patch_budget(
+    pixel_values: torch.Tensor, image_grid_thw: torch.Tensor, args
+) -> None:
+    """Fail fast when a microbatch's vision payload exceeds configured caps.
+
+    The vision tower consumes the whole microbatch payload in one packed
+    forward whose attention workspace scales stepwise with total raw patches;
+    exceeding the memory envelope otherwise surfaces as an opaque CUDA OOM
+    deep in backward. Checked on the TP source rank before any concat result
+    is broadcast or moved to the GPU forward.
+    """
+    max_total = getattr(args, "max_vision_patches_per_microbatch", None)
+    max_per_image = getattr(args, "max_vision_patches_per_image", None)
+    if max_total is None and max_per_image is None:
+        return
+    num_images = int(image_grid_thw.shape[0]) if image_grid_thw.dim() == 2 else 0
+    total_patches = int(pixel_values.shape[0])
+    if max_total is not None and total_patches > int(max_total):
+        raise ValueError(
+            f"Microbatch vision payload has {total_patches} raw patches across "
+            f"{num_images} image(s), exceeding --max-vision-patches-per-microbatch="
+            f"{int(max_total)}. Reduce the image count/size profile or the "
+            "per-sample vision budget."
+        )
+    if max_per_image is not None and num_images:
+        patches_per_image = image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+        worst = int(patches_per_image.max().item())
+        if worst > int(max_per_image):
+            worst_index = int(patches_per_image.argmax().item())
+            raise ValueError(
+                f"Image {worst_index} with grid {image_grid_thw[worst_index].tolist()} has "
+                f"{worst} raw patches, exceeding --max-vision-patches-per-image="
+                f"{int(max_per_image)}."
+            )
+
+
 def _segment_bounds(seq_lens: Optional[torch.Tensor], sample_len: int) -> list[tuple[int, int]]:
     """Per-segment (start, end) bounds of a sample's token axis.
 
@@ -402,6 +438,9 @@ def pack_or_pad_batch(
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
             packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+            _check_vision_patch_budget(
+                packed_batch["pixel_values"], packed_batch["image_grid_thw"], args
+            )
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
             packed_batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
@@ -504,6 +543,9 @@ def pack_or_pad_batch(
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
         padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+        _check_vision_patch_budget(
+            padded_batch["pixel_values"], padded_batch["image_grid_thw"], args
+        )
 
     return broadcast_data_batch(padded_batch, device=device)
 

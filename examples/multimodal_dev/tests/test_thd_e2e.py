@@ -704,6 +704,50 @@ class TestPackOrPadBatchPackedAlignment:
             )
 
 
+class TestVisionPatchGuard:
+    """Fail-fast caps on the microbatch vision payload."""
+
+    @pytest.fixture
+    def guard_args(self, monkeypatch):
+        from examples.multimodal_dev import forward_step
+
+        args = SimpleNamespace(
+            sequence_parallel=False,
+            pad_packed_seq_alignment=None,
+            cuda_graph_impl="none",
+            max_vision_patches_per_microbatch=None,
+            max_vision_patches_per_image=None,
+        )
+        monkeypatch.setattr(forward_step, "get_args", lambda: args)
+        return args
+
+    def test_microbatch_patch_budget_rejects_oversized_payload(self, guard_args):
+        guard_args.max_vision_patches_per_microbatch = 7
+        batch = [_make_sample(5, num_patches=4), _make_sample(5, num_patches=4)]
+        with pytest.raises(ValueError, match="8 raw patches across 2 image"):
+            pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+    def test_per_image_patch_budget_names_the_worst_image(self, guard_args):
+        guard_args.max_vision_patches_per_image = 4
+        sample = _make_sample(5, num_patches=8)
+        sample["image_grid_thw"] = torch.tensor([[2, 2, 2]], dtype=torch.long, device="cuda")
+        with pytest.raises(ValueError, match=r"grid \[2, 2, 2\] has 8 raw patches"):
+            pack_or_pad_batch([sample], use_packed_sequence=True, device="cuda")
+
+    def test_guard_applies_to_the_padded_branch_too(self, guard_args):
+        guard_args.max_vision_patches_per_microbatch = 7
+        batch = [_make_sample(5, num_patches=4), _make_sample(5, num_patches=4)]
+        with pytest.raises(ValueError, match="raw patches across"):
+            pack_or_pad_batch(batch, use_packed_sequence=False, seq_length=8, device="cuda")
+
+    def test_payload_within_budget_passes(self, guard_args):
+        guard_args.max_vision_patches_per_microbatch = 8
+        guard_args.max_vision_patches_per_image = 32
+        batch = [_make_sample(5, num_patches=4), _make_sample(5, num_patches=4)]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+        assert packed["pixel_values"].shape[0] == 8
+
+
 # ===================================================================
 # pack_or_pad_batch — padded (BSHD) mode
 # ===================================================================
