@@ -487,9 +487,7 @@ class TestLLaVAModel:
         input_ids = torch.tensor(
             [[image_token_index, 20, 21, 22], [10, image_token_index, 11, 12]], device="cuda"
         )
-        loss_mask = torch.tensor(
-            [[1, 0, 0, 0], [1, 1, 1, 1]], dtype=torch.float, device="cuda"
-        )
+        loss_mask = torch.tensor([[1, 0, 0, 0], [1, 1, 1, 1]], dtype=torch.float, device="cuda")
         captured = {}
 
         def capture_language_inputs(module, args, kwargs):

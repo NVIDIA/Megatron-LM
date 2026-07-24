@@ -432,10 +432,7 @@ class TestMultiTokenPredictionLayer:
         )
         seq_len = 4
         hidden_states = torch.randn(
-            (1 + config.mtp_num_layers) * seq_len,
-            1,
-            config.hidden_size,
-            requires_grad=True,
+            (1 + config.mtp_num_layers) * seq_len, 1, config.hidden_size, requires_grad=True
         )
         output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
 
