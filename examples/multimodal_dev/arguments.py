@@ -5,9 +5,7 @@
 
 def add_multimodal_args(parser):
     """Add multimodal-specific arguments to the Megatron argument parser."""
-    group = parser.add_argument_group(
-        "Multimodal", "Multimodal model arguments",
-    )
+    group = parser.add_argument_group("Multimodal", "Multimodal model arguments")
 
     group.add_argument(
         "--model-arch",
@@ -25,48 +23,48 @@ def add_multimodal_args(parser):
         "--dataset-provider",
         type=str,
         default="mock",
-        help="Dataset provider: mock",
+        help="Dataset provider: mock, mock_varlen, or cord_v2",
     )
     group.add_argument(
-        "--image-token-id",
-        type=int,
-        default=248056,
-        help="Token ID for image placeholder tokens",
+        "--image-token-id", type=int, default=248056, help="Token ID for image placeholder tokens"
     )
     group.add_argument(
-        "--image-size",
-        type=int,
-        default=224,
-        help="Image size (height and width) for mock data",
+        "--image-size", type=int, default=224, help="Image size (height and width) for mock data"
     )
     group.add_argument(
-        "--total-seq-length",
-        type=int,
-        default=1024,
-        help="Total sequence length for mock data",
+        "--mock-image-size-config-json",
+        type=str,
+        default=None,
+        help=(
+            "Processed-image resolution buckets for mock_varlen (required in "
+            "packed_window mode). Accepts inline JSON or a JSON-file path with "
+            'schema {"mode":"buckets","resolutions":[[224,224],[448,224]],'
+            '"weights":[3,1]}. Each resolution must be divisible by '
+            "patch_size*spatial_merge_size; weights are optional categorical "
+            "bucket weights. The generator itself is configured through the "
+            "core --varlen-mock-dataset-config-json flag with "
+            '{"mode":"packed_window",...}; see the packed_window README '
+            "section for the schema."
+        ),
     )
     group.add_argument(
-        "--image-seq-length",
-        type=int,
-        default=256,
-        help="Number of image tokens in mock data",
+        "--total-seq-length", type=int, default=1024, help="Total sequence length for mock data"
+    )
+    group.add_argument(
+        "--image-seq-length", type=int, default=256, help="Number of image tokens in mock data"
     )
     group.add_argument(
         "--vision-num-layers",
         type=int,
         default=None,
-        help=(
-            "Override for vision backbone depth. "
-            "Useful for proxy perf runs."
-        ),
+        help=("Override for vision backbone depth. " "Useful for proxy perf runs."),
     )
     group.add_argument(
         "--hf-processor-path",
         type=str,
         default=None,
         help=(
-            "HuggingFace processor path for real VLM datasets "
-            "(e.g. Qwen/Qwen2.5-VL-7B-Instruct)"
+            "HuggingFace processor path for real VLM datasets " "(e.g. Qwen/Qwen2.5-VL-7B-Instruct)"
         ),
     )
     group.add_argument(
@@ -83,18 +81,24 @@ def add_multimodal_args(parser):
         "--use-packed-sequence",
         action="store_true",
         default=False,
+        help=("Pack variable-length sequences into THD format to eliminate " "padding waste."),
+    )
+    group.add_argument(
+        "--pad-packed-seq-by-appending-dummy-seq",
+        dest="pad_packed_seq_by_appending_dummy_seq",
+        action="store_true",
+        default=True,
         help=(
-            "Pack variable-length sequences into THD format to eliminate "
-            "padding waste."
+            "Positive compatibility alias for multimodal THD recipes. "
+            "Dummy-tail representation is enabled by default; core also "
+            "provides --no-pad-packed-seq-by-appending-dummy-seq to disable it."
         ),
     )
     group.add_argument(
         "--use-vanilla-collate-fn",
         action="store_true",
         default=False,
-        help=(
-            "Use vanilla collate function to collate the data."
-        ),
+        help=("Use vanilla collate function to collate the data."),
     )
 
     return parser

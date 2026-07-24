@@ -53,6 +53,10 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.mock"
                 ".train_valid_test_datasets_provider"
             ),
+            "mock_varlen": (
+                "examples.multimodal_dev.data.mock_varlen"
+                ".train_valid_test_varlen_datasets_provider"
+            ),
             "cord_v2": (
                 "examples.multimodal_dev.data.cord_v2"
                 ".train_valid_test_datasets_provider"
