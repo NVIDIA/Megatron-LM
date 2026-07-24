@@ -3,7 +3,7 @@
 """Tests for loading GPT checkpoints into HybridModel runs.
 
 Covers the load-time sharded state dict retargeting in
-``megatron.core.models.hybrid.gpt_checkpoint_interop``:
+``megatron.core.dist_checkpointing.gpt_checkpoint_interop``:
 
 * pure layer-map derivation and validation (no GPU state),
 * pure key retargeting on synthetic sharded state dicts,
@@ -22,6 +22,11 @@ import torch
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
+from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
+    gpt_compatible_layer_maps,
+    retarget_fsdp_state_dict_to_gpt_checkpoint,
+    retarget_sharded_state_dict_to_gpt_checkpoint,
+)
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
     ShardedObject,
@@ -34,11 +39,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.gpt_checkpoint_interop import (
-    gpt_compatible_layer_maps,
-    retarget_fsdp_state_dict_to_gpt_checkpoint,
-    retarget_sharded_state_dict_to_gpt_checkpoint,
-)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed

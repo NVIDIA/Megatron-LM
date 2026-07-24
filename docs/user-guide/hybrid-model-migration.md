@@ -92,7 +92,7 @@ different tensor, pipeline, expert, or FSDP layout on the following load.
 ### Option A: Translate at load time
 
 Load-time translation is handled by
-[`megatron/core/models/hybrid/gpt_checkpoint_interop.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/models/hybrid/gpt_checkpoint_interop.py).
+[`megatron/core/dist_checkpointing/gpt_checkpoint_interop.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/dist_checkpointing/gpt_checkpoint_interop.py).
 It triggers automatically when a non-hybrid (GPT) checkpoint is loaded into a
 `HybridModel` run: for `torch_dist`, the run's model and optimizer sharded
 state dicts are rewritten into the GPT checkpoint's homogeneous-layer format;

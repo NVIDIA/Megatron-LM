@@ -1736,7 +1736,7 @@ def _load_base_checkpoint(
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
         if gpt_compat_layer_maps is not None:
-            from megatron.core.models.hybrid.gpt_checkpoint_interop import (
+            from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
                 retarget_fsdp_state_dict_to_gpt_checkpoint,
             )
 
@@ -1949,12 +1949,12 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
 
     Returns ``(layer_maps, load_optim)`` where ``layer_maps`` is used to retarget
     the run's sharded state dict at the GPT checkpoint's keys (see
-    ``megatron.core.models.hybrid.gpt_checkpoint_interop``) and ``load_optim`` is
+    ``megatron.core.dist_checkpointing.gpt_checkpoint_interop``) and ``load_optim`` is
     True when the GPT optimizer state should be translated and loaded as well.
     Returns ``(None, False)`` when checkpoint and runtime already agree. Raises
     RuntimeError for combinations that cannot be loaded.
     """
-    from megatron.core.models.hybrid.gpt_checkpoint_interop import gpt_compatible_layer_maps
+    from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
     from megatron.core.models.hybrid.hybrid_model import HybridModel
 
     def _contains_hybrid_model(module):
@@ -2288,7 +2288,7 @@ def load_checkpoint(
             )
 
         if gpt_compat_layer_maps is not None:
-            from megatron.core.models.hybrid.gpt_checkpoint_interop import (
+            from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
                 retarget_sharded_state_dict_to_gpt_checkpoint,
             )
 
