@@ -36,6 +36,18 @@ def _empty_load_args():
     return {}, True, [], [], []
 
 
+def test_split_empty_extra_state_for_stateless_recipe():
+    module = _grouped_linear_stub(num_gemms=2)
+    module.fp8_meta = {"fp8_checkpoint": True}
+    module.fp8 = False
+    module.fp8_calibration = False
+
+    states = module._split_extra_state(torch.empty(0, dtype=torch.uint8))
+
+    assert len(states) == 2
+    assert all(state.dtype == torch.uint8 and state.numel() == 0 for state in states)
+
+
 def test_split_grouped_checkpoint_tensor_uses_quantized_members():
     module = _grouped_linear_stub(num_gemms=2)
     members = [torch.tensor([1, 2]), torch.tensor([3, 4])]
