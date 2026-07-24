@@ -276,11 +276,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
             MixedPrecisionPolicy,
         )
 
-        if (
-            fsdp_unit_modules is None
-            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
-        ):
-            fsdp_unit_modules = [TransformerLayer, MambaLayer, TEGroupedMLP, SequentialMLP]
+        if fsdp_unit_modules is None:
+            fsdp_unit_modules = (TEGroupedMLP, SequentialMLP)
+            if ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                fsdp_unit_modules = fsdp_unit_modules + (TransformerLayer, MambaLayer)
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -352,7 +351,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 grad_sf = gradient_scaling_factor
                 mesh = dp_mesh
 
-            enable_cuda_graph = fsdp_unit_modules is not None and any(
+            enable_cuda_graph = any(
                 [
                     isinstance(m, TransformerLayer) and "transformer" in cuda_graph_on,
                     isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
@@ -366,9 +365,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 fully_shard(
                     m, enable_cuda_graph=True, mesh=mesh, gradient_scaling_factor=grad_sf, **kwargs
                 )
-            elif isinstance(m, (TEGroupedMLP, SequentialMLP)) or (
-                fsdp_unit_modules is not None and isinstance(m, tuple(fsdp_unit_modules))
-            ):
+            elif isinstance(m, tuple(fsdp_unit_modules)):
                 fully_shard(
                     m, mesh=mesh, gradient_scaling_factor=grad_sf, enable_cuda_graph=False, **kwargs
                 )
