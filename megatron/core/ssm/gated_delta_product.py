@@ -200,6 +200,9 @@ class GatedDeltaProductMixer(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
         )
+        setattr(self.in_proj.weight, "use_muon", False)
+        if self.in_proj.bias is not None:
+            setattr(self.in_proj.bias, "use_muon", False)
 
         conv_dim = (
             self.d_inner_local_tp * self.num_householder
