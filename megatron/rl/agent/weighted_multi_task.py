@@ -68,6 +68,12 @@ class WeightedMultiTask(
                 self.weights.append(0.0)
             else:
                 self.weights.append(config.weight / total_weight)
+            # Expose the normalized prompt share to the sub-agent. Curriculum
+            # cursors that seed from iteration * grpo_prompts_per_step must
+            # scale by this share: each agent only serves share * prompts_per_step
+            # groups per iteration, so seeding from the global counter skips
+            # (1 - share) of that agent's dataset every iteration.
+            agent._prompt_share = self.weights[-1]
 
     @classmethod
     def from_config(
