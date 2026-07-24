@@ -423,50 +423,74 @@ def _native_unfused_sparse_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
     query: torch.Tensor,
-    compressed_kv: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed_kv_offset: int,
     softmax_scale: float,
     loss_coeff: float,
     sparse_loss: bool,
     causal_mask: torch.Tensor,
     calculate_per_token_loss: bool,
 ) -> torch.Tensor:
-    sq, batch_size, num_heads, _ = query.size()
-    sk = compressed_kv.size(0)
-    mask = causal_mask.to(dtype=torch.float32)
-
-    attention_scores = torch.einsum(
-        "sbhd,tbd->bhst", query.detach().float(), compressed_kv.detach().float()
-    )
-    attention_scores = attention_scores * softmax_scale
-    attention_scores = attention_scores + mask.view(batch_size, 1, sq, sk)
-    index_scores = index_scores + mask
-
+    sq, batch_size, _, head_dim = query.size()
+    n_compressed = index_scores.shape[-1]
+    causal_valid = causal_mask > float("-inf")
     if sparse_loss:
-        index_mask = torch.full(
-            (batch_size, sq, sk), float("-inf"), dtype=torch.float32, device=index_scores.device
-        ).scatter_(-1, topk_indices.clamp(min=0), 0)
-        attention_scores = attention_scores + index_mask.view(batch_size, 1, sq, sk)
-        index_scores = index_scores + index_mask
+        selected_compressed = topk_indices
+        safe_compressed = selected_compressed.clamp(min=0, max=n_compressed - 1).long()
+        selected_valid = (selected_compressed >= 0) & torch.gather(
+            causal_valid, dim=-1, index=safe_compressed
+        )
+        predict_logits = torch.gather(index_scores, dim=-1, index=safe_compressed)
+    else:
+        selected_compressed = torch.arange(
+            n_compressed, device=index_scores.device, dtype=topk_indices.dtype
+        ).view(1, 1, -1)
+        selected_compressed = selected_compressed.expand(batch_size, sq, -1)
+        safe_compressed = selected_compressed.long()
+        selected_valid = causal_valid
+        predict_logits = index_scores
 
-    row_valid = (mask > float("-inf")).any(dim=-1)
-    attn_row_mask = row_valid.view(batch_size, 1, sq, 1)
-    idx_row_mask = row_valid.view(batch_size, sq, 1)
+    row_valid = selected_valid.any(dim=-1, keepdim=True)
+    predict_logits = predict_logits.masked_fill(~selected_valid, float("-inf"))
+    predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
+    predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32) * row_valid.float()
 
-    attention_scores = attention_scores.masked_fill(~attn_row_mask, 0.0)
-    index_scores = index_scores.masked_fill(~idx_row_mask, 0.0)
+    compressed_attention_indices = torch.where(
+        selected_valid, safe_compressed + compressed_kv_offset, torch.full_like(safe_compressed, -1)
+    )
+    attention_indices = torch.cat(
+        [window_indices.to(compressed_attention_indices.dtype), compressed_attention_indices],
+        dim=-1,
+    )
+    safe_attention_indices = attention_indices.clamp(min=0).long()
+    gathered_kv = torch.gather(
+        kv_full.detach().permute(1, 0, 2).unsqueeze(1).expand(-1, sq, -1, -1),
+        dim=2,
+        index=safe_attention_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim),
+    )
+    attention_scores = torch.einsum(
+        "bhsd,bskd->bhsk", query.detach().permute(1, 2, 0, 3).float(), gathered_kv.float()
+    )
+    attention_scores = (attention_scores * softmax_scale).masked_fill(
+        (attention_indices < 0).unsqueeze(1), float("-inf")
+    )
+    sink = attn_sink.detach().view(1, -1, 1, 1).float()
+    score_max = torch.maximum(attention_scores.max(dim=-1, keepdim=True).values, sink)
+    exp_scores = torch.exp(attention_scores - score_max)
+    exp_sink = torch.exp(sink - score_max)
+    attention_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
 
-    attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32)
-    predict = F.softmax(index_scores, dim=-1, dtype=torch.float32)
-    attention_probs = attention_probs * attn_row_mask.float()
-    predict = predict * idx_row_mask.float()
-
-    target = attention_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True)
+    compressed_width = compressed_attention_indices.shape[-1]
+    target = attention_probs[..., -compressed_width:].sum(dim=1)
     eps = torch.finfo(torch.float32).tiny
+    target = target / target.sum(dim=-1, keepdim=True).clamp(min=eps)
+    target = target * row_valid.float()
     target = target.clamp(min=eps)
     predict = predict.clamp(min=eps)
     kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
-    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+    kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
     loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
     return loss * loss_coeff
 
@@ -700,7 +724,10 @@ class NativeCompressedSparseAttention(nn.Module):
                         index_scores,
                         topk_compressed,
                         query.detach(),
-                        compressed_kv.detach(),
+                        kv_full.detach(),
+                        self.attn_sink,
+                        window_idxs,
+                        offset,
                         self.softmax_scale,
                         self.indexer_loss_coeff,
                         self.indexer_use_sparse_loss,
@@ -1376,13 +1403,12 @@ class TestDSv4HybridNativeParity:
             pad_offset += pl
         hidden_padded = hidden_padded.clone().requires_grad_(True)
 
-        # cu_seqlens_q: unpadded real boundaries (cumsum of real lengths
-        # within the padded physical layout).
+        # cu_seqlens_q: cumulative unpadded lengths, matching the metadata
+        # produced by data_schedule. Physical boundaries live separately in
+        # cu_seqlens_q_padded.
         cu_seqlens_q_vals = [0]
-        offset = 0
-        for rl, pl in zip(seg_lens, padded_seg_lens):
-            cu_seqlens_q_vals.append(offset + rl)
-            offset += pl
+        for real_length in seg_lens:
+            cu_seqlens_q_vals.append(cu_seqlens_q_vals[-1] + real_length)
         cu_seqlens_unpadded = torch.tensor(cu_seqlens_q_vals, dtype=torch.int32, device='cuda')
 
         # cu_seqlens_q_padded: padded boundaries (cumsum of padded lengths
