@@ -24,7 +24,7 @@ from torch.distributed import DeviceMesh
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
-from .placement import MeshAxis, Placements
+from .placement import Placements
 
 
 class FsdpContext:
@@ -104,10 +104,11 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
-        axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-        assert axis_indices == tuple(
-            range(mesh.ndim)
-        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
+        # ``fully_shard`` accepts the full parallelism mesh, which may include axes FSDP
+        # does not shard over (for example the expert-parallel axis when composing with
+        # EP). Pass the full mesh to each parameter group; it selects the data-parallel
+        # sub-mesh named by ``Placements.dp_axes`` for sharding while retaining the full
+        # mesh for optimizer/checkpointing.
         parameter_groups = [
             FsdpParameterGroup(
                 owning_module=self,
@@ -360,21 +361,6 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, order)
-
-
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        axis_index = axis
-        if axis_index < 0:
-            axis_index += mesh.ndim
-        if axis_index < 0 or axis_index >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis_index
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
 
 
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:

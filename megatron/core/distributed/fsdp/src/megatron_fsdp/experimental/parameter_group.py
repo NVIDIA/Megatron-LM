@@ -14,6 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+from collections.abc import Iterable
 from contextlib import nullcontext
 
 import torch
@@ -24,7 +25,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .placement import MeshAxis, Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -41,6 +42,8 @@ class FsdpParameterGroup:
     parameter_names: tuple[str, ...]
     sharded_parameters: tuple[nn.Parameter, ...]
     unsharded_parameters: tuple[nn.Parameter, ...]
+    # Full parallelism mesh, retained for TP/checkpointing. FSDP shards over the
+    # data-parallel sub-mesh selected from it, which each DBuffer owns as its ``mesh``.
     mesh: DeviceMesh
     dtype: torch.dtype
     requires_grad: bool
@@ -64,7 +67,10 @@ class FsdpParameterGroup:
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
             parameters: Root-module-relative FQNs and their parameters.
-            mesh: Device mesh used for all DBuffer storage in this version.
+            mesh: Full parallelism device mesh. FSDP shards over the sub-mesh named by
+                ``placements.dp_axes``; the group keeps the full mesh so sharded DTensors
+                can later be extended with the other axes (e.g. TP) for the optimizer and
+                distributed checkpointing.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
             use_symm_mem: Allocate communication staging buffers from PyTorch's
@@ -81,6 +87,9 @@ class FsdpParameterGroup:
         # parameters.values() define the same stable DBuffer tensor order.
         self.owning_module = owning_module
         self.mesh = mesh
+        # FSDP shards over the data-parallel sub-mesh; the DBuffers own it (as their
+        # ``mesh``), so it is not tracked separately on the group.
+        dp_mesh = _select_dp_mesh(mesh, placements.dp_axes)
         self.parameter_names = tuple(parameters)
         first_parameter = next(iter(parameters.values()))
         self.dtype = first_parameter.dtype
@@ -101,7 +110,7 @@ class FsdpParameterGroup:
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
-            mesh=self.mesh,
+            mesh=dp_mesh,
             placements=main_weight_placements,
         )
 
@@ -114,8 +123,8 @@ class FsdpParameterGroup:
 
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
+                mesh=dp_mesh,
+                placements=[Replicate()] * dp_mesh.ndim,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
@@ -124,7 +133,7 @@ class FsdpParameterGroup:
             self.model_weight = self.main_weight
         else:
             self.model_weight = DBuffer(
-                mesh=self.mesh,
+                mesh=dp_mesh,
                 placements=model_weight_placements,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
@@ -140,7 +149,7 @@ class FsdpParameterGroup:
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
             self.main_grad = DBuffer(
-                mesh=self.mesh,
+                mesh=dp_mesh,
                 placements=main_grad_placements,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=grad_dtype,
@@ -267,8 +276,8 @@ class FsdpParameterGroup:
             grads.append(parameter.grad)
         with self._symmetric_memory_context():
             return DBuffer(
-                mesh=self.mesh,
-                placements=[Partial(partial_op)] * self.mesh.ndim,
+                mesh=self.main_grad.mesh,
+                placements=[Partial(partial_op)] * self.main_grad.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -328,7 +337,9 @@ class FsdpParameterGroup:
         if reduce_axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
         partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        grad_divisor = (
+            self.main_grad.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        )
         if self._symm_mem_pool is not None:
             partial_grad.rendezvous(reduce_axis)
         if can_reduce_into_main_grad:
@@ -358,3 +369,36 @@ def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
     module_name, separator, parameter_name = name.rpartition(".")
     owner = module.get_submodule(module_name) if separator else module
     return owner, parameter_name
+
+
+def _select_dp_mesh(mesh: DeviceMesh, dp_axes: Iterable[MeshAxis]) -> DeviceMesh:
+    """Return the data-parallel sub-mesh that FSDP shards and communicates over.
+
+    ``dp_axes`` names the mesh axes FSDP shards over; any others (for example an
+    expert-parallel axis) are left untouched. When ``dp_axes`` spans the whole mesh,
+    ``mesh`` is returned unchanged -- this preserves plain-FSDP and HSDP behavior and
+    covers meshes without dim names. Otherwise the named sub-mesh is selected.
+    """
+    axis_indices = tuple(_axis_index(mesh, axis) for axis in dp_axes)
+    if axis_indices == tuple(range(mesh.ndim)):
+        return mesh
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None:
+        raise ValueError("Sharding over a subset of mesh axes requires a named DeviceMesh.")
+    # DeviceMesh sub-selection is by dim name only (integer indexing is unsupported).
+    return mesh[tuple(dim_names[index] for index in axis_indices)]
+
+
+def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
+    if isinstance(axis, int):
+        axis_index = axis
+        if axis_index < 0:
+            axis_index += mesh.ndim
+        if axis_index < 0 or axis_index >= mesh.ndim:
+            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
+        return axis_index
+
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None or axis not in dim_names:
+        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
+    return dim_names.index(axis)
