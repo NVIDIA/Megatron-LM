@@ -56,7 +56,7 @@ class Partial(Placement):
 
 @dataclasses.dataclass(frozen=True)
 class Flat(Placement):
-    """Flat per-unit dim-0 sharded local buffer placement."""
+    """Flat dim-0 sharded local buffer placement."""
 
 
 def changed_mesh_axis(

@@ -776,22 +776,24 @@ def _make_routing_coordinator(
 class TestRoutingPolicies:
     """Unit tests for routing behavior under different policies and load conditions."""
 
-    def test_no_prefix_caching_uses_round_robin(self):
-        """When prefix caching is off, round-robin is used regardless of load."""
+    def test_no_prefix_caching_uses_load_balanced(self):
+        """When prefix caching is off, routing goes to the least-loaded rank."""
         coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
         coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
         coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
 
-        results = [coord.get_best_data_parallel_rank([]) for _ in range(6)]
-        assert results == [b"rank-0", b"rank-1", b"rank-2", b"rank-0", b"rank-1", b"rank-2"]
+        # rank-2 has the fewest in-flight requests (0).
+        assert coord.get_best_data_parallel_rank([]) == b"rank-2"
 
-    def test_empty_hashes_uses_round_robin(self):
-        """Empty hash list falls back to round-robin."""
+    def test_empty_hashes_uses_load_balanced(self):
+        """Empty hash list falls back to the least-loaded rank."""
         coord = _make_routing_coordinator(num_ranks=4)
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 3
         coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 5
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-2"]] = 1
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-3"]] = 4
 
-        results = [coord.get_best_data_parallel_rank([]) for _ in range(4)]
-        assert results == [b"rank-0", b"rank-1", b"rank-2", b"rank-3"]
+        assert coord.get_best_data_parallel_rank([]) == b"rank-2"
 
     def test_prefix_affinity_routing(self):
         """When prefix caching is on with hashes, scoring picks the best rank."""
@@ -846,18 +848,17 @@ class TestRoutingPolicies:
         chosen = coord.get_best_data_parallel_rank([fake_hash])
         assert chosen == b"rank-1"
 
-    def test_round_robin_policy_ignores_load(self):
-        """ROUND_ROBIN policy does naive round-robin regardless of load."""
+    def test_load_balanced_policy_ignores_prefix(self):
+        """LOAD_BALANCED policy routes to the least-loaded rank, ignoring prefix affinity."""
         coord = _make_routing_coordinator(
             num_ranks=3,
             enable_prefix_caching=True,
-            policy=PrefixCachingCoordinatorPolicy.ROUND_ROBIN,
+            policy=PrefixCachingCoordinatorPolicy.LOAD_BALANCED,
         )
-        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 1
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
         coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
 
-        coord._round_robin_idx = 0
-        identities = list(coord.identities_of_data_parallel_ranks)
-        for i in range(len(identities)):
-            chosen = coord.get_best_data_parallel_rank([99])
-            assert chosen == identities[i]
+        # Seed a prefix match on the most-loaded rank; load balancing must ignore it.
+        _set_hash_rank(coord, 99, b"rank-0", 1)
+
+        assert coord.get_best_data_parallel_rank([99]) == b"rank-2"
