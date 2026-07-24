@@ -199,11 +199,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if can_use_nvls:
             # do multimem all gather; the barrier-before-reuse decision is derived
             # from the last collective on this buffer (see multimem_all_gather).
-            multimem_all_gather(
-                symm_mem_buffer["tensor"],
-                x,
-                symm_mem_buffer["handle"],
-            )
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
             return symm_mem_buffer["tensor"]
         else:
             # revert to torch dist (NCCL) all gather
@@ -323,11 +319,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         if can_use_nvls:
             # The barrier-before-reuse decision is derived from the last collective
             # on this buffer (see multimem_all_gather).
-            multimem_all_gather(
-                symm_mem_buffer["tensor"],
-                x,
-                symm_mem_buffer["handle"],
-            )
+            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
             return symm_mem_buffer["tensor"]
         else:
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)

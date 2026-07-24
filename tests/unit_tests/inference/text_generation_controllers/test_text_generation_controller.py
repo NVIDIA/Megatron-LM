@@ -2196,9 +2196,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         controller_module = (
             "megatron.core.inference.text_generation_controllers.text_generation_controller"
         )
-        with mock.patch(f"{controller_module}.gather_from_sequence_parallel_region", mock_gather), mock.patch(
-            f"{controller_module}.scatter_to_sequence_parallel_region",
-            side_effect=lambda hidden, group=None: hidden[:1],
+        with (
+            mock.patch(f"{controller_module}.gather_from_sequence_parallel_region", mock_gather),
+            mock.patch(
+                f"{controller_module}.scatter_to_sequence_parallel_region",
+                side_effect=lambda hidden, group=None: hidden[:1],
+            ),
         ):
             controller._compute_serial_mtp_and_sample()
 

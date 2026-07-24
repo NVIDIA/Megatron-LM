@@ -1132,8 +1132,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection.
         if InferenceMode.is_active():
+            # This all-gather immediately follows the input all-gather inside eh_proj
+            # on the same symmetric buffer, so the buffer-reuse barrier is required;
+            # it is derived automatically from the op sequence (see multimem_all_gather).
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
-                hidden_states, self.tp_group, self.config, barrier_before=True
+                hidden_states, self.tp_group, self.config
             )
         else:
             hidden_states = gather_from_tensor_model_parallel_region(

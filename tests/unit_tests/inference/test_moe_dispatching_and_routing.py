@@ -442,6 +442,181 @@ class TestNVLSAllGatherVDispatcher:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# symmetric-memory collective ordering (barrier-before-reuse tracking)
+# ──────────────────────────────────────────────────────────────────────
+
+# Hidden size chosen so each bf16 row is 16-byte aligned (an NVLS requirement).
+_ORDERING_HIDDEN = 1024
+_ORDERING_LOCAL_ROWS = 4
+
+
+@pytest.mark.internal
+class TestSymmCollectiveOrdering:
+    """Buffer-level barrier-before-reuse tracking driven by real NVLS collectives.
+
+    These run the real Triton multimem all-gather / reduce-scatter kernels on
+    actual symmetric memory and verify the tracking that decides whether an
+    all-gather must barrier before reusing the buffer:
+
+      - a reduce-scatter already synchronizes ranks, so a following all-gather
+        needs no barrier;
+      - two consecutive all-gathers reuse the buffer, so the second must barrier
+        (the MTP hazard the tracking replaces the old name-sniffing with).
+
+    The decision is read from ``all_gather_needs_barrier`` — the same helper the
+    production ``multimem_all_gather`` consults — and every step runs a real
+    collective so the recorded state reflects the true call path.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+    def _require_nvls_buffer(self):
+        """Return (tp_group, buffer) or skip if NVLS symmetric memory is unavailable."""
+        from megatron.core import parallel_state
+        from megatron.core.inference.communication.torch_symm_triton.utils import (
+            is_device_nvls_capable,
+        )
+        from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        if not is_device_nvls_capable(device):
+            pytest.skip("NVLS multicast requires a Hopper+ GPU (SM >= 9)")
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        if torch.distributed.get_world_size(tp_group) < 2:
+            pytest.skip("requires a tensor-model-parallel world size >= 2")
+        buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
+        if buf.symm_mem_hdl is None:
+            pytest.skip(f"symmetric memory unavailable: {buf.init_failure_reason}")
+        return tp_group, buf
+
+    def _run_all_gather(self, buf, tp_group, *, barrier_before=None):
+        """Real all-gather of a rank-tagged tensor into the shared 'tp' buffer."""
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            multimem_all_gather,
+        )
+
+        world = torch.distributed.get_world_size(tp_group)
+        rank = torch.distributed.get_rank(tp_group)
+        # Each rank contributes rows filled with its own (1-based) rank id.
+        x = torch.full(
+            (_ORDERING_LOCAL_ROWS, _ORDERING_HIDDEN),
+            float(rank + 1),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        symm = buf.maybe_get_tensor(
+            [_ORDERING_LOCAL_ROWS * world, _ORDERING_HIDDEN], torch.bfloat16
+        )
+        assert symm["handle"] is not None, "expected symmetric buffer to be allocatable"
+        out = multimem_all_gather(symm["tensor"], x, symm["handle"], barrier_before=barrier_before)
+        return out, world
+
+    def _assert_gather_correct(self, out, world):
+        """The gathered buffer must hold each rank's block back-to-back."""
+        for i in range(world):
+            block = out[i * _ORDERING_LOCAL_ROWS : (i + 1) * _ORDERING_LOCAL_ROWS]
+            assert torch.all(block == float(i + 1)), f"rank block {i} corrupted"
+
+    def _run_reduce_scatter(self, buf, tp_group):
+        """Real reduce-scatter over the shared 'tp' buffer; every rank contributes ones."""
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            multimem_reduce_scatter,
+        )
+
+        world = torch.distributed.get_world_size(tp_group)
+        symm = buf.maybe_get_tensor(
+            [_ORDERING_LOCAL_ROWS * world, _ORDERING_HIDDEN], torch.bfloat16
+        )
+        assert symm["handle"] is not None
+        symm["tensor"].fill_(1.0)
+        out = torch.empty(
+            (_ORDERING_LOCAL_ROWS, _ORDERING_HIDDEN), dtype=torch.bfloat16, device="cuda"
+        )
+        multimem_reduce_scatter(out, symm["tensor"], symm["handle"])
+        return out, world
+
+    def test_all_gather_after_reduce_scatter_needs_no_barrier(self):
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            all_gather_needs_barrier,
+            reset_collective_ordering,
+        )
+
+        tp_group, buf = self._require_nvls_buffer()
+        reset_collective_ordering()
+
+        # A reduce-scatter already synchronizes ranks, so a following all-gather
+        # must not request the extra barrier.
+        rs_out, world = self._run_reduce_scatter(buf, tp_group)
+        assert torch.all(rs_out == float(world)), "reduce-scatter should sum ones across ranks"
+        assert all_gather_needs_barrier(buf.symm_mem_hdl) is False
+
+        # The all-gather runs correctly and then records itself as the last op.
+        ag_out, world = self._run_all_gather(buf, tp_group)
+        self._assert_gather_correct(ag_out, world)
+        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
+
+    def test_consecutive_all_gathers_need_barrier(self):
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            all_gather_needs_barrier,
+            reset_collective_ordering,
+        )
+
+        tp_group, buf = self._require_nvls_buffer()
+        reset_collective_ordering()
+
+        first_out, world = self._run_all_gather(buf, tp_group)
+        self._assert_gather_correct(first_out, world)
+        # The buffer now records an all-gather, so the next all-gather auto-derives
+        # barrier_before=True. It must still produce correct data under the barrier.
+        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
+
+        second_out, world = self._run_all_gather(buf, tp_group)
+        self._assert_gather_correct(second_out, world)
+        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
+
+    def test_reset_clears_tracked_state(self):
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            all_gather_needs_barrier,
+            reset_collective_ordering,
+        )
+
+        tp_group, buf = self._require_nvls_buffer()
+        reset_collective_ordering()
+
+        self._run_all_gather(buf, tp_group)
+        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
+
+        reset_collective_ordering()
+        assert all_gather_needs_barrier(buf.symm_mem_hdl) is False
+
+    def test_explicit_barrier_override_runs_correctly(self):
+        from megatron.core.inference.communication.torch_symm_triton.collectives import (
+            all_gather_needs_barrier,
+            reset_collective_ordering,
+        )
+
+        tp_group, buf = self._require_nvls_buffer()
+        reset_collective_ordering()
+
+        # After a reduce-scatter the auto-decision is "no barrier", but an explicit
+        # barrier_before=True must still be honored and produce correct output.
+        self._run_reduce_scatter(buf, tp_group)
+        assert all_gather_needs_barrier(buf.symm_mem_hdl) is False
+
+        out, world = self._run_all_gather(buf, tp_group, barrier_before=True)
+        self._assert_gather_correct(out, world)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # mask_routing_padding kernel
 # ──────────────────────────────────────────────────────────────────────
 
