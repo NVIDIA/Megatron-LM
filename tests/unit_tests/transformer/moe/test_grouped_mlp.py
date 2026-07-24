@@ -263,6 +263,43 @@ def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
         hook(object())
 
 
+def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad():
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, *, fuse_wgrad_accumulation):
+            super().__init__()
+            self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+            self.bias = torch.nn.Parameter(torch.zeros(2))
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.linear_fc1 = FakeGroupedLinear(fuse_wgrad_accumulation=True)
+    module.linear_fc2 = FakeGroupedLinear(fuse_wgrad_accumulation=False)
+
+    fc1_main_grad = torch.empty_like(module.linear_fc1.weight)
+    module.linear_fc1.weight.get_main_grad = lambda: fc1_main_grad
+    module.linear_fc1.weight.overwrite_main_grad = False
+
+    existing_main_grad = torch.empty_like(module.linear_fc1.bias)
+    module.linear_fc1.bias.main_grad = existing_main_grad
+    module.linear_fc1.bias.get_main_grad = pytest.fail
+    module.linear_fc1.bias.overwrite_main_grad = False
+
+    fc2_main_grad = torch.empty_like(module.linear_fc2.weight)
+    module.linear_fc2.weight.get_main_grad = lambda: fc2_main_grad
+    module.linear_fc2.weight.overwrite_main_grad = False
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    assert module.linear_fc1.weight.main_grad is fc1_main_grad
+    assert module.linear_fc1.weight.overwrite_main_grad is True
+    assert module.linear_fc1.bias.main_grad is existing_main_grad
+    assert module.linear_fc1.bias.overwrite_main_grad is True
+    assert getattr(module.linear_fc2.weight, "main_grad", None) is None
+    assert module.linear_fc2.weight.overwrite_main_grad is False
+
+
 def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(
@@ -358,6 +395,12 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     ops = module._make_fused_ops()
 
     assert ops[0].weight is module.linear_fc1.weight
+    assert ops[0].weight0 is None
+    assert ops[0].weight1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["weight"] is module.linear_fc1.weight
+    assert "weight0" not in fc1_named_params
+    assert "weight1" not in fc1_named_params
     assert ops[1].glu_interleave_size == 8
     assert ops[1].activation_recompute_in_mlp is True
     assert ops[2].weight0 is module.linear_fc2.weight0
@@ -701,10 +744,13 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
     assert ops[0].weight0 is module.linear_fc1.weight0
     assert ops[0].weight1 is module.linear_fc1.weight1
-    assert ops[0].bias is module.linear_fc1.bias  # ← single grouped bias attached at "bias"
-    assert not hasattr(
-        ops[0], "bias0"
-    ), "bias should not be split into bias{idx} when single_grouped_bias=True"
+    assert ops[0].bias is module.linear_fc1.bias
+    assert ops[0].bias0 is None
+    assert ops[0].bias1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["bias"] is module.linear_fc1.bias
+    assert "bias0" not in fc1_named_params
+    assert "bias1" not in fc1_named_params
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
