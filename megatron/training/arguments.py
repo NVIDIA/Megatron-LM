@@ -1274,6 +1274,10 @@ def validate_args(args, defaults={}):
         # enabled; disable the flag to avoid a TP broadcast mismatch.
         if args.create_attention_mask_in_dataloader:
             args.create_attention_mask_in_dataloader = False
+        assert args.context_parallel_size == 1, \
+            'Context parallelism is not yet correctly supported with inter-document masking ' \
+            'in pre-training; context parallelism for attention with cu_seqlens assumes ' \
+            'per-document load balancing.'
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
