@@ -33,6 +33,11 @@ import re
 import pytest
 import torch
 
+from megatron.core.distributed.fsdp.checkpoint import (
+    _build_torch_dist_to_v2_map,
+    _detect_gdn_layers,
+)
+from megatron.core.distributed.fsdp.checkpoint import _match_gdn_key as _match_gdn_key_v2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_model_parallel,
@@ -327,6 +332,67 @@ class TestMTPKeyRenaming:
         assert not self._should_auto_detect_mtp(keys)
 
 
+class TestTorchDistToMegatronFSDPV2Map:
+    """Regression coverage for torch_dist → Megatron FSDP v2 key mapping."""
+
+    @staticmethod
+    def _build(metadata_keys, v2_keys):
+        metadata = {key: object() for key in metadata_keys}
+        tensors = {key: torch.empty(1) for key in v2_keys}
+        regular_model, fused_layer_groups, _, _, _ = _build_torch_dist_to_v2_map(
+            metadata, tensors, {}
+        )
+        return tensors, regular_model, fused_layer_groups
+
+    def test_direct_mtp_transformer_layer_key_matches_v2_mtp_model_layer(self):
+        td_key = (
+            "language_model.mtp.layers.0.transformer_layer." "mlp.shared_experts.linear_fc1.weight"
+        )
+        v2_key = (
+            "language_model.mtp.layers.0.mtp_model_layer." "mlp.shared_experts.linear_fc1.weight"
+        )
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {td_key: tensors[v2_key]}
+        assert fused_layer_groups == {}
+
+    def test_grouped_mlp_per_layer_expert_key_matches_source_experts_tensor(self):
+        td_key = "language_model.decoder.layers.0.mlp.experts.experts.linear_fc1.weight"
+        v2_key = "language_model.decoder.layers.0.mlp.experts.linear_fc1.weight3"
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {}
+        assert fused_layer_groups == {
+            td_key: [(v2_key, tensors[v2_key], 3, "grouped_mlp_per_layer")]
+        }
+
+    def test_mtp_grouped_mlp_per_layer_key_preserves_transformer_layer_prefix(self):
+        td_key = (
+            "language_model.mtp.layers.0.transformer_layer." "mlp.experts.experts.linear_fc1.weight"
+        )
+        v2_key = "language_model.mtp.layers.0.mtp_model_layer." "mlp.experts.linear_fc1.weight7"
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {}
+        assert fused_layer_groups == {
+            td_key: [(v2_key, tensors[v2_key], 7, "grouped_mlp_per_layer")]
+        }
+
+    def test_grouped_mlp_fused_expert_key_still_matches_source_experts_tensor(self):
+        td_key = "language_model.decoder.layers.mlp.experts.experts.linear_fc1.weight"
+        v2_key = "language_model.decoder.layers.2.mlp.experts.linear_fc1.weight3"
+
+        tensors, regular_model, fused_layer_groups = self._build([td_key], [v2_key])
+
+        assert regular_model == {}
+        assert fused_layer_groups == {
+            td_key: [(v2_key, tensors[v2_key], 2, 3, "grouped_mlp_fused")]
+        }
+
+
 # ============================================================================
 # Test per-TransformerLayer gated_linear_unit check logic
 # ============================================================================
@@ -522,6 +588,66 @@ class TestGDNKeyMatching:
         # TP=2 should halve the split sizes
         assert r1[0][0] == 64 and r2[0][0] == 32
         assert r1[0][2] == 128 and r2[0][2] == 64
+
+
+class TestMegatronFSDPV2GDNKeyMatching:
+    """Regression coverage for Megatron FSDP v2 GDN key matching."""
+
+    class FakeGDN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qk_dim_local_tp = 2
+            self.v_dim_local_tp = 4
+            self.num_value_heads = 2
+            self.tp_size = 1
+
+    def test_detect_gdn_layers_uses_gdn_module_attrs(self):
+        model = torch.nn.Module()
+        model.decoder = torch.nn.Module()
+        model.decoder.layer = torch.nn.Module()
+        model.decoder.layer.self_attention = self.FakeGDN()
+
+        gdn_info = _detect_gdn_layers(model)
+
+        assert gdn_info == {
+            "decoder.layer.self_attention": {
+                "in_proj_sizes": [2, 2, 4, 4, 2, 2],
+                "conv1d_sizes": [2, 2, 4],
+            }
+        }
+
+    def test_match_gdn_key_uses_real_gdn_keys(self):
+        gdn_info = {
+            "decoder.layers.0.self_attention": {
+                "in_proj_sizes": [2, 2, 4, 4, 2, 2],
+                "conv1d_sizes": [2, 2, 4],
+            }
+        }
+
+        in_proj = _match_gdn_key_v2(
+            "module.decoder.layers.0.self_attention.in_proj.weight", torch.empty(16, 4), gdn_info
+        )
+        conv1d = _match_gdn_key_v2(
+            "module.decoder.layers.0.self_attention.conv1d.weight", torch.empty(8, 1, 4), gdn_info
+        )
+
+        assert in_proj == ([2, 2, 4, 4, 2, 2], ["query", "key", "value", "z", "beta", "alpha"], 0)
+        assert conv1d == ([2, 2, 4], ["query", "key", "value"], 0)
+
+    def test_match_gdn_key_ignores_attention_projection_keys(self):
+        gdn_info = {
+            "decoder.layers.0.self_attention.gdn": {
+                "in_proj_sizes": [2, 2, 4, 4, 2, 2],
+                "conv1d_sizes": [2, 2, 4],
+            }
+        }
+
+        assert (
+            _match_gdn_key_v2(
+                "decoder.layers.0.self_attention.linear_qkv.weight", torch.empty(16, 4), gdn_info
+            )
+            is None
+        )
 
 
 class TestGDNFSDPTensorParallelMetadata:

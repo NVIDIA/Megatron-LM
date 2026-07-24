@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -102,6 +102,17 @@ class DistributedDataParallelConfig:
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
+    """
+
+    mfsdp_cuda_graph_modules: list = field(default_factory=list)
+    """If set and ``use_megatron_fsdp_v2`` is set, enable CUDA graph capture
+    on specific FSDP module types. Valid values: ``'mamba'`` (MambaLayer),
+    ``'transformer'`` (TransformerLayer), ``'attn'`` (Attention), ``'mlp'`` (dense MLP),
+    ``'moe'`` (TEGroupedMLP or SequentialMLP), and ``'moe_router'`` (MoE Router).
+    Example: ``['attn', 'mlp']``.
+    Only leaf FSDP modules (without FSDP children) are eligible."""
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -150,6 +161,15 @@ class DistributedDataParallelConfig:
       This option will cause additional memory overhead, however, it is necessary for
       to register user buffer (nccl_ub=True) for the Megatron FSDP. 
       This option will be automatically set to True when nccl_ub=True.
+    """
+
+    fsdp_trace_pool: bool = False
+    """If true, use TracePoolAllocator for Megatron FSDP v2 communication buffers
+      instead of the default StorageFreeingBucketAllocator.  The TracePoolAllocator
+      traces the first micro-batch to build a static key-to-address plan, providing
+      stable buffer addresses required for CUDA graph capture.  This flag only takes
+      effect in the Megatron FSDP v2 path.  In the v1 path, use ``fsdp_double_buffer``
+      for FixedPoolAllocator-based double buffering.
     """
 
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
@@ -272,6 +292,9 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.use_megatron_fsdp_v2:
+            self.use_megatron_fsdp = True
+
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 

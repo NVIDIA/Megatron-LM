@@ -1073,6 +1073,10 @@ def get_megatron_optimizer(
             if ddp_config.data_parallel_sharding_strategy == 'no_shard'
             else intra_dist_opt_group
         )
+        # FSDP v2 builds dp_cp as the flattened outer x inner HSDP group.
+        if ddp_config.use_megatron_fsdp_v2 and ddp_config.outer_dp_sharding_strategy == 'optim':
+            effective_intra_dist_opt_group = dp_cp_group
+
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):

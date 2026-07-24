@@ -21,27 +21,48 @@ from torch.distributed.checkpoint import default_planner
 
 logger = logging.getLogger(__name__)
 
-try:
-    from torch.distributed import DeviceMesh
-    from torch.distributed._tensor import DTensor
-    from torch.distributed.checkpoint.metadata import TensorStorageMetadata
-    from torch.distributed.tensor.placement_types import Replicate, Shard
+HAVE_MEGATRON_FSDP = False
 
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
-        make_fsdp_dtensor,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        split_dtensor,
-        uneven_dtensor_to_full_tensor,
-    )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
-        get_mcore_tensor_parallel_partition_dim,
-        is_mcore_tensor_model_parallel,
-    )
+
+def _ensure_megatron_fsdp_imports():
+    """Load optional Megatron-FSDP helpers, retrying after circular initialization."""
+    global HAVE_MEGATRON_FSDP
+    global DTensor, DeviceMesh, Replicate, Shard, TensorStorageMetadata
+    global get_mcore_tensor_parallel_partition_dim, is_mcore_tensor_model_parallel
+    global make_fsdp_dtensor, split_dtensor, uneven_dtensor_to_full_tensor
+
+    if HAVE_MEGATRON_FSDP:
+        return
+
+    try:
+        from torch.distributed import DeviceMesh
+        from torch.distributed._tensor import DTensor
+        from torch.distributed.checkpoint.metadata import TensorStorageMetadata
+        from torch.distributed.tensor.placement_types import Replicate, Shard
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+            make_fsdp_dtensor,
+        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            split_dtensor,
+            uneven_dtensor_to_full_tensor,
+        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+            get_mcore_tensor_parallel_partition_dim,
+            is_mcore_tensor_model_parallel,
+        )
+    except ImportError as error:
+        raise ImportError("Megatron-FSDP checkpoint dependencies are unavailable.") from error
 
     HAVE_MEGATRON_FSDP = True
+
+
+try:
+    _ensure_megatron_fsdp_imports()
 except ImportError:
-    HAVE_MEGATRON_FSDP = False
+    # This module can be imported while Megatron-FSDP is still initializing.
+    # Checkpoint entry points retry the imports after module initialization.
+    pass
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
@@ -201,7 +222,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     decoder uses SWiGLU — splitting non-SWiGLU fc1 weights would create _w/_v
     keys that don't exist in the checkpoint, causing a load-time mismatch.
     """
-    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+    _ensure_megatron_fsdp_imports()
 
     # Extract num_experts from model config for expert parameter processing
     model_config = get_attr_wrapped_model(model, "config", allow_none=True)
@@ -432,7 +453,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         conv1d.weight   → .query / .key / .value                         (3-way)
         conv1d.bias     → .query / .key / .value                         (3-way)
     """
-    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+    _ensure_megatron_fsdp_imports()
 
     GDN_IN_PROJ_NAMES = ["query", "key", "value", "z", "beta", "alpha"]
     GDN_CONV1D_NAMES = ["query", "key", "value"]
@@ -621,7 +642,7 @@ def handle_fp8_extra_state_case(model_state_dict):
     """
     Handle the case where FP8 extra state is present in the model state dict.
     """
-    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+    _ensure_megatron_fsdp_imports()
 
     for key in list(model_state_dict.keys()):
         if key.endswith('._extra_state'):
@@ -683,7 +704,7 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
     """
     Validate the loaded state dict against the expected structure and types.
     """
-    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+    _ensure_megatron_fsdp_imports()
 
     # Initialize reader
     reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_path)
