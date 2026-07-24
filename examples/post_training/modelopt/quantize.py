@@ -347,7 +347,7 @@ def get_calib_dataloader(
 
     Supports either a local path (.jsonl) or a HuggingFace dataset name.
     """
-    if os.path.isfile(dataset_path_or_name):
+    if os.path.isfile(dataset_path_or_name) and dataset_path_or_name.endswith(".jsonl"):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
         all_texts = []
@@ -539,6 +539,11 @@ if __name__ == "__main__":
         import_kwargs = {"dtype": import_dtype}
         if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
+        if (
+            "moe_router_dtype" in inspect.signature(import_mcore_gpt_from_hf).parameters
+            and getattr(args, "moe_router_dtype", None)
+        ):
+            import_kwargs.update({"moe_router_dtype": args.moe_router_dtype})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )

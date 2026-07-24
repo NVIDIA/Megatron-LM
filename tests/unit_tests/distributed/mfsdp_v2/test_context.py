@@ -27,7 +27,7 @@ class NestedModel(nn.Module):
 
 
 class MultiChildModel(nn.Module):
-    """Model with direct parameters and multiple child FSDP units."""
+    """Model with direct parameters and multiple child FsdpModules."""
 
     def __init__(self, dim: int, num_children: int) -> None:
         super().__init__()
@@ -42,12 +42,39 @@ class MultiChildModel(nn.Module):
         return x
 
 
+class BranchModel(nn.Module):
+    """Nested branch with its own child FsdpModule."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.ones(dim))
+        self.inner = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the nested branch."""
+        return torch.relu(self.inner(x) + self.bias)
+
+
+class NestedSiblingModel(nn.Module):
+    """Model with a nested left subtree and a right sibling."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.ones(dim))
+        self.left = BranchModel(dim)
+        self.right = nn.Linear(dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the nested subtree before the right sibling."""
+        return self.right(self.left(x) + self.bias)
+
+
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
-    """A parent FSDP unit should lazily create one context for its subtree."""
+    """A parent FsdpModule should lazily create one context for its subtree."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -98,3 +125,23 @@ def test_sibling_roots_without_parent_keep_separate_contexts(distributed_setup):
     assert model.layers[0].context is not model.layers[1].context
     assert model.layers[0].is_root()
     assert model.layers[1].is_root()
+
+
+def test_nested_prefetch_orders_use_dfs(distributed_setup):
+    """Nested FsdpModules should use DFS orders for one-step prefetch."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedSiblingModel(dim=4).to(device)
+
+    fully_shard(model.left.inner, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.left, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.right, mesh=mesh, placements=_flat_placements())
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    with torch.no_grad():
+        model(torch.ones(2, 4, device=device))
+
+    context = model.context
+    assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
+    assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]

@@ -945,7 +945,10 @@ def validate_args(args, defaults={}):
             )
 
     # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    if args.hybrid_layer_pattern and (
+        Symbols.MLA in args.hybrid_layer_pattern
+        or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -2577,11 +2580,13 @@ def _add_inference_args(parser):
         '--inference-dynamic-batching-async-sched-mode',
         type=str,
         default='legacy',
-        choices=['legacy', 'serial'],
+        choices=['legacy', 'serial', 'overlap'],
         help='Async scheduling mode for dynamic batching. '
         '"legacy" (default) preserves the existing resolve-before-prepare '
         'path. "serial" speculatively prepares and forwards decode-only '
-        'steps before resolving finished requests.',
+        'steps before resolving finished requests. "overlap" uses the same '
+        'async scheduling path while overlapping prepare/sample and '
+        'forward/resolve phases.',
     )
     group.add_argument(
         '--inference-dynamic-batching-logprobs-mode',
@@ -2668,6 +2673,17 @@ def _add_inference_args(parser):
         help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
         'By default, all graphs are limited by the decode limit of '
         '`max_requests * (num_speculative_tokens + 1)`.',
+    )
+    group.add_argument(
+        '--inference-cuda-graph-max-tokens',
+        type=int,
+        default=512,
+        dest='inference_cuda_graph_max_tokens',
+        help='Token ceiling for the largest captured prefill/mixed CUDA '
+        'graph (default: 512). Clamped to at least the decode limit '
+        '`max_requests * (num_speculative_tokens + 1)` and at most '
+        '`max_tokens`. Ignored when --inference-cuda-graph-all-prefills '
+        'is set (which extends capture to the full `max_tokens`).',
     )
     group.add_argument(
         '--inference-dynamic-batching-cuda-graph-sizing-distribution',
@@ -4767,9 +4783,16 @@ def _add_moe_args(parser):
         '--moe-router-load-balancing-type',
         nargs='+',
         type=str,
-        choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
+        choices=[
+            'aux_loss',
+            'seq_aux_loss',
+            'global_aux_loss',
+            'sinkhorn',
+            'quantile_balancing',
+            'none',
+        ],
         default='aux_loss',
-        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".',
+        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" (QB) uses dual coordinate descent on a per-expert bias to handle load balance internally; "none" implies no load balancing. The default is "aux_loss".',
     )
     group.add_argument(
         '--moe-aux-loss-coeff',

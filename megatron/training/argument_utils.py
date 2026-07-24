@@ -535,8 +535,18 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
-def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
-    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
+def gpt_config_from_args(
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type = GPTModelConfig,
+) -> Any:
+    """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
+
+    `model_config_cls` lets callers reuse this same arg-derivation logic for
+    subclasses that only override metadata (e.g. `builder`) and add no new fields,
+    such as `ModelOptModelConfig`.
+    """
+    assert issubclass(model_config_cls, GPTModelConfig)
 
     kwargs = {}
     if config is None:
@@ -577,11 +587,25 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = Non
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return GPTModelConfig(**kwargs)
+    return model_config_cls(**kwargs)
 
 
-def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
-    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
+def hybrid_config_from_args(
+    args: Namespace,
+    config: TransformerConfig | None = None,
+    model_config_cls: type | None = None,
+) -> Any:
+    """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
+
+    `model_config_cls` lets callers reuse this same arg-derivation logic for
+    subclasses that only override metadata (e.g. `builder`) and add no new fields,
+    such as `ModelOptHybridModelConfig`. It defaults to `None` and is resolved to
+    `HybridModelConfig` at call time so the class can be patched by callers/tests.
+    """
+    if model_config_cls is None:
+        model_config_cls = HybridModelConfig
+    else:
+        assert issubclass(model_config_cls, HybridModelConfig)
 
     kwargs = {}
     if config is None:
@@ -627,7 +651,7 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = 
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return HybridModelConfig(**kwargs)
+    return model_config_cls(**kwargs)
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:

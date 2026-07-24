@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -75,6 +76,10 @@ class TestHybridBlock:
             pg_collection=self.get_pg_collection(),
         )
 
+    def get_dsa_hybrid_block(self, layer_pattern):
+        # main's helper is a subset of dev's get_dsa_mamba_block (no mHC kwargs).
+        return self.get_dsa_mamba_block(layer_pattern)
+
     def get_dsa_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
         mhc_kwargs = (
@@ -104,6 +109,35 @@ class TestHybridBlock:
             dsa_indexer_topk=32,
             add_bias_linear=False,
             **mhc_kwargs,
+        )
+        modules = hybrid_stack_spec.submodules
+        return HybridStack(
+            transformer_config,
+            modules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+
+    def get_mla_hybrid_block(self, layer_pattern):
+        layer_type_list = validate_segment_layers(layer_pattern)
+        transformer_config = MLATransformerConfig(
+            hidden_size=256,  # The Mamba layer places several constraints on this
+            # Need to specify num_attention_heads and num_layers or TransformerConfig
+            # will generate errors.
+            num_layers=len(layer_type_list),
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
         )
         modules = hybrid_stack_spec.submodules
         return HybridStack(
@@ -397,7 +431,7 @@ class TestHybridBlock:
         assert output.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size)
 
     def test_invalid_layer_types_cause_failure(self):
-        invalid_symbol = '+'
+        invalid_symbol = 'X'
         assert invalid_symbol not in Symbols.VALID_LAYERS  # sanity check.
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
         # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
@@ -455,7 +489,7 @@ class TestHybridBlock:
     def test_dsa_layer_types(self):
         """D symbol creates a TransformerLayer with MLA and DSA core attention."""
         layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
-        block = self.get_dsa_mamba_block(layer_pattern)
+        block = self.get_dsa_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], MambaLayer)
         assert isinstance(layers[1], TransformerLayer)
@@ -467,4 +501,22 @@ class TestHybridBlock:
         """* and D in the same block fail."""
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.DS_ATTENTION + Symbols.MAMBA
         with pytest.raises(ValueError):
-            block = self.get_dsa_mamba_block(layer_pattern)
+            block = self.get_dsa_hybrid_block(layer_pattern)
+
+    def test_mla_layer_types(self):
+        """+ symbol creates a TransformerLayer with MLASelfAttention but
+        standard (non-DSA) core attention."""
+        layer_pattern = Symbols.MAMBA + Symbols.MLA + Symbols.MAMBA
+        block = self.get_mla_hybrid_block(layer_pattern)
+        layers = block.layers
+        assert isinstance(layers[0], MambaLayer)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, MLASelfAttention)
+        assert isinstance(layers[1].self_attention.core_attention, TEDotProductAttention)
+        assert isinstance(layers[2], MambaLayer)
+
+    def test_mixed_attention_and_mla_layer_types(self):
+        """* and + in the same block fail (same reason as * and D)."""
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLA + Symbols.MAMBA
+        with pytest.raises(ValueError):
+            block = self.get_mla_hybrid_block(layer_pattern)

@@ -363,6 +363,12 @@ class TEGroupedMLP(MegatronModule):
             return _unsupported(f"linear_fc1 is {type(self.linear_fc1).__name__}")
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
+        if (
+            self.linear_fc2.use_bias
+            and "scale_bias" not in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+        ):
+            # Older TE op-fuser versions cannot scale FC2 bias by router probabilities
+            return _unsupported("TE op-fuser too old to scale FC2 bias by router probabilities")
 
         # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
         # Clamped SwiGLU (e.g. DSv4) routes through ScaledClampedQGeGLU with
@@ -568,6 +574,7 @@ class TEGroupedMLP(MegatronModule):
         ops.append(op)
 
         # FC2
+        fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
         op = te.pytorch.ops.GroupedLinear(
             self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
@@ -579,6 +586,8 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_weight=fc2_single_grouped_weight,
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
+            # Preserve p * (FC2(x) + bias) after the scaled activation moves p before FC2.
+            **fc2_bias_kwargs,
         )
 
         # In single grouped mode, clear stale per-expert meta params so TE does not reset
@@ -598,7 +607,7 @@ class TEGroupedMLP(MegatronModule):
         """Make function that calls submodule pre-forward callback hooks.
 
         This is intended for compatibility with
-        DistributedDataParallel hooks that trigger parameter
+        DistributedDataParallel/FSDP hooks that trigger parameter
         all-gathers. It does not support general pre-forward hooks
         since they may manipulate intermediate tensors that are never
         instantiated by the fused implementation.
@@ -616,6 +625,7 @@ class TEGroupedMLP(MegatronModule):
                             f"but a {submodule.__class__.__name__} submodule "
                             "has a pre-forward hook that modifies the input tensor."
                         )
+            self._ensure_main_grad_for_fused_impl()
 
         return forward_pre_hook
 
@@ -639,6 +649,23 @@ class TEGroupedMLP(MegatronModule):
             return output
 
         return forward_post_hook
+
+    @staticmethod
+    def _ensure_main_grad(linear_module: torch.nn.Module) -> None:
+        """Expose FSDP main_grad buffers required by TE fused wgrad accumulation."""
+        if not getattr(linear_module, "fuse_wgrad_accumulation", False):
+            return
+        for param in linear_module.parameters(recurse=False):
+            get_main_grad = getattr(param, "get_main_grad", None)
+            if get_main_grad is not None and getattr(param, "main_grad", None) is None:
+                param.main_grad = get_main_grad()
+            if hasattr(param, "overwrite_main_grad"):
+                param.overwrite_main_grad = True
+
+    def _ensure_main_grad_for_fused_impl(self) -> None:
+        """Expose wrapper parameter main_grad buffers before TE fused ops run."""
+        self._ensure_main_grad(self.linear_fc1)
+        self._ensure_main_grad(self.linear_fc2)
 
     def _fused_forward(
         self,
@@ -706,11 +733,16 @@ class TEGroupedMLP(MegatronModule):
             )
             with stash_context:
                 # Call fused impl
+                fc2_extra_inputs = (
+                    (tokens_per_expert, permuted_probs)
+                    if self.linear_fc2.use_bias
+                    else (tokens_per_expert,)
+                )
                 output = ops(
                     permuted_local_hidden_states,
                     tokens_per_expert,  # FC1
                     permuted_probs,  # Scaled activation
-                    tokens_per_expert,  # FC2
+                    *fc2_extra_inputs,  # FC2 splits and, for bias, its per-token scale
                 )
         output = fused_group_mlp_manager.group_offload(
             output,
