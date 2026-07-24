@@ -160,7 +160,7 @@ def _mamba_chunk_scan_combined_fwd(
         return final_states
 
 
-def mamba_chunk_scan_combined_varlen(
+def _mamba_chunk_scan_combined_varlen_triton(
     x,
     dt,
     A,
@@ -232,3 +232,131 @@ def mamba_chunk_scan_combined_varlen(
     )
 
     return varlen_states
+
+
+_CUTEDSL_SSD_ENABLED = None
+
+
+def _cutedsl_ssd_enabled():
+    """Whether the CuteDSL SSD backend is usable on this system.
+
+    CuteDSL is the default varlen-SSD backend: it is used whenever the GPU is
+    Blackwell (SM 10.0+) and the CuteDSL runtime imports; Triton is the fallback
+    for other platforms and for argument combinations the CuteDSL kernel does
+    not support. The decision is cached in ``_CUTEDSL_SSD_ENABLED`` (tests may
+    override that global directly to force a backend).
+    """
+    global _CUTEDSL_SSD_ENABLED
+    if _CUTEDSL_SSD_ENABLED is not None:
+        return _CUTEDSL_SSD_ENABLED
+
+    enabled = False
+    try:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+            from .cutedsl_mamba2_ssd import is_cutedsl_ssd_available
+
+            enabled = is_cutedsl_ssd_available()
+    except Exception:
+        enabled = False
+    _CUTEDSL_SSD_ENABLED = enabled
+    return enabled
+
+
+def mamba_chunk_scan_combined_varlen(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    cu_chunk_seqlens,
+    last_chunk_indices,
+    seq_idx,
+    out,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    return_intermediate_states=False,
+    intermediate_chunk_indices=None,
+    state_dtype=None,
+):
+    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell + divisible sequence)
+    or Triton backend.
+
+    CuteDSL is the default backend on Blackwell (SM 10.0+): a faster drop-in
+    covering the production prefill cases (divisible sequence lengths, chunked
+    prefill via ``initial_states``, prefix caching via
+    ``intermediate_chunk_indices``, empty padded sequences). Eligibility is
+    decided up front via :func:`cutedsl_unsupported_reason`; Triton is used on
+    other platforms and for the argument combinations the CuteDSL kernel does
+    not support (non-divisible sequence lengths, gating ``z``, interleaved
+    empty sequences with intermediate emission). See
+    :func:`_mamba_chunk_scan_combined_varlen_triton` for the argument contract.
+    """
+    if _cutedsl_ssd_enabled():
+        # Kept local: this is the graceful-degradation boundary (the cutlass-
+        # dependent package must only be imported once the backend is enabled).
+        from .cutedsl_mamba2_ssd import (
+            cutedsl_unsupported_reason,
+            mamba_chunk_scan_combined_varlen_cutedsl_thd,
+        )
+
+        supported = (
+            cutedsl_unsupported_reason(
+                x,
+                chunk_size,
+                cu_chunk_seqlens,
+                last_chunk_indices,
+                z=z,
+                return_intermediate_states=return_intermediate_states,
+                intermediate_chunk_indices=intermediate_chunk_indices,
+            )
+            is None
+        )
+        if supported:
+            return mamba_chunk_scan_combined_varlen_cutedsl_thd(
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                chunk_size=chunk_size,
+                cu_chunk_seqlens=cu_chunk_seqlens,
+                last_chunk_indices=last_chunk_indices,
+                seq_idx=seq_idx,
+                out=out,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                return_intermediate_states=return_intermediate_states,
+                intermediate_chunk_indices=intermediate_chunk_indices,
+                state_dtype=state_dtype,
+            )
+
+    return _mamba_chunk_scan_combined_varlen_triton(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_chunk_seqlens,
+        last_chunk_indices,
+        seq_idx,
+        out,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        return_intermediate_states=return_intermediate_states,
+        intermediate_chunk_indices=intermediate_chunk_indices,
+        state_dtype=state_dtype,
+    )

@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+import megatron.core.ssm.ops.ssd_combined as ssd_combined
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
@@ -10,6 +11,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
+from megatron.core.ssm.ops.ssd_combined import _cutedsl_ssd_enabled
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -143,3 +145,92 @@ class TestMambaMixerErrorChecks:
                 pg_collection=pg_collection,
             )
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    not _cutedsl_ssd_enabled(),
+    reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
+)
+class TestMambaMixerCuteDSL:
+    """The mamba layer's varlen SSM prefill must give near-identical results with the
+    CuteDSL backend vs Triton. CuteDSL accelerates the case where each request length
+    is a multiple of the chunk size; the mixer routes the varlen prefill through the
+    ``mamba_chunk_scan_combined_varlen`` dispatcher (CuteDSL by default on Blackwell;
+    forced per-backend here via the dispatcher's cached decision)."""
+
+    def teardown_method(self, method):
+        ssd_combined._CUTEDSL_SSD_ENABLED = None  # restore backend autodetection
+        Utils.destroy_model_parallel()
+
+    def _build_mixer(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            hidden_size=256, num_layers=1, num_attention_heads=1, use_cpu_initialization=True
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        mixer = MambaMixer(
+            config,
+            hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
+            config.hidden_size,
+            layer_number=1,
+            pg_collection=pg_collection,
+        )
+        return mixer.cuda()
+
+    def _run_prefill(
+        self, mixer, zxBCdt, seq_idx, cu_seqlens, batch_indices, num_requests, backend
+    ):
+        # Force the dispatcher's cached backend decision (no env knob anymore).
+        ssd_combined._CUTEDSL_SSD_ENABLED = backend == "cutedsl"
+
+        conv_dim = mixer.d_inner_local_tp + 2 * mixer.ngroups_local_tp * mixer.d_state
+        conv_state = torch.zeros(num_requests, conv_dim, mixer.d_conv, device="cuda")
+        ssm_state = torch.zeros(
+            num_requests, mixer.nheads_local_tp, mixer.headdim, mixer.d_state, device="cuda"
+        )
+        # Prefill runs under inference (no autograd) in production; mirror that here
+        # (the SSD scan returns plain state tensors, and cumsum(out=) needs no grad).
+        # _ssm_prefill mutates zxBCdt/states in place, so feed fresh copies per backend.
+        with torch.no_grad():
+            y = mixer._ssm_prefill(
+                zxBCdt=zxBCdt.clone(),
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+                batch_indices=batch_indices,
+            )
+        return y, ssm_state
+
+    def test_prefill_cutedsl_matches_triton(self):
+        torch.manual_seed(7)
+        mixer = self._build_mixer()
+
+        num_requests = 4  # extra padding slots; only request 0 is real
+        real_seq_len = 256  # multiple of chunk_size -> exercises the CuteDSL kernel
+        assert real_seq_len % mixer.chunk_size == 0
+
+        dim_inputs = (
+            mixer.d_inner_local_tp * 2
+            + 2 * mixer.ngroups_local_tp * mixer.d_state
+            + mixer.nheads_local_tp
+        )
+        zxBCdt = torch.randn(real_seq_len, 1, dim_inputs, device="cuda", dtype=torch.float32)
+        seq_idx = torch.zeros((1, real_seq_len), dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.tensor([0, real_seq_len], dtype=torch.int32, device="cuda")
+        batch_indices = torch.tensor([0], dtype=torch.long, device="cuda")
+
+        y_tri, st_tri = self._run_prefill(
+            mixer, zxBCdt, seq_idx, cu_seqlens, batch_indices, num_requests, "triton"
+        )
+        y_cute, st_cute = self._run_prefill(
+            mixer, zxBCdt, seq_idx, cu_seqlens, batch_indices, num_requests, "cutedsl"
+        )
+
+        torch.testing.assert_close(y_cute, y_tri, rtol=2e-2, atol=0.25)
+        torch.testing.assert_close(
+            st_cute[batch_indices], st_tri[batch_indices], rtol=3e-2, atol=3e-2
+        )
