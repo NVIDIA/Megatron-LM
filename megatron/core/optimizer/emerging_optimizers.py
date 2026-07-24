@@ -17,7 +17,7 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_size, log_single_rank
+from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -230,6 +230,41 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
+    def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
+        """All-gather grad along GTP_remat/EGTP_remat dim 0, orthogonalize, then slice back.
+
+        GTP_remat shards weights along dim 0 independently of TP's partition_dim. Newton-Schulz
+        needs the full weight matrix, so we reconstruct the GTP_remat dimension before running
+        the TP-aware orthogonalization, then extract the local GTP_remat shard from the result.
+        When GTP_remat is inactive this is a plain passthrough to scaled_orthogonalize_fn.
+        """
+        is_expert = getattr(p, 'expert_tp', False)
+        gtp_remat_group = (
+            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
+            if self.pg_collection
+            else None
+        )
+
+        if gtp_remat_group is None or get_pg_size(gtp_remat_group) <= 1:
+            return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+
+        # Parameters with is_gtp_weight_remat=False are not sharded along the
+        # GTP process group, and do not require all-gathering prior to
+        # orthogonalization.
+        if not getattr(p, 'is_gtp_weight_remat', False):
+            return self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+
+        gtp_remat_size = get_pg_size(gtp_remat_group)
+        gtp_rank = get_pg_rank(gtp_remat_group)
+        shards = [torch.empty_like(grad) for _ in range(gtp_remat_size)]
+        torch.distributed.all_gather(shards, grad, gtp_remat_group)
+        gathered_grad = torch.cat(shards, dim=0)
+
+        gathered_grad = self.scaled_orthogonalize_fn(gathered_grad, tp_group, partition_dim)
+
+        shard_size = gathered_grad.shape[0] // gtp_remat_size
+        return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -280,14 +315,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
 
             qkv_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                self.scaled_orthogonalize_fn_with_gtp_remat(p, g, tp_group, partition_dim).view(
                     num_query_groups, -1, grad_shape[-1]
                 )
                 for g in qkv_grads
             ]
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
         else:
-            grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
+            grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
         return grad
 
 
