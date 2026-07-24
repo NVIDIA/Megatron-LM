@@ -26,7 +26,6 @@ Megatron-FSDP path does.
 """
 
 import os
-from typing import Optional, Union
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -61,7 +60,7 @@ def _strip_extra_state(model_state_dict: dict) -> dict:
     }
 
 
-def _build_state_dict(model: torch.nn.Module, optimizer: Optional[torch.optim.Optimizer]) -> dict:
+def _build_state_dict(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> dict:
     state_dict = {"model": _strip_extra_state(model.state_dict())}
     if optimizer is not None:
         state_dict["optimizer"] = optimizer.state_dict()
@@ -119,24 +118,24 @@ def sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
 
 def save_checkpoint(
     model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
-    checkpoint_id: Union[str, os.PathLike],
+    optimizer: torch.optim.Optimizer | None,
+    checkpoint_dir: str | os.PathLike,
 ) -> None:
     """Save a ``fully_shard``-wrapped model (and optionally its optimizer) as a DCP checkpoint.
 
     Args:
         model: A module tree that has been sharded with :func:`fully_shard`.
         optimizer: Optimizer stepping the sharded parameters, or ``None`` to save only weights.
-        checkpoint_id: Destination directory for the DCP checkpoint.
+        checkpoint_dir: Destination directory for the DCP checkpoint.
     """
     state_dict = _annotate_uneven_dtensors(_build_state_dict(model, optimizer))
-    dcp.save(state_dict, checkpoint_id=str(checkpoint_id))
+    dcp.save(state_dict, checkpoint_id=checkpoint_dir)
 
 
 def load_checkpoint(
     model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
-    checkpoint_id: Union[str, os.PathLike],
+    optimizer: torch.optim.Optimizer | None,
+    checkpoint_dir: str | os.PathLike,
     *,
     resync_model_weights: bool = True,
 ) -> None:
@@ -149,13 +148,13 @@ def load_checkpoint(
     Args:
         model: A module tree sharded with :func:`fully_shard`, whose weights receive the load.
         optimizer: Optimizer whose state receives the load, or ``None`` to load only weights.
-        checkpoint_id: Source directory of the DCP checkpoint.
+        checkpoint_dir: Source directory of the DCP checkpoint.
         resync_model_weights: Refresh compute weights from the loaded main weights afterwards.
     """
     if optimizer is not None:
         materialize_optimizer_state(optimizer)
     state_dict = _annotate_uneven_dtensors(_build_state_dict(model, optimizer))
-    dcp.load(state_dict, checkpoint_id=str(checkpoint_id))
+    dcp.load(state_dict, checkpoint_id=checkpoint_dir)
     # DCP wrote into the resting DTensors in place. Re-install the loaded model tensors (a no-op
     # for the shared storage, but it also restores any stripped-key structure) and the optimizer
     # state, mirroring the stable Megatron-FSDP load path.
