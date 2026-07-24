@@ -238,6 +238,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         the TP-aware orthogonalization, then extract the local GTP_remat shard from the result.
         When GTP_remat is inactive this is a plain passthrough to scaled_orthogonalize_fn.
         """
+        # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
         gtp_remat_group = (
             (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
