@@ -155,6 +155,34 @@ class TestCudaGraphConfigAndArguments:
                 num_moe_experts=4,
             )
 
+    def test_te_whole_moe_graph_allows_sync_free_hybridep_paged_stash(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.moe],
+            num_moe_experts=4,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_expert_rank_capacity_factor=1.2,
+            moe_paged_stash=True,
+            use_transformer_engine_op_fuser=True,
+        )
+
+        assert cfg.cuda_graph_modules == [CudaGraphModule.moe]
+
+    def test_te_whole_moe_graph_rejects_sync_free_hybridep_without_paged_stash(self):
+        with pytest.raises(
+            AssertionError, match="sync-free HybridEP with rank capacity and paged stash"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.moe],
+                num_moe_experts=4,
+                moe_token_dispatcher_type="flex",
+                moe_flex_dispatcher_backend="hybridep",
+                moe_expert_rank_capacity_factor=1.2,
+                use_transformer_engine_op_fuser=True,
+            )
+
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
             AssertionError,

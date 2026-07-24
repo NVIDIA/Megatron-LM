@@ -1,4 +1,6 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,9 +10,12 @@ from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashManager,
+    PagedStashRunner,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
@@ -25,6 +30,78 @@ from tests.unit_tests.test_utilities import Utils
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
 # tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
 pytestmark = pytest.mark.launch_on_gb200
+
+
+def test_te_graph_capture_replays_paged_stash_schedule():
+    manager = PagedStashManager.__new__(PagedStashManager)
+    manager.enabled = True
+    manager.status = 'captured'
+    manager.vp_size = 1
+    manager._pp_schedule = [1_001_000, 1_002_000, -1_002_000, -1_001_000]
+    manager.current_layer = [99]
+    manager.current_microbatch = [99]
+    manager.current_vp_stage = 0
+    manager.current_schedule_index = len(manager._pp_schedule)
+    manager._te_graph_capture = False
+
+    manager.start_te_graph_capture()
+    manager.prepare_te_graph_capture_forward()
+    assert manager.current_schedule_index == 0
+    assert manager.current_layer == [1]
+    assert manager.current_microbatch == [0]
+
+    manager.current_schedule_index = 1
+    manager.prepare_te_graph_capture_forward()
+    assert manager.current_layer == [2]
+
+    manager.current_schedule_index = 2
+    with pytest.raises(RuntimeError, match="expected a forward schedule entry"):
+        manager.prepare_te_graph_capture_forward()
+
+    manager.finish_te_graph_capture()
+    assert not manager._te_graph_capture
+
+
+def test_te_graph_capture_joins_auxiliary_streams_per_layer(monkeypatch):
+    manager = PagedStashManager.__new__(PagedStashManager)
+    manager._te_graph_capture = True
+    manager._unpack_stream_status = 'reloading'
+    manager._unpack_stream = object()
+
+    calls = []
+    manager.wait_for_stash_to_complete = lambda: calls.append("stash")
+
+    class FakeCurrentStream:
+        def wait_stream(self, stream):
+            calls.append(("reload", stream))
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: FakeCurrentStream())
+
+    manager.finish_te_graph_capture_group_io()
+
+    assert calls == ["stash", ("reload", manager.unpack_stream)]
+    assert manager._unpack_stream_status == 'idle'
+
+    manager._te_graph_capture = False
+    manager._unpack_stream_status = 'reloading'
+    calls.clear()
+    manager.finish_te_graph_capture_group_io()
+    assert calls == []
+    assert manager._unpack_stream_status == 'reloading'
+
+
+def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback():
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.moe]
+    )
+
+    with pytest.raises(RuntimeError, match="Dynamic fallback is not supported"):
+        runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=1, overbudget_ranks=0)
+    with pytest.raises(RuntimeError, match="expert-rank token budget overflow on 2 rank"):
+        runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=0, overbudget_ranks=2)
+
+    runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=0, overbudget_ranks=0)
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:

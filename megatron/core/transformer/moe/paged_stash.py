@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -9,6 +9,7 @@ import torch
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     paged_stash_copy_kernel,
@@ -319,6 +320,7 @@ class PipelinePreScheduleFunction(torch.autograd.Function):
             ]
             if next_schedule_layer < 0:
                 ctx.stash_manager.reload_paged_tensors(-next_schedule_layer)
+                ctx.stash_manager.finish_te_graph_capture_group_io()
 
         return grad_output + (None, None)
 
@@ -354,6 +356,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
             else:
                 ctx.stash_manager.remove_paged_tensor_from_stash()
 
+        ctx.stash_manager.finish_te_graph_capture_group_io()
         ctx.stash_manager.current_schedule_index += 1
         # return the identical tensor
         return tensor
@@ -417,6 +420,7 @@ class PagedStashManager:
         self.current_layer = None
         self.current_microbatch = None
         self.current_schedule_index = None
+        self._te_graph_capture = False
 
         # Track max tokens needed across all vp_stages grouped by dtype and hidden_size
         self.max_tokens_across_vp_stages = None
@@ -676,6 +680,69 @@ class PagedStashManager:
         self.current_layer[vp_stage_index] = 1
         self.current_microbatch[vp_stage_index] += 1
 
+    def start_te_graph_capture(self):
+        """Prepare paged-stash state for TE's repeated per-layer capture passes."""
+        if not self.enabled or self.status != 'captured':
+            raise RuntimeError(
+                "Paged stash must finish its schedule and buffer warmup before TE graph capture."
+            )
+        if not self._pp_schedule:
+            raise RuntimeError("Paged stash has no pipeline schedule for TE graph capture.")
+        self._te_graph_capture = True
+        self.current_schedule_index = 0
+
+    def finish_te_graph_capture(self):
+        """Leave TE's per-layer graph-capture mode."""
+        self._te_graph_capture = False
+
+    def finish_te_graph_capture_group_io(self):
+        """Join auxiliary stash streams before a TE per-layer graph capture ends."""
+        if not self._te_graph_capture:
+            return
+
+        self.wait_for_stash_to_complete()
+        if self._unpack_stream_status == 'reloading':
+            torch.cuda.current_stream().wait_stream(self.unpack_stream)
+            self._unpack_stream_status = 'idle'
+
+    def prepare_te_graph_capture_forward(self):
+        """Align CPU schedule state before each TE capture-time MoE forward.
+
+        ``make_graphed_callables`` captures layers directly without calling the model-level
+        paged-stash chunk handlers. Reuse the already-recorded pipeline schedule as the
+        source of truth for each capture-time forward.
+        """
+        if not self._te_graph_capture:
+            return
+        if self.current_schedule_index == len(self._pp_schedule):
+            self.current_schedule_index = 0
+        if not 0 <= self.current_schedule_index < len(self._pp_schedule):
+            raise RuntimeError(
+                "Paged-stash TE graph capture schedule index is out of range: "
+                f"{self.current_schedule_index} of {len(self._pp_schedule)}."
+            )
+
+        schedule_layer = self._pp_schedule[self.current_schedule_index]
+        if schedule_layer <= 0:
+            raise RuntimeError(
+                "Paged-stash TE graph capture expected a forward schedule entry, "
+                f"but found {schedule_layer} at index {self.current_schedule_index}."
+            )
+
+        vp_stage = schedule_layer // 1_000_000
+        layer_and_microbatch = schedule_layer % 1_000_000
+        layer_no = layer_and_microbatch // 1_000
+        microbatch_no = layer_and_microbatch % 1_000
+        if not 1 <= vp_stage <= self.vp_size:
+            raise RuntimeError(f"Paged-stash TE graph capture decoded invalid VP stage {vp_stage}.")
+
+        if self.current_layer is None or len(self.current_layer) != self.vp_size:
+            self.current_layer = [1 for _ in range(self.vp_size)]
+            self.current_microbatch = [0 for _ in range(self.vp_size)]
+        self.current_vp_stage = vp_stage - 1
+        self.current_layer[self.current_vp_stage] = layer_no
+        self.current_microbatch[self.current_vp_stage] = microbatch_no
+
     def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
         """
         Hook called when autograd saves a tensor for backward pass.
@@ -849,6 +916,7 @@ def paged_stash_group_start(tensor):
     stash_manager = PagedStashManager.get_instance()
     if not stash_manager.enabled:
         return tensor
+    stash_manager.prepare_te_graph_capture_forward()
     return PipelinePreScheduleFunction.apply(tensor, stash_manager)
 
 
@@ -884,6 +952,21 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
     stash_manager.vp_size = vp_size if vp_size is not None else 1
     stash_manager.current_vp_stage = vp_stage if vp_stage is not None else 0
     stash_manager.update_model_chunk(stash_manager.current_vp_stage)
+
+
+@contextmanager
+def paged_stash_te_graph_capture(enabled):
+    """Scope repeated TE per-layer graph capture over the recorded stash schedule."""
+    if not enabled:
+        yield
+        return
+
+    stash_manager = PagedStashManager.get_instance()
+    stash_manager.start_te_graph_capture()
+    try:
+        yield
+    finally:
+        stash_manager.finish_te_graph_capture()
 
 
 def paged_stash_reset(enabled=True, config=None):
@@ -1084,6 +1167,26 @@ class PagedStashRunner:
         torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM)
         return flags[0].item(), flags[1].item(), flags[2].item()
 
+    def _raise_if_te_whole_moe_graph_overflow(
+        self, stash_overflow_ranks: int, overbudget_ranks: int
+    ) -> None:
+        """Fail fast when a captured TE whole-MoE graph exceeds its static buffers."""
+        te_whole_moe_graph = (
+            self.config.cuda_graph_impl == "transformer_engine"
+            and CudaGraphModule.moe in self.config.cuda_graph_modules
+        )
+        if not te_whole_moe_graph or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
+            return
+
+        raise RuntimeError(
+            "Transformer Engine whole-MoE CUDA graph overflowed its static sync-free buffers: "
+            f"paged stash overflow on {stash_overflow_ranks} rank(s), "
+            f"expert-rank token budget overflow on {overbudget_ranks} rank(s). "
+            "Dynamic fallback is not supported for an already captured TE whole-MoE graph. "
+            "Increase --moe-expert-rank-capacity-factor and/or "
+            "--moe-paged-stash-buffer-size-factor-cuda, then restart the job."
+        )
+
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun"""
         log_single_rank(
@@ -1194,6 +1297,7 @@ class PagedStashRunner:
             result = self.forward_backward_func(*args, **kwargs)
 
             stash_overflow_ranks, overbudget_ranks, host_spill_ranks = self.check_moe_overflow()
+            self._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks, overbudget_ranks)
             # if no overflow, set the expert_rank_capacity_factor to the original value
             if stash_overflow_ranks == 0 and overbudget_ranks == 0:
                 if host_spill_ranks > 0:
