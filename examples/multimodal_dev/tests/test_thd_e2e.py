@@ -145,6 +145,103 @@ class TestBuildPackedSeqParams:
 
 
 # ===================================================================
+# Multimodal model — CP must precede sequence-parallel scatter
+# ===================================================================
+
+
+def test_multimodal_model_defers_embedding_sequence_parallel_scatter(monkeypatch):
+    """The GPT embedding remains full until multimodal CP partitioning."""
+    from examples.multimodal_dev.models import base
+
+    captured = {}
+
+    class _FakeGPT(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured.update(kwargs)
+
+    monkeypatch.setattr(base, "GPTModel", _FakeGPT)
+
+    base.MultimodalModel(
+        language_config=SimpleNamespace(),
+        language_spec=None,
+        vision_encoder=None,
+        vocab_size=100,
+        max_sequence_length=8,
+        image_token_id=97,
+    )
+
+    assert captured["scatter_embedding_sequence_parallel"] is False
+
+
+def test_multimodal_forward_partitions_cp_before_scattering_sequence_parallel(monkeypatch):
+    """A full multimodal sequence is CP-sharded before its TP/SP shard."""
+    from examples.multimodal_dev.models import base
+
+    events = []
+
+    class _FakeVision(torch.nn.Module):
+        def forward(self, pixel_values, image_grid_thw):
+            return torch.tensor([[100.0, 101.0]])
+
+    class _FakeLanguage(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_kwargs = None
+
+        def embedding(self, input_ids, position_ids):
+            events.append(("embedding", input_ids.shape[1]))
+            return torch.arange(16, dtype=torch.float32).view(8, 1, 2)
+
+        def forward(self, **kwargs):
+            self.forward_kwargs = kwargs
+            events.append(("language", kwargs["decoder_input"].shape[0]))
+            return kwargs["decoder_input"]
+
+    model = base.MultimodalModel.__new__(base.MultimodalModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(sequence_parallel=True)
+    model.image_token_id = 97
+    model.vision_model = _FakeVision()
+    model.language_model = _FakeLanguage()
+
+    monkeypatch.setattr(base.parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(base.parallel_state, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(base.parallel_state, "get_context_parallel_rank", lambda: 0)
+
+    def _fake_cp_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
+        events.append(("cp", total_tokens))
+        assert total_tokens == 8
+        return torch.tensor([0, 1, 6, 7], dtype=torch.long)
+
+    def _fake_sp_scatter(tensor):
+        events.append(("sp", tensor.shape[0]))
+        return tensor[: tensor.shape[0] // 2]
+
+    monkeypatch.setattr(base, "_thd_cp_partition_index", _fake_cp_index)
+    monkeypatch.setattr(
+        base.tensor_parallel, "scatter_to_sequence_parallel_region", _fake_sp_scatter
+    )
+
+    input_ids = torch.tensor([[10, 97, 12, 13, 14, 15, 16, 17]], dtype=torch.long)
+    output = model(
+        input_ids=input_ids,
+        position_ids=torch.arange(8).unsqueeze(0),
+        labels=input_ids.clone(),
+        loss_mask=torch.ones_like(input_ids, dtype=torch.float32),
+        padding_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        pixel_values=torch.ones(1, 2),
+        image_grid_thw=torch.tensor([[1, 1, 1]], dtype=torch.long),
+        packed_seq_params=SimpleNamespace(cu_seqlens_q_padded=torch.tensor([0, 8])),
+    )
+
+    assert events == [("embedding", 8), ("cp", 8), ("sp", 4), ("language", 2)]
+    assert output.shape == (2, 1, 2)
+    assert output[1, 0].tolist() == [100.0, 101.0]
+    assert model.language_model.forward_kwargs["input_ids"].tolist() == [[10, 97, 16, 17]]
+
+
+# ===================================================================
 # pack_or_pad_batch — packed (THD) mode
 # ===================================================================
 
