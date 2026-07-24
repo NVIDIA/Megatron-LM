@@ -924,7 +924,12 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False, stream_ckpt_dequant: bool = True):
+    def __init__(
+        self,
+        cache_metadata: bool = False,
+        stream_ckpt_dequant: bool = True,
+        checkpoint_name: str = None,
+    ):
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
         # When True, quantized destinations (FP8/MXFP8/blockwise FP8/NVFP4) are
