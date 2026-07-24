@@ -87,6 +87,7 @@ functional:configure:
         "--record-checkpoints ${RECORD_CHECKPOINTS}"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
+        "--enable-error-extraction"
       )
     - |
       SMOKE_ARGS=(
@@ -101,6 +102,7 @@ functional:configure:
         "--record-checkpoints false"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
+        "--enable-error-extraction"
       )
     - |
       export PYTHONPATH=$(pwd)
@@ -457,19 +459,28 @@ functional:x_notify:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || echo "0")
     - export TEAM_SLUG=$SLACK_ADMIN
+    - export PYTHONPATH=$(pwd)
     - |
       python tests/test_utils/python_scripts/notify.py \
         --pipeline-id "${CI_PIPELINE_ID}" \
         --check-for functional-tests \
         --pipeline-context $CONTEXT \
-        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
+        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}" \
+        --summary-output pipeline_summaries.json \
+        --failure-buckets-output failure_buckets.json \
+        --slack-output slack_notification.json
 
   artifacts:
     when: always
     paths:
       - scripts
+      - pipeline_summaries.json
+      - failure_buckets.json
+      - slack_notification.json
+      - inference_metrics.json
+      - agent_formatter_debug.txt
   rules:
     - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
       when: always

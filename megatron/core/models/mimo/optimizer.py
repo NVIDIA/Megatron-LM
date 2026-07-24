@@ -103,6 +103,11 @@ class MimoOptimizer(MegatronOptimizer):
         num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         success = self.step_with_ready_grads()
 
+        # Reduce update success across the world (MIN) so disjoint-grid ranks agree.
+        success_tensor = torch.tensor([1 if success else 0], dtype=torch.int, device="cuda")
+        torch.distributed.all_reduce(success_tensor, op=torch.distributed.ReduceOp.MIN)
+        success = bool(success_tensor.item())
+
         return success, grad_norm, num_zeros
 
     @torch.no_grad()
@@ -125,8 +130,13 @@ class MimoOptimizer(MegatronOptimizer):
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
-        """Count zero gradients across all active module optimizers."""
-        return sum(opt.count_zeros() for opt in self._active_optimizers)
+        """Count zero gradients per module (world-MAX so disjoint grids agree), then sum."""
+        module_counts = torch.zeros(len(self.module_infos), device="cuda", dtype=torch.int64)
+        for index, (_, info) in enumerate(sorted(self.module_infos.items())):
+            if info.is_active and info.optimizer is not None:
+                module_counts[index] = info.optimizer.count_zeros()
+        torch.distributed.all_reduce(module_counts, op=torch.distributed.ReduceOp.MAX)
+        return int(module_counts.sum().item())
 
     @property
     def param_groups(self) -> List[dict]:
@@ -324,54 +334,26 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
+_EXPERT_VIEW = "expert"
+
+
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
-    """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
+    """Derive the optimizer's ProcessGroupCollection from a populated HyperCommGrid.
 
-    Only fetches process groups required by the optimizer. Assumes all groups
-    are pre-created in the grid via grid.create_pg() - does not create any new groups.
-
-    The following groups must be pre-created in the grid before calling this function:
-        grid.create_pg(["dp"])
-        grid.create_pg(["dp", "cp"])
-        grid.create_pg(["tp"])
-        grid.create_pg(["pp"])
-        grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
-
-    Args:
-        grid: HyperCommGrid with pre-created process groups.
-
-    Returns:
-        ProcessGroupCollection containing optimizer-required groups:
-        - dp: Data parallel group
-        - dp_cp: Data parallel with context parallel
-        - tp: Tensor parallel group
-        - mp: Model parallel group (tp × pp)
-        - tp_ep_pp: Expert tensor-model-pipeline group
-        - expt_dp: Expert data parallel group
+    Dense groups come from the base view; expert-parallel groups (tp_ep_pp, expt_dp) come from
+    the grid's dedicated expert view -- expert parallelism is always factored into a separate
+    view (expt_tp/ep/expt_dp), never the base view. All groups must be pre-created on the grid.
     """
     pg = ProcessGroupCollection()
-
-    # Core groups needed by optimizer and checkpointing
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
     pg.tp = grid.get_pg("tp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
-
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
-
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
-
+    pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
+    pg.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
+    # Distributed-optimizer grad-stats group spans the dense shards (mirrors the topology PGC).
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
     return pg
 
 
@@ -390,7 +372,7 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
         is_active = grid.is_current_rank_in_grid()
 
         optimizer = None
-        pg_collection = _get_pg_collection_for_optimizer(grid)
+        pg_collection = None
 
         if is_active:
             if module_name == lang_key:
@@ -399,6 +381,7 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 module = mimo_model.modality_submodules[module_name]
 
             if module is not None:
+                pg_collection = _get_pg_collection_for_optimizer(grid)
                 assert (
                     not hasattr(module, 'ddp_config')
                     or module.ddp_config is None

@@ -861,7 +861,10 @@ def validate_args(args, defaults={}):
             )
 
     # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    if args.hybrid_layer_pattern and (
+            Symbols.MLA in args.hybrid_layer_pattern
+            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -1032,8 +1035,6 @@ def validate_args(args, defaults={}):
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
     args.megatron_fsdp_grad_comm_dtype = map_dtype(args.megatron_fsdp_grad_comm_dtype)
-    if args.grad_reduce_in_bf16:
-        args.megatron_fsdp_grad_comm_dtype = torch.bfloat16
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
@@ -1083,6 +1084,17 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
+        if args.moe_single_grouped_weight or args.moe_single_grouped_bias:
+            # Megatron-FSDP currently remaps module parameters through plain Tensor and TE
+            # Float8Tensor/MXFP8Tensor storage paths. TE GroupedTensor parameters need their
+            # grouped backing storage remapped instead; quantized grouped tensors also need
+            # grouped scale/amax handling. DDP has a separate GroupedTensor-aware path.
+            raise ValueError(
+                "Megatron-FSDP does not currently support moe_single_grouped_weight or "
+                "moe_single_grouped_bias. Disable single grouped MoE parameters or use the "
+                "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
+                "GroupedTensor param buffers."
+            )
         # Optimizer compatibility check.
         assert args.optimizer in ('sgd', 'adam'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
@@ -1110,7 +1122,12 @@ def validate_args(args, defaults={}):
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
             args.fsdp_manual_registration = True
-            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
+            args.fsdp_double_buffer = True
+            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+
+        if args.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of FSDP double buffer.
+            args.fsdp_double_buffer = True
 
         if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
             raise ValueError(
@@ -1251,6 +1268,12 @@ def validate_args(args, defaults={}):
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
             'seq-length should be a multiple of 2 * context-parallel-size ' \
             'if context-parallel-size > 1.'
+
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        # The dataset omits attention_mask when inter-document masking is
+        # enabled; disable the flag to avoid a TP broadcast mismatch.
+        if args.create_attention_mask_in_dataloader:
+            args.create_attention_mask_in_dataloader = False
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -1496,16 +1519,14 @@ def validate_args(args, defaults={}):
         "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
     )
 
-    # Deterministic mode
+    # Deterministic mode — env vars + config overrides + torch global state.
+    # Implementation lives in ``megatron/training/determinism.py`` so the
+    # same setup is reachable from tests / profiling scripts that don't go
+    # through argparse.
     if args.deterministic_mode:
-        assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
-        assert not args.cross_entropy_loss_fusion, "Cross Entropy Fusion is currently not deterministic."
+        from megatron.training.determinism import apply_determinism_to_args
 
-        all_reduce_choices = ["Tree", "Ring", "CollnetDirect", "CollnetChain", "^NVLS"]
-        assert os.getenv("NCCL_ALGO", -1) != -1 and os.getenv("NCCL_ALGO") in all_reduce_choices, \
-            f"NCCL_ALGO must be one of {all_reduce_choices}."
-
-        torch.use_deterministic_algorithms(True)
+        apply_determinism_to_args(args)
 
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
@@ -1908,6 +1929,13 @@ def _add_inference_args(parser):
                        help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
                        'By default, all graphs are limited by the decode limit of '
                        '`max_requests * (num_speculative_tokens + 1)`.')
+    group.add_argument('--inference-cuda-graph-max-tokens', type=int, default=512,
+                       dest='inference_cuda_graph_max_tokens',
+                       help='Token ceiling for the largest captured prefill/mixed CUDA '
+                       'graph (default: 512). Clamped to at least the decode limit '
+                       '`max_requests * (num_speculative_tokens + 1)` and at most '
+                       '`max_tokens`. Ignored when --inference-cuda-graph-all-prefills '
+                       'is set (which extends capture to the full `max_tokens`).')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
@@ -1936,14 +1964,18 @@ def _add_inference_args(parser):
                        'free pool when ref_count hits 0. "lru" keeps blocks '
                        'cached and evicts via LRU only when space is needed.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
-                       type=str, default='first_prefix_block',
-                       choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
+                       type=str, default='load_balanced',
+                       choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],
                        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
                        help='Coordinator routing policy for prefix caching. '
-                       '"first_prefix_block" (default) routes based on the first '
-                       'block hash only. "longest_prefix" routes to the rank with '
-                       'the longest matching prefix. "round_robin" ignores prefix '
-                       'affinity and cycles through ranks.')
+                       '"load_balanced" (default) routes to the rank with the fewest '
+                       'in-flight requests, ignoring prefix affinity. '
+                       '"first_prefix_block" routes based on the first block hash only. '
+                       '"longest_prefix" routes to the rank with the longest matching '
+                       'prefix. "first_prefix_block" and "longest_prefix" both combine '
+                       'prefix affinity with load balancing and fall back to '
+                       'load-balanced routing when prefix caching is disabled or no '
+                       'prefix match exists.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
                        type=float, default=0.5,
                        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
@@ -1960,9 +1992,10 @@ def _add_inference_args(parser):
                        'covers both the durable cache (the ssm_states/conv_states '
                        'slots reused across requests) and the per-step extraction '
                        'scratch (the intermediate_ssm_out/intermediate_conv_out '
-                       'buffers, sized to 3 * max_requests slots); the scratch is '
-                       'reserved first, so a larger max_requests leaves fewer durable '
-                       'slots.')
+                       'buffers, sized to min(ceil(max_tokens / block_size), '
+                       '3 * max_requests) slots); the scratch is reserved first, so a '
+                       'smaller max_tokens (or max_requests) shrinks the scratch and '
+                       'leaves more durable slots.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
@@ -1980,6 +2013,15 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-async-sched-mode',
+                       type=str, default='legacy',
+                       choices=['legacy', 'serial', 'overlap'],
+                       help='Async scheduling mode for dynamic batching. '
+                            '"legacy" (default) preserves the existing resolve-before-prepare '
+                            'path. "serial" speculatively prepares and forwards decode-only '
+                            'steps before resolving finished requests. "overlap" uses the same '
+                            'async scheduling path while overlapping prepare/sample and '
+                            'forward/resolve phases.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
@@ -2036,6 +2078,7 @@ def _add_network_size_args(parser):
         "output_layer_init_method",
         "embedding_init_method",
         "activation_func",
+        "experimental_attention_variant_loss_scale_func",
         # types affect docstring
         "pipeline_model_parallel_layout",
         "window_size",
@@ -2979,6 +3022,10 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--dataloader-inter-document-masking', action='store_true',
+                       help='Return cu_seqlens marking document boundaries '
+                       'within each sample so that attention is restricted '
+                       'to individual documents.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
@@ -3182,9 +3229,9 @@ def _add_moe_args(parser):
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
     group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
-                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
+                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'quantile_balancing', 'none'],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" (QB) uses dual coordinate descent on a per-expert bias to handle load balance internally; "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     # Token dispatcher arguments
@@ -3365,6 +3412,16 @@ def _add_experimental_args(parser):
                 'recomputation will be unsharded.'
             ),
         )
+
+    group.add_argument("--megatron-fsdp-max-pool-double-buffer", action='store_true',
+                        help="When using Megatron-FSDP double buffering, use the MaxPoolAllocator instead of "
+                             "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "
+                             "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
+                             "NCCL user buffer registration and CUDA graph replay for mixed-arch models.")
+    group.add_argument("--fsdp-db-use-persist-buf-on-alloc-fail", action='store_true',
+                        help="When using Megatron-FSDP double buffering, persist non-unit modules that "
+                             "are not included in the symmetric buffer pool. May be necessary for NCCL "
+                             "UBR or CUDA Graphs on hybrid architectures.")
 
     return parser
 

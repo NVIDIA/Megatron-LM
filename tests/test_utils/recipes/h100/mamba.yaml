@@ -96,3 +96,10 @@ products:
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
+
+  - test_case: [hybrid_nemotron_v3_pico_7b_a1b_tp1_ep8_QAD_dgx_h100_1N8G]
+    products:
+      # Disabled while the deterministic total-loss mismatch is investigated.
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]

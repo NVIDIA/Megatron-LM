@@ -60,7 +60,7 @@ def _run(**kwargs):
 
 def test_train_step_forwards_schedule_plumbing():
     p2p, pg = object(), object()
-    captured = _run(p2p_communicator=p2p, schedule_pg_collection=pg)
+    captured = _run(p2p_communicator=p2p, pg_collection=pg)
     assert captured["p2p_communicator"] is p2p and captured["pg_collection"] is pg
 
 

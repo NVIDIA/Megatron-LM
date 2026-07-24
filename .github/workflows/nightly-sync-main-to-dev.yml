@@ -27,10 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  id-token: write
+  contents: read
 
 jobs:
   # Re-dispatch scheduled runs as workflow_dispatch via a PAT so the heavy
@@ -184,8 +181,12 @@ jobs:
       - name: Run Claude Code to merge, fix, and iterate
         if: steps.check-sync.outputs.skip != 'true'
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ secrets.PAT }}
           prompt: |
             You are an automated sync bot. Merge `main` into `dev`, create a
@@ -297,9 +298,8 @@ jobs:
             `Nemo_CICD_Test`, `copyright-check`, `pre-flight`, wheel
             builds, etc. — is NOT exempt and must reach a terminal
             green conclusion.
-          show_full_output: true
           claude_args: |
             --allowedTools "Bash,Read,Edit,Write,Grep,Glob,Agent"
-            --model "opus[1m]"
+            --model "${{ vars.CLAUDE_MODEL }}"
             --effort max
             --max-turns 1500
