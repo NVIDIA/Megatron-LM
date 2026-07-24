@@ -57,6 +57,7 @@ from megatron.core.optimizer_param_scheduler import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
+from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
@@ -67,6 +68,7 @@ from .emerging_optimizers import (
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
 )
+from .fully_sharded_optimizer import FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
@@ -664,15 +666,18 @@ def _get_megatron_optimizer_based_on_param_groups(
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
-            optimizer = DistributedOptimizer(
-                *optimizer_args,
-                model_chunks=model_chunks,
-                per_model_buffers=per_model_buffers,
-                data_parallel_group=data_parallel_group,
-                data_parallel_group_gloo=data_parallel_group_gloo,
-                data_parallel_group_idx=data_parallel_group_idx,
-                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-            )
+            if isinstance(model_chunks[0], FullyShardedDataParallelV2):
+                optimizer = FullyShardedOptimizer(*optimizer_args, model_chunks=model_chunks)
+            else:
+                optimizer = DistributedOptimizer(
+                    *optimizer_args,
+                    model_chunks=model_chunks,
+                    per_model_buffers=per_model_buffers,
+                    data_parallel_group=data_parallel_group,
+                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    data_parallel_group_idx=data_parallel_group_idx,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                )
             # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
             # weight gradients are all-reduced across optimizer instances, so each instance has
             # the duplicated weight gradients, need to reduce gradient stats inside each instance.
@@ -752,6 +757,9 @@ def _get_megatron_emerging_optimizer(
         )
         eopt_name = bare_name
         use_layer_wise = True
+
+    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
+        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -1034,6 +1042,7 @@ def get_megatron_optimizer(
 
     check_config_overrides_consistency(config, config_overrides)
 
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
@@ -1045,6 +1054,10 @@ def get_megatron_optimizer(
         )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
+
+    if is_mfsdp_v2:
+        if not config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=True.")
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -1090,14 +1103,32 @@ def get_megatron_optimizer(
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):
-            param_groups, buffers = _get_param_groups_and_buffers(
-                model_chunk,
-                model_chunk_offset=model_chunk_offset,
-                config=config,
-                config_overrides=config_overrides,
-                filter_fn=lambda g: True,
-                buffer_name='buffers',
-            )
+            if is_mfsdp_v2:
+                param_groups = _get_param_groups(model_chunk, config, config_overrides)
+                # TE FusedAdam can skip pending updates when a group ends in an empty tensor:
+                # https://github.com/NVIDIA/TransformerEngine/issues/3207.
+                # Empty local shards have no optimizer state or data to update, so omit them.
+                for param_group in param_groups:
+                    param_group['params'] = [
+                        parameter
+                        for parameter in param_group['params']
+                        if parameter.to_local().numel() > 0
+                    ]
+                param_groups = [
+                    param_group for param_group in param_groups if param_group['params']
+                ]
+                # MFSDP v2 owns its sharded parameter and gradient storage, so
+                # FullyShardedOptimizer does not need DDP param-and-grad buffers.
+                buffers = None
+            else:
+                param_groups, buffers = _get_param_groups_and_buffers(
+                    model_chunk,
+                    model_chunk_offset=model_chunk_offset,
+                    config=config,
+                    config_overrides=config_overrides,
+                    filter_fn=lambda g: True,
+                    buffer_name='buffers',
+                )
 
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
                 config=config,
