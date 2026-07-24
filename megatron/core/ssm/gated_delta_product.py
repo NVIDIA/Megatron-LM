@@ -15,8 +15,14 @@ import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
+from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
+    tensor_get_slice_after,
+    tensor_masked_update,
+    tensor_merge,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm._packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -26,13 +32,15 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, is_using_quantization_scales
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 except ImportError:
     causal_conv1d_fn = None
     causal_conv1d_update = None
+    causal_conv1d_varlen_states = None
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
@@ -335,9 +343,11 @@ class GatedDeltaProductMixer(MegatronModule):
 
         conv_state, ssm_state = None, None
         if inference_context is not None:
+            if inference_context.is_dynamic_batching():
+                return self._dynamic_inference(hidden_states, inference_context)
             assert (
                 inference_context.is_static_batching()
-            ), "Mamba does not currently support dynamic inference batching."
+            ), "GDP inference must be either static or dynamic batching."
             assert not self.config.sequence_parallel
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch_size)
 
@@ -480,6 +490,307 @@ class GatedDeltaProductMixer(MegatronModule):
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
+
+    # ------------------------------------------------------------------
+    # Dynamic-batching inference.
+    #
+    # Mirrors ``MambaMixer._dynamic_inference`` / ``_ssm_decode`` / ``_ssm_prefill``
+    # (same ``_ssm_`` naming and the same request-level control flow), but runs
+    # the Gated Delta Product kernels instead of the Mamba2 scan. The per-request
+    # recurrent state (short-conv state + matrix-valued SSM state) is read/written
+    # through the slot-indexed caches owned by ``DynamicInferenceContext``.
+    #
+    # MVP scope: this path does not yet support context parallelism (cp_size > 1),
+    # speculative decoding, chunked prefill, Mamba prefix caching, or CUDA-graph
+    # capture. The reshapes mirror the static ``forward`` math with batch/seq
+    # repurposed for the packed dynamic layout.
+    # ------------------------------------------------------------------
+    def _dynamic_inference(
+        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Execute one dynamic inference step by separating decode and prefill
+        requests, running each through the GDP kernels independently, and merging
+        the results back into packed token order."""
+        ok, reason = check_fla_sequence_packing_support()
+        assert ok, reason
+        assert self.cp.cp_size == 1, "Context parallel is not supported for GDP dynamic inference"
+        assert (
+            not context.is_chunked_prefill_enabled()
+        ), "GDP dynamic inference does not support chunked prefill yet."
+
+        # GDP-style layers register as Mamba layers, so the same (conv_state,
+        # ssm_state) accessor and per-layer slab layout apply.
+        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
+
+        padded_dims = context.padded_batch_dimensions
+        token_count = padded_dims.token_count
+        decode_req_count = padded_dims.decode_req_count
+        prefill_req_count = padded_dims.prefill_req_count
+        metadata = context.mamba_metadata
+
+        # Input projection over the full packed batch.
+        zVKQba, _ = self.in_proj(hidden_states)
+
+        y_decode = None
+        y_prefill = None
+
+        # --- Decode partition (placed first in the packed batch) ---------
+        if decode_req_count > 0:
+            # MVP: exactly one token per decode request (no speculative tokens).
+            zVKQba_decode = zVKQba[:decode_req_count] if prefill_req_count > 0 else zVKQba
+            y_decode = self._ssm_decode(
+                zVKQba_decode.transpose(0, 1), conv_state, ssm_state, metadata.batch_indices_decode
+            ).transpose(0, 1)
+
+        # --- Prefill partition -------------------------------------------
+        if prefill_req_count > 0:
+            if decode_req_count > 0:
+                # Mixed batch: gather the prefill tokens out of the packed tensor.
+                zVKQba_prefill = torch.empty_like(zVKQba)
+                tensor_get_slice_after(
+                    zVKQba, zVKQba_prefill, metadata.device_decode_prefill, check_bounds=False
+                )
+            else:
+                zVKQba_prefill = zVKQba
+            y_prefill = self._ssm_prefill(
+                zVKQba_prefill,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                seq_idx=metadata.seq_idx,
+                cu_seqlens=metadata.cu_seqlens,
+                batch_indices=metadata.batch_indices_prefill,
+            )
+
+        # --- Merge back into packed token order --------------------------
+        if y_decode is not None and y_prefill is not None:
+            y = torch.empty(
+                [token_count, 1, y_prefill.shape[-1]],
+                dtype=y_prefill.dtype,
+                device=y_prefill.device,
+            )
+            tensor_merge(y_decode, y_prefill, metadata.device_decode_prefill, output_tensor=y)
+        elif y_decode is not None:
+            y = y_decode
+        elif y_prefill is not None:
+            y = y_prefill
+        else:
+            raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
+
+        # Zero padding positions to avoid corrupting quantization amax calculations.
+        if is_using_quantization_scales(self.config):
+            y[context.padding_slice] = 0.0
+
+        out, out_bias = self.out_proj(y)
+        return out, out_bias
+
+    def _ssm_decode(
+        self,
+        zVKQba: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        batch_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Single-token-per-request decode. ``zVKQba`` is ``[1, decode_req_count,
+        proj_dim]``; returns ``[1, decode_req_count, d_inner]``. The conv and SSM
+        states are read/written in place at the slots named by ``batch_indices``
+        (``-1`` marks padding slots)."""
+        seq_len, _, _ = zVKQba.shape
+        assert seq_len == 1, "GDP decode supports one token per request"
+        zVKQba = zVKQba.squeeze(0)  # [n, proj_dim]
+        M = self.num_householder
+
+        z, VKQ, ba = torch.split(
+            zVKQba,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp * M
+                + (M + 1) * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp * (M + 1),
+            ],
+            dim=-1,
+        )
+
+        # Indexed conv update: reads/writes the per-request conv state rows
+        # selected by ``batch_indices``, in place. ``self.activation`` must be the
+        # activation *string* so the kernel enables SiLU (a bool would disable it).
+        VKQ = causal_conv1d_update(
+            VKQ,
+            conv_state,
+            rearrange(self.conv1d.weight, "d 1 w -> d w"),
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=batch_indices,
+        )
+
+        value, key, query = torch.split(
+            VKQ,
+            [
+                self.cp.d_inner_local_tpcp * M,
+                self.cp.ngroups_local_tpcp * self.d_state * M,
+                self.cp.ngroups_local_tpcp * self.d_state,
+            ],
+            dim=-1,
+        )
+        b, a = torch.split(ba, [self.cp.nheads_local_tpcp * M, self.cp.nheads_local_tpcp], dim=-1)
+
+        # Reshape to the fla layout with batch=n requests, seq length 1, and the
+        # householder copies folded into the sequence dimension (static path, l=1).
+        value = rearrange(value, "n (m h p) -> n m h p", m=M, p=self.headdim).contiguous()
+        key = rearrange(key, "n (m g s) -> n m g s", m=M, s=self.d_state).contiguous()
+        query = rearrange(query, "n (g s) -> n 1 g s", s=self.d_state).contiguous()
+        z = rearrange(z, "n (h p) -> n 1 h p", p=self.headdim).contiguous()
+        beta = rearrange(b.sigmoid(), "n (m h) -> n m h", m=M).contiguous()
+        g = -self.cp.get_A_log().float().exp() * F.softplus(a.float() + self.cp.get_dt_bias())
+        g = rearrange(g, "n h -> n 1 h").contiguous()
+
+        if self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp > 1:
+            rep = self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp
+            query = query.repeat_interleave(rep, dim=2)
+            key = key.repeat_interleave(rep, dim=2)
+
+        # Interleave the (length-1) query / decay with householder zeros so the
+        # recurrent kernel sees an (1 * M)-length sequence (matches static decode).
+        g_new = g.new_zeros(g.shape[0], g.shape[1], M, g.shape[2])
+        g_new[:, :, 0] = g
+        g = rearrange(g_new, "n t m h -> n (t m) h")
+        query_new = query.new_zeros(
+            query.shape[0], query.shape[1], M, query.shape[2], query.shape[3]
+        )
+        query_new[:, :, -1] = query
+        query = rearrange(query_new, "n t m h d -> n (t m) h d")
+
+        # Gather this step's per-request initial states. ``.clamp`` (NOT in-place)
+        # returns a new tensor, so ``batch_indices`` keeps its -1 padding sentinels
+        # for the scatter below; the padding rows' outputs are never scattered back.
+        gather_idx = batch_indices.clamp(min=0)
+        initial_state = ssm_state[gather_idx]
+
+        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        core_attn_out = rearrange(core_attn_out, "n (t m) h d -> n t m h d", m=M)[
+            ..., -1, :, :
+        ].contiguous()  # [n, 1, h, d]
+
+        # Scatter updated states back into the cache (skips -1 padding slots).
+        tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
+
+        y = rearrange(core_attn_out, "n t h p -> t n (h p)").contiguous()  # [1, n, d_inner]
+        if self.rmsnorm:
+            z = rearrange(z, "n t h p -> t n (h p)").contiguous()
+            y = self.norm(y, z)
+        return y
+
+    def _ssm_prefill(
+        self,
+        zVKQba: torch.Tensor,
+        conv_state: Optional[torch.Tensor] = None,
+        ssm_state: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        batch_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Variable-length prefill over all prefill requests in one varlen call.
+        ``zVKQba`` is ``[l, 1, proj_dim]``; returns ``[l, 1, d_inner]``. Fresh
+        requests start from a zero recurrent state (no prefix caching in the MVP);
+        the resulting final conv/SSM states are written back into the caches."""
+        is_dynamic_batching = seq_idx is not None
+        M = self.num_householder
+
+        # l b d -> b l d
+        zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
+
+        z, VKQ, ba = torch.split(
+            zVKQba,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp * M
+                + (M + 1) * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp * (M + 1),
+            ],
+            dim=-1,
+        )
+
+        if conv_state is not None and is_dynamic_batching:
+            assert batch_indices is not None
+            # Capture per-request final conv states (before the conv consumes the
+            # inputs) and write them into the prefill requests' cache rows.
+            conv_varlen_states = causal_conv1d_varlen_states(
+                VKQ.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+            )
+            tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
+            # Maintain channels-last memory layout so causal_conv1d_fn can use seq_idx.
+            VKQ = VKQ.transpose(1, 2)
+        else:
+            VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
+
+        seqlen = VKQ.size(2)
+        if causal_conv1d_fn is None:
+            VKQ = self.act(self.cp.conv1d(VKQ)[..., :seqlen])
+        else:
+            VKQ = causal_conv1d_fn(
+                x=VKQ,
+                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                bias=self.cp.get_conv1d_bias(),
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
+        VKQ = rearrange(VKQ, "b d l -> b l d").contiguous()
+
+        value, key, query = torch.split(
+            VKQ,
+            [
+                self.cp.d_inner_local_tpcp * M,
+                self.cp.ngroups_local_tpcp * self.d_state * M,
+                self.cp.ngroups_local_tpcp * self.d_state,
+            ],
+            dim=-1,
+        )
+        b, a = torch.split(ba, [self.cp.nheads_local_tpcp * M, self.cp.nheads_local_tpcp], dim=-1)
+
+        # batch = 1 packed sequence of length T; householder folded into seq.
+        value = rearrange(value, "b l (m h p) -> b (l m) h p", m=M, p=self.headdim).contiguous()
+        key = rearrange(key, "b l (m g s) -> b (l m) g s", m=M, s=self.d_state).contiguous()
+        query = rearrange(query, "b l (g s) -> b l g s", s=self.d_state).contiguous()
+        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+        beta = rearrange(b.sigmoid(), "b l (m h) -> b (l m) h", m=M).contiguous()
+        g = -self.cp.get_A_log().float().exp() * F.softplus(a.float() + self.cp.get_dt_bias())
+        g = g.contiguous()
+
+        if self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp > 1:
+            rep = self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp
+            query = query.repeat_interleave(rep, dim=2)
+            key = key.repeat_interleave(rep, dim=2)
+
+        core_attn_out, last_recurrent_state = chunk_gated_delta_product(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=ssm_state is not None,
+            num_householder=M,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+        )
+
+        # Write per-request final SSM states into the cache for subsequent decode.
+        if ssm_state is not None and is_dynamic_batching:
+            tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
+
+        y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
+        if self.rmsnorm:
+            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+            y = self.norm(y, z)
+        return y
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """
