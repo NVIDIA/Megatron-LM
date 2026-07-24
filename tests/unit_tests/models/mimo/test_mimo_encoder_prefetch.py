@@ -307,6 +307,26 @@ def test_prefetch_keeps_input_ids_on_cpu_path(fake_cuda, monkeypatch):
     assert moved[0] is encoder_inputs
 
 
+def test_prefetch_passes_through_text_only_batches(fake_cuda):
+    input_ids = torch.tensor([[1, 2]])
+    loader = EncoderPrefetchLoader(
+        source=[{"input_ids": input_ids}],
+        encoder_name=ENCODER,
+        feature_producer=lambda _inputs: pytest.fail("text-only batches must not run the encoder"),
+        depth=1,
+        stream=fake_cuda.producer,
+        debug=True,
+    )
+    loader.start()
+    _wait_until(lambda: len(loader._ready) == 1)
+
+    batch = next(loader)
+    loader.close()
+
+    assert set(batch) == {"input_ids"}
+    assert batch["input_ids"] is input_ids
+
+
 def test_debug_logs_prefetch_timing_and_queue_state(fake_cuda, caplog):
     module_logger_level = encoder_prefetch.logger.level
     caplog.set_level("INFO", logger=f"{encoder_prefetch.__name__}.debug")
