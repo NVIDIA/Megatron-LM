@@ -388,7 +388,7 @@ class TestFusedApplyMLARopeCosWidthGuard:
         cos = torch.randn(seqlen, 1, 1, narrow)
         sin = torch.randn(seqlen, 1, 1, narrow)
 
-        with pytest.raises(AssertionError, match="cos/sin last dim"):
+        with pytest.raises(ValueError, match="cos/sin last dim"):
             fused_apply_mla_rope_for_q(q, cos, sin, qk_head_dim, emb_dim, cu_seqlens_q=None)
 
     @pytest.mark.skipif(
@@ -408,7 +408,7 @@ class TestFusedApplyMLARopeCosWidthGuard:
         cos = torch.randn(seqlen, 1, 1, narrow)
         sin = torch.randn(seqlen, 1, 1, narrow)
 
-        with pytest.raises(AssertionError, match="cos/sin last dim"):
+        with pytest.raises(ValueError, match="cos/sin last dim"):
             fused_apply_mla_rope_for_kv(
                 kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim, cu_seqlens_kv=None
             )
