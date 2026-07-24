@@ -593,15 +593,19 @@ def gpt_config_from_args(
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
-    model_config_cls: type = HybridModelConfig,
+    model_config_cls: type | None = None,
 ) -> Any:
     """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
 
     `model_config_cls` lets callers reuse this same arg-derivation logic for
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
-    such as `ModelOptHybridModelConfig`.
+    such as `ModelOptHybridModelConfig`. It defaults to `None` and is resolved to
+    `HybridModelConfig` at call time so the class can be patched by callers/tests.
     """
-    assert issubclass(model_config_cls, HybridModelConfig)
+    if model_config_cls is None:
+        model_config_cls = HybridModelConfig
+    else:
+        assert issubclass(model_config_cls, HybridModelConfig)
 
     kwargs = {}
     if config is None:

@@ -556,12 +556,13 @@ class TopKRouter(Router):
             aux_loss_groups.metric_reduce_group,
             avg_group=aux_loss_groups.metric_avg_group,
             needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
-            # local_num_tokens is per-sequence (bsz folded into the expert dim above);
-            # * bsz recovers the micro-batch total, else per-token-loss scaling keeps a 1/MBS.
+            # local_num_tokens / total_num_tokens are per-sequence (bsz folded into the
+            # expert dim above); * bsz recovers the micro-batch total, else per-token-loss
+            # scaling keeps a 1/MBS and the seq_aux_loss gradient is no longer MBS-invariant.
             valid_token_count=local_num_tokens * bsz,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
-            aux_loss_scale_num_tokens=total_num_tokens,
+            aux_loss_scale_num_tokens=total_num_tokens * bsz,
         )
         return probs
 
