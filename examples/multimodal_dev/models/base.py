@@ -62,6 +62,33 @@ class _NoCPGroup:
 
 _NO_CP_GROUP = _NoCPGroup()
 
+
+def _vision_chunk_slices(image_grid_thw, chunk_patches):
+    """Greedy image-boundary partition of a vision payload.
+
+    Returns ``(image_lo, image_hi, row_lo, row_hi)`` tuples whose raw-patch
+    row counts stay <= ``chunk_patches``, except that a single image larger
+    than the chunk budget forms its own chunk (images are indivisible).
+    Vision attention's cu_seqlens are per-image, so no computation ever
+    crosses a chunk boundary — chunked execution is exact scheduling
+    freedom, not an approximation.
+    """
+    sizes = (image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]).tolist()
+    slices = []
+    image_lo = 0
+    row_lo = 0
+    accumulated = 0
+    for index, size in enumerate(sizes):
+        if accumulated and accumulated + size > chunk_patches:
+            slices.append((image_lo, index, row_lo, row_lo + accumulated))
+            image_lo, row_lo = index, row_lo + accumulated
+            accumulated = 0
+        accumulated += int(size)
+    if accumulated:
+        slices.append((image_lo, len(sizes), row_lo, row_lo + accumulated))
+    return slices
+
+
 # Note: reported ``mtp_1 loss`` drifts ~1.3% from the CP=1 baseline under
 # THD+CP. Megatron-Core's logging averages per-rank pre-divided ratios
 # with op=AVG, and per-rank num_tokens are unequal after MTP rolling.
@@ -132,6 +159,7 @@ class MultimodalModel(MegatronModule):
             post_process=True,
             parallel_output=parallel_output,
             share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
+            scatter_embedding_sequence_parallel=False,
             position_embedding_type=position_embedding_type,
             rotary_percent=rotary_percent,
             rotary_base=rotary_base,
@@ -150,36 +178,161 @@ class MultimodalModel(MegatronModule):
     ) -> Tensor:
         """Replace image-token positions with vision embeddings.
 
-        Handles sequence parallelism (gather → scatter → re-scatter).
+        The text sequence must still be full here. Context parallelism is
+        applied after the replacement, followed by sequence parallelism.
 
         Args:
             input_ids: ``[B, S]`` token IDs.
-            text_embeddings: ``[S, B, D]`` (or ``[S/TP, B, D]`` with SP).
+            text_embeddings: Full, unsharded ``[S, B, D]`` embeddings.
             vision_embeddings: ``[num_visual_tokens, D]``.
 
         Returns:
-            Combined embeddings, same shape as *text_embeddings*.
+            Full combined embeddings with shape ``[S, B, D]``.
         """
-        sp = (
-            self.config.sequence_parallel
-            and parallel_state.get_tensor_model_parallel_world_size() > 1
-        )
-
-        if sp:
-            text_embeddings = tensor_parallel.gather_from_sequence_parallel_region(
-                text_embeddings, tensor_parallel_output_grad=False
-            )
-
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
         combined = combined.masked_scatter(mask_expanded, vision_embeddings)
         combined = combined.transpose(0, 1).contiguous()
-
-        if sp:
-            combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
-
         return combined
+
+    def _empty_vision_grad_anchor(self, pixel_values: Tensor) -> Tensor:
+        """Zero-valued scalar that keeps the vision tower live on image-free ranks.
+
+        An image-free microbatch (text-only samples) would otherwise skip the
+        vision tower entirely, which breaks two per-rank lockstep contracts:
+        in training, its parameters would produce no grads while image-bearing
+        ranks reduce real grads (bucketed grad sync requires every param to
+        register a grad); and under Megatron-FSDP the tower's per-module
+        parameter unshard is itself a collective, so a rank that never enters
+        the vision forward deadlocks the others' all-gathers — in evaluation
+        just as much as in training. Run the tower on one minimal dummy image
+        and fold a zero-weighted scalar into the decoder input instead.
+        """
+        merge = int(getattr(self.vision_model, "spatial_merge_size", 2))
+        dummy_pixels = torch.zeros(
+            (merge * merge, pixel_values.shape[-1]),
+            dtype=pixel_values.dtype,
+            device=pixel_values.device,
+        )
+        dummy_grid = torch.tensor([[1, merge, merge]], dtype=torch.long, device=pixel_values.device)
+        return self.vision_model(dummy_pixels, dummy_grid).sum() * 0.0
+
+    def _vision_forward(self, pixel_values: Tensor, image_grid_thw: Tensor):
+        """Run the vision tower, optionally in image-boundary chunks.
+
+        With ``vision_encoder_chunk_patches <= 0`` this is the legacy
+        single-call path, bit-for-bit unchanged. With chunking enabled the
+        payload is split at image boundaries (exact — see
+        :func:`_vision_chunk_slices`) so the packed fused-attention
+        workspace is bounded by one chunk instead of the whole payload.
+
+        Under Megatron-FSDP every tower forward triggers a per-module
+        parameter-unshard collective over the sharding group, so all ranks
+        must run the same number of tower invocations per microbatch: chunk
+        counts are max-all-reduced over ``vision_lockstep_group`` (injected
+        by the model provider from the dp-cp process group; the FSDP wrapper
+        is installed after the provider returns, so it cannot be queried
+        here) and ranks with fewer real chunks pad with zero-weighted dummy
+        passes. In evaluation a group-wide image-free microbatch skips the
+        tower entirely; in training at least one pass always runs so vision
+        parameters keep producing (zero) grads for bucketed grad sync.
+
+        Returns ``(vision_embeddings | None, vision_grad_anchor | None)``.
+        """
+        chunk_patches = int(getattr(self, "vision_encoder_chunk_patches", 0) or 0)
+        pool = getattr(self, "vision_noise_pool", None)
+        streaming = pixel_values is None
+        if chunk_patches > 0 and not getattr(self, "_vision_release_deferred", False):
+            # Chunked execution can invoke the tower several times per
+            # microbatch; Megatron-FSDP must defer these units' parameter
+            # release to the root post-backward (releasing after the first
+            # invocation's backward races with the other invocations'
+            # asynchronous kernels).
+            for submodule in getattr(self.vision_model, "modules", lambda: ())():
+                submodule._fsdp_defer_release = True
+            for parameter in getattr(self.vision_model, "parameters", lambda: ())():
+                # Each chunk's checkpoint recompute is its own inner
+                # backward, so grad hooks fire once per chunk: defer the
+                # reduce-scatter to the root post-backward (see
+                # megatron_fsdp._process_post_backward_gradients).
+                parameter._fsdp_defer_grad_reduce = True
+            self._vision_release_deferred = True
+        if streaming:
+            # Synthetic-streaming profile: the dataset ships geometry only;
+            # every chunk input is a read-only VIEW into one preallocated
+            # noise pool, so autograd-saved conv inputs alias a single
+            # storage and retained-input memory is O(pool), independent of
+            # the window payload.
+            if pool is None:
+                raise RuntimeError(
+                    "Streaming vision payload (no pixel_values) requires the "
+                    "vision_noise_pool buffer; enable "
+                    "--mock-synthetic-streaming-pixels so the provider registers it."
+                )
+            if chunk_patches <= 0:
+                raise RuntimeError(
+                    "Streaming vision payloads require --vision-encoder-chunk-patches "
+                    "> 0; the pool holds at most one chunk."
+                )
+        if chunk_patches <= 0:
+            if pixel_values.shape[0] > 0:
+                return self.vision_model(pixel_values, image_grid_thw), None
+            return None, self._empty_vision_grad_anchor(pixel_values)
+
+        if streaming and not getattr(self, "_vision_noise_pool_ready", False):
+            # The provider registers the pool under whatever init context
+            # Megatron uses — with meta-device init the placeholder is a
+            # meta tensor, and to_empty-style materialization can wipe
+            # buffer contents — so the content is (re)generated
+            # deterministically exactly once at first use, on the real
+            # device. Identical seed on every rank -> identical pool.
+            generator = torch.Generator(device="cpu").manual_seed(
+                int(getattr(self, "vision_noise_pool_seed", 1234))
+            )
+            noise = torch.randn(pool.shape, generator=generator, dtype=torch.float32, device="cpu")
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            self.vision_noise_pool = noise.to(device=device, dtype=pool.dtype)
+            self._vision_noise_pool_ready = True
+            pool = self.vision_noise_pool
+
+        reference = pool if streaming else pixel_values
+        has_payload = (
+            image_grid_thw is not None and image_grid_thw.shape[0] > 0
+            if streaming
+            else pixel_values.shape[0] > 0
+        )
+        slices = _vision_chunk_slices(image_grid_thw, chunk_patches) if has_payload else []
+        k_local = len(slices)
+        k_global = k_local
+        group = getattr(self, "vision_lockstep_group", None)
+        if group is not None and torch.distributed.is_initialized():
+            counts = torch.tensor([k_local], dtype=torch.long, device=reference.device)
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.MAX, group=group)
+            k_global = int(counts.item())
+        if self.training:
+            k_global = max(k_global, 1)
+
+        embeddings = []
+        for image_lo, image_hi, row_lo, row_hi in slices:
+            rows = row_hi - row_lo
+            if streaming:
+                if rows > pool.shape[0]:
+                    raise RuntimeError(
+                        f"Vision chunk needs {rows} raw patch rows but the noise "
+                        f"pool holds {pool.shape[0]}; keep "
+                        "--max-vision-patches-per-image <= "
+                        "--vision-encoder-chunk-patches."
+                    )
+                chunk_pixels = pool[:rows]
+            else:
+                chunk_pixels = pixel_values[row_lo:row_hi]
+            embeddings.append(self.vision_model(chunk_pixels, image_grid_thw[image_lo:image_hi]))
+        anchor = None
+        for _ in range(k_global - k_local):
+            dummy = self._empty_vision_grad_anchor(reference)
+            anchor = dummy if anchor is None else anchor + dummy
+        return (torch.cat(embeddings) if embeddings else None), anchor
 
     def compute_position_ids(
         self, input_ids: Tensor, image_grid_thw: Optional[Tensor] = None, packed_seq_params=None
@@ -217,8 +370,13 @@ class MultimodalModel(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
             return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
 
@@ -256,8 +414,13 @@ class MultimodalModel(MegatronModule):
             padding_mask = _split(padding_mask, 1)
 
         return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         )
 
     @staticmethod
@@ -340,6 +503,7 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
+        scatter_decoder_input_to_sp = False
         if position_ids is None:
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
@@ -348,22 +512,39 @@ class MultimodalModel(MegatronModule):
             )
 
         vision_embeddings = None
-        if self.vision_model is not None and pixel_values is not None:
-            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+        vision_grad_anchor = None
+        if self.vision_model is not None and (
+            pixel_values is not None
+            or (image_grid_thw is not None and getattr(self, "vision_noise_pool", None) is not None)
+        ):
+            vision_embeddings, vision_grad_anchor = self._vision_forward(
+                pixel_values, image_grid_thw
+            )
 
         if decoder_input is None and self.language_model is not None:
             text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
 
+            scatter_decoder_input_to_sp = (
+                self.config.sequence_parallel
+                and parallel_state.get_tensor_model_parallel_world_size() > 1
+            )
             if vision_embeddings is not None:
                 decoder_input = self._scatter_vision_embeddings(
                     input_ids, text_embeddings, vision_embeddings
                 )
             else:
                 decoder_input = text_embeddings
+            if vision_grad_anchor is not None:
+                decoder_input = decoder_input + vision_grad_anchor
 
         (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,
@@ -374,6 +555,9 @@ class MultimodalModel(MegatronModule):
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
         )
+
+        if scatter_decoder_input_to_sp:
+            decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(decoder_input)
 
         with self._thd_mrope_no_cp_override(packed_seq_params):
             return self.language_model(

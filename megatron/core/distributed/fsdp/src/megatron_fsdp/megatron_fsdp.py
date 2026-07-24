@@ -338,6 +338,7 @@ class MegatronFSDP(torch.nn.Module):
                 param.__fsdp_param__ = True
 
         self._init_fsdp_param_and_grad_buffer()
+        self._deferred_release_modules = set()
         self._register_fsdp_hooks(self.module)
         self.microbatch_count = 0
         self.is_param_fsdp_distributed = False
@@ -684,6 +685,30 @@ class MegatronFSDP(torch.nn.Module):
             assert isinstance(module, tuple(fsdp_unit_modules))
             assert self.data_parallel_sharding_strategy == "optim_grads_params"
 
+            # An FSDP unit may run several forward passes inside one
+            # microbatch (e.g. a vision tower executed in image-boundary
+            # chunks). Each pass inserts its own post-backward function, but
+            # releasing the unsharded parameter buffers after the FIRST
+            # completed backward races with the asynchronous kernels of the
+            # remaining passes (observed as an illegal memory access that
+            # disappears under CUDA_LAUNCH_BLOCKING). Defer the release to
+            # the LAST in-flight backward of this unit. Gradients need no
+            # such guard: each parameter's AccumulateGrad node fires once
+            # per backward with all contributions already summed.
+            inflight = getattr(module, "_fsdp_inflight_backwards", 1) - 1
+            module._fsdp_inflight_backwards = inflight
+            if inflight > 0:
+                return
+            if getattr(module, "_fsdp_defer_release", False):
+                # Multi-invocation units (e.g. a chunked vision tower) defer
+                # the release to the root post-backward: under activation
+                # recompute each invocation's insert/fire pair drains the
+                # in-flight count within its own checkpoint cycle, so the
+                # count alone cannot order the release after the OTHER
+                # invocations' still-enqueued asynchronous kernels.
+                self._deferred_release_modules.add(module)
+                return
+
             # Release parameters for this module after backward.
             release_module_parameters(module, bwd=True)
             release_module_parameters(module, bwd=False)
@@ -739,6 +764,38 @@ class MegatronFSDP(torch.nn.Module):
 
             if not param_list:
                 return
+
+            # Parameters of multi-invocation units (e.g. a chunked vision
+            # tower under activation recompute) receive one gradient event
+            # PER invocation: every chunk's checkpoint recompute is its own
+            # inner backward, so AccumulateGrad — and this hook — fire once
+            # per chunk. Reducing on each event both races the previous
+            # chunk's in-flight reduce-scatter (observed as an illegal
+            # memory access in allocate_bucket_storage) and multiply-reduces
+            # the gradients. Accumulate locally per event and defer the
+            # single reduction to the root post-backward, which already
+            # reduces every parameter left in _params_require_handle_grad.
+            deferred = [
+                param for param in param_list if getattr(param, "_fsdp_defer_grad_reduce", False)
+            ]
+            if deferred:
+                # Parameters of multi-invocation units (e.g. a chunked vision
+                # tower under activation recompute) receive one gradient event
+                # PER invocation: every chunk's checkpoint recompute is its
+                # own inner backward, so AccumulateGrad — and this hook —
+                # fire once per chunk. Reducing per event both races the
+                # previous chunk's in-flight reduce-scatter (observed as an
+                # illegal memory access in allocate_bucket_storage) and would
+                # multiply-reduce the gradients. Do NOTHING here: p.grad
+                # keeps accumulating in place across the chunk backwards
+                # (AccumulateGrad adds), and the root post-backward runs the
+                # canonical _grad_acc + reduction exactly once via
+                # _params_require_handle_grad. TE-fused wgrads likewise
+                # accumulate natively into main_grad across invocations.
+                deferred_set = set(deferred)
+                param_list = [p for p in param_list if p not in deferred_set]
+                if not param_list:
+                    return
 
             for param in param_list:
                 _grad_acc(param)
@@ -826,6 +883,10 @@ class MegatronFSDP(torch.nn.Module):
             backward pass has completed in order to shard this layer's model memory
             once the current backward stage is done.
             """
+            # Track in-flight backward functions per FSDP unit so parameter
+            # release can be deferred to the last one (multi-invocation
+            # forwards, e.g. chunked vision towers).
+            module._fsdp_inflight_backwards = getattr(module, "_fsdp_inflight_backwards", 0) + 1
             inp_tensors = RegisterFSDPBackwardFunction.apply(
                 functools.partial(post_backward_hook, module), *inp_tensors
             )
@@ -842,6 +903,15 @@ class MegatronFSDP(torch.nn.Module):
             return args, kwargs
 
         def _root_post_backward(*unused):
+            # Release multi-invocation (deferred) FSDP units now that every
+            # backward node of the iteration has executed.
+            for deferred_module in self._deferred_release_modules:
+                release_module_parameters(deferred_module, bwd=True)
+                release_module_parameters(deferred_module, bwd=False)
+                for sub_module in deferred_module.modules():
+                    sub_module._training_state = TrainingState.IDLE
+            self._deferred_release_modules.clear()
+
             # Make sure all the gradients are handled.
             ordered_params = sorted(
                 list(self._params_require_handle_grad), key=lambda p: self.param_to_name[p]
