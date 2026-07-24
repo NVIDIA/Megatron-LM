@@ -513,6 +513,12 @@ class ShortcutMoEBlock:
                 dispatch_probs,
             )
             combined_output = moe_layer.mlp.combine(routed_output)
+            # Shared experts execute later in the shortcut forward than the routed branch.
+            # Without an explicit priority, autograd therefore walks the shared branch first.
+            # That can launch overlapped dense gradient reduction while HybridEP/expert
+            # backward is still pending. Match the eager-overlap schedule by visiting the
+            # routed combine backward first.
+            set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
 
         with quant_context_factory(quant_config, layer_number):
             return self.output_and_shared(
