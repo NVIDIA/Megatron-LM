@@ -1,14 +1,18 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import logging
 import math
 import os
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -17,9 +21,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import transformer_config as transformer_config_module
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.spec_utils import build_module
-from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
@@ -52,7 +57,7 @@ _SEED = 1234
 # * fused vs unfused — the fused path exercises the cudnn DSA kernels + Triton
 #   fused MLA RoPE, whose bf16 numerics (and non-deterministic atomic
 #   reductions) drift ~an order of magnitude more than the pytorch-eager
-#   unfused path. ``apply_rope_fusion`` is coupled to ``apply_dsa_kernel_fusion``.
+#   unfused path. ``apply_rope_fusion`` is coupled to the selected DSA backend.
 # * forward (the layer ``out``) vs backward (``hidden_grad`` + every param
 #   grad) — gradients accumulate kernel noise and need looser floors than the
 #   forward output.
@@ -114,16 +119,22 @@ _DSA_BACKENDS = [
 def _make_config(
     variant: str,
     compress_ratio: int,
-    apply_dsa_kernel_fusion: bool = False,
+    use_fused_kernels: bool = False,
     calculate_per_token_loss: bool = False,
     dsa_indexer_use_sparse_loss: bool = False,
+    legacy_kernel_fusion: bool | None = None,
+    kernel_backend: str | None = None,
+    use_legacy_attention_type: bool = False,
 ) -> MLATransformerConfig:
     shape = _DSV4_VARIANTS[variant]
     mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
     qk_head_dim = shape["v_head_dim"] - shape["qk_pos_emb_head_dim"]
+    if kernel_backend is None:
+        kernel_backend = "cudnn" if use_fused_kernels else "none"
     config = MLATransformerConfig(
         multi_latent_attention=True,
-        experimental_attention_variant="dsv4_hybrid",
+        experimental_attention_variant=None if use_legacy_attention_type else "dsv4_hybrid",
+        linear_attention_type="dsv4_hybrid" if use_legacy_attention_type else None,
         num_layers=1,
         hidden_size=shape["hidden_size"],
         num_attention_heads=shape["num_attention_heads"],
@@ -154,7 +165,7 @@ def _make_config(
         tensor_model_parallel_size=1,
         sequence_parallel=False,
         context_parallel_size=1,
-        rope_type="yarn" if apply_dsa_kernel_fusion else "rope",
+        rope_type="yarn" if use_fused_kernels else "rope",
         rotary_base=10000,
         rotary_percent=1.0,
         csa_compress_rotary_base=shape["csa_compress_rotary_base"],
@@ -178,8 +189,9 @@ def _make_config(
         delay_wgrad_compute=False,
         tp_comm_overlap=False,
         softmax_scale=None,
-        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
-        apply_rope_fusion=apply_dsa_kernel_fusion,
+        dsa_kernel_backend=kernel_backend,
+        apply_dsa_kernel_fusion=legacy_kernel_fusion,
+        apply_rope_fusion=use_fused_kernels,
     )
     return config
 
@@ -563,7 +575,7 @@ class NativeCSAIndexer(nn.Module):
         self.index_topk = config.dsa_indexer_topk
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
         self.softmax_scale = self.index_head_dim**-0.5
-        self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
+        self.use_fused_kernels = config.dsa_kernel_backend == "cudnn"
         self.rope_base = config.csa_compress_rotary_base
         # CSA indexer is only instantiated for ``compress_ratio == 4``, which is
         # always the YaRN-enabled branch on the production side.
@@ -604,7 +616,7 @@ class NativeCSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, weights = self.forward_before_topk(x, qr)
         weights_scaled = weights.float() * self.softmax_scale
-        if self.apply_dsa_kernel_fusion:
+        if self.use_fused_kernels:
             weights_scaled = weights_scaled.to(weights.dtype).float()
         scores = torch.einsum("sbhd,tbd->sbht", q.float(), k.float())
         scores = torch.relu(scores) * weights_scaled.unsqueeze(-1)
@@ -637,7 +649,7 @@ class NativeCompressedSparseAttention(nn.Module):
         self.indexer_loss_coeff = config.dsa_indexer_loss_coeff
         self.indexer_use_sparse_loss = config.dsa_indexer_use_sparse_loss
         self.calculate_per_token_loss = config.calculate_per_token_loss
-        self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
+        self.use_fused_kernels = config.dsa_kernel_backend == "cudnn"
 
         self.attn_sink = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.compressor = (
@@ -684,7 +696,7 @@ class NativeCompressedSparseAttention(nn.Module):
                     topk_compressed >= 0, topk_compressed + offset, -1
                 )
 
-                if not self.apply_dsa_kernel_fusion:
+                if not self.use_fused_kernels:
                     causal_mask = (
                         torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
                     )
@@ -723,7 +735,7 @@ class NativeCompressedSparseAttention(nn.Module):
                 topk_compressed_for_attn = _get_compress_topk_idxs(
                     self.compress_ratio, batch_size, sq, offset, query.device
                 )
-            if self.indexer is not None and self.apply_dsa_kernel_fusion:
+            if self.indexer is not None and self.use_fused_kernels:
                 topk_idxs = torch.cat([topk_compressed_for_attn, window_idxs], dim=-1)
             else:
                 topk_idxs = torch.cat([window_idxs, topk_compressed_for_attn], dim=-1)
@@ -885,6 +897,88 @@ def _skip_if_real_kernels_unavailable(*, sm_min: int = 9, need_flash_mla: bool =
         pytest.importorskip("flash_mla")
 
 
+def test_dsv4_backend_default_does_not_use_deprecated_adapter(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    config = _make_config("flash", 1)
+
+    assert config.dsa_kernel_backend == "none"
+    assert config.apply_dsa_kernel_fusion is None
+    assert "apply_dsa_kernel_fusion is deprecated" not in caplog.text
+
+
+def _assert_rank_zero_log(caplog, message):
+    assert (message in caplog.text) == (safe_get_rank() == 0)
+
+
+def test_deprecated_dsv4_kernel_fusion_false_maps_to_none(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    config = _make_config("flash", 1, legacy_kernel_fusion=False)
+
+    assert config.dsa_kernel_backend == "none"
+    _assert_rank_zero_log(caplog, "use dsa_kernel_backend='none' instead")
+
+
+def test_deprecated_kernel_fusion_is_normalized_after_legacy_attention_type(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    with pytest.warns(UserWarning, match="linear_attention_type is deprecated"):
+        config = _make_config(
+            "flash", 1, legacy_kernel_fusion=False, use_legacy_attention_type=True
+        )
+
+    assert config.experimental_attention_variant == "dsv4_hybrid"
+    assert config.linear_attention_type is None
+    assert config.dsa_kernel_backend == "none"
+    _assert_rank_zero_log(caplog, "use dsa_kernel_backend='none' instead")
+    assert "ignored outside" not in caplog.text
+
+
+def test_deprecated_dsv4_kernel_fusion_true_maps_to_cudnn(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+    fake_cudnn = ModuleType("cudnn")
+    fake_cudnn.DSA = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "cudnn", fake_cudnn)
+    monkeypatch.setattr(
+        transformer_config_module,
+        "_validate_dsa_kernel_backend_dependencies",
+        lambda _backend: None,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+
+    config = _make_config("flash", 1, legacy_kernel_fusion=True)
+
+    assert config.dsa_kernel_backend == "cudnn"
+    _assert_rank_zero_log(caplog, "use dsa_kernel_backend='cudnn' instead")
+
+
+@pytest.mark.parametrize(
+    ("legacy_kernel_fusion", "kernel_backend"), [(False, "cudnn"), (True, "tilelang")]
+)
+def test_deprecated_dsv4_kernel_fusion_rejects_conflicts(legacy_kernel_fusion, kernel_backend):
+    with pytest.raises(ValueError, match="Conflicting DSA kernel controls"):
+        _make_config(
+            "flash", 1, legacy_kernel_fusion=legacy_kernel_fusion, kernel_backend=kernel_backend
+        )
+
+
+def test_deprecated_kernel_fusion_is_ignored_outside_dsv4(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    config = TransformerConfig(
+        num_layers=1, hidden_size=8, num_attention_heads=1, apply_dsa_kernel_fusion=True
+    )
+
+    assert config.dsa_kernel_backend == "none"
+    _assert_rank_zero_log(caplog, "ignored outside")
+
+
+def test_dsv4_rejects_tilelang_backend():
+    with pytest.raises(ValueError, match="does not support.*tilelang"):
+        _make_config("flash", 1, kernel_backend="tilelang")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
 class TestDSv4HybridNativeParity:
@@ -907,7 +1001,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash", "pro"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
     @pytest.mark.parametrize(
@@ -926,36 +1020,32 @@ class TestDSv4HybridNativeParity:
         compress_ratio: int,
         seqlen: int,
         backend: str,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
         calculate_per_token_loss: bool,
         dsa_indexer_use_sparse_loss: bool,
     ):
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         major, _ = torch.cuda.get_device_capability()
         if (
             major == 9
-            and apply_dsa_kernel_fusion
+            and use_fused_kernels
             and compress_ratio == 4
             and not dsa_indexer_use_sparse_loss
         ):
             pytest.skip("cuDNN Frontend SM90 dense DSA is not supported")
-        if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
+        if major < 10 and not use_fused_kernels and seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=calculate_per_token_loss,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1021,7 +1111,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash", "pro"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
     @pytest.mark.parametrize(
@@ -1034,7 +1124,7 @@ class TestDSv4HybridNativeParity:
         compress_ratio: int,
         seqlen: int,
         backend: str,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
         dsa_indexer_use_sparse_loss: bool,
     ):
         """THD (packed-sequence) variant of test_attention_matches_native_reference.
@@ -1043,32 +1133,28 @@ class TestDSv4HybridNativeParity:
         (equivalent to SBHD B=1) and compares forward output and backward
         gradients against the native reference.
         """
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         major, _ = torch.cuda.get_device_capability()
         if (
             major == 9
-            and apply_dsa_kernel_fusion
+            and use_fused_kernels
             and compress_ratio == 4
             and not dsa_indexer_use_sparse_loss
         ):
             pytest.skip("cuDNN Frontend SM90 THD dense DSA has cache and stream bugs")
-        if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
+        if major < 10 and not use_fused_kernels and seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1137,7 +1223,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
     @pytest.mark.parametrize(
@@ -1153,7 +1239,7 @@ class TestDSv4HybridNativeParity:
         compress_ratio: int,
         seg_lens: list,
         backend: str,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
         dsa_indexer_use_sparse_loss: bool,
     ):
         """Multi-segment THD parity against per-segment native references.
@@ -1172,26 +1258,22 @@ class TestDSv4HybridNativeParity:
         Segment lengths are multiples of 128 (== ``csa_window_size`` and the
         max compress ratio) so compression is exact at every ratio.
         """
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         major, _ = torch.cuda.get_device_capability()
         total_T = sum(seg_lens)
-        if major < 10 and not apply_dsa_kernel_fusion and total_T > 4096:
+        if major < 10 and not use_fused_kernels and total_T > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1272,7 +1354,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash"])
     @pytest.mark.parametrize("compress_ratio", [4, 128])
     @pytest.mark.parametrize("dsa_indexer_use_sparse_loss", [True, False])
@@ -1293,7 +1375,7 @@ class TestDSv4HybridNativeParity:
         pad_max_num_seqs: int,
         backend: str,
         dsa_indexer_use_sparse_loss: bool,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
     ):
         """Verify that THD padding does not corrupt real tokens' output.
 
@@ -1302,11 +1384,11 @@ class TestDSv4HybridNativeParity:
         gradients for the real (non-padding) token positions are identical
         within tolerance.
         """
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         if (
             torch.cuda.get_device_capability()[0] == 9
-            and apply_dsa_kernel_fusion
+            and use_fused_kernels
             and compress_ratio == 4
             and not dsa_indexer_use_sparse_loss
         ):
@@ -1319,16 +1401,12 @@ class TestDSv4HybridNativeParity:
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 

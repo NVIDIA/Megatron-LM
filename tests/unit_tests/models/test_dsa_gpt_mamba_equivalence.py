@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """
 Equivalence tests: GPTModel with DSA vs HybridModel with DSA pattern.
 
@@ -121,6 +121,7 @@ def _make_dsa_config(num_layers: int, tp: int = 1, pp: int = 1) -> MLATransforme
         hidden_dropout=0.0,
         attention_dropout=0.0,
         tensor_model_parallel_size=tp,
+        sequence_parallel=tp > 1,
         pipeline_model_parallel_size=pp,
     )
 

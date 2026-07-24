@@ -185,6 +185,22 @@ def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     assert "torch.matmul" not in primitive_text
 
 
+def test_lite_csa_imports_core_csa_kernel_namespace():
+    root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
+    csa_text = (root / "primitive" / "modules" / "attention" / "csa.py").read_text()
+
+    assert (
+        "from megatron.core.transformer.experimental_attention_variant.csa_kernels import"
+        in csa_text
+    )
+    assert "FusedCSAIndexerSparseAttnFromTopkFunc" in csa_text
+    assert "csa_sparse_attn" in csa_text
+    assert (
+        "from megatron.core.transformer.experimental_attention_variant.dsa_kernels import"
+        not in csa_text
+    )
+
+
 def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
     from megatron.lite.primitive.kernels import dsa_kernels
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -26,6 +26,10 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -140,9 +144,9 @@ hybrid_stack_spec = ModuleSpec(
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
-                    module=MLASelfAttention,
+                    module=AbsorbedMLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
+                    submodules=AbsorbedMLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
                         linear_q_down_proj=TELinear,
                         linear_q_up_proj=TEColumnParallelLinear,
@@ -323,8 +327,8 @@ def hybrid_dsv4_stack_spec(config):
     ``CompressedSparseAttention`` (CSA/HCA + ``CSAIndexer``), identical to the GPT
     ``dsv4_hybrid`` path, instead of the legacy ``DSAttention``.
 
-    The default ``hybrid_stack_spec`` wires the ``D`` layer to ``MLASelfAttention +
-    DSAttention`` (DSv3-style sparse attention with no CSA/HCA compression). To run real
+    The default ``hybrid_stack_spec`` wires the ``D`` layer to ``AbsorbedMLASelfAttention +
+    DSAttention`` (DS3.2-style sparse attention with no CSA/HCA compression). To run real
     DSv4 on HybridModel — and to be numerically equivalent to a GPT ``dsv4_hybrid``
     attention layer — we reuse GPT's own ``get_dsv4_hybrid_module_spec_for_backend``
     (which is config-aware, e.g. picks the qk-layernorm form from ``config``) so the two
