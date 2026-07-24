@@ -682,18 +682,26 @@ class GPTDataset(MegatronDataset):
         Returns:
             int: The number of epochs
         """
-        num_epochs = 1
-        num_tokens = num_tokens_per_epoch
+        if num_tokens_per_epoch <= 0:
+            raise RuntimeError(
+                f"The {self.index_split.name} split contains {num_tokens_per_epoch} tokens, but a "
+                "positive number is required to build the dataset. This typically happens when the "
+                "data split allocates too small a fraction to this split for the size of the "
+                "dataset. Increase this split's fraction (the --split argument or the "
+                "train/valid/test split fractions) or provide a larger dataset."
+            )
+
         if self.num_samples is None:
-            return num_epochs
-        else:
-            num_tokens_requested = (
-                self.num_samples * self.config.sequence_length
-            ) + self.config.add_extra_token_to_sequence
-            while num_tokens < num_tokens_requested:
-                num_epochs += 1
-                num_tokens += num_tokens_per_epoch
-        return num_epochs
+            return 1
+
+        num_tokens_requested = (
+            self.num_samples * self.config.sequence_length
+        ) + self.config.add_extra_token_to_sequence
+
+        # Repeat the epoch as many times as needed to cover the requested number of tokens, while
+        # exposing the dataset at least once. Integer ceiling division avoids the floating-point
+        # rounding that ceil(a / b) would introduce for large token counts.
+        return max(1, -(-num_tokens_requested // num_tokens_per_epoch))
 
 
 def _build_document_index(
