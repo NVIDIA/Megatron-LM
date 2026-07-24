@@ -288,16 +288,11 @@ class TestRetargetShardedStateDict:
             'decoder.layers.0.mlp.linear_fc1.weight'
         }
 
-        wrapped = {
-            'module.module.module.decoder.layers.1.self_attention.linear_qkv.weight': attn
-        }
+        wrapped = {'module.module.module.decoder.layers.1.self_attention.linear_qkv.weight': attn}
         translated = retarget_fsdp_state_dict_to_gpt_checkpoint(
             wrapped,
             maps,
-            (
-                'optimizer.state.module.module.decoder.layers.0.'
-                'self_attention.linear_qkv.weight',
-            ),
+            ('optimizer.state.module.module.decoder.layers.0.' 'self_attention.linear_qkv.weight',),
             checkpoint_prefix='optimizer.state',
         )
         assert set(translated) == {
@@ -765,11 +760,7 @@ class TestGPTToHybridFSDPLoad:
                 (2, 1, 1, 1, 1), (1, 1, 1, 1, 1), 'M*-M*-', False, id='tp2-fsdp2-to-fsdp4'
             ),
             pytest.param(
-                (1, 1, 2, 1, 1),
-                (2, 1, 1, 1, 1),
-                'M*-M*-',
-                False,
-                id='cp2-fsdp2-to-tp2-fsdp2',
+                (1, 1, 2, 1, 1), (2, 1, 1, 1, 1), 'M*-M*-', False, id='cp2-fsdp2-to-tp2-fsdp2'
             ),
             pytest.param(
                 (1, 1, 1, 2, 1),

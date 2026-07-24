@@ -268,9 +268,7 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
 
 
 def _retarget_explicit_key_to_gpt_checkpoint(
-    key: Any,
-    layer_maps: GPTCompatLayerMaps,
-    checkpoint_keys: Iterable[str] | None = None,
+    key: Any, layer_maps: GPTCompatLayerMaps, checkpoint_keys: Iterable[str] | None = None
 ) -> Any | None:
     """Translate one explicit HybridModel state-dict key to its GPT key.
 
@@ -298,10 +296,7 @@ def _retarget_explicit_key_to_gpt_checkpoint(
                 "which is not part of the hybrid layer pattern used to derive the "
                 "GPT layer maps."
             )
-        key = (
-            f'{key[:layer_match.start()]}decoder.layers.{gpt_idx}.'
-            f'{key[layer_match.end():]}'
-        )
+        key = f'{key[:layer_match.start()]}decoder.layers.{gpt_idx}.' f'{key[layer_match.end():]}'
 
     for hybrid_prefix, gpt_prefix in _GPT_FINAL_NORM_KEY_MAP.items():
         pos = key.find(hybrid_prefix)
