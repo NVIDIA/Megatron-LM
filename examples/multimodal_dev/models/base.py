@@ -62,6 +62,33 @@ class _NoCPGroup:
 
 _NO_CP_GROUP = _NoCPGroup()
 
+
+def _vision_chunk_slices(image_grid_thw, chunk_patches):
+    """Greedy image-boundary partition of a vision payload.
+
+    Returns ``(image_lo, image_hi, row_lo, row_hi)`` tuples whose raw-patch
+    row counts stay <= ``chunk_patches``, except that a single image larger
+    than the chunk budget forms its own chunk (images are indivisible).
+    Vision attention's cu_seqlens are per-image, so no computation ever
+    crosses a chunk boundary — chunked execution is exact scheduling
+    freedom, not an approximation.
+    """
+    sizes = (image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]).tolist()
+    slices = []
+    image_lo = 0
+    row_lo = 0
+    accumulated = 0
+    for index, size in enumerate(sizes):
+        if accumulated and accumulated + size > chunk_patches:
+            slices.append((image_lo, index, row_lo, row_lo + accumulated))
+            image_lo, row_lo = index, row_lo + accumulated
+            accumulated = 0
+        accumulated += int(size)
+    if accumulated:
+        slices.append((image_lo, len(sizes), row_lo, row_lo + accumulated))
+    return slices
+
+
 # Note: reported ``mtp_1 loss`` drifts ~1.3% from the CP=1 baseline under
 # THD+CP. Megatron-Core's logging averages per-rank pre-divided ratios
 # with op=AVG, and per-rank num_tokens are unequal after MTP rolling.
@@ -191,6 +218,57 @@ class MultimodalModel(MegatronModule):
         dummy_grid = torch.tensor([[1, merge, merge]], dtype=torch.long, device=pixel_values.device)
         return self.vision_model(dummy_pixels, dummy_grid).sum() * 0.0
 
+    def _vision_forward(self, pixel_values: Tensor, image_grid_thw: Tensor):
+        """Run the vision tower, optionally in image-boundary chunks.
+
+        With ``vision_encoder_chunk_patches <= 0`` this is the legacy
+        single-call path, bit-for-bit unchanged. With chunking enabled the
+        payload is split at image boundaries (exact — see
+        :func:`_vision_chunk_slices`) so the packed fused-attention
+        workspace is bounded by one chunk instead of the whole payload.
+
+        Under Megatron-FSDP every tower forward triggers a per-module
+        parameter-unshard collective over the sharding group, so all ranks
+        must run the same number of tower invocations per microbatch: chunk
+        counts are max-all-reduced over ``vision_lockstep_group`` (injected
+        by the model provider from the dp-cp process group; the FSDP wrapper
+        is installed after the provider returns, so it cannot be queried
+        here) and ranks with fewer real chunks pad with zero-weighted dummy
+        passes. In evaluation a group-wide image-free microbatch skips the
+        tower entirely; in training at least one pass always runs so vision
+        parameters keep producing (zero) grads for bucketed grad sync.
+
+        Returns ``(vision_embeddings | None, vision_grad_anchor | None)``.
+        """
+        chunk_patches = int(getattr(self, "vision_encoder_chunk_patches", 0) or 0)
+        if chunk_patches <= 0:
+            if pixel_values.shape[0] > 0:
+                return self.vision_model(pixel_values, image_grid_thw), None
+            return None, self._empty_vision_grad_anchor(pixel_values)
+
+        slices = (
+            _vision_chunk_slices(image_grid_thw, chunk_patches) if pixel_values.shape[0] > 0 else []
+        )
+        k_local = len(slices)
+        k_global = k_local
+        group = getattr(self, "vision_lockstep_group", None)
+        if group is not None and torch.distributed.is_initialized():
+            counts = torch.tensor([k_local], dtype=torch.long, device=pixel_values.device)
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.MAX, group=group)
+            k_global = int(counts.item())
+        if self.training:
+            k_global = max(k_global, 1)
+
+        embeddings = [
+            self.vision_model(pixel_values[row_lo:row_hi], image_grid_thw[image_lo:image_hi])
+            for image_lo, image_hi, row_lo, row_hi in slices
+        ]
+        anchor = None
+        for _ in range(k_global - k_local):
+            dummy = self._empty_vision_grad_anchor(pixel_values)
+            anchor = dummy if anchor is None else anchor + dummy
+        return (torch.cat(embeddings) if embeddings else None), anchor
+
     def compute_position_ids(
         self, input_ids: Tensor, image_grid_thw: Optional[Tensor] = None, packed_seq_params=None
     ) -> Tensor:
@@ -227,8 +305,13 @@ class MultimodalModel(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
             return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
 
@@ -266,8 +349,13 @@ class MultimodalModel(MegatronModule):
             padding_mask = _split(padding_mask, 1)
 
         return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         )
 
     @staticmethod
@@ -361,10 +449,9 @@ class MultimodalModel(MegatronModule):
         vision_embeddings = None
         vision_grad_anchor = None
         if self.vision_model is not None and pixel_values is not None:
-            if pixel_values.shape[0] > 0:
-                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
-            else:
-                vision_grad_anchor = self._empty_vision_grad_anchor(pixel_values)
+            vision_embeddings, vision_grad_anchor = self._vision_forward(
+                pixel_values, image_grid_thw
+            )
 
         if decoder_input is None and self.language_model is not None:
             text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
@@ -383,8 +470,13 @@ class MultimodalModel(MegatronModule):
                 decoder_input = decoder_input + vision_grad_anchor
 
         (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,

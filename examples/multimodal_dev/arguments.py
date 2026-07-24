@@ -95,6 +95,23 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--vision-encoder-chunk-patches",
+        type=int,
+        default=0,
+        help=(
+            "Run the vision tower in image-boundary chunks of at most this "
+            "many raw patches (0 disables). Vision attention never crosses "
+            "images, so chunking is numerically exact while bounding the "
+            "packed fused-attention workspace to one chunk instead of the "
+            "whole microbatch payload. Under Megatron-FSDP chunk counts are "
+            "max-all-reduced across the sharding group and short ranks pad "
+            "with zero-weighted dummy passes so per-module unshard "
+            "collectives stay in lockstep (training keeps at least one pass "
+            "for grad registration; evaluation skips a group-wide image-free "
+            "microbatch entirely)."
+        ),
+    )
+    group.add_argument(
         "--max-vision-patches-per-microbatch",
         type=int,
         default=None,

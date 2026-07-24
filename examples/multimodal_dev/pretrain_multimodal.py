@@ -27,10 +27,9 @@ import importlib
 import os
 import sys
 
-sys.path.insert(
-    0,
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
-)
+import torch
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
@@ -40,11 +39,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
 
-def model_provider(
-    pre_process: bool = True,
-    post_process: bool = True,
-    **kwargs,
-):
+def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs):
     """Build a multimodal model from ``--model-arch``.
 
     The language ``TransformerConfig`` is built from CLI args so that
@@ -59,8 +54,7 @@ def model_provider(
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
+            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
         )
 
     registry = MODEL_REGISTRY[model_arch]
@@ -91,11 +85,21 @@ def model_provider(
 
     # --- build model (fully delegated to the arch factory) ---
     model = registry["model_factory_fn"](
-        args=args,
-        language_config=language_config,
-        vision_config=vision_config,
-        **kwargs,
+        args=args, language_config=language_config, vision_config=vision_config, **kwargs
     )
+
+    # Chunked vision-encoder execution (Phase B runtime). The Megatron-FSDP
+    # wrapper is installed AFTER this provider returns, so the lockstep
+    # group cannot be queried from it here; inject the expected dp-cp
+    # sharding group from parallel_state instead (the GPU prototype asserts
+    # it matches wrapper.dist_index.get_fsdp_group()).
+    model.vision_encoder_chunk_patches = getattr(args, "vision_encoder_chunk_patches", 0)
+    if torch.distributed.is_initialized():
+        from megatron.core import parallel_state
+
+        model.vision_lockstep_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True
+        )
 
     return model
 
@@ -104,9 +108,7 @@ def _resolve_provider_fn(provider_fn):
     """Resolve a provider that may be a dotted import path string."""
     if isinstance(provider_fn, str):
         module_path, func_name = provider_fn.rsplit(".", 1)
-        provider_fn = getattr(
-            importlib.import_module(module_path), func_name,
-        )
+        provider_fn = getattr(importlib.import_module(module_path), func_name)
     return provider_fn
 
 
@@ -124,8 +126,7 @@ def datasets_provider(train_val_test_num_samples):
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
+            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
         )
 
     registry = MODEL_REGISTRY[model_arch]
@@ -144,10 +145,7 @@ def datasets_provider(train_val_test_num_samples):
 if __name__ == "__main__":
     datasets_provider.is_distributed = True
 
-    args = parse_and_validate_args(
-        extra_args_provider=add_multimodal_args,
-        args_defaults={},
-    )
+    args = parse_and_validate_args(extra_args_provider=add_multimodal_args, args_defaults={})
     # multimodal_dev's model_provider builds the full model on every rank and
     # does not honor pre_process / post_process pipeline-stage flags. PP>1
     # would silently violate Megatron's pipeline-parallel contract.

@@ -187,7 +187,14 @@ def _check_vision_patch_budget(
     if max_total is None and max_per_image is None:
         return
     num_images = int(image_grid_thw.shape[0]) if image_grid_thw.dim() == 2 else 0
-    total_patches = int(pixel_values.shape[0])
+    # Compute from geometry so the guard also covers pixel-free (streaming)
+    # payloads; for eager payloads grid-prod equals the pixel row count.
+    if num_images:
+        total_patches = int(
+            (image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]).sum().item()
+        )
+    else:
+        total_patches = int(pixel_values.shape[0]) if pixel_values is not None else 0
     if max_total is not None and total_patches > int(max_total):
         raise ValueError(
             f"Microbatch vision payload has {total_patches} raw patches across "
