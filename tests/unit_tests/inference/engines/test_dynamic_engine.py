@@ -18,6 +18,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -148,6 +149,17 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    # Sliding-window attention config. When `window_size` is None, SWA is
+    # disabled and all layers do full causal attention. When set to a
+    # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
+    # local window of `left` past tokens and `right` future tokens.
+    window_size: Optional[Tuple[int, int]] = None
+    window_attn_skip_freq: Optional[int] = None
+    # Sink (off-by-one / learnable) softmax — exercises the post-hoc LSE
+    # rescale path inside Attention.flash_decode_and_prefill. Default keeps
+    # behavior unchanged for existing tests.
+    softmax_type: str = "vanilla"
 
     def __post_init__(self):
 
@@ -297,6 +309,7 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
+                async_sched_mode=test_config.async_sched_mode,
             ),
         )
 
@@ -370,7 +383,10 @@ class DynamicInferenceEngineTestBase:
                     if test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
                 ),
+                softmax_type=test_config.softmax_type,
                 # inference optimized currently only supports RMS Norm
+                window_size=test_config.window_size,
+                window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec()
@@ -886,6 +902,40 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        # Cover three regimes:
+        #   - SWA active on every layer (window_attn_skip_freq=None)
+        #   - SWA active on a subset of layers (gpt-oss style: every other layer)
+        #   - window smaller than the longest sequence we generate, so the
+        #     kernel actually applies the local-attention mask.
+        "window_size,window_attn_skip_freq",
+        [((4, 0), None), ((4, 0), 2), ((127, 0), 2)],
+    )
+    def test_sliding_window_attention(
+        self, window_size: Tuple[int, int], window_attn_skip_freq: Optional[int]
+    ) -> None:
+        """Exercise SWA on the dynamic batching (FA2/FA3/FA4) attention path.
+
+        This mirrors the gpt-oss configuration (window 127 to the left, no
+        future tokens, applied every other layer) at a much smaller scale.
+        The test only checks that decoding runs end-to-end and produces the
+        expected number of tokens; numerical correctness of the SWA kernels
+        themselves is owned by the upstream flash-attention test suites.
+        """
+        self._run_test(
+            model_provider="gpt",
+            num_gap_steps=0,
+            window_size=window_size,
+            window_attn_skip_freq=window_attn_skip_freq,
+            # Disable CUDA graphs: this test only validates the SWA plumbing
+            # through the attention kernel, not the CG capture path.
+            num_cuda_graphs=None,
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fixed_output_lengths(self, model_provider: str) -> None:
         """Test generating a fixed number of output tokens."""
@@ -1040,6 +1090,46 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 )
 
             engine_task.cancel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_async_sched_run_engine_accepts_request_during_decode(self):
+        """Verify async decode yields so a new request can enter a running engine."""
+        with torch.inference_mode():
+            test_config = DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=16,
+                async_sched_mode=AsyncScheduleMode.OVERLAP,
+            )
+            env = self._build_test_env(test_config)
+            long_request, short_request = env.requests
+            for request in env.requests:
+                request.sampling_params.top_k = 1
+                request.sampling_params.top_p = 0.0
+                request.sampling_params.termination_id = -1
+            short_request.sampling_params.num_tokens_to_generate = 2
+
+            engine_task = asyncio.create_task(env.engine.run_engine())
+            try:
+                long_request_future = env.engine._add_request(long_request)
+
+                while len(long_request.generated_tokens) < 2:
+                    await asyncio.sleep(0)
+
+                generated_count_at_submission = len(long_request.generated_tokens)
+                short_request_future = env.engine._add_request(short_request)
+                await asyncio.gather(long_request_future, short_request_future)
+
+                assert generated_count_at_submission < 16
+                assert len(short_request.generated_tokens) == 2
+            finally:
+                engine_task.cancel()
+                await engine_task
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1959,6 +2049,55 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
 
     @pytest.mark.internal
+    @torch.inference_mode()
+    def test_mamba_match_is_chunk_local_when_chunked_prefill_limits_kv_match(self):
+        """Mamba restore depth is bounded to KV blocks assigned for the current chunk."""
+        block_size = 256
+        block_hashes = [111, 222]
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.arange(512, dtype=torch.int64, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+            precomputed_block_hashes=block_hashes,
+        )
+
+        # This simulates the old scheduler-side full-prompt Mamba match. The
+        # context must ignore it and record the chunk-local executable count.
+        req._mamba_num_matched_blocks = 2
+
+        ctx = DynamicInferenceContext.__new__(DynamicInferenceContext)
+        ctx.block_size_tokens = block_size
+        ctx.enable_prefix_caching = True
+        ctx.is_hybrid_model = True
+        ctx.kv_block_allocator = types.SimpleNamespace(
+            kv_hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
+        )
+        ctx.mamba_slot_allocator = types.SimpleNamespace(
+            hash_to_block_id={block_hashes[0]: 7, block_hashes[1]: 8}
+        )
+
+        (
+            matched_block_ids,
+            num_blocks_from_pool,
+            already_allocated_blocks,
+            overall_required_blocks,
+            prefix_skip_tokens,
+            effective_prefill_chunk_length,
+        ) = DynamicInferenceContext._compute_prefix_match(
+            ctx, req, prefill_chunk_length=211, record_mamba_match=True
+        )
+
+        assert matched_block_ids == [7]
+        assert num_blocks_from_pool == 0
+        assert already_allocated_blocks == 0
+        assert overall_required_blocks == 1
+        assert req._mamba_num_matched_blocks == 1
+        assert prefix_skip_tokens == 0
+        assert effective_prefill_chunk_length == 211
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -2581,7 +2720,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits[:, :, 0] = 100.0  # High probability for token 0
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -2720,7 +2859,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -2815,7 +2954,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -2911,7 +3050,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -3187,7 +3326,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
                 base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
 
-                model._decoder_hidden_states_cache = torch.zeros(
+                env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                     s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
                 )
                 if test_config.materialize_only_last_token_logits:
@@ -3308,7 +3447,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             base_logits[:, :, 0] = 100.0  # Force model to deterministically pick token 0
 
             # Cache hidden states for serial MTP computation
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             if test_config.materialize_only_last_token_logits:
@@ -3526,7 +3665,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 dtype=torch.bfloat16,
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -3669,7 +3808,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             # Make token 0 very likely so speculative tokens get accepted.
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -3791,7 +3930,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -3923,7 +4062,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 b, s, test_config.vocab_size, device=tokens.device, dtype=torch.bfloat16
             )
             base_logits[:, :, 0] = 100.0
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -4178,7 +4317,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits
@@ -4276,7 +4415,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             )
             next_toks = (tokens + 1).clamp(max=test_config.vocab_size - 1)
             base_logits.scatter_(2, next_toks.unsqueeze(-1), 100.0)
-            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+            env.engine.context.mtp_decoder_hidden_states = torch.zeros(
                 s, 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
             )
             return base_logits

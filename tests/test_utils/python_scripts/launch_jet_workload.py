@@ -222,7 +222,7 @@ def launch_and_wait_for_completion(
                                         "MCORE_BACKWARDS_COMMIT": (
                                             os.getenv("MCORE_BACKWARDS_COMMIT") or ""
                                         ),
-                                        "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
+                                        "HF_HUB_CACHE": "/mnt/artifacts/hf_home/hub",
                                         "TRANSFORMERS_OFFLINE": "1",
                                         "CLUSTER": cluster,
                                         "RUN_ID": str(uuid.uuid4()),
@@ -665,12 +665,13 @@ def main(
 
             n_iteration += 1
 
-    send_slack_alert(
-        test_case=test_case,
-        context="max attempts exhausted",
-        n_iteration=n_iteration,
-        n_attempts=n_attempts,
-    )
+    if test_type == "release":
+        send_slack_alert(
+            test_case=test_case,
+            context="max attempts exhausted",
+            n_iteration=n_iteration,
+            n_attempts=n_attempts,
+        )
     telemetrics_and_exit(
         success=False,
         test_case=test_case,
