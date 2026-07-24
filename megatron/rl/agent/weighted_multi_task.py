@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
+import time
+from dataclasses import dataclass
 from typing import Any, Optional, Type
 
 import numpy as np
 
-from .registry import get_agent_class
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -21,6 +22,7 @@ from .api import (
     RolloutGenerator,
     RolloutRequest,
 )
+from .registry import get_agent_class
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +41,96 @@ class AgentConfig(AgentBaseModel):
             raise ValueError("Agent weight must be non-negative")
 
 
+@dataclass
+class PgtRebalanceConfig:
+    """Knobs for dynamic per-env inference-concurrency rebalancing."""
+
+    ema_alpha: float = 0.2
+    min_interval_s: float = 30.0
+    min_samples_per_env: int = 8
+    max_step_fraction: float = 0.25
+
+
+class _PgtRebalancer:
+    """Periodically shifts submission-gate capacity toward slower envs.
+
+    The data mix (agent_groups / agent_slots) is untouched; only inference
+    concurrency moves. Scoped to a single get_grouped_rollouts call, like
+    _RolloutPipeline is for a single sub-agent."""
+
+    def __init__(
+        self,
+        config: PgtRebalanceConfig,
+        *,
+        agent_indices: list[int],
+        weights: list[float],
+        current_pgts: list[int],
+        min_pgts: list[int],
+    ) -> None:
+        self.config = config
+        self.agent_indices = agent_indices
+        self.weights = weights
+        self.current = list(current_pgts)
+        self.min_pgts = min_pgts
+        self.total_pgt = sum(current_pgts)
+        self.rebalance_count = 0
+        self.latest_emas: list[float | None] = [None] * len(agent_indices)
+        self._last_check = float("-inf")
+
+    def maybe_rebalance(self, agents: list) -> dict | None:
+        """Re-allocate gate capacity if the check interval elapsed and the
+        allocation would change. Returns an event dict for logging, or None."""
+        now = time.monotonic()
+        if now - self._last_check < self.config.min_interval_s:
+            return None
+        self._last_check = now
+
+        pipelines, durations = [], []
+        for idx in self.agent_indices:
+            pipeline = getattr(agents[idx], "_active_pipeline", None)
+            pipelines.append(pipeline)
+            if (
+                pipeline is None
+                or pipeline.engine_dwell_sample_count < self.config.min_samples_per_env
+            ):
+                durations.append(None)
+            else:
+                durations.append(pipeline.engine_dwell_ema)
+        self.latest_emas = durations
+
+        new = WeightedMultiTask._compute_pgt_allocation(
+            self.weights,
+            durations,
+            self.total_pgt,
+            self.current,
+            min_pgts=self.min_pgts,
+            max_step_fraction=self.config.max_step_fraction,
+        )
+        if new == self.current:
+            return None
+        old, self.current = self.current, new
+        self.rebalance_count += 1
+        for idx, pipeline, pgt in zip(self.agent_indices, pipelines, new):
+            agents[idx].parallel_generation_tasks = pgt
+            if pipeline is not None:
+                pipeline.gate.set_capacity(pgt)
+        return {"old": old, "new": new, "emas": durations}
+
+
 class WeightedMultiTask(
     RolloutGenerator, GroupedRolloutGenerator, ContrastiveRolloutGenerator, EvaluationAgent
 ):
     """An agent that manages multiple sub-agents and distributes rollouts according to weights."""
 
-    def __init__(self, agent_configs: list[AgentConfig]):
+    def __init__(
+        self,
+        agent_configs: list[AgentConfig],
+        pgt_rebalance: PgtRebalanceConfig | None = None,
+    ):
         super().__init__()
         if not agent_configs:
             raise ValueError("Must provide at least one agent configuration")
+        self.pgt_rebalance = pgt_rebalance
 
         # Initialize all sub-agents
         self.agents = []
@@ -71,7 +154,11 @@ class WeightedMultiTask(
 
     @classmethod
     def from_config(
-        cls, config: list[dict[str, Any]], *, parallel_generation_tasks: int | None = None
+        cls,
+        config: list[dict[str, Any]],
+        *,
+        parallel_generation_tasks: int | None = None,
+        pgt_rebalance: PgtRebalanceConfig | None = None,
     ) -> 'WeightedMultiTask':
         """Create a WeightedMultiTask from a config list.
 
@@ -101,7 +188,7 @@ class WeightedMultiTask(
                 )
             )
 
-        instance = cls(agent_configs)
+        instance = cls(agent_configs, pgt_rebalance=pgt_rebalance)
         if parallel_generation_tasks is not None:
             instance.parallel_generation_tasks = parallel_generation_tasks
         return instance
@@ -156,6 +243,63 @@ class WeightedMultiTask(
 
         return final_counts
 
+    @staticmethod
+    def _compute_pgt_allocation(
+        weights: list[float],
+        durations: list[float | None],
+        total_pgt: int,
+        current: list[int],
+        *,
+        min_pgts: list[int],
+        max_step_fraction: float,
+    ) -> list[int]:
+        """Helper method to distribute parallel generation tasks by measured speed.
+
+        The dynamic counterpart of _distribute_counts: allocates total_pgt so
+        each env's share is proportional to weight_i * duration_i, equalizing
+        per-env finish time for its share of the data mix. Envs without a
+        duration estimate use the weighted mean of known durations; with no
+        estimates at all, the current allocation is kept. Per-update movement
+        is clamped to max_step_fraction of the current value (hysteresis) and
+        floors are enforced; the result always sums to total_pgt.
+        """
+        known = [(w, d) for w, d in zip(weights, durations) if d is not None]
+        if not known:
+            return list(current)
+
+        # Mean of known durations for fallback
+        fallback = sum(w * d for w, d in known) / sum(w for w, _ in known)
+
+        # Calculate shares for each agent
+        shares = [w * (d if d is not None else fallback) for w, d in zip(weights, durations)]
+        if (total_share := sum(shares)) <= 0:
+            return list(current)
+
+        # Calculate exact pgt for each agent
+        exact = [total_pgt * s / total_share for s in shares]
+
+        # Largest-remainder rounding (same scheme as _distribute_counts).
+        target = [int(x) for x in exact]
+        order = sorted(range(len(exact)), key=lambda i: exact[i] - target[i], reverse=True)
+        for i in range(total_pgt - sum(target)):
+            target[order[i]] += 1
+
+        # Clamp per-update movement, then enforce floors.
+        new = []
+        for cur, tgt, floor in zip(current, target, min_pgts):
+            step = max(1, round(max_step_fraction * cur))
+            new.append(max(floor, min(max(tgt, cur - step), cur + step)))
+
+        # Repair the sum (clamping/floors can break it); floors stay respected.
+        diff = total_pgt - sum(new)
+        while diff != 0:
+            sign = 1 if diff > 0 else -1
+            candidates = [i for i in range(len(new)) if sign > 0 or new[i] - 1 >= min_pgts[i]]
+            i = max(candidates, key=lambda i: sign * (exact[i] - new[i]))
+            new[i] += sign
+            diff -= sign
+        return new
+
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
@@ -204,6 +348,44 @@ class WeightedMultiTask(
             agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
         agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
+
+        # Optional dynamic rebalancing of inference concurrency (gate
+        # capacity) toward slower envs. The data mix (agent_groups,
+        # agent_slots) always stays at the configured weights. Not
+        # applicable in B submission mode, where every active env already
+        # receives the full pgt.
+        rebalancer = None
+        if self.pgt_rebalance is not None and request.submission_granularity != "B":
+            active = [
+                i
+                for i, (groups, config) in enumerate(zip(agent_groups, self.agent_configs))
+                if groups > 0 and not config.evaluation_only
+            ]
+            if len(active) >= 2:
+                # G submission + B consumption releases slots only when a
+                # full local batch is consumed; below agent_groups[i] slots
+                # that batch can never complete, so it is the hard floor.
+                needs_batch_floor = (
+                    request.submission_granularity == "G"
+                    and request.consumption_granularity == "B"
+                )
+                min_pgts = [agent_groups[i] if needs_batch_floor else 1 for i in active]
+                total_active_pgt = sum(agent_pgts[i] for i in active)
+                for pos, i in enumerate(active):
+                    # Ceiling for this env's future growth: the total minus
+                    # what the other envs can never go below. Sizes the
+                    # fixed infer-worker pool in _RolloutPipeline.
+                    self.agents[i].max_parallel_generation_tasks = (
+                        total_active_pgt - sum(min_pgts) + min_pgts[pos]
+                    )
+                    self.agents[i].engine_dwell_ema_alpha = self.pgt_rebalance.ema_alpha
+                rebalancer = _PgtRebalancer(
+                    self.pgt_rebalance,
+                    agent_indices=active,
+                    weights=[self.weights[i] for i in active],
+                    current_pgts=[agent_pgts[i] for i in active],
+                    min_pgts=min_pgts,
+                )
 
         # Snapshot the distribution for observability. Read back by rl_utils
         # during per-iteration metric logging.
@@ -257,35 +439,66 @@ class WeightedMultiTask(
             else:
                 generators.append(None)
 
-        while any(generators):
-            balanced_rollouts = asyncio.Queue()
+        tasks = []
+        try:
+            while any(generators):
+                if rebalancer is not None and (event := rebalancer.maybe_rebalance(self.agents)):
+                    live_pgts = list(agent_pgts)
+                    duration_emas: list[float | None] = [None] * len(agent_pgts)
+                    for pos, i in enumerate(rebalancer.agent_indices):
+                        live_pgts[i] = rebalancer.current[pos]
+                        duration_emas[i] = rebalancer.latest_emas[pos]
+                    self.latest_distribution["live_pgts"] = live_pgts
+                    self.latest_distribution["duration_ema_s"] = duration_emas
+                    self.latest_distribution["rebalance_count"] = rebalancer.rebalance_count
+                    logger.info(
+                        "PGT rebalance #%d: %s -> %s (engine_dwell_ema=%s)",
+                        rebalancer.rebalance_count,
+                        event["old"],
+                        event["new"],
+                        event["emas"],
+                    )
+                balanced_rollouts = asyncio.Queue()
 
-            async def get_balanced_rollouts_if_remaining(agent_id):
-                generated_rollouts = 0
-                while generated_rollouts < agent_slots[agent_id]:
-                    if generators[agent_id] is None:
-                        return
+                async def get_balanced_rollouts_if_remaining(agent_id):
+                    generated_rollouts = 0
+                    while generated_rollouts < agent_slots[agent_id]:
+                        if generators[agent_id] is None:
+                            return
+                        try:
+                            await balanced_rollouts.put(await anext(generators[agent_id]))
+                            generated_rollouts += 1
+                        except StopAsyncIteration:
+                            await balanced_rollouts.put(None)
+                            generators[agent_id] = None
+                            return
+
+                tasks = [
+                    asyncio.create_task(get_balanced_rollouts_if_remaining(agent_id))
+                    for agent_id in range(len(generators))
+                ]
+
+                try:
+                    while balanced_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
+                        rollout = await balanced_rollouts.get()
+                        if rollout is not None:
+                            yield rollout
+                finally:
+                    for task in tasks:
+                        task.cancel()
+        finally:
+            # When the consumer closes this generator early (streaming), shut
+            # the sub-agent generators down too so their pipelines cancel
+            # instead of leaking running tasks. The last round's puller tasks
+            # must settle first: a generator with a pending anext rejects
+            # aclose with "already running".
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for generator in generators:
+                if generator is not None:
                     try:
-                        await balanced_rollouts.put(await anext(generators[agent_id]))
-                        generated_rollouts += 1
-                    except StopAsyncIteration:
-                        await balanced_rollouts.put(None)
-                        generators[agent_id] = None
-                        return
-
-            tasks = [
-                asyncio.create_task(get_balanced_rollouts_if_remaining(agent_id))
-                for agent_id in range(len(generators))
-            ]
-
-            try:
-                while balanced_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                    rollout = await balanced_rollouts.get()
-                    if rollout is not None:
-                        yield rollout
-            finally:
-                for task in tasks:
-                    task.cancel()
+                        await generator.aclose()
+                    except RuntimeError:
+                        pass
 
     async def get_contrastive_rollouts(self, request: RolloutRequest) -> list[ContrastiveRollout]:
         """Distribute contrastive rollouts across sub-agents according to weights."""

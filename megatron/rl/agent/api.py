@@ -3,6 +3,7 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
+from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
 
 import numpy as np
@@ -19,12 +20,7 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-from ..rollout_granularity import (
-    RELEASE_STATE_BY_SUBMISSION,
-    ConsumptionGranularity,
-    ReleaseState,
-    SubmissionGranularity,
-)
+from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -227,7 +223,19 @@ class _GranularityConfig(NamedTuple):
 
 
 class _SubmissionGate:
-    """Gate capacity is measured in units of the configured submission granularity."""
+    """Gate capacity is measured in units of the configured submission granularity.
+
+    Each granularity has a single release point: R slots free when inference
+    completes, so the gate bounds engine concurrency in rollouts. G and B
+    slots free when the trainer consumes the group/batch, so the gate
+    enforces the --rl-generation-lag run-ahead cap in groups/batches
+    respectively.
+
+    Capacity is resizable at runtime (set_capacity): growing wakes blocked
+    acquirers; shrinking below `held` never revokes in-flight slots — new
+    acquires simply block until enough releases bring `held` under the new
+    capacity.
+    """
 
     def __init__(
         self,
@@ -235,32 +243,69 @@ class _SubmissionGate:
         capacity: int,
         submission: SubmissionGranularity,
     ) -> None:
-        self._sem = asyncio.Semaphore(capacity)
         self._submission = submission
-        self._release_on = RELEASE_STATE_BY_SUBMISSION[submission]
+        self._waiters: deque[asyncio.Future] = deque()
         self.capacity = capacity
         # Observability counters, updated only on the configured submission
-        # granularity (the only path that touches the semaphore). `held`
+        # granularity (the only path that touches the gate). `held`
         # counts slots currently held; `prepare_blocked_seconds` accumulates
-        # time stage_prepare spent waiting on the semaphore.
+        # time stage_prepare spent waiting for a free slot.
         self.held = 0
         self.prepare_blocked_seconds = 0.0
         self.acquire_calls = 0
         self.release_calls = 0
 
     async def acquire_for(self, granularity: SubmissionGranularity) -> None:
-        if self._submission == granularity:
-            start = time.monotonic()
-            await self._sem.acquire()
-            self.prepare_blocked_seconds += time.monotonic() - start
-            self.held += 1
-            self.acquire_calls += 1
+        if self._submission != granularity:
+            return
+        start = time.monotonic()
+        while self.held >= self.capacity:
+            waiter = asyncio.get_running_loop().create_future()
+            self._waiters.append(waiter)
+            try:
+                await waiter
+            except asyncio.CancelledError:
+                # Woken and cancelled in the same tick: pass the wake-up on
+                # so a release is never lost.
+                if waiter.done() and not waiter.cancelled():
+                    self._wake_next()
+                raise
+            finally:
+                if waiter in self._waiters:
+                    self._waiters.remove(waiter)
+        self.prepare_blocked_seconds += time.monotonic() - start
+        self.held += 1
+        self.acquire_calls += 1
 
-    def release_after(self, state: ReleaseState) -> None:
-        if self._release_on == state:
-            self._sem.release()
-            self.held -= 1
-            self.release_calls += 1
+    def release_for(self, granularity: SubmissionGranularity) -> None:
+        if self._submission != granularity:
+            return
+        self.held -= 1
+        self.release_calls += 1
+        self._wake_next()
+
+    def set_capacity(self, capacity: int) -> None:
+        """Resize the gate. Growing wakes all waiters (each re-checks the
+        acquire loop, so overshoot is impossible); shrinking takes effect as
+        in-flight slots drain."""
+        capacity = max(1, int(capacity))
+        grew = capacity > self.capacity
+        self.capacity = capacity
+        if grew:
+            self._wake_all()
+
+    def _wake_next(self) -> None:
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_result(None)
+                return
+
+    def _wake_all(self) -> None:
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_result(None)
 
 
 class _InferWorkItem(NamedTuple):
@@ -296,6 +341,8 @@ class _RolloutPipeline:
         agent: "GroupedRolloutGenerator",
         request: GroupedRolloutRequest,
         parallel_generation_tasks: int,
+        max_parallel_generation_tasks: int | None = None,
+        engine_dwell_ema_alpha: float = 0.2,
     ) -> None:
         self.agent = agent
         self.request = request
@@ -309,7 +356,12 @@ class _RolloutPipeline:
             "G": request.rollouts_per_group,
             "B": self.gran_policy.num_groups_per_batch * request.rollouts_per_group,
         }[self.gran_policy.submission]
-        self.num_infer_workers = parallel_generation_tasks * rollouts_per_submission_unit
+        # Workers are created once in stage_infer, so size the pool for the
+        # largest capacity the gate may grow to (dynamic rebalancing); the
+        # gate remains the sole concurrency limit.
+        self.num_infer_workers = (
+            max_parallel_generation_tasks or parallel_generation_tasks
+        ) * rollouts_per_submission_unit
         if not request.streaming:
             self.num_infer_workers = min(
                 self.num_infer_workers, request.num_groups * request.rollouts_per_group
@@ -335,6 +387,13 @@ class _RolloutPipeline:
         self.engine_dwell: list[float] = []
         self.assemble_queue_dwell: list[float] = []
         self.output_queue_dwell: list[float] = []
+        # EMA of per-rollout engine service time. Unlike the engine_dwell
+        # list above (snapshot/reset by rl_utils during metric logging),
+        # these persist for the pipeline's lifetime; the pgt rebalancer in
+        # WeightedMultiTask reads them.
+        self.engine_dwell_ema: float | None = None
+        self.engine_dwell_sample_count = 0
+        self._engine_dwell_ema_alpha = engine_dwell_ema_alpha
         self.prepared_count = 0
         self.inferred_count = 0
         self.assembled_count = 0
@@ -401,9 +460,17 @@ class _RolloutPipeline:
             self.request, item.params.inference_request
         )
         inferred_at = time.monotonic()
-        self.gate.release_after("inferred")
+        self.gate.release_for("R")
         if item.infer_dequeued_at:
-            self.engine_dwell.append(inferred_at - item.infer_dequeued_at)
+            dwell = inferred_at - item.infer_dequeued_at
+            self.engine_dwell.append(dwell)
+            alpha = self._engine_dwell_ema_alpha
+            self.engine_dwell_ema = (
+                dwell
+                if self.engine_dwell_ema is None
+                else alpha * dwell + (1 - alpha) * self.engine_dwell_ema
+            )
+            self.engine_dwell_sample_count += 1
         self.inferred_count += 1
         await self.assemble_queue.put(
             _InferredItem(item=item, response=response, inferred_at=inferred_at)
@@ -430,13 +497,15 @@ class _RolloutPipeline:
                 rollouts = await asyncio.gather(
                     *[item.item.params.build_rollout(item.response) for item in completed]
                 )
-                self.gate.release_after("assembled")
                 self.assembled_count += 1
                 # NOTE: this filter is currently non-functional dead code:
                 # _GranularityConfig._validate rejects filter_groups_with_same_reward
                 # at pipeline construction, so `keep` is always True. Kept for a
                 # future PR that regenerates dropped groups instead of
-                # under-delivering to the caller.
+                # under-delivering to the caller. That PR must also release the
+                # gate slot on the drop path: G/B slots free on consumption, and
+                # a dropped group never reaches stage_consume, so its slot (and
+                # eventually its batch's) would leak permanently.
                 keep = (
                     not self.request.filter_groups_with_same_reward
                     or np.std([rollout.reward for rollout in rollouts]) > 1e-6
@@ -474,6 +543,7 @@ class _RolloutPipeline:
                     return
                 self._record_output_dwell(group)
                 yield group
+                self.gate.release_for("G")
 
         next_batch_id = 0
         pending = self._consume_pending
@@ -493,13 +563,18 @@ class _RolloutPipeline:
                 next_batch_id += 1
                 for group in batch:
                     yield group
-                self.gate.release_after("consumed")
+                    self.gate.release_for("G")
+                self.gate.release_for("B")
 
 
 class GroupedRolloutGenerator(Agent, ABC):
     """An interface to return grouped Rollout objects to support algorithms like GRPO."""
 
     parallel_generation_tasks: int = 512
+    # Ceiling for runtime gate growth; sized by WeightedMultiTask when
+    # dynamic pgt rebalancing is enabled. None = no rebalancing headroom.
+    max_parallel_generation_tasks: int | None = None
+    engine_dwell_ema_alpha: float = 0.2
 
     def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -529,6 +604,8 @@ class GroupedRolloutGenerator(Agent, ABC):
             agent=self,
             request=request,
             parallel_generation_tasks=self.parallel_generation_tasks,
+            max_parallel_generation_tasks=self.max_parallel_generation_tasks,
+            engine_dwell_ema_alpha=self.engine_dwell_ema_alpha,
         )
         # Expose the live pipeline for observability; rl_utils reads its
         # queue sizes, gate state, and timing accumulators during logging.

@@ -6,15 +6,16 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+import warnings
+from pathlib import Path
 
 import torch
 
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -23,23 +24,24 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
+    ArgumentGroupFactory,
+    core_transformer_config_from_args,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
-
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
-
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -398,8 +400,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -518,6 +521,16 @@ def validate_args(args, defaults={}):
             args.rl_submission_granularity == "B"
             and args.rl_consumption_granularity == "G"
         ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
+        if args.rl_inference_rebalancing:
+            assert args.rl_submission_granularity != "B", (
+                "--rl-inference-rebalancing requires --rl-submission-granularity R or G "
+                "(in B mode every environment already gets the full gate capacity)."
+            )
+            if not args.rl_partial_rollouts:
+                warnings.warn(
+                    "--rl-inference-rebalancing without --rl-partial-rollouts has "
+                    "little effect: rollout generators are rebuilt every iteration."
+                )
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
@@ -719,8 +732,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -2477,6 +2492,21 @@ def _add_rl_args(parser):
                        help="Filter groups with same reward.")
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
+    group.add_argument('--rl-inference-rebalancing', action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Dynamically shift per-environment inference concurrency '
+                            '(parallel generation tasks) toward slower environments in '
+                            'multi-env runs, driven by an EMA of per-rollout generation '
+                            'time. The training data mix is unchanged. Requires a '
+                            'multi-env --langrl-env-config and submission granularity '
+                            'R or G.')
+    group.add_argument('--rl-inference-rebalancing-ema-alpha', type=float, default=0.2,
+                       help='EMA smoothing factor for per-rollout generation time.')
+    group.add_argument('--rl-inference-rebalancing-interval', type=float, default=30.0,
+                       help='Minimum seconds between inference rebalancing updates.')
+    group.add_argument('--rl-inference-rebalancing-max-step', type=float, default=0.25,
+                       help='Maximum per-update change of an environment\'s allocation, '
+                            'as a fraction of its current value.')
     group.add_argument('--rl-default-temperature', type=float, default=1.0,
                        help="Default temperature for model inference.")
     group.add_argument('--rl-default-top-p', type=float, default=0,
@@ -2583,8 +2613,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -3443,7 +3472,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
