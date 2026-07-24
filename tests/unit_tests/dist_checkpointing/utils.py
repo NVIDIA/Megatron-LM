@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
 from typing import Any, Callable, Tuple, Union
@@ -9,6 +9,7 @@ import torch
 from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
     CachedMetadataFileSystemReader,
 )
+from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -28,7 +29,7 @@ NUM_ATTENTION_HEADS = 8
 
 
 def initialize_gpt_model(
-    pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
+    pre_process=True, post_process=True, seed=0, use_glu=True, fp8=False, **config_kwargs
 ):
     # These kwargs are passed through training.get_model for model construction,
     # but are not part of TransformerConfig; strip them before building config.
@@ -45,11 +46,24 @@ def initialize_gpt_model(
         use_cpu_initialization=True,
         bf16=True,
     )
+    if fp8:
+        # FP8 params only materialize with TransformerEngine layers, GPU init, and a
+        # hidden size that satisfies the MXFP8 32-element block-scaling alignment. The
+        # tiny (hidden=16, local-spec) default gives zero fp8 params.
+        default_config_kwargs.update(
+            hidden_size=128,
+            num_attention_heads=8,
+            use_cpu_initialization=False,
+            fp8='e4m3',
+            fp8_recipe='mxfp8',
+            fp8_param=True,
+        )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs, gated_linear_unit=use_glu)
+    spec = get_gpt_layer_with_transformer_engine_spec() if fp8 else get_gpt_layer_local_spec()
     model = GPTModel(
         config=transformer_config,
-        transformer_layer_spec=get_gpt_layer_local_spec(),
+        transformer_layer_spec=spec,
         vocab_size=128,
         max_sequence_length=4,
         pre_process=pre_process,
@@ -58,6 +72,10 @@ def initialize_gpt_model(
 
     with torch.no_grad():
         for p in model.parameters():
+            # Float8Tensor params own quantized storage; skip the plain random_ init
+            # (embeddings / layernorms remain plain tensors and are still randomized).
+            if is_float8tensor(p):
+                continue
             p.random_()
     return model
 
@@ -185,6 +203,9 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
+    ddp_bucket_size=None,
+    grad_reduce_in_fp32=False,
+    fp8=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -205,10 +226,24 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.ddp_bucket_size = ddp_bucket_size
+        # grad_reduce_in_fp32 -> ddp_config grad_dtype=fp32 while params stay bf16, i.e. the
+        # mixed-dtype (bf16, fp32) gradient buffer / optimizer-state bucket.
+        mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
             mock_args.optimizer = optimizer
+        # Only forward ``fp8`` to initialize_fn when enabled, so existing callers
+        # passing an initialize_fn without an ``fp8`` parameter keep working.
+        extra_init_kwargs = {}
+        if fp8:
+            # Make DDP build an fp8 param-gather buffer (MXFP8 reuses the grad buffer
+            # for the param all-gather). ``fp8_param`` on the TransformerConfig (set in
+            # ``initialize_gpt_model``) is what actually quantizes the model weights.
+            mock_args.fp8_param_gather = True
+            mock_args.reuse_grad_buf_for_mxfp8_param_ag = True
+            extra_init_kwargs['fp8'] = True
         model = get_model(
             partial(
                 initialize_fn,
@@ -217,8 +252,16 @@ def setup_model_and_optimizer(
                 pipeline_model_parallel_size=pp,
                 pipeline_dtype=torch.bfloat16,
                 bf16=bf16,
+                **extra_init_kwargs,
             )
         )
+
+    if fp8:
+        # Guard against a silent config regression: if the fp8/TE path stops producing
+        # quantized weights the checkpoint round-trip would no longer exercise the
+        # fp8 -> fp32-master mapping we mean to test.
+        num_fp8_params = sum(1 for m in model for p in m.parameters() if is_float8tensor(p))
+        assert num_fp8_params > 0, "fp8=True but no Float8Tensor params were created"
 
     config = OptimizerConfig(
         bf16=bf16,
@@ -304,6 +347,8 @@ def setup_moe_model_and_optimizer(
     use_glu=False,
     optimizer='adam',
     use_param_layout=False,
+    ddp_bucket_size=None,
+    grad_reduce_in_fp32=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -320,6 +365,17 @@ def setup_moe_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.ddp_bucket_size = ddp_bucket_size
+        # ``resolve_ddp_bucket_size`` (megatron/training/training.py) discards an explicit
+        # bucket_size unless overlap_grad_reduce is on -- otherwise the whole buffer is a
+        # single bucket. Turning overlap on (no backward is run here) lets ddp_bucket_size
+        # split the sibling DistOpt buffer into many small buckets so some DP rank owns a
+        # shard made only of inter-param alignment padding -> the empty-bucket-synth path.
+        if ddp_bucket_size is not None:
+            mock_args.overlap_grad_reduce = True
+        # grad_reduce_in_fp32 -> ddp_config grad_dtype=fp32 while params stay bf16, i.e. the
+        # mixed-dtype (bf16, fp32) gradient buffer / optimizer-state bucket.
+        mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -355,12 +411,25 @@ def setup_moe_model_and_optimizer(
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
+    def _init_states(opt):
+        # In the decoupled compact LayerWise + DistOpt layout the top-level
+        # ChainedOptimizer wraps another ChainedOptimizer (LayerWise, which has no
+        # ``init_state_fn``) alongside a sibling DistOpt; recurse so the Muon
+        # Float16 sub-optimizers still get seeded, and skip optimizers without
+        # ``init_state_fn`` (DistOpt seeds its state elsewhere).
+        if isinstance(opt, ChainedOptimizer):
+            for child in opt.chained_optimizers:
+                _init_states(child)
+            return
+        if not hasattr(opt, 'init_state_fn'):
+            return
+        if not hasattr(opt, 'optimizer'):
+            opt.init_state_fn(opt)
+        else:
+            opt.init_state_fn(opt.optimizer)
+
     if optimizer_type in ('muon', 'dist_muon'):
-        for opt in optimizer.chained_optimizers:
-            if not hasattr(opt, 'optimizer'):
-                opt.init_state_fn(opt)
-            else:
-                opt.init_state_fn(opt.optimizer)
+        _init_states(optimizer)
     else:
         for opt in optimizer.chained_optimizers:
             for group in opt.param_groups:

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from copy import deepcopy
 from functools import partial
@@ -252,6 +252,222 @@ class TestLayerWiseOptimizer:
                 plain_sd_B = load_plain_tensors(ckpt_dir_B)
 
                 check_equal(plain_sd_A, plain_sd_B)
+
+    # grad_reduce_in_fp32=True gives the mixed-dtype (bf16 param, fp32 grad) DistOpt sibling
+    # buffer of the decoupled Muon layout -- the case that fails 'Failed to validate global plan'
+    # in sharded_param_state_dp_reshardable on the real fp8 SFT save.
+    @pytest.mark.parametrize('grad_reduce_in_fp32', [False, True])
+    @pytest.mark.parametrize('bf16', [True])
+    def test_dp_reshardable_decouple_ckpt(self, tmp_path_dist_ckpt, bf16, grad_reduce_in_fp32):
+        """Save/load of the decoupled compact LayerWise (Muon) optimizer in ``dp_reshardable``
+        format, for both the uniform (bf16, bf16) and the mixed-dtype (bf16, fp32) sibling
+        DistOpt buffers. Exercises ``sharded_param_state_dp_reshardable`` on the decouple path,
+        including the empty-bucket and global-plan-coverage handling.
+        """
+        Utils.initialize_model_parallel(1, 1)  # tp=pp=1 -> dp = world_size
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        def _build(seed):
+            return setup_model_and_optimizer(
+                seed=seed,
+                tp=1,
+                pp=1,
+                bf16=bf16,
+                dist_opt=True,
+                initialize_fn=initialize_gpt_model,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+            )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_layer_wise_dp_reshardable', sync=True
+        ) as ckpt_dir:
+            model_A, optimizer_A = _build(2)
+            model_sd = model_A[0].sharded_state_dict()
+            optim_sd = optimizer_A.sharded_state_dict(model_sd, metadata=metadata)
+            save(optim_sd, ckpt_dir)
+
+            model_B, optimizer_B = _build(3)
+            model_sd_B = model_B[0].sharded_state_dict()
+            load_sd = optimizer_B.sharded_state_dict(model_sd_B, is_loading=True, metadata=metadata)
+            state_dict = load(load_sd, ckpt_dir)
+            optimizer_B.load_state_dict(state_dict)
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('ep', [2, 4])
+    def test_dp_reshardable_decouple_moe_ckpt(self, tmp_path_dist_ckpt, ep):
+        """dp_reshardable save/load round-trip of the decoupled compact LayerWise (Muon)
+        optimizer on an MoE model with expert parallelism and mixed-dtype (bf16 param /
+        fp32 grad) sibling DistOpt buffers. Single bucket per buffer (no ``ddp_bucket_size``),
+        so ownership is dense and the round-trip loads cleanly.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=ep,
+        )
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        def _build(seed):
+            return setup_moe_model_and_optimizer(
+                seed=seed,
+                tp=1,
+                pp=1,
+                ep=ep,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=True,
+            )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_layer_wise_dp_reshardable_moe', sync=True
+        ) as ckpt_dir:
+            model_A, optimizer_A = _build(2)
+            model_sd = model_A[0].sharded_state_dict()
+            optim_sd = optimizer_A.sharded_state_dict(model_sd, metadata=metadata)
+            save(optim_sd, ckpt_dir)
+
+            model_B, optimizer_B = _build(3)
+            model_sd_B = model_B[0].sharded_state_dict()
+            load_sd = optimizer_B.sharded_state_dict(model_sd_B, is_loading=True, metadata=metadata)
+            state_dict = load(load_sd, ckpt_dir)
+            optimizer_B.load_state_dict(state_dict)
+        Utils.destroy_model_parallel()
+
+    def test_dp_reshardable_moe_synth_save(self, tmp_path_dist_ckpt):
+        """Regression for the empty-bucket-synth coverage gap in
+        ``DistributedOptimizer.sharded_param_state_dp_reshardable``.
+
+        A small ``ddp_bucket_size`` splits the sibling DistOpt buffer of the decoupled
+        compact LayerWise (Muon) layout into many small buckets. Params are 64-element
+        aligned inside a bucket, so at DP=4 (local shard = 32) some DP rank owns a shard
+        that lies entirely inside inter-param padding while still overlapping
+        ``[0, gbuf_world_numel_unpadded)`` -- the empty-bucket-synth path. Set
+        ``DEBUG_DP_RESHARDABLE=1`` to see the per-bucket ``synth=True`` ``[DPRESH ...]``
+        lines (this config fires it ~34x/rank-bucket).
+
+        With the fix the synthesized padding ShardedTensor is stored back into the returned
+        ``state`` so the per-bucket global tensor is fully covered and torch DCP ``save``
+        validates the global plan. Without the store-back line those shards are dropped and
+        ``save`` raises ``ValueError: Failed to validate global plan`` (chunks_volume <
+        tensor_volume).
+
+        Note: this asserts the *save* half only. Extending it to a load round-trip trips a
+        separate, pre-existing ``dp_reshardable`` multi-bucket load defect (a
+        ``len(bucket_state) == len(param_map)`` mismatch in
+        ``load_parameter_state_from_dp_reshardable``) that also fires for a non-synth
+        multi-bucket config, so it is out of scope for this store-back fix.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+        )
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'moe_synth_save', sync=True) as ckpt_dir:
+            model, optimizer = setup_moe_model_and_optimizer(
+                seed=2,
+                tp=1,
+                pp=1,
+                ep=2,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=True,
+                ddp_bucket_size=32,
+            )
+            model_sd = model[0].sharded_state_dict()
+            optim_sd = optimizer.sharded_state_dict(model_sd, metadata=metadata)
+            # Fails with "Failed to validate global plan" if the synth store-back line
+            # in sharded_param_state_dp_reshardable is removed.
+            save(optim_sd, ckpt_dir)
+        Utils.destroy_model_parallel()
+
+    # NOTE: 'fully_sharded_model_space' is intentionally NOT covered here. It is incompatible with
+    # the decoupled compact LayerWise (Muon) DistOpt layout regardless of precision: the sibling
+    # embedding / output_layer params produce a flattened_range ShardedTensor that
+    # dist_checkpointing rejects ('ShardedTensor.flattened_range is not supported'). This was
+    # confirmed to fail identically for bf16 and fp8 (so it is NOT fp8-specific), and it raises
+    # non-uniformly across DP ranks, so it cannot be asserted cleanly in a distributed test. It is
+    # a pre-existing limitation, independent of the dp_reshardable empty-bucket fix.
+    @pytest.mark.parametrize('fp8', [False, True])
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
+    def test_decouple_ckpt_roundtrip_values(self, tmp_path_dist_ckpt, sharding_type, fp8):
+        """Value-level save/load round-trip of the decoupled compact LayerWise (Muon) optimizer,
+        for the ``dp_reshardable`` and ``fully_reshardable`` sharding formats, for both bf16 and
+        quantized FP8 (MXFP8) model params.
+
+        Correctness (not just "does not crash"): save optimizer A in ``sharding_type``, load it
+        into a differently seeded optimizer B, then assert B's optimizer state equals A's *by
+        value*. If the round-trip is faithful, B's fp32 master / exp_avg / exp_avg_sq must match
+        A's exactly.
+
+        The comparison is done through a padding-free *canonical view*: both A's and (post-load)
+        B's in-memory state are re-serialized with ``fully_reshardable`` (model-centric, no
+        padding, deterministic) and compared bitwise via ``load_plain_tensors`` + ``check_equal``.
+        This is required because ``dp_reshardable``'s own bucket-space checkpoint serializes
+        inter-param / empty-shard padding as uninitialized ``torch.empty`` (values discarded on
+        load), so two saves of identical state differ in the padding bytes and cannot be compared
+        directly. ``fully_reshardable`` has no such padding, so it is a faithful canonical view of
+        the real optimizer state for both formats under test.
+
+        The ``fp8`` axis covers the fp8 -> fp32-master path: FP8 changes model-param storage to a
+        Float8Tensor while optimizer state stays fp32, so the dequantize path
+        (``_is_distopt_quantized_param`` in distrib_optimizer.py) must round-trip. Both bf16 and
+        fp8 are exercised.
+        """
+        from megatron.core.dist_checkpointing import load_plain_tensors
+
+        Utils.initialize_model_parallel(1, 1)  # tp=pp=1 -> dp = world_size
+        metadata = {'distrib_optim_sharding_type': sharding_type}
+        # Padding-free canonical view used to compare optimizer state by value.
+        canonical = {'distrib_optim_sharding_type': 'fully_reshardable'}
+
+        def _build(seed):
+            kwargs = dict(
+                seed=seed,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                initialize_fn=initialize_gpt_model,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=True,
+            )
+            if fp8:
+                kwargs['fp8'] = True
+            return setup_model_and_optimizer(**kwargs)
+
+        tag = f'{"fp8" if fp8 else "bf16"}_{sharding_type}'
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_rt', sync=True) as rt_dir,
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_A', sync=True) as canon_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_B', sync=True) as canon_dir_B,
+        ):
+            # Save A in the format under test, load it into a differently seeded B.
+            model_A, optimizer_A = _build(2)
+            model_sd_A = model_A[0].sharded_state_dict()
+            save(optimizer_A.sharded_state_dict(model_sd_A, metadata=metadata), rt_dir)
+
+            model_B, optimizer_B = _build(3)
+            model_sd_B = model_B[0].sharded_state_dict()
+            load_sd = optimizer_B.sharded_state_dict(model_sd_B, is_loading=True, metadata=metadata)
+            optimizer_B.load_state_dict(load(load_sd, rt_dir))
+
+            # Compare A vs post-load B by value, through the padding-free canonical view.
+            save(optimizer_A.sharded_state_dict(model_sd_A, metadata=canonical), canon_dir_A)
+            save(optimizer_B.sharded_state_dict(model_sd_B, metadata=canonical), canon_dir_B)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(1, 1)
+            check_equal(load_plain_tensors(canon_dir_A), load_plain_tensors(canon_dir_B))
+        Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
