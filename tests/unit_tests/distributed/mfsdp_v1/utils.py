@@ -7,14 +7,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_mixer import HAVE_MAMBA_SSM
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training.arguments import parse_args, validate_args
@@ -55,14 +53,17 @@ def make_gpt_mock_data_iterator(
 
 
 def make_moe_args_model_and_optimizer(ut_filename, **overrides):
-    use_hybrid = HAVE_MAMBA_SSM
     sys.argv = [ut_filename]
     base_args = dict(
+        hybrid_layer_pattern="MEME/ME",
+        spec=["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"],
         num_layers=4,
         mtp_num_layers=1,
         hidden_size=128,
         num_attention_heads=2,
         max_position_embeddings=128,
+        mamba_num_groups=4,
+        mamba_num_heads=16,
         bf16=False,
         add_bias_linear=False,
         swiglu=True,
@@ -84,15 +85,6 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
         finalize_model_grads_func=finalize_model_grads,
     )
 
-    # Preserve generic FSDP coverage when the optional Mamba kernels are unavailable.
-    if use_hybrid:
-        base_args.update(
-            hybrid_layer_pattern="MEME/ME",
-            spec=["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"],
-            mamba_num_groups=4,
-            mamba_num_heads=16,
-        )
-
     base_args.update(overrides)
     args = parse_args()
     for key, value in base_args.items():
@@ -104,13 +96,11 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     destroy_num_microbatches_calculator()
     set_global_variables(args, build_tokenizer=False)
 
-    model_class = "hybrid" if use_hybrid else "gpt"
-    model_builder = hybrid_builder if use_hybrid else gpt_builder
-    cfg_container = Utils.pretrain_config_from_global_args(args, model_class)
+    cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
         model_type=ModelType.encoder_or_decoder,
-        model_provider_func=partial(model_provider, model_builder),
+        model_provider_func=partial(model_provider, hybrid_builder),
         cfg_container=cfg_container,
         pg_collection=pg_collection,
     )

@@ -88,17 +88,13 @@ class DataParallelBuffer:
                 return strategy in ("optim_grads", "optim_grads_params")
             raise ValueError(f"Unsupported data-parallel buffer role: {buffer_role}")
 
+        self.outer_sharded = is_sharded_from_strategy(outer_dp_sharding_strategy)
+        self.inner_sharded = is_sharded_from_strategy(sharding_strategy)
         self.storage_placements: list[Placement] = [
-            (
-                Placement.FLAT
-                if is_sharded_from_strategy(outer_dp_sharding_strategy)
-                else Placement.REPLICATE
-            ),
-            Placement.FLAT if is_sharded_from_strategy(sharding_strategy) else Placement.REPLICATE,
+            Placement.FLAT if sharded else Placement.REPLICATE
+            for sharded in (self.outer_sharded, self.inner_sharded)
         ]
         self.placements: list[Placement] = self.storage_placements.copy()
-        self.outer_sharded = self.storage_placements[0] is Placement.FLAT
-        self.inner_sharded = self.storage_placements[1] is Placement.FLAT
         self.sharding_strategy = sharding_strategy
         self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.gradient_scaling_factor = gradient_scaling_factor
