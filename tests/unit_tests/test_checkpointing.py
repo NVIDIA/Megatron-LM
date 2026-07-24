@@ -88,6 +88,31 @@ class MockOptParamScheduler(MockState):
         self.step_calls.append(increment)
 
 
+class MockOptimizer(MockState):
+    def state_dict(self, is_loading=False):
+        state_dict = super().state_dict(is_loading=is_loading).copy()
+        state_dict["param_groups"] = [param_group.copy() for param_group in self.param_groups]
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.param_groups = [param_group.copy() for param_group in state_dict["param_groups"]]
+
+
+class MockOptParamScheduler(MockState):
+    def __init__(self, state_dict):
+        super().__init__(state_dict)
+        self.num_steps = state_dict.get("num_steps", 0)
+        self.step_calls = []
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.num_steps = state_dict.get("num_steps", self.num_steps)
+
+    def step(self, increment=1):
+        self.step_calls.append(increment)
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
@@ -130,6 +155,7 @@ def create_args():
     args.auto_detect_ckpt_format = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
+    args.override_opt_param_scheduler = False
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
