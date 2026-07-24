@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+from string import Template
 from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
@@ -574,6 +575,47 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
+def _expand_env_config_vars(config, config_path):
+    """Expand `$VAR` / `${VAR}` references in a loaded environment config.
+
+    Dataset paths cannot use the relative-path convention that
+    `nemo_gym_config_path` uses: only `Gym/` is copied into a run's code
+    snapshot while `data/` stays in the source tree, so `dataset_file` has to
+    be absolute. Baking one cluster's absolute paths into a config that is
+    shared across clusters via git makes it silently unusable everywhere else
+    — the run dies at iteration 0 with a FileNotFoundError naming a filesystem
+    that does not exist on the cluster it is running on. That cost three users
+    a day of debugging on 2026-07-24, because the failure surfaced only as a
+    bare exit(1) per rank.
+
+    `${MRL_DATA_ROOT}` defaults to the tree containing the config, so a config
+    written against it resolves correctly on any cluster with no launcher
+    changes, and can still be overridden explicitly. Values without a `$` are
+    returned untouched, so existing absolute-path configs keep working.
+    """
+    env = dict(os.environ)
+    env.setdefault('MRL_DATA_ROOT', str(Path(config_path).resolve().parent.parent))
+
+    def _expand(value):
+        if isinstance(value, dict):
+            return {k: _expand(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_expand(v) for v in value]
+        if not isinstance(value, str) or '$' not in value:
+            return value
+        expanded = Template(value).safe_substitute(env)
+        if '$' in expanded:
+            raise ValueError(
+                f"Unresolved variable in environment config {config_path}: "
+                f"{value!r} expanded to {expanded!r}. Set the referenced "
+                f"environment variable (MRL_DATA_ROOT defaults to the tree "
+                f"containing the config)."
+            )
+        return expanded
+
+    return _expand(config)
+
+
 def get_agent(args, parallel_generation_tasks: int | None = None):
     """Get an agent based on environment configuration.
 
@@ -582,6 +624,8 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
     """
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
+
+    config = _expand_env_config_vars(config, args.langrl_env_config)
 
     return WeightedMultiTask.from_config(
         config,
