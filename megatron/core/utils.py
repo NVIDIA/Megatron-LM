@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
 
@@ -512,10 +512,7 @@ def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
     try:
         from flash_mla import flash_mla_sparse_fwd  # noqa: F401
     except ImportError:
-        missing.append(
-            "flash_mla "
-            "(https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
-        )
+        missing.append("flash_mla " "(https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)")
     try:
         from cudnn import DSA  # noqa: F401
     except ImportError:

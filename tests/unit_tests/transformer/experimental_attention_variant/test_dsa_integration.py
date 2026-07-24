@@ -17,9 +17,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     absorbed_mla as absorbed_mla_module,
 )
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
-from megatron.core.transformer.experimental_attention_variant import (
-    dsa_kernels,
-)
+from megatron.core.transformer.experimental_attention_variant import dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -30,9 +28,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     source_dsa_compute_layer,
 )
 from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
-from megatron.training.arguments import (
-    _add_experimental_attention_variant_args,
-)
+from megatron.training.arguments import _add_experimental_attention_variant_args
 
 
 def _index_share_config():
@@ -125,6 +121,20 @@ def test_index_share_skip_layer_uses_request_scoped_holders(monkeypatch):
     assert length_holder is getattr(packed_seq_params, DSAttention._LENGTH_HOLDER_ATTR)
     assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
     assert not hasattr(config, DSAttention._HOLDER_ATTR)
+
+
+def test_backward_dw_flushes_only_an_owned_indexer():
+    flushes = []
+    attention = SimpleNamespace(
+        indexer=SimpleNamespace(backward_dw=lambda: flushes.append("indexer"))
+    )
+
+    DSAttention.backward_dw(attention)
+    assert flushes == ["indexer"]
+
+    attention.indexer = None
+    DSAttention.backward_dw(attention)
+    assert flushes == ["indexer"]
 
 
 def test_indexer_loss_autograd_surface_is_owned_by_dsa():

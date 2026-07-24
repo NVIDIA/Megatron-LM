@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import logging
@@ -21,13 +21,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import transformer_config as transformer_config_module
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.spec_utils import build_module
-from megatron.core.transformer import transformer_config as transformer_config_module
-from megatron.core.transformer.transformer_config import (
-    MLATransformerConfig,
-    TransformerConfig,
-)
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
@@ -928,10 +925,7 @@ def test_deprecated_kernel_fusion_is_normalized_after_legacy_attention_type(capl
 
     with pytest.warns(UserWarning, match="linear_attention_type is deprecated"):
         config = _make_config(
-            "flash",
-            1,
-            legacy_kernel_fusion=False,
-            use_legacy_attention_type=True,
+            "flash", 1, legacy_kernel_fusion=False, use_legacy_attention_type=True
         )
 
     assert config.experimental_attention_variant == "dsv4_hybrid"
@@ -960,18 +954,12 @@ def test_deprecated_dsv4_kernel_fusion_true_maps_to_cudnn(monkeypatch, caplog):
 
 
 @pytest.mark.parametrize(
-    ("legacy_kernel_fusion", "kernel_backend"),
-    [(False, "cudnn"), (True, "tilelang")],
+    ("legacy_kernel_fusion", "kernel_backend"), [(False, "cudnn"), (True, "tilelang")]
 )
-def test_deprecated_dsv4_kernel_fusion_rejects_conflicts(
-    legacy_kernel_fusion, kernel_backend
-):
+def test_deprecated_dsv4_kernel_fusion_rejects_conflicts(legacy_kernel_fusion, kernel_backend):
     with pytest.raises(ValueError, match="Conflicting DSA kernel controls"):
         _make_config(
-            "flash",
-            1,
-            legacy_kernel_fusion=legacy_kernel_fusion,
-            kernel_backend=kernel_backend,
+            "flash", 1, legacy_kernel_fusion=legacy_kernel_fusion, kernel_backend=kernel_backend
         )
 
 
@@ -979,10 +967,7 @@ def test_deprecated_kernel_fusion_is_ignored_outside_dsv4(caplog):
     caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
 
     config = TransformerConfig(
-        num_layers=1,
-        hidden_size=8,
-        num_attention_heads=1,
-        apply_dsa_kernel_fusion=True,
+        num_layers=1, hidden_size=8, num_attention_heads=1, apply_dsa_kernel_fusion=True
     )
 
     assert config.dsa_kernel_backend == "none"
@@ -1059,12 +1044,8 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=calculate_per_token_loss,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1172,12 +1153,8 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1295,12 +1272,8 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1432,12 +1405,8 @@ class TestDSv4HybridNativeParity:
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 

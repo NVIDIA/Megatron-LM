@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (

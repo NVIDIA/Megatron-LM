@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MCore-facing utilities for the DSv4 THD context-parallel path.
 
 This module owns CP row mapping, boundary exchange, compressor-input layout,

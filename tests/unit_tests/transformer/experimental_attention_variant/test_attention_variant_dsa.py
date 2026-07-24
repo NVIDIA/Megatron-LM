@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from types import SimpleNamespace
@@ -690,9 +690,7 @@ def test_missing_cudnn_dependency_includes_flash_mla_install_url():
     with patch.dict("sys.modules", {"flash_mla": None, "cudnn": fake_cudnn}):
         missing = core_utils._missing_cudnn_dsa_kernel_dependencies()
 
-    assert missing == [
-        "flash_mla (https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
-    ]
+    assert missing == ["flash_mla (https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"]
 
 
 class TestDSACPPositionHelpers:
