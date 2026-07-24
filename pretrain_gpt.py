@@ -142,9 +142,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
+    needs_padding_mask = args.use_varlen_dataset and args.varlen_sbhd_validation
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
+        and not needs_padding_mask
         and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
     ):
         return None, None, None, None, None, None, None
@@ -197,7 +199,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
     # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    padding_mask = None
+    # SBHD validation samples carry physical right-padding metadata. CP has
+    # already partitioned it with the other sequence-dimension tensors.
+    padding_mask = batch.get('padding_mask')
     if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
         tokens = batch.get('tokens', None)
         labels = batch.get('labels', None)
@@ -397,7 +401,12 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or (
+        getattr(args, 'use_varlen_dataset', False)
+        and getattr(args, 'varlen_sbhd_validation', False)
+    ):
+        # Packed THD and SBHD validation both need padding metadata on every
+        # pipeline stage so each MoE layer excludes physical padding.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
         config, ignore_virtual=False, vp_stage=vp_stage

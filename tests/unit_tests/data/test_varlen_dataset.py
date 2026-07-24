@@ -569,12 +569,87 @@ def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
     ds = _make_varlen(["abc"], _make_config(tok, seq_length=8, sbhd=True))
     out = ds[0]
     # SBHD emits fixed [seq_length] samples with no packing metadata.
-    assert set(out) == {"tokens", "labels", "loss_mask", "position_ids"}
+    assert set(out) == {"tokens", "labels", "loss_mask", "padding_mask", "position_ids"}
     assert out["tokens"].numel() == 8
     loss_mask = out["loss_mask"].tolist()
+    padding_mask = out["padding_mask"].tolist()
     # tokens=[a,b,c,eod]: valid_len=3 -> first 3 kept (incl. real eod), rest masked.
     assert loss_mask[0:3] == [1.0, 1.0, 1.0]
     assert all(v == 0.0 for v in loss_mask[3:])
+    assert padding_mask[0:3] == [False, False, False]
+    assert all(padding_mask[3:])
+    assert out["padding_mask"].dtype == torch.bool
+
+
+def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
+    """CP zigzag slicing must select identical token and padding-mask positions."""
+    from megatron.core.utils import get_pretrain_batch_on_this_cp_rank
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 1)
+
+    tokens = torch.arange(16, dtype=torch.int64).view(1, 16)
+    padding_mask = tokens >= 10
+    batch = {"tokens": tokens.clone(), "padding_mask": padding_mask.clone()}
+    result = get_pretrain_batch_on_this_cp_rank(batch, cp_group=object())
+
+    expected_indices = torch.tensor([2, 3, 12, 13])
+    assert torch.equal(result["tokens"], tokens.index_select(1, expected_indices))
+    assert torch.equal(result["padding_mask"], padding_mask.index_select(1, expected_indices))
+
+
+def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
+    """The dataset padding mask must survive the pretrain_gpt batch handoff."""
+    import pretrain_gpt
+
+    padding_mask = torch.tensor([[False, False, True, True]], dtype=torch.bool)
+    source_batch = {
+        "tokens": torch.tensor([[1, 2, 0, 0]], dtype=torch.int64),
+        "labels": torch.tensor([[2, 0, 0, 0]], dtype=torch.int64),
+        "loss_mask": torch.tensor([[1.0, 1.0, 0.0, 0.0]]),
+        "padding_mask": padding_mask,
+        "attention_mask": None,
+        "position_ids": torch.arange(4, dtype=torch.int64).view(1, 4),
+    }
+    args = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        sft=False,
+        use_varlen_dataset=True,
+        varlen_sbhd_validation=True,
+        dynamic_context_parallel=False,
+    )
+    config = SimpleNamespace(
+        virtual_pipeline_model_parallel_size=None, pad_packed_seq_alignment=None
+    )
+
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
+    # Exercise an intermediate PP stage: it must not take the legacy early return.
+    monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        pretrain_gpt, "get_batch_on_this_tp_rank", lambda *args, **kwargs: source_batch.copy()
+    )
+    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch: batch)
+
+    *_, returned_padding_mask = pretrain_gpt.get_batch(iter(()))
+    assert torch.equal(returned_padding_mask, padding_mask)
+
+
+def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
+    """Every PP stage needs SBHD padding metadata for its local MoE layers."""
+    import pretrain_gpt
+
+    args = SimpleNamespace(use_varlen_dataset=True, varlen_sbhd_validation=True)
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(
+        pretrain_gpt, "core_transformer_config_from_args", lambda _: SimpleNamespace()
+    )
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *args, **kwargs: False)
+
+    assert pretrain_gpt.is_dataset_built_on_rank() is True
 
 
 def test_mock_getitem_thd_keys_and_pad_fallback():
@@ -724,6 +799,8 @@ def test_sbhd_validation_dataloader_uses_default_collate():
         assert batch["tokens"].shape == (mbs, seq_len)
         assert batch["labels"].shape == (mbs, seq_len)
         assert batch["loss_mask"].shape == (mbs, seq_len)
+        assert batch["padding_mask"].shape == (mbs, seq_len)
+        assert batch["padding_mask"].dtype == torch.bool
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()
