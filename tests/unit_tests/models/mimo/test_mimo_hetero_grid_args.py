@@ -9,8 +9,10 @@ import argparse
 import pytest
 
 from examples.mimo.training.args import (
+    MIMO_LAYOUT_COLOCATED,
     add_hetero_grid_args,
     build_module_grid_specs,
+    validate_colocated_runtime_args,
     validate_hetero_grid_args,
 )
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
@@ -33,10 +35,35 @@ def _layout_8gpu_20l(**overrides):
     ).split()
     args = _parse(argv)
     # Stock args the validator reads but the grid parser does not own.
-    args.micro_batch_size = 1
-    args.num_experts = 128
+    vars(args).update(
+        micro_batch_size=1,
+        num_experts=128,
+        recompute_granularity=None,
+        async_save=False,
+        rerun_mode="disabled",
+        te_rng_tracker=False,
+        log_params_norm=False,
+        log_num_zeros_in_grad=False,
+        fp16=False,
+        use_megatron_fsdp=False,
+        use_torch_fsdp2=False,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        overlap_param_gather_with_optimizer_step=False,
+        moe_use_upcycling=False,
+        init_model_with_meta_device=False,
+        cuda_graph_impl="none",
+        save=None,
+        load=None,
+        pretrained_checkpoint=None,
+        data_parallel_random_init=False,
+        ckpt_format="torch_dist",
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
+    )
     for key, value in overrides.items():
         setattr(args, key, value)
+    args.eval_micro_batch_size = args.micro_batch_size
     return args
 
 
@@ -117,3 +144,59 @@ def test_llm_only_covers_world():
     specs = build_module_grid_specs(args, 4, encoder_module_name="radio_encoder")
     assert len(specs) == 1
     assert specs[0].name == MIMO_LANGUAGE_MODULE_KEY
+
+
+def test_layout_defaults_to_non_colocated():
+    assert _parse([]).mimo_layout == "non-colocated"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(encoder_tp=2, encoder_dp=4, llm_tp=4, llm_dp=2, micro_batch_size=2),
+        dict(encoder_tp=4, encoder_dp=2, llm_tp=2, llm_dp=4, micro_batch_size=1),
+    ],
+)
+def test_colocated_layout_maps_both_grids_to_the_world(overrides):
+    args = _layout_8gpu_20l(mimo_layout=MIMO_LAYOUT_COLOCATED, llm_offset=0, **overrides)
+    specs = build_module_grid_specs(args, WORLD_SIZE_8, "radio_encoder")
+    assert [(spec.rank_offset, spec.num_ranks) for spec in specs] == [(0, 8), (0, 8)]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "recompute_granularity",
+        "async_save",
+        "te_rng_tracker",
+        "log_params_norm",
+        "log_num_zeros_in_grad",
+        "fp16",
+        "overlap_grad_reduce",
+    ],
+)
+def test_colocated_runtime_rejects_unsupported_modes(field):
+    args = _layout_8gpu_20l(mimo_layout=MIMO_LAYOUT_COLOCATED, llm_offset=0)
+    setattr(args, field, "full" if field == "recompute_granularity" else True)
+    with pytest.raises(ValueError, match="does not support"):
+        validate_colocated_runtime_args(args)
+
+
+def test_colocated_checkpoint_requires_supported_rng_and_format():
+    args = _layout_8gpu_20l(mimo_layout=MIMO_LAYOUT_COLOCATED, llm_offset=0)
+    args.save = "/tmp/checkpoint"
+    args.ckpt_format = "torch_dist"
+    args.data_parallel_random_init = False
+    with pytest.raises(ValueError, match="data-parallel-random-init"):
+        validate_colocated_runtime_args(args)
+
+    args.data_parallel_random_init = True
+    validate_colocated_runtime_args(args)
+
+
+def test_colocated_runtime_rerun_error_gives_disable_flag():
+    args = _layout_8gpu_20l(
+        mimo_layout=MIMO_LAYOUT_COLOCATED, llm_offset=0, rerun_mode="validate_results"
+    )
+    with pytest.raises(ValueError, match="--rerun-mode disabled"):
+        validate_colocated_runtime_args(args)

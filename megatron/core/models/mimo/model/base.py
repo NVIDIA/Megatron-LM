@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import logging
 import warnings
 from typing import Any, Dict, Optional, Tuple
@@ -12,6 +13,7 @@ from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.random import cuda_rng_namespace, fork_process_rng_state
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
@@ -38,9 +40,18 @@ class MimoModel(MegatronModule):
     Args:
         mimo_config (MimoModelConfig):
             Configuration for the model, including language model and modality submodules
+        rng_namespaces: CUDA RNG tracker namespace for each colocated module.
+        rng_construction_seeds: Process RNG seed used to construct each colocated module.
     """
 
-    def __init__(self, mimo_config: MimoModelConfig, cp_group=None, tp_group=None) -> None:
+    def __init__(
+        self,
+        mimo_config: MimoModelConfig,
+        cp_group=None,
+        tp_group=None,
+        rng_namespaces: Optional[Dict[str, str]] = None,
+        rng_construction_seeds: Optional[Dict[str, int]] = None,
+    ) -> None:
         """Initialize the multimodal model.
 
         Example:
@@ -60,6 +71,8 @@ class MimoModel(MegatronModule):
         )
 
         self.mimo_config = mimo_config
+        self._rng_namespaces = rng_namespaces or {}
+        self._rng_construction_seeds = rng_construction_seeds or {}
         modality_names = list(mimo_config.modality_submodules_spec.keys())
         self.colocated_comms = {}
         self.role = RankRole.build(modality_names, mimo_config.module_to_grid_map)
@@ -96,6 +109,22 @@ class MimoModel(MegatronModule):
         self.modality_submodules = torch.nn.ModuleDict()
         self._initialize_submodules()
         self._initialize_language_model()
+
+    def _rng_scope(self, module_name: str):
+        namespace = self._rng_namespaces.get(module_name)
+        if namespace is None:
+            return contextlib.nullcontext()
+        return cuda_rng_namespace(namespace, fork_data_parallel_rng=True)
+
+    @contextlib.contextmanager
+    def _construction_rng_scope(self, module_name: str):
+        seed = self._rng_construction_seeds.get(module_name)
+        with self._rng_scope(module_name):
+            if seed is None:
+                yield
+            else:
+                with fork_process_rng_state(seed):
+                    yield
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
@@ -230,9 +259,10 @@ class MimoModel(MegatronModule):
             )
 
             # Pass stage info to from_spec so projections are only built when needed
-            submodule = submodule_class.from_spec(
-                submodule_spec, is_first_stage=is_first_stage, is_last_stage=is_last_stage
-            )
+            with self._construction_rng_scope(modality_name):
+                submodule = submodule_class.from_spec(
+                    submodule_spec, is_first_stage=is_first_stage, is_last_stage=is_last_stage
+                )
 
             self.modality_submodules[modality_name] = submodule
 
@@ -249,7 +279,8 @@ class MimoModel(MegatronModule):
         logger.debug(
             f"Building language model using {self.mimo_config.language_model_spec.module.__name__}"
         )
-        self.language_model = build_module(self.mimo_config.language_model_spec)
+        with self._construction_rng_scope(MIMO_LANGUAGE_MODULE_KEY):
+            self.language_model = build_module(self.mimo_config.language_model_spec)
 
     def set_input_tensor(self, input_tensor):
         """Set input tensor for pipeline parallelism.
@@ -760,7 +791,8 @@ class MimoModel(MegatronModule):
                 and modality_inputs[modality_name] is not None
             ):
                 logger.debug(f"Processing {modality_name} modality")
-                embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
+                with self._rng_scope(modality_name):
+                    embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
                     modality_embeddings[modality_name] = embeddings
                     logger.debug(
@@ -772,7 +804,10 @@ class MimoModel(MegatronModule):
             modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
         # Get text embeddings
-        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+        with self._rng_scope(MIMO_LANGUAGE_MODULE_KEY):
+            text_embeddings = self.get_text_embeddings(
+                input_ids, position_ids, self.special_token_ids
+            )
         logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
 
         modality_embeddings["text"] = text_embeddings
@@ -796,17 +831,18 @@ class MimoModel(MegatronModule):
         )
 
         # 5. Forward pass through language model
-        lm_output = self.language_model(
-            # decoder_input replaces the embedding lookup, so input_ids is
-            # unused here; position_ids is still consumed by mRoPE in models
-            # such as Qwen3-VL.
-            input_ids=None,
-            position_ids=position_ids,
-            decoder_input=combined_embeddings,
-            labels=labels,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-        )
+        with self._rng_scope(MIMO_LANGUAGE_MODULE_KEY):
+            lm_output = self.language_model(
+                # decoder_input replaces the embedding lookup, so input_ids is
+                # unused here; position_ids is still consumed by mRoPE in models
+                # such as Qwen3-VL.
+                input_ids=None,
+                position_ids=position_ids,
+                decoder_input=combined_embeddings,
+                labels=labels,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+            )
 
         logger.debug(f"Language model output shape: {lm_output.shape}")
 

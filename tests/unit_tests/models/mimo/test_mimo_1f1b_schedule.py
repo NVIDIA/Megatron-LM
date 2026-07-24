@@ -111,7 +111,7 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
         ["tp", "cp", "dp", "pp"],
     ):
         grid.create_pg(dims)
-    for dims in (["ep"], ["expt_dp"], ["expt_tp", "ep", "pp"]):
+    for dims in (["ep"], ["expt_tp"], ["expt_dp"], ["expt_tp", "ep", "pp"]):
         grid.create_pg(dims, view="expert")
     _active_grids.append(grid)
     return grid

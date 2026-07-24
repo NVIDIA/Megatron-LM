@@ -8,6 +8,8 @@ from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
+    cuda_rng_namespace,
+    fork_process_rng_state,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -184,6 +186,82 @@ def test_model_parallel_cuda_manual_seed():
     rng_tracker = get_cuda_rng_tracker()
     assert rng_tracker.get_states()['model-parallel-rng'] is not None
     Utils.destroy_model_parallel()
+
+
+def test_namespaced_seed_extends_singleton_without_changing_ambient_cuda():
+    model_parallel_cuda_manual_seed(11, force_reset_rng=True, tp_rank=0, ep_rank=0, etp_rank=0)
+    tracker = get_cuda_rng_tracker()
+    base_states = {name: state.clone() for name, state in tracker.get_states().items()}
+    ambient = torch.cuda.get_rng_state().clone()
+
+    model_parallel_cuda_manual_seed(101, tp_rank=1, ep_rank=2, etp_rank=0, rng_namespace="vision")
+
+    assert set(tracker.get_states()) == set(base_states) | {
+        "vision::data-parallel-rng",
+        "vision::model-parallel-rng",
+        "vision::expert-parallel-rng",
+    }
+    assert all(
+        torch.equal(tracker.get_states()[name], state) for name, state in base_states.items()
+    )
+    assert torch.equal(torch.cuda.get_rng_state(), ambient)
+
+
+def test_duplicate_seed_is_scoped_to_rng_namespace():
+    tracker = CudaRNGStatesTracker()
+    tracker.add("encoder::state", 123)
+    tracker.add("language::state", 123)
+    with pytest.raises(Exception, match="seed 123 already exists"):
+        tracker.add("encoder::other", 123)
+
+
+@pytest.mark.parametrize(
+    "tracker",
+    [
+        object(),
+        CudaRNGStatesTracker(is_inference_rng_tracker=True),
+        CudaRNGStatesTracker(use_cudagraphable_rng=True),
+    ],
+)
+def test_cuda_rng_namespace_rejects_unsupported_tracker(monkeypatch, tracker):
+    from megatron.core.tensor_parallel import random
+
+    monkeypatch.setattr(random, "_CUDA_RNG_STATE_TRACKER", tracker)
+    monkeypatch.setattr(random, "_CUDA_RNG_STATE_TRACKER_INITIALIZED", True)
+    with pytest.raises(RuntimeError, match="require Megatron CudaRNGStatesTracker"):
+        with cuda_rng_namespace("encoder"):
+            pass
+
+
+def test_namespaced_default_and_data_parallel_streams_are_independent():
+    model_parallel_cuda_manual_seed(13, force_reset_rng=True, tp_rank=0, ep_rank=0, etp_rank=0)
+    model_parallel_cuda_manual_seed(113, tp_rank=0, ep_rank=0, etp_rank=0, rng_namespace="encoder")
+    model_parallel_cuda_manual_seed(213, tp_rank=0, ep_rank=0, etp_rank=0, rng_namespace="language")
+    tracker = get_cuda_rng_tracker()
+
+    with cuda_rng_namespace("encoder"):
+        with tracker.fork():
+            encoder_model = torch.rand(4, device="cuda")
+    with cuda_rng_namespace("language"):
+        with tracker.fork():
+            language_model = torch.rand(4, device="cuda")
+    with cuda_rng_namespace("encoder", fork_data_parallel_rng=True):
+        encoder_data = torch.rand(4, device="cuda")
+
+    assert not torch.equal(encoder_model, language_model)
+    assert not torch.equal(encoder_model, encoder_data)
+
+
+def test_fork_process_rng_state_is_repeatable_and_preserves_cuda():
+    cpu_state = torch.get_rng_state().clone()
+    cuda_state = torch.cuda.get_rng_state().clone()
+    with fork_process_rng_state(123):
+        first = torch.rand(4)
+    with fork_process_rng_state(123):
+        second = torch.rand(4)
+    assert torch.equal(first, second)
+    assert torch.equal(torch.get_rng_state(), cpu_state)
+    assert torch.equal(torch.cuda.get_rng_state(), cuda_state)
 
 
 def test_checkpoint():

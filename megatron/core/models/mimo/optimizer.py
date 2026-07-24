@@ -348,6 +348,7 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
     pg.tp = grid.get_pg("tp")
+    pg.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
     pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)

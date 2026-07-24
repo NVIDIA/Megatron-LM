@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, contextmanager
 
 import torch
 
@@ -13,7 +14,9 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
+from megatron.core.utils import get_pg_rank
 from megatron.training.initialize import _set_random_seed
 from megatron.training.models.dist_utils import (
     prepare_existing_model_chunks_for_distributed_training,
@@ -53,6 +56,27 @@ def configure_module_rng(
         ep_group=pg_collection.ep,
         etp_group=pg_collection.expt_tp,
     )
+
+
+def configure_namespaced_module_rng(
+    args: argparse.Namespace,
+    pg_collection: ProcessGroupCollection,
+    role_seed_offset: int,
+    namespace: str,
+    data_parallel_random_init: bool = False,
+) -> int:
+    """Add one module's states to the global RNG tracker."""
+    seed = args.seed + role_seed_offset + 100 * get_pg_rank(pg_collection.pp)
+    if data_parallel_random_init:
+        seed += 10 * get_pg_rank(pg_collection.dp)
+    model_parallel_cuda_manual_seed(
+        seed,
+        tp_rank=get_pg_rank(pg_collection.tp),
+        ep_rank=get_pg_rank(pg_collection.ep),
+        etp_rank=get_pg_rank(pg_collection.expt_tp),
+        rng_namespace=namespace,
+    )
+    return seed
 
 
 def _freeze_modality_submodule(submodule: torch.nn.Module, args: argparse.Namespace) -> None:
@@ -128,3 +152,18 @@ def wrap_active_modules_with_ddp(
                 mixed_precision_wrapper=_EncoderFloat16Module,
             )[0]
         )
+
+
+def configure_composite_no_sync(mimo_model: MimoModel) -> None:
+    """Make gradient accumulation span every inner DDP module."""
+
+    @contextmanager
+    def no_sync():
+        with ExitStack() as stack:
+            if mimo_model.language_model is not None:
+                stack.enter_context(mimo_model.language_model.no_sync())
+            for submodule in mimo_model.modality_submodules.values():
+                stack.enter_context(submodule.no_sync())
+            yield
+
+    mimo_model.config.no_sync_func = no_sync

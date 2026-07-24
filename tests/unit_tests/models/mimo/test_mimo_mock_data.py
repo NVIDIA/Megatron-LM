@@ -16,8 +16,12 @@ def _group(rank=0, size=1):
     return SimpleNamespace(rank=lambda: rank, size=lambda: size)
 
 
-def _grid(contains_rank):
-    return SimpleNamespace(is_current_rank_in_grid=lambda: contains_rank)
+def _grid(contains_rank, dp_rank=0, dp_size=1):
+    tp_groups = [[rank + 1] for rank in range(dp_size)]
+    tp_groups[dp_rank] = [0]
+    return SimpleNamespace(
+        is_current_rank_in_grid=lambda: contains_rank, get_rank_enum=lambda dims: tp_groups
+    )
 
 
 def _args():
@@ -53,11 +57,29 @@ def _topology(*, language_rank, encoder_rank=None):
     return SimpleNamespace(grids=grids, module_pgs=pgs)
 
 
+def _colocated_topology(*, encoder_dp, language_dp, encoder_rank=0, language_rank=0):
+    encoder = RADIO_ENCODER_MODULE_NAME
+    return SimpleNamespace(
+        is_colocated=True,
+        grids={
+            encoder: _grid(True, encoder_rank, encoder_dp),
+            "language": _grid(True, language_rank, language_dp),
+        },
+        module_pgs={
+            encoder: SimpleNamespace(pp=_group(), dp=_group(rank=encoder_rank, size=encoder_dp)),
+            "language": SimpleNamespace(
+                pp=_group(), dp=_group(rank=language_rank, size=language_dp)
+            ),
+        },
+    )
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     from examples.mimo.training import data
 
     monkeypatch.setattr(data, "get_pg_rank", lambda pg: pg.rank())
+    monkeypatch.setattr(data.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(data, "is_pp_first_stage", lambda pg: pg.rank() == 0)
     monkeypatch.setattr(data, "is_pp_last_stage", lambda pg: pg.rank() == pg.size() - 1)
     return data
@@ -121,3 +143,82 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         RADIO_ENCODER_MODULE_NAME
     ]
     assert encoder_inputs["x"].shape == (4, 3, 4, 4)
+
+
+def test_colocated_fan_out_slices_only_language_view(adapter, monkeypatch):
+    args = _args()
+    args.micro_batch_size = 1
+    args.encoder_dp = 2
+    args.llm_dp = 4
+    monkeypatch.setattr(adapter, "get_pg_rank", lambda pg: 0)
+    loader = adapter.build_train_valid_test_data_loaders(
+        args, _colocated_topology(encoder_dp=2, language_dp=4, language_rank=1)
+    )[0]
+    batch = next(iter(loader))
+    inputs = batch["modality_inputs"][RADIO_ENCODER_MODULE_NAME][RADIO_ENCODER_MODULE_NAME]
+    assert loader.batch_size == 2
+    assert batch["input_ids"].shape == (1, 8)
+    assert torch.equal(batch["input_ids"][0], loader.dataset[1]["input_ids"])
+    assert inputs["x"].shape == (2, 3, 4, 4)
+
+
+def test_colocated_fan_in_slices_only_encoder_view(adapter, monkeypatch):
+    args = _args()
+    args.encoder_dp = 4
+    args.llm_dp = 2
+    sample = iter((0, 1))
+    original_encoder_inputs = adapter._MockVLMDataset._encoder_inputs
+
+    def indexed_encoder_inputs(dataset):
+        inputs = original_encoder_inputs(dataset)
+        inputs["x"].fill_(next(sample))
+        return inputs
+
+    monkeypatch.setattr(adapter._MockVLMDataset, "_encoder_inputs", indexed_encoder_inputs)
+    monkeypatch.setattr(adapter, "get_pg_rank", lambda pg: 0)
+    loader = adapter.build_train_valid_test_data_loaders(
+        args, _colocated_topology(encoder_dp=4, language_dp=2, encoder_rank=1)
+    )[0]
+    batch = next(iter(loader))
+    inputs = batch["modality_inputs"][RADIO_ENCODER_MODULE_NAME][RADIO_ENCODER_MODULE_NAME]
+    assert batch["input_ids"].shape == (2, 8)
+    assert inputs["x"].shape == (1, 3, 4, 4)
+    assert torch.count_nonzero(inputs["x"] == 1) == inputs["x"].numel()
+
+
+def test_colocated_dynamic_radio_rebases_packed_encoder_view(adapter):
+    args = _args()
+    args.encoder_dp = 4
+    args.llm_dp = 2
+    args.seq_length = 24
+    args.image_seq_length = 12
+    args.dynamic_resolution = True
+    args.pixel_shuffle = True
+    args.patch_dim = 8
+    args.num_image_tiles = 3
+    batch = next(
+        iter(
+            adapter.build_train_valid_test_data_loaders(
+                args, _colocated_topology(encoder_dp=4, language_dp=2, encoder_rank=1)
+            )[0]
+        )
+    )
+    inputs = batch["modality_inputs"][RADIO_ENCODER_MODULE_NAME][RADIO_ENCODER_MODULE_NAME]
+    assert inputs["x"].shape == (1, 48, 3 * 8 * 8)
+    assert inputs["imgs_sizes"].shape == (3, 2)
+    assert torch.equal(
+        inputs["packed_seq_params"].cu_seqlens_q, torch.arange(0, 49, 16, dtype=torch.int32)
+    )
+
+
+def test_colocated_loader_applies_resume_offset_without_advancing_cpu_rng(adapter):
+    args = _args()
+    args.encoder_dp = args.llm_dp = 2
+    args.consumed_train_samples = 4
+    state = torch.get_rng_state().clone()
+    loader = adapter.build_train_valid_test_data_loaders(
+        args, _colocated_topology(encoder_dp=2, language_dp=2)
+    )[0]
+    iter(loader)
+    assert loader.dataset.start_index == 2
+    assert torch.equal(torch.get_rng_state(), state)
