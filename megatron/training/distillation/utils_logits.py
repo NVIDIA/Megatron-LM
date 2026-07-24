@@ -275,17 +275,27 @@ def _verify_logprobs_metadata(
     *,
     tar_path: str,
     expected_hash: Optional[str],
+    expected_num_heads: Optional[int] = None,
 ) -> None:
-    """Validate the per-tar dataset hash stored in ``_meta.json``."""
-    if expected_hash is None:
-        return
-    saved_hash = json.loads(data).get("hash")
-    if saved_hash != expected_hash:
-        raise RuntimeError(
-            f"Teacher tar {tar_path} was saved with hash {saved_hash} "
-            f"but the current student run has hash {expected_hash}. "
-            "Data does not align!"
-        )
+    """Validate the per-tar dataset hash (and head count) stored in ``_meta.json``."""
+    meta = json.loads(data)
+    if expected_hash is not None:
+        saved_hash = meta.get("hash")
+        if saved_hash != expected_hash:
+            raise RuntimeError(
+                f"Teacher tar {tar_path} was saved with hash {saved_hash} "
+                f"but the current student run has hash {expected_hash}. "
+                "Data does not align!"
+            )
+    if expected_num_heads is not None:
+        saved_num_heads = int(meta.get("num_heads", 1))
+        if saved_num_heads != expected_num_heads:
+            raise RuntimeError(
+                f"Teacher tar {tar_path} was saved with num_heads={saved_num_heads} "
+                f"but the current student run expects num_heads={expected_num_heads} "
+                "(1 main head + mtp_num_layers). Check --logits-load-mtp and that "
+                "teacher/student mtp_num_layers match."
+            )
 
 
 def iter_logprobs_tar_entries(
@@ -293,6 +303,7 @@ def iter_logprobs_tar_entries(
     *,
     start_iteration: int = 0,
     expected_hash: Optional[str] = None,
+    expected_num_heads: Optional[int] = None,
 ) -> Iterator[LogprobsTarEntry]:
     """Stream cached-logits payload members from a batched tar archive.
 
@@ -318,6 +329,7 @@ def iter_logprobs_tar_entries(
                         extracted.read(),
                         tar_path=tar_path,
                         expected_hash=expected_hash,
+                        expected_num_heads=expected_num_heads,
                     )
                     metadata_seen = True
                     continue
@@ -353,8 +365,18 @@ def iter_logprobs_tar_entries(
         )
 
 
-def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Decode one zstd-compressed cached-logits payload."""
+def decode_logprobs_payload(
+    data: bytes,
+) -> Tuple[List[Any], List[Any], int]:
+    """Decode one zstd-compressed cached-logits payload.
+
+    Returns ``(values_list, indices_list, num_heads)`` where both lists are
+    microbatch-major. For the single-head (legacy / main-head-only) format each
+    element is a tensor. For the multi-head format (``num_heads > 1``, produced
+    when the teacher saves MTP heads) each element is a list of ``num_heads``
+    tensors ordered by output-layer firing order ``[mtp_0 .. mtp_{N-1}, main]``,
+    i.e. the **last** head is the main LM head.
+    """
     if not HAVE_ZSTANDARD:
         raise ImportError(
             "zstandard is required to decode cached-logits payloads. "
@@ -362,11 +384,20 @@ def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch
         )
     data = zstandard.ZstdDecompressor().decompress(data)
     tensors = torch.load(io.BytesIO(data), weights_only=True)
+    num_heads = int(tensors.get("num_heads", 1))
+    if num_heads == 1:
+        indices_list = [
+            unpack_indices(low, bit17)
+            for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
+        ]
+        return tensors["values"], indices_list, num_heads
+
+    # Multi-head: each microbatch entry is itself a per-head list of tensors.
     indices_list = [
-        unpack_indices(low, bit17)
-        for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])
+        [unpack_indices(low_h, bit_h) for low_h, bit_h in zip(low_mb, bit_mb)]
+        for low_mb, bit_mb in zip(tensors["indices_low"], tensors["bit_17"])
     ]
-    return tensors["values"], indices_list
+    return tensors["values"], indices_list, num_heads
 
 
 def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
@@ -385,8 +416,12 @@ def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
 def load_log_probs_from_tar(
     tar_path: str,
     iteration: int,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    """Load one iteration from a specific batched tar shard."""
+) -> Tuple[List[Any], List[Any], int]:
+    """Load one iteration from a specific batched tar shard.
+
+    Returns ``(values_list, indices_list, num_heads)`` — see
+    :func:`decode_logprobs_payload` for the per-head layout.
+    """
     for entry in iter_logprobs_tar_entries(tar_path, start_iteration=iteration):
         if entry.iteration == iteration:
             return decode_logprobs_payload(entry.data)
