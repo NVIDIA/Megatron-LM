@@ -684,7 +684,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
                         process_group = expt_dp_group if expt_dp_group is not None else mpu.get_expert_data_parallel_group()
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
-                                                                     args.ckpt_assume_constant_structure)
+                                                                     args.ckpt_assume_constant_structure,
+                                                                     pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+                                                                     pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False))
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
@@ -1328,7 +1330,9 @@ def _load_global_dist_base_checkpoint(
             raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
+            pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+            pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
