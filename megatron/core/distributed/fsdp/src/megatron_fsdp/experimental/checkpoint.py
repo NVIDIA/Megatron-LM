@@ -35,10 +35,10 @@ from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .module import FsdpModule
 
 __all__ = [
-    "save_dcp_checkpoint",
-    "load_dcp_checkpoint",
+    "save_checkpoint",
+    "load_checkpoint",
     "materialize_optimizer_state",
-    "resync_compute_weights",
+    "sync_model_weight_from_main_weight",
 ]
 
 
@@ -100,7 +100,7 @@ def materialize_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     optimizer.zero_grad(set_to_none=True)
 
 
-def resync_compute_weights(model: torch.nn.Module) -> None:
+def sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
     """Refresh every FSDP group's compute weights from its (loaded) main weights.
 
     A load writes into the ``main_weight``-backed sharded DTensors. When mixed precision keeps a
@@ -117,7 +117,7 @@ def resync_compute_weights(model: torch.nn.Module) -> None:
             parameter_group.sync_model_weight_from_main_weight()
 
 
-def save_dcp_checkpoint(
+def save_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     checkpoint_id: Union[str, os.PathLike],
@@ -133,7 +133,7 @@ def save_dcp_checkpoint(
     dcp.save(state_dict, checkpoint_id=str(checkpoint_id))
 
 
-def load_dcp_checkpoint(
+def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     checkpoint_id: Union[str, os.PathLike],
@@ -163,4 +163,4 @@ def load_dcp_checkpoint(
     if optimizer is not None:
         optimizer.load_state_dict(state_dict["optimizer"])
     if resync_model_weights:
-        resync_compute_weights(model)
+        sync_model_weight_from_main_weight(model)

@@ -13,8 +13,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_optimizer,
-    load_dcp_checkpoint,
-    save_dcp_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
@@ -123,7 +123,7 @@ def test_dcp_roundtrip_flat_dp(distributed_setup, shared_checkpoint_dir, config)
 
     The fc1 group packs ``weight (16, 8)`` and ``bias (16,)`` into one flat buffer, so per-rank
     shards do not tile like canonical ``Shard(0)`` (e.g. one rank owns no bias rows). This
-    exercises the uneven-DTensor metadata path in :func:`save_dcp_checkpoint`.
+    exercises the uneven-DTensor metadata path in :func:`save_checkpoint`.
     """
     if distributed_setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
@@ -138,13 +138,13 @@ def test_dcp_roundtrip_flat_dp(distributed_setup, shared_checkpoint_dir, config)
     )
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
     snapshot = _snapshot(model, optimizer)
-    save_dcp_checkpoint(model, optimizer, shared_checkpoint_dir)
+    save_checkpoint(model, optimizer, shared_checkpoint_dir)
 
     # Destination: a differently-initialized model+optimizer, so a correct load is non-trivial.
     model2, optimizer2 = _build_sharded(
         4321, mesh, device, param_dtype=param_dtype, mp_policy=mp_policy
     )
-    load_dcp_checkpoint(model2, optimizer2, shared_checkpoint_dir)
+    load_checkpoint(model2, optimizer2, shared_checkpoint_dir)
 
     local_nonempty = _assert_matches(snapshot, model2, optimizer2)
 
