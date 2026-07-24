@@ -1,15 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import asyncio
-import time
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
+from typing import Awaitable, Callable, Generic, NamedTuple, TypeVar
 
-import numpy as np
 from pydantic import BaseModel
-
-from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
-from megatron.core.utils import trace_async_exceptions
 
 from ..__init__ import Request, TypeLookupable
 from ..inference import (
@@ -17,14 +11,8 @@ from ..inference import (
     InferenceRequest,
     InferenceResponse,
     LLMChatMessage,
-    ReturnsRaw,
 )
-from ..rollout_granularity import (
-    RELEASE_STATE_BY_SUBMISSION,
-    ConsumptionGranularity,
-    ReleaseState,
-    SubmissionGranularity,
-)
+from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -110,6 +98,7 @@ class GroupRolloutParams(NamedTuple):
 
     inference_request: InferenceRequest
     build_rollout: Callable[[InferenceResponse], Awaitable[Rollout]]
+    agent: "Agent"
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -196,356 +185,40 @@ class TokenizedRolloutGenerator(Agent, ABC):
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]: ...
 
 
-class _GranularityConfig(NamedTuple):
-    submission: SubmissionGranularity
-    consumption: ConsumptionGranularity
-    num_groups_per_batch: int
-
-    @classmethod
-    def from_request(cls, request: GroupedRolloutRequest) -> "_GranularityConfig":
-        cls._validate(request)
-        return cls(
-            submission=request.submission_granularity,
-            consumption=request.consumption_granularity,
-            num_groups_per_batch=request.num_groups,
-        )
-
-    @property
-    def prevent_dataset_reorder(self) -> bool:
-        return self.consumption == "B"
-
-    @staticmethod
-    def _validate(request: GroupedRolloutRequest) -> None:
-        assert not (
-            request.submission_granularity == "B" and request.consumption_granularity == "G"
-        ), "Batch submission with group consumption is not supported."
-        assert not request.filter_groups_with_same_reward, (
-            "filter_groups_with_same_reward is not currently supported: dropped groups "
-            "are not regenerated, so non-streaming callers receive fewer groups than "
-            "requested and batch-order consumers stall on incomplete batches."
-        )
-
-
-class _SubmissionGate:
-    """Gate capacity is measured in units of the configured submission granularity."""
-
-    def __init__(
-        self,
-        *,
-        capacity: int,
-        submission: SubmissionGranularity,
-    ) -> None:
-        self._sem = asyncio.Semaphore(capacity)
-        self._submission = submission
-        self._release_on = RELEASE_STATE_BY_SUBMISSION[submission]
-        self.capacity = capacity
-        # Observability counters, updated only on the configured submission
-        # granularity (the only path that touches the semaphore). `held`
-        # counts slots currently held; `prepare_blocked_seconds` accumulates
-        # time stage_prepare spent waiting on the semaphore.
-        self.held = 0
-        self.prepare_blocked_seconds = 0.0
-        self.acquire_calls = 0
-        self.release_calls = 0
-
-    async def acquire_for(self, granularity: SubmissionGranularity) -> None:
-        if self._submission == granularity:
-            start = time.monotonic()
-            await self._sem.acquire()
-            self.prepare_blocked_seconds += time.monotonic() - start
-            self.held += 1
-            self.acquire_calls += 1
-
-    def release_after(self, state: ReleaseState) -> None:
-        if self._release_on == state:
-            self._sem.release()
-            self.held -= 1
-            self.release_calls += 1
-
-
-class _InferWorkItem(NamedTuple):
-    """One rollout's worth of work flowing from prepare to infer.
-
-    Timestamps are wall-clock monotonic seconds: `prepared_at` is stamped at
-    construction and `infer_dequeued_at` is filled in via `_replace` when an
-    infer worker dequeues the item. Zero means "not yet reached".
-    """
-
-    group_id: int
-    rollout_idx: int
-    batch_id: int
-    index_in_batch: int
-    params: GroupRolloutParams
-    prepared_at: float = 0.0
-    infer_dequeued_at: float = 0.0
-
-
-class _InferredItem(NamedTuple):
-    """One rollout post-inference, flowing from infer to assemble."""
-
-    item: _InferWorkItem
-    response: InferenceResponse
-    inferred_at: float = 0.0
-
-
-class _RolloutPipeline:
-    """Per-call orchestrator for grouped rollout generation."""
-
-    def __init__(
-        self,
-        agent: "GroupedRolloutGenerator",
-        request: GroupedRolloutRequest,
-        parallel_generation_tasks: int,
-    ) -> None:
-        self.agent = agent
-        self.request = request
-        self.gran_policy = _GranularityConfig.from_request(request)
-        self.gate = _SubmissionGate(
-            capacity=parallel_generation_tasks,
-            submission=self.gran_policy.submission,
-        )
-        rollouts_per_submission_unit = {
-            "R": 1,
-            "G": request.rollouts_per_group,
-            "B": self.gran_policy.num_groups_per_batch * request.rollouts_per_group,
-        }[self.gran_policy.submission]
-        self.num_infer_workers = parallel_generation_tasks * rollouts_per_submission_unit
-        if not request.streaming:
-            self.num_infer_workers = min(
-                self.num_infer_workers, request.num_groups * request.rollouts_per_group
-            )
-        self.infer_queue = asyncio_Queue()
-        self.assemble_queue = asyncio_Queue()
-        # Unbounded: flow control is owned entirely by the submission gate.
-        # Bounding this queue would add a second backpressure that silently
-        # clamps the run-ahead configured via --rl-generation-lag.
-        self.output_queue = asyncio_Queue()
-        # Buffer of pending groups (incomplete groups being filled by
-        # stage_assemble). Held here so metric collection can report its size.
-        self._assemble_pending: dict[int, list[_InferredItem]] = {}
-        # Pending groups waiting for their batch to fill in stage_consume
-        # (only populated when prevent_dataset_reorder is True).
-        self._consume_pending: dict[int, list[RolloutGroup]] = {}
-        # Per-group "output entry" times, keyed by (batch_id, index_in_batch),
-        # so stage_consume can compute output_queue_dwell when yielding.
-        self._output_enqueued_at: dict[tuple[int, int], float] = {}
-        # Observability accumulators. Measured here; snapshot/reset and
-        # wandb formatting happen in rl_utils during metric logging.
-        self.infer_queue_dwell: list[float] = []
-        self.engine_dwell: list[float] = []
-        self.assemble_queue_dwell: list[float] = []
-        self.output_queue_dwell: list[float] = []
-        self.prepared_count = 0
-        self.inferred_count = 0
-        self.assembled_count = 0
-        self.yielded_count = 0
-
-    async def stage_prepare(self) -> None:
-        """Generate gated inference work items."""
-        assert (
-            self.request.streaming
-            or self.request.num_groups % self.gran_policy.num_groups_per_batch == 0
-        ), "non-streaming requires num_groups to be a multiple of num_groups_per_batch"
-        group_id = 0
-        try:
-            while self.request.streaming or group_id < self.request.num_groups:
-                await self.gate.acquire_for("B")
-                batch_id = group_id // self.gran_policy.num_groups_per_batch
-
-                for index_in_batch in range(self.gran_policy.num_groups_per_batch):
-                    await self.gate.acquire_for("G")
-                    params: GroupRolloutParams = await self.agent.prepare_group_rollout(self.request)
-
-                    for rollout_idx in range(self.request.rollouts_per_group):
-                        await self.gate.acquire_for("R")
-                        item = _InferWorkItem(
-                            group_id=group_id,
-                            rollout_idx=rollout_idx,
-                            batch_id=batch_id,
-                            index_in_batch=index_in_batch,
-                            params=params,
-                            prepared_at=time.monotonic(),
-                        )
-                        await self.infer_queue.put(item)
-                        self.prepared_count += 1
-                    group_id += 1
-        finally:
-            self.infer_queue.shutdown()
-
-    async def stage_infer(self) -> None:
-        """Run a persistent pool of inference workers, spawned once per pipeline."""
-        workers = [
-            asyncio.create_task(self._infer_worker()) for _ in range(self.num_infer_workers)
-        ]
-        try:
-            await asyncio.gather(*workers, return_exceptions=True)
-        finally:
-            for worker in workers:
-                worker.cancel()
-            self.assemble_queue.shutdown()
-
-    async def _infer_worker(self) -> None:
-        while True:
-            try:
-                item = await self.infer_queue.get()
-            except asyncio_QueueShutDown:
-                return
-            item = item._replace(infer_dequeued_at=time.monotonic())
-            if item.prepared_at:
-                self.infer_queue_dwell.append(item.infer_dequeued_at - item.prepared_at)
-            await self._infer_one(item)
-
-    @trace_async_exceptions(verbose=True)
-    async def _infer_one(self, item: _InferWorkItem) -> None:
-        response = await self.agent.get_rollout_response(
-            self.request, item.params.inference_request
-        )
-        inferred_at = time.monotonic()
-        self.gate.release_after("inferred")
-        if item.infer_dequeued_at:
-            self.engine_dwell.append(inferred_at - item.infer_dequeued_at)
-        self.inferred_count += 1
-        await self.assemble_queue.put(
-            _InferredItem(item=item, response=response, inferred_at=inferred_at)
-        )
-
-    async def stage_assemble(self) -> None:
-        """Build complete rollout groups from inferred items."""
-        pending = self._assemble_pending
-        try:
-            while True:
-                try:
-                    inferred = await self.assemble_queue.get()
-                except asyncio_QueueShutDown:
-                    break
-                dequeued_at = time.monotonic()
-                if inferred.inferred_at:
-                    self.assemble_queue_dwell.append(dequeued_at - inferred.inferred_at)
-                bucket = pending.setdefault(inferred.item.group_id, [])
-                bucket.append(inferred)
-                if len(bucket) < self.request.rollouts_per_group:
-                    continue
-                completed = pending.pop(inferred.item.group_id)
-                completed.sort(key=lambda item: item.item.rollout_idx)
-                rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.response) for item in completed]
-                )
-                self.gate.release_after("assembled")
-                self.assembled_count += 1
-                # NOTE: this filter is currently non-functional dead code:
-                # _GranularityConfig._validate rejects filter_groups_with_same_reward
-                # at pipeline construction, so `keep` is always True. Kept for a
-                # future PR that regenerates dropped groups instead of
-                # under-delivering to the caller.
-                keep = (
-                    not self.request.filter_groups_with_same_reward
-                    or np.std([rollout.reward for rollout in rollouts]) > 1e-6
-                )
-                if keep:
-                    first = completed[0]
-                    output_enqueued_at = time.monotonic()
-                    self._output_enqueued_at[
-                        (first.item.batch_id, first.item.index_in_batch)
-                    ] = output_enqueued_at
-                    await self.output_queue.put(
-                        RolloutGroup(
-                            rollouts=rollouts,
-                            batch_id=first.item.batch_id,
-                            index_in_batch=first.item.index_in_batch,
-                        )
-                    )
-        finally:
-            self.output_queue.shutdown()
-
-    def _record_output_dwell(self, group: RolloutGroup) -> None:
-        """Record how long a group sat in output_queue before being yielded."""
-        key = (group.batch_id, group.index_in_batch)
-        enqueued_at = self._output_enqueued_at.pop(key, 0.0)
-        if enqueued_at:
-            self.output_queue_dwell.append(time.monotonic() - enqueued_at)
-        self.yielded_count += 1
-
-    async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
-        if not self.gran_policy.prevent_dataset_reorder:
-            while True:
-                try:
-                    group = await self.output_queue.get()
-                except asyncio_QueueShutDown:
-                    return
-                self._record_output_dwell(group)
-                yield group
-
-        next_batch_id = 0
-        pending = self._consume_pending
-        while True:
-            try:
-                group = await self.output_queue.get()
-            except asyncio_QueueShutDown:
-                return
-            self._record_output_dwell(group)
-            pending.setdefault(group.batch_id, []).append(group)
-            while (
-                len(pending.get(next_batch_id, []))
-                >= self.gran_policy.num_groups_per_batch
-            ):
-                batch = pending.pop(next_batch_id)
-                batch.sort(key=lambda group: group.index_in_batch)
-                next_batch_id += 1
-                for group in batch:
-                    yield group
-                self.gate.release_after("consumed")
-
-
 class GroupedRolloutGenerator(Agent, ABC):
-    """An interface to return grouped Rollout objects to support algorithms like GRPO."""
-
-    parallel_generation_tasks: int = 512
-
-    def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
-        super().__init__(**kwargs)
-        if parallel_generation_tasks is not None:
-            self.parallel_generation_tasks = parallel_generation_tasks
+    """Agent contract consumed by RolloutPipeline to generate grouped rollouts (e.g. GRPO)."""
 
     @abstractmethod
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
+        env_index: int = 0,
     ) -> GroupRolloutParams:
         """Return the params for one group's rollouts.
 
-        Called once per group by _RolloutPipeline.stage_prepare. The returned
-        build_rollout closure is invoked once per inference response in
-        _RolloutPipeline.stage_assemble.
+        Called once per group by `RolloutPipeline.stage_prepare`; the returned `build_rollout` is
+        invoked once per inference response in `RolloutPipeline.stage_assemble`.
+
+        Args:
+            request: The grouped rollout request being served.
+            env_index: An index of the environment this group belongs to.
+
+        Returns:
+            GroupRolloutParams carrying the inference request, the
+            build_rollout closure, and the serving agent stamped on `agent`.
         """
         ...
 
-    async def get_grouped_rollouts(
-        self, request: GroupedRolloutRequest
-    ) -> AsyncIterator[RolloutGroup]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
-        pipeline = _RolloutPipeline(
-            agent=self,
-            request=request,
-            parallel_generation_tasks=self.parallel_generation_tasks,
-        )
-        # Expose the live pipeline for observability; rl_utils reads its
-        # queue sizes, gate state, and timing accumulators during logging.
-        self._active_pipeline = pipeline
-        stage_prepare_task = asyncio.create_task(pipeline.stage_prepare())
-        infer_task = asyncio.create_task(pipeline.stage_infer())
-        assemble_task = asyncio.create_task(pipeline.stage_assemble())
-        tasks = (stage_prepare_task, infer_task, assemble_task)
+    def rollout_group_layout(self, num_groups: int) -> list[int]:
+        """Returns the groups within a batch that each env contributes to one batch, in env order.
 
-        try:
-            async for group in pipeline.stage_consume():
-                yield group
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self._active_pipeline = None
+        Args:
+            num_groups: Total groups in one trainer batch.
+
+        Returns:
+            Positive per-env group counts summing to num_groups.
+        """
+        return [num_groups]
 
 
 class EvaluationAgent(Agent, ABC):

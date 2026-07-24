@@ -1,9 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import itertools
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
@@ -35,7 +36,6 @@ from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
 from megatron.rl.inference import ReturnsRaw
-from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -174,30 +174,6 @@ class TestRLUtils:
         assert args.rl_consumption_granularity == "B"
         assert args.rl_generation_lag == 0
         assert not hasattr(args, "rl_parallel_generation_tasks")
-        assert get_rl_parallel_generation_tasks(args) == 1
-
-    @pytest.mark.parametrize(
-        "submission_granularity, generation_lag, expected_parallel_generation_tasks",
-        [
-            pytest.param("B", 0, 1, id="batch"),
-            pytest.param("B", 2, 3, id="batch_with_lag"),
-            pytest.param("G", 0, 8, id="group"),
-            pytest.param("G", 2, 24, id="group_with_lag"),
-            pytest.param("R", 0, 32, id="rollout"),
-            pytest.param("R", 2, 96, id="rollout_with_lag"),
-        ],
-    )
-    def test_get_rl_parallel_generation_tasks(
-        self, submission_granularity, generation_lag, expected_parallel_generation_tasks
-    ):
-        args = SimpleNamespace(
-            rl_submission_granularity=submission_granularity,
-            rl_generation_lag=generation_lag,
-            grpo_prompts_per_step=8,
-            grpo_group_size=4,
-        )
-
-        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
 
     @pytest.mark.parametrize(
         "rl_partial_rollouts, submission_granularity",
@@ -214,27 +190,30 @@ class TestRLUtils:
         """Regression for the removed ``num_groups=1`` streaming override.
 
         Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
-        streamed with a non-batch submission granularity. For a multi-environment
-        agent that collapses the per-env group distribution so some environments
-        receive zero groups (and a degenerate all-zero ``agent_slots``), stalling
-        ``get_grouped_rollouts``. ``num_groups`` must stay at the trainer batch size
-        (``n_prompts``) regardless of streaming or submission granularity.
+        streamed with a non-batch submission granularity, collapsing the per-env
+        group layout so some environments received zero groups (now a loud
+        ``ValueError`` from ``rollout_group_layout``). ``num_groups`` must stay at
+        the trainer batch size (``n_prompts``) regardless of streaming or
+        submission granularity.
         """
         n_prompts = 8
         captured = {}
         rollout_generator = object()
+        agent = object()
 
-        class Agent:
-            def get_grouped_rollouts(self, request):
+        class FakePipeline:
+            def __init__(self, agent, request, parallel_generation_tasks):
+                captured["agent"] = agent
                 captured["request"] = request
+                captured["parallel_generation_tasks"] = parallel_generation_tasks
+
+            def run(self):
                 return rollout_generator
 
-        def get_agent(_args, parallel_generation_tasks=None):
-            captured["parallel_generation_tasks"] = parallel_generation_tasks
-            return Agent()
-
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
-        monkeypatch.setattr(rl_utils, "get_agent", get_agent)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", None)
+        monkeypatch.setattr(rl_utils, "get_agent", lambda _args: agent)
+        monkeypatch.setattr(rl_utils, "RolloutPipeline", FakePipeline)
 
         args = SimpleNamespace(
             rl_partial_rollouts=rl_partial_rollouts,
@@ -255,9 +234,75 @@ class TestRLUtils:
         )
 
         assert result is rollout_generator
+        assert captured["agent"] is agent
         assert captured["request"].num_groups == n_prompts
         assert captured["request"].streaming == rl_partial_rollouts
+        # The gate depth handed to the pipeline is lag + 1 trainer batches,
+        # independent of submission granularity.
+        assert captured["parallel_generation_tasks"] == args.rl_generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
+
+    @pytest.mark.parametrize(
+        "ready_batches, partial_rollouts, expected_skip",
+        [
+            pytest.param(1, True, True, id="banked_batch_skips"),
+            pytest.param(0, True, False, id="empty_bank_runs_inference"),
+            pytest.param(1, False, False, id="non_partial_always_runs_inference"),
+            pytest.param(None, True, False, id="no_pipeline_runs_inference"),
+        ],
+    )
+    def test_can_skip_inference_routes_rollout_collection(
+        self, monkeypatch, ready_batches, partial_rollouts, expected_skip
+    ):
+        """can_skip_inference cold-reads the pipeline bank; a skip routes
+        get_environment_rollouts to consume banked groups without inference."""
+        n_prompts = 4
+        fake_groups = [[f"group_{i}"] for i in range(n_prompts)]
+        loop = asyncio.new_event_loop()
+
+        async def gen():
+            for group in fake_groups:
+                yield group
+
+        rollout_generator = gen()
+        colocated = MagicMock(return_value=list(fake_groups))
+        pipeline = (
+            None
+            if ready_batches is None
+            else SimpleNamespace(
+                ready_batches=ready_batches, gran_policy=SimpleNamespace(num_groups_per_batch=0)
+            )
+        )
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", pipeline)
+        monkeypatch.setattr(rl_utils, "colocated_inference", colocated)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", rollout_generator)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(curr_iteration=1))
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
+        )
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+        try:
+            with (
+                patch("torch.distributed.get_rank", return_value=0),
+                patch("torch.distributed.broadcast_object_list"),
+                patch("torch.are_deterministic_algorithms_enabled", return_value=False),
+            ):
+                skip = rl_utils.can_skip_inference(partial_rollouts)
+                assert skip == expected_skip
+                rollouts = rl_utils.get_environment_rollouts(
+                    [MagicMock()],
+                    inference_model=None,
+                    optimizer=MagicMock(),
+                    n_prompts=n_prompts,
+                    samples_per_group=1,
+                    run_inference=not skip,
+                )
+            assert rollouts == fake_groups
+            assert colocated.called != expected_skip
+        finally:
+            loop.run_until_complete(rollout_generator.aclose())
+            loop.close()
 
     @pytest.mark.parametrize(
         "overrides, match",
@@ -276,11 +321,6 @@ class TestRLUtils:
                 {"rl_consumption_granularity": "R"},
                 "--rl-consumption-granularity R is not currently supported",
                 id="rollout_consumption_unsupported",
-            ),
-            pytest.param(
-                {"rl_submission_granularity": "B", "rl_consumption_granularity": "G"},
-                "--rl-submission-granularity B with --rl-consumption-granularity G",
-                id="batch_submit_group_consume_unsupported",
             ),
         ],
     )
