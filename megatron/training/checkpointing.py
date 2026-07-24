@@ -2046,6 +2046,21 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
         try:
+            runtime_lr_bounds = None
+            if (
+                args.override_opt_param_scheduler
+                and optimizer is not None
+                and not getattr(optimizer, "is_stub_optimizer", False)
+            ):
+                runtime_lr_bounds = [
+                    {
+                        key: param_group[key]
+                        for key in ('max_lr', 'min_lr')
+                        if key in param_group
+                    }
+                    for param_group in optimizer.param_groups
+                ]
+
             # Load state dict.
             if getattr(args, "use_layer_wise_distributed_optimizer", False) and args.ckpt_format == 'torch':
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
@@ -2078,6 +2093,39 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+
+            # Optimizer state dict can overwrite per-group max_lr/min_lr values.
+            # If scheduler override is requested, restore runtime lr bounds so
+            # scheduler math does not stay pinned to checkpoint lr settings.
+            if args.override_opt_param_scheduler:
+                if runtime_lr_bounds is None or opt_param_scheduler is None:
+                    print_rank_0(
+                        " > WARNING: --override-opt-param-scheduler is set, but optimizer or "
+                        "opt_param_scheduler is not available; skipping override of scheduler "
+                        "and optimizer param_group max_lr/min_lr."
+                    )
+                else:
+                    assert len(runtime_lr_bounds) == len(optimizer.param_groups), (
+                        "Optimizer param group count changed while loading checkpoint: "
+                        f"{len(runtime_lr_bounds)} runtime groups versus "
+                        f"{len(optimizer.param_groups)} checkpoint groups"
+                    )
+                    for param_group, lr_bounds in zip(optimizer.param_groups, runtime_lr_bounds):
+                        param_group.update(lr_bounds)
+                    # Synchronize scheduler num_steps with consumed_train_samples
+                    # to ensure lr calculation is based on current training progress
+                    if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                        print_rank_0(
+                            f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
+                            f"differs from consumed_train_samples ({args.consumed_train_samples}). "
+                            f"Resetting scheduler num_steps to match consumed_train_samples."
+                        )
+                        opt_param_scheduler.num_steps = args.consumed_train_samples
+                    opt_param_scheduler.step(increment=0)
+                    print_rank_0(
+                        " > restored optimizer param_group max_lr/min_lr from runtime config "
+                        "because --override-opt-param-scheduler is set"
+                    )
         except KeyError as e:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
