@@ -290,6 +290,10 @@ class WeightedMultiTask(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
                     )
                 agent.parallel_generation_tasks = pgt
+                # Forward the durable rollout bank to each sub-pipeline so completed
+                # groups from every env are written through at assembly. WeightedMultiTask
+                # and its reorder buffer are thus covered by construction.
+                agent._rollout_bank = getattr(self, "_rollout_bank", None)
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,

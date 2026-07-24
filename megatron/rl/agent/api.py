@@ -3,7 +3,7 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
@@ -21,6 +21,9 @@ from ..inference import (
 )
 from ..inflight_tracker import add_inflight, remove_inflight
 from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
+
+if TYPE_CHECKING:
+    from ..rollout_bank import RolloutBank
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -302,9 +305,13 @@ class _RolloutPipeline:
         agent: "GroupedRolloutGenerator",
         request: GroupedRolloutRequest,
         parallel_generation_tasks: int,
+        bank: "RolloutBank | None" = None,
     ) -> None:
         self.agent = agent
         self.request = request
+        # Optional durable rollout bank. Injected (never read from a global) so the
+        # pipeline stays testable; when None, all bank calls are skipped.
+        self.bank = bank
         self.gran_policy = _GranularityConfig.from_request(request)
         self.gate = _SubmissionGate(
             capacity=parallel_generation_tasks,
@@ -460,17 +467,23 @@ class _RolloutPipeline:
                     self._output_enqueued_at[
                         (first.item.batch_id, first.item.index_in_batch)
                     ] = output_enqueued_at
-                    await self.output_queue.put(
-                        RolloutGroup(
-                            rollouts=rollouts,
-                            batch_id=first.item.batch_id,
-                            index_in_batch=first.item.index_in_batch,
-                        )
+                    group = RolloutGroup(
+                        rollouts=rollouts,
+                        batch_id=first.item.batch_id,
+                        index_in_batch=first.item.index_in_batch,
                     )
+                    # Write-through: the completed group hits durable storage the
+                    # instant it exists, before it is queued for the trainer. The
+                    # returned uid rides on the group so the consume side can mark
+                    # it consumed. Rank-0 single writer (only rank 0 runs the pipeline).
+                    if self.bank is not None:
+                        group.uid = self.bank.append(group)
+                    await self.output_queue.put(group)
                 else:
                     # Filtered out (all-equal reward): these rollouts are dropped
                     # and will never be consumed, so they leave the in-flight set here.
                     remove_inflight(len(rollouts))
+
         finally:
             self.output_queue.shutdown()
 
@@ -548,6 +561,9 @@ class GroupedRolloutGenerator(Agent, ABC):
             agent=self,
             request=request,
             parallel_generation_tasks=self.parallel_generation_tasks,
+            # Set by rl_utils on rank 0 when --rl-durable-rollout-bank is enabled;
+            # absent (None) otherwise, so this is a no-op for existing runs.
+            bank=getattr(self, "_rollout_bank", None),
         )
         # Expose the live pipeline for observability; rl_utils reads its
         # queue sizes, gate state, and timing accumulators during logging.

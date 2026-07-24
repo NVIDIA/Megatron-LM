@@ -880,17 +880,33 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
+    if not args.async_save:
+        # Add a barrier so that all ranks wait for finalization to complete
+        # before returning from this function.
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        # Durable rollout bank: compact at the checkpoint boundary so the bank's
+        # compacted-through T tracks this (now durable) checkpoint. Only on sync
+        # saves — for async_save the checkpoint is not yet finalized here, so we
+        # leave compaction to a later sync save / restart to avoid pruning groups
+        # whose training is not yet durably persisted. Rank-0 no-op otherwise.
+        if getattr(args, "rl_durable_rollout_bank", False):
+            from megatron.rl.rl_utils import maybe_compact_rollout_bank
+
+            maybe_compact_rollout_bank(iteration)
+
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
 @_disable_gc()
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
                                   cpu_priority=None, io_priority=None):
     """Module-level function for async checkpoint deletion.
-    
+
     This function can be pickled and executed by the async worker process.
     Note: This is only called from rank 0, so we use regular print() instead of print_rank_0()
     since torch.distributed won't be initialized in the async worker process.
-    
+
     Args:
         save_path (str): Path to the checkpoints directory
         iteration_to_delete (int): Iteration number of checkpoint to delete

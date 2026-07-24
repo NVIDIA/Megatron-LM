@@ -9,7 +9,7 @@ import json
 import logging
 import math
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -344,6 +344,12 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Durable rollout bank (rank-0 only). Groups restored from disk at restart
+        # wait here and are injected into collections before any fresh generation;
+        # bank_restored guards the one-shot restore per process.
+        self.rollout_bank = None
+        self.restored_groups = deque()
+        self.bank_restored = False
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
         # Per-GPU variants are available via methods that divide by world_size.
         self.world_size = None
@@ -727,6 +733,7 @@ def get_inference_interface(args, loop, model):
 
 _ROLLOUT_GENERATOR = None
 _ROLLOUT_AGENT = None
+_ROLLOUT_BANK = None
 
 
 async def _speculative_select_generator(base_generator, k, strategy):
@@ -746,6 +753,47 @@ async def _speculative_select_generator(base_generator, k, strategy):
         yield select_rollouts(list(group), k, strat)
 
 
+def maybe_get_rollout_bank(args):
+    """Return the durable rollout bank singleton, creating it on first use.
+
+    Rank-0 only (only rank 0 runs the rollout pipeline, so the bank is a single
+    writer with no distributed coordination). Returns None when the feature is
+    disabled or on non-zero ranks.
+    """
+    global _ROLLOUT_BANK
+    if not getattr(args, "rl_durable_rollout_bank", False):
+        return None
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return None
+    if _ROLLOUT_BANK is None:
+        from megatron.rl.rollout_bank import RolloutBank
+
+        bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
+        get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
+        log_single_rank(
+            logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}"
+        )
+    return _ROLLOUT_BANK
+
+
+def get_rollout_bank():
+    """Return the rollout bank singleton, or None if disabled / not yet created."""
+    return _ROLLOUT_BANK
+
+
+def maybe_compact_rollout_bank(iteration):
+    """Compact the bank at a durable-checkpoint boundary (rank-0 no-op otherwise).
+
+    Called from save_checkpoint so the bank's compacted-through T tracks the model
+    checkpoint: groups consumed at marker <= iteration are reclaimed, survivors
+    carry forward.
+    """
+    bank = get_rollout_bank()
+    if bank is not None:
+        bank.checkpoint(iteration)
+
+
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
@@ -755,6 +803,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         reset_inflight()
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
+        agent._rollout_bank = get_rollout_bank()
         # When speculative rollout is enabled, inflate rollouts_per_group so the
         # draft engine generates oversample_factor * samples_per_group candidates.
         # A thin async wrapper then down-selects to the original samples_per_group
@@ -765,9 +814,10 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             if exit_layer is not None
             else samples_per_group
         )
-
+        # Attach the durable bank so stage_assemble writes each completed group
+        # through to disk (no-op when the bank is disabled / non-rank-0).
         request = GroupedRolloutRequest(
-            num_groups=n_prompts,
+            num_groups=num_groups,
             streaming=streaming,
             rollouts_per_group=effective_rollouts_per_group,
             inference_interface=inference_interface,
@@ -795,6 +845,12 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         else:
             _ROLLOUT_GENERATOR = base_gen
     return _ROLLOUT_GENERATOR
+
+
+async def _empty_rollout_generator():
+    """An async generator that yields nothing (fully-restored collection)."""
+    return
+    yield  # pragma: no cover - makes this a generator
 
 
 def get_environment_rollouts(
@@ -858,10 +914,33 @@ def get_environment_rollouts(
             training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
+            # Durable rollout bank: point appends at this collection, restore any
+            # completed groups banked before a restart (once per process), and take
+            # this collection's share to inject. Fresh generation is reduced by the
+            # injected count so the trainer still sees exactly n_prompts groups.
+            runtime_state = get_rl_runtime_state()
+            bank = maybe_get_rollout_bank(args)
+            inject = []
+            if bank is not None:
+                bank.set_collection(args.curr_iteration)
+                if not runtime_state.bank_restored:
+                    runtime_state.restored_groups = deque(bank.restore(args.iteration))
+                    runtime_state.bank_restored = True
+                    if runtime_state.restored_groups:
+                        log_single_rank(
+                            logger,
+                            logging.INFO,
+                            f"RolloutBank restored {len(runtime_state.restored_groups)} completed "
+                            f"groups from disk at resume iteration {args.iteration}",
+                        )
+                take = min(len(runtime_state.restored_groups), n_prompts)
+                inject = [runtime_state.restored_groups.popleft() for _ in range(take)]
+            n_fresh = n_prompts - len(inject)
+
             with nvtx_range("rl/inference-setup", time=True):
                 # Asyncronously run inference and rollout collection
                 rollout_generator = get_rollout_generator(
-                    args, inference_interface, n_prompts, samples_per_group
+                    args, inference_interface, n_fresh, samples_per_group
                 )
 
             # NOTE(jbarker): we need to double check this when using PP>1
@@ -873,14 +952,16 @@ def get_environment_rollouts(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    rollouts = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
+                    fresh = [
+                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_fresh)
                     ]
                     # These groups are now consumed into the training batch: they
                     # leave the in-flight set (decrement here, where consumption is final,
                     # so buffered groups awaiting their batch peers stay counted).
                     for group in rollouts:
                         remove_inflight(len(group))
+                    # Restored groups first, then freshly generated ones.
+                    rollouts = list(inject) + fresh
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
@@ -897,6 +978,12 @@ def get_environment_rollouts(
                                 assert False, "Unexpected group left in generator."
                             except StopAsyncIteration:
                                 break
+                    # Record consumption for every group handed to the trainer. On a
+                    # rollback (restart at T < this step) the marker > T rule restores
+                    # these; once the checkpoint advances past this step they are pruned.
+                    if bank is not None:
+                        for group in rollouts:
+                            bank.mark_consumed(getattr(group, "uid", None), args.curr_iteration)
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
