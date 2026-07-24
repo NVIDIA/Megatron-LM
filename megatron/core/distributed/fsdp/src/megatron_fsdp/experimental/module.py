@@ -23,7 +23,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
-from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
+from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import MeshAxis, Placements
 
 
@@ -238,7 +238,7 @@ class FsdpModule:
         if self.is_root():
             allgather_stream.wait_stream(current_stream)
 
-        self._unshard_parameter_groups(sync_model_weight=True)
+        self._unshard_parameter_groups()
         assert self._unshard_event is not None
         # Compute waits only for this FsdpModule's all-gather (the prefetch below is
         # issued afterwards, so it is free to run concurrently with this FsdpModule).
@@ -246,9 +246,9 @@ class FsdpModule:
 
         next_module = context.forward_order.next_item(self)
         if next_module is not None:
-            next_module._unshard_parameter_groups(sync_model_weight=True)
+            next_module._unshard_parameter_groups()
 
-    def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
+    def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
         If ``_unshard_event`` is already set, this FsdpModule was already
@@ -262,10 +262,6 @@ class FsdpModule:
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                if sync_model_weight:
-                    # TODO: After NVIDIA/Megatron-LM#5411 lands, move this sync to the
-                    # optimizer post-step hook instead of running it every microbatch.
-                    group.sync_model_weight_from_main_weight()
                 group.unshard_parameters()
             self._unshard_event = allgather_stream.record_event()
 
@@ -308,13 +304,13 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self._unshard_parameter_groups(sync_model_weight=False)
+        self._unshard_parameter_groups()
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
         next_module = context.backward_order.next_item(self)
         if next_module is not None:
-            next_module._unshard_parameter_groups(sync_model_weight=False)
+            next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -387,7 +383,7 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
             parameter_fqn = (
                 f"{submodule_fqn}.{local_parameter_name}" if submodule_fqn else local_parameter_name
             )
-            if contained_in_parameter_group(parameter):
+            if get_containing_parameter_group(parameter) is not None:
                 raise ValueError(
                     f"Parameter {parameter_fqn!r} is already owned by another FsdpModule."
                 )
