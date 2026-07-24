@@ -19,6 +19,8 @@ state dict is retargeted at load time:
   mirroring ``TransformerBlock.sharded_state_dict`` with
   ``non_homogeneous_layers=False`` (the format GPTModel training saves);
 * ``decoder.final_norm`` is pointed at GPT's ``decoder.final_layernorm``;
+* HybridModel's empty ``output_layer._extra_state`` entry stays local because
+  GPT checkpoints intentionally omit that backward-compatibility key;
 * entries of layers without a GPT counterpart are wrapped in
   ``LocalNonpersistentObject`` so no storage read is attempted and the
   freshly initialized module values are kept (and remain visible to the
@@ -43,7 +45,7 @@ keep their freshly initialized optimizer state via ``LocalNonpersistentObject``.
 
 import re
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Iterable, Mapping
 
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import (
@@ -72,6 +74,7 @@ _FRESH_INIT_SYMBOLS = (Symbols.MAMBA,)
 _DECODER_LAYER_KEY_RE = re.compile(r'decoder\.layers\.(\d+)\.')
 
 _GPT_FINAL_NORM_KEY_MAP = {'decoder.final_norm.': 'decoder.final_layernorm.'}
+_GPT_OMITTED_LOCAL_KEYS = ('output_layer._extra_state',)
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,9 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
         if not isinstance(entry, ShardedBase):
             return entry
 
+        if entry.key.endswith(_GPT_OMITTED_LOCAL_KEYS):
+            return LocalNonpersistentObject(entry.data)
+
         layer_match = _DECODER_LAYER_KEY_RE.search(entry.key)
         if layer_match is not None:
             hybrid_idx = int(layer_match.group(1))
@@ -259,3 +265,103 @@ def retarget_sharded_state_dict_to_gpt_checkpoint(
         return entry
 
     dict_list_map_inplace(_retarget, sharded_state_dict)
+
+
+def _retarget_explicit_key_to_gpt_checkpoint(
+    key: Any,
+    layer_maps: GPTCompatLayerMaps,
+    checkpoint_keys: Iterable[str] | None = None,
+) -> Any | None:
+    """Translate one explicit HybridModel state-dict key to its GPT key.
+
+    ``fsdp_dtensor`` checkpoints store explicit parameter names rather than
+    homogeneous-layer ``ShardedTensor`` metadata. Returning ``None`` omits a
+    fresh-only or GPT-omitted entry from the DCP load plan while leaving its
+    existing HybridModel value untouched.
+    """
+    if not isinstance(key, str):
+        return key
+    if key.endswith(_GPT_OMITTED_LOCAL_KEYS):
+        return None
+
+    layer_match = _DECODER_LAYER_KEY_RE.search(key)
+    if layer_match is not None:
+        hybrid_idx = int(layer_match.group(1))
+        if hybrid_idx in layer_maps.fresh_init:
+            return None
+        gpt_idx = layer_maps.attention_to_gpt.get(hybrid_idx)
+        if gpt_idx is None:
+            gpt_idx = layer_maps.mlp_to_gpt.get(hybrid_idx)
+        if gpt_idx is None:
+            raise ValueError(
+                f"FSDP state dict entry {key!r} refers to hybrid layer {hybrid_idx}, "
+                "which is not part of the hybrid layer pattern used to derive the "
+                "GPT layer maps."
+            )
+        key = (
+            f'{key[:layer_match.start()]}decoder.layers.{gpt_idx}.'
+            f'{key[layer_match.end():]}'
+        )
+
+    for hybrid_prefix, gpt_prefix in _GPT_FINAL_NORM_KEY_MAP.items():
+        pos = key.find(hybrid_prefix)
+        if pos != -1:
+            key = f'{key[:pos]}{gpt_prefix}{key[pos + len(hybrid_prefix):]}'
+            break
+
+    # FSDP optimizer parameter names include the wrapper hierarchy. GPTModel
+    # and HybridModel can have different Float16/FSDP wrapper depths, so use
+    # checkpoint metadata to recover the exact source-side ``module.`` prefix.
+    if checkpoint_keys is not None:
+        bare_key = re.sub(r'^(?:module\.)+', '', key)
+        key_pattern = re.compile(rf'(?<![A-Za-z0-9_])((?:module\.)*{re.escape(bare_key)})(?:\.|$)')
+        matches = {
+            match.group(1)
+            for checkpoint_key in checkpoint_keys
+            if (match := key_pattern.search(checkpoint_key)) is not None
+        }
+        if len(matches) == 1:
+            key = matches.pop()
+    return key
+
+
+def retarget_fsdp_state_dict_to_gpt_checkpoint(
+    state_dict: Mapping[Any, Any],
+    layer_maps: GPTCompatLayerMaps,
+    checkpoint_keys: Iterable[str] | None = None,
+    checkpoint_prefix: str = '',
+) -> dict[Any, Any]:
+    """Return an ``fsdp_dtensor`` model or optimizer state dict under GPT keys.
+
+    FSDP model state is a flat parameter-name mapping. Distributed-optimizer
+    state can contain nested ``state`` and ``param_to_group_meta`` mappings
+    (and chained-optimizer integer keys), so the translation recursively
+    rewrites every parameter-name key while preserving the DTensor leaves.
+    """
+
+    checkpoint_key_set = set(checkpoint_keys) if checkpoint_keys is not None else None
+
+    def _retarget(value, path):
+        if isinstance(value, Mapping):
+            translated = {}
+            for key, child in value.items():
+                translated_key = _retarget_explicit_key_to_gpt_checkpoint(
+                    key, layer_maps, checkpoint_key_set
+                )
+                if translated_key is not None:
+                    child_path = f'{path}.{translated_key}' if path else str(translated_key)
+                    translated_child = _retarget(child, child_path)
+                    if (
+                        checkpoint_key_set is None
+                        or isinstance(child, (Mapping, list, tuple))
+                        or child_path in checkpoint_key_set
+                    ):
+                        translated[translated_key] = translated_child
+            return translated
+        if isinstance(value, list):
+            return [_retarget(child, f'{path}.{idx}') for idx, child in enumerate(value)]
+        if isinstance(value, tuple):
+            return tuple(_retarget(child, f'{path}.{idx}') for idx, child in enumerate(value))
+        return value
+
+    return _retarget(state_dict, checkpoint_prefix)

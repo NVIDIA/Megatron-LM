@@ -76,10 +76,12 @@ different tensor, pipeline, expert, or FSDP layout on the following load.
 
 - **Option A — translate at load time (no separate step).** Start the hybrid
   run directly against the GPT checkpoint. The hybrid model retargets its own
-  sharded state dict at the GPT checkpoint's keys during loading, so no second
-  copy is written to disk. This path also supports patterns that contain layer
-  families with no GPT counterpart, such as Mamba (`M`) positions, which keep
-  their fresh initialization.
+  checkpoint state dict at the GPT checkpoint's keys during loading, so no
+  second copy is written to disk. This supports both `torch_dist` checkpoints
+  and Megatron-FSDP `fsdp_dtensor` checkpoints, including their optimizer
+  state. This path also supports patterns that contain layer families with no
+  GPT counterpart, such as Mamba (`M`) positions, which keep their fresh
+  initialization.
 - **Option B — convert offline to a new checkpoint.** Use
   [`tools/checkpoint/gpt_hybrid_conversion.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/checkpoint/gpt_hybrid_conversion.py)
   to write a standalone `HybridModel` checkpoint whose keys already match the
@@ -92,11 +94,13 @@ different tensor, pipeline, expert, or FSDP layout on the following load.
 Load-time translation is handled by
 [`megatron/core/models/hybrid/gpt_checkpoint_interop.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/models/hybrid/gpt_checkpoint_interop.py).
 It triggers automatically when a non-hybrid (GPT) checkpoint is loaded into a
-`HybridModel` run: the run's model (and, by default, optimizer) sharded state
-dict is rewritten into the GPT checkpoint's homogeneous-layer format, the
-checkpoint is read directly, and the weights and optimizer state are resharded
-to the current TP/PP/EP/ETP layout. No conversion tool is run, and the GPT
-checkpoint on disk is never modified.
+`HybridModel` run: for `torch_dist`, the run's model and optimizer sharded
+state dicts are rewritten into the GPT checkpoint's homogeneous-layer format;
+for `fsdp_dtensor`, their explicit parameter-name mappings are rewritten onto
+the GPT keys before Torch DCP planning. The checkpoint is read directly, and
+the weights and optimizer state are resharded to the current
+TP/PP/EP/ETP/FSDP layout. No conversion tool is run, and the GPT checkpoint on
+disk is never modified.
 
 The reverse mismatch is an error: loading a checkpoint that was saved by a
 hybrid run into a non-hybrid run raises a `RuntimeError` that directs you to the
@@ -119,12 +123,20 @@ Adam moments and fp32 master params for the attention and MLP layers carry over,
 enabling architecture-preserving continued training. Pass `--no-load-optim` to
 skip this and start every layer's optimizer state fresh.
 
-Loading optimizer state requires the GPT checkpoint to use a model-space
-distributed-optimizer format (`fully_reshardable` or `fully_sharded_model_space`,
-i.e. saved with `--ckpt-fully-parallel-save`). The bucket-space formats key
-optimizer state by a flat buffer layout that the extra hybrid layers reshuffle,
-so the run raises an error directing you to re-save the checkpoint or pass
+For `torch_dist`, loading optimizer state requires the GPT checkpoint to use a
+model-space distributed-optimizer format (`fully_reshardable` or
+`fully_sharded_model_space`, i.e. saved with
+`--dist-ckpt-optim-fully-reshardable`). The bucket-space formats key optimizer
+state by a flat buffer layout that the extra hybrid layers reshuffle, so the
+run raises an error directing you to re-save the checkpoint or pass
 `--no-load-optim`.
+
+For Megatron FSDP, save and load with `--ckpt-format fsdp_dtensor`. The loader
+retargets the explicit DTensor model keys and the model-parameter names used by
+the distributed optimizer, so model weights and optimizer state can be
+resharded across a different FSDP, TP, EP, or ETP layout during the automatic
+GPT-to-Hybrid load. This path is for Megatron FSDP; Torch FSDP2's `torch_dcp`
+format is not supported by this automatic translation.
 
 Layers without a GPT counterpart (for example Mamba `M` positions) have no
 optimizer state in the checkpoint; their moments start fresh, and the run prints
