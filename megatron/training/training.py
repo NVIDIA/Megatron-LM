@@ -54,7 +54,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1851,9 +1851,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for disable in per_chunk_disable_bucketing
         ]
 
-        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
-        #  capture support with DDP, but we sync it with the current stream to avoid races.
-        ddp_stream = torch.cuda.Stream()
+        # DDP initialization must use the full-iteration capture stream so its retained
+        # AccumulateGrad nodes do not reference a different, non-capturing stream.
+        ddp_stream = get_shared_capture_stream()
         # Wait for the default stream to complete before starting ddp_stream
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued

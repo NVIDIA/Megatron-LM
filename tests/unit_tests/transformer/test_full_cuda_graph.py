@@ -6,7 +6,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -16,6 +16,37 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
+    capture_stream = get_shared_capture_stream()
+    current_stream = torch.cuda.current_stream()
+    capture_stream.wait_stream(current_stream)
+
+    with torch.cuda.stream(capture_stream):
+        model = torch.nn.Linear(4, 4, device="cuda")
+        grad_accumulators = []
+        for param in model.parameters():
+            expanded_param = param.expand_as(param)
+            grad_accumulator = expanded_param.grad_fn.next_functions[0][0]
+            grad_accumulator.register_hook(lambda *_: None)
+            grad_accumulators.append(grad_accumulator)
+
+        static_input = torch.ones(2, 4, device="cuda")
+        model(static_input).sum().backward()
+        model.zero_grad(set_to_none=False)
+
+    current_stream.wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(cuda_graph, stream=capture_stream):
+        model(static_input).sum().backward()
+
+    cuda_graph.replay()
+    torch.cuda.synchronize()
+    assert all(param.grad is not None for param in model.parameters())
+    assert len(grad_accumulators) == len(list(model.parameters()))
 
 
 @pytest.mark.skipif(

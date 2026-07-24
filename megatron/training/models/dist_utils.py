@@ -1,19 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-
-
-logger = logging.getLogger(__name__)
-
 from typing import Any, Callable
 
 import torch
+
 from megatron.core import tensor_parallel
 from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
+from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 try:
@@ -35,6 +33,8 @@ try:
 except ImportError:
     correct_amax_history_if_needed = None
 
+
+logger = logging.getLogger(__name__)
 
 
 def unimodal_build_distributed_models(
@@ -293,10 +293,9 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    # DDP initialization is required to be on a side-stream for the full-iteration CUDA graph.
-    #  this side-stream may be nested if being called from within the get_model function, but it
-    #  is here in case someone wants to use this directly outside of get_model.
-    ddp_stream = torch.cuda.Stream()
+    # DDP initialization must use the full-iteration capture stream so its retained
+    # AccumulateGrad nodes do not reference a different, non-capturing stream.
+    ddp_stream = get_shared_capture_stream()
     ddp_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
