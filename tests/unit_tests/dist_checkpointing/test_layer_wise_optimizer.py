@@ -388,6 +388,87 @@ class TestLayerWiseOptimizer:
             save(optim_sd, ckpt_dir)
         Utils.destroy_model_parallel()
 
+    # NOTE: 'fully_sharded_model_space' is intentionally NOT covered here. It is incompatible with
+    # the decoupled compact LayerWise (Muon) DistOpt layout regardless of precision: the sibling
+    # embedding / output_layer params produce a flattened_range ShardedTensor that
+    # dist_checkpointing rejects ('ShardedTensor.flattened_range is not supported'). This was
+    # confirmed to fail identically for bf16 and fp8 (so it is NOT fp8-specific), and it raises
+    # non-uniformly across DP ranks, so it cannot be asserted cleanly in a distributed test. It is
+    # a pre-existing limitation, independent of the dp_reshardable empty-bucket fix.
+    @pytest.mark.parametrize('fp8', [False, True])
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
+    def test_decouple_ckpt_roundtrip_values(self, tmp_path_dist_ckpt, sharding_type, fp8):
+        """Value-level save/load round-trip of the decoupled compact LayerWise (Muon) optimizer,
+        for the ``dp_reshardable`` and ``fully_reshardable`` sharding formats, for both bf16 and
+        quantized FP8 (MXFP8) model params.
+
+        Correctness (not just "does not crash"): save optimizer A in ``sharding_type``, load it
+        into a differently seeded optimizer B, then assert B's optimizer state equals A's *by
+        value*. If the round-trip is faithful, B's fp32 master / exp_avg / exp_avg_sq must match
+        A's exactly.
+
+        The comparison is done through a padding-free *canonical view*: both A's and (post-load)
+        B's in-memory state are re-serialized with ``fully_reshardable`` (model-centric, no
+        padding, deterministic) and compared bitwise via ``load_plain_tensors`` + ``check_equal``.
+        This is required because ``dp_reshardable``'s own bucket-space checkpoint serializes
+        inter-param / empty-shard padding as uninitialized ``torch.empty`` (values discarded on
+        load), so two saves of identical state differ in the padding bytes and cannot be compared
+        directly. ``fully_reshardable`` has no such padding, so it is a faithful canonical view of
+        the real optimizer state for both formats under test.
+
+        The ``fp8`` axis covers the fp8 -> fp32-master path: FP8 changes model-param storage to a
+        Float8Tensor while optimizer state stays fp32, so the dequantize path
+        (``_is_distopt_quantized_param`` in distrib_optimizer.py) must round-trip. Both bf16 and
+        fp8 are exercised.
+        """
+        from megatron.core.dist_checkpointing import load_plain_tensors
+
+        Utils.initialize_model_parallel(1, 1)  # tp=pp=1 -> dp = world_size
+        metadata = {'distrib_optim_sharding_type': sharding_type}
+        # Padding-free canonical view used to compare optimizer state by value.
+        canonical = {'distrib_optim_sharding_type': 'fully_reshardable'}
+
+        def _build(seed):
+            kwargs = dict(
+                seed=seed,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                initialize_fn=initialize_gpt_model,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=True,
+            )
+            if fp8:
+                kwargs['fp8'] = True
+            return setup_model_and_optimizer(**kwargs)
+
+        tag = f'{"fp8" if fp8 else "bf16"}_{sharding_type}'
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_rt', sync=True) as rt_dir,
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_A', sync=True) as canon_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_B', sync=True) as canon_dir_B,
+        ):
+            # Save A in the format under test, load it into a differently seeded B.
+            model_A, optimizer_A = _build(2)
+            model_sd_A = model_A[0].sharded_state_dict()
+            save(optimizer_A.sharded_state_dict(model_sd_A, metadata=metadata), rt_dir)
+
+            model_B, optimizer_B = _build(3)
+            model_sd_B = model_B[0].sharded_state_dict()
+            load_sd = optimizer_B.sharded_state_dict(model_sd_B, is_loading=True, metadata=metadata)
+            optimizer_B.load_state_dict(load(load_sd, rt_dir))
+
+            # Compare A vs post-load B by value, through the padding-free canonical view.
+            save(optimizer_A.sharded_state_dict(model_sd_A, metadata=canonical), canon_dir_A)
+            save(optimizer_B.sharded_state_dict(model_sd_B, metadata=canonical), canon_dir_B)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(1, 1)
+            check_equal(load_plain_tensors(canon_dir_A), load_plain_tensors(canon_dir_B))
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     def test_layer_wise_optimizer_grad_norm(self, tp, pp):
