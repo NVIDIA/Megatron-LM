@@ -136,10 +136,11 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
+    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial", "overlap"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
     existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
-    steps before resolving finished requests."""
+    steps before resolving finished requests. "overlap" uses the same async scheduling path while
+    overlapping prepare/sample and forward/resolve phases."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
@@ -155,6 +156,9 @@ class InferenceSetupConfig:
     inference_cuda_graph_all_prefills: bool = False
     """Extend prefill/mixed CUDA graph capture up to `max_tokens`. By default, all graphs are
     limited by the decode limit of `max_requests * (num_speculative_tokens + 1)`."""
+
+    inference_cuda_graph_max_tokens: int = 512
+    """Token ceiling for the largest captured prefill/mixed CUDA graph (default: 512)."""
 
     # ---------------- Chunked prefill / speculation ----------------
 
@@ -340,6 +344,7 @@ class InferenceSetupConfig:
             ),
             use_cuda_graphs_for_non_decode_steps=not self.decode_only_cuda_graphs,
             cuda_graph_all_prefills=self.inference_cuda_graph_all_prefills,
+            cuda_graph_max_tokens=self.inference_cuda_graph_max_tokens,
             static_kv_memory_pointers=static_kv_memory_pointers,
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,

@@ -109,6 +109,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "ffn_hidden_size": 1856,
     "finalize_model_grads_func": None,
     "first_last_layers_bf16": False,
+    "flash_attention_version": None,
     "flash_decode": False,
     "fp16": False,
     "fp32_residual_connection": False,
@@ -337,6 +338,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
+    "moe_hybridep_pad_uneven_dispatch_inputs": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

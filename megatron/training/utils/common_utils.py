@@ -12,10 +12,10 @@ from typing import Optional
 
 import torch
 
+from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
-from megatron.core.msc_utils import open_file
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -496,14 +496,14 @@ def get_blend_and_blend_per_split(args):
     if use_data_path:
         if args.data_args_path is not None:
             assert args.data_path is None
-            with open_file(args.data_args_path, 'r') as f:
+            with maybe_msc.open(args.data_args_path, 'r') as f:
                 blend = get_blend_from_list(f.read().split())
         else:
             assert args.data_path is not None
             blend = get_blend_from_list(args.data_path)
     elif use_per_split_data_path:
         if args.per_split_data_args_path is not None:
-            with open_file(args.per_split_data_args_path, 'r') as f:
+            with maybe_msc.open(args.per_split_data_args_path, 'r') as f:
                 per_split_data_args = json.load(f)
                 # Each element in blend_per_split should be a list of files (and optional
                 # weights), so split string if needed.

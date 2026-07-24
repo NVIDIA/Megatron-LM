@@ -441,7 +441,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
-            input_ids, position_ids = self.controller._dynamic_step_context_init(
+            input_ids, position_ids, _ = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
             )
             # Progress.
@@ -993,11 +993,11 @@ class DynamicInferenceEngine(AbstractEngine):
         return self.requests[request_id].record[-1]
 
     def _validate_async_sched_support_for_config(self) -> None:
-        """Validate config-level restrictions for serial async scheduling.
+        """Validate config-level restrictions for async scheduling.
 
-        Raises if the config does not support serial async scheduling.
+        Raises if the config does not support async scheduling.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         model_config = self.controller.inference_wrapped_model.model.config
@@ -1017,12 +1017,12 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support routing replay.")
 
     def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
-        """Validate request-level restrictions for serial async scheduling.
+        """Validate request-level restrictions for async scheduling.
 
         Args:
             request (DynamicInferenceRequest): Request being added to the engine.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         sampling_params = request.sampling_params
