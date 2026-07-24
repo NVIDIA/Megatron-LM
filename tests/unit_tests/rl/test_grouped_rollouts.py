@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import itertools
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -86,6 +87,30 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
 
 
+class FilteringMockGenerator(MockGenerator):
+    """Mock generator whose first `num_degenerate` prepared groups have zero reward variance."""
+
+    def __init__(self, num_degenerate=0, **kwargs):
+        super().__init__(**kwargs)
+        self.num_degenerate = num_degenerate
+
+    async def prepare_group_rollout(self, request):
+        idx = self._call_count
+        params = await super().prepare_group_rollout(request)
+        degenerate = idx < self.num_degenerate
+        rollout_counter = itertools.count()
+        base_build = params.build_rollout
+
+        async def build_rollout(response):
+            rollout = await base_build(response)
+            rollout.reward = 0.0 if degenerate else float(next(rollout_counter))
+            return rollout
+
+        return GroupRolloutParams(
+            inference_request=params.inference_request, build_rollout=build_rollout
+        )
+
+
 class CountingRewardAgent(RewardOnlyAgent):
     """Minimal RewardOnlyAgent: prompts t0, t1, ... and reward = echoed index."""
 
@@ -130,28 +155,54 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "num_groups, submission_granularity, consumption_granularity",
+        "streaming, submission_granularity, consumption_granularity, num_degenerate",
         [
-            pytest.param(1, "B", "B", id="num_groups_1_batch"),
-            pytest.param(4, "G", "G", id="num_groups_gt_1_group"),
-            pytest.param(4, "R", "B", id="num_groups_gt_1_rollout"),
+            pytest.param(False, "B", "B", 3, id="batch_submission"),
+            pytest.param(False, "G", "B", 3, id="group_submission"),
+            pytest.param(False, "R", "B", 3, id="rollout_submission"),
+            pytest.param(False, "G", "G", 3, id="group_consumption"),
+            pytest.param(False, "B", "B", 9, id="cascading_regeneration"),
+            pytest.param(True, "B", "B", 3, id="streaming_batch_consume"),
+            pytest.param(True, "G", "G", 3, id="streaming_group_consume"),
         ],
     )
-    async def test_filter_groups_with_same_reward_rejected(
-        self, num_groups, submission_granularity, consumption_granularity
+    async def test_filter_groups_and_regenerate(
+        self, streaming, submission_granularity, consumption_granularity, num_degenerate
     ):
-        gen = MockGenerator(parallel_generation_tasks=8)
+        num_groups = 4
+        gen = FilteringMockGenerator(num_degenerate=num_degenerate, parallel_generation_tasks=8)
         request = GroupedRolloutRequest(
             num_groups=num_groups,
             rollouts_per_group=2,
             inference_interface=MockInferenceInterface(),
             filter_groups_with_same_reward=True,
+            streaming=streaming,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
         )
-        with pytest.raises(AssertionError, match="filter_groups_with_same_reward"):
-            async for _ in gen.get_grouped_rollouts(request):
-                pass
+
+        expected_count = 2 * num_groups if streaming else num_groups
+        groups, filtered_counts = [], []
+        async for group in gen.get_grouped_rollouts(request):
+            groups.append(group)
+            filtered_counts.append(gen._active_pipeline.filtered_count)
+            if streaming and len(groups) >= expected_count:
+                break
+
+        assert len(groups) == expected_count
+        # Every delivered group carries reward signal.
+        for group in groups:
+            assert np.std([rollout.reward for rollout in group]) > 1e-6
+        if consumption_granularity == "B":
+            # Batches complete and arrive in submission order despite drops.
+            assert [g.batch_id for g in groups] == sorted(g.batch_id for g in groups)
+            for batch_start in range(0, expected_count, num_groups):
+                batch = groups[batch_start : batch_start + num_groups]
+                assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
+        if not streaming:
+            # One extra prepare per dropped group, and no under-delivery.
+            assert gen.prepare_group_rollout_calls == num_groups + num_degenerate
+            assert filtered_counts[-1] == num_degenerate
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
