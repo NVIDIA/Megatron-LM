@@ -303,7 +303,7 @@ class InferenceConfig:
     """Whether to enable prefix caching for KV cache block sharing."""
 
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
-        PrefixCachingEvictionPolicy.REF_ZERO
+        PrefixCachingEvictionPolicy.LRU
     )
     """Eviction policy for prefix caching blocks. See `PrefixCachingEvictionPolicy` for options.
 

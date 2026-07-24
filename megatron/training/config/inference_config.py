@@ -174,10 +174,10 @@ class InferenceSetupConfig:
     """Enable/disable prefix caching for dynamic batching inference. When disabled, KV cache blocks
     cannot be shared between requests with identical prompt prefixes."""
 
-    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "ref_zero"
-    """Eviction policy for prefix caching blocks. "ref_zero" (default) immediately returns blocks to
-    the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
-    space is needed."""
+    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "lru"
+    """Eviction policy for prefix caching blocks. "lru" (default) keeps blocks cached and evicts
+    via LRU only when space is needed. "ref_zero" immediately returns blocks to the free pool when
+    ref_count hits 0."""
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
         "longest_prefix", "first_prefix_block", "load_balanced"

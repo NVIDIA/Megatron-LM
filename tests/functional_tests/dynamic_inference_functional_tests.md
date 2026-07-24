@@ -52,7 +52,7 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Feature | CLI Flag | Default | Notes |
 |---|---|---|---|
 | Enable prefix caching | `--inference-dynamic-batching-prefix-caching` | off | Reuse KV blocks for shared prompt prefixes |
-| Eviction policy | `--inference-dynamic-batching-prefix-caching-eviction-policy {ref_zero, lru}` | `ref_zero` | Block reclamation strategy |
+| Eviction policy | `--inference-dynamic-batching-prefix-caching-eviction-policy {ref_zero, lru}` | `lru` | Block reclamation strategy |
 | Coordinator routing | `--inference-dynamic-batching-prefix-caching-coordinator-policy {longest_prefix, first_prefix_block, load_balanced}` | `load_balanced` | Multi-rank request routing |
 | Routing alpha | `--inference-dynamic-batching-prefix-caching-routing-alpha` | 0.5 | 0=load-balance, 1=prefix-affinity |
 | Mamba state cache | `--inference-dynamic-batching-prefix-caching-mamba-gb` | — | GPU memory for Mamba hybrid block states |
@@ -192,7 +192,7 @@ I will generate golden values by running each test on cw-dfw and capturing `INFE
 
 | # | Test name | Feature exercised | Base size | Hardware | Priority |
 |---|---|---|---|---|---|
-| S1 | `gpt_dynamic_inference_tp1_pp1_583m_prefix_caching` | Prefix caching, default `ref_zero` eviction | 583M | 1 GPU | High |
+| S1 | `gpt_dynamic_inference_tp1_pp1_583m_prefix_caching` | Prefix caching, default `lru` eviction | 583M | 1 GPU | High |
 | S2 | `gpt_dynamic_inference_tp1_pp1_583m_prefix_caching_lru` | Prefix caching, `lru` eviction | 583M | 1 GPU | Medium |
 | S3 | `gpt_dynamic_inference_tp1_pp1_583m_mtp_speculative` | MTP with `--num-speculative-tokens=2` | 583M | 1 GPU | High — feature owner asked |
 | S4 | `gpt_dynamic_inference_tp1_pp1_583m_chunked_prefill` | Chunked prefill on GPT (currently only on hybrid) | 583M | 1 GPU | Medium |
