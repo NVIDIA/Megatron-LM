@@ -1956,13 +1956,13 @@ def _add_inference_args(parser):
                        'When disabled, KV cache blocks cannot be shared between '
                        'requests with identical prompt prefixes.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
-                       type=str, default='ref_zero',
+                       type=str, default='lru',
                        choices=['ref_zero', 'lru'],
                        dest='inference_dynamic_batching_prefix_caching_eviction_policy',
                        help='Eviction policy for prefix caching blocks. '
-                       '"ref_zero" (default) immediately returns blocks to the '
-                       'free pool when ref_count hits 0. "lru" keeps blocks '
-                       'cached and evicts via LRU only when space is needed.')
+                       '"lru" (default) keeps blocks cached and evicts via LRU '
+                       'only when space is needed. "ref_zero" immediately '
+                       'returns blocks to the free pool when ref_count hits 0.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
                        type=str, default='load_balanced',
                        choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],

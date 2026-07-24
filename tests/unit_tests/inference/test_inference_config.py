@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -48,6 +52,14 @@ class TestInferenceConfig:
         args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "overlap"])
         assert args.inference_dynamic_batching_async_sched_mode == "overlap"
 
+    def test_prefix_caching_eviction_policy_defaults_to_lru(self):
+        """Ensure prefix caching uses LRU eviction unless explicitly overridden."""
+        parser = _add_inference_args(ArgumentParser())
+        args = parser.parse_args([])
+
+        assert InferenceConfig().prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        assert args.inference_dynamic_batching_prefix_caching_eviction_policy == "lru"
+
     def test_inference_setup_config_maps_async_sched_mode(self):
         """Ensure declarative inference config maps async scheduling mode to runtime config."""
         model = SimpleNamespace(
@@ -67,3 +79,4 @@ class TestInferenceConfig:
         )
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.OVERLAP
+        assert inference_config.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
