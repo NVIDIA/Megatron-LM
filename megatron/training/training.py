@@ -1381,6 +1381,26 @@ def pretrain(
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
 
+    if args.hybrid_context_parallel:
+        _tp_pg = init_pg_collection.tp if init_pg_collection is not None else mpu.get_tensor_model_parallel_group()
+        if _tp_pg.rank() == 0:
+            assert train_data_iterator is not None, "train_data_iterator must be provided for TP0 rank before Dynamic CP wrapper"
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, model_cfg))
+        if isinstance(valid_data_iterator, list):
+            valid_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, model_cfg)) if v is not None else None
+                for v in valid_data_iterator
+            ]
+        elif valid_data_iterator is not None:
+            valid_data_iterator = iter(HybridCPDataLoaderWrapper(valid_data_iterator, model_cfg))
+        if isinstance(test_data_iterator, list):
+            test_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, model_cfg)) if v is not None else None
+                for v in test_data_iterator
+            ]
+        elif test_data_iterator is not None:
+            test_data_iterator = iter(HybridCPDataLoaderWrapper(test_data_iterator, model_cfg))
+
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
@@ -3387,9 +3407,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
