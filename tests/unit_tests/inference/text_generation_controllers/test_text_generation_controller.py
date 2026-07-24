@@ -1153,7 +1153,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             assert (
                 len(request.segments)
                 == len(request.prompt_log_probs) + len(request.generated_log_probs) + 1
-            ), "Segments should be returned for both prompt and generated tokens"
+            ), f"Segments should be returned for both prompt and generated tokens: {request}"
             assert len(request.prompt) + len(request.generated_text) == len(
                 request.text
             ), "Output text should include prompts and generations"
@@ -2352,6 +2352,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
             pipeline_model_parallel_size=pipeline_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
         )
         super().setup_model(
             dtype,
@@ -2521,3 +2522,121 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 assert (
                     expected == actual
                 ), f"Rank {i} tokens differ from rank {local_rank} tokens for request {j}"
+
+    @pytest.mark.parametrize("static", [True, False])
+    @pytest.mark.parametrize("enable_prefix_caching", [True, False])
+    def test_sampled_tokens_dp_mismatch(self, static, enable_prefix_caching):
+        """
+        TextGenerationController should generate different tokens
+        on every DP rank given the same prompt / request.
+        """
+        if not static and not is_fa_min_version("2.7.3"):
+            pytest.skip(reason="Need latest flash attn for dynamic batching")
+
+        self.setup_model(
+            dtype=torch.bfloat16,
+            # Set all model parallelisms to 1.
+            # No rank should shard the model.
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            # Test all batching and balancing strategies.
+            static=static,
+            enable_prefix_caching=enable_prefix_caching,
+            # Set a random seed for generation, so we can
+            # verify that different DP ranks produce disparate
+            # generations given the DP rank seed offset.
+            # Without this, generations will always be random
+            # and we don't be able to verify DP disparity.
+            use_training_random_init=True,
+        )
+        # Ensure only data parallelism is used. This is critical since
+        # we expect generation parity across model parallel ranks.
+        dp_size = parallel_state.get_data_parallel_group().size()
+        assert (
+            dp_size == torch.distributed.get_world_size()
+        ), "[test_sampled_tokens_dp_mismatch] Expected DP size to match WORLD size for this DP disparity test."
+
+        # Prepare requests.
+        active_requests: Dict[str, InferenceRequest] = OrderedDict()
+        for i in range(self.batch_size):
+            # Create a batch of constant prompts to test DP disparity.
+            # Same inputs should produce different outputs.
+            prompt = "sample" * (i + 1)
+            prompt_tokens = [1] * (i + 1)
+            request_id = str(i)
+            inference_request = InferenceRequest(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params=SamplingParams(
+                    top_k=10, num_tokens_to_generate=25, return_log_probs=True
+                ),
+                arrival_time=time.time(),
+                prompt_tokens=prompt_tokens,
+                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+            )
+            active_requests[request_id] = inference_request
+
+        # Generate tokens for each sample of the batch.
+        if static:
+            # Static batching requires dummy metadata and functions.
+            self.mock_tokenizer.vocab_size = self.vocab_size
+            self.mock_tokenizer.eod = self.vocab_size - 1
+            self.mock_tokenizer.detokenize.side_effect = (
+                lambda x, skip_special_tokens=False: ' '.join(
+                    [
+                        ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                        for _ in range(len(x))
+                    ]
+                )
+            )
+            self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+                i for i, c in enumerate(s) if c == ' '
+            ] + [len(s)]
+
+            # Generate.
+            requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
+                active_requests
+            )
+            all_generated_tokens = [req.generated_tokens.tolist() for req in requests.values()]
+        else:
+            all_generated_tokens = [[] for _ in range(len(active_requests))]
+            context = self.text_generation_controller.inference_wrapped_model.inference_context
+            for request_id, request in active_requests.items():
+                context.add_request(
+                    DynamicInferenceRequest(
+                        request_id=int(request_id),
+                        prompt_tokens=torch.tensor(
+                            request.prompt_tokens,
+                            dtype=torch.long,
+                            device=torch.cuda.current_device(),
+                        ),
+                        sampling_params=SamplingParams(
+                            top_k=10, return_log_probs=True, num_tokens_to_generate=25
+                        ),
+                    )
+                )
+            expected_active_requests = set(int(x) for x in active_requests.keys())
+            while context.has_unfinished_requests():
+                result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
+                new_tokens = result["sample"]
+                active_ids = result["active_request_ids"].tolist()
+                finished_ids = result["finished_request_ids"].tolist()
+                assert len(new_tokens) == len(expected_active_requests)
+                assert set(active_ids) == expected_active_requests
+                expected_active_requests -= set(finished_ids)
+                for i, token in enumerate(new_tokens.tolist()):
+                    all_generated_tokens[i].append(token)
+
+            # Wait for all requests on all host ranks to complete before proceeding.
+            torch.distributed.barrier()
+
+        # All-gather the generated tokens on every DP rank.
+        all_dp_generated_tokens = [None] * dp_size
+        torch.distributed.all_gather_object(all_dp_generated_tokens, all_generated_tokens)
+        for i in range(self.batch_size):
+            # Get the i-th generation for each DP rank.
+            dp_batch = [tuple(batch[i]) for batch in all_dp_generated_tokens]
+            assert len(set(dp_batch)) == len(
+                dp_batch
+            ), "Detected duplicate generations across DP ranks."

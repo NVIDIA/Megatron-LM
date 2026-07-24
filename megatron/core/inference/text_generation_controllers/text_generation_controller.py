@@ -142,8 +142,10 @@ class TextGenerationController:
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             self.pp_group = pg_collection.pp
+            self.dp_group = pg_collection.dp
         else:
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
+            self.dp_group = parallel_state.get_data_parallel_group()
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
@@ -155,8 +157,20 @@ class TextGenerationController:
         else:
             self.vocab_size = unwrapped_model.vocab_size
 
+        # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
+        # unique generation seed (avoids identical samples when the same prompt is
+        # assigned to multiple DP ranks, which can corrupt RL training). Controlled by
+        # InferenceConfig.offset_sampling_seed_by_dp_rank, but deactivated when enabling
+        # --deterministic-mode (model_config.deterministic_mode).
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
+        seed = self.model_config.inference_sampling_seed
+        offset_by_dp = (
+            inference_config.offset_sampling_seed_by_dp_rank
+            and not self.model_config.deterministic_mode
+        )
+        if offset_by_dp:
+            seed += torch.distributed.get_rank(group=self.dp_group)
+        self.sampling_rng.manual_seed(seed)
 
         if not self.num_speculative_tokens:
             self.num_mtp_depths = 0
@@ -2901,11 +2915,11 @@ class TextGenerationController:
 
             request.status = Status.COMPLETED
 
+            # Detokenize up to input_prompt_length + required_sequence_length for this idx.
+            sequence_length = input_prompt_length + required_sequence_length
             text, segments = self.detokenize_generations(
-                batch_prompt_tokens_with_generations[
-                    idx, : (input_prompt_length + required_sequence_length)
-                ],
-                input_prompt_length + generated_sequence_lengths,
+                batch_prompt_tokens_with_generations[idx, :sequence_length],
+                torch.tensor([sequence_length], device=batch_prompt_tokens_with_generations.device),
                 sampling_params.return_segments,
             )
             request.text = text  # Inference server returns prompts & generations together

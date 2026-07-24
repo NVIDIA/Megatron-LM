@@ -136,6 +136,11 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
+    offset_sampling_seed_by_dp_rank: bool = True
+    """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
+    generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
+    --deterministic-mode is enabled."""
+
     inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial", "overlap"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
     existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
@@ -373,6 +378,7 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
+            offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(
                 self.inference_dynamic_batching_async_sched_mode
             ),

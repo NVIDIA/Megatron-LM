@@ -2013,6 +2013,11 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--use-same-sampling-seed-across-dp-ranks',
+                       action='store_false', dest='offset_sampling_seed_by_dp_rank',
+                       default=True,
+                       help='Use the same inference sampling seed on every data-parallel rank. '
+                            '--deterministic-mode also uses the same seed on every DP rank.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='legacy',
                        choices=['legacy', 'serial', 'overlap'],
