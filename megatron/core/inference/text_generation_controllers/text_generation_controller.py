@@ -2127,10 +2127,21 @@ class TextGenerationController:
 
         range_push("sampling")
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
+        logits = self._all_logits_cuda.squeeze(0)[:active_request_count]
+        # ``torch.max`` requires the values ``out`` tensor to share the input's
+        # dtype. ``_all_logits_cuda`` is ``params_dtype`` under CUDA graphs (where
+        # logits are copied into the preallocated buffer) but the model's raw
+        # output dtype (commonly fp32) in eager mode, so the preallocated
+        # ``params_dtype`` scratch would mismatch. The values are discarded here
+        # (only the argmax token ids are used), so size the scratch to match the
+        # logits dtype instead of relying on the preallocated buffer's dtype.
+        sample_values_gpu = self._async_sched_sample_values_cuda[:active_request_count]
+        if sample_values_gpu.dtype != logits.dtype:
+            sample_values_gpu = logits.new_empty(active_request_count)
         torch.max(
-            self._all_logits_cuda.squeeze(0)[:active_request_count],
+            logits,
             dim=-1,
-            out=(self._async_sched_sample_values_cuda[:active_request_count], sampled_tokens_gpu),
+            out=(sample_values_gpu, sampled_tokens_gpu),
         )
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
