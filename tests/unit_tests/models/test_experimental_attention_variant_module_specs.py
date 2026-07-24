@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,6 +44,10 @@ class _FakeQKNorm:
 
 
 class _FakeCoreAttention:
+    pass
+
+
+class _FakeBatchedLinear:
     pass
 
 
@@ -401,6 +406,55 @@ class TestGetDsaModuleSpec:
         # column_parallel_linear() is called exactly 3 times (q_proj, q_up_proj, kv_up_proj)
         assert backend.column_parallel_linear.call_count == 3
         assert backend.row_parallel_linear.call_count == 1
+
+
+# ===================================================================
+# Tests for get_dsv4_hybrid_module_spec_for_backend
+# ===================================================================
+
+
+class TestGetDSv4HybridModuleSpec:
+    MODULE = "megatron.core.models.gpt.experimental_attention_variant_module_specs"
+
+    @staticmethod
+    def _config():
+        return _make_config(
+            multi_latent_attention=True,
+            qk_l2_norm=False,
+            qk_layernorm=True,
+            experimental_attention_variant="dsv4_hybrid",
+        )
+
+    def _call(self):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_dsv4_hybrid_module_spec_for_backend,
+        )
+
+        return get_dsv4_hybrid_module_spec_for_backend(
+            config=self._config(), backend=_make_backend()
+        )
+
+    def test_uses_te_batched_linear_when_available(self):
+        """The canonical DSv4 spec should select TE's BatchedLinear module."""
+        fake_te = SimpleNamespace(pytorch=SimpleNamespace(BatchedLinear=_FakeBatchedLinear))
+        with (
+            patch(f"{self.MODULE}.HAVE_TE", True),
+            patch(f"{self.MODULE}.te", fake_te, create=True),
+        ):
+            spec = self._call()
+
+        assert spec.submodules.linear_o_group_proj is _FakeBatchedLinear
+
+    def test_sets_none_when_te_batched_linear_is_unavailable(self):
+        """Old TE installations should leave construction to the einsum fallback."""
+        fake_te = SimpleNamespace(pytorch=SimpleNamespace())
+        with (
+            patch(f"{self.MODULE}.HAVE_TE", True),
+            patch(f"{self.MODULE}.te", fake_te, create=True),
+        ):
+            spec = self._call()
+
+        assert spec.submodules.linear_o_group_proj is None
 
 
 # ===================================================================
