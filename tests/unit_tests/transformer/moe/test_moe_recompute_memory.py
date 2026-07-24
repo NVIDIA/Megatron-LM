@@ -69,14 +69,17 @@ def measure_peak_memory(fn, *args, **kwargs):
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
 
     result = fn(*args, **kwargs)
+    torch.cuda.synchronize()
 
     peak_mb = torch.cuda.max_memory_allocated() / 1024**2
     retained_mb = torch.cuda.memory_allocated() / 1024**2
     return result, peak_mb, retained_mb
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
     "num_permuted_tokens, num_total_tokens, hidden_size, ffn_hidden",
     [
@@ -97,52 +100,50 @@ def test_moe_recompute_memory_reduction(
     from scatter_add_ can accumulate if not explicitly freed.
     """
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-
     device = torch.device("cuda")
     dtype = torch.bfloat16
-
-    # Create random data simulating permuted MoE tokens
-    permuted_tokens = torch.randn(
-        num_permuted_tokens, hidden_size, device=device, dtype=dtype, requires_grad=True
-    )
-    sorted_indices = torch.randint(0, num_total_tokens, (num_permuted_tokens,), device=device)
     restore_shape = torch.Size((num_total_tokens, hidden_size))
 
-    # Random target for loss
-    target = torch.randn(num_total_tokens, hidden_size, device=device, dtype=dtype)
+    def build_inputs():
+        # Fresh tensors per measurement so grads from the other path do not leak.
+        permuted_tokens = torch.randn(
+            num_permuted_tokens, hidden_size, device=device, dtype=dtype, requires_grad=True
+        )
+        sorted_indices = torch.randint(0, num_total_tokens, (num_permuted_tokens,), device=device)
+        target = torch.randn(num_total_tokens, hidden_size, device=device, dtype=dtype)
+        return permuted_tokens, sorted_indices, target
 
-    def compute_loss_and_backward(layer, grad_scaler=1.0):
+    def build_layer(unpermute_fn):
+        # Must match activation dtype: Linear defaults to float32 weights.
+        # CI failure was: mat1 BFloat16 vs mat2 Float.
+        return MoELayer(hidden_size, ffn_hidden, unpermute_fn).to(device=device, dtype=dtype)
+
+    def compute_loss_and_backward(layer, permuted_tokens, sorted_indices, target):
         """Simulate one MoE step with full recompute."""
-        # Wrap in checkpoint to simulate full recomputation
         output = torch.utils.checkpoint.checkpoint(
             layer, permuted_tokens, sorted_indices, restore_shape, use_reentrant=False
         )
         loss = torch.nn.functional.mse_loss(output, target)
-        scaled_loss = loss * grad_scaler
-        scaled_loss.backward()
+        loss.backward()
         return loss.item()
 
     # Measure with del (fix)
-    layer_with_del = MoELayer(hidden_size, ffn_hidden, unpermute_with_del).to(device)
-    layer_with_del.ffn[0].weight.requires_grad_(True)
-    layer_with_del.ffn[2].weight.requires_grad_(True)
-
+    permuted_tokens, sorted_indices, target = build_inputs()
+    layer_with_del = build_layer(unpermute_with_del)
     _, peak_with_del, retained_with_del = measure_peak_memory(
-        compute_loss_and_backward, layer_with_del
+        compute_loss_and_backward, layer_with_del, permuted_tokens, sorted_indices, target
     )
 
-    del layer_with_del
+    del layer_with_del, permuted_tokens, sorted_indices, target
     torch.cuda.empty_cache()
     gc.collect()
 
     # Measure without del (baseline / original behavior)
-    layer_no_del = MoELayer(hidden_size, ffn_hidden, unpermute_without_del).to(device)
-    layer_no_del.ffn[0].weight.requires_grad_(True)
-    layer_no_del.ffn[2].weight.requires_grad_(True)
-
-    _, peak_no_del, retained_no_del = measure_peak_memory(compute_loss_and_backward, layer_no_del)
+    permuted_tokens, sorted_indices, target = build_inputs()
+    layer_no_del = build_layer(unpermute_without_del)
+    _, peak_no_del, retained_no_del = measure_peak_memory(
+        compute_loss_and_backward, layer_no_del, permuted_tokens, sorted_indices, target
+    )
 
     print(
         f"\n[scale={num_permuted_tokens}x{hidden_size}] "
