@@ -70,11 +70,116 @@ treated as a new architecture and benchmarked independently.
 
 ## 2. How to Convert a Checkpoint
 
-Use
-[`tools/checkpoint/gpt_hybrid_conversion.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/checkpoint/gpt_hybrid_conversion.py)
-to convert a `GPTModel` checkpoint directly to `HybridModel` state-dict keys.
+There are two ways to bring `GPTModel` weights into a `HybridModel` run. Both
+stay in Megatron's distributed-checkpoint format and can reshard across a
+different tensor, pipeline, expert, or FSDP layout on the following load.
 
-### Choose an architecture-preserving pattern
+- **Option A — translate at load time (no separate step).** Start the hybrid
+  run directly against the GPT checkpoint. The hybrid model retargets its own
+  checkpoint state dict at the GPT checkpoint's keys during loading, so no
+  second copy is written to disk. This supports both `torch_dist` checkpoints
+  and Megatron-FSDP `fsdp_dtensor` checkpoints, including their optimizer
+  state. This path also supports patterns that contain layer families with no
+  GPT counterpart, such as Mamba (`M`) positions, which keep their fresh
+  initialization.
+- **Option B — convert offline to a new checkpoint.** Use
+  [`tools/checkpoint/gpt_hybrid_conversion.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/checkpoint/gpt_hybrid_conversion.py)
+  to write a standalone `HybridModel` checkpoint whose keys already match the
+  hybrid layout. Use this when you need a persisted hybrid checkpoint, an
+  architecture-preserving `*-` or `*E` copy, or a target you can inspect before
+  training. This path only supports `*-` and `*E` layouts.
+
+### Option A: Translate at load time
+
+Load-time translation is handled by
+[`megatron/core/dist_checkpointing/gpt_checkpoint_interop.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/dist_checkpointing/gpt_checkpoint_interop.py).
+It triggers automatically when a non-hybrid (GPT) checkpoint is loaded into a
+`HybridModel` run: for `torch_dist`, the run's model and optimizer sharded
+state dicts are rewritten into the GPT checkpoint's homogeneous-layer format;
+for `fsdp_dtensor`, their explicit parameter-name mappings are rewritten onto
+the GPT keys before Torch DCP planning. The checkpoint is read directly, and
+the weights and optimizer state are resharded to the current
+TP/PP/EP/ETP/FSDP layout. No conversion tool is run, and the GPT checkpoint on
+disk is never modified.
+
+The reverse mismatch is an error: loading a checkpoint that was saved by a
+hybrid run into a non-hybrid run raises a `RuntimeError` that directs you to the
+hybrid training entrypoint.
+
+#### Set the required flags
+
+When the hybrid run loads a GPT checkpoint, it must set:
+
+- `--hybrid-layer-pattern` — pairs the checkpoint's layers with hybrid layer
+  positions. Without it the load is rejected.
+- `--finetune` — the hybrid architecture has a different layer count than the
+  GPT checkpoint, so iteration bookkeeping and the LR schedule restart fresh.
+  The load is rejected without it.
+- `--pretrained-checkpoint` pointing at the GPT checkpoint root (see
+  [Section 3](#3-how-to-train-a-model)).
+
+By default the GPT run's **optimizer state is also translated and loaded** —
+Adam moments and fp32 master params for the attention and MLP layers carry over,
+enabling architecture-preserving continued training. Pass `--no-load-optim` to
+skip this and start every layer's optimizer state fresh.
+
+For `torch_dist`, loading optimizer state requires the GPT checkpoint to use a
+model-space distributed-optimizer format (`fully_reshardable` or
+`fully_sharded_model_space`, i.e. saved with
+`--dist-ckpt-optim-fully-reshardable`). The bucket-space formats key optimizer
+state by a flat buffer layout that the extra hybrid layers reshuffle, so the
+run raises an error directing you to re-save the checkpoint or pass
+`--no-load-optim`.
+
+For Megatron FSDP, save and load with `--ckpt-format fsdp_dtensor`. The loader
+retargets the explicit DTensor model keys and the model-parameter names used by
+the distributed optimizer, so model weights and optimizer state can be
+resharded across a different FSDP, TP, EP, or ETP layout during the automatic
+GPT-to-Hybrid load. This path is for Megatron FSDP; Torch FSDP2's `torch_dcp`
+format is not supported by this automatic translation.
+
+Layers without a GPT counterpart (for example Mamba `M` positions) have no
+optimizer state in the checkpoint; their moments start fresh, and the run prints
+a warning naming how many layers are affected. Everything else — iteration
+count, LR schedule, RNG, and rerun state — restarts fresh under `--finetune`.
+
+#### Supported patterns and key mapping
+
+The main pattern (the part before any `/` MTP suffix, with `|` pipeline
+separators ignored) may contain:
+
+| Symbol | Source of weights |
+|--------|-------------------|
+| `*` | GPT `self_attention` sub-module of the paired layer |
+| `-` or `E` | GPT `mlp` sub-module of the paired layer (MoE tensors also live under `mlp.*`) |
+| `M` | No GPT source; the Mamba layer keeps its fresh initialization |
+
+Parameters are paired by occurrence: the *i*-th `*` position takes GPT layer
+*i*'s attention, and the *i*-th `-`/`E` position takes GPT layer *i*'s MLP.
+`decoder.final_norm` is loaded from GPT's `decoder.final_layernorm`, and
+embedding and output weights are copied unchanged.
+
+Because each GPT layer supplies exactly one attention and one MLP sub-module,
+the loader rejects a pattern that:
+
+- contains MTP layers (a `/...` suffix), which have no GPT source weights;
+- uses a layer type it cannot translate, such as GDN (`G`) or DeepSeek Sparse
+  Attention (`D`), whose weight layouts differ from GPT attention;
+- mixes dense (`-`) and MoE (`E`) MLP positions in one pattern; or
+- has an unequal or zero number of `*` and MLP positions.
+
+The checkpoint's `num_layers` must equal the number of `*` positions in the
+pattern; a mismatch is rejected.
+
+```{warning}
+Optimizer loading warm-starts the Adam moments and fp32 master params only; RNG,
+rerun, iteration, and LR-schedule state restart fresh under `--finetune`. Pass
+`--no-load-optim` for a pure weights-only load (as the offline tool produces).
+```
+
+### Option B: Convert offline with `gpt_hybrid_conversion.py`
+
+#### Choose an architecture-preserving pattern
 
 For a source checkpoint with *N* GPT layers:
 
@@ -90,7 +195,7 @@ The converter maps parameters by occurrence, not merely by numeric layer index:
 | Embedding and output weights | Copied without changing their model role |
 | `decoder.final_layernorm` | Renamed to `decoder.final_norm` |
 
-### Check the prerequisites
+#### Check the prerequisites
 
 The source must use one of these distributed-checkpoint formats:
 
@@ -117,7 +222,7 @@ not constitute a converted optimizer or RNG state. Start the converted model
 with a fresh optimizer and RNG state.
 ```
 
-### Run the conversion
+#### Run the conversion
 
 The following example converts a four-layer dense GPT model. Its equivalent
 HybridModel has the eight-layer pattern `*-*-*-*-`:
@@ -172,11 +277,19 @@ Start with the command that trained the GPT model and make these changes:
    parser derives `num_layers` from the pattern.
 3. Select the HybridModel stack specification with
    `--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec`.
-4. Load the converted weights with a fresh optimizer and write new training
-   checkpoints to a separate directory. Set `--ckpt-format` to the converter's
-   `torch_dist` or `fsdp_dtensor` output format.
+4. Point `--pretrained-checkpoint` at the pretrained weights and write new
+   training checkpoints to a separate directory:
+   - With **Option A (load-time translation)**, point
+     `--pretrained-checkpoint` directly at the *GPT* checkpoint and add
+     `--finetune`. The optimizer state is loaded by default; add
+     `--no-load-optim` only if you want a fresh optimizer. No offline conversion
+     is needed.
+   - With **Option B (offline conversion)**, point `--pretrained-checkpoint` at
+     the converted *hybrid* checkpoint. Set `--ckpt-format` to the converter's
+     `torch_dist` or `fsdp_dtensor` output format.
 
-A minimal migration of the model and checkpoint arguments looks like this:
+A minimal Option A migration — loading the GPT checkpoint and its optimizer
+state directly for architecture-preserving continued training — looks like this:
 
 ```diff
 - torchrun --nproc_per_node=8 pretrain_gpt.py \
@@ -185,10 +298,16 @@ A minimal migration of the model and checkpoint arguments looks like this:
 -     --save /path/to/gpt-checkpoints
 + torchrun --nproc_per_node=8 pretrain_hybrid.py \
 +     --hybrid-layer-pattern '*-*-*-*-' \
-+     --pretrained-checkpoint /path/to/hybrid-checkpoints \  # first-time only
++     --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
++     --pretrained-checkpoint /path/to/gpt-checkpoints \  # first-time only
++     --finetune \
 +     --load /path/to/new-training-checkpoints \
 +     --save /path/to/new-training-checkpoints
 ```
+
+For Option B, point `--pretrained-checkpoint` at the converted hybrid
+checkpoint instead; `--finetune` is not required because the converted
+checkpoint already matches the hybrid layout.
 
 Keep the existing architecture, optimizer, precision, data, and basic
 TP/DP/EP/CP arguments unless this guide identifies a required change. Review
@@ -200,10 +319,12 @@ A GPT training workflow that uses fill-in-the-middle data needs a custom dataset
 path or equivalent Hybrid entry-point support before migration.
 ```
 
-With an empty `--load` directory, `--pretrained-checkpoint` loads the converted
-weights with finetuning semantics: iteration starts at zero, and optimizer and
-RNG state are not restored. After the job writes a checkpoint to `--load`, later
-launches resume the new HybridModel training state normally.
+With an empty `--load` directory, `--pretrained-checkpoint` loads the pretrained
+weights with finetuning semantics: iteration starts at zero and RNG state is not
+restored. For Option A the optimizer state is still warm-started unless
+`--no-load-optim` is set (Option B always starts with a fresh optimizer). After
+the job writes a checkpoint to `--load`, later launches resume the new
+HybridModel training state normally.
 
 ### Train from scratch
 
