@@ -718,7 +718,11 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_input, "can_skip_replay_copy", False
             ) and getattr(user_input, "can_skip_replay_copy", True)
 
-            if can_skip_replay_copy:
+            # when the same input (like cu_seqlens) is passed to multiple cudagraphs, the first
+            # cudagraph will copy the it into the corresponding cudagraph_input. Subsequent
+            # cudagraphs will read the same cudagraph_input, leading to a case where the passed 
+            # tensor doesn't need to be copied despite having a different data_ptr
+            if can_skip_replay_copy and cudagraph_input.cg_buffer_metadata.input_use_count == 1:
                 assert user_input.data_ptr() == cudagraph_input.data_ptr()
             elif user_input.data_ptr() != cudagraph_input.data_ptr():
                 cudagraph_input.copy_(user_input)
