@@ -2296,6 +2296,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
 
         hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
+        self.mlp_norm_manager = None
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
