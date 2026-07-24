@@ -10,7 +10,7 @@ from typing import Optional
 import click
 import nemo_run as run
 
-from tests.test_utils.python_scripts import recipe_parser
+from tests.test_utils.python_scripts import flaky_failure, recipe_parser
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,37 +19,8 @@ logger = logging.getLogger(__name__)
 def is_flaky_failure(concat_allranks_logs: str) -> bool:
     """Assumes that certain keywords hint towards intermittent failures"""
 
-    return (
-        "The server socket has failed to listen on any local network address."
-        in concat_allranks_logs
-        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
-        or "uncorrectable ECC error encountered" in concat_allranks_logs
-        or "illegal memory access" in concat_allranks_logs
-        or "illegal instruction" in concat_allranks_logs
-        or "torch.distributed.DistNetworkError" in concat_allranks_logs
-        or "Segmentation fault" in concat_allranks_logs
-        or "found NaN in" in concat_allranks_logs
-        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
-        or "double free or corruption" in concat_allranks_logs
-        or "Call to CUDA function failed." in concat_allranks_logs
-        or "Connection reset by peer" in concat_allranks_logs
-        or "invalid pointer" in concat_allranks_logs
-        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
-        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
-        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
-        or "Unpack failed: incomplete input" in concat_allranks_logs
-        or "The read operation timed out" in concat_allranks_logs
-        or "Read timed out" in concat_allranks_logs
-        or "TimeoutError" in concat_allranks_logs
-        or "Connection broken" in concat_allranks_logs
-        or "Temporary failure in name resolution" in concat_allranks_logs
-        or "unspecified launch failure" in concat_allranks_logs
-        or "free(): corrupted unsorted chunks" in concat_allranks_logs
-        or "Segfault encountered" in concat_allranks_logs
-        or "The following metrics failed" in concat_allranks_logs
-        or "removal of container" in concat_allranks_logs
-        or "is already in progress" in concat_allranks_logs
-        or "Error deleting container" in concat_allranks_logs
+    return flaky_failure.is_flaky_failure(
+        concat_allranks_logs, extra_patterns=flaky_failure.NEMO_RUN_EXTRA_FLAKY_FAILURE_PATTERNS
     )
 
 
