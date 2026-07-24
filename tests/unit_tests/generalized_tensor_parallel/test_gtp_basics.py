@@ -32,7 +32,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from megatron.core.tensor_parallel.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
@@ -521,7 +521,7 @@ def _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe):
     """
     from transformer_engine.pytorch import fp8_model_init
 
-    from megatron.core.tensor_parallel.gtp import (
+    from megatron.core.tensor_parallel.gtp_api import (
         attach_gtp_to_presharded_module,
         gtp_remat_shard_dim0,
     )

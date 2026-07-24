@@ -399,7 +399,7 @@ def _gtp_pre_init(
     rank's final shard stays alignment-divisible. Padding the full ``out_features`` would leave the
     post-TP-split shard mis-aligned (MXFP8 needs dims divisible by 32).
     """
-    from megatron.core.tensor_parallel.gtp import gtp_remat_shard_dim0
+    from megatron.core.tensor_parallel.gtp_api import gtp_remat_shard_dim0
     from megatron.core.tensor_parallel.random import get_gtp_remat_rng_tracker_name
 
     assert (
@@ -422,7 +422,7 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
 
     ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
     """
-    from megatron.core.tensor_parallel.gtp import attach_gtp_to_presharded_module
+    from megatron.core.tensor_parallel.gtp_api import attach_gtp_to_presharded_module
 
     gtp_remat_group, pad_length, logical_out_features = gtp_ctx
     # Restore the LOGICAL out_features (the sharded value was only needed to size the weight in

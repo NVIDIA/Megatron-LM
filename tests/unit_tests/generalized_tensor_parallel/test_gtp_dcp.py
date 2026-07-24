@@ -15,7 +15,7 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.tensor_parallel.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TE with hook registry", allow_module_level=True)
@@ -45,7 +45,7 @@ from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # no
     update_gtp_config,
     wrap_module_params_gtp,
 )
-from megatron.core.tensor_parallel.gtp import (  # noqa: E402
+from megatron.core.tensor_parallel.gtp_api import (  # noqa: E402
     attach_gtp_to_presharded_module,
     dequantize_gtp_native_fp8,
     gtp_native_fp8_load_context,

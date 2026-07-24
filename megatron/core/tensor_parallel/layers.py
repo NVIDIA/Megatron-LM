@@ -312,7 +312,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             required_pgs=["gtp_remat"]
         ).gtp_remat
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
-            from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
+            from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
             wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
             self.gtp_remat_size = gtp_remat_group.size()
@@ -338,7 +338,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         weight = self.weight
         if self.gtp_remat_size > 1:
-            from megatron.core.tensor_parallel.gtp import GTPEmbeddingWeight
+            from megatron.core.tensor_parallel.gtp_api import GTPEmbeddingWeight
 
             weight = GTPEmbeddingWeight.apply(self.weight)
 
@@ -1014,7 +1014,7 @@ class ColumnParallelLinear(torch.nn.Module):
         )
         gtp_remat_group = _pg.expt_gtp_remat if self.is_expert else _pg.gtp_remat
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
-            from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
+            from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
             wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
             self.gtp_remat_size = gtp_remat_group.size()
@@ -1374,7 +1374,7 @@ class RowParallelLinear(torch.nn.Module):
         )
         gtp_remat_group = _pg.expt_gtp_remat if self.is_expert else _pg.gtp_remat
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
-            from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
+            from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
             wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
             self.gtp_remat_size = gtp_remat_group.size()

@@ -876,7 +876,7 @@ def _backfill_gtp_sharded_param_map(
     No-op when GTP is unavailable or when every param already matched.
     """
     try:
-        from megatron.core.tensor_parallel.gtp import (
+        from megatron.core.tensor_parallel.gtp_api import (
             is_gtp_param,
             make_sharded_tensors_for_checkpoint_with_gtp_remat,
         )

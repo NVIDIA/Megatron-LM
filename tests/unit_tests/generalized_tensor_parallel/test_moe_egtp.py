@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.tensor_parallel.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)

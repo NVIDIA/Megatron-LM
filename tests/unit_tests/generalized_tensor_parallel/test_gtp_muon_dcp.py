@@ -118,7 +118,7 @@ class TestGTPMuonDCP:
 
         import pytest
 
-        from megatron.core.tensor_parallel.gtp import HAVE_GTP
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
         if not HAVE_GTP:
             pytest.skip("GTP requires TE with hook registry")
@@ -227,7 +227,7 @@ class TestGTPMuonDCP:
 
         import pytest
 
-        from megatron.core.tensor_parallel.gtp import HAVE_GTP
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
         from tests.unit_tests.dist_checkpointing import utils as _dc_utils
         from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
 

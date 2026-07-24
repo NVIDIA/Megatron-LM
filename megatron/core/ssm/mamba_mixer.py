@@ -29,7 +29,7 @@ from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
-from megatron.core.tensor_parallel.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -48,7 +48,7 @@ from megatron.core.utils import (
 )
 
 if HAVE_GTP:
-    from megatron.core.tensor_parallel.gtp import is_gtp_param
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
 else:
     is_gtp_param = None
 

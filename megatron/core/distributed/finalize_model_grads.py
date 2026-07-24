@@ -613,7 +613,9 @@ def finalize_model_grads(
 
     # Fence the current stream against all GTP backward grad work before the DP gradient sync.
     if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:
-        from megatron.core.tensor_parallel.gtp import wait_for_gtp_grad_reduction_on_current_stream
+        from megatron.core.tensor_parallel.gtp_api import (
+            wait_for_gtp_grad_reduction_on_current_stream,
+        )
 
         wait_for_gtp_grad_reduction_on_current_stream()
 

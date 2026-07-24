@@ -2025,10 +2025,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         """Helper function to load state dict with fallback for missing extra states."""
         # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
         # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
-        from megatron.core.tensor_parallel.gtp import HAVE_GTP
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
         if HAVE_GTP:
-            from megatron.core.tensor_parallel.gtp import gtp_native_fp8_load_context
+            from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
 
             load_ctx = lambda: gtp_native_fp8_load_context(module)
         else:

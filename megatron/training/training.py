@@ -114,7 +114,7 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
-from megatron.core.tensor_parallel.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -2048,7 +2048,7 @@ def setup_model_and_optimizer(
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
     # also covers the config-container builder path, which does not call get_model.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp import configure_gtp_remat_from_recipe
+        from megatron.core.tensor_parallel.gtp_api import configure_gtp_remat_from_recipe
 
         configure_gtp_remat_from_recipe(
             fp4=getattr(args, 'fp4', None) is not None,
@@ -2064,7 +2064,7 @@ def setup_model_and_optimizer(
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp import classify_gtp_remat_chains
+        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
 
         classify_gtp_remat_chains(
             model,

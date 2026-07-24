@@ -58,14 +58,14 @@ except:
     HAVE_TE_GRAPHS = False
 
 try:
-    from megatron.core.tensor_parallel.gtp import HAVE_GTP
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 except ImportError:
     # GTP requires TransformerEngine with the GTP hook registry; treat it as
     # unavailable when that import path cannot be resolved.
     HAVE_GTP = False
 
 if HAVE_GTP:
-    from megatron.core.tensor_parallel.gtp import (
+    from megatron.core.tensor_parallel.gtp_api import (
         GTPChain,
         get_ag_stream,
         get_rs_stream,

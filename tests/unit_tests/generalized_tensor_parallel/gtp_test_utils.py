@@ -81,7 +81,7 @@ def _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype=torch.bfloat16, **kwarg
     construction hooks, so the module is built stock, ``module.gtp_remat_size`` (the forward-gather
     gate) is stamped post-init, and the BF16 weight is sliced by ``wrap_module_params_gtp``.
     """
-    from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
+    from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
     layer = te.Linear(
         in_features=in_f,
@@ -101,7 +101,7 @@ def _make_gtp_remat_grouped_linear(
 ):
     """Construct a bias-free GTP-sharded te.GroupedLinear on CUDA (post-init slice, see
     _make_gtp_linear)."""
-    from megatron.core.tensor_parallel.gtp import wrap_module_params_gtp
+    from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
     layer = te.GroupedLinear(
         num_gemms=num_gemms,

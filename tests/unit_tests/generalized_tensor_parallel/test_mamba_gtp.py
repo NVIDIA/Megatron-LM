@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.tensor_parallel.gtp import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
@@ -242,7 +242,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     # BF16 baseline within MXFP8 noise; a frozen/miswired FP8 weight flattens or diverges it.
     # -------------------------------------------------------------------------
     from megatron.core.fp8_utils import is_float8tensor
-    from megatron.core.tensor_parallel.gtp import gtp_native_fp8_load_context, is_gtp_param
+    from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context, is_gtp_param
 
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=4

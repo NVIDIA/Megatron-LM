@@ -48,7 +48,7 @@ try:
     _te_version = Version(te.__version__)
     if _te_version < _GTP_TE_MIN_VERSION:
         raise ImportError(
-            f"megatron.core.tensor_parallel.gtp requires TransformerEngine "
+            f"megatron.core.tensor_parallel.gtp_api requires TransformerEngine "
             f">= {_GTP_TE_MIN_VERSION} (found {_te_version})."
         )
 
@@ -76,7 +76,7 @@ try:
     HAVE_TE = True
 except (ImportError, ModuleNotFoundError):
     # TE unavailable/too old -> stub the TE-backed names so this module still imports,
-    # and flag GTP unusable via HAVE_TE (gtp.py surfaces this as HAVE_GTP=False). No
+    # and flag GTP unusable via HAVE_TE (gtp_api.py surfaces this as HAVE_GTP=False). No
     # GTP path runs without TE. The `annotations` future-import keeps the lone
     # module-level TE reference (a dataclass field annotation) from being evaluated.
     from unittest.mock import MagicMock
