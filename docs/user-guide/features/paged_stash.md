@@ -19,6 +19,18 @@
 
 Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-backward: after each pass it checks **stash overflow** (only with `--moe-paged-stash`) and **token over-budget**. If either hits any rank, the step **reruns once** without capacity padding and without paged stashing.
 
+For Transformer Engine per-layer CUDA graphs, the whole MoE scope
+(`--cuda-graph-impl transformer_engine --cuda-graph-modules moe`) is supported by the sync-free
+HybridEP + paged-stash configuration above. Its captured graph is tied to the static expert-rank
+and stash capacities. If either capacity overflows, training fails immediately instead of
+attempting the dynamic rerun; increase the corresponding capacity factor and restart the job.
+
+Transformer Engine warmup and graph capture both replay the previously recorded paged-stash
+schedule, preserving the training layer, microbatch, and virtual-pipeline coordinates. This mode
+requires a Transformer Engine version whose ordered warmup follows the real pipeline schedule.
+Each per-layer graph joins the stash and reload work it launched on the auxiliary stream before
+its capture ends because CUDA stream dependencies cannot cross independent capture boundaries.
+
 ## Prerequisites
 
 HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.
