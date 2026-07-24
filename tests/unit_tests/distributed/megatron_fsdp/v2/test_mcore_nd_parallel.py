@@ -15,8 +15,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import 
     HAVE_TE_NVFP4,
     HAVE_TE_NVFP4_RECIPE,
 )
+from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import is_torch_min_version
+from megatron.training.global_vars import destroy_global_vars
 from tests.unit_tests.distributed.mfsdp_v1.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -40,6 +42,10 @@ def ref_cache():
 
 
 class TestMegatronFSDPE2E:
+    def teardown_method(self):
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
     @pytest.mark.parametrize("outer_dp_size", [1, 2])
     def test_dp_mesh_flatten_groups_reuse_full_dp_groups(self, outer_dp_size):
         if Utils.world_size < 4 or Utils.world_size % 4 != 0:
