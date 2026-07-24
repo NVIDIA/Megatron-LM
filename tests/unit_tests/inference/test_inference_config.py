@@ -26,10 +26,10 @@ class TestInferenceConfig:
         "async_sched_mode, expected",
         [
             (None, AsyncScheduleMode.LEGACY),
-            ("serial", AsyncScheduleMode.SERIAL),
-            (AsyncScheduleMode.SERIAL, AsyncScheduleMode.SERIAL),
-            ("overlap", AsyncScheduleMode.OVERLAP),
-            (AsyncScheduleMode.OVERLAP, AsyncScheduleMode.OVERLAP),
+            ("legacy", AsyncScheduleMode.LEGACY),
+            (AsyncScheduleMode.LEGACY, AsyncScheduleMode.LEGACY),
+            ("async", AsyncScheduleMode.ASYNC),
+            (AsyncScheduleMode.ASYNC, AsyncScheduleMode.ASYNC),
         ],
     )
     def test_async_sched_mode_default_and_coercion(self, async_sched_mode, expected):
@@ -37,16 +37,24 @@ class TestInferenceConfig:
         kwargs = {} if async_sched_mode is None else {"async_sched_mode": async_sched_mode}
         assert InferenceConfig(**kwargs).async_sched_mode == expected
 
-    def test_async_sched_mode_rejects_invalid_value(self):
+    @pytest.mark.parametrize("invalid_mode", ["serial", "overlap", "invalid"])
+    def test_async_sched_mode_rejects_invalid_value(self, invalid_mode):
         """Ensure invalid async scheduling modes fail during config construction."""
         with pytest.raises(ValueError):
-            InferenceConfig(async_sched_mode="invalid")
+            InferenceConfig(async_sched_mode=invalid_mode)
 
     def test_async_sched_argparse_plumbing(self):
         """Ensure the CLI exposes async scheduling mode."""
         parser = _add_inference_args(ArgumentParser())
-        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "overlap"])
-        assert args.inference_dynamic_batching_async_sched_mode == "overlap"
+        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "async"])
+        assert args.inference_dynamic_batching_async_sched_mode == "async"
+
+    @pytest.mark.parametrize("invalid_mode", ["serial", "overlap"])
+    def test_async_sched_argparse_rejects_removed_modes(self, invalid_mode):
+        """Ensure the CLI rejects removed async scheduling modes."""
+        parser = _add_inference_args(ArgumentParser())
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--inference-dynamic-batching-async-sched-mode", invalid_mode])
 
     def test_inference_setup_config_maps_async_sched_mode(self):
         """Ensure declarative inference config maps async scheduling mode to runtime config."""
@@ -56,7 +64,7 @@ class TestInferenceConfig:
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="overlap")
+        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="async")
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -66,4 +74,4 @@ class TestInferenceConfig:
             verbose=False,
         )
 
-        assert inference_config.async_sched_mode == AsyncScheduleMode.OVERLAP
+        assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC

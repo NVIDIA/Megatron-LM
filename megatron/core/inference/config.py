@@ -139,11 +139,8 @@ class AsyncScheduleMode(str, Enum):
     LEGACY = "legacy"
     """Resolve requests before preparing the next forward pass."""
 
-    SERIAL = "serial"
-    """Prepare and forward speculatively before resolving the sampled requests."""
-
-    OVERLAP = "overlap"
-    """Overlap async scheduling prepare/sample and forward/resolve phases."""
+    ASYNC = "async"
+    """Overlap asynchronous scheduling phases by reordering them to prepare-before-resolve."""
 
 
 @dataclass
