@@ -452,6 +452,7 @@ class TopKRouter(Router):
         seq_length: int,
         bsz: int,
         with_padding_mask: bool = False,
+        moe_seq_idx: Optional[torch.Tensor] = None,
     ):
         """Apply the sequence-level auxiliary loss for the given scores and routing map.
 
@@ -459,13 +460,42 @@ class TopKRouter(Router):
         experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
         to the sum of aux loss for each sequence in the batch. And then we divide the aux
         loss by the batch size to get averaged aux loss.
+
+        When ``moe_seq_idx`` is given the sequences are packed (inter-document masking
+        flattened the batch into [num_tokens, 1, H]), so the [seq, bsz] reshape cannot
+        group tokens by sample -- under sequence parallelism a contiguous shard can
+        straddle sample boundaries. Instead we scatter each token's expert vector into its
+        sample's column block, producing the same [rows, bsz*E] layout so the tp_cp
+        reduction below still recombines samples that were split across ranks.
         """
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
         if seq_aux_loss_coeff == 0:
             return probs
 
-        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
-        routing_map = routing_map.reshape(seq_length, -1)
+        if moe_seq_idx is None:
+            scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
+            routing_map = routing_map.reshape(seq_length, -1)
+        else:
+            moe_seq_idx = moe_seq_idx.reshape(-1).long()
+            # Global sample count: SP may leave the tail sample only on the last rank.
+            bsz = moe_seq_idx.max() + 1
+            torch.distributed.all_reduce(
+                bsz, op=torch.distributed.ReduceOp.MAX, group=self.tp_cp_group
+            )
+            bsz = int(bsz.item())
+            num_experts = self.config.num_moe_experts
+            cols = moe_seq_idx[:, None] * num_experts + torch.arange(
+                num_experts, device=moe_seq_idx.device
+            )
+            scores_for_aux_loss = scores_for_aux_loss.new_zeros(
+                scores_for_aux_loss.shape[0], bsz * num_experts
+            ).scatter_(1, cols, scores_for_aux_loss)
+            routing_map = routing_map.new_zeros(
+                routing_map.shape[0], bsz * num_experts
+            ).scatter_(1, cols, routing_map)
+            # Force the valid-token-count path: it normalizes total_num_tokens per sample
+            # (dividing by bsz), which the else-branch's row-count path does not.
+            with_padding_mask = True
 
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
@@ -738,7 +768,12 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        moe_seq_idx: Optional[torch.Tensor] = None,
+    ):
         """Top-k routing function
 
         Args:
@@ -746,6 +781,8 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            moe_seq_idx (torch.Tensor, optional): Per-token global sample index for packed
+                                                  sequences, used by seq_aux_loss. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -818,6 +855,7 @@ class TopKRouter(Router):
                 seq_length,
                 bsz,
                 with_padding_mask=padding_mask is not None,
+                moe_seq_idx=moe_seq_idx,
             )
             probs = self._apply_global_aux_loss(
                 probs,
@@ -837,7 +875,12 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        moe_seq_idx: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass of the router.
 
@@ -846,6 +889,8 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            moe_seq_idx (torch.Tensor, optional): Per-token global sample index for packed
+                                                  sequences, used by seq_aux_loss. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 
@@ -863,7 +908,9 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(
+            logits, padding_mask=padding_mask, moe_seq_idx=moe_seq_idx
+        )
 
         return probs, routing_map
 

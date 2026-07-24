@@ -760,29 +760,50 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return pre_mlp_layernorm_output
 
-    def _maybe_unflatten_for_moe(self, hidden_states, padding_mask, packed_seq_params):
-        """Un-flatten packed sequences to restore the batch dimension for MoE.
+    def _maybe_unflatten_for_moe(
+        self, hidden_states, padding_mask, packed_seq_params, use_seq_idx=True
+    ):
+        """Recover per-sample structure for MoE seq_aux_loss on packed sequences.
 
-        When inter-document masking flattens MBS > 1 into [mbs*S, 1, H], the MoE
-        router sees bsz=1 and computes seq_aux_loss over the entire flattened
-        sequence instead of per sample. Un-flattening to [S, mbs, H] before the
-        MoE layer restores the correct per-sample structure.
+        When inter-document masking flattens MBS > 1 into [mbs*S, 1, H], the MoE router
+        sees bsz=1 and would compute seq_aux_loss over the entire flattened sequence.
+
+        Without context parallelism we hand the router a per-token global sample index
+        (``moe_seq_idx``) instead of reshaping: sequence parallelism splits the flattened
+        sequence into contiguous shards that can straddle sample boundaries, so a local
+        reshape to [S, mbs, H] is not possible, but a per-token index survives sharding.
+        With context parallelism (which reorders tokens) we fall back to the reshape path.
 
         Returns:
-            (hidden_states, padding_mask, mbs) where mbs is None if no
-            un-flattening was applied.
+            (hidden_states, padding_mask, mbs, moe_seq_idx). mbs is None unless the reshape
+            path ran; moe_seq_idx is None unless the sample-index path ran.
         """
         if (
             not self.is_moe_layer
             or packed_seq_params is None
             or getattr(packed_seq_params, 'tokens_per_sample', None) is None
         ):
-            return hidden_states, padding_mask, None
+            return hidden_states, padding_mask, None, None
 
         tokens_per_sample = packed_seq_params.tokens_per_sample
+
+        if use_seq_idx and self.config.context_parallel_size == 1:
+            # tokens_per_sample is the unsharded sample length; shape[0] is this rank's
+            # sequence-parallel shard. The shard holds contiguous global positions
+            # [sp_rank * n_local, (sp_rank + 1) * n_local), so token t belongs to sample
+            # (sp_rank * n_local + t) // tokens_per_sample. The router reduces these counts
+            # over tp_cp, recombining samples split across ranks.
+            sp_group = self.pg_collection.tp
+            n_local = hidden_states.shape[0]
+            global_pos = sp_group.rank() * n_local + torch.arange(
+                n_local, device=hidden_states.device
+            )
+            moe_seq_idx = global_pos // tokens_per_sample
+            return hidden_states, padding_mask, None, moe_seq_idx
+
         mbs = hidden_states.shape[0] // tokens_per_sample
         if mbs <= 1:
-            return hidden_states, padding_mask, None
+            return hidden_states, padding_mask, None, None
 
         # The flattened tensor has all tokens from sample 0, then all tokens
         # from sample 1, etc. A plain reshape would keep that ordering, but we
@@ -791,7 +812,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states = hidden_states.view(mbs, tokens_per_sample, -1).transpose(0, 1).contiguous()
         if padding_mask is not None:
             padding_mask = padding_mask.view(mbs, tokens_per_sample)
-        return hidden_states, padding_mask, mbs
+        return hidden_states, padding_mask, mbs, None
 
     def _maybe_reflatten_from_moe(self, output, packed_seq_params, mbs):
         """Re-flatten MoE output back to [mbs*S, 1, H] for the residual add."""
@@ -841,9 +862,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
-        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs, moe_seq_idx = (
+            self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, packed_seq_params
+            )
         )
+        # Only MoE layers on the packed path produce moe_seq_idx; pass it through the same
+        # kwargs the MoE layer already threads to its router, and leave dense MLPs untouched.
+        moe_kwargs = {} if moe_seq_idx is None else {"moe_seq_idx": moe_seq_idx}
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -877,10 +903,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
+                    **moe_kwargs,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                    functools.partial(
+                        apply_module(self.mlp), padding_mask=padding_mask, **moe_kwargs
+                    ),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -912,7 +941,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
             )
 
         if moe_unflatten_mbs is not None:
@@ -1736,8 +1765,13 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         if self.use_partial_cudagraphs:
-            hidden_states, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-                hidden_states, padding_mask, packed_seq_params
+            # TODO: route moe_seq_idx through the partial-cudagraph path so packed
+            # seq_aux_loss uses the sample-index path here too. For now use_seq_idx=False
+            # keeps the exact prior reshape behavior on this path.
+            hidden_states, padding_mask, moe_unflatten_mbs, _moe_seq_idx = (
+                self._maybe_unflatten_for_moe(
+                    hidden_states, padding_mask, packed_seq_params, use_seq_idx=False
+                )
             )
 
             if self.moe_layer_recompute:
