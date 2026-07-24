@@ -1982,6 +1982,10 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
         kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+        if args.use_megatron_fsdp and os.getenv("MFSDP_VERSION") == "2":
+            # MFSDP v2 gathers parameters from module hooks rather than the V1
+            # start_param_sync path, so disable the V1-only startup all-gather knob.
+            kwargs["fsdp_all_gather_in_start_param_sync"] = False
         if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
             # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
             # operations (such as pointer dereferencing) that can break CUDA graph replay.
