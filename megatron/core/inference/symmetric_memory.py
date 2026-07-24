@@ -178,6 +178,17 @@ class SymmetricMemoryManager:
         else:
             cls._buffers.clear()
 
+        # Drop collective-ordering history so a buffer recreated with a recycled
+        # multicast pointer cannot inherit a stale last-collective record.
+        try:
+            from megatron.core.inference.communication.torch_symm_triton.collectives import (
+                reset_collective_ordering,
+            )
+
+            reset_collective_ordering()
+        except ImportError:
+            pass
+
     @classmethod
     def is_initialized(cls, key: str) -> bool:
         """Check whether a buffer has been created for *key*."""

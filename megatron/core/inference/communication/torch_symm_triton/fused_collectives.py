@@ -3,6 +3,7 @@
 import torch
 
 from .barrier import symm_mem_sync
+from .collectives import ALL_GATHER, record_collective
 from .multimem_asm import add_v8_bf16_from_u32, asm_rsqrt, ld_128, st_128
 from .utils import sync_threads
 
@@ -276,5 +277,8 @@ def fused_multimem_rs_add_norm_ag(
         WORLD_SIZE=symm_mem_hdl.world_size,
         num_warps=num_warps,
     )
+    # The fused kernel finishes with an all-gather into the symmetric buffer, so a
+    # subsequent all-gather that reuses the buffer must barrier before overwriting.
+    record_collective(symm_mem_hdl, ALL_GATHER)
 
     return residual_output_tensor

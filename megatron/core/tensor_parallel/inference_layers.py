@@ -164,9 +164,6 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
-        self.barrier_before_all_gather = name is not None and (
-            name == "mtp" or name.startswith("mtp.") or ".mtp_model_layer" in name
-        )
 
         # Boolean to be toggled externally for skipping norm and all-gather.
         # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
@@ -200,12 +197,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
-            # do multimem all gather
+            # do multimem all gather; the barrier-before-reuse decision is derived
+            # from the last collective on this buffer (see multimem_all_gather).
             multimem_all_gather(
                 symm_mem_buffer["tensor"],
                 x,
                 symm_mem_buffer["handle"],
-                barrier_before=self.barrier_before_all_gather,
             )
             return symm_mem_buffer["tensor"]
         else:
@@ -299,9 +296,6 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
-        self.barrier_before_all_gather = name is not None and (
-            name == "mtp" or name.startswith("mtp.") or ".mtp_model_layer" in name
-        )
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -327,11 +321,12 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
+            # The barrier-before-reuse decision is derived from the last collective
+            # on this buffer (see multimem_all_gather).
             multimem_all_gather(
                 symm_mem_buffer["tensor"],
                 x,
                 symm_mem_buffer["handle"],
-                barrier_before=self.barrier_before_all_gather,
             )
             return symm_mem_buffer["tensor"]
         else:
@@ -507,7 +502,7 @@ def inference_all_gather_from_tensor_model_parallel_region(
     x: torch.Tensor,
     tp_group: torch.distributed.ProcessGroup,
     config: TransformerConfig,
-    barrier_before: bool = False,
+    barrier_before: Optional[bool] = None,
 ) -> torch.Tensor:
     """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
 
@@ -518,6 +513,10 @@ def inference_all_gather_from_tensor_model_parallel_region(
     along dim-0), then rearranges the result to the last dimension — the same
     semantics as `_gather_along_last_dim` but using hardware multicast when
     possible.
+
+    ``barrier_before`` is forwarded to `multimem_all_gather`: leave it as ``None``
+    to derive the buffer-reuse barrier from the op sequence, or pass ``True`` to
+    force it on.
     """
     tp_size = dist.get_world_size(tp_group)
     if tp_size == 1:
