@@ -670,9 +670,7 @@ class TestGTPRematPgCollectionWithoutParallelState:
         assert pg_collection.gtp_remat is None
         assert pg_collection.expt_gtp_remat is None
         for is_expert in (False, True):
-            gtp_remat_group = (
-                pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
-            )
+            gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
             assert gtp_remat_group is None
 
 
