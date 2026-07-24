@@ -246,9 +246,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+    cross_entropy_fusion_impl: Literal['native', 'te', 'liger'] = 'native'
+    """Implementation used when ``cross_entropy_loss_fusion=True``. 'native'
+       uses MCore's built-in fused CE; 'te' uses TransformerEngine's parallel
+       CE; 'liger' uses Liger-Kernel's Triton vocab-parallel CE (requires the
+       optional ``liger-kernel`` package). Defaults to 'native'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
@@ -443,7 +445,8 @@ class ModelParallelConfig:
             warnings.warn(
                 "Transformer Engine cross entropy loss fusion has known stability issues. "
                 "Megatron-LM training args validation rejects this combination by default. "
-                "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
+                "Use cross_entropy_fusion_impl='native' or 'liger', or disable "
+                "cross_entropy_loss_fusion.",
                 UserWarning,
                 stacklevel=2,
             )

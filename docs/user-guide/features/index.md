@@ -26,4 +26,5 @@ pipeline_parallel_layout
 tokenizers
 megatron_energon
 megatron_rl
+liger_kernel
 ```

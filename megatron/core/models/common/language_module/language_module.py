@@ -190,6 +190,12 @@ class LanguageModule(MegatronModule):
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
+            elif self.config.cross_entropy_fusion_impl == 'liger':
+                from megatron.core.fusions.liger_cross_entropy import (
+                    liger_vocab_parallel_cross_entropy,
+                )
+
+                loss = liger_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(
                 logits, labels, tp_group=self.tp_group
