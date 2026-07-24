@@ -492,7 +492,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 
 
 class FullyShardedDataParallelV2(_BaseDataParallel):
-    """Experimental Megatron FSDP v2 wrapper for the Megatron model."""
+    """MFSDP v2 wrapper for the Megatron model."""
 
     def __init__(
         self,
@@ -504,6 +504,26 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
+        """Initialize the MFSDP v2 wrapper.
+
+        Args:
+            config: Transformer configuration for the model.
+            ddp_config: Data-parallel and sharding configuration.
+            module: Root model module to shard.
+            fsdp_unit_modules: Module types to shard as child FSDP units. If
+                unspecified, transformer, MoE transformer, and Mamba layers are used.
+            disable_bucketing: Compatibility argument that must remain ``False`` for
+                MFSDP v2.
+            device: Device whose type is used to construct the data-parallel mesh.
+                Defaults to CUDA.
+            pg_collection: Explicit process groups. The ``dp_cp`` group defines the
+                data-parallel mesh.
+
+        Raises:
+            ImportError: If the Megatron FSDP implementation is unavailable.
+            ValueError: If required process groups are missing or the configuration
+                requests a feature unsupported by MFSDP v2.
+        """
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
@@ -565,7 +585,20 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         pg_collection: ProcessGroupCollection,
         disable_bucketing: bool,
     ) -> None:
-        """Reject features outside the initial MFSDP v2 integration scope."""
+        """Validate that the model and configuration are supported by MFSDP v2.
+
+        Args:
+            config: Transformer configuration describing the requested model topology.
+            ddp_config: Data-parallel and sharding configuration to validate.
+            module: Model whose parameters are checked for expert parallelism.
+            pg_collection: Materialized process groups whose topology must match the
+                supported MFSDP v2 topology.
+            disable_bucketing: Whether parameter bucketing is disabled.
+
+        Raises:
+            ValueError: If a required process group is missing or the model,
+                topology, or data-parallel configuration uses an unsupported feature.
+        """
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):
