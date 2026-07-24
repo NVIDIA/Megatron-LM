@@ -75,6 +75,7 @@ def _make_model(chunk_patches, *, training=True, group=None, pool=None):
     model.training = training
     if pool is not None:
         model.vision_noise_pool = pool
+        model._vision_noise_pool_ready = True  # tests inject real content directly
     return model
 
 
@@ -190,3 +191,15 @@ class TestStreamingNoisePool:
         assert embeddings is None
         assert anchor is not None and float(anchor) == 0.0
         assert len(model.vision_model.calls) == 1
+
+    def test_unready_pool_is_materialized_deterministically(self):
+        grids = _grids((2, 2))
+        first = _make_model(8, pool=torch.empty(8, 6))
+        second = _make_model(8, pool=torch.empty(8, 6))
+        for model in (first, second):
+            model._vision_noise_pool_ready = False
+            model.vision_noise_pool_seed = 777
+            model._vision_forward(None, grids)
+            assert model._vision_noise_pool_ready
+        assert torch.equal(first.vision_noise_pool, second.vision_noise_pool)
+        assert not torch.equal(first.vision_noise_pool, torch.zeros(8, 6))

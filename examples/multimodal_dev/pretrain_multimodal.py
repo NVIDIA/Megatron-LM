@@ -118,12 +118,16 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
             * int(getattr(args, "vision_patch_size", 16)) ** 2
         )
         pool_dtype = torch.bfloat16 if args.bf16 else torch.half if args.fp16 else torch.float32
-        generator = torch.Generator().manual_seed(int(getattr(args, "seed", 1234)))
+        # Placeholder only: under meta-device init this lands on meta, and
+        # to_empty-style materialization may wipe buffer contents either
+        # way. The model regenerates the content deterministically from
+        # vision_noise_pool_seed at first streaming use, on the real device.
         model.register_buffer(
             "vision_noise_pool",
-            torch.randn(chunk_patches, pixel_dim, generator=generator).to(pool_dtype),
+            torch.empty(chunk_patches, pixel_dim, dtype=pool_dtype),
             persistent=False,
         )
+        model.vision_noise_pool_seed = int(getattr(args, "seed", 1234))
 
     return model
 

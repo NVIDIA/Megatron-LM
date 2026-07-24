@@ -265,6 +265,22 @@ class MultimodalModel(MegatronModule):
                 return self.vision_model(pixel_values, image_grid_thw), None
             return None, self._empty_vision_grad_anchor(pixel_values)
 
+        if streaming and not getattr(self, "_vision_noise_pool_ready", False):
+            # The provider registers the pool under whatever init context
+            # Megatron uses — with meta-device init the placeholder is a
+            # meta tensor, and to_empty-style materialization can wipe
+            # buffer contents — so the content is (re)generated
+            # deterministically exactly once at first use, on the real
+            # device. Identical seed on every rank -> identical pool.
+            generator = torch.Generator(device="cpu").manual_seed(
+                int(getattr(self, "vision_noise_pool_seed", 1234))
+            )
+            noise = torch.randn(pool.shape, generator=generator, dtype=torch.float32, device="cpu")
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            self.vision_noise_pool = noise.to(device=device, dtype=pool.dtype)
+            self._vision_noise_pool_ready = True
+            pool = self.vision_noise_pool
+
         reference = pool if streaming else pixel_values
         has_payload = (
             image_grid_thw is not None and image_grid_thw.shape[0] > 0
