@@ -577,20 +577,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.num_speculative_tokens > 0:
             self.max_kv_block_count += 1
 
-        # The pool must be sufficient to hold `max_sequence_length` + 1 blocks.
-        min_usable_block_count = max((self.max_sequence_length - 1) // self.block_size_tokens, 1)
-        if (
-            self.kv_block_allocator.active_count < min_usable_block_count
-            and torch.distributed.get_rank() == 0
-        ):
-            warnings.warn(
-                f"The active KV block pool ({self.kv_block_allocator.active_count} blocks) "
-                f"is too small for one request generating up to the engine's sequence "
-                f"budget ({min_usable_block_count} blocks for max_sequence_length="
-                f"{self.max_sequence_length}); such a request would pause forever. "
-                f"Increase buffer_size_gb or reduce max_sequence_length."
-            )
-
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
