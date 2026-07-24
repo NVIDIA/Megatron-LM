@@ -556,6 +556,7 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "gdn_in_proj_conv": recompute the GatedDeltaNet input projection, HP-to-CP all-to-all, split, and convolution.
     "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
@@ -1765,6 +1766,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "gdn_in_proj_conv",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1789,6 +1791,15 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if (
+                "gdn_in_proj_conv" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_in_proj_conv in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net'."
                 )
 
