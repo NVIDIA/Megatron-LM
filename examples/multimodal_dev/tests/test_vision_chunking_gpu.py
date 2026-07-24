@@ -2,6 +2,15 @@
 
 """GPU equality matrix for chunked vision-encoder execution.
 
+Includes the REAL MegatronFSDP multi-invocation regression
+(TestMFSDPMultiInvocation): a small vision encoder wrapped in
+FullyShardedDataParallel with optim_grads_params, exercised whole-call vs
+K chunk invocations across recompute on/off and two gradient-accumulation
+microbatches, comparing outputs, post-step parameter shards, and the
+injected lockstep group against dist_index.get_fsdp_group(). This is the
+regression for the megatron_fsdp multi-invocation fixes (deferred release
++ deferred gradient reduction).
+
 Single-rank (torchrun --nproc-per-node 1):
     outputs / loss / parameter-gradient / optimizer-step equality of the
     chunked vs unchunked real Qwen3.5-VL vision encoder.
@@ -152,33 +161,33 @@ class TestStreamingPoolMemory:
         assert len(seen) == 8
         assert set(seen) == {pool.untyped_storage().data_ptr()}
 
-    def test_retained_input_memory_does_not_scale_with_chunks(self):
-        # Same per-chunk size; 2 vs 16 chunks. Eager fresh inputs would
-        # retain 8x more pixel memory; pool views retain O(pool).
+    def test_backward_saved_pixel_tensors_all_alias_the_pool(self):
+        """Direct proof (reviewer P1): the tensors AUTOGRAD SAVES for
+        backward — not merely the views passed in — alias the single pool
+        storage, so retained pixel memory is O(pool) regardless of the
+        chunk count. A ratio-based memory bound cannot distinguish linear
+        pixel-copy growth from activation growth; this can."""
         encoder = _small_encoder()
         pixel_dim = 3 * 2 * 16 * 16
-        pool = torch.randn(256, pixel_dim, device="cuda")
+        pool = torch.randn(1024, pixel_dim, device="cuda")
+        grids = torch.tensor([[1, 16, 16]] * 8, dtype=torch.long, device="cuda")
 
-        def measure(num_chunks):
-            grids = torch.tensor([[1, 16, 16]] * num_chunks, dtype=torch.long, device="cuda")
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            baseline = torch.cuda.memory_allocated()
+        saved_pixel_storages = set()
+
+        def pack(tensor):
+            if tensor.dim() == 2 and tensor.shape[-1] == pixel_dim:
+                saved_pixel_storages.add(tensor.untyped_storage().data_ptr())
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
             out = self._run(encoder, grids, chunk_patches=256, pool=pool)
-            torch.cuda.synchronize()
-            retained = torch.cuda.memory_allocated() - baseline
-            out.sum().backward()
-            encoder.zero_grad(set_to_none=True)
-            return retained, out.shape[0]
+        out.sum().backward()
 
-        retained_2, tokens_2 = measure(2)
-        retained_16, tokens_16 = measure(16)
-        # Retained memory grows with activations/outputs (proportional to
-        # tokens) but must NOT additionally grow by the pixel payload:
-        # 16 chunks of fresh inputs would add >= 14 * pool_bytes.
-        pool_bytes = pool.numel() * pool.element_size()
-        activation_scaling = retained_2 * (tokens_16 / tokens_2)
-        assert retained_16 < activation_scaling + 4 * pool_bytes
+        assert saved_pixel_storages, "no pixel-shaped tensors were saved for backward"
+        assert saved_pixel_storages == {pool.untyped_storage().data_ptr()}, (
+            "backward saved pixel tensors outside the noise pool storage: "
+            f"{len(saved_pixel_storages)} distinct storages"
+        )
 
 
 @pytest.mark.skipif(_WORLD != 2, reason="two-rank lockstep")
@@ -237,3 +246,101 @@ class TestTwoRankLockstep:
         with torch.no_grad():
             embeddings, anchor = model._vision_forward(pixels, grids)
         assert embeddings is None and anchor is None and calls["n"] == 0
+
+
+@pytest.mark.skipif(_WORLD != 2, reason="two-rank MegatronFSDP regression")
+class TestMFSDPMultiInvocation:
+    """Whole-call vs chunked equality UNDER MegatronFSDP (optim_grads_params)."""
+
+    def _build(self, *, recompute, defer_flags, seed=321):
+        from megatron.core.distributed import DistributedDataParallelConfig
+        from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        torch.manual_seed(seed)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            use_cpu_initialization=True,
+            bf16=False,
+        )
+        if recompute:
+            config.recompute_granularity = "full"
+            config.recompute_method = "uniform"
+            config.recompute_num_layers = config.num_layers
+        encoder = Qwen35VLVisionEncoder(
+            config=config,
+            in_channels=3,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=64,
+            max_num_positions=2304,
+        ).cuda()
+        if defer_flags:
+            for submodule in encoder.modules():
+                submodule._fsdp_defer_release = True
+            for parameter in encoder.parameters():
+                parameter._fsdp_defer_grad_reduce = True
+        ddp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            megatron_fsdp_main_params_dtype=None,
+        )
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=ddp_config,
+            module=encoder,
+            fsdp_unit_modules=[TransformerLayer],
+        )
+        optimizer = torch.optim.SGD(wrapped.parameters(), lr=1e-2)
+        return wrapped, optimizer
+
+    def _train(self, wrapped, optimizer, *, chunk_patches, microbatches=2):
+        pixels, grids = _payload(seed=11)
+        for microbatch in range(microbatches):
+            wrapped.zero_grad_buffer() if hasattr(wrapped, "zero_grad_buffer") else None
+            if chunk_patches:
+                out = _chunked_output(wrapped, pixels, grids, chunk_patches)
+            else:
+                out = wrapped(pixels, grids)
+            (out.square().mean() * (1.0 + microbatch)).backward()
+            if hasattr(wrapped, "finish_grad_sync"):
+                wrapped.finish_grad_sync()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        return out
+
+    @pytest.mark.parametrize("recompute", [False, True])
+    def test_chunked_matches_whole_under_mfsdp(self, recompute):
+        reference, ref_opt = self._build(recompute=recompute, defer_flags=False)
+        chunked, chk_opt = self._build(recompute=recompute, defer_flags=True)
+        # Identical initial parameter shards by construction (same seed).
+        out_ref = self._train(reference, ref_opt, chunk_patches=0)
+        out_chk = self._train(chunked, chk_opt, chunk_patches=32)
+        torch.testing.assert_close(out_chk, out_ref, rtol=1e-4, atol=1e-5)
+        for (name, p_ref), (_, p_chk) in zip(
+            reference.named_parameters(), chunked.named_parameters()
+        ):
+            torch.testing.assert_close(
+                p_chk.to_local() if hasattr(p_chk, "to_local") else p_chk,
+                p_ref.to_local() if hasattr(p_ref, "to_local") else p_ref,
+                rtol=1e-4,
+                atol=1e-5,
+                msg=name,
+            )
+
+    def test_injected_lockstep_group_matches_fsdp_sharding_group(self):
+        wrapped, _ = self._build(recompute=False, defer_flags=True)
+        expected = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        module = wrapped.module if hasattr(wrapped, "module") else wrapped
+        dist_index = getattr(module, "dist_index", None) or getattr(wrapped, "dist_index", None)
+        assert dist_index is not None, "MegatronFSDP dist_index not found on wrapper"
+        actual = dist_index.get_fsdp_group()
+        assert torch.distributed.get_process_group_ranks(actual) == (
+            torch.distributed.get_process_group_ranks(expected)
+        )
