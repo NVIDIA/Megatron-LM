@@ -22,7 +22,11 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_merge,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm._packed_seq_helpers import check_fla_sequence_packing_support
+from megatron.core.ssm._packed_seq_helpers import (
+    build_packed_seq_idx,
+    check_fla_sequence_packing_support,
+    get_cu_seqlens,
+)
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -163,6 +167,15 @@ class GatedDeltaProductMixer(MegatronModule):
             raise ImportError("FLA is not installed")
 
         super().__init__(config)
+
+        # Inference-time contract: ``MambaInferenceStateConfig.from_model`` in
+        # megatron/core/inference/config.py reads ``layer.mixer.chunk_size`` to
+        # size the SSM scan blocks.
+        self.chunk_size = chunk_size
+
+        # Check that the causal_conv1d version is new enough or fail
+        ok, reason = check_fla_sequence_packing_support()
+        assert ok, reason
 
         self.num_householder = 3
 
@@ -334,11 +347,6 @@ class GatedDeltaProductMixer(MegatronModule):
         packed_seq_params=None,
     ):
         """Run the gated delta product mixer on hidden states."""
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "GatedDeltaProductMixer does not support packed sequences yet."
-            )
-
         seq_len, batch_size, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
@@ -349,11 +357,32 @@ class GatedDeltaProductMixer(MegatronModule):
                 inference_context.is_static_batching()
             ), "GDP inference must be either static or dynamic batching."
             assert not self.config.sequence_parallel
+            assert packed_seq_params is None, (
+                "GDP does not currently support packed sequences during inference. "
+                "Packing is only wired through the training/prefill (chunk) path."
+            )
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch_size)
+
+        # Build cu_seqlens for the chunked recurrence (FLA) when running with
+        # packed (THD) sequences on the training/prefill path.
+        cu_seqlens_packed = None
+        if packed_seq_params is not None:
+            # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
+            assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
+            cu_seqlens_packed = get_cu_seqlens(packed_seq_params)
 
         zVKQba, _ = self.in_proj(hidden_states)
 
-        zVKQba = self.cp.pre_conv_ssm(zVKQba)
+        zVKQba = self.cp.pre_conv_ssm(zVKQba, packed_seq_params=packed_seq_params)
+
+        # Build seq_idx *after* in_proj's SP all-gather and pre_conv_ssm's CP
+        # all-to-all. ``zVKQba.shape[0]`` is now the true pack_length, so the
+        # helper produces a seq_idx matching the conv1d's input length
+        # regardless of SP/CP/TP upstream-slicing. Mirrors mamba_mixer.py
+        # which calls _create_packed_seq_idx after the same gather points.
+        seq_idx_packed = None
+        if packed_seq_params is not None:
+            seq_idx_packed = build_packed_seq_idx(packed_seq_params, zVKQba.shape[0])
 
         zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
 
@@ -368,7 +397,16 @@ class GatedDeltaProductMixer(MegatronModule):
             dim=-1,
         )
 
-        VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
+        # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor.
+        # But the expected memory layout varies depending on whether seq_idx is set.
+        if seq_idx_packed is None:
+            # Default path: channels-first contiguous, stride(2) == 1.
+            VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
+        else:
+            # ``causal_conv1d_fn(seq_idx=...)`` requires channels-last memory but [B, D, L]
+            # logical shape. This keeps the channels contiguous in memory.
+            VKQ = VKQ.contiguous()
+            VKQ = rearrange(VKQ, "b l d -> b d l")
 
         # Decode
         if inference_context is not None and inference_context.seqlen_offset > 0:
@@ -388,11 +426,13 @@ class GatedDeltaProductMixer(MegatronModule):
                     F.pad(VKQ, (self.d_conv - VKQ.shape[-1], 0))
                 )  # Update state (B D W)
             # Train
+            # causal_conv1d uses seq_idx_packed to reset the convolution boundaries
             VKQ = causal_conv1d_fn(
                 x=VKQ,
                 weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
                 bias=self.cp.get_conv1d_bias(),
                 activation=self.activation,
+                seq_idx=seq_idx_packed,
             )
 
         VKQ = rearrange(VKQ, "b d l ->  b l d").contiguous()
@@ -475,16 +515,17 @@ class GatedDeltaProductMixer(MegatronModule):
                 output_final_state=(ssm_state is not None),
                 num_householder=self.num_householder,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens_packed,
             )
 
         if ssm_state is not None:
             ssm_state.copy_(last_recurrent_state)
 
         y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
-        y = self.cp.post_conv_ssm(y)
+        y = self.cp.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
-            z = self.cp.post_conv_ssm(z)
+            z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
 
         out, out_bias = self.out_proj(y)
