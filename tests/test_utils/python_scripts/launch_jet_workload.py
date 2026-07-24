@@ -21,7 +21,7 @@ import yaml
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.test_utils.python_scripts import recipe_parser
+from tests.test_utils.python_scripts import flaky_failure, recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
@@ -390,30 +390,11 @@ def telemetrics_and_exit(
     sys.exit(int(not success))
 
 
-def is_flaky_failure(concat_allranks_logs: str) -> bool:
-    return (
-        "The server socket has failed to listen on any local network address."
-        in concat_allranks_logs
-        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
-        or "uncorrectable ECC error encountered" in concat_allranks_logs
-        or "illegal memory access" in concat_allranks_logs
-        or "illegal instruction" in concat_allranks_logs
-        or "torch.distributed.DistNetworkError" in concat_allranks_logs
-        or "Segmentation fault" in concat_allranks_logs
-        or "found NaN in" in concat_allranks_logs
-        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
-        or "double free or corruption" in concat_allranks_logs
-        or "Call to CUDA function failed." in concat_allranks_logs
-        or "Connection reset by peer" in concat_allranks_logs
-        or "invalid pointer" in concat_allranks_logs
-        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
-        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
-        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
-        or "Unpack failed: incomplete input" in concat_allranks_logs
-        or "unspecified launch failure" in concat_allranks_logs
-        or "free(): corrupted unsorted chunks" in concat_allranks_logs
-        or "Segfault encountered" in concat_allranks_logs
-        or "Fatal glibc error" in concat_allranks_logs
+def is_flaky_failure(concat_allranks_logs: str, concat_mainrank_log: str = "") -> bool:
+    return flaky_failure.is_flaky_failure(
+        concat_allranks_logs,
+        concat_mainrank_log,
+        extra_patterns=flaky_failure.JET_EXTRA_FLAKY_FAILURE_PATTERNS,
     )
 
 
@@ -597,7 +578,7 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
-            if not success and is_flaky_failure(concat_allranks_logs):
+            if not success and is_flaky_failure(concat_allranks_logs, concat_mainrank_log):
                 logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
@@ -614,7 +595,7 @@ def main(
                     is_integration_test=enable_lightweight_mode,
                 )
 
-            if is_flaky_failure(concat_allranks_logs):
+            if is_flaky_failure(concat_allranks_logs, concat_mainrank_log):
                 if n_attempts < 9:
                     logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
