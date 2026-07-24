@@ -1413,7 +1413,7 @@ def validate_args(args, defaults={}):
     # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
     # Assigning high priority to communication streams ensures that communication kernels are scheduled
     # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
-    if args.use_torch_fsdp2 or args.use_megatron_fsdp and get_device_arch_version() >= 10:
+    if (args.use_torch_fsdp2 or args.use_megatron_fsdp) and get_device_arch_version() >= 10:
         if 'dp_cp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('dp_cp')
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
