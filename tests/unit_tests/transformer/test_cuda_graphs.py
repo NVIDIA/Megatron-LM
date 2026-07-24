@@ -37,7 +37,12 @@ from megatron.core.transformer.cuda_graphs import (
     _CudagraphGlobalRecord,
     create_cudagraphs,
 )
-from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
+from megatron.core.transformer.enums import (
+    AttnBackend,
+    CudaGraphModule,
+    CudaGraphScope,
+    InferenceCudaGraphScope,
+)
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
@@ -461,12 +466,31 @@ class TestPackedSeqCudagraphs:
     SEQ_LENGTHS = [7, 5]
     SLOT_STARTS = [0, 8, 16]  # slot layout aligned to 2 * cp_size for every cp_size tested
     BIN_SIZE = 32
+    NVTE_ENV_VARS = (
+        "NVTE_FLASH_ATTN",
+        "NVTE_FUSED_ATTN",
+        "NVTE_UNFUSED_ATTN",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+    )
+
+    def setup_method(self, method):
+        self.original_nvte_env = {
+            name: os.environ.get(name) for name in self.NVTE_ENV_VARS
+        }
+        os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
+        try:
+            Utils.destroy_model_parallel()
+            _CudagraphGlobalRecord.cudagraph_created = False
+            _CudagraphGlobalRecord.cudagraph_record = []
+            CudaGraphManager.global_mempool = None
+        finally:
+            for name, value in self.original_nvte_env.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     def _build_packed_seq_params(self, device):
         # Actual boundaries: each sequence's real tokens inside its slot; the trailing bin
@@ -495,6 +519,9 @@ class TestPackedSeqCudagraphs:
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
         model_parallel_cuda_manual_seed(123)
+        os.environ["NVTE_FLASH_ATTN"] = "0"
+        os.environ["NVTE_FUSED_ATTN"] = "1"
+        os.environ["NVTE_UNFUSED_ATTN"] = "0"
 
         config = TransformerConfig(
             num_layers=2,
@@ -505,7 +532,10 @@ class TestPackedSeqCudagraphs:
             params_dtype=torch.bfloat16,
             attention_dropout=0.0,
             hidden_dropout=0.0,
+            attention_backend=AttnBackend.fused,
+            deterministic_mode=True,
             cuda_graph_impl="local",
+            cuda_graph_warmup_steps=1,
             use_cpu_initialization=True,
         )
         block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec()).cuda()
@@ -524,22 +554,84 @@ class TestPackedSeqCudagraphs:
         )
 
         eager_out = block(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            hidden_states=hidden_states,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
         )
+        hidden_states_metadata = hidden_states.cg_buffer_metadata
+        assert hidden_states_metadata.is_cudagraph_input
+        assert hidden_states_metadata.is_saved_for_backward
+
+        # The second layer's TE input layernorm saves the first layer's output for backward.
+        # This naturally exercises a CUDA graph output whose pool buffer must stay alive until
+        # backward capture.
+        first_runner = block.layers[0].cudagraph_manager.cudagraph_runners[0]
+        first_runner_record = next(
+            record
+            for record in _CudagraphGlobalRecord.cudagraph_record
+            if record[0] is first_runner and record[1] == "fwd"
+        )
+        recorded_outputs = first_runner_record[4]
+        output_metadata = first_runner.get_arg_metas(recorded_outputs)[0].cg_buffer_metadata
+        output_metadata_state = (
+            f"input={output_metadata.is_cudagraph_input}, "
+            f"output={output_metadata.is_cudagraph_output}, "
+            f"saved={output_metadata.is_saved_for_backward}"
+        )
+        assert output_metadata.is_cudagraph_input, output_metadata_state
+        assert output_metadata.is_cudagraph_output, output_metadata_state
+        assert output_metadata.is_saved_for_backward, output_metadata_state
+
+        # The q/kv aliases for each offsets tensor must share one metadata object while recording
+        # every graph-input use for replay-buffer sharing.
+        actual_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q.cg_buffer_metadata
+        padded_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q_padded.cg_buffer_metadata
+        assert packed_seq_params.cu_seqlens_kv.cg_buffer_metadata is actual_cu_seqlens_metadata
+        assert (
+            packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata
+            is padded_cu_seqlens_metadata
+        )
+        assert actual_cu_seqlens_metadata.is_cudagraph_input
+        assert padded_cu_seqlens_metadata.is_cudagraph_input
         eager_out.sum().backward()
 
         # This is the primary function under test.
         create_cudagraphs()
 
+        runners = []
         for layer in block.layers:
-            runners = layer.cudagraph_manager.cudagraph_runners
-            assert len(runners) == 1
-            assert runners[0].fwd_graph is not None
+            layer_runners = layer.cudagraph_manager.cudagraph_runners
+            assert len(layer_runners) == 1
+            assert layer_runners[0].fwd_graph is not None
+            runners.extend(layer_runners)
+
+        # There are four cu_seqlens arguments per layer: q/kv pairs for the real and padded
+        # offsets. Each pair and every later layer should alias one of two shared buffers. Within
+        # each buffer group, only its first graph-input occurrence performs the replay copy.
+        cu_seqlens_buffers = [
+            tensor
+            for runner in runners
+            for tensor in runner.fwd_graph_input_surface[: runner.num_dgrads]
+            if tensor.dtype == torch.int32
+            and tensor.shape == packed_seq_params.cu_seqlens_q.shape
+        ]
+        assert len(cu_seqlens_buffers) == 4 * len(runners)
+        buffers_by_ptr = {}
+        for tensor in cu_seqlens_buffers:
+            buffers_by_ptr.setdefault(tensor.data_ptr(), []).append(tensor)
+        assert len(buffers_by_ptr) == 2
+        for shared_buffers in buffers_by_ptr.values():
+            assert sum(not tensor.can_skip_replay_copy for tensor in shared_buffers) == 1
 
         graphed_out = block(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            hidden_states=hidden_states,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
         )
-        assert torch.allclose(graphed_out.float(), eager_out.float(), rtol=1e-2, atol=1e-2)
+        assert torch.equal(graphed_out, eager_out), (
+            "CUDA graph replay output is not bitwise equal to eager output: "
+            f"max_abs_diff={(graphed_out.float() - eager_out.float()).abs().max().item()}"
+        )
         graphed_out.sum().backward()
 
         # Destroy captured graphs deterministically before parallel-state teardown.
