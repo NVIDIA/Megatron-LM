@@ -42,6 +42,8 @@ from transformer_engine.pytorch import fp8_autocast
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
+from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPShardedParam,
     wrap_module_params_gtp,
@@ -643,6 +645,35 @@ class TestGTPGroupSizeOne:
             mod.weight is original_weight
         ), "gtp_remat_group.size()==1 should leave parameters unchanged"
         assert not isinstance(mod.weight, GTPShardedParam)
+
+
+class TestGTPRematPgCollectionWithoutParallelState:
+    """Resolving the GTP shard group with GTP off must return None, not assert.
+
+    TE linear ``__init__`` calls ``use_mpu_process_groups(["gtp_remat", "expt_gtp_remat"])``; both
+    getters use ``check_initialized=False``, so an uninitialized GTP axis must yield None groups
+    rather than break construction of every non-GTP module.
+    """
+
+    def test_gtp_remat_pgs_are_none_and_do_not_raise(self, mocker):
+        """The exact call in the TE extension returns None groups, no assert, when GTP is off."""
+        # Force the uninitialized GTP state deterministically (independent of suite ordering).
+        mocker.patch.object(parallel_state, "_GTP_WEIGHT_REMAT_GROUP", None)
+        mocker.patch.object(parallel_state, "_EXPERT_GTP_WEIGHT_REMAT_GROUP", None)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat", "expt_gtp_remat"]
+        )
+
+        # Mirror the downstream selection in the TE extension; both branches are None, so
+        # _init_gtp_remat_context takes the no-op (GTP-inactive) path.
+        assert pg_collection.gtp_remat is None
+        assert pg_collection.expt_gtp_remat is None
+        for is_expert in (False, True):
+            gtp_remat_group = (
+                pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+            )
+            assert gtp_remat_group is None
 
 
 # ---------------------------------------------------------------------------
