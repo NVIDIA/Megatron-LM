@@ -748,6 +748,41 @@ class TestMegatronFsdpFullyShard:
             optimizer.step()
             optimizer.zero_grad()
 
+    @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS, OPTIM_GRADS_PARAMS])
+    @pytest.mark.parametrize("optimizer_type", ["adamw", "fused_adam"])
+    def test_optimizer_preinitialization_does_not_advance_step(
+        self, shard_strategy, optimizer_type
+    ):
+        """Optimizer state pre-initialization must not consume a training step."""
+        if optimizer_type == "fused_adam" and not HAVE_TE_FUSED_ADAM:
+            pytest.skip("Transformer Engine FusedAdam is not available")
+
+        torch.manual_seed(1234)
+        model = RootParamModel().cuda()
+        model_input = torch.randn(DIM_SIZE, DIM_SIZE, device="cuda")
+        expected_output = model(model_input).detach().clone()
+
+        mfsdp_model = fully_shard_model(
+            module=model, fsdp_unit_modules=[RootParamModel], zero_dp_strategy=shard_strategy
+        )
+        optimizer_cls = torch.optim.AdamW if optimizer_type == "adamw" else FusedAdam
+        optimizer = fully_shard_optimizer(
+            optimizer_cls(mfsdp_model.parameters(), lr=0.01, weight_decay=0.1)
+        )
+
+        # State must exist for loading a DCP checkpoint, but wrapping the optimizer
+        # must neither apply weight decay nor alter the first-step bias correction.
+        torch.testing.assert_close(mfsdp_model(model_input), expected_output)
+        assert optimizer.state
+        optimizer_steps = [group["step"] for group in optimizer.param_groups if "step" in group]
+        for state in optimizer.state.values():
+            if "step" in state:
+                optimizer_steps.append(state["step"])
+        assert optimizer_steps
+        for step in optimizer_steps:
+            step_value = step.item() if isinstance(step, torch.Tensor) else step
+            assert step_value == 0
+
     def test_root_module_forward_uses_gathered_parameters(self):
         """
         Test that root-owned parameters are gathered before the root forward.
