@@ -1661,7 +1661,7 @@ class MoETransformerLayer(TransformerLayer):
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )
 
-        if self.use_partial_cudagraphs():
+        if self.use_partial_cudagraphs:
             attr_names, token_dispatcher_attr_outputs = self._get_token_dispatcher_attrs()
             if self._local_cudagraph_attr_names is None:
                 self._local_cudagraph_attr_names = attr_names
@@ -1688,7 +1688,7 @@ class MoETransformerLayer(TransformerLayer):
         step runs eagerly between the router and postprocess graph replays.
         """
 
-        if self.use_partial_cudagraphs():
+        if self.use_partial_cudagraphs:
             # Restore the token dispatcher attrs returned on the router graph's output surface.
             self._restore_token_dispatcher_attrs(token_dispatcher_attr_outputs)
 
