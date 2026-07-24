@@ -362,7 +362,11 @@ def test_zero_grad_set_to_none_reuses_dist_grad_wrappers(strategy, outer_strateg
             None if dist_grad is None else dist_grad._local_tensor.shape
             for dist_grad in original_dist_grads
         ]
-        assert any(dist_grad is not None for dist_grad in original_dist_grads)
+        dist_grad_count = torch.tensor(
+            sum(dist_grad is not None for dist_grad in original_dist_grads), device=device
+        )
+        torch.distributed.all_reduce(dist_grad_count)
+        assert dist_grad_count.item() > 0
 
         pg.zero_grad(set_to_none=True)
 
