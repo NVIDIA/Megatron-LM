@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import random
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -17,6 +18,9 @@ except:
     from torch.optim import Adam as GPUAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer.grad_scaler import ConstantGradScaler
+from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
 
 class Net(nn.Module):
@@ -253,3 +257,63 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         assert torch.allclose(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+
+
+@pytest.mark.parametrize(
+    'dtype',
+    [
+        torch.bfloat16,
+        torch.float16,
+    ],
+)
+@pytest.mark.skipif(
+    torch.__version__ < '2.3.0',
+    reason=(
+        "Requires PyTorch 2.3.0 or higher, lower versions of pytorch have "
+        "misaligned optimizer accuracy for CPU and GPU."
+    ),
+)
+def test_hybrid_optimizer_with_float16_wrapper_first_step(dtype):
+    setup_seed(123)
+    net = Net().cuda().to(dtype=dtype)
+    original_param = next(net.parameters())
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=1e-3,
+        bf16=dtype == torch.bfloat16,
+        fp16=dtype == torch.float16,
+        clip_grad=0.0,
+    )
+    hdo = HybridDeviceOptimizer(
+        list(net.parameters()),
+        offload_fraction=0.5,
+        lr=1e-3,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+        overlap_cpu_optimizer_d2h_h2d=False,
+        param_update_in_fp32=True,
+    )
+    optimizer = Float16OptimizerWithFloat16Params(
+        hdo,
+        optimizer_config,
+        None if dtype == torch.bfloat16 else ConstantGradScaler(1.0),
+        lambda *args, **kwargs: None,
+    )
+    optimizer.grad_stats_parallel_group = None
+
+    wrapped_param = hdo.param_groups[0]['params'][0]
+    assert wrapped_param is not original_param
+    assert wrapped_param.dtype == torch.float32
+
+    input = torch.randn(1, 3, 32, 32, device='cuda', dtype=dtype)
+    before = original_param.detach().float().clone()
+    output = net(input)
+    output.sum().backward()
+
+    with patch('torch.distributed.all_reduce', return_value=None):
+        success, _, _ = optimizer.step()
+
+    assert success
+    assert len(hdo.state_dict()["state"]) != 0
+    assert len(optimizer.state_dict()["optimizer"]["state"]) != 0
+    assert not torch.allclose(original_param.detach().float(), before)
