@@ -114,10 +114,10 @@ def _convert_to_moe_state_dict(moe_model, dense_model):
     transformations for weights and biases specific to the MoE architecture.
 
     Args:
-        state_dict (dict): The dense model's state_dict.
         moe_model (nn.Module): The MoE model instance from which to get the submodule
                                and state_dict, must be a model without FP16 and/or
                                DDP wrapper.
+        dense_model (nn.Module): The dense model instance.
 
     Returns:
         dict: The converted MoE model state_dict, ready for use in the MoE architecture.
@@ -320,9 +320,7 @@ def upcycle_state_dict(moe_model, dense_model):
     else:
         assert len(moe_model) == len(dense_model)
         for i in range(len(moe_model)):
-            state_dict['model%d' % i] = _convert_to_moe_state_dict(
-                dense_model[i].state_dict(), moe_model[i]
-            )
+            state_dict['model%d' % i] = _convert_to_moe_state_dict(moe_model[i], dense_model[i])
     return state_dict
 
 
