@@ -56,7 +56,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+    # ARM builders can exhaust resources when uv builds several CUDA packages concurrently.
+    if [ "$(uname -m)" = "aarch64" ]; then
+        export UV_CONCURRENT_BUILDS=1
+    fi
+    uv sync -v \
+        --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
