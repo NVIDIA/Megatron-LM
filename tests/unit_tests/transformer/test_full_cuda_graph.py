@@ -1,21 +1,93 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
+from unittest.mock import Mock, patch
+
 import pytest
 import torch
 from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.utils import is_te_min_version
+from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
+    """Retained DDP AccumulateGrad nodes must use the full-iteration capture stream."""
+
+    class RetainingDataParallel(torch.nn.Module):
+        """Minimal DDP wrapper that retains parameter AccumulateGrad nodes."""
+
+        def __init__(self, *, module, **_):
+            super().__init__()
+            self.module = module
+            self.grad_accumulators = []
+            for param in module.parameters():
+                expanded_param = param.expand_as(param)
+                grad_accumulator = expanded_param.grad_fn.next_functions[0][0]
+                grad_accumulator.register_hook(lambda *_: None)
+                self.grad_accumulators.append(grad_accumulator)
+
+        def forward(self, inputs):
+            """Run the wrapped module."""
+            return self.module(inputs)
+
+    assert torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch is not None
+    model = torch.nn.Linear(4, 4, device="cuda")
+    model.config = Mock()
+    ddp_config = Mock(
+        num_buckets=None,
+        bucket_size=1024,
+        overlap_grad_reduce=True,
+        use_distributed_optimizer=False,
+    )
+    process_groups = Mock()
+    with patch(
+        "megatron.training.models.dist_utils.DistributedDataParallel", RetainingDataParallel
+    ):
+        wrapped_model = _ddp_wrap(
+            [model],
+            data_parallel_random_init=False,
+            ddp_config=ddp_config,
+            overlap_param_gather_with_optimizer_step=False,
+            pg_collection=process_groups,
+        )[0]
+
+    capture_stream = get_shared_capture_stream()
+    current_stream = torch.cuda.current_stream()
+    capture_stream.wait_stream(current_stream)
+    static_input = torch.ones(2, 4, device="cuda")
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        with torch.cuda.stream(capture_stream):
+            wrapped_model(static_input).sum().backward()
+            wrapped_model.zero_grad(set_to_none=False)
+
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph, stream=capture_stream):
+                wrapped_model(static_input).sum().backward()
+
+    cuda_graph.replay()
+    torch.cuda.synchronize()
+
+    stream_mismatch_warnings = [
+        warning
+        for warning in caught_warnings
+        if "AccumulateGrad node's stream does not match" in str(warning.message)
+    ]
+    assert not stream_mismatch_warnings
+    assert all(param.grad is not None for param in wrapped_model.parameters())
 
 
 @pytest.mark.skipif(
