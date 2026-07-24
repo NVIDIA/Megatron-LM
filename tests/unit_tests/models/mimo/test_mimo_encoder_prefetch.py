@@ -159,6 +159,17 @@ class _Source:
         }
 
 
+def test_prefetch_state_is_not_authoritative():
+    loader = EncoderPrefetchLoader(
+        source=_Source(1),
+        encoder_name=ENCODER,
+        feature_producer=lambda _inputs: torch.empty(0),
+        depth=1,
+    )
+
+    assert loader.save_state() is None
+
+
 def _wait_until(predicate):
     deadline = time.monotonic() + 2
     while not predicate():

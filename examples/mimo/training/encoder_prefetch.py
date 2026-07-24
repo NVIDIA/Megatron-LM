@@ -187,6 +187,10 @@ class EncoderPrefetchLoader:
         """Return this loader as its own iterator."""
         return self
 
+    def save_state(self) -> None:
+        """Keep encoder lookahead derived from the canonical language-loader state."""
+        return None
+
     def start(self) -> None:
         """Initialize CUDA stream state and start the producer thread."""
         with self._condition:
