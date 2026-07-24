@@ -454,7 +454,21 @@ if __name__ == "__main__":
         text = f'=== crash rank={rank} t={time.time():.3f} ===\n' + ''.join(
             traceback.format_exception(exc_type, exc, tb)
         )
-        crash_dir = os.environ.get('MRL_CRASH_DIR') or os.getcwd()
+        # Do NOT default to os.getcwd(): under pyxis the container starts in the
+        # image's workdir rather than the submitting directory, so a CWD-relative
+        # crash file lands in the container overlay and dies with the container.
+        # Combined with the /dev/shm fallback dying with the node, and os._exit
+        # racing srun's IO forwarding, this handler could destroy every copy of
+        # its own evidence: runs across several users died with a bare exit(1)
+        # and no recoverable traceback anywhere (2026-07-24). Prefer paths that
+        # outlive the container, and keep /dev/shm below for the case where the
+        # shared filesystem is itself the failure.
+        crash_dir = (
+            os.environ.get('MRL_CRASH_DIR')
+            or os.environ.get('LANGRL_LOG_DIR')
+            or os.environ.get('SLURM_SUBMIT_DIR')
+            or os.getcwd()
+        )
         write_errs = []
         for path in (
             os.path.join(crash_dir, f'crash_rank{rank}.log'),
