@@ -812,7 +812,12 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
+            # fp32-accum RS needs the distributed optimizer; else fall through (all-reduce -> cm).
+            if (
+                self.ddp_config.reduce_scatter_with_fp32_accumulation
+                and self.ddp_config.use_distributed_optimizer
+                and not force_all_reduce
+            ):
                 assert (
                     len(self.buckets) == 1
                 ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"

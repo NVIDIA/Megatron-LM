@@ -29,7 +29,7 @@ class TestProcessGroupsConfig:
         # Test attribute existence
         assert hasattr(model_pgs, 'tp')
         assert hasattr(model_pgs, 'pp')
-        assert not hasattr(model_pgs, 'cp')  # Not set yet
+        assert model_pgs.cp is None  # Not set yet
 
     def test_grad_comm_process_groups(self, mocker):
         """Test basic functionality of ProcessGroupCollection."""
@@ -47,7 +47,7 @@ class TestProcessGroupsConfig:
 
         # Test attribute existence
         assert hasattr(grad_pgs, 'dp')
-        assert not hasattr(grad_pgs, 'dp_cp')  # Not set yet
+        assert grad_pgs.dp_cp is None  # Not set yet
 
     def test_hierarchical_context_parallel_groups(self, mocker):
         """Test setting and accessing the hierarchical context parallel list."""
@@ -129,7 +129,7 @@ class TestPGConfigDefaultInitialization:
         assert hasattr(model_pgs, 'tp')
         assert hasattr(model_pgs, 'pp')
         assert hasattr(model_pgs, 'cp')
-        assert not hasattr(model_pgs, 'dp')
+        assert model_pgs.dp is None  # Not requested, so not set
 
         # Test that an error is raised if an invalid process group is requested
         with pytest.raises(ValueError, match=r"Invalid process groups requested"):

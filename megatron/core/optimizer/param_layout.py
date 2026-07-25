@@ -11,7 +11,7 @@ buffers consume the resulting layouts without any optimizer-specific knowledge.
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -79,12 +79,16 @@ class PerBufferParamLayout:
         param_indices: The index of each param among same-dtype params (using the "fake"
             high-precision dtype for FP8/NVFP4 params). Needed for loading non-native-fp8
             checkpoints in native-fp8 mode. Order matches param_index_map iteration order.
+        num_optimizer_shards: Number of shards the bucket boundaries were aligned to. Set only
+            by ``LayerWiseDistributedOptimizer``, to recover a param's shard index; ``None`` for
+            ``DistributedOptimizer``, which takes the count from the buffer's data_parallel_group.
     """
 
     param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
     bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
     per_bucket_numel_unpadded: List[int] = field(default_factory=list)
     param_indices: List[int] = field(default_factory=list)
+    num_optimizer_shards: Optional[int] = None
 
 
 @dataclass
