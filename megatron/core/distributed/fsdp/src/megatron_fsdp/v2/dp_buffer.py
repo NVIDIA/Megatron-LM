@@ -1,17 +1,40 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import logging
-from typing import Dict, Iterable, List, Optional, Tuple
+import enum
+from typing import Dict, List, Optional
 
 import torch
 from torch.distributed.tensor import DeviceMesh
 
 from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
-from .buffer_index import BufferIndex
-from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
-logger = logging.getLogger(__name__)
+
+class Placement(enum.Enum):
+    """Logical state of a DP buffer along one mesh dimension.
+
+    A buffer stores two enum members ordered as ``[outer-DP, inner-DP]``.
+
+    ``FLAT`` and ``DIRTY`` contain the same valid rank-owned shard. ``FLAT``
+    has compact shard storage, while ``DIRTY`` keeps full-sized storage whose
+    non-owned regions are invalid. ``PARTIAL`` is a local contribution pending
+    reduction; it is not another form of ``DIRTY``.
+
+    Supported data transitions are:
+
+    - ``FLAT``/``DIRTY`` -> ``REPLICATE``: all-gather
+    - ``PARTIAL`` -> ``REPLICATE``: all-reduce
+    - ``PARTIAL`` -> ``FLAT``/``DIRTY``: reduce-scatter
+    - ``REPLICATE`` -> ``FLAT``: retain the rank-owned shard
+    - ``REPLICATE`` -> ``DIRTY``: update only the rank-owned shard
+    - ``FLAT`` -> ``DIRTY``: place the shard into full-sized storage
+    - ``DIRTY`` -> ``FLAT``: discard invalid full-sized storage
+    """
+
+    FLAT = "flat"
+    REPLICATE = "replicate"
+    PARTIAL = "partial"
+    DIRTY = "dirty"
 
 
 class DataParallelBuffer:
@@ -30,7 +53,7 @@ class DataParallelBuffer:
         device: torch.device,
         mesh: DeviceMesh,
         param_group_id: ParamGroupIdx,
-        mp_policy: MixedPrecisionPolicy,
+        mp_policy,
         *,
         allocator: Optional[BucketAllocator] = None,
         buffer_role: str = "model_weight",
@@ -39,6 +62,9 @@ class DataParallelBuffer:
         sharding_strategy: str = "no_shard",
         outer_dp_sharding_strategy: str = "no_shard",
     ):
+        # Keep BufferIndex's Placement import from forming a module-level cycle.
+        from .buffer_index import BufferIndex
+
         assert mp_policy is not None, "DataParallelBuffer requires a mixed-precision policy"
         self.params = params
         self.param_idx = param_idx
@@ -50,8 +76,10 @@ class DataParallelBuffer:
         self.buffer_role = buffer_role
         self.alloc_key = (param_group_id, buffer_role)
         self.mp_policy = mp_policy
+        self.grad_comm_dtype = mp_policy.grad_comm_dtype or dtype
+        self._use_grad_comm_buffer = self.grad_comm_dtype != dtype
 
-        def get_sharding_from_strategy(strategy: str) -> bool:
+        def is_sharded_from_strategy(strategy: str) -> bool:
             if buffer_role in ("model_weight", "transpose_weight"):
                 return strategy == "optim_grads_params"
             if buffer_role == "main_weight":
@@ -60,12 +88,13 @@ class DataParallelBuffer:
                 return strategy in ("optim_grads", "optim_grads_params")
             raise ValueError(f"Unsupported data-parallel buffer role: {buffer_role}")
 
-        inner_sharded = get_sharding_from_strategy(sharding_strategy)
-        outer_sharded = get_sharding_from_strategy(outer_dp_sharding_strategy)
-        self.inner_sharded = inner_sharded
-        self.outer_sharded = outer_sharded
-        # shard_layout=(outer, inner): 1 means sharded and 0 means replicated.
-        self.storage_shard_layout = (int(outer_sharded), int(inner_sharded))
+        self.outer_sharded = is_sharded_from_strategy(outer_dp_sharding_strategy)
+        self.inner_sharded = is_sharded_from_strategy(sharding_strategy)
+        self.storage_placements: list[Placement] = [
+            Placement.FLAT if sharded else Placement.REPLICATE
+            for sharded in (self.outer_sharded, self.inner_sharded)
+        ]
+        self.placements: list[Placement] = self.storage_placements.copy()
         self.sharding_strategy = sharding_strategy
         self.outer_dp_sharding_strategy = outer_dp_sharding_strategy
         self.gradient_scaling_factor = gradient_scaling_factor
@@ -88,7 +117,8 @@ class DataParallelBuffer:
             compact_shapes = mp_policy.get_param_storage_shapes(params)
             self.buffer_index.compact(0.5, compact_shapes)
 
-        self.data_size = self.buffer_index.outer_shard_metas[self.storage_shard_layout].size
+        # Dirty has larger physical storage, but buffers are never initialized as Dirty.
+        self.data_size = self.buffer_index._get_shard_meta(self.storage_placements).size
 
         self.data: Optional[torch.Tensor] = None
         self._unsharded_buffer: Optional[torch.Tensor] = None
@@ -102,8 +132,6 @@ class DataParallelBuffer:
         assert data.dtype == self.dtype, f"dtype mismatch: {data.dtype} vs {self.dtype}"
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
-        self._inner_dirty = False
-        self._outer_dirty = False
 
     # ------------------------------------------------------------------ #
     #  CPU offload
@@ -143,116 +171,156 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def set_item(
-        self, item_id: int, item_data: torch.Tensor, *, shard_layout: Optional[Iterable[int]] = None
+        self, item_id: int, item_data: torch.Tensor, *, placements: Optional[list[Placement]] = None
     ) -> None:
         """Write a parameter tensor into the corresponding region of the buffer."""
-        requested_layout = shard_layout if shard_layout is not None else self.storage_shard_layout
+        requested_placements = placements if placements is not None else self.placements
+        assert not any(
+            placement is Placement.DIRTY for placement in requested_placements
+        ), "set_item does not support Dirty placements"
         source_slice, local_slice = self.buffer_index.local_slice_for(
             self.buffer_index._get_item_global_range(item_id),
-            requested_layout,
-            self.storage_shard_layout,
+            requested_placements,
+            self.storage_placements,
         )
         if source_slice is None or local_slice is None:
             return
         self.data[local_slice].copy_(item_data.flatten()[source_slice])
 
     def get_item(
-        self, item_id: int, *, shard_layout: Optional[Iterable[int]] = None
+        self, item_id: int, *, placements: Optional[list[Placement]] = None
     ) -> torch.Tensor:
         """Read a parameter tensor (or its shard) from the buffer."""
-        requested_layout = shard_layout if shard_layout is not None else self.storage_shard_layout
+        requested_placements = placements if placements is not None else self.placements
+        assert not any(
+            placement is Placement.DIRTY for placement in requested_placements
+        ), "get_item does not support Dirty placements"
         _, local_slice = self.buffer_index.local_slice_for(
             self.buffer_index._get_item_global_range(item_id),
-            requested_layout,
-            self.storage_shard_layout,
+            requested_placements,
+            self.storage_placements,
         )
         return self.data[:0] if local_slice is None else self.data[local_slice]
 
     def is_unsharded(self) -> bool:
         """Return whether this buffer currently has a full unsharded view."""
-        if self._outer_dirty or self._inner_dirty:
-            return False
-        # shard_layout=(outer, inner): (0, 0) means neither dimension is sharded.
-        if self.storage_shard_layout != (0, 0):
-            return self._unsharded_buffer is not None
-        return self.data is not None
+        return all(placement is Placement.REPLICATE for placement in self.placements)
 
     @torch.no_grad()
-    def unshard(
+    def redistribute(
         self,
-        unshard_dim: Optional[int] = 1,
-        bind_params: bool = False,
+        target_placements: Optional[list[Placement]] = None,
+        *,
         stream: Optional[torch.cuda.Stream] = None,
     ) -> torch.Tensor:
-        """All-gather selected dimensions and optionally bind params.
+        """Redistribute one mesh axis and return the branch output."""
+        if target_placements is None:
+            target_placements = self.storage_placements
+        assert len(target_placements) == 2
 
-        ``unshard_dim`` uses mesh dim ids: ``None`` does not unshard,
-        ``0`` unshards outer-DP, and ``1`` unshards inner-DP.
-        """
+        changed_axis = None
+        for axis, (source, target) in enumerate(zip(self.placements, target_placements)):
+            if source == target:
+                continue
+            if changed_axis is not None:
+                raise ValueError(
+                    "redistribute supports changing only one placement axis per call: "
+                    f"{self.placements} -> {target_placements}"
+                )
+            changed_axis = axis
+        if changed_axis is None:
+            return self.fetch_buffer(target_placements)
+
         current_stream = torch.cuda.current_stream()
         stream = stream or current_stream
         if stream != current_stream:
             stream.wait_stream(current_stream)
 
-        # If unshard_dim is set, that dimension becomes replicated in the target.
-        # Otherwise, every dimension keeps the current storage state.
-        target_shard_layout = (
-            0 if unshard_dim == 0 else self.storage_shard_layout[0],
-            0 if unshard_dim == 1 else self.storage_shard_layout[1],
-        )
-        dirty_flags = (self._outer_dirty, self._inner_dirty)
-        storage_is_dirty = (
-            unshard_dim is not None
-            and self.storage_shard_layout[unshard_dim] == 0
-            and dirty_flags[unshard_dim]
-        )
-        # If storage is replicated but dirty, dimension d acts as a sharded source.
-        # Otherwise, dimension d keeps the current storage state as the source.
-        source_shard_layout = (
-            1 if storage_is_dirty and unshard_dim == 0 else self.storage_shard_layout[0],
-            1 if storage_is_dirty and unshard_dim == 1 else self.storage_shard_layout[1],
-        )
-        # Only a source-sharded -> target-replicated transition needs all-gather.
-        requires_unshard = (
-            unshard_dim is not None
-            and source_shard_layout[unshard_dim] == 1
-            and target_shard_layout[unshard_dim] == 0
-        )
+        source = self.placements[changed_axis]
+        target = target_placements[changed_axis]
+        input_buffer = self.fetch_buffer(self.placements)
+        output = self.fetch_buffer(target_placements)
+        group = self.outer_dp_group if changed_axis == 0 else self.inner_dp_group
 
-        # Fast path: target is already available from clean local storage.
-        if not requires_unshard:
-            output_buffer = self.fetch_buffer(target_shard_layout)
-            if bind_params and target_shard_layout == (0, 0):
-                self._bind_buffer_to_params(output_buffer)
-            return output_buffer
-
-        output_shard_layout = (
-            0 if unshard_dim == 0 else source_shard_layout[0],
-            0 if unshard_dim == 1 else source_shard_layout[1],
-        )
-        group = self.outer_dp_group if unshard_dim == 0 else self.inner_dp_group
-
-        input_buffer = self.fetch_buffer(source_shard_layout)
-        output_buffer = self.fetch_buffer(output_shard_layout)
-        if torch.distributed.get_world_size(group) == 1:
+        if source in (Placement.FLAT, Placement.DIRTY) and target is Placement.REPLICATE:
             with torch.cuda.stream(stream):
-                if output_buffer.data_ptr() != input_buffer.data_ptr():
-                    output_buffer.copy_(input_buffer)
+                torch.distributed.all_gather_into_tensor(output, input_buffer, group=group)
+        elif source is Placement.PARTIAL:
+            scaling_factor = self.gradient_scaling_factor
+            scale_inner = changed_axis == 1 and scaling_factor not in (None, 1.0)
+            prescale = scale_inner and (
+                self.grad_comm_dtype == torch.bfloat16
+                or torch.distributed.get_world_size(group) == 1
+            )
+            op = (
+                torch.distributed.ReduceOp.SUM
+                if not scale_inner or prescale
+                else torch.distributed._make_nccl_premul_sum(scaling_factor)
+            )
+
+            comm_input = input_buffer
+            if self._use_grad_comm_buffer:
+                comm_input = self.allocator.allocate(
+                    key=(self.alloc_key, "grad_reduce_input", changed_axis),
+                    size=input_buffer.numel(),
+                    dtype=self.grad_comm_dtype,
+                    device=self.device,
+                ).data
+            if comm_input.is_cuda:
+                comm_input.record_stream(stream)
+
+            with torch.cuda.stream(stream):
+                if comm_input is not input_buffer:
+                    comm_input.copy_(input_buffer)
+                if prescale:
+                    comm_input.mul_(scaling_factor)
+                if target is Placement.REPLICATE:
+                    torch.distributed.all_reduce(comm_input, group=group, op=op)
+                    output = comm_input
+                else:
+                    input_meta = self.buffer_index._get_shard_meta(self.placements)
+                    output_meta = self.buffer_index._get_shard_meta(target_placements)
+                    output_offset = output_meta.global_data_index - input_meta.global_data_index
+                    output = comm_input[output_offset : output_offset + output_meta.size]
+                    torch.distributed.reduce_scatter_tensor(
+                        output=output, input=comm_input, group=group, op=op
+                    )
+        elif target in (Placement.DIRTY, Placement.PARTIAL):
+            pass
+        elif target is Placement.FLAT:
+            if source is Placement.REPLICATE:
+                self.release_unsharded_buffer()
         else:
-            with torch.cuda.stream(stream):
-                torch.distributed.all_gather_into_tensor(
-                    output_tensor=output_buffer, input_tensor=input_buffer, group=group
-                )
+            raise NotImplementedError(f"Unsupported placement transition: {source!r} -> {target!r}")
 
-        setattr(self, "_outer_dirty" if unshard_dim == 0 else "_inner_dirty", False)
+        self.placements[changed_axis] = target
+        return output
 
-        # Parameter binding needs the full compute buffer.
-        if bind_params and output_shard_layout == (0, 0):
-            self._bind_buffer_to_params(output_buffer)
-        return output_buffer
+    @torch.no_grad()
+    def commit_comm_output(
+        self,
+        comm_output: torch.Tensor,
+        changed_axis: int,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+        accumulate: bool = False,
+    ) -> None:
+        """Copy or accumulate a communication result into its target buffer."""
+        output_buffer = self.fetch_buffer(self.placements)
+        with torch.cuda.stream(stream or torch.cuda.current_stream()):
+            if output_buffer.data_ptr() != comm_output.data_ptr():
+                if accumulate:
+                    output_buffer.add_(comm_output)
+                else:
+                    output_buffer.copy_(comm_output)
+        if self._use_grad_comm_buffer:
+            self.allocator.free((self.alloc_key, "grad_reduce_input", changed_axis))
 
-    def _bind_buffer_to_params(self, buffer: torch.Tensor) -> None:
-        """Bind the given buffer to the params according to the layout."""
+    def bind_params(self, buffer: Optional[torch.Tensor] = None) -> None:
+        """Bind parameters to a fully replicated buffer."""
+        if buffer is None:
+            assert self.is_unsharded(), "Cannot bind params from a sharded buffer"
+            buffer = self.fetch_buffer(self.placements)
         assert buffer.numel() == self.buffer_index.bucket_meta.size, (
             f"Buffer size {buffer.numel()} does not match expected size "
             f"{self.buffer_index.bucket_meta.size}"
@@ -264,59 +332,44 @@ class DataParallelBuffer:
             param_data = buffer[start:end].view(idx_shape)
             self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
 
-    @torch.no_grad()
-    def reshard(self, shard_dim: Optional[int] = None) -> None:
-        """Release temporary buffers allocated by ``fetch_buffer`` / ``unshard``."""
-        if shard_dim is not None:
-            # If storage is already replicated on this dim, unshard() returned
-            # self.data or a self.data view, so no temporary buffer was allocated.
-            if self.storage_shard_layout[shard_dim] == 0:
-                return
+    def release_unsharded_buffer(self) -> None:
+        """Release the temporary full-sized buffer without changing placements."""
         self.allocator.free(self.alloc_key)
         self._unsharded_buffer = None
 
-    def get_shard_view(self, shard_layout: Optional[Iterable[int]] = None) -> torch.Tensor:
-        """Return a shard view inside the persistent data buffer."""
+    def get_shard_view(self, placements: Optional[list[Placement]] = None) -> torch.Tensor:
+        """Return a placement view inside the persistent data buffer."""
         assert self.data is not None, "DataParallelBuffer data not initialized"
-        requested_layout = shard_layout if shard_layout is not None else self.storage_shard_layout
+        requested_placements = placements if placements is not None else self.placements
         _, local_slice = self.buffer_index.local_slice_for(
-            (0, self.buffer_index.bucket_meta.size), requested_layout, self.storage_shard_layout
+            (0, self.buffer_index.bucket_meta.size), requested_placements, self.storage_placements
         )
         return self.data[:0] if local_slice is None else self.data[local_slice]
 
-    def fetch_buffer(self, shard_layout: Tuple[int, int] = (0, 0)) -> torch.Tensor:
-        """Return a buffer for ``shard_layout``, allocating temporary storage if needed.
+    def fetch_buffer(self, placements: list[Placement]) -> torch.Tensor:
+        """Return a buffer for placements, allocating temporary storage if needed.
 
-        1. If ``shard_layout`` matches this buffer's storage layout, return
-           ``self.data`` directly.
-        2. If ``self.data`` is a known parent layout of the requested shard,
-           return a view into ``self.data``. Example: storage ``(0, 1)`` can
-           return a ``(1, 1)`` view.
-        3. Otherwise allocate/reuse the full ``(0, 0)`` unsharded buffer and
-           return either that full buffer or a view from it. Example: storage
-           ``(1, 1)`` requesting ``(0, 1)`` must materialize the full buffer
-           because one outer shard cannot cover the complete inner-DP shard.
+        1. If placements match the storage placements, return self.data directly.
+        2. If self.data is a known parent of the requested placements, return a
+           view into self.data.
+        3. Otherwise allocate/reuse the fully replicated temporary buffer and
+           return either that full buffer or a view from it.
 
         Memory allocation always occurs on the caller stream for deterministic
         caching-allocator behaviour.
         """
-        requested_shard_layout = shard_layout
-
-        # 1. Exact storage match: no view or temporary buffer needed.
-        if requested_shard_layout == self.storage_shard_layout:
+        requested_meta = self.buffer_index._get_shard_meta(placements)
+        if placements == self.storage_placements:
             assert self.data is not None, "DataParallelBuffer data not initialized"
             return self.data
 
-        # 2. Parent storage layouts can directly expose a child shard view.
         data_contains_requested = all(
-            storage_dim == 0 or storage_dim == requested_dim
-            for storage_dim, requested_dim in zip(self.storage_shard_layout, requested_shard_layout)
+            storage_placement is not Placement.FLAT or requested_placement is Placement.FLAT
+            for storage_placement, requested_placement in zip(self.storage_placements, placements)
         )
         if data_contains_requested:
-            return self.get_shard_view(requested_shard_layout)
+            return self.get_shard_view(placements)
 
-        # 3. Otherwise materialize the full buffer and return the requested view
-        # from it. This covers HSDP storage (1, 1) -> requested (0, 1).
         if self._unsharded_buffer is None:
             bucket = self.allocator.allocate(
                 key=self.alloc_key,
@@ -325,121 +378,9 @@ class DataParallelBuffer:
                 device=self.device,
             )
             self._unsharded_buffer = bucket.data
-        if requested_shard_layout == (0, 0):
+        if all(placement is Placement.REPLICATE for placement in placements):
             return self._unsharded_buffer
-        requested_meta = self.buffer_index._get_shard_meta(requested_shard_layout)
         return self._unsharded_buffer[
             requested_meta.bucket_data_index : requested_meta.bucket_data_index
             + requested_meta.size
         ]
-
-    @torch.no_grad()
-    def reduce_grad(
-        self,
-        *,
-        accumulate_reduced_grad: bool = False,
-        reduce_dim: Optional[int] = 1,
-        reduce_scatter: bool = True,
-        grad_comm_dtype: Optional[torch.dtype] = None,
-        stream: Optional[torch.cuda.Stream] = None,
-    ):
-        """Reduce gradients into the optimizer-facing local shard.
-
-        ``reduce_dim`` uses mesh dim ids: ``None`` does not reduce,
-        ``0`` reduces outer-DP, and ``1`` reduces inner-DP.
-        ``reduce_scatter`` selects RS vs AR; ParameterGroup owns that strategy decision.
-        ``accumulate_reduced_grad`` adds the collective result to an existing
-        local output gradient instead of replacing it.
-        """
-        if reduce_dim is None:
-            return
-
-        current_stream = torch.cuda.current_stream()
-        stream = stream or current_stream
-        if stream != current_stream:
-            stream.wait_stream(current_stream)
-
-        grad_comm_dtype = grad_comm_dtype or self.mp_policy.grad_comm_dtype or self.dtype
-        # Scale exactly once, when reducing fresh full grads over inner-DP.
-        # Outer-only reduce consumes an already-scaled inner-DP result.
-        if reduce_dim != 1 or self.gradient_scaling_factor in (None, 1.0):
-            op = torch.distributed.ReduceOp.SUM
-            prescale = False
-        elif grad_comm_dtype != torch.bfloat16:
-            op = torch.distributed._make_nccl_premul_sum(self.gradient_scaling_factor)
-            prescale = False
-        else:
-            op = torch.distributed.ReduceOp.SUM
-            prescale = True
-
-        # Inner reduce consumes fresh full grads: (0, 0) -> (0, 1).
-        # Outer reduce consumes the inner-reduced view: (0, 1) -> (1, 1).
-        input_shard_layout = (0, 0 if reduce_dim == 1 else self.storage_shard_layout[1])
-        # AR keeps the same shard view; RS shards the reduced dimension.
-        output_shard_layout = (
-            1 if reduce_scatter and reduce_dim == 0 else input_shard_layout[0],
-            1 if reduce_scatter and reduce_dim == 1 else input_shard_layout[1],
-        )
-        input_buffer = self.fetch_buffer(input_shard_layout)
-        output_buffer = self.fetch_buffer(output_shard_layout)
-
-        # Pick the process group covering exactly the reduced dimension.
-        group = self.outer_dp_group if reduce_dim == 0 else self.inner_dp_group
-        if torch.distributed.get_world_size(group) == 1:
-            if input_buffer.is_cuda:
-                input_buffer.record_stream(stream)
-            with torch.cuda.stream(stream):
-                # A singleton inner-DP group bypasses both NCCL premul-sum and the
-                # BF16 prescale path above, so apply its scaling locally.
-                if reduce_dim == 1 and self.gradient_scaling_factor not in (None, 1.0):
-                    input_buffer.mul_(self.gradient_scaling_factor)
-                if output_buffer.data_ptr() != input_buffer.data_ptr():
-                    if accumulate_reduced_grad:
-                        output_buffer.add_(input_buffer)
-                    else:
-                        output_buffer.copy_(input_buffer)
-            return
-
-        comm_input = input_buffer
-        input_key = None
-        if grad_comm_dtype != self.dtype:
-            input_key = (self.alloc_key, "grad_reduce_input", reduce_dim)
-            input_bucket = self.allocator.allocate(
-                key=input_key, size=input_buffer.numel(), dtype=grad_comm_dtype, device=self.device
-            )
-            comm_input = input_bucket.data
-            with torch.cuda.stream(stream):
-                comm_input.copy_(input_buffer)
-        if comm_input.is_cuda:
-            comm_input.record_stream(stream)
-        if prescale:
-            with torch.cuda.stream(stream):
-                comm_input.mul_(self.gradient_scaling_factor)
-
-        if not reduce_scatter:
-            with torch.cuda.stream(stream):
-                torch.distributed.all_reduce(comm_input, group=group, op=op)
-                if input_key is not None:
-                    output_buffer.copy_(comm_input.to(self.dtype))
-            if input_key is not None:
-                self.allocator.free(input_key)
-            return
-
-        input_meta = self.buffer_index._get_shard_meta(input_shard_layout)
-        output_meta = self.buffer_index._get_shard_meta(output_shard_layout)
-        output_offset = output_meta.global_data_index - input_meta.global_data_index
-        # Stage RS output in the input buffer slice; avoids untraced temp keys in TracePool.
-        comm_output = comm_input[output_offset : output_offset + output_buffer.numel()]
-
-        with torch.cuda.stream(stream):
-            torch.distributed.reduce_scatter_tensor(
-                output=comm_output, input=comm_input, group=group, op=op
-            )
-
-            if output_buffer.data_ptr() != comm_output.data_ptr():
-                if accumulate_reduced_grad:
-                    output_buffer += comm_output
-                else:
-                    output_buffer.copy_(comm_output)
-        if input_key is not None:
-            self.allocator.free(input_key)

@@ -17,6 +17,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import 
 )
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.global_vars import destroy_global_vars
 from tests.unit_tests.distributed.mfsdp_v1.utils import (

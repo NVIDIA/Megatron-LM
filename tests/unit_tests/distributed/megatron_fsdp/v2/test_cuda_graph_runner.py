@@ -29,6 +29,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.cuda_graph_runner impor
     _prepare_compiled_modules_for_capture,
     _restore_compiled_modules_after_capture_failure,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.dp_buffer import Placement
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.hooks import _pre_backward_setup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.te_graph_runtime.graph import (
@@ -129,12 +130,18 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
 
     reduce_calls = []
     release_calls = []
+    redistribute_calls = []
     dist_param = SimpleNamespace(dtype=param.dtype, grad=None)
     param_group = SimpleNamespace(
         requires_grad=True,
         sharding_strategy="optim_grads_params",
         enable_full_iteration_cuda_graph=False,
-        main_grad_buffer=SimpleNamespace(inner_sharded=True),
+        main_grad_buffer=SimpleNamespace(
+            inner_sharded=True,
+            placements=[Placement.REPLICATE, Placement.FLAT],
+            redistribute=lambda placements, **_kwargs: redistribute_calls.append(placements.copy()),
+        ),
+        mesh=SimpleNamespace(size=lambda _dim: 1),
         _full_grad_buffer_has_accumulated_grad=False,
         params=(param,),
         dist_params=(dist_param,),
@@ -155,6 +162,7 @@ def test_reduce_grad_skips_aliased_main_grad_copy():
         FSDPModule.reduce_grad(module)
 
     copy_mock.assert_not_called()
+    assert redistribute_calls == [[Placement.REPLICATE, Placement.PARTIAL]]
     assert param.grad is None
     assert reduce_calls == [True]
     assert release_calls == [True]
@@ -299,12 +307,16 @@ def test_capture_backward_pre_hook_prefetches_only_te_fused_wgrad():
     regular_fetch_calls = []
     fused_group = SimpleNamespace(
         params=(fused_param,),
-        main_grad_buffer=SimpleNamespace(fetch_buffer=lambda: fused_fetch_calls.append(True)),
+        main_grad_buffer=SimpleNamespace(
+            fetch_buffer=lambda _placements: fused_fetch_calls.append(True)
+        ),
         _init_dist_grads=lambda: fused_init_calls.append(True),
     )
     regular_group = SimpleNamespace(
         params=(regular_param,),
-        main_grad_buffer=SimpleNamespace(fetch_buffer=lambda: regular_fetch_calls.append(True)),
+        main_grad_buffer=SimpleNamespace(
+            fetch_buffer=lambda _placements: regular_fetch_calls.append(True)
+        ),
         _init_dist_grads=lambda: regular_init_calls.append(True),
     )
     unshard_calls = []
@@ -333,7 +345,7 @@ def test_trace_prefetches_static_main_grad_before_backward():
         requires_grad=True,
         sharding_strategy="optim_grads_params",
         main_grad_buffer=SimpleNamespace(
-            dtype=param.dtype, fetch_buffer=lambda: fetch_calls.append(True)
+            dtype=param.dtype, fetch_buffer=lambda _placements: fetch_calls.append(True)
         ),
         _init_dist_grads=lambda: init_calls.append(True),
     )
