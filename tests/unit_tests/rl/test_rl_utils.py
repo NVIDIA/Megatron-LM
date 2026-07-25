@@ -166,9 +166,7 @@ def initialize_model_parallel(request, monkeypatch):
     cp = request.param[2] if len(request.param) > 2 else 1
     world_size = Utils.world_size
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tp,
-        pipeline_model_parallel_size=pp,
-        context_parallel_size=cp,
+        tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, context_parallel_size=cp
     )
     model_parallel_cuda_manual_seed(123)
     dp = world_size // (tp * pp * cp)
