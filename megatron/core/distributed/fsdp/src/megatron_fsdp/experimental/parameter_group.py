@@ -29,9 +29,9 @@ from .placement import Partial, Placements, Replicate, changed_mesh_axis
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 
-def contained_in_parameter_group(parameter: nn.Parameter) -> bool:
-    """Return whether a parameter is already owned by an FsdpParameterGroup."""
-    return hasattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR)
+def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
+    """Return the FSDP parameter group that owns ``parameter``, if any."""
+    return getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
 
 
 class FsdpParameterGroup:
@@ -172,6 +172,9 @@ class FsdpParameterGroup:
         self.sharded_parameters = tuple(sharded_parameters)
         self.unsharded_parameters = tuple(unsharded_parameters)
 
+        # Compute weights must be initialized before the first forward; subsequent
+        # refreshes happen from the FSDP optimizer's post-step hook.
+        self.sync_model_weight_from_main_weight()
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
