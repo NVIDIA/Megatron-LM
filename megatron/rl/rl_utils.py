@@ -957,6 +957,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                 total_tokens=tokens.shape[1],
                 pad_between_seqs=False,
             )
+            packed_seq_params.seq_idx = None
 
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
     cp_group = pg_collection.cp

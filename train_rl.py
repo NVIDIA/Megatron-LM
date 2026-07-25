@@ -273,6 +273,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 total_tokens=tokens.shape[1],
                 pad_between_seqs=False,
             )
+            packed_seq_params.seq_idx = None
 
     # Clear RoPE cache to avoid inference tensor errors
     try:
