@@ -14,7 +14,14 @@ class TestMambaMetadata:
         """Fixture to initialize MambaMetadata with standard constraints."""
         max_requests = 16
         max_tokens = 2048
-        metadata = MambaMetadata(max_requests=max_requests, max_tokens=max_tokens)
+        # Per-step intermediate-state cap (token budget / block_size + margin);
+        # value is irrelevant to these update() tests, which don't extract state.
+        max_intermediate_count = 17
+        metadata = MambaMetadata(
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_intermediate_count=max_intermediate_count,
+        )
 
         # Manually allocate some slots to simulate a running state.
         # We assume request_id i maps to mamba_slot i for simplicity in assertions.
