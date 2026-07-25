@@ -68,7 +68,11 @@ def fully_shard(
 
 @contextmanager
 def microbatch(module: nn.Module, is_last: bool) -> Iterator[None]:
-    """Scope FSDP state to one microbatch.
+    """Mark an FSDP microbatch as the last accumulation microbatch.
+
+    At present, this is only needed for HSDP/HFSDP gradient accumulation, so
+    FSDP finalizes gradients only on the last backward. Plain all-Flat data
+    parallelism finalizes gradients on every backward and does not need it.
 
     Args:
         module: Module tree whose FSDP roots should use this microbatch state.
