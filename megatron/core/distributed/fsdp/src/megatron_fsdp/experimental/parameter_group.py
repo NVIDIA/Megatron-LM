@@ -250,12 +250,6 @@ class FsdpParameterGroup:
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
-    def _install_sharded_grads(self) -> None:
-        """Point each sharded parameter's grad at main_grad's current DTensor view."""
-        assert self.main_grad is not None
-        for index, sharded_parameter in enumerate(self.sharded_parameters):
-            sharded_parameter.grad = self.main_grad.get_dtensor(index)
-
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
@@ -321,8 +315,6 @@ class FsdpParameterGroup:
         # and a fresh reduce-scattered buffer for HFSDP in the future.
         if self.main_grad.placements != self._accumulation_placements:
             self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
-            if has_sharded_grads:
-                self._install_sharded_grads()
 
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -346,14 +338,15 @@ class FsdpParameterGroup:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
-        if not has_sharded_grads:
-            self._install_sharded_grads()
 
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
-            # reduce-scatter for HFSDP) and install the sharded parameter gradients.
+            # reduce-scatter for HFSDP) before binding the sharded parameter grads.
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
-            self._install_sharded_grads()
+
+        # Make each sharded parameter's .grad consistent with the final main_grad.
+        for index, sharded_parameter in enumerate(self.sharded_parameters):
+            sharded_parameter.grad = self.main_grad.get_dtensor(index)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
