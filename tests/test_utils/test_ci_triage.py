@@ -133,12 +133,7 @@ def test_notification_rules_use_expected_pipeline_sources():
         '$CI_COMMIT_BRANCH ==  "ci-dev-unit-test-extended")'
     ]
 
-    smoke_condition = functional["functional:smoke_notify"]["rules"][1]["if"]
-    assert smoke_condition == (
-        '$FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly)$/ && '
-        '($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || '
-        '$CI_MERGE_REQUEST_EVENT_TYPE == "merged_result")'
-    )
+    assert "functional:smoke_notify" not in functional
     assert functional["functional:x_notify"]["rules"][0]["if"] == (
         '($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && '
         '$FUNCTIONAL_TEST == "yes"'
@@ -162,27 +157,92 @@ def test_all_generated_test_types_enable_error_extraction():
     assert functional.count('"--enable-error-extraction"') >= 2
 
 
+@pytest.mark.parametrize(("test_type", "expected_alerts"), [("regular", 0), ("release", 1)])
+def test_retry_exhaustion_per_test_alert_is_release_only(
+    monkeypatch, tmp_path, test_type, expected_alerts
+):
+    pytest.importorskip("jetclient")
+    from tests.test_utils.python_scripts import launch_jet_workload
+
+    base_path = tmp_path / "tests" / "test_utils" / "python_scripts"
+    model_config = (
+        tmp_path
+        / "tests"
+        / "functional_tests"
+        / "test_cases"
+        / "model"
+        / "case"
+        / "model_config.yaml"
+    )
+    base_path.mkdir(parents=True)
+    model_config.parent.mkdir(parents=True)
+    model_config.write_text(f"TEST_TYPE: {test_type}\n")
+
+    job = Mock()
+    job.name = "basic-job"
+    pipeline = Mock()
+    pipeline.get_jobs.return_value = [job]
+    launch = Mock(return_value=pipeline)
+    alert = Mock()
+    telemetry = Mock()
+    monkeypatch.setattr(launch_jet_workload, "BASE_PATH", base_path)
+    monkeypatch.setattr(launch_jet_workload, "launch_and_wait_for_completion", launch)
+    monkeypatch.setattr(launch_jet_workload, "download_job_assets", Mock(return_value=None))
+    monkeypatch.setattr(launch_jet_workload, "send_slack_alert", alert)
+    monkeypatch.setattr(launch_jet_workload, "telemetrics_and_exit", telemetry)
+
+    launch_jet_workload.main.callback(
+        model="model",
+        test_case="case",
+        environment="dev",
+        n_repeat=1,
+        time_limit=1,
+        scope="mr",
+        account="mcore",
+        partition=None,
+        cluster="cluster",
+        platform="platform",
+        container_tag="tag",
+        record_checkpoints="false",
+        run_name="run",
+        wandb_experiment="experiment",
+    )
+
+    assert launch.call_count == 9
+    assert alert.call_count == expected_alerts
+    telemetry.assert_called_once()
+
+
 def test_get_pipeline_jobs_uses_triage_collector(monkeypatch, notify_module):
     notify = notify_module
-    bridge = SimpleNamespace(
-        name="functional:run_dev_dgx_h100", attributes={"downstream_pipeline": {"id": 101}}
-    )
+    bridges = [
+        SimpleNamespace(
+            name="functional:run_dev_dgx_h100", attributes={"downstream_pipeline": {"id": 101}}
+        ),
+        SimpleNamespace(
+            name="functional:smoke-gb200", attributes={"downstream_pipeline": {"id": 102}}
+        ),
+    ]
     root_pipeline = Mock()
-    root_pipeline.bridges.list.return_value = [bridge]
+    root_pipeline.bridges.list.return_value = bridges
     project = Mock()
     project.pipelines.get.return_value = root_pipeline
     handle = Mock()
     handle.projects.get.return_value = project
-    jobs = [{"status": "failed", "gpu": "Unknown"}]
-
     monkeypatch.setattr(notify, "get_gitlab_handle", lambda: handle)
-    collector = Mock(return_value=jobs)
+    collector = Mock(
+        side_effect=[
+            [{"status": "failed", "gpu": "Unknown"}],
+            [{"status": "failed", "gpu": "Unknown"}],
+        ]
+    )
     monkeypatch.setattr(notify.notification, "get_jobs_from_pipeline", collector)
 
-    assert notify.get_pipeline_jobs(123, "functional:run_") == [
-        ("functional:run_dev_dgx_h100", 101, [{"status": "failed", "gpu": "H100"}])
+    assert notify.get_pipeline_jobs(123, notify.JOB_PREFIXES["functional-tests"]) == [
+        ("functional:run_dev_dgx_h100", 101, [{"status": "failed", "gpu": "H100"}]),
+        ("functional:smoke-gb200", 102, [{"status": "failed", "gpu": "GB200"}]),
     ]
-    collector.assert_called_once_with(project, 101)
+    assert collector.call_args_list == [((project, 101),), ((project, 102),)]
 
 
 def test_build_linear_reports_groups_matching_failures(monkeypatch):
@@ -221,6 +281,19 @@ def test_build_linear_reports_groups_matching_failures(monkeypatch):
                 }
             ],
         ),
+        (
+            "functional:smoke-gb200",
+            103,
+            [
+                {
+                    "config_name": "gpt_smoke_fail",
+                    "id": 4,
+                    "status": "failed",
+                    "allow_failure": False,
+                    "error_type": "CUDA OOM",
+                }
+            ],
+        ),
     ]
     reports = {
         2: {
@@ -235,6 +308,12 @@ def test_build_linear_reports_groups_matching_failures(monkeypatch):
             "error_subtype": "torch.OutOfMemoryError",
             "excerpt": "CUDA out of memory",
         },
+        4: {
+            "exit_code_training": 1,
+            "category": "CUDA OOM",
+            "error_subtype": "torch.OutOfMemoryError",
+            "excerpt": "CUDA out of memory",
+        },
     }
 
     summaries, buckets = linear_ci.build_pipeline_reports(
@@ -242,9 +321,10 @@ def test_build_linear_reports_groups_matching_failures(monkeypatch):
     )
 
     stats = summaries["modules"][linear_ci.LINEAR_MODULE]
-    assert stats == {"passed": 1, "failed": 2, "passed_tests": ["gpt_pass@dev-dgx-h100"]}
+    assert stats == {"passed": 1, "failed": 3, "passed_tests": ["gpt_pass@dev-dgx-h100"]}
     assert len(buckets["buckets"]) == 1
     bucket = buckets["buckets"][0]
+    assert bucket["module"] == linear_ci.LINEAR_MODULE
     assert bucket["category"] == "CUDA OOM"
     assert bucket["rationale"] == "CUDA OOM: torch.OutOfMemoryError"
     assert bucket["tests"] == [
@@ -255,6 +335,10 @@ def test_build_linear_reports_groups_matching_failures(monkeypatch):
         {
             "name": "gpt_fail_b@lts-dgx-h100",
             "job_url": "https://ci.example.com/ADLR/megatron-lm/-/jobs/3",
+        },
+        {
+            "name": "gpt_smoke_fail@smoke-gb200",
+            "job_url": "https://ci.example.com/ADLR/megatron-lm/-/jobs/4",
         },
     ]
     summarize.assert_called_once()
@@ -335,6 +419,8 @@ def test_triage_config_selects_megatron_and_enables_write_actions():
             linear_ci.LINEAR_MODULE,
             {
                 "build_module": "megatron-lm",
+                "channel_id_env": "MCORE_SLACK_CHANNEL_ID",
+                "reconcile_proposal": True,
                 "team_key": "MCORE",
                 "project_template": "MCore CI Testing",
                 "enable_linear_open": True,
@@ -348,17 +434,37 @@ def test_triage_config_selects_megatron_and_enables_write_actions():
     }
 
 
+def test_slack_followup_uses_upstream_detailed_and_execution_summaries():
+    triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
+    execution_summary, detailed_summary = triage["triage:slack_linear_followup"]["script"]
+    script = f"{execution_summary}\n{detailed_summary}"
+
+    assert "--pipeline-summary slack_notification.json" in execution_summary
+    assert "--linear-plan linear_action_plan_post.json" in execution_summary
+    assert "--slack-channel-id" in execution_summary
+    assert "--module megatron_lm" in detailed_summary
+    assert "--only-followup" in detailed_summary
+    assert '--thread-ts "${THREAD_TIMESTAMP}"' in detailed_summary
+    assert "--failure-buckets failure_buckets.json" in detailed_summary
+    assert "--linear-report linear_status_report.json" in detailed_summary
+    assert "--action-plan linear_action_plan_post.json" in detailed_summary
+    assert "--slack-channel-id" not in detailed_summary
+    assert 'if [[ -z "${THREAD_TIMESTAMP}" ]]' in script
+
+
 def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
     notify = notify_module
+    project = Mock()
     pipeline_jobs = [("functional:run_dev_dgx_h100", 101, [{"status": "failed"}])]
+    collector = Mock(return_value=pipeline_jobs)
     sender = Mock()
 
     monkeypatch.setattr(notify, "WEBHOOK_URL", "https://slack.invalid/webhook")
     monkeypatch.setattr(notify, "SLACK_BOT_TOKEN", "")
     monkeypatch.setattr(notify, "SLACK_CHANNEL_ID", "")
     monkeypatch.setattr(notify, "PROJECT_URL", "https://ci.example.com/ADLR/megatron-lm")
-    monkeypatch.setattr(notify, "get_project", Mock())
-    monkeypatch.setattr(notify, "get_pipeline_jobs", lambda *_args, **_kwargs: pipeline_jobs)
+    monkeypatch.setattr(notify, "get_project", lambda: project)
+    monkeypatch.setattr(notify, "get_pipeline_jobs", collector)
     monkeypatch.setattr(notify.notification, "send_slack_notification", sender)
 
     result = CliRunner().invoke(
@@ -386,6 +492,48 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
         slack_channel_id=None,
         config=notify.TRIAGE_CONFIG,
     )
+    collector.assert_called_once_with(123, notify.JOB_PREFIXES["functional-tests"], project=project)
+
+
+@pytest.mark.parametrize("has_failure", [False, True])
+def test_smoke_notification_is_failure_only_and_aggregate(monkeypatch, notify_module, has_failure):
+    notify = notify_module
+    project = Mock()
+    pipeline_jobs = [
+        ("functional:smoke-h100", 101, [{"status": "success"}]),
+        ("functional:smoke-gb200", 102, [{"status": "failed" if has_failure else "success"}]),
+    ]
+    collector = Mock(return_value=pipeline_jobs)
+    sender = Mock()
+
+    monkeypatch.setattr(notify, "WEBHOOK_URL", "https://slack.invalid/webhook")
+    monkeypatch.setattr(notify, "SLACK_BOT_TOKEN", "")
+    monkeypatch.setattr(notify, "SLACK_CHANNEL_ID", "")
+    monkeypatch.setattr(notify, "get_project", lambda: project)
+    monkeypatch.setattr(notify, "get_pipeline_jobs", collector)
+    monkeypatch.setattr(notify.notification, "send_slack_notification", sender)
+
+    result = CliRunner().invoke(
+        notify.main,
+        [
+            "--pipeline-id",
+            "123",
+            "--check-for",
+            "smoke-tests",
+            "--pipeline-context",
+            "smoke-nightly",
+            "--pipeline-created-at",
+            "2026-07-12T00:00:00Z",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    collector.assert_called_once_with(123, notify.JOB_PREFIXES["smoke-tests"], project=project)
+    if has_failure:
+        sender.assert_called_once()
+        assert sender.call_args.args[2] == pipeline_jobs
+    else:
+        sender.assert_not_called()
 
 
 def test_notification_records_bot_thread_context(monkeypatch, tmp_path, notify_module):
@@ -438,13 +586,14 @@ def test_notification_writes_linear_inputs_without_webhook(monkeypatch, tmp_path
     notify = notify_module
     project = Mock()
     pipeline_jobs = [("functional:run_dev_dgx_h100", 101, [])]
+    collector = Mock(return_value=pipeline_jobs)
     writer = Mock()
 
     monkeypatch.setattr(notify, "WEBHOOK_URL", "")
     monkeypatch.setattr(notify, "SLACK_BOT_TOKEN", "")
     monkeypatch.setattr(notify, "SLACK_CHANNEL_ID", "")
     monkeypatch.setattr(notify, "get_project", lambda: project)
-    monkeypatch.setattr(notify, "get_pipeline_jobs", lambda *_args, **_kwargs: pipeline_jobs)
+    monkeypatch.setattr(notify, "get_pipeline_jobs", collector)
     monkeypatch.setattr(notify.linear_ci, "write_pipeline_reports", writer)
     summaries = tmp_path / "pipeline_summaries.json"
     buckets = tmp_path / "failure_buckets.json"
@@ -468,6 +617,7 @@ def test_notification_writes_linear_inputs_without_webhook(monkeypatch, tmp_path
     )
 
     assert result.exit_code == 0, result.output
+    collector.assert_called_once_with(123, notify.JOB_PREFIXES["functional-tests"], project=project)
     writer.assert_called_once_with(
         123, "nightly", pipeline_jobs, project, notify.PROJECT_URL, summaries, buckets
     )

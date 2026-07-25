@@ -14,6 +14,7 @@ from megatron.rl.agent.api import (
     Rollout,
     RolloutGenerator,
     RolloutRequest,
+    _SubmissionGate,
 )
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
@@ -101,6 +102,101 @@ class CountingRewardAgent(RewardOnlyAgent):
 
     async def get_reward(self, response, golden, finish_reason):
         return float(int(response.removeprefix("t")) == golden["idx"])
+
+
+async def _flush(rounds: int = 50):
+    """Let pipeline stage tasks settle (mock inference is zero-delay)."""
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+
+
+class TestSubmissionGate:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("submission", ["R", "G", "B"])
+    async def test_release_requires_matching_granularity(self, submission):
+        gate = _SubmissionGate(capacity=1, submission=submission)
+        await gate.acquire_for(submission)
+        assert gate.held == 1
+        for granularity in ("R", "G", "B"):
+            if granularity == submission:
+                continue
+            gate.release_for(granularity)
+        assert gate.held == 1
+        assert gate.release_calls == 0
+        gate.release_for(submission)
+        assert gate.held == 0
+        assert gate.release_calls == 1
+
+
+class TestConsumptionRelease:
+    """G-submission gate slots must recycle on trainer consumption, not assembly."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "consumption_granularity, num_groups",
+        [
+            pytest.param("G", 1, id="group_consumption"),
+            pytest.param("B", 2, id="batch_consumption"),
+        ],
+    )
+    async def test_group_submission_stalls_until_consumption(
+        self, consumption_granularity, num_groups
+    ):
+        capacity = 4
+        gen = MockGenerator(parallel_generation_tasks=capacity)
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="G",
+            consumption_granularity=consumption_granularity,
+        )
+        it = gen.get_grouped_rollouts(request)
+        try:
+            for pulled in range(1, capacity + 3):
+                # wait_for turns the deadlock failure mode (a slot never freed)
+                # into a test failure instead of a hang.
+                await asyncio.wait_for(anext(it), timeout=10)
+                await _flush()
+                # Each yield frees exactly one group slot on the consumer's next
+                # resume, so submission tracks consumption with a one-slot skew
+                # (the release for the latest pull hasn't fired yet). On
+                # assembly-release semantics this runs away unbounded; if no
+                # consume-site release existed, the loop would deadlock at
+                # `pulled == capacity + 1`.
+                assert gen.prepare_group_rollout_calls == capacity + pulled - 1
+        finally:
+            await it.aclose()
+
+    @pytest.mark.asyncio
+    async def test_batch_submission_releases_once_per_batch(self):
+        gen = MockGenerator(parallel_generation_tasks=1)
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            streaming=True,
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        it = gen.get_grouped_rollouts(request)
+        try:
+            await asyncio.wait_for(anext(it), timeout=10)
+            await asyncio.wait_for(anext(it), timeout=10)
+            await _flush()
+            gate = gen._active_pipeline.gate
+            # Batch 0 fully yielded but the consumer hasn't come back yet: its
+            # single batch slot is still held (a per-group release here would
+            # show release_calls == 2 and prepared == 4).
+            assert gate.release_calls == 0
+            assert gen.prepare_group_rollout_calls == 2
+            await asyncio.wait_for(anext(it), timeout=10)
+            await _flush()
+            assert gate.release_calls == 1
+            assert gen.prepare_group_rollout_calls == 4
+        finally:
+            await it.aclose()
 
 
 class TestRewardRollouts:
