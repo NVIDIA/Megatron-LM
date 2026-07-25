@@ -7,18 +7,22 @@ import ast
 from pathlib import Path
 
 AGENT_COMPOSE_ROOT = Path(__file__).resolve().parents[2]
-PACKAGE_ROOT = AGENT_COMPOSE_ROOT / "megatron" / "lite"
+PACKAGE_ROOT = AGENT_COMPOSE_ROOT / "megatron" / "experimental" / "agent_compose"
 LAYER_ROOTS = {
     "primitive": PACKAGE_ROOT / "primitive",
     "model": PACKAGE_ROOT / "model",
     "runtime": PACKAGE_ROOT / "runtime",
 }
 DENIED_IMPORTS = {
-    "primitive": ("experimental.lite", "megatron.lite.model", "megatron.lite.runtime"),
-    "model": ("experimental.lite", "megatron.lite.runtime"),
-    "runtime": ("experimental.lite",),
+    "primitive": (
+        "experimental",
+        "megatron.experimental.agent_compose.model",
+        "megatron.experimental.agent_compose.runtime",
+    ),
+    "model": ("experimental", "megatron.experimental.agent_compose.runtime"),
+    "runtime": ("experimental",),
 }
-SHARED_CONTRACTS = ("megatron.lite.runtime.contracts",)
+SHARED_CONTRACTS = ("megatron.experimental.agent_compose.runtime.contracts",)
 
 
 def _matches(module: str, prefix: str) -> bool:

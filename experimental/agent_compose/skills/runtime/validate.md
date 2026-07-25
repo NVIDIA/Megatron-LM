@@ -2,7 +2,7 @@
 
 Validate the runtime lifecycle through a composed model.
 
-<!-- MLITE_SKILL_SCHEMA_BEGIN -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_BEGIN -->
 ```python
 schema = Skill(
     "runtime.validate", kind="state_machine", purpose="validate the runtime lifecycle end to end",
@@ -12,7 +12,7 @@ schema = Skill(
     outputs=["runtime", "evidence", "risks"], exits=["done", "blocked", "out_of_scope"],
 )
 ```
-<!-- MLITE_SKILL_SCHEMA_END -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_END -->
 
 ```python
 def validate(task, runtime_config, model_spec, primitives, reference, budget):

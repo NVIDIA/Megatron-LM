@@ -1,8 +1,8 @@
 # Agent Compose Constitution
 
-Global constraints for Megatron Lite work upstreamed through Agent Compose.
+Global constraints for work upstreamed through Agent Compose.
 
-<!-- MLITE_SKILL_SCHEMA_BEGIN -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_BEGIN -->
 ```python
 schema = Skill(
     "basic.constitution", kind="constitution", purpose="set global Agent Compose constraints",
@@ -11,7 +11,7 @@ schema = Skill(
     outputs=["constraints", "validation", "stop"], exits=["done", "blocked", "out_of_scope"],
 )
 ```
-<!-- MLITE_SKILL_SCHEMA_END -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_END -->
 
 ```python
 def constitution(task, layer, reference):

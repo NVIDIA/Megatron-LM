@@ -2,7 +2,7 @@
 
 Define the minimum review contract for an upstreamed primitive.
 
-<!-- MLITE_SKILL_SCHEMA_BEGIN -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_BEGIN -->
 ```python
 schema = Skill(
     "primitive.contract", kind="constitution", purpose="define primitive review outputs",
@@ -12,7 +12,7 @@ schema = Skill(
     exits=["done", "blocked", "out_of_scope"],
 )
 ```
-<!-- MLITE_SKILL_SCHEMA_END -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_END -->
 
 ```python
 def contract(task, primitive, reference):

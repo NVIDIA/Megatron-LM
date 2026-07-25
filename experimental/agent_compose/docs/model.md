@@ -1,8 +1,8 @@
 # Model Layer
 
-Model code lives under `megatron.lite.model`. The layer turns a model-family
-declaration into backend-consumable model state by composing validated
-primitives; it is not a second runtime.
+Model code lives under `megatron.experimental.agent_compose.model`. The layer
+turns a model-family declaration into backend-consumable model state by
+composing validated primitives; it is not a second runtime.
 
 ## Responsibilities
 
@@ -20,8 +20,8 @@ checkpoint scheduling, or runtime backend selection.
 
 ## Protocol Direction
 
-The Lite preview currently uses module-level model protocols. A model protocol
-provides these required operations:
+The development preview currently uses module-level model protocols. A model
+protocol provides these required operations:
 
 ```text
 ImplConfig

@@ -24,8 +24,8 @@ def test_skill_registry_is_complete_and_resolved() -> None:
     for expected_name, relative_path in EXPECTED.items():
         path = SKILL_ROOT / relative_path
         text = path.read_text(encoding="utf-8")
-        assert text.count("MLITE_SKILL_SCHEMA_BEGIN") == 1
-        assert text.count("MLITE_SKILL_SCHEMA_END") == 1
+        assert text.count("AGENT_COMPOSE_SKILL_SCHEMA_BEGIN") == 1
+        assert text.count("AGENT_COMPOSE_SKILL_SCHEMA_END") == 1
         match = SCHEMA_NAME.search(text)
         assert match is not None
         assert match.group(1) == expected_name

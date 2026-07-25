@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Runtime interface implemented by Megatron Lite backends."""
+"""Runtime interface implemented by Agent Compose backends."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     import torch
 
-    from megatron.lite.runtime.contracts.data import ForwardResult
-    from megatron.lite.runtime.contracts.handle import ModelHandle
+    from megatron.experimental.agent_compose.runtime.contracts.data import ForwardResult
+    from megatron.experimental.agent_compose.runtime.contracts.handle import ModelHandle
 
 
 class Runtime(ABC):

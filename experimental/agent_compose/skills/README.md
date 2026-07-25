@@ -1,7 +1,7 @@
 # Agent Compose Skills
 
 This directory defines agent-agnostic operational contracts for upstreaming
-Megatron Lite through Agent Compose. Skills describe how to make and validate a
+capabilities through Agent Compose. Skills describe how to make and validate a
 change; they do not replace executable tests.
 
 ## Format
@@ -9,8 +9,8 @@ change; they do not replace executable tests.
 Each skill is one Markdown file with three parts:
 
 1. A short human-facing title.
-2. A schema between `MLITE_SKILL_SCHEMA_BEGIN` and
-   `MLITE_SKILL_SCHEMA_END`.
+2. A schema between `AGENT_COMPOSE_SKILL_SCHEMA_BEGIN` and
+   `AGENT_COMPOSE_SKILL_SCHEMA_END`.
 3. A finite Python-like pseudocode body with a declared exit.
 
 Schema names map to paths by replacing underscores with hyphens and dots with

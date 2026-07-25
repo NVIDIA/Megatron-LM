@@ -1,25 +1,28 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Public runtime interface for Megatron Lite."""
+"""Public runtime interface for Agent Compose."""
 
 from __future__ import annotations
 
 import importlib
 from typing import TYPE_CHECKING
 
-from megatron.lite.runtime.contracts.config import RuntimeConfig
+from megatron.experimental.agent_compose.runtime.contracts.config import RuntimeConfig
 
 if TYPE_CHECKING:
-    from megatron.lite.runtime.backends import Runtime
-    from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
-    from megatron.lite.runtime.contracts.data import (
+    from megatron.experimental.agent_compose.runtime.backends import Runtime
+    from megatron.experimental.agent_compose.runtime.contracts.config import (
+        OptimizerConfig,
+        ParallelConfig,
+    )
+    from megatron.experimental.agent_compose.runtime.contracts.data import (
         Batch,
         ForwardResult,
         ModelOutputs,
         PackedBatch,
         TrainBatch,
     )
-    from megatron.lite.runtime.contracts.handle import ModelHandle
-    from megatron.lite.runtime.contracts.loss import LossContext
+    from megatron.experimental.agent_compose.runtime.contracts.handle import ModelHandle
+    from megatron.experimental.agent_compose.runtime.contracts.loss import LossContext
 
 _RUNTIME_REGISTRY: dict[str, str] = {}
 
@@ -44,16 +47,16 @@ def create_runtime(cfg: RuntimeConfig) -> Runtime:
 
 def __getattr__(name: str):
     lazy = {
-        "Batch": "megatron.lite.runtime.contracts.data",
-        "ForwardResult": "megatron.lite.runtime.contracts.data",
-        "LossContext": "megatron.lite.runtime.contracts.loss",
-        "ModelHandle": "megatron.lite.runtime.contracts.handle",
-        "ModelOutputs": "megatron.lite.runtime.contracts.data",
-        "OptimizerConfig": "megatron.lite.runtime.contracts.config",
-        "PackedBatch": "megatron.lite.runtime.contracts.data",
-        "ParallelConfig": "megatron.lite.runtime.contracts.config",
-        "Runtime": "megatron.lite.runtime.backends",
-        "TrainBatch": "megatron.lite.runtime.contracts.data",
+        "Batch": "megatron.experimental.agent_compose.runtime.contracts.data",
+        "ForwardResult": "megatron.experimental.agent_compose.runtime.contracts.data",
+        "LossContext": "megatron.experimental.agent_compose.runtime.contracts.loss",
+        "ModelHandle": "megatron.experimental.agent_compose.runtime.contracts.handle",
+        "ModelOutputs": "megatron.experimental.agent_compose.runtime.contracts.data",
+        "OptimizerConfig": "megatron.experimental.agent_compose.runtime.contracts.config",
+        "PackedBatch": "megatron.experimental.agent_compose.runtime.contracts.data",
+        "ParallelConfig": "megatron.experimental.agent_compose.runtime.contracts.config",
+        "Runtime": "megatron.experimental.agent_compose.runtime.backends",
+        "TrainBatch": "megatron.experimental.agent_compose.runtime.contracts.data",
     }
     if name in lazy:
         module = importlib.import_module(lazy[name])

@@ -13,8 +13,8 @@ import pytest
 def test_runtime_import_stays_lightweight() -> None:
     script = (
         "import sys; "
-        "import megatron.lite.runtime as runtime; "
-        "assert runtime.RuntimeConfig().backend == 'mlite'; "
+        "import megatron.experimental.agent_compose.runtime as runtime; "
+        "assert runtime.RuntimeConfig().backend == 'agent_compose'; "
         "assert 'torch' not in sys.modules"
     )
     subprocess.run([sys.executable, "-c", script], check=True)
@@ -23,7 +23,7 @@ def test_runtime_import_stays_lightweight() -> None:
 def test_public_runtime_contracts() -> None:
     import torch
 
-    from megatron.lite.runtime import PackedBatch, ParallelConfig
+    from megatron.experimental.agent_compose.runtime import PackedBatch, ParallelConfig
 
     batch = PackedBatch(
         input_ids=torch.tensor([1, 2, 3]),
@@ -39,14 +39,17 @@ def test_public_runtime_contracts() -> None:
 
 
 def test_unregistered_backend_fails_explicitly() -> None:
-    from megatron.lite.runtime import RuntimeConfig, create_runtime
+    from megatron.experimental.agent_compose.runtime import (
+        RuntimeConfig,
+        create_runtime,
+    )
 
     with pytest.raises(ValueError, match="No runtime backend registered"):
         create_runtime(RuntimeConfig(backend="missing"))
 
 
 def test_runtime_required_method_set() -> None:
-    from megatron.lite.runtime import Runtime
+    from megatron.experimental.agent_compose.runtime import Runtime
 
     assert Runtime.__abstractmethods__ == {
         "build_model",
@@ -62,7 +65,11 @@ def test_runtime_required_method_set() -> None:
 
 
 def test_registered_runtime_factory(monkeypatch) -> None:
-    from megatron.lite.runtime import RuntimeConfig, create_runtime, register_runtime
+    from megatron.experimental.agent_compose.runtime import (
+        RuntimeConfig,
+        create_runtime,
+        register_runtime,
+    )
 
     module = types.ModuleType("agent_compose_test_runtime")
     module.create = lambda hf_path, cfg: (hf_path, cfg)

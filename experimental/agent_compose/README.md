@@ -1,30 +1,46 @@
 # Agent Compose (experimental)
 
-Agent Compose is the upstream home for incrementally reviewed Megatron Lite
-components. It makes Megatron-LM development agentic-native by composing
-Megatron Core primitives with coding agents, rather than introducing a new
-standalone product or training stack.
+Agent Compose is an experimental incubation surface for incrementally reviewed
+Megatron capabilities. It makes Megatron-LM development agentic-native by
+combining Megatron Core primitives with coding agents, rather than maintaining
+a fork or introducing a standalone training stack.
 
 `experimental/agent_compose` is the project and review location. The Python
-package keeps the public namespace `megatron.lite`; `experimental.agent_compose`
-is not an import path.
+package uses the public namespace `megatron.experimental.agent_compose`;
+`experimental.agent_compose` is not an import path.
 
 ## Main And Dev
 
-The complete work-in-progress implementation remains on the `dev` branch under
-[`experimental/lite`](https://github.com/NVIDIA/Megatron-LM/tree/dev/experimental/lite).
-Code is promoted from that preview one independently validated primitive at a
-time.
+The complete work-in-progress implementation remains in `experimental/lite` on
+the `dev` branch, while `experimental/agent_compose` on `main` is its
+independently reviewed upstream incubation surface. Code is promoted from the
+development preview one vertically complete and independently validated slice
+at a time.
 
 | Surface | `main` | `dev` |
 | --- | --- | --- |
-| Project tree | `experimental/agent_compose` | `experimental/lite` |
+| Project tree | `experimental/agent_compose` | Development preview |
 | Role | Reviewed upstream subset | Work-in-progress superset |
-| Python namespace | `megatron.lite` | `megatron.lite` |
+| Python namespace | `megatron.experimental.agent_compose` | Preview-local |
 
 The upstream package has no runtime dependency on the preview tree. Do not add
 both source roots to the same `PYTHONPATH`; select the tree from the branch being
 tested.
+
+## Incubation
+
+Incomplete prototypes remain on `dev`. Changes promoted to `main` must be
+functionally complete and validated for their declared scope.
+
+Successful, reusable capabilities should graduate to their long-term owners:
+
+- reusable primitives and backend-neutral interfaces to Megatron Core;
+- training orchestration to Megatron Bridge or Automodel;
+- integration-specific behavior to the owning integration project.
+
+Agent Compose first switches to the graduated implementation and validates
+parity. Duplicate incubating code is removed only after that transition, so the
+Agent Compose path remains coherent and runnable.
 
 ## Architecture
 
@@ -45,10 +61,11 @@ experimental/agent_compose/
     architecture.md
     model.md
   megatron/
-    lite/
-      primitive/
-      model/
-      runtime/
+    experimental/
+      agent_compose/
+        primitive/
+        model/
+        runtime/
   skills/
     basic/
     primitive/
@@ -64,12 +81,12 @@ For local source-tree use:
 export PYTHONPATH=/path/to/Megatron-LM/experimental/agent_compose:$PYTHONPATH
 ```
 
-The skeleton exposes the stable runtime interface and shared runtime contracts,
+The skeleton exposes the initial runtime interface and shared runtime contracts,
 but contains no built-in runtime backend, model, or primitive implementation.
 Those implementations will be added in separate reviewable PRs.
 
 ```python
-from megatron.lite.runtime import Runtime, RuntimeConfig, create_runtime, register_runtime
+from megatron.experimental.agent_compose.runtime import Runtime, RuntimeConfig, create_runtime, register_runtime
 ```
 
 Backends subclass `Runtime` and register a module-level factory before

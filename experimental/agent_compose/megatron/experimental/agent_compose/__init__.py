@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Composable Megatron Lite primitives."""
+"""Agent Compose components reviewed through Agent Compose."""
 
 from __future__ import annotations
 

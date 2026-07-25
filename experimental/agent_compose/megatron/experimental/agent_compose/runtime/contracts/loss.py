@@ -20,7 +20,7 @@ class LossContext:
 
 
 _CURRENT_LOSS_CONTEXT: ContextVar[LossContext | None] = ContextVar(
-    "megatron_lite_loss_context", default=None
+    "megatron_agent_compose_loss_context", default=None
 )
 
 

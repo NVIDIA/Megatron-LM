@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Megatron Lite components reviewed through Agent Compose."""
+"""Agent Compose model composition layer."""
 
 from __future__ import annotations
 

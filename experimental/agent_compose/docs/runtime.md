@@ -1,8 +1,8 @@
 # Runtime Interface
 
-The public runtime entrypoint is `megatron.lite.runtime`. It defines a
-backend-neutral interface so training applications do not depend on a concrete
-Megatron Lite, Megatron Bridge, or integration-specific backend.
+The public runtime entrypoint is
+`megatron.experimental.agent_compose.runtime`. It defines a backend-neutral
+interface so training applications do not depend on a concrete backend.
 
 ## API Tiers
 
@@ -32,7 +32,7 @@ The runtime package exposes:
 - `LossContext` for per-microbatch output and loss policy.
 
 Imports are lazy where Torch-backed data contracts are involved. Importing
-`megatron.lite.runtime` alone does not load Torch.
+`megatron.experimental.agent_compose.runtime` alone does not load Torch.
 
 ## Backend Registration
 
@@ -40,7 +40,11 @@ A backend module provides `create(hf_path, backend_cfg)` and registers its
 dotted module path:
 
 ```python
-from megatron.lite.runtime import RuntimeConfig, create_runtime, register_runtime
+from megatron.experimental.agent_compose.runtime import (
+    RuntimeConfig,
+    create_runtime,
+    register_runtime,
+)
 
 register_runtime("my_backend", "my_package.runtime")
 runtime = create_runtime(RuntimeConfig(backend="my_backend"))

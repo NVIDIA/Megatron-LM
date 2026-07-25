@@ -2,7 +2,7 @@
 
 Compose a model only from primitives with explicit review contracts.
 
-<!-- MLITE_SKILL_SCHEMA_BEGIN -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_BEGIN -->
 ```python
 schema = Skill(
     "model.compose", kind="state_machine", purpose="compose a model from validated primitives",
@@ -12,7 +12,7 @@ schema = Skill(
     outputs=["model", "evidence", "risks"], exits=["done", "blocked", "out_of_scope"],
 )
 ```
-<!-- MLITE_SKILL_SCHEMA_END -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_END -->
 
 ```python
 def compose(task, model_spec, primitives, reference, budget):

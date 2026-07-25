@@ -8,10 +8,10 @@ import importlib
 
 def test_three_layer_skeleton_imports() -> None:
     modules = [
-        "megatron.lite",
-        "megatron.lite.primitive",
-        "megatron.lite.model",
-        "megatron.lite.runtime",
+        "megatron.experimental.agent_compose",
+        "megatron.experimental.agent_compose.primitive",
+        "megatron.experimental.agent_compose.model",
+        "megatron.experimental.agent_compose.runtime",
     ]
 
     for module in modules:
@@ -20,7 +20,7 @@ def test_three_layer_skeleton_imports() -> None:
 
 
 def test_runtime_public_surface_imports() -> None:
-    from megatron.lite.runtime import (
+    from megatron.experimental.agent_compose.runtime import (
         Batch,
         ForwardResult,
         LossContext,

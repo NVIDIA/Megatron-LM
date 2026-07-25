@@ -52,7 +52,7 @@ class OptimizerConfig:
 class RuntimeConfig:
     """Select a runtime backend and provide its configuration."""
 
-    backend: str = "mlite"
+    backend: str = "agent_compose"
     hf_path: str = ""
     backend_cfg: Any = field(default_factory=dict)
 

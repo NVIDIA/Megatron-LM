@@ -2,7 +2,7 @@
 
 Validate an Agent Compose skill before review.
 
-<!-- MLITE_SKILL_SCHEMA_BEGIN -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_BEGIN -->
 ```python
 schema = Skill(
     "basic.lint_skill", kind="state_machine", purpose="validate skill structure",
@@ -11,7 +11,7 @@ schema = Skill(
     outputs=["lint", "risks"], exits=["done", "blocked", "out_of_scope"],
 )
 ```
-<!-- MLITE_SKILL_SCHEMA_END -->
+<!-- AGENT_COMPOSE_SKILL_SCHEMA_END -->
 
 ```python
 def lint_skill(skill_file, registry, budget):
