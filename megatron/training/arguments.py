@@ -47,6 +47,7 @@ from megatron.core.utils import (
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     _normalize_dsv4_hybrid_csa_compress_ratios,
+    _resolve_dsa_kernel_backend_cli_default,
 )
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
@@ -2247,6 +2248,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsa'
         # Normalize compact and legacy-padded ratios through the shared migration helper.
         _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, _pat)
+
+    _resolve_dsa_kernel_backend_cli_default(args, kw_args)
 
     kw_args['inference_sampling_seed'] = args.seed
 
