@@ -136,13 +136,19 @@ def append_to_progress_log(save_dir: str, string: str, barrier: bool = True) -> 
             )
 
 
-def barrier_and_log(string: str) -> None:
-    """Perform a distributed barrier and then log a message on rank 0.
+def barrier_and_log(string: str, override_timestamp: float | None=None) -> None:
+    """Perform a distributed barrier and then log a timestamped message.
+
+    Logs override_timestamp if provided, otherwise current timestamp.
 
     Args:
         string: The message string to log.
+        override_timestamp: Optional timestamp to log instead of current.
     """
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
-    time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if override_timestamp is None:
+        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    else:
+        time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f"[{string}] datetime: {time_str} ")
