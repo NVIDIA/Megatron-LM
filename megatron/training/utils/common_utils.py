@@ -113,6 +113,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
     gtp_rank = mpu.get_gtp_weight_remat_rank()
     egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
+    tp_group = mpu.get_tensor_model_parallel_group()
+    expert_tp_group = mpu.get_expert_tensor_parallel_group()
 
     for model_chunk in model:
         for param in model_chunk.parameters():
@@ -120,7 +122,9 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
             # Filter TP duplicates. GTP_remat params are always unique across TP ranks
             # so skip this check for them.
-            if not is_gtp and not param_is_not_tensor_parallel_duplicate(param):
+            if not is_gtp and not param_is_not_tensor_parallel_duplicate(
+                param, tp_group=tp_group, expert_tp_group=expert_tp_group
+            ):
                 continue
             is_expert = not getattr(param, 'allreduce', True)
 
