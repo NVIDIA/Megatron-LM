@@ -13,7 +13,7 @@ To generate docs locally, use the following commands:
 
 ```
 cd docs
-uv run --only-group docs sphinx-autobuild . _build/html --port 8080 --host 127.0.0.1
+SKIP_PUBLIC_DOCS_FEATURES=true uv run --only-group docs sphinx-autobuild . _build/html --port 8080 --host 127.0.0.1
 ```
 
 Docs will be generated at <http://localhost:8080/>.

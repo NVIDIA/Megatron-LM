@@ -815,8 +815,10 @@ def convert_checkpoint(
 @click.option(
     "--param-to-param-group-map-json",
     type=str,
-    default="{}",
-    help="JSON string representing the param to parameter group map."
+    default=None,
+    help="Path to a JSON file mapping parameter names to optimizer param group ids. "
+         "Required only if the source checkpoint has multiple optimizer param groups "
+         "(e.g. different LR/weight-decay per group). Leave unset for single-group checkpoints."
 )
 @click.option(
     "--rename-mtp-keys",
@@ -921,8 +923,11 @@ def convert_torch_dist_to_fsdp_dtensor(
 
     ckpt_path = Path(input_dir)
     output_dir = Path(output_dir)
-    with open(param_to_param_group_map_json, "r") as f:
-        param_to_param_group_map = json.load(f)
+    if param_to_param_group_map_json:
+        with open(param_to_param_group_map_json, "r") as f:
+            param_to_param_group_map = json.load(f)
+    else:
+        param_to_param_group_map = {}
     _swiglu_modules = (
         [m.strip() for m in swiglu_modules.split(",") if m.strip()]
         if swiglu_modules is not None else None

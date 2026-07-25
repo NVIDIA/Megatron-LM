@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import contextlib
 import logging
 import multiprocessing
 import sys
@@ -8,13 +9,48 @@ from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
 except PackageNotFoundError:
     FLASHINFER_JIT_CACHE_VERSION = None
+
+
+class InferenceMode:
+    """Process-wide flag indicating whether an inference engine is currently using the model.
+
+    Modules that need to distinguish between inference and non-inference (e.g. training,
+    RL logprobs) paths should read `InferenceMode.is_active()` rather than relying on
+    `self.training`, `torch.is_grad_enabled()`, or `inference_context is not None`.
+    """
+
+    _is_active: bool = False
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Return True while an inference engine is currently using the model."""
+        return cls._is_active
+
+    @classmethod
+    def set_active(cls) -> None:
+        """Mark the inference engine as active. Idempotent."""
+        cls._is_active = True
+
+    @classmethod
+    def unset_active(cls) -> None:
+        """Mark the inference engine as inactive. Idempotent."""
+        cls._is_active = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def active(cls):
+        """Context manager: set the flag for the duration of the `with` block."""
+        cls.set_active()
+        try:
+            yield
+        finally:
+            cls.unset_active()
 
 
 def device_memory_summary() -> str:
@@ -73,12 +109,15 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
 
 # Initialize cache for sequence parallel modules
 moe_layer_cache = None
+_moe_metadata_sync_initialized = False
 
 
 def _init_moe_expert_cache(model):
     """
     Initialize the cache of MoE layers once
     """
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
     global moe_layer_cache
     if moe_layer_cache is not None:
         return  # already initialized
@@ -98,6 +137,25 @@ def _init_moe_expert_cache(model):
             walk(child)
 
     walk(model)
+
+
+def set_moe_metadata_sync(model) -> None:
+    """Set _runs_metadata_sync on inference dispatchers.
+
+    Exactly one dispatcher per model — the first MoE layer — fires update_metadata
+    each step. All subsequent layers skip it to avoid redundant collective calls.
+    Must be called once after the model is built and put into eval mode.
+    """
+    global moe_layer_cache, _moe_metadata_sync_initialized
+    if _moe_metadata_sync_initialized:
+        return
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+    for i, moe_layer in enumerate(moe_layer_cache):
+        dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
+        if dispatcher is not None:
+            dispatcher._runs_metadata_sync = i == 0
+    _moe_metadata_sync_initialized = True
 
 
 def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int = None):
@@ -199,34 +257,6 @@ def check_flashinfer_jit_cache_installed(log_version: bool = False):
         "The 'flashinfer-jit-cache' package is required for expert parallel inference "
         f"but is not installed. {install_cmd}"
     )
-
-
-def set_inference_cuda_graphed_iteration_for_ep_inference(model):
-    """Enable CUDA graph compatibility for expert parallel inference.
-
-    Sets a flag in all MoELayers indicating the current iteration is being
-    captured/executed in a CUDA graph. This allows the dispatcher to adjust
-    its behavior for CUDA graph compatibility.
-    """
-    global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
-
-    for moe_layer in moe_layer_cache:
-        moe_layer.set_inference_cuda_graphed_iteration()
-
-
-def unset_inference_cuda_graphed_iteration_for_ep_inference(model):
-    """Disable CUDA graph compatibility for expert parallel inference.
-
-    Clears the flag in all MoELayers, restoring standard dispatcher behavior.
-    """
-    global moe_layer_cache
-    if moe_layer_cache is None:
-        _init_moe_expert_cache(model)
-
-    for moe_layer in moe_layer_cache:
-        moe_layer.unset_inference_cuda_graphed_iteration()
 
 
 def tensor_swap(x, src_idxs, dst_idxs):

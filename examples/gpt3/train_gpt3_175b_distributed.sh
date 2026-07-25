@@ -7,7 +7,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
-MASTER_PORT=6000
+MASTER_PORT=29500
 NUM_NODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
@@ -36,9 +36,9 @@ GPT_MODEL_ARGS=(
 
 TRAINING_ARGS=(
     --micro-batch-size 1 
-    --global-batch-size 1536 
-    --rampup-batch-size 16 16 5859375 
-    --train-iters 500000 
+    --global-batch-size 1536
+    --step-batch-size-schedule "0:16 2.4B:320 4.8B:624 7.2B:928 9.6B:1232 12B:1536"
+    --train-iters 500000
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 

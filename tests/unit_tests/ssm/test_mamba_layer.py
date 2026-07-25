@@ -1,14 +1,17 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+
+from dataclasses import replace
 
 import pytest
 import torch
 
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_block import MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -24,19 +27,23 @@ class TestMambaLayer:
             # will generate errors.
             num_layers=1,
             num_attention_heads=1,
+            layernorm_epsilon=1e-6,
             use_cpu_initialization=True,
         )
-        assert isinstance(mamba_stack_spec.submodules, MambaStackSubmodules)
-        assert isinstance(mamba_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        self.layer = MambaLayer(
-            transformer_config,
-            mamba_stack_spec.submodules.mamba_layer.submodules,
-            pg_collection=pg_collection,
+        assert isinstance(hybrid_stack_spec.submodules, HybridStackSubmodules)
+        assert isinstance(hybrid_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
+        # Use an explicit norm so the test can verify the configured epsilon.
+        mamba_submodules = replace(
+            hybrid_stack_spec.submodules.mamba_layer.submodules, norm=WrappedTorchNorm
         )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        self.layer = MambaLayer(transformer_config, mamba_submodules, pg_collection=pg_collection)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_configured_layernorm_epsilon(self):
+        assert self.layer.norm.eps == self.layer.config.layernorm_epsilon
 
     def test_gpu_forward(self):
         layer = self.layer

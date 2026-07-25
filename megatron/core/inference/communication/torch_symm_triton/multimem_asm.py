@@ -212,6 +212,182 @@ def add_v8_bf16_from_u32(
 
 
 @triton.jit
+def ld_64(ptr, mask):
+    """
+    Loads 64 bits from local global memory into two 32-bit registers.
+
+    Uses `ld.global.v2.u32`. Mirrors the non-multicast path of ld_128.
+
+    Args:
+        ptr: source pointer typed as uint64 (8-byte aligned).
+        mask: boolean predicate — if False, the load is skipped.
+
+    Returns:
+        (x, y): two tl.uint32 registers containing 64 bits of loaded data.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.ne.s32 %p0, $3, 1;
+            @%p0 bra end;
+            ld.global.v2.u32 {$0, $1}, [$2];
+            end:
+        }
+        """,
+        "=r,=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def st_64(ptr, x, y, mask, multicast_op: tl.constexpr):
+    """
+    Stores 64 bits (two 32-bit registers) to memory.
+
+    Mirrors st_128 but operates on 64-bit (v2) quantities.
+
+    1.  **Standard Store (`multicast_op=False`)**:
+        -   `st.global.v2.f32` — writes 64 bits to local global memory.
+
+    2.  **Multicast Store (`multicast_op=True`)**:
+        -   `multimem.st.relaxed.sys.global.v2.f32` — broadcasts 64 bits to all
+            peers in the multicast group simultaneously.
+
+    Args:
+        ptr: destination pointer typed as uint64 (8-byte aligned).
+        x, y: two tl.uint32 registers containing the data to store.
+        mask: boolean predicate — if False, the store is skipped.
+        multicast_op (tl.constexpr): False = local store, True = multicast broadcast.
+    """
+    if multicast_op:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $4, 1;
+                @%p0 bra end;
+                multimem.st.relaxed.sys.global.v2.f32 [$1], {$2, $3};
+                end:
+            }
+            """,
+            "=r,l,r,r,r",
+            args=[ptr, x, y, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $4, 1;
+                @%p0 bra end;
+                st.global.v2.f32 [$1], {$2, $3};
+                end:
+            }
+            """,
+            "=r,l,r,r,r",
+            args=[ptr, x, y, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+
+
+@triton.jit
+def ld_32(ptr, mask):
+    """
+    Loads 32 bits from local global memory into one 32-bit register.
+
+    Uses `ld.global.u32`. Scalar version of ld_64/ld_128.
+
+    Args:
+        ptr: source pointer typed as uint32 (4-byte aligned).
+        mask: boolean predicate — if False, the load is skipped.
+
+    Returns:
+        x: one tl.uint32 register containing 32 bits of loaded data.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            .reg .pred %p0;
+            setp.ne.s32 %p0, $2, 1;
+            @%p0 bra end;
+            ld.global.u32 $0, [$1];
+            end:
+        }
+        """,
+        "=r,l,r",
+        args=[ptr, mask.to(tl.int32)],
+        dtype=(tl.uint32,),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def st_32(ptr, x, mask, multicast_op: tl.constexpr):
+    """
+    Stores 32 bits (one 32-bit register) to memory.
+
+    Scalar version of st_64/st_128.
+
+    1.  **Standard Store (`multicast_op=False`)**:
+        -   `st.global.f32` — writes 32 bits to local global memory.
+
+    2.  **Multicast Store (`multicast_op=True`)**:
+        -   `multimem.st.relaxed.sys.global.f32` — broadcasts 32 bits to all
+            peers in the multicast group simultaneously.
+
+    Args:
+        ptr: destination pointer typed as uint32 (4-byte aligned).
+        x: one tl.uint32 register containing the data to store.
+        mask: boolean predicate — if False, the store is skipped.
+        multicast_op (tl.constexpr): False = local store, True = multicast broadcast.
+    """
+    if multicast_op:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $3, 1;
+                @%p0 bra end;
+                multimem.st.relaxed.sys.global.f32 [$1], $2;
+                end:
+            }
+            """,
+            "=r,l,r,r",
+            args=[ptr, x, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+    else:
+        return tl.inline_asm_elementwise(
+            """
+            {
+                .reg .pred %p0;
+                setp.ne.s32 %p0, $3, 1;
+                @%p0 bra end;
+                st.global.f32 [$1], $2;
+                end:
+            }
+            """,
+            "=r,l,r,r",
+            args=[ptr, x, mask.to(tl.int32)],
+            dtype=(tl.uint32),
+            is_pure=False,
+            pack=1,
+        )
+
+
+@triton.jit
 def asm_rsqrt(x, eps):
     """
     Computes the reciprocal square root of a float32 number using inline assembly.

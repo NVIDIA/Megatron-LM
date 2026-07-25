@@ -22,7 +22,7 @@ jobs:
           mkdir -p pr
           echo "${{ github.event.pull_request.number }}" > pr/number
       - name: Upload PR number
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: pr-number
           path: pr/

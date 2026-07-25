@@ -4,7 +4,7 @@ from __future__ import annotations
 import warnings
 from abc import abstractmethod
 from functools import partial
-from typing import Optional, Protocol, cast
+from typing import Literal, Optional, Protocol, cast
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
@@ -103,7 +103,7 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[RowParallelLinear]:
         """Which row parallel linear module the backend uses"""
         return RowParallelLinear
 
@@ -157,8 +157,8 @@ class InferenceSpecProvider(BackendSpecProvider):
         """Which column parallel linear module TE backend uses"""
         return InferenceColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
-        """Which row parallel linear module TE backend uses"""
+    def row_parallel_linear(self) -> type[InferenceRowParallelLinear]:
+        """Which row parallel linear module Inference backend uses"""
         return InferenceRowParallelLinear
 
     def fuse_layernorm_and_linear(self) -> bool:
@@ -200,3 +200,19 @@ class InferenceSpecProvider(BackendSpecProvider):
                 activation_func=self.activation_func(),
             ),
         )
+
+
+def get_backend(
+    transformer_impl: Literal["local", "transformer_engine", "inference_optimized"]
+) -> BackendSpecProvider:
+    """Return the backend that's selected with the given `transformer_impl`."""
+    if transformer_impl == "transformer_engine":
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+        return TESpecProvider()
+    elif transformer_impl == "inference_optimized":
+        return InferenceSpecProvider()
+    elif transformer_impl == "local":
+        return LocalSpecProvider()
+    else:
+        raise ValueError(f"unknown transformer_impl='{transformer_impl}'")

@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import warnings
+from functools import partial
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -61,13 +62,16 @@ def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmo
                 linear_qkv=not_none(TELayerNormColumnParallelLinear),
                 core_attention=not_none(TEDotProductAttention),
                 linear_proj=not_none(TERowParallelLinear),
-                q_layernorm=IdentityOp,
-                k_layernorm=IdentityOp,
+                # Leave q_layernorm/k_layernorm unset (None) rather than IdentityOp so that
+                # TransformerConfig.qk_layernorm can select the default TENorm through the
+                # shared SelfAttention fallback (`submodules.q_layernorm or TENorm`).
+                q_layernorm=None,
+                k_layernorm=None,
             ),
         ),
         self_attn_bda=get_bias_dropout_add,
-        mlp=ModuleSpec(
-            module=MLP,
+        mlp=partial(
+            MLP.as_mlp_submodule,
             submodules=MLPSubmodules(
                 linear_fc1=not_none(TELayerNormColumnParallelLinear),
                 linear_fc2=not_none(TERowParallelLinear),
@@ -117,8 +121,8 @@ bert_layer_local_spec = ModuleSpec(
         ),
         self_attn_bda=get_bias_dropout_add,
         pre_mlp_layernorm=LNImpl,
-        mlp=ModuleSpec(
-            module=MLP,
+        mlp=partial(
+            MLP.as_mlp_submodule,
             submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear),
         ),
         mlp_bda=get_bias_dropout_add,

@@ -27,9 +27,17 @@ def cleanup():
 
 @pytest.fixture(scope="function", autouse=True)
 def set_env():
+    """Configure TE env vars for MoE unit tests.
+
+    ``NVTE_CUTEDSL_FUSED_GROUPED_MLP`` enables TE's cuDSL fused grouped MLP path.
+    The kernel additionally requires SM100 (Blackwell), so on H100/A100 CI this
+    is a no-op; setting it here means the kernel is picked up automatically when
+    Blackwell hardware joins the unit-test matrix.
+    """
     if is_te_min_version("1.3"):
         os.environ['NVTE_FLASH_ATTN'] = '0'
         os.environ['NVTE_FUSED_ATTN'] = '0'
+    os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = '1'
 
 
 @pytest.fixture(scope="session")

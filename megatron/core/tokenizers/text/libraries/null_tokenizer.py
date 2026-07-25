@@ -9,12 +9,15 @@ class NullTokenizer:
 
     Args:
         vocab_size: vocabulary size for embedding
+        eod_id: id of the end-of-document token. Defaults to ``vocab_size - 1``.
+        pad_id: id of the padding token. Defaults to ``-1`` (no pad token).
     """
 
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size, eod_id=None, pad_id=-1, **kwargs):
         """ """
-        self._vocab_size_without_eod = int(vocab_size)
-        self._eod_id = self._vocab_size_without_eod
+        self._vocab_size = int(vocab_size)
+        self._eod_id = int(eod_id) if eod_id is not None else self._vocab_size - 1
+        self._pad_id = int(pad_id)
 
     def text_to_ids(self, text):
         """Converts text to ids."""
@@ -44,12 +47,19 @@ class NullTokenizer:
     @property
     def unique_identifiers(self) -> OrderedDict:
         """Property required for use with megatron-core datasets."""
-        return OrderedDict({"class": f"{type(self).__module__}.{type(self).__qualname__}"})
+        return OrderedDict(
+            {
+                "class": f"{type(self).__module__}.{type(self).__qualname__}",
+                "vocab_size": self._vocab_size,
+                "eod_id": self._eod_id,
+                "pad_id": self._pad_id,
+            }
+        )
 
     @property
     def vocab_size(self):
         """Returns vocab size."""
-        return self._vocab_size_without_eod + 1
+        return self._vocab_size
 
     @property
     def vocab(self):
@@ -80,6 +90,11 @@ class NullTokenizer:
     def eod(self):
         """Returns eod token."""
         return self._eod_id
+
+    @property
+    def pad_id(self):
+        """Returns pad token."""
+        return self._pad_id
 
     @property
     def additional_special_tokens_ids(self):

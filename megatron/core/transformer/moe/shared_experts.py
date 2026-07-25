@@ -1,7 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from copy import copy
+from copy import deepcopy
+from enum import Enum
+from functools import wraps
 from typing import Optional
 
 import torch
@@ -23,15 +25,78 @@ from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
+    get_pg_size,
     is_te_min_version,
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
 )
 
 if HAVE_TE:
+    import transformer_engine as te
+
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 else:
+    te = None
     TELinear, set_save_original_input = None, None
+    get_cuda_rng_tracker = None
+
+
+class SharedExpertState(Enum):
+    """State machine states for SharedExpertMLP overlapped forward pass."""
+
+    IDLE = 0
+    PRE_FORWARD_COMM_DONE = 1
+    FC1_FORWARD_DONE = 2
+    FC2_FORWARD_DONE = 3
+    POST_FORWARD_COMM_DONE = 4
+
+
+def overlap_state_check(required_state: "SharedExpertState", next_state: "SharedExpertState"):
+    """
+    Decorator to validate overlap state and cached variables before method execution,
+    and update state after method execution.
+
+    Args:
+        required_state: The expected SharedExpertState before this method runs.
+        next_state: The SharedExpertState to transition to after method execution.
+    """
+
+    def decorator(method):
+        @wraps(method)
+        def wrapper(self, *args, **kwargs):
+            # Check overlap is enabled
+            assert (
+                self.config.moe_shared_expert_overlap
+            ), f"{method.__name__} requires --moe-shared-expert-overlap to be set"
+            # Check state machine
+            assert self._overlap_state == required_state, (
+                f"{method.__name__} must be called from {required_state.name} state, "
+                f"but current state is {self._overlap_state.name}"
+            )
+            # Execute method
+            result = method(self, *args, **kwargs)
+            # Update state after method execution
+            self._overlap_state = next_state
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+class _BackwardStreamWait(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, stream):
+        """forward"""
+        ctx.stream = stream
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """backward with stream wait"""
+        ctx.stream.wait_stream(torch.cuda.current_stream())
+        return grad_output, None
 
 
 class SharedExpertMLP(MLP):
@@ -49,14 +114,19 @@ class SharedExpertMLP(MLP):
         submodules: MLPSubmodules,
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
-        config = copy(config)
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
+        config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
+        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp, name=name)
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -115,8 +185,12 @@ class SharedExpertMLP(MLP):
             self.cached_output = None
             self.gate_score = None
 
-            if self.stream is None:
-                self.stream = torch.cuda.Stream()
+            # State machine to ensure correct calling order of overlapped forward methods
+            self._overlap_state = SharedExpertState.IDLE
+
+            if SharedExpertMLP.stream is None:
+                SharedExpertMLP.stream = torch.cuda.Stream()
+            self.stream = SharedExpertMLP.stream
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
@@ -147,37 +221,42 @@ class SharedExpertMLP(MLP):
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
-    def pre_forward_comm(self, input):
+    def wait_current_stream(self):
+        """Wait for the current stream to complete."""
+        self.stream.wait_stream(torch.cuda.current_stream())
+
+    @overlap_state_check(SharedExpertState.IDLE, SharedExpertState.PRE_FORWARD_COMM_DONE)
+    def pre_forward_comm(self, input, wait_current_stream=True):
         """
         All Gather for SP before forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_output is None
-        self.stream.wait_stream(torch.cuda.current_stream())
+        if wait_current_stream:
+            self.wait_current_stream()
         with torch.cuda.stream(self.stream):
             if self.use_shared_expert_gate:
                 logits = torch.nn.functional.linear(input, self.gate_weight)
                 self.gate_score = torch.nn.functional.sigmoid(logits)
             if self.config.sequence_parallel:
                 self.cached_fc1_input = gather_from_sequence_parallel_region(
-                    input, tensor_parallel_output_grad=True
+                    input, tensor_parallel_output_grad=True, group=self.tp_group
                 )
             else:
-                self.cached_fc1_input = copy_to_tensor_model_parallel_region(input)
+                self.cached_fc1_input = copy_to_tensor_model_parallel_region(
+                    input, group=self.tp_group
+                )
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
 
+    @overlap_state_check(
+        SharedExpertState.PRE_FORWARD_COMM_DONE, SharedExpertState.FC1_FORWARD_DONE
+    )
     def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
         """
         Do Linear FC1 and activation function forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_fc1_input is not None
-        if overlapped_comm_output is not None:
-            set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
             # [s, b, 4 * h/p]
             intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
@@ -220,50 +299,58 @@ class SharedExpertMLP(MLP):
                     intermediate_parallel = self.activation_func(intermediate_parallel)
 
             self.cached_fc2_input = intermediate_parallel
+        # Tensor sequence number is used to control the backward order.
+        # Decrease the sequence number of the expert output to make the comm launched first
+        # in the backward order.
+        if overlapped_comm_output is not None and overlapped_comm_output.grad_fn is not None:
+            target_sequence_nr = overlapped_comm_output.grad_fn._sequence_nr() - 1
+            set_tensor_grad_fn_sequence_sr(intermediate_parallel, target_sequence_nr)
+            # Make sure the shared expert fc1 backward is launched after the routed fc1 backward
+            self.cached_fc2_input = _BackwardStreamWait.apply(intermediate_parallel, self.stream)
 
+    @overlap_state_check(SharedExpertState.FC1_FORWARD_DONE, SharedExpertState.FC2_FORWARD_DONE)
     def linear_fc2_forward(self, overlapped_comm_output=None):
         """
         Do Linear FC2 forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_fc2_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
+        assert self.cached_fc2_input is not None
         with torch.cuda.stream(self.stream):
             # [s, b, h]
             self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
             self.cached_fc2_input = None
 
+    @overlap_state_check(
+        SharedExpertState.FC2_FORWARD_DONE, SharedExpertState.POST_FORWARD_COMM_DONE
+    )
     def post_forward_comm(self):
         """
         Reduce scatter for SP after forward.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_fc2_output is not None
         with torch.cuda.stream(self.stream):
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output, group=self.tp_group
                 )
             else:
                 self.cached_output = reduce_from_tensor_model_parallel_region(
-                    self.cached_fc2_output
+                    self.cached_fc2_output, group=self.tp_group
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)
 
+    @overlap_state_check(SharedExpertState.POST_FORWARD_COMM_DONE, SharedExpertState.IDLE)
     def get_output(self):
         """
         Gets the module forward output.
         This function is used to overlap shared experts with the dispatcher.
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
-        assert self.config.moe_shared_expert_overlap
-        assert self.cached_output is not None
         with torch.cuda.stream(self.stream):
             if self.use_shared_expert_gate:
                 assert self.gate_score is not None
@@ -274,6 +361,225 @@ class SharedExpertMLP(MLP):
             self.cached_output = None
         torch.cuda.current_stream().wait_stream(self.stream)
         return output
+
+    def backward_dw(self):
+        """Compute delayed weight gradients for shared experts."""
+        super().backward_dw()
+
+
+class FusedSharedExpertMLP(SharedExpertMLP):
+    """Shared expert MLP implemented with TE GroupedLinear(num_groups=1) fused ops."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        gate: bool,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
+    ):
+        super().__init__(
+            config=config, submodules=submodules, gate=gate, pg_collection=pg_collection, name=name
+        )
+        self._fused_grouped_swiglu_ops = None
+        self._fused_grouped_swiglu_recipe = None
+        self._validate_fused_grouped_swiglu()
+
+    def _validate_fused_grouped_swiglu(self) -> None:
+        """Validate the requested GroupedLinear(num_groups=1) SwiGLU path."""
+        if not HAVE_TE:
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine when "
+                "use_grouped_gemm_for_shared_expert=True."
+            )
+        if not is_te_min_version("2.14.0"):
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine >= 2.14.0 "
+                "(needs pytorch.ops.GroupedLinear and pytorch.ops.ScaledSwiGLU)."
+            )
+        if self.config.add_bias_linear:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support add_bias_linear=True; "
+                "the CuTeGEMM fused kernel requires bias-free linear layers."
+            )
+        if not self.config.gated_linear_unit or self.config.activation_func != F.silu:
+            raise ValueError(
+                f"{self.__class__.__name__} requires SwiGLU activation "
+                "(activation_func=F.silu, gated_linear_unit=True) for the CuTeGEMM "
+                f"fused kernel, but got activation_func={self.config.activation_func}, "
+                f"gated_linear_unit={self.config.gated_linear_unit}."
+            )
+        if self.config.moe_shared_expert_glu_interleave_size is None:
+            raise ValueError(
+                f"{self.__class__.__name__} requires "
+                "moe_shared_expert_glu_interleave_size to be set when "
+                "use_grouped_gemm_for_shared_expert=True."
+            )
+        if not isinstance(self.linear_fc1, te.pytorch.Linear):
+            raise ValueError(
+                f"{self.__class__.__name__} expects FC1 to be Transformer Engine Linear, "
+                f"but found {self.linear_fc1.__class__.__name__}."
+            )
+        if not isinstance(self.linear_fc2, te.pytorch.Linear):
+            raise ValueError(
+                f"{self.__class__.__name__} expects FC2 to be Transformer Engine Linear, "
+                f"but found {self.linear_fc2.__class__.__name__}."
+            )
+
+    def _get_fused_grouped_swiglu_recipe(self):
+        """Create the TE recipe used to select the fused grouped MLP kernel."""
+        if self._fused_grouped_swiglu_recipe is None:
+            fp4_recipe = getattr(self.config.fp4_recipe, "value", self.config.fp4_recipe)
+            fp8_recipe = getattr(self.config.fp8_recipe, "value", self.config.fp8_recipe)
+            if self.config.fp4 and fp4_recipe == "nvfp4":
+                self._fused_grouped_swiglu_recipe = te.common.recipe.NVFP4BlockScaling()
+            elif self.config.fp8 and fp8_recipe == "mxfp8":
+                self._fused_grouped_swiglu_recipe = te.common.recipe.MXFP8BlockScaling()
+            else:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires fp4_recipe='nvfp4' or "
+                    f"fp8_recipe='mxfp8', but got fp4={self.config.fp4}, "
+                    f"fp4_recipe={self.config.fp4_recipe}, fp8={self.config.fp8}, "
+                    f"fp8_recipe={self.config.fp8_recipe}."
+                )
+        return self._fused_grouped_swiglu_recipe
+
+    def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
+        """Construct GroupedLinear(num_groups=1) -> ScaledSwiGLU -> GroupedLinear."""
+        ops = te.pytorch.ops.Sequential()
+        tp_world_size = get_pg_size(self.tp_group)
+        rng_state_tracker_function = None
+        if get_cuda_rng_tracker().is_initialized():
+            rng_state_tracker_function = get_cuda_rng_tracker
+
+        glu_interleave_size = self.config.moe_shared_expert_glu_interleave_size
+        fc1_weight = self.linear_fc1.weight
+        op = te.pytorch.ops.GroupedLinear(
+            num_groups=1,
+            in_features=fc1_weight.size(1),
+            out_features=fc1_weight.size(0) * tp_world_size,
+            device="meta",
+            dtype=fc1_weight.dtype,
+            bias=False,
+            rng_state_tracker_function=rng_state_tracker_function,
+            accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
+        )
+        op.weight0 = fc1_weight
+        op._glu_interleave_size = glu_interleave_size
+        ops.append(op)
+
+        ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
+
+        fc2_weight = self.linear_fc2.weight
+        op = te.pytorch.ops.GroupedLinear(
+            num_groups=1,
+            in_features=fc2_weight.size(1),
+            out_features=fc2_weight.size(0),
+            device="meta",
+            dtype=fc2_weight.dtype,
+            bias=False,
+            rng_state_tracker_function=rng_state_tracker_function,
+            accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
+        )
+        op.weight0 = fc2_weight
+        ops.append(op)
+
+        def forward_pre_hook(_module, *_) -> None:
+            for source in (self.linear_fc1, self.linear_fc2):
+                for hook_id, hook in list(source._forward_pre_hooks.items()):
+                    if hook_id in source._forward_pre_hooks_with_kwargs:
+                        ret = hook(source, (), {})
+                    else:
+                        ret = hook(source, ())
+                    if ret is not None:
+                        raise RuntimeError(
+                            f"{self.__class__.__name__} cannot replay a pre-forward hook "
+                            f"on {source.__class__.__name__} that modifies inputs."
+                        )
+
+        ops.register_forward_pre_hook(forward_pre_hook)
+        return ops
+
+    def _fused_grouped_swiglu_no_comm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the fused shared expert MLP on tensor-parallel prepared input."""
+        orig_shape = hidden_states.shape
+        hidden_size = hidden_states.size(-1)
+        hidden_states_2d = hidden_states.view(-1, hidden_size)
+        total_tokens = hidden_states_2d.size(0)
+        tokens_per_expert = torch.full(
+            (1,), total_tokens, dtype=torch.long, device=hidden_states.device
+        )
+        scales = torch.ones(total_tokens, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        recipe = self._get_fused_grouped_swiglu_recipe()
+        if self._fused_grouped_swiglu_ops is None:
+            with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                self._fused_grouped_swiglu_ops = (self._make_fused_grouped_swiglu_ops(),)
+
+        with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            output = self._fused_grouped_swiglu_ops[0](
+                hidden_states_2d, tokens_per_expert, scales, tokens_per_expert
+            )
+        return output.view(*orig_shape[:-1], output.size(-1))
+
+    def _fused_grouped_swiglu_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the fused shared expert MLP with the same TP comms as the dense MLP path."""
+        if self.config.sequence_parallel:
+            fc1_input = gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=True
+            )
+        else:
+            fc1_input = copy_to_tensor_model_parallel_region(hidden_states)
+
+        fc2_output = self._fused_grouped_swiglu_no_comm(fc1_input)
+
+        if self.config.sequence_parallel:
+            output = reduce_scatter_to_sequence_parallel_region(fc2_output)
+        else:
+            output = reduce_from_tensor_model_parallel_region(fc2_output)
+        return output
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Forward function."""
+        output = self._fused_grouped_swiglu_forward(hidden_states)
+        if self.use_shared_expert_gate:
+            logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
+            gate_score = torch.nn.functional.sigmoid(logits)
+            output = output * gate_score
+        return output
+
+    @overlap_state_check(
+        SharedExpertState.PRE_FORWARD_COMM_DONE, SharedExpertState.FC1_FORWARD_DONE
+    )
+    def linear_fc1_forward_and_act(self, overlapped_comm_output=None):
+        """Run fused FC1, activation, and FC2 for overlapped shared experts."""
+        del overlapped_comm_output
+        with torch.cuda.stream(self.stream):
+            self.cached_fc2_output = self._fused_grouped_swiglu_no_comm(self.cached_fc1_input)
+            self.cached_fc1_input = None
+
+    @overlap_state_check(SharedExpertState.FC1_FORWARD_DONE, SharedExpertState.FC2_FORWARD_DONE)
+    def linear_fc2_forward(self, overlapped_comm_output=None):
+        """Skip FC2 because the fused path computes FC2 during linear_fc1_forward_and_act."""
+        if overlapped_comm_output is not None:
+            set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
+        assert self.cached_fc2_output is not None
+
+    def backward_dw(self):
+        """Compute delayed weight gradients for fused shared experts."""
+        if self.config.delay_wgrad_compute:
+            if self._fused_grouped_swiglu_ops is not None:
+                (seq,) = self._fused_grouped_swiglu_ops
+                fused_children = list(seq.children())
+                assert len(fused_children) >= 3, "expected FC1, activation, FC2 in fused TE ops"
+                fused_children[2].backward_dw()
+                fused_children[0].backward_dw()
+                if hasattr(self.linear_fc2, "_trigger_wgrad_accumulation_and_reduce_hooks"):
+                    self.linear_fc2._trigger_wgrad_accumulation_and_reduce_hooks()
+                if hasattr(self.linear_fc1, "_trigger_wgrad_accumulation_and_reduce_hooks"):
+                    self.linear_fc1._trigger_wgrad_accumulation_and_reduce_hooks()
+            return
+        super().backward_dw()
 
 
 def set_tensor_grad_fn_sequence_sr(tensor, value):

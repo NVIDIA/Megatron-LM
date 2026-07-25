@@ -20,8 +20,8 @@ MODEL_ARGS:
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
   --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 50257
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015

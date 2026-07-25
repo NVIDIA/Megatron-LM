@@ -6,6 +6,7 @@ import math
 import os
 from statistics import median
 
+import numpy as np
 import pytest
 import yaml
 
@@ -16,6 +17,8 @@ _NON_REQUEST_TOP_LEVEL_KEYS = {
     # System-level metrics
     "throughput",
     "lifetime_prefill_token_count",
+    "async_sched_step_count",
+    "async_sched_compaction_step_count",
     # Peak memory metrics (added by inference scripts; optionally checked if present in golden values)
     "mem-max-allocated-bytes",
 }
@@ -145,7 +148,8 @@ def test_inference_pipeline(
         # TODO: Compare liftime_prefill_token_count to groundtruth
         pass
 
-    for request_id, groundtruth_results in output_groundtruth.items():
+    for request_id in groundtruth_request_ids:
+        groundtruth_results = output_groundtruth[request_id]
         current_results = output_current[request_id]
 
         at_least_one_test_loop = False
@@ -189,10 +193,16 @@ def test_inference_pipeline(
 
         if "routing_indices" in groundtruth_results and "routing_indices" in metrics:
             at_least_one_test_loop = True
-            routing_indices_groundtruth = groundtruth_results["routing_indices"]
-            routing_indices_current = current_results["routing_indices"]
-            assert (
-                routing_indices_groundtruth == routing_indices_current
+            token_indices = groundtruth_results.get("routing_indices_token_indices")
+            current_routing = np.array(current_results["routing_indices"])
+            assert token_indices is not None
+            current_routing = current_routing[token_indices]
+            routing_indices_groundtruth = np.sort(
+                np.array(groundtruth_results["routing_indices"]), axis=-1
+            )
+            routing_indices_current = np.sort(current_routing, axis=-1)
+            assert np.array_equal(
+                routing_indices_groundtruth, routing_indices_current
             ), f"Routing indices mismatch:\nGround truth: {routing_indices_groundtruth}\nCurrent: {routing_indices_current}"
 
         if not at_least_one_test_loop:

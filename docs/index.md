@@ -50,6 +50,7 @@ get-started/quickstart
 user-guide/data-preparation
 user-guide/training-examples
 user-guide/parallelism-guide
+user-guide/hybrid-model-migration
 ```
 
 ```{toctree}
@@ -67,11 +68,12 @@ models/index
 
 user-guide/features/moe
 user-guide/features/context_parallel
-user-guide/features/custom_fsdp
+user-guide/features/megatron_fsdp
 user-guide/features/dist_optimizer
 user-guide/features/optimizer_cpu_offload
 user-guide/features/pipeline_parallel_layout
 user-guide/features/fine_grained_activation_offloading
+user-guide/data-loading
 user-guide/features/megatron_energon
 user-guide/features/megatron_rl
 user-guide/features/tokenizers

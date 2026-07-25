@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"MANDATORY WORKFLOW — never skip or reorder: (1) Read the artifact first (commit, file, error, PR). (2) Identify and invoke the relevant skill via the Skill tool BEFORE forming any answer or plan — even when the answer seems obvious. (3) Only then answer using the skill context. Skipping step 2 is not allowed.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -7,9 +7,14 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_utils import (
+    get_updated_expert_bias,
+    router_gating_linear,
+    topk_routing_with_score_function,
+)
 from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -44,10 +49,11 @@ class TestTop2Router:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
         )
-        self.sequential_mlp = MoELayer(self.transformer_config, submodules.mlp.submodules)
+        assert isinstance(submodules, MoESubmodules)
+        self.sequential_mlp = MoELayer(self.transformer_config, submodules)
         self.router = cast(Router, self.sequential_mlp.router)
 
     def teardown_method(self, method):
@@ -313,10 +319,11 @@ class TestGroupLimitedRouter:
         )
 
         # init MoE layer
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
         )
-        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules).cuda()
+        assert isinstance(submodules, MoESubmodules)
+        self.moe_layer = MoELayer(self.transformer_config, submodules).cuda()
         self.router = cast(Router, self.moe_layer.router)
 
     def teardown_method(self, method):
@@ -418,10 +425,11 @@ class TestAuxLossFreeTop2Router:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=num_moe_experts, moe_grouped_gemm=False).mlp
         )
-        self.moe_layer = MoELayer(self.transformer_config, submodules.mlp.submodules)
+        assert isinstance(submodules, MoESubmodules)
+        self.moe_layer = MoELayer(self.transformer_config, submodules)
         self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
         assert self.router.local_tokens_per_expert is not None
@@ -464,11 +472,14 @@ class TestAuxLossFreeTop2Router:
     def test_router_forward_fusion_equivalence(self, score_function):
         with torch.no_grad():
             # Build two fresh routers to avoid bias update interference
-            submodules = get_gpt_layer_local_submodules(
-                num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
+            submodules = get_submodules(
+                get_gpt_layer_local_submodules(
+                    num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
+                ).mlp
             )
-            moe_layer_ref = MoELayer(self.transformer_config, submodules.mlp.submodules)
-            moe_layer_fused = MoELayer(self.transformer_config, submodules.mlp.submodules)
+            assert isinstance(submodules, MoESubmodules)
+            moe_layer_ref = MoELayer(self.transformer_config, submodules)
+            moe_layer_fused = MoELayer(self.transformer_config, submodules)
             router_ref = moe_layer_ref.router.cuda()
             router_fused = moe_layer_fused.router.cuda()
 
@@ -522,6 +533,10 @@ def test_router_gating_linear(router_dtype):
     assert output.dtype == router_dtype
     assert ref_inp.grad.dtype == ref_inp.dtype
     assert ref_weight.grad.dtype == ref_weight.dtype
+    # Relax atol for float32: TE general_gemm produces results ~6.5e-3 away from
+    # torch.nn.functional.linear, which exceeds the default 1e-3 atol.
+    if router_dtype == torch.float32:
+        tols = dict(rtol=2.0e-2, atol=1.0e-2)
     assert torch.allclose(output, ref_output, **tols)
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
@@ -563,3 +578,40 @@ def test_router_gating_linear_bias(router_dtype):
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
     assert torch.allclose(bias.grad, ref_bias.grad, **tols)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("use_pre_softmax", [True, False])
+@pytest.mark.parametrize("topk", [1, 2])
+def test_topk_routing_precomputed_indices_equivalence(score_function, use_pre_softmax, topk):
+    """Passing precomputed_indices that match the function's own selection must reproduce
+    the standard output. Guards the shared post-top-k path reused by quantile balancing."""
+    if score_function != "softmax" and use_pre_softmax:
+        pytest.skip("pre_softmax only applies to softmax scoring")
+
+    torch.manual_seed(123)
+    num_tokens, num_experts = 64, 8
+    logits = torch.randn(num_tokens, num_experts)
+
+    kwargs = dict(use_pre_softmax=use_pre_softmax, score_function=score_function, fused=False)
+    probs_ref, map_ref = topk_routing_with_score_function(logits, topk, **kwargs)
+    _, top_indices = topk_routing_with_score_function(logits, topk, dense_output=True, **kwargs)
+    probs_pre, map_pre = topk_routing_with_score_function(
+        logits, topk, precomputed_indices=top_indices, **kwargs
+    )
+
+    # Natural top-k indices reproduce the standard output.
+    assert torch.equal(map_ref, map_pre)
+    torch.testing.assert_close(probs_ref, probs_pre)
+
+    # Indices that differ from the natural top-k must route to exactly those experts. This
+    # catches a regression where the precomputed_indices branch is dropped and the function
+    # silently recomputes its own top-k instead of honoring the caller's indices. Bottom-k is
+    # disjoint from top-k since 2 * topk <= num_experts.
+    alt_indices = logits.topk(topk, dim=1, largest=False).indices
+    _, map_alt = topk_routing_with_score_function(
+        logits, topk, precomputed_indices=alt_indices, **kwargs
+    )
+    expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, alt_indices, True)
+    assert torch.equal(map_alt, expected_map)

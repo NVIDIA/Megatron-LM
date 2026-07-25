@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import io
 import logging
 import os
 import pathlib
@@ -37,10 +38,51 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
         or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
         or "Unpack failed: incomplete input" in concat_allranks_logs
+        or "The read operation timed out" in concat_allranks_logs
+        or "Read timed out" in concat_allranks_logs
+        or "TimeoutError" in concat_allranks_logs
+        or "Connection broken" in concat_allranks_logs
+        or "Temporary failure in name resolution" in concat_allranks_logs
         or "unspecified launch failure" in concat_allranks_logs
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
+        or "The following metrics failed" in concat_allranks_logs
+        or "removal of container" in concat_allranks_logs
+        or "is already in progress" in concat_allranks_logs
+        or "Error deleting container" in concat_allranks_logs
     )
+
+
+def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
+    """Reads every log file that may carry a flaky-failure signature.
+
+    The per-rank ``attempt_0/*/std*.log`` files only contain torchrun training
+    output. The golden-value comparison runs in ``run_ci_test.sh`` and emits its
+    assertion (e.g. ``The following metrics failed``) to the nemo-run task log,
+    which lives outside that per-rank tree. Globbing both ensures harness-side
+    failures are seen by ``is_flaky_failure`` and therefore eligible for retry.
+
+    Args:
+        workdir: Working directory under which nemo-run writes all log files.
+
+    Returns:
+        The concatenated lines of every discovered log file, deduplicated by
+        resolved path to avoid double-counting overlapping globs.
+    """
+    seen_paths = set()
+    collected_lines: list[str] = []
+    for pattern in ("**/attempt_0/*/std*.log", "**/*.log"):
+        for log_file_path in workdir.glob(pattern):
+            resolved = log_file_path.resolve()
+            if resolved in seen_paths or not log_file_path.is_file():
+                continue
+            seen_paths.add(resolved)
+            try:
+                with open(log_file_path, "r", errors="replace") as f:
+                    collected_lines.extend(f.readlines())
+            except OSError as error:
+                logger.warning("Could not read log file %s: %s", log_file_path, error)
+    return collected_lines
 
 
 @click.command()
@@ -65,6 +107,16 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
     default=False,
     help="To enable lightweight mode",
 )
+@click.option(
+    "--cadence",
+    required=False,
+    type=str,
+    default=None,
+    help=(
+        "Trigger cadence to filter tests by (pr|nightly|mergegroup). "
+        "Empty/unset disables the cadence filter."
+    ),
+)
 def main(
     scope,
     model,
@@ -77,7 +129,10 @@ def main(
     hf_home: Optional[str] = None,
     tag: Optional[str] = None,
     enable_lightweight_mode: Optional[bool] = False,
+    cadence: Optional[str] = None,
 ):
+    cadence_arg = cadence or None
+
     workloads = recipe_parser.load_workloads(
         container_image="none",
         scope=scope,
@@ -87,6 +142,7 @@ def main(
         container_tag="none",
         platform=platform,
         tag=tag,
+        cadence=cadence_arg,
     )
 
     workloads = [workload for workload in workloads if workload.type != "build"]
@@ -120,6 +176,8 @@ def main(
         shm_size="30g",
         env_vars={
             "PYTHONUNBUFFERED": "1",
+            "FORCE_COLOR": "1",
+            "TERM": "xterm-256color",
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": str(n_repeat),
@@ -135,11 +193,37 @@ def main(
 
     n_attempts = 0
     while n_attempts < 3:
-        with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
-            _ = exp.add([inline_script], tail_logs=False, name="task-1")
+        tee_buffer = io.StringIO()
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
 
-            exp.dryrun(log=True)
-            exp.run(detach=False, tail_logs=True, sequential=False)
+        class _TeeStream:
+            def __init__(self, real_stream, buf):
+                self._real = real_stream
+                self._buf = buf
+
+            def write(self, data):
+                self._real.write(data)
+                self._buf.write(data)
+
+            def flush(self):
+                self._real.flush()
+                self._buf.flush()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        sys.stdout = _TeeStream(original_stdout, tee_buffer)
+        sys.stderr = _TeeStream(original_stderr, tee_buffer)
+        try:
+            with run.Experiment("mcore-ci-test", executor=executor, log_level="INFO") as exp:
+                _ = exp.add([inline_script], tail_logs=False, name="task-1")
+
+                exp.dryrun(log=True)
+                exp.run(detach=False, tail_logs=True, sequential=False)
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
         result_dict = exp.status(return_dict=True)
         _, job_dict = list(result_dict.items())[0]
@@ -150,12 +234,8 @@ def main(
             sys.exit(0)
 
         logger.error(f"Job failed with status: {job_dict['status']}")
-        log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/*/attempt_0/*/std*.log")
-        all_ranks_all_logs = []
-        for log_file_path in log_file_paths:
-            with open(log_file_path, "r") as f:
-                all_logs = f.readlines()
-            all_ranks_all_logs.extend(all_logs)
+        all_ranks_all_logs = [tee_buffer.getvalue()]
+        all_ranks_all_logs.extend(_collect_failure_logs(pathlib.Path(os.getcwd())))
         all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
         if is_flaky_failure(all_ranks_all_logs_string):
             logger.warning("Detected flaky failure, attempt restart.")
