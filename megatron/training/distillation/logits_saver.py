@@ -141,6 +141,7 @@ class LogitsSaverHooks:
         p: Optional[float] = None,
         min_k: int = 1,
         save_dtype: str = 'fp16',
+        save_mtp: bool = False,
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
@@ -172,10 +173,17 @@ class LogitsSaverHooks:
         self.dp_rank = parallel_state.get_data_parallel_rank()
         self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
 
-        # Track number of MTP outputs to ignore
+        # MTP handling. The shared output_layer fires once per head in firing
+        # order [mtp_0 .. mtp_{N-1}, main] (main last). When ``save_mtp`` is set
+        # we capture every head; otherwise we skip the MTP passes and keep only
+        # the main head (legacy behavior).
         args = get_args()
         self._mtp_num_layers = args.mtp_num_layers or 0
         self._curr_mtp_passes = 0
+        self._save_mtp = bool(save_mtp) and self._mtp_num_layers > 0
+        self._num_heads = 1 + (self._mtp_num_layers if self._save_mtp else 0)
+        # Per-microbatch buffer of processed per-head results (multi-head only).
+        self._curr_microbatch_heads: List[Any] = []
 
         # Dataset-identity hash + serialised metadata, written as the
         # first member of every batched tar so the student loader can
@@ -191,12 +199,18 @@ class LogitsSaverHooks:
                 "save_dtype": save_dtype,
             },
         }
+        # Only record num_heads for the multi-head format so main-head-only tars
+        # stay byte-identical to the pre-MTP format (readers default to 1).
+        if self._num_heads > 1:
+            self.metadata_dict["num_heads"] = self._num_heads
         self._meta_bytes: bytes = json.dumps(
             self.metadata_dict, sort_keys=False, separators=(',', ':'),
         ).encode("utf-8")
 
-        # Hook states – store already-processed top-K results (not full logits)
-        self._accumulated_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        # Hook states – store already-processed top-K results (not full logits).
+        # Each entry is a (values, indices_low, high_bit) tuple for the main-head-only
+        # format, or a per-head list of such tuples for the multi-head (MTP) format.
+        self._accumulated_results: List[Any] = []
         self._hook_handles: List[Any] = []
         self._loss_overrides: List[Tuple[torch.nn.Module, Any]] = []
 
@@ -229,22 +243,42 @@ class LogitsSaverHooks:
         if not module.training:
             return
 
-        if self._curr_mtp_passes == self._mtp_num_layers:
-            # Main output logits come after MTP logits.
-            logits = output[0] if isinstance(output, tuple) else output
+        logits = output[0] if isinstance(output, tuple) else output
+        # ``_curr_mtp_passes`` is the firing index within a microbatch:
+        # 0..N-1 are MTP depths, N (== mtp_num_layers) is the main head (last).
+        is_main = self._curr_mtp_passes == self._mtp_num_layers
 
+        if self._save_mtp:
+            # Capture every head in firing order [mtp_0 .. mtp_{N-1}, main].
             with torch.no_grad():
                 result = self._process_single_microbatch(logits)
             if result is not None:
-                self._accumulated_results.append(result)
-
-            if len(self._accumulated_results) == get_num_microbatches():
-                self._save_accumulated_log_probs()
-                self._accumulated_results.clear()
-
-            self._curr_mtp_passes = 0
+                self._curr_microbatch_heads.append(result)
+            if is_main:
+                if self._curr_microbatch_heads:  # only populated on TP rank 0
+                    self._accumulated_results.append(self._curr_microbatch_heads)
+                self._curr_microbatch_heads = []
+                self._curr_mtp_passes = 0
+                self._maybe_flush()
+            else:
+                self._curr_mtp_passes += 1
         else:
-            self._curr_mtp_passes += 1
+            # Main-head-only (legacy): skip MTP passes, keep only the main head.
+            if is_main:
+                with torch.no_grad():
+                    result = self._process_single_microbatch(logits)
+                if result is not None:
+                    self._accumulated_results.append(result)
+                self._curr_mtp_passes = 0
+                self._maybe_flush()
+            else:
+                self._curr_mtp_passes += 1
+
+    def _maybe_flush(self) -> None:
+        """Flush once a full set of microbatches has been accumulated."""
+        if len(self._accumulated_results) == get_num_microbatches():
+            self._save_accumulated_log_probs()
+            self._accumulated_results.clear()
 
     def attach_hooks(self, model: LanguageModule) -> None:
         """Attach logits-saving hooks and skip expensive LM loss computation.
@@ -291,10 +325,17 @@ class LogitsSaverHooks:
         all_indices_low = []
         all_high_bits = []
 
-        for values, indices_low, high_bit in self._accumulated_results:
-            all_values.append(values.cpu())
-            all_indices_low.append(indices_low.cpu())
-            all_high_bits.append(high_bit.cpu())
+        if self._save_mtp:
+            # Each accumulated entry is a per-head list of (values, low, high) tuples.
+            for per_head in self._accumulated_results:
+                all_values.append([values.cpu() for values, _, _ in per_head])
+                all_indices_low.append([low.cpu() for _, low, _ in per_head])
+                all_high_bits.append([high.cpu() for _, _, high in per_head])
+        else:
+            for values, indices_low, high_bit in self._accumulated_results:
+                all_values.append(values.cpu())
+                all_indices_low.append(indices_low.cpu())
+                all_high_bits.append(high_bit.cpu())
 
         self._buffer_iteration(all_values, all_indices_low, all_high_bits)
 
@@ -518,14 +559,22 @@ class LogitsSaverHooks:
           in ``self._save_dtype`` (default ``torch.float16``)
         - indices_low: list of uint16 tensors (lower 16 bits of vocab indices)
         - bit_17: list of bool tensors (17th bit, same shape as indices_low)
+
+        For the multi-head (MTP) format (``self._num_heads > 1``) each list
+        element is itself a per-head list ordered ``[mtp_0 .. mtp_{N-1}, main]``,
+        and a ``num_heads`` key is added. The main-head-only format omits the key
+        so it stays byte-identical to the pre-MTP layout.
         """
         # Serialize all tensors together
-        buffer = io.BytesIO()
-        torch.save({
+        payload: Dict[str, Any] = {
             'values': values_list,
             'indices_low': indices_low_list,
             'bit_17': bit_17_list,
-        }, buffer)
+        }
+        if self._num_heads > 1:
+            payload['num_heads'] = self._num_heads
+        buffer = io.BytesIO()
+        torch.save(payload, buffer)
         data = buffer.getvalue()
         iteration = get_current_iteration()
         self._pending_writes[iteration] = data
