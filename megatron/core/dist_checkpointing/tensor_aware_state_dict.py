@@ -180,7 +180,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         """
         Get the tensor data from the state dict.
         """
-        assert not self.is_hollow  # TODO raise exception
+        if self.is_hollow:
+            raise RuntimeError("Expected non-hollow tensor, but got hollow tensor")
         return map(lambda sh_ten: sh_ten.data, self._sharded_tensors)
 
     @property
@@ -200,7 +201,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
 
         @return List of extracted tensors
         """
-        assert not self.is_hollow  # TODO raise exception
+        if self.is_hollow:
+            raise RuntimeError("Expected non-hollow tensor, but got hollow tensor")
         result = []
         for sh_ten in self._sharded_tensors:
             result.append(sh_ten.data)
@@ -218,7 +220,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
             self.insert_tensors(self.pop_tensors())
             ```
         """
-        assert self.is_hollow  # TODO raise exception
+        if not self.is_hollow:
+            raise RuntimeError("Expected hollow tensor, but got non-hollow tensor")
         for sh_ten, ten in zip_strict(self._sharded_tensors, tensor_data):
             # FIXME: Hacky way to store the original device
             if sh_ten.orig_device == ten.device.type:
@@ -235,7 +238,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         It ensures that the newly created empty tensors match the shape,
         dtype, and device of the originals, but contain no data.
         """
-        assert self.is_hollow  # TODO raise exception
+        if not self.is_hollow:
+            raise RuntimeError("Expected hollow tensor, but got non-hollow tensor")
         for sh_ten in self._sharded_tensors:
             # Hacky way to retrieve the original device
             sh_ten.init_data(sh_ten.orig_device)
@@ -249,7 +253,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         The original devices are remembered for restoration with restore_tensor_device().
         Using non_blocking=True allows for asynchronous copying.
         """
-        assert not self.is_hollow  # TODO raise exception
+        if self.is_hollow:
+            raise RuntimeError("Expected non-hollow tensor, but got hollow tensor")
         for sh_ten in self._sharded_tensors:
             if sh_ten.data.device.type == "cpu":
                 # Skip cloning if it's already confirmed to be a copy
@@ -266,7 +271,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         Restores all tensors to their original devices, if a move is required.
         Using non_blocking=True allows for asynchronous copying.
         """
-        assert not self.is_hollow  # TODO raise exception
+        if self.is_hollow:
+            raise RuntimeError("Expected non-hollow tensor, but got hollow tensor")
         for sh_ten in self._sharded_tensors:
             # FIXME: Hacky way to store the original device
             if hasattr(sh_ten, "orig_device"):
@@ -336,7 +342,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         Convert tensor-aware dict back to the original state_dict
         """
         with debug_time("load_preprocess_and_state_dict_manipulations", logger):
-            assert not self.is_hollow  # TODO raise exception
+            if self.is_hollow:
+                raise RuntimeError("Expected non-hollow tensor, but got hollow tensor")
             self._validate_params(algo)
             fully_parallel = algo == "fully_parallel"
 
