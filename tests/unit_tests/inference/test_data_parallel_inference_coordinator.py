@@ -19,9 +19,7 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
-    handle_engine_reply,
-)
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import handle_engine_reply
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
