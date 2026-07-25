@@ -7,6 +7,8 @@ ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
+# NCCL 2.30.4 supports CUDA 13.x; NVIDIA publishes its CUDA 13 package as cuda13.2.
+ARG NCCL_VERSION=2.30.4-1+cuda13.2
 ENV PATH="/root/.local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
@@ -30,6 +32,9 @@ RUN bash -ex <<"EOF"
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
+
+RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
+    bash /opt/install_nccl.sh --NCCL_VER=${NCCL_VERSION}
 
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
