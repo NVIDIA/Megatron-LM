@@ -1387,7 +1387,11 @@ def prepare_trajectories(
             else tokenizer.tokenize(rollout.trajectory)[turn_idx]
         )
         inf_logprobs = rollout.logprobs[turn_idx]
-        generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
+        generation_mask = (
+            copy.deepcopy(rollout.generation_mask[turn_idx])
+            if isinstance(rollout, TokenRollout)
+            else None
+        )
         length = len(trajectory)
         assert length <= seq_length, "Rollout too long, how did this happen?"
 
