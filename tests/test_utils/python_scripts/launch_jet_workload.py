@@ -414,6 +414,8 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
         or "Fatal glibc error" in concat_allranks_logs
+        or "Disk quota exceeded" in concat_allranks_logs
+        or "basic_ios::clear: iostream error" in concat_allranks_logs
     )
 
 
