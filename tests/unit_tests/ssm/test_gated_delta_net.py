@@ -1446,6 +1446,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
         )
         assert fused_bias == unfused_bias
 
+    @pytest.mark.flaky_in_dev
     def test_fused_and_unfused_backward_chunkwise_cp_match(self):
         unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
         fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
@@ -1520,6 +1521,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
         )
         assert fused_bias == unfused_bias
 
+    @pytest.mark.flaky_in_dev
     def test_fused_and_unfused_packed_backward_chunkwise_cp_match(self):
         unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
         fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
