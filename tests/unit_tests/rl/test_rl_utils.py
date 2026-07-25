@@ -1181,3 +1181,21 @@ class TestRLUtils:
         assert metrics["max_num_evictions"] == 1
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
+
+        # Case where every episode has failed.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[],
+            turn_lens=[],
+            rewards=[],
+            num_turns=[],
+            advantages=[],
+            policy_epoch=[],
+            kv_cache_epoch=[],
+            completed_epochs=[],
+            num_evictions=[],
+            current_iteration=6,
+        )
+        assert metrics == {}
+        writer.Table.assert_not_called()

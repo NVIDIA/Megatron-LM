@@ -587,9 +587,11 @@ def compute_packed_inference_logprobs_stats(
     # Use packed_loss_mask to identify valid positions for stats (shift by 1 for logprobs)
     mask = packed_loss_mask[:, 1:].bool()
 
-    # Ensure shapes match
     if mask.shape != old_logprobs.shape:
-        return
+        raise RuntimeError(
+            f"packed inference-logprob stats shape mismatch: loss-mask "
+            f"{tuple(mask.shape)} vs old_logprobs {tuple(old_logprobs.shape)}"
+        )
 
     # Update group statistics using common helper
     update_inference_logprobs_group_stats(
