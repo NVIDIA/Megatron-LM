@@ -1367,6 +1367,45 @@ class TestRLUtils:
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
 
+        # Case where every episode has failed: the wave still reports the
+        # failure counters (the one signal it carries) and skips the tables.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[],
+            turn_lens=[],
+            rewards=[],
+            num_turns=[],
+            advantages=[],
+            policy_epoch=[],
+            kv_cache_epoch=[],
+            completed_epochs=[],
+            num_evictions=[],
+            current_iteration=6,
+        )
+        assert metrics == {'failed_rollouts/count': 0, 'failed_rollouts/ratio': 0.0}
+        writer.Table.assert_not_called()
+
+        # All-placeholder wave: rewards exist (placeholders carry 0.0) but every
+        # rollout is a zero-turn pad, so the masked stats have nothing to reduce
+        # over; the guard must still report the failure counters.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[[0, 0]],
+            turn_lens=[[]],
+            rewards=[[0.0, 0.0]],
+            num_turns=[[0, 0]],
+            advantages=[0.0, 0.0],
+            policy_epoch=[[[0], [0]]],
+            kv_cache_epoch=[[[0], [0]]],
+            completed_epochs=[[]],
+            num_evictions=[[0, 0]],
+            current_iteration=6,
+        )
+        assert metrics == {'failed_rollouts/count': 2, 'failed_rollouts/ratio': 1.0}
+        writer.Table.assert_not_called()
+
     def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
         def real_rollout(tokens, problem_id):
             return TokenRollout(

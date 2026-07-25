@@ -554,9 +554,40 @@ def get_agent(env_config_path):
 _INFERENCE_INTERFACE = None
 
 
+def _eager_train_comm_warmup():
+    """Run one tiny allreduce per training process group to initialize NCCL communicators."""
+    group_getters = {
+        'dp': partial(mpu.get_data_parallel_group),
+        'dp_cp': partial(mpu.get_data_parallel_group, with_context_parallel=True),
+        'cp': mpu.get_context_parallel_group,
+        'mp': mpu.get_model_parallel_group,
+        'tp_dp_cp': partial(mpu.get_tensor_and_data_parallel_group, with_context_parallel=True),
+        'expert_dp': mpu.get_expert_data_parallel_group,
+        'expert_tp': mpu.get_expert_tensor_parallel_group,
+        'expert_mp': mpu.get_expert_model_parallel_group,
+    }
+    warmed = []
+    for name, getter in group_getters.items():
+        try:
+            group = getter()
+        except AssertionError:
+            continue
+        if group is None:
+            continue
+        dist.all_reduce(torch.zeros(1, device='cuda'), group=group)
+        warmed.append(name)
+    torch.cuda.synchronize()
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f'[EagerCommWarmup] initialized NCCL communicators for: {warmed}',
+    )
+
+
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
+        _eager_train_comm_warmup()
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
                 model[0],
@@ -1091,6 +1122,21 @@ def prep_wandb_metrics(
             failed_rollouts / total_rollouts if total_rollouts else 0.0
         ),
     }
+
+    # All-empty wave: every episode failed and was dropped (nothing to aggregate),
+    # or every surviving rollout is a zero-turn placeholder (rewards exist but the
+    # length/turn stats below would reduce over empty sequences). Keep the failure
+    # counters: they are the one signal such a wave still carries.
+    if (
+        len(advantages) == 0
+        or not rewards
+        or not any(keep for g in real_mask for keep in g)
+    ):
+        logger.warning(
+            "prep_wandb_metrics: empty wave (0 usable rollouts); "
+            "skipping rollout metrics this iteration."
+        )
+        return failure_metrics
 
     def _real(grouped):
         """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
@@ -2151,7 +2197,18 @@ def evaluate_and_print_results_rl(
                         tb_writer.add_scalar(k, v, iteration)
             wandb_writer = get_wandb_writer()
             if wandb_writer:
-                wandb_writer.log(eval_metrics, step=iteration)
+                if args.do_train:
+                    wandb_writer.log(eval_metrics, step=iteration)
+                else:
+                    # Without a training loop the eval may target an arbitrary (older) checkpoint,
+                    # breaking wandb step monotonicity.
+                    wandb_writer.define_metric('eval_only/*', step_metric='eval_checkpoint_iter')
+                    wandb_writer.log(
+                        {
+                            'eval_checkpoint_iter': iteration,
+                            **{f'eval_only/{k}': v for k, v in eval_metrics.items()},
+                        }
+                    )
             logger.info(
                 "Evaluation results:"
                 + "".join([f"\n\t{k}: {v:0.4f}" for k, v in eval_metrics.items()])
