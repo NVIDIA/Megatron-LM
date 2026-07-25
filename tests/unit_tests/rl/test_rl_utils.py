@@ -738,7 +738,7 @@ class TestRLUtils:
         def mt1():
             return make_token_rollout(
                 [[1, 2, 3], [1, 2, 3, 4]],
-                [[0.1, 0.2], [0.3]],
+                [[-0.1, -0.2], [-0.3]],
                 [[False, True, True], [False, False, False, True]],
                 problem_id="1",
             )
@@ -746,7 +746,7 @@ class TestRLUtils:
         def mt2():
             return make_token_rollout(
                 [[1, 2], [1, 2, 3], [1, 2, 3, 4]],
-                [[0.1], [0.2], [0.3]],
+                [[-0.1], [-0.2], [-0.3]],
                 [[False, True], [False, False, True], [False, False, False, True]],
                 reward=0.0,
                 problem_id="3",
@@ -822,7 +822,7 @@ class TestRLUtils:
         def single(problem_id, reward):
             return make_token_rollout(
                 [[1, 2, 3, tokenizer.eod]],
-                [[0.1, 0.2, 0.3]],
+                [[-0.1, -0.2, -0.3]],
                 [[False, True, True, True]],
                 reward=reward,
                 problem_id=problem_id,
@@ -845,7 +845,7 @@ class TestRLUtils:
             def non_prefix():
                 return make_token_rollout(
                     [[1, 2, 3, tokenizer.eod], [7, 8, 9, tokenizer.eod]],
-                    [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+                    [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]],
                     [[False, True, True, True], [False, True, True, True]],
                     reward=0.0,
                     problem_id="x",
