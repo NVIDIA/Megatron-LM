@@ -151,22 +151,25 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
             # Adopt the request's prompt as the conversation: turn 0 may start from a bare
             # string, which prepare_request normalizes into a single user message.
             conversation = list(turn_request.prompt)
-            responses.append(await self.get_rollout_response(request, turn_request))
-            if turn_idx == self.max_turns - 1:
-                break
 
-            observation, done = await self.get_observation(
-                turn_idx, responses[-1], conversation, golden
-            )
-            if done or observation is None:
-                break
-            assert observation, (
-                "get_observation must return a non-empty observation when continuing (done=False)."
-            )
-            conversation = conversation + [
-                responses[-1].response,
-                LLMChatMessage(role="user", content=observation),
-            ]
+            response = await self.get_rollout_response(request, turn_request)
+            responses.append(response)
+
+            if turn_idx + 1 < self.max_turns:
+                observation, done = await self.get_observation(
+                    turn_idx, response, conversation, golden
+                )
+                if done:
+                    break
+                if not observation:
+                    raise ValueError(
+                        "get_observation must return a non-empty observation"
+                    )
+
+                conversation += [
+                    response.response,
+                    LLMChatMessage(role="user", content=observation),
+                ]
 
         # The loop appends a reply only when continuing, so the final turn's reply is not in
         # `conversation` yet; append it once so get_trajectory_reward sees the full dialogue.
