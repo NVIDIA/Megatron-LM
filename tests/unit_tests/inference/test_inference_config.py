@@ -67,3 +67,32 @@ class TestInferenceConfig:
         )
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.OVERLAP
+
+    def test_offset_sampling_seed_argparse_plumbing(self):
+        """Ensure the CLI can select a shared sampling seed across DP ranks."""
+        parser = _add_inference_args(ArgumentParser())
+        default_args = parser.parse_args([])
+        assert default_args.offset_sampling_seed_by_dp_rank is True
+
+        disabled_args = parser.parse_args(["--use-same-sampling-seed-across-dp-ranks"])
+        assert disabled_args.offset_sampling_seed_by_dp_rank is False
+
+    def test_inference_setup_config_maps_offset_sampling_seed_by_dp_rank(self):
+        """Ensure declarative inference config maps DP seed offset to runtime config."""
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+        )
+        setup_config = InferenceSetupConfig(offset_sampling_seed_by_dp_rank=False)
+
+        inference_config = setup_config.to_inference_config(
+            model=model,
+            kv_cache_management_mode="persist",
+            static_kv_memory_pointers=False,
+            enable_cuda_graphs=False,
+            verbose=False,
+        )
+
+        assert inference_config.offset_sampling_seed_by_dp_rank is False
