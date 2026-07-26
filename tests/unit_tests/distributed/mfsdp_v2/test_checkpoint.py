@@ -16,7 +16,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     load_checkpoint,
     save_checkpoint,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 
 
@@ -36,17 +35,17 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def _build_sharded(seed, mesh, device, *, param_dtype, mp_policy):
-    torch.manual_seed(seed)
+def _build_sharded(mesh, device, *, param_dtype, zero_init):
     model = _TinyModel().to(device=device, dtype=param_dtype)
-    fully_shard(
-        model.fc1, mesh=mesh, placements=_flat_placements(), mixed_precision_policy=mp_policy
-    )
-    fully_shard(
-        model.fc2, mesh=mesh, placements=_flat_placements(), mixed_precision_policy=mp_policy
-    )
+    if zero_init:
+        # Zero the destination weights so they are obviously different from the saved (trained)
+        # source; a correct load must overwrite them.
+        for parameter in model.parameters():
+            nn.init.zeros_(parameter)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
-    # Mixed precision feeds the optimizer main-weight-dtype params with FSDP-dtype grads; the
+    # main_weight is fp32 by default, so a bf16 model feeds the fp32 optimizer bf16 grads; the
     # adapter casts them around each step.
     fully_shard_optimizer(optimizer)
     return model, optimizer
@@ -64,43 +63,45 @@ def _to_local(value):
     return value.to_local() if isinstance(value, DTensor) else value
 
 
-def _snapshot(model, optimizer):
-    model_snap = {
-        key: _to_local(value).detach().clone()
-        for key, value in model.state_dict().items()
-        if not key.endswith("_extra_state")
-    }
-    optim_snap = {}
+def _snapshot_local_state(model, optimizer):
+    """Clone this rank's local model weights and optimizer state, keyed as their state dicts are."""
+    model_snapshot = {key: _to_local(value).clone() for key, value in model.state_dict().items()}
+    optimizer_snapshot = {}
     for index, state in optimizer.state_dict()["state"].items():
-        optim_snap[index] = {
-            key: (_to_local(value).detach().clone() if torch.is_tensor(value) else value)
+        optimizer_snapshot[index] = {
+            key: (_to_local(value).clone() if torch.is_tensor(value) else value)
             for key, value in state.items()
         }
-    return model_snap, optim_snap
+    return model_snapshot, optimizer_snapshot
 
 
-def _assert_matches(snapshot, model, optimizer):
-    model_snap, optim_snap = snapshot
+def _assert_model_matches_snapshot(model, model_snapshot) -> bool:
+    """Assert the model's local weights equal the snapshot.
+
+    Returns whether this rank held any non-empty local shard, so the caller can assert that at
+    least one rank exercised a real comparison.
+    """
+    current = model.state_dict()
+    assert model_snapshot.keys() == current.keys()
     local_nonempty = False
-
-    current_model = {
-        key: value for key, value in model.state_dict().items() if not key.endswith("_extra_state")
-    }
-    assert model_snap.keys() == current_model.keys()
-    for key, expected in model_snap.items():
-        assert isinstance(current_model[key], DTensor), f"{key} should rest as a DTensor"
-        actual = _to_local(current_model[key])
+    for key, expected in model_snapshot.items():
+        assert isinstance(current[key], DTensor), f"{key} should rest as a DTensor"
+        actual = _to_local(current[key])
         assert (
             expected.shape == actual.shape
         ), f"model[{key}] shape {expected.shape} != {actual.shape}"
         assert torch.equal(expected, actual), f"model[{key}] value mismatch after roundtrip"
         local_nonempty = local_nonempty or expected.numel() > 0
+    return local_nonempty
 
-    current_state = optimizer.state_dict()["state"]
-    assert optim_snap.keys() == current_state.keys()
-    for index, expected_state in optim_snap.items():
+
+def _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot) -> None:
+    """Assert the optimizer's local state equals the snapshot."""
+    current = optimizer.state_dict()["state"]
+    assert optimizer_snapshot.keys() == current.keys()
+    for index, expected_state in optimizer_snapshot.items():
         for key, expected in expected_state.items():
-            actual = current_state[index][key]
+            actual = current[index][key]
             if torch.is_tensor(expected):
                 actual = _to_local(actual)
                 assert expected.shape == actual.shape, f"optim[{index}][{key}] shape mismatch"
@@ -108,50 +109,38 @@ def _assert_matches(snapshot, model, optimizer):
             else:
                 assert expected == actual, f"optim[{index}][{key}] scalar mismatch"
 
-    return local_nonempty
 
-
-# (param_dtype, mixed_precision_policy): plain fp32, and bf16 compute with fp32 master weights.
-_CONFIGS = {
-    "fp32": (torch.float32, None),
-    "bf16_fp32_master": (torch.bfloat16, MixedPrecisionPolicy(main_params_dtype=torch.float32)),
-}
-
-
-@pytest.mark.parametrize("config", list(_CONFIGS), ids=list(_CONFIGS))
-def test_dcp_roundtrip_flat_dp(distributed_setup, tmp_path_dist_ckpt, config):
+@pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_checkpoint_roundtrip_flat_dp(distributed_setup, tmp_path_dist_ckpt, param_dtype):
     """Saving then loading a flat-DP sharded model+optimizer restores state bit-exactly.
 
     The fc1 group packs ``weight (16, 8)`` and ``bias (16,)`` into one flat buffer, so per-rank
     shards do not tile like canonical ``Shard(0)`` (e.g. one rank owns no bias rows). This
-    exercises the uneven-DTensor metadata path in :func:`save_checkpoint`.
+    exercises the uneven-DTensor metadata path in :func:`save_checkpoint`. With a bf16 model the
+    optimizer's ``main_weight`` stays fp32, covering the mixed-precision master-weight path.
     """
     if distributed_setup.world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
+        pytest.skip("Requires >=2 ranks so parameters shard unevenly across the DP mesh.")
 
     device = distributed_setup.device
-    param_dtype, mp_policy = _CONFIGS[config]
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
     # Source: train one step so weights and optimizer state are non-trivial, then save.
-    model, optimizer = _build_sharded(
-        1234, mesh, device, param_dtype=param_dtype, mp_policy=mp_policy
-    )
+    model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=False)
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
-    snapshot = _snapshot(model, optimizer)
+    model_snapshot, optimizer_snapshot = _snapshot_local_state(model, optimizer)
 
-    with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{config}", sync=True) as checkpoint_dir:
+    with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{param_dtype}", sync=True) as checkpoint_dir:
         save_checkpoint(model, optimizer, checkpoint_dir)
 
-        # Destination: a differently-initialized model+optimizer, so a correct load is non-trivial.
-        model2, optimizer2 = _build_sharded(
-            4321, mesh, device, param_dtype=param_dtype, mp_policy=mp_policy
-        )
-        load_checkpoint(model2, optimizer2, checkpoint_dir)
+        # Destination: zero-initialized, so a correct load is non-trivial.
+        model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=True)
+        load_checkpoint(model, optimizer, checkpoint_dir)
 
-    local_nonempty = _assert_matches(snapshot, model2, optimizer2)
+    local_nonempty = _assert_model_matches_snapshot(model, model_snapshot)
+    _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot)
 
-    # At least one rank must have held real (non-empty) local shards for the check to be meaningful.
+    # At least one rank must have held non-empty local shards for the check to be meaningful.
     nonempty_flags = [None] * distributed_setup.world_size
     torch.distributed.all_gather_object(nonempty_flags, local_nonempty)
     assert any(nonempty_flags), "All ranks had empty local shards."
