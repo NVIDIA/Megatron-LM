@@ -14,89 +14,36 @@
 
 """PyTorch Distributed Checkpoint (DCP) save/load for the experimental Megatron-FSDP path.
 
-After :func:`fully_shard`, a module's parameters rest as ``DTensor`` views over the
-optimizer (``main_weight``) buffers, and the optimizer's ``exp_avg``/``exp_avg_sq`` states
-become ``DTensor`` s on the same device mesh. Those DTensors can be saved and loaded with
-PyTorch DCP directly, with one caveat: a ``FsdpParameterGroup`` packs several parameters into
-one flat buffer with least-common-multiple row padding, so a parameter's per-rank shard does
-not tile like torch's canonical ``Shard(0)``. DCP's default planner would therefore compute
-wrong global offsets. :func:`preprocess_state_dict_for_uneven_dtensor` fixes this by attaching
-true per-shard chunk metadata to every DTensor before the save and load, exactly as the stable
-Megatron-FSDP path does.
+After :func:`fully_shard`, a module's parameters rest as ``DTensor`` views over the optimizer
+(``main_weight``) buffers, and the optimizer's ``exp_avg``/``exp_avg_sq`` states are ``DTensor`` s on
+the same device mesh. The standard DCP state-dict helpers
+(:func:`torch.distributed.checkpoint.state_dict.get_model_state_dict` /
+:func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`) expose those as FQN-keyed
+DTensors and initialize the (empty) optimizer state on load, so we do not reimplement that here.
+
+The one Megatron-FSDP-specific step is :func:`preprocess_state_dict_for_uneven_dtensor`. A
+``FsdpParameterGroup`` packs several parameters into one flat buffer with least-common-multiple row
+padding, so a parameter's per-rank shard does not tile like torch's canonical ``Shard(0)`` (a rank
+may own several rows of one parameter and none of the next). The helper attaches each DTensor's true
+per-shard chunk offsets so DCP writes and reshards it correctly; without it the default planner
+assumes canonical ``Shard(0)`` offsets and silently corrupts the checkpoint.
 """
 
 import os
 
 import torch
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
 
 from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .module import FsdpModule
 
-__all__ = [
-    "save_checkpoint",
-    "load_checkpoint",
-    "materialize_optimizer_state",
-    "sync_model_weight_from_main_weight",
-]
-
-
-def _iter_fsdp_modules(model: torch.nn.Module):
-    """Yield every ``FsdpModule`` in ``model`` (including ``model`` itself)."""
-    for module in model.modules():
-        if isinstance(module, FsdpModule):
-            yield module
-
-
-def _strip_extra_state(model_state_dict: dict) -> dict:
-    """Drop TransformerEngine ``_extra_state`` entries.
-
-    ``_extra_state`` holds opaque per-module bytes (for example FP8 scale history) that FSDP
-    does not manage as DTensors. Following the stable Megatron-FSDP DCP path, these are not
-    checkpointed here.
-    """
-    return {
-        key: value for key, value in model_state_dict.items() if not key.endswith("_extra_state")
-    }
-
-
-def _build_state_dict(model: torch.nn.Module, optimizer: torch.optim.Optimizer | None) -> dict:
-    state_dict = {"model": _strip_extra_state(model.state_dict())}
-    if optimizer is not None:
-        state_dict["optimizer"] = optimizer.state_dict()
-    return state_dict
-
-
-def _annotate_uneven_dtensors(state_dict: dict) -> dict:
-    """Attach uneven-DTensor chunk metadata to the model and optimizer sub-dicts in place."""
-    preprocess_state_dict_for_uneven_dtensor(state_dict["model"])
-    if "optimizer" in state_dict:
-        preprocess_state_dict_for_uneven_dtensor(state_dict["optimizer"])
-    return state_dict
-
-
-def materialize_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
-    """Allocate optimizer state slots so an in-place DCP load has destinations to fill.
-
-    A freshly constructed optimizer has an empty ``optimizer.state``, so ``state_dict()["state"]``
-    is empty and :func:`torch.distributed.checkpoint.load` would find nothing to load into. Run a
-    single zero-gradient step to allocate the per-parameter state (for example Adam's ``exp_avg``,
-    ``exp_avg_sq``, and ``step``); the subsequent load overwrites those slots in place, so this
-    step's zero update and ``step == 1`` are discarded.
-
-    Args:
-        optimizer: Optimizer whose state should be materialized before loading.
-    """
-    for group in optimizer.param_groups:
-        for param in group["params"]:
-            if param.grad is None:
-                # A sharded parameter advertises the FSDP gradient dtype via ``grad_dtype``, which
-                # can differ from the (main-weight) parameter dtype under mixed precision. Match it
-                # so the temporary grad is consistent with the parameter's grad contract.
-                grad_dtype = getattr(param, "grad_dtype", param.dtype)
-                param.grad = torch.zeros_like(param, dtype=grad_dtype)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+__all__ = ["save_checkpoint", "load_checkpoint", "sync_model_weight_from_main_weight"]
 
 
 def sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
@@ -104,62 +51,88 @@ def sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
 
     A load writes into the ``main_weight``-backed sharded DTensors. When mixed precision keeps a
     separate lower-precision compute buffer, that buffer is stale until the next forward pre-hook
-    would resync it. Doing it here makes the post-load state deterministic (and correct if the
-    caller inspects compute weights before running a forward pass). It is a no-op when the compute
-    buffer aliases the main buffer.
+    would resync it; doing it here makes the post-load state deterministic. It is a no-op when the
+    compute buffer aliases the main buffer.
 
     Args:
         model: Root module (or any module tree) containing ``FsdpModule`` instances.
     """
-    for module in _iter_fsdp_modules(model):
-        for parameter_group in module.parameter_groups:
-            parameter_group.sync_model_weight_from_main_weight()
+    for module in model.modules():
+        if isinstance(module, FsdpModule):
+            for parameter_group in module.parameter_groups:
+                parameter_group.sync_model_weight_from_main_weight()
+
+
+def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    """Allocate optimizer state so a DCP load has DTensors to fill.
+
+    :func:`get_optimizer_state_dict` initializes empty optimizer state via torch's
+    ``_init_optim_state``, but that assigns a parameter-dtype gradient. A Megatron-FSDP sharded
+    parameter advertises the FSDP gradient dtype through ``grad_dtype``, which differs from the
+    (main-weight) parameter dtype under mixed precision, and rejects a mismatched gradient. So
+    initialize the state here with a ``grad_dtype``-matched zero gradient; the subsequent load
+    overwrites it. This is a no-op once the state exists (for example after a training step).
+    """
+    if optimizer.state:
+        return
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is None:
+                grad_dtype = getattr(param, "grad_dtype", None) or param.dtype
+                param.grad = torch.zeros_like(param, dtype=grad_dtype)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
 
 
 def save_checkpoint(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer | None,
-    checkpoint_dir: str | os.PathLike,
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer, checkpoint_dir: str | os.PathLike
 ) -> None:
-    """Save a ``fully_shard``-wrapped model (and optionally its optimizer) as a DCP checkpoint.
+    """Save a ``fully_shard``-wrapped model and its optimizer as a DCP checkpoint.
 
     Args:
         model: A module tree that has been sharded with :func:`fully_shard`.
-        optimizer: Optimizer stepping the sharded parameters, or ``None`` to save only weights.
+        optimizer: Optimizer stepping the sharded parameters.
         checkpoint_dir: Destination directory for the DCP checkpoint.
     """
-    state_dict = _annotate_uneven_dtensors(_build_state_dict(model, optimizer))
-    dcp.save(state_dict, checkpoint_id=checkpoint_dir)
+    model_state_dict = get_model_state_dict(model)
+    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
+    preprocess_state_dict_for_uneven_dtensor(model_state_dict)
+    preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+    dcp.save(
+        {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
+    )
 
 
 def load_checkpoint(
     model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer | None,
+    optimizer: torch.optim.Optimizer,
     checkpoint_dir: str | os.PathLike,
     *,
-    resync_model_weights: bool = True,
+    sync_model_weights: bool = True,
 ) -> None:
-    """Load a DCP checkpoint into a ``fully_shard``-wrapped model (and optionally its optimizer).
+    """Load a DCP checkpoint into a ``fully_shard``-wrapped model and its optimizer.
 
-    The model and optimizer must already be sharded with the same layout used at save time (the
-    same module structure and mesh); DCP reshards the on-disk data to this rank's shards. Tensors
-    are loaded in place into the resting sharded DTensors.
+    The model and optimizer must already be sharded with the same layout used at save time (the same
+    module structure and mesh); DCP reshards the on-disk data to this rank's shards.
+    :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes the (empty)
+    optimizer state so DCP has DTensors to load into in place, and the ``set_*`` helpers reinstall the
+    loaded state.
 
     Args:
         model: A module tree sharded with :func:`fully_shard`, whose weights receive the load.
-        optimizer: Optimizer whose state receives the load, or ``None`` to load only weights.
+        optimizer: Optimizer whose state receives the load.
         checkpoint_dir: Source directory of the DCP checkpoint.
-        resync_model_weights: Refresh compute weights from the loaded main weights afterwards.
+        sync_model_weights: Refresh compute weights from the loaded main weights afterwards.
     """
-    if optimizer is not None:
-        materialize_optimizer_state(optimizer)
-    state_dict = _annotate_uneven_dtensors(_build_state_dict(model, optimizer))
-    dcp.load(state_dict, checkpoint_id=checkpoint_dir)
-    # DCP wrote into the resting DTensors in place. Re-install the loaded model tensors (a no-op
-    # for the shared storage, but it also restores any stripped-key structure) and the optimizer
-    # state, mirroring the stable Megatron-FSDP load path.
-    model.load_state_dict(state_dict["model"], strict=False)
-    if optimizer is not None:
-        optimizer.load_state_dict(state_dict["optimizer"])
-    if resync_model_weights:
+    _init_optimizer_state(optimizer)
+    model_state_dict = get_model_state_dict(model)
+    optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
+    preprocess_state_dict_for_uneven_dtensor(model_state_dict)
+    preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+    dcp.load(
+        {"model": model_state_dict, "optimizer": optimizer_state_dict}, checkpoint_id=checkpoint_dir
+    )
+    set_model_state_dict(model, model_state_dict)
+    set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
+    if sync_model_weights:
         sync_model_weight_from_main_weight(model)
