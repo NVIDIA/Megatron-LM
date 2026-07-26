@@ -37,10 +37,19 @@ def fully_shard(
     This attaches the FSDP mixin to the original module instance, so parent
     modules do not need to replace existing child-module references.
 
+    Tensor-parallel placement is inferred from each parameter's own MCore /
+    Transformer Engine attributes (``tensor_model_parallel`` / ``partition_dim``),
+    so any mesh axis not named in ``placements.dp_axes`` is treated as the
+    tensor-parallel axis and no separate TP layout argument is required.
+
     Args:
         module: Module whose currently unowned parameters are managed by FSDP.
-        mesh: Device mesh used for sharding.
-        placements: Parameter, gradient, and optimizer placements.
+        mesh: Full device mesh used for sharding. Its axis order is the source of
+            truth for the emitted DTensor placement tuple order. Data-parallel
+            axes are named by ``placements.dp_axes``; any remaining axis is the
+            tensor-parallel axis.
+        placements: Parameter, gradient, and optimizer placements for the
+            data-parallel axes.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
         use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from

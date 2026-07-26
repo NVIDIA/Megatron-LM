@@ -24,7 +24,7 @@ from torch.distributed import DeviceMesh
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import MeshAxis, Placements
+from .placement import Placements
 
 
 class FsdpContext:
@@ -99,15 +99,29 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symm_mem: bool = False,
     ) -> None:
-        """Initialize FSDP runtime state on an already-constructed module."""
+        """Initialize FSDP runtime state on an already-constructed module.
+
+        Tensor-parallel placement is inferred from each parameter's own MCore /
+        Transformer Engine attributes, so any mesh axis not named in
+        ``placements.dp_axes`` is treated as the tensor-parallel axis.
+
+        Args:
+            mesh: Full user-provided device mesh. Its axis order is the source of
+                truth for the emitted DTensor placement tuple order.
+            placements: Per-DP-axis parameter, gradient, and optimizer placements,
+                ordered to match ``placements.dp_axes``.
+            mixed_precision_policy: Precision policy for main weights and gradients.
+            use_symm_mem: Allocate communication staging buffers from PyTorch's
+                NCCL symmetric-memory pool.
+        """
         self._context = None
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
-        axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-        assert axis_indices == tuple(
-            range(mesh.ndim)
-        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
+
+        # Each group owns the full user-provided mesh and placements so it can
+        # build optimizer-facing full-mesh DTensors; it derives the DP submesh
+        # handed to its DBuffers internally.
         parameter_groups = [
             FsdpParameterGroup(
                 owning_module=self,
@@ -356,21 +370,6 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, order)
-
-
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        axis_index = axis
-        if axis_index < 0:
-            axis_index += mesh.ndim
-        if axis_index < 0 or axis_index >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis_index
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
 
 
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:

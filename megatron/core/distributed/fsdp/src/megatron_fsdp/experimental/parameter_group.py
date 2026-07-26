@@ -21,9 +21,16 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import Placement as DTensorPlacement
+from torch.distributed.tensor import Replicate as DTensorReplicate
+from torch.distributed.tensor import Shard as DTensorShard
 
 from ..mixed_precision import MixedPrecisionPolicy
+from ..utils import get_mcore_tensor_parallel_partition_dim
 from .dbuffer import DBuffer
+from .layout import contiguous_stride
+from .mesh_utils import build_dp_mesh
 from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -41,6 +48,9 @@ class FsdpParameterGroup:
     parameter_names: tuple[str, ...]
     sharded_parameters: tuple[nn.Parameter, ...]
     unsharded_parameters: tuple[nn.Parameter, ...]
+    # Full user-provided mesh. The DP submesh handed to the DBuffers lives on the
+    # DBuffers themselves (``main_weight.mesh`` etc.); ``get_dtensor`` lifts a
+    # DP-only DTensor back onto this full mesh.
     mesh: DeviceMesh
     dtype: torch.dtype
     requires_grad: bool
@@ -61,11 +71,24 @@ class FsdpParameterGroup:
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
+        The group owns the full user-provided ``mesh`` and ``placements`` because
+        it builds the optimizer-facing full-mesh DTensors. It derives the DP
+        submesh handed to its DBuffers, so ``placements`` is expressed on the
+        full mesh via ``placements.dp_axes``.
+
+        Tensor-parallel placement is inferred from each parameter's own MCore /
+        Transformer Engine attributes (``tensor_model_parallel``,
+        ``partition_dim``, ``partition_stride``), so callers do not pass TP
+        layouts separately. Parameters without those attributes are replicated
+        over the tensor-parallel axis.
+
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
             parameters: Root-module-relative FQNs and their parameters.
-            mesh: Device mesh used for all DBuffer storage in this version.
-            placements: Parameter, gradient, and optimizer placements.
+            mesh: Full user-provided device mesh. Its axis order is the source of
+                truth for the emitted DTensor placement tuple order.
+            placements: Per-DP-axis parameter, gradient, and optimizer placements,
+                ordered to match ``placements.dp_axes``.
             mixed_precision_policy: Precision policy for main weights and gradients.
             use_symm_mem: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
@@ -73,15 +96,25 @@ class FsdpParameterGroup:
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
 
+        # This group owns the full mesh; the DBuffers below own the DP submesh.
+        # The DP placement lists are already aligned with the DP submesh, whose
+        # axes follow dp_axes order.
+        self.owning_module = owning_module
+        self.mesh = mesh
+        dp_mesh = build_dp_mesh(mesh, placements.dp_axes)
         model_weight_placements = tuple(placements.parameter)
         main_grad_placements = tuple(placements.gradient)
         main_weight_placements = tuple(placements.optimizer)
 
         # Python dicts preserve insertion order, so parameter_names and
         # parameters.values() define the same stable DBuffer tensor order.
-        self.owning_module = owning_module
-        self.mesh = mesh
         self.parameter_names = tuple(parameters)
+        # Infer TP placements up front so unsupported layouts fail before any
+        # buffer is allocated. These are only needed to build the sharded
+        # parameters below, so keep them local instead of a persistent field.
+        parameter_tp_placements = [
+            self._tp_placement(name, parameter) for name, parameter in parameters.items()
+        ]
         first_parameter = next(iter(parameters.values()))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -101,7 +134,7 @@ class FsdpParameterGroup:
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
-            mesh=self.mesh,
+            mesh=dp_mesh,
             placements=main_weight_placements,
         )
 
@@ -114,8 +147,8 @@ class FsdpParameterGroup:
 
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
+                mesh=dp_mesh,
+                placements=[Replicate()] * dp_mesh.ndim,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
@@ -124,7 +157,7 @@ class FsdpParameterGroup:
             self.model_weight = self.main_weight
         else:
             self.model_weight = DBuffer(
-                mesh=self.mesh,
+                mesh=dp_mesh,
                 placements=model_weight_placements,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
@@ -140,7 +173,7 @@ class FsdpParameterGroup:
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
             self.main_grad = DBuffer(
-                mesh=self.mesh,
+                mesh=dp_mesh,
                 placements=main_grad_placements,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=grad_dtype,
@@ -163,7 +196,8 @@ class FsdpParameterGroup:
             unsharded_parameters.append(parameter)
 
             sharded_parameter = nn.Parameter(
-                self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
+                self.get_dtensor(self.main_weight, index, parameter_tp_placements[index]),
+                requires_grad=parameter.requires_grad,
             )
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
@@ -177,6 +211,88 @@ class FsdpParameterGroup:
         self.sync_model_weight_from_main_weight()
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
+
+    def _tp_placement(self, name: str, parameter: nn.Parameter) -> DTensorPlacement:
+        """Infer a parameter's tensor-parallel placement from its MCore/TE attrs.
+
+        Classic MCore and TE parameters carry ``tensor_model_parallel`` /
+        ``partition_dim`` (``partition_dim`` 0 is column-parallel ``Shard(0)``, 1
+        is row-parallel ``Shard(1)``); parameters without those attributes are
+        replicated. This is the semantic TP layout only -- ``get_dtensor`` maps it
+        onto the actual tensor-parallel mesh axis.
+        """
+        partition_dim = get_mcore_tensor_parallel_partition_dim(parameter)
+        if partition_dim is None:
+            return DTensorReplicate()
+
+        partition_stride = int(getattr(parameter, "partition_stride", 1))
+        if partition_stride != 1:
+            # Strided tensor-parallel sharding (for example fused QKV) cannot be
+            # expressed as a canonical Shard without losing ordering information.
+            # Reject it rather than silently mislabel it; strided TP is a
+            # deliberately deferred follow-up.
+            raise NotImplementedError(
+                f"Strided tensor-parallel sharding is not supported yet: {name!r} has "
+                f"partition_stride={partition_stride}."
+            )
+        return DTensorShard(partition_dim)
+
+    def get_dtensor(self, buffer: DBuffer, index: int, tp_placement: DTensorPlacement) -> DTensor:
+        """Lift a DBuffer's DP-only DTensor onto this group's full mesh.
+
+        ``buffer.get_dtensor`` returns a DTensor on the DP submesh; this re-wraps
+        it on ``self.mesh``, splicing ``tp_placement`` onto the single non-DP
+        (tensor-parallel) axis and scaling the sharded dimension to the global
+        shape. A pure-data-parallel group has no TP axis, so the DP DTensor
+        already spans the full mesh and is returned unchanged.
+
+        This method is the only place that maps DP mesh axes to full-mesh axes; it
+        recovers the correspondence from the two meshes' dim names.
+        """
+        dp_dtensor = buffer.get_dtensor(index)
+        full_mesh = self.mesh
+        dp_mesh = dp_dtensor.device_mesh
+        if dp_mesh.ndim == full_mesh.ndim:
+            # DP spans the whole mesh; there is no tensor-parallel axis to add.
+            return dp_dtensor
+
+        full_dim_names = full_mesh.mesh_dim_names
+        dp_dim_names = dp_mesh.mesh_dim_names
+        full_placements: list[DTensorPlacement | None] = [None] * full_mesh.ndim
+        dp_full_axes: set[int] = set()
+        for dp_axis, dp_dim_name in enumerate(dp_dim_names):
+            full_axis = full_dim_names.index(dp_dim_name)
+            full_placements[full_axis] = dp_dtensor.placements[dp_axis]
+            dp_full_axes.add(full_axis)
+
+        tp_axes = [axis for axis in range(full_mesh.ndim) if axis not in dp_full_axes]
+        if len(tp_axes) != 1:
+            raise NotImplementedError(
+                f"Only a single tensor-parallel axis is supported, got {len(tp_axes)}."
+            )
+        (tp_axis,) = tp_axes
+        full_placements[tp_axis] = tp_placement
+
+        # dp_dtensor.shape is the TP-local global shape (DP sharding does not change
+        # it). Scale the tensor-parallel sharded dimension up to the global shape.
+        global_shape = list(dp_dtensor.shape)
+        if isinstance(tp_placement, DTensorShard):
+            if tp_placement.dim < 0 or tp_placement.dim >= len(global_shape):
+                raise ValueError(
+                    f"Tensor-parallel Shard dim {tp_placement.dim} is out of bounds for "
+                    f"shape {tuple(dp_dtensor.shape)}."
+                )
+            global_shape[tp_placement.dim] *= full_mesh.size(tp_axis)
+        global_shape = torch.Size(global_shape)
+
+        return DTensor.from_local(
+            dp_dtensor.to_local(),
+            device_mesh=full_mesh,
+            placements=tuple(full_placements),
+            run_check=False,
+            shape=global_shape,
+            stride=contiguous_stride(global_shape),
+        )
 
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
@@ -254,7 +370,13 @@ class FsdpParameterGroup:
         """Point each sharded parameter's grad at main_grad's current DTensor view."""
         assert self.main_grad is not None
         for index, sharded_parameter in enumerate(self.sharded_parameters):
-            sharded_parameter.grad = self.main_grad.get_dtensor(index)
+            # The gradient shares the parameter's TP placement (its DP placement
+            # follows main_grad, which get_dtensor reads off the buffer). Re-infer
+            # the TP placement from the parameter's attrs rather than storing it.
+            tp_placement = self._tp_placement(
+                self.parameter_names[index], self.unsharded_parameters[index]
+            )
+            sharded_parameter.grad = self.get_dtensor(self.main_grad, index, tp_placement)
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
@@ -268,10 +390,11 @@ class FsdpParameterGroup:
             if parameter.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
             grads.append(parameter.grad)
+        dp_mesh = self.main_grad.mesh
         with self._symmetric_memory_context():
             return DBuffer(
-                mesh=self.mesh,
-                placements=[Partial(partial_op)] * self.mesh.ndim,
+                mesh=dp_mesh,
+                placements=[Partial(partial_op)] * dp_mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -331,7 +454,9 @@ class FsdpParameterGroup:
         if reduce_axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
         partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        grad_divisor = (
+            self.main_grad.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        )
         if self._symm_mem_pool is not None:
             partial_grad.rendezvous(reduce_axis)
         if can_reduce_into_main_grad:

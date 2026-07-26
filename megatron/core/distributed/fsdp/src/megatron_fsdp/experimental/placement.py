@@ -33,6 +33,7 @@ import dataclasses
 from collections.abc import Iterable
 
 import torch.distributed as dist
+import torch.distributed.tensor as dist_tensor
 
 
 class Placement:
@@ -57,6 +58,28 @@ class Partial(Placement):
 @dataclasses.dataclass(frozen=True)
 class Flat(Placement):
     """Flat dim-0 sharded local buffer placement."""
+
+
+def to_dtensor_placement(placement: Placement) -> dist_tensor.Placement:
+    """Convert a DBuffer placement to its equivalent DTensor placement.
+
+    ``Flat`` shards dim 0 in the flattened local buffer, so it maps to
+    ``Shard(0)``. ``Replicate`` and ``Partial`` mirror the DTensor placements
+    of the same name.
+    """
+    if isinstance(placement, Replicate):
+        return dist_tensor.Replicate()
+    if isinstance(placement, Flat):
+        return dist_tensor.Shard(0)
+    if isinstance(placement, Partial):
+        # main_grad backs .grad while it rests DP-outer-Partial between
+        # microbatches, so a Partial placement must round-trip to a DTensor.
+        if placement.reduce_op == dist.ReduceOp.AVG:
+            return dist_tensor.Partial("avg")
+        if placement.reduce_op == dist.ReduceOp.SUM:
+            return dist_tensor.Partial("sum")
+        raise ValueError(f"Unsupported Partial reduce op for DTensor: {placement.reduce_op!r}.")
+    raise TypeError(f"Unsupported placement for DTensor conversion: {placement!r}.")
 
 
 def changed_mesh_axis(
