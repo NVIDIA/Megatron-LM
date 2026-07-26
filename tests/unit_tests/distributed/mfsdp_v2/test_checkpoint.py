@@ -2,10 +2,12 @@
 
 """DCP save/load roundtrip tests for the experimental Megatron-FSDP path."""
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -35,7 +37,9 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def _build_sharded(mesh, device, *, param_dtype, zero_init):
+def _build_sharded(
+    mesh: DeviceMesh, device: torch.device, *, param_dtype: torch.dtype, zero_init: bool
+) -> tuple[nn.Module, torch.optim.Optimizer]:
     model = _TinyModel().to(device=device, dtype=param_dtype)
     if zero_init:
         # Zero the destination weights so they are obviously different from the saved (trained)
@@ -51,7 +55,13 @@ def _build_sharded(mesh, device, *, param_dtype, zero_init):
     return model, optimizer
 
 
-def _train_one_step(model, optimizer, device, *, param_dtype):
+def _train_one_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    *,
+    param_dtype: torch.dtype,
+) -> None:
     x = torch.randn(4, 8, device=device, dtype=param_dtype)
     target = torch.randn(4, 4, device=device, dtype=param_dtype)
     optimizer.zero_grad()
@@ -59,14 +69,16 @@ def _train_one_step(model, optimizer, device, *, param_dtype):
     optimizer.step()
 
 
-def _to_local(value):
+def _to_local(value: torch.Tensor) -> torch.Tensor:
     return value.to_local() if isinstance(value, DTensor) else value
 
 
-def _snapshot_local_state(model, optimizer):
+def _snapshot_local_state(
+    model: nn.Module, optimizer: torch.optim.Optimizer
+) -> tuple[dict[str, torch.Tensor], dict[int, dict]]:
     """Clone this rank's local model weights and optimizer state, keyed as their state dicts are."""
     model_snapshot = {key: _to_local(value).clone() for key, value in model.state_dict().items()}
-    optimizer_snapshot = {}
+    optimizer_snapshot: dict[int, dict] = {}
     for index, state in optimizer.state_dict()["state"].items():
         optimizer_snapshot[index] = {
             key: (_to_local(value).clone() if torch.is_tensor(value) else value)
@@ -75,7 +87,9 @@ def _snapshot_local_state(model, optimizer):
     return model_snapshot, optimizer_snapshot
 
 
-def _assert_model_matches_snapshot(model, model_snapshot) -> bool:
+def _assert_model_matches_snapshot(
+    model: nn.Module, model_snapshot: dict[str, torch.Tensor]
+) -> bool:
     """Assert the model's local weights equal the snapshot.
 
     Returns:
@@ -99,7 +113,9 @@ def _assert_model_matches_snapshot(model, model_snapshot) -> bool:
     return local_nonempty
 
 
-def _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot) -> None:
+def _assert_optimizer_matches_snapshot(
+    optimizer: torch.optim.Optimizer, optimizer_snapshot: dict[int, dict]
+) -> None:
     """Assert the optimizer's local state equals the snapshot."""
     current = optimizer.state_dict()["state"]
     assert optimizer_snapshot.keys() == current.keys()
@@ -115,7 +131,9 @@ def _assert_optimizer_matches_snapshot(optimizer, optimizer_snapshot) -> None:
 
 
 @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_checkpoint_roundtrip_flat_dp(distributed_setup, tmp_path_dist_ckpt, param_dtype):
+def test_checkpoint_roundtrip_flat_dp(
+    distributed_setup, tmp_path_dist_ckpt: Path, param_dtype: torch.dtype
+) -> None:
     """Saving then loading a flat-DP sharded model+optimizer restores state bit-exactly.
 
     The fc1 group packs ``weight (16, 8)`` and ``bias (16,)`` into one flat buffer, so per-rank
