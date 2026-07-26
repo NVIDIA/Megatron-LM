@@ -17,6 +17,7 @@ Run under torchrun with four ranks, for example::
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -26,7 +27,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
 )
-from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    set_tensor_model_parallel_attributes,
+)
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class TpModule(nn.Module):
@@ -198,3 +205,146 @@ def test_optimizer_state_lives_on_full_mesh(distributed_setup):
         after = parameter.to_local()
         assert not torch.equal(after, before_tensor)
         torch.testing.assert_close(after, reference_parameter.detach())
+
+
+class TpMlp(nn.Module):
+    """A column-parallel -> GELU -> row-parallel MLP of real MCore TP layers.
+
+    The tensor-parallel layers carry out their own TP collectives (column has no
+    forward all-reduce; row all-reduces its output), so this computes the same
+    function as the unsharded ``RefMlp`` below, which is what makes a loss-curve
+    comparison meaningful.
+    """
+
+    def __init__(self, config: TransformerConfig, tp_group, hidden: int, ffn: int) -> None:
+        super().__init__()
+        self.fc1 = ColumnParallelLinear(
+            input_size=hidden,
+            output_size=ffn,
+            config=config,
+            init_method=config.init_method,
+            bias=True,
+            gather_output=False,
+            skip_bias_add=False,
+            tp_group=tp_group,
+        )
+        self.fc2 = RowParallelLinear(
+            input_size=ffn,
+            output_size=hidden,
+            config=config,
+            init_method=config.init_method,
+            bias=True,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            tp_group=tp_group,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the tensor-parallel MLP; the linears return ``(output, bias)``."""
+        hidden, _ = self.fc1(x)
+        hidden = torch.nn.functional.gelu(hidden)
+        output, _ = self.fc2(hidden)
+        return output
+
+
+class RefMlp(nn.Module):
+    """A plain, un-tensor-parallel MLP matching ``TpMlp``'s full weights."""
+
+    def __init__(self, hidden: int, ffn: int) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(hidden, ffn)
+        self.fc2 = nn.Linear(ffn, hidden)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the reference MLP."""
+        return self.fc2(torch.nn.functional.gelu(self.fc1(x)))
+
+
+def _all_gather_cat(local: torch.Tensor, group, dim: int) -> torch.Tensor:
+    """All-gather a tensor-parallel shard across ``group`` and concatenate on ``dim``."""
+    shards = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(shards, local.contiguous(), group=group)
+    return torch.cat(shards, dim=dim)
+
+
+def test_fsdp_tp_loss_curve_matches_unsharded(distributed_setup):
+    """FSDP+TP training should track an unsharded single-replica reference loss curve."""
+    if distributed_setup.world_size != 4:
+        pytest.skip("This test requires exactly 4 ranks for a DP=2, TP=2 mesh.")
+    device = distributed_setup.device
+    if device.type != "cuda":
+        pytest.skip("MCore tensor-parallel layers require CUDA ranks.")
+
+    tp_size, dp_size = 2, 2
+    hidden, ffn, batch, steps = 8, 16, 4, 5
+
+    # init_device_mesh lays ranks out row-major (tp innermost), so the tp axis is a
+    # contiguous 2-rank group -- exactly the tensor-parallel group the TP layers use.
+    # Pass those groups explicitly (via ProcessGroupCollection) instead of mutating
+    # global parallel_state, so this test never depends on MPU init.
+    mesh = init_device_mesh(device.type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = mesh.get_group("tp")
+    pg_collection.dp = mesh.get_group("dp")
+
+    # CPU initialization derives the shard rank/size from tp_group and needs no
+    # model-parallel RNG tracker. With the same seed on every rank, each rank builds
+    # the identical full master weight and keeps its own slice, so all-gathering the
+    # slices reconstructs the full weight for the reference.
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=hidden,
+        num_attention_heads=1,
+        tensor_model_parallel_size=tp_size,
+        # FSDP tracks gradients through .grad, not a fused weight.main_grad.
+        gradient_accumulation_fusion=False,
+        sequence_parallel=False,
+        use_cpu_initialization=True,
+    )
+
+    torch.manual_seed(1234)
+    model = TpMlp(config, pg_collection.tp, hidden, ffn).to(device)
+
+    # Rebuild the full (un-TP-sharded) weights before FSDP shards across DP, and
+    # load them into the reference so both models start bit-identical.
+    reference = RefMlp(hidden, ffn).to(device)
+    with torch.no_grad():
+        reference.fc1.weight.copy_(_all_gather_cat(model.fc1.weight, pg_collection.tp, dim=0))
+        reference.fc1.bias.copy_(_all_gather_cat(model.fc1.bias, pg_collection.tp, dim=0))
+        reference.fc2.weight.copy_(_all_gather_cat(model.fc2.weight, pg_collection.tp, dim=1))
+        # Row-parallel bias is added after the output all-reduce, so it is replicated.
+        reference.fc2.bias.copy_(model.fc2.bias)
+
+    fully_shard(model.fc1, mesh=mesh, placements=_dp_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_dp_placements())
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+
+    # Every rank sees the same input: TP ranks must (TP replicates the input), and
+    # giving every DP rank the same data makes the DP-averaged gradient equal the
+    # single-replica gradient, so each step's loss matches the reference.
+    torch.manual_seed(2024)
+    x = torch.randn(steps, batch, hidden, device=device)
+    target = torch.randn(steps, batch, hidden, device=device)
+
+    def train(module, module_optimizer):
+        losses = []
+        for step in range(steps):
+            module_optimizer.zero_grad(set_to_none=True)
+            loss = torch.nn.functional.mse_loss(module(x[step]), target[step])
+            loss.backward()
+            module_optimizer.step()
+            losses.append(loss.detach())
+        return losses
+
+    reference_losses = train(reference, reference_optimizer)
+    fsdp_losses = train(model, optimizer)
+
+    torch.testing.assert_close(
+        torch.stack(fsdp_losses),
+        torch.stack(reference_losses),
+        rtol=1e-3,
+        atol=1e-4,
+        msg="FSDP+TP loss curve did not match the unsharded reference.",
+    )
