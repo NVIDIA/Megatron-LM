@@ -17,6 +17,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     save_checkpoint,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 
 
 class _TinyModel(nn.Module):
@@ -118,7 +119,7 @@ _CONFIGS = {
 
 
 @pytest.mark.parametrize("config", list(_CONFIGS), ids=list(_CONFIGS))
-def test_dcp_roundtrip_flat_dp(distributed_setup, shared_checkpoint_dir, config):
+def test_dcp_roundtrip_flat_dp(distributed_setup, tmp_path_dist_ckpt, config):
     """Saving then loading a flat-DP sharded model+optimizer restores state bit-exactly.
 
     The fc1 group packs ``weight (16, 8)`` and ``bias (16,)`` into one flat buffer, so per-rank
@@ -138,13 +139,15 @@ def test_dcp_roundtrip_flat_dp(distributed_setup, shared_checkpoint_dir, config)
     )
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
     snapshot = _snapshot(model, optimizer)
-    save_checkpoint(model, optimizer, shared_checkpoint_dir)
 
-    # Destination: a differently-initialized model+optimizer, so a correct load is non-trivial.
-    model2, optimizer2 = _build_sharded(
-        4321, mesh, device, param_dtype=param_dtype, mp_policy=mp_policy
-    )
-    load_checkpoint(model2, optimizer2, shared_checkpoint_dir)
+    with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{config}", sync=True) as checkpoint_dir:
+        save_checkpoint(model, optimizer, checkpoint_dir)
+
+        # Destination: a differently-initialized model+optimizer, so a correct load is non-trivial.
+        model2, optimizer2 = _build_sharded(
+            4321, mesh, device, param_dtype=param_dtype, mp_policy=mp_policy
+        )
+        load_checkpoint(model2, optimizer2, checkpoint_dir)
 
     local_nonempty = _assert_matches(snapshot, model2, optimizer2)
 
