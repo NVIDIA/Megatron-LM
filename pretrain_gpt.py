@@ -195,8 +195,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch, cu_seqlens, cu_seqlens_padded, max_seqlen
         )
 
-    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+    # Pad the already-packed THD tensors at the end when requested. A configured
+    # thd_max_packed_sequences also pads cu_seqlens to a fixed capacity in eager or graph mode.
     padding_mask = None
     if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
         tokens = batch.get('tokens', None)
