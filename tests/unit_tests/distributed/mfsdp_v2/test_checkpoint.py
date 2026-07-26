@@ -78,11 +78,15 @@ def _snapshot_local_state(model, optimizer):
 def _assert_model_matches_snapshot(model, model_snapshot) -> bool:
     """Assert the model's local weights equal the snapshot.
 
-    Returns whether this rank held any non-empty local shard, so the caller can assert that at
-    least one rank exercised a real comparison.
+    Returns:
+        bool: whether this rank held at least one non-empty local shard. The caller all-gathers
+        this flag across ranks and asserts that some rank made a real (non-empty) comparison, so
+        the test cannot pass vacuously when a rank happens to own only empty shards.
     """
     current = model.state_dict()
     assert model_snapshot.keys() == current.keys()
+    # Tracks whether this rank owned any real (non-empty) shard data; returned for the caller's
+    # cross-rank "at least one rank compared something" check.
     local_nonempty = False
     for key, expected in model_snapshot.items():
         assert isinstance(current[key], DTensor), f"{key} should rest as a DTensor"
