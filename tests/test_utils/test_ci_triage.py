@@ -409,9 +409,7 @@ def test_slack_followup_uses_upstream_detailed_and_execution_summaries():
 
 
 @pytest.mark.parametrize("pipeline_context", ["mr", "nightly", "weekly", "release"])
-def test_notification_delegates_to_triage_package(
-    monkeypatch, notify_module, pipeline_context
-):
+def test_notification_delegates_to_triage_package(monkeypatch, notify_module, pipeline_context):
     notify = notify_module
     project = Mock()
     pipeline_jobs = [("functional:run_dev_dgx_h100", 101, [{"status": "failed"}])]
