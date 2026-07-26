@@ -302,6 +302,11 @@ class _ParamAndGradBucketGroup:
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
+                if bucket.param_data is None:
+                    # LayerWise variable-size gather path: params are already updated via
+                    # unflatten + copy_ in finish_param_sync, and there is no param_data
+                    # buffer to copy back from.
+                    continue
                 has_non_quantized_weight = False
                 for param in bucket.params:
                     # Non-quantized weights are already mapped to param.data. Skip
@@ -446,9 +451,21 @@ class _ParamAndGradBucketGroup:
                 # Detach from autograd since start_param_sync may be called
                 # during the forward pass where autograd is active.
                 if local_size > 0:
-                    flat_local_params = _flatten_dense_tensors(
-                        bucket.layerwise_params_list[local_rank]
-                    ).detach()
+                    # MXFP8 params can't be flattened (view(-1) unsupported); gather the
+                    # fp32 master (param.main_param -> bf16), which the receive-side copy_
+                    # re-quantizes. Non-mxfp8 params flatten as-is.
+                    src_params = []
+                    for p in bucket.layerwise_params_list[local_rank]:
+                        if is_mxfp8tensor(p):
+                            main_param = getattr(p, "main_param", None)
+                            assert main_param is not None, (
+                                "LayerWise mxfp8 param sync needs param.main_param (fp32 "
+                                "master) to stage the all-gather source; got None."
+                            )
+                            src_params.append(main_param.to(param_dtype))
+                        else:
+                            src_params.append(p)
+                    flat_local_params = _flatten_dense_tensors(src_params).detach()
                     local_slot_view.copy_(flat_local_params)
                 bucket.layerwise_gather_list = gather_list
 
@@ -738,7 +755,12 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
+            # fp32-accum RS needs the distributed optimizer; else fall through (all-reduce -> cm).
+            if (
+                self.ddp_config.reduce_scatter_with_fp32_accumulation
+                and self.ddp_config.use_distributed_optimizer
+                and not force_all_reduce
+            ):
                 assert (
                     len(self.buckets) == 1
                 ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
@@ -865,8 +887,9 @@ def group_params_for_buffers(
     Each distinct buffer is identified by a BufferKey with three dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
-    - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
-      which requires a separate buffer with a different data-parallel group.
+    - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
+      which requires a separate buffer for the expert data-parallel group.  This is true for experts
+      when expert-parallelism > 1 or expert-tensor-parallelism != tensor-parallelism.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
