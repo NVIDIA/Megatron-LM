@@ -200,10 +200,7 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
             if param.grad is None:
                 continue
             torch.testing.assert_close(
-                param.grad,
-                torch.full_like(param.grad, expected_clip_coefficient),
-                rtol=1.0e-5,
-                atol=1.0e-6,
+                param.grad, torch.full_like(param.grad, expected_clip_coefficient), rtol=1.0e-5, atol=1.0e-6
             )
             grads_checked += 1
         assert grads_checked > 0
