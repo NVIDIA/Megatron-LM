@@ -142,8 +142,7 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
             tensor_parallel_size=1, expert_parallel_size=1, expert_tensor_parallel_size=1, bf16=True
         )
         expected_numel = sum(param.numel() for param in reference_model.parameters())
-        expected_num_zeros = sum(1 for _ in reference_model.parameters())
-        expected_norm = math.sqrt(expected_numel - expected_num_zeros)
+        expected_norm = math.sqrt(expected_numel)
         del reference_model
 
         Utils.initialize_model_parallel(
@@ -177,13 +176,19 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
 
         for param in model.parameters():
             assert hasattr(param, "main_grad")
+            param.main_grad.zero_()
+
+        found_inf = optimizer.prepare_grads()
+        assert not found_inf
+        assert optimizer.count_zeros() == expected_numel
+
+        for param in model.parameters():
             param.main_grad.fill_(1.0)
-            param.main_grad.view(-1)[0] = 0.0
 
         update_successful, actual_norm, actual_num_zeros = optimizer.step()
 
         assert update_successful
-        assert actual_num_zeros == expected_num_zeros
+        assert actual_num_zeros == 0
         actual_norm_value = (
             actual_norm.item() if isinstance(actual_norm, torch.Tensor) else actual_norm
         )
@@ -194,11 +199,9 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
         for param in optimizer.get_parameters():
             if param.grad is None:
                 continue
-            expected_grad = torch.full_like(param.grad, expected_clip_coefficient)
-            expected_grad.view(-1)[0] = 0.0
             torch.testing.assert_close(
                 param.grad,
-                expected_grad,
+                torch.full_like(param.grad, expected_clip_coefficient),
                 rtol=1.0e-5,
                 atol=1.0e-6,
             )
