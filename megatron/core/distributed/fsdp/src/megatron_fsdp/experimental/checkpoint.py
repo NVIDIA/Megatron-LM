@@ -43,7 +43,7 @@ from torch.distributed.checkpoint.state_dict import (
 from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .module import FsdpModule
 
-__all__ = ["save_checkpoint", "load_checkpoint"]
+__all__ = ["save_checkpoint", "load_checkpoint", "init_optimizer_state"]
 
 
 def _sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
@@ -63,7 +63,7 @@ def _sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
                 parameter_group.sync_model_weight_from_main_weight()
 
 
-def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+def init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     """Allocate optimizer state so a DCP load has DTensors to fill.
 
     :func:`get_optimizer_state_dict` initializes empty optimizer state via torch's
@@ -76,6 +76,9 @@ def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     TODO: this function becomes unnecessary once torch's ``_init_optim_state`` honors a parameter's
     ``grad_dtype`` when it allocates the placeholder gradient (``torch.zeros_like(param)`` in
     ``torch/distributed/checkpoint/state_dict.py``); an upstream issue is being filed.
+
+    Args:
+        optimizer: Optimizer whose (possibly empty) state should be materialized.
     """
     if optimizer.state:
         return
@@ -128,7 +131,7 @@ def load_checkpoint(
         checkpoint_dir: Source directory of the DCP checkpoint.
         sync_model_weights: Refresh compute weights from the loaded main weights afterwards.
     """
-    _init_optimizer_state(optimizer)
+    init_optimizer_state(optimizer)
     model_state_dict = get_model_state_dict(model)
     optimizer_state_dict = get_optimizer_state_dict(model, optimizer)
     preprocess_state_dict_for_uneven_dtensor(model_state_dict)
