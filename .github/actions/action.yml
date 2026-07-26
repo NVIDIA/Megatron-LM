@@ -218,7 +218,14 @@ runs:
         { set -x; } 2>/dev/null
         echo "::group::Logs"
         EXIT_CODE=0
-        /bin/bash job.sh || EXIT_CODE=$?
+        timeout \
+          --signal=TERM \
+          --kill-after=60s \
+          "${{ steps.timeout_in_seconds.outputs.main }}s" \
+          /bin/bash job.sh || EXIT_CODE=$?
+        if [[ "$EXIT_CODE" -eq 124 ]]; then
+          echo "::error::Test timed out after ${{ inputs.timeout }} minutes."
+        fi
         echo "exit_code=$EXIT_CODE" | tee -a "$GITHUB_OUTPUT"
         echo "::endgroup::"
         exit $EXIT_CODE
