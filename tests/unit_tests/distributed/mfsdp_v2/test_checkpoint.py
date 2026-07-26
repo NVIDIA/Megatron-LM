@@ -136,14 +136,13 @@ def test_checkpoint_roundtrip_flat_dp(
 ) -> None:
     """Saving then loading a flat-DP sharded model+optimizer restores state bit-exactly.
 
-    The fc1 group packs ``weight (16, 8)`` and ``bias (16,)`` into one flat buffer, so per-rank
-    shards do not tile like canonical ``Shard(0)`` (e.g. one rank owns no bias rows). This
-    exercises the uneven-DTensor metadata path in :func:`save_checkpoint`. With a bf16 model the
-    optimizer's ``main_weight`` stays fp32, covering the mixed-precision master-weight path.
+    The fc1 group packs ``weight (16, 8)`` and ``bias (16,)`` into one flat buffer, so with >=2
+    ranks the per-rank shards do not tile like canonical ``Shard(0)`` (e.g. one rank owns no bias
+    rows), which is what exercises the uneven-DTensor metadata path in :func:`save_checkpoint`. On
+    a single rank the sharding degenerates to one full shard and this is a plain roundtrip sanity
+    check. With a bf16 model the optimizer's ``main_weight`` stays fp32, covering the
+    mixed-precision master-weight path.
     """
-    if distributed_setup.world_size < 2:
-        pytest.skip("Requires >=2 ranks so parameters shard unevenly across the DP mesh.")
-
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
 
