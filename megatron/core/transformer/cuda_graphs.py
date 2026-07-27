@@ -194,7 +194,7 @@ class CudagraphBufferMetadata:
       is_cudagraph_input / is_cudagraph_output — which graph boundary this buffer sits on.
       is_saved_for_backward — set by the save_for_backward observer; means the forward
           buffer must outlive the forward graph and stay allocator-owned until backward
-          capture (see make_weakref(preserve_saved_for_backward=True)).
+          capture.
 
     Reuse accounting (used during graph creation):
       input_use_count — times this buffer appears as a graph input.
@@ -357,17 +357,9 @@ def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Gen
     return gen
 
 
-def make_weakref(ten, inplace=True, preserve_saved_for_backward=False):
+def make_weakref(ten, inplace=True):
     """Creates a weak reference to a tensor by creating a tensor that replaces storage with
     raw-pointer wrappers that do not hold a storage reference"""
-
-    if (
-        preserve_saved_for_backward
-        and torch.is_tensor(ten)
-        and hasattr(ten, "cg_buffer_metadata")
-        and ten.cg_buffer_metadata.is_saved_for_backward
-    ):
-        return ten
 
     # Only graph mempool tensors in the graph mempool (e.g. a previous layer's
     # output reused as this graph's input) are safe to weak-ref since their memory is
@@ -721,7 +713,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
             # when the same input (like cu_seqlens) is passed to multiple cudagraphs, the first
             # cudagraph will copy the it into the corresponding cudagraph_input. Subsequent
             # cudagraphs will read the same cudagraph_input, leading to a case where the passed 
-            # tensor doesn't need to be copied despite having a different data_ptr
+            # tensor doesn't need to be copied despite having a different data_ptr as its cudagraph_input
             if can_skip_replay_copy and cudagraph_input.cg_buffer_metadata.input_use_count == 1:
                 assert user_input.data_ptr() == cudagraph_input.data_ptr()
             elif user_input.data_ptr() != cudagraph_input.data_ptr():
@@ -908,16 +900,69 @@ class _CudaGraphRunner(torch.nn.Module):
         # Return module params that were found in the graph, preserving original order
         return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
 
-    def _weakref_forward_buffers(self, preserve_saved_for_backward: bool) -> None:
-        """Release strong references to forward buffers after their final capture use."""
-        weakref = partial(
-            make_weakref, preserve_saved_for_backward=preserve_saved_for_backward
-        )
-        self.fwd_graph_input_surface = tree_map(weakref, self.fwd_graph_input_surface)
-        self.fwd_graph_input_args = tree_map(weakref, self.fwd_graph_input_args)
-        self.fwd_graph_input_kwargs = tree_map(weakref, self.fwd_graph_input_kwargs)
-        self.fwd_graph_outputs = tree_map(weakref, self.fwd_graph_outputs)
-        self.fwd_graph_output_surface = tree_map(weakref, self.fwd_graph_output_surface)
+    def _weakref_forward_buffers(
+        self, preserve_forward_to_backward_lifetimes: bool
+    ) -> None:
+        """Release ownership only when CUDA graph topology proves the buffer reclaimable.
+
+        `make_weakref` preserves a captured address but releases allocator ownership.
+        Although CUDA graph memory is pinned to a stable address, the graph-pool allocator may
+        reuse an unowned allocation before backward capture and overwrite its contents.
+        these conditions only within that interval avoids retaining every boundary tensor.
+        """
+
+        def is_saved_for_backward(tensor) -> bool:
+            """Return whether capture-time autograd saved this boundary tensor.
+
+            Backward formulas may read the tensor's forward contents even when the tensor is
+            only a CUDA graph input and never becomes a graph output. Preserving allocator
+            ownership guards against the graph pool reusing and overwriting that storage before
+            backward capture records the read.
+            """
+            metadata = getattr(tensor, "cg_buffer_metadata", None)
+            return bool(
+                torch.is_tensor(tensor)
+                and metadata is not None
+                and metadata.is_saved_for_backward
+            )
+
+        def is_differentiable_cudagraph_output_escape(tensor) -> bool:
+            """Return whether a differentiable graph output escapes to eager code.
+
+            Outputs that are also inputs to another CUDA graph are protected by graph-to-graph
+            reuse accounting. A differentiable output that is not another graph's input has no
+            such owner, although an eager consumer and its backward may still need its contents.
+            Preserving it guards against premature graph-pool storage reuse across that eager
+            boundary.
+            """
+            metadata = getattr(tensor, "cg_buffer_metadata", None)
+            return bool(
+                torch.is_tensor(tensor)
+                and tensor.requires_grad
+                and metadata is not None
+                and metadata.is_cudagraph_output
+                and not metadata.is_cudagraph_input
+            )
+
+        def weakref_input(tensor):
+            if preserve_forward_to_backward_lifetimes:
+                if is_saved_for_backward(tensor):
+                    return tensor
+            return make_weakref(tensor)
+
+        def weakref_output(tensor):
+            if preserve_forward_to_backward_lifetimes:
+                if is_saved_for_backward(tensor):
+                    return tensor
+                if is_differentiable_cudagraph_output_escape(tensor):
+                    return tensor
+            return make_weakref(tensor)
+
+        self.fwd_graph_input_surface = tree_map(weakref_input, self.fwd_graph_input_surface)
+        self.fwd_graph_input_args = tree_map(weakref_input, self.fwd_graph_input_args)
+        self.fwd_graph_input_kwargs = tree_map(weakref_input, self.fwd_graph_input_kwargs)
+        self.fwd_graph_outputs = tree_map(weakref_output, self.fwd_graph_outputs)
+        self.fwd_graph_output_surface = tree_map(weakref_output, self.fwd_graph_output_surface)
 
     def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
@@ -1133,10 +1178,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 however the graphed module must output at least one tensor, 
                 so that a corresponding backward node may be registered in the autograd graph."""
 
-            # A buffer used only in forward can release allocator ownership now. A buffer saved
-            # for backward must remain allocator-owned because both captured graphs record its
-            # address and its lifetime spans the forward-to-backward graph boundary.
-            self._weakref_forward_buffers(preserve_saved_for_backward=True)
+            # Preserve only forward buffers whose lifetime crosses into backward capture.
+            self._weakref_forward_buffers(preserve_forward_to_backward_lifetimes=True)
 
             self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
             self.num_dgrads = len(self.fwd_graph_input_surface)
@@ -1254,7 +1297,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_inputs = tree_map(make_weakref, self.static_grad_inputs)
         self.static_grad_outputs = tree_map(make_weakref, self.static_grad_outputs)
         # Backward capture is the final recorded use of forward buffers retained for autograd.
-        self._weakref_forward_buffers(preserve_saved_for_backward=False)
+        self._weakref_forward_buffers(preserve_forward_to_backward_lifetimes=False)
 
         delattr(self, "args")
         delattr(self, "kwargs")
