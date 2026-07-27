@@ -162,6 +162,13 @@ under `results/_final/`). Losses depend on hardware/kernels; the pass criterion 
 **LR exact and `lm loss` within bf16 tolerance** (FP8 ~1% by design), not the
 absolute value.
 
+> **Spot-check after rebasing onto main — 2026-07-27.** `dense` was re-run end to
+> end (`validate_resume.sh` + `validate_bitexact.py --iter 80`) and reproduced the
+> table below exactly: iter 61 `5.796581 → 5.793622`, iter 81
+> `4.752846 → 4.751805`, LR exact, and a bit-exact diff containing only the
+> intentionally-dropped `_extra_state` / `rng_state` / `rerun_state_machine_state`
+> keys. The other seven models were not re-run.
+
 ### Resume continuity + bit-exact (single-rank source)
 
 `lm loss` FSDP → resumed. LR is **exact** at every point (iter 61 `5.710524e-05`,
