@@ -1536,7 +1536,11 @@ class TransformerConfig(ModelParallelConfig):
         ):
             assert (
                 self.sequence_packing_scheduler is not None
-            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+                or self.cp_partition_mode == "contiguous"
+            ), (
+                "DSv4 Hybrid with CP requires either a sequence_packing_scheduler for online THD packing, "
+                "or cp_partition_mode='contiguous' for externally pre-packed (offline) THD data."
+            )
 
         if self.context_parallel_size > 1:
             if (
