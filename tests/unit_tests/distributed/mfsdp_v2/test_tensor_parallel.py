@@ -297,7 +297,9 @@ def test_fsdp_tp_loss_curve_matches_unsharded(distributed_setup):
     config = TransformerConfig(
         num_layers=1,
         hidden_size=hidden,
-        num_attention_heads=1,
+        # This MLP has no attention, but TransformerConfig validates that heads
+        # divide tensor_model_parallel_size regardless, so keep it a multiple.
+        num_attention_heads=tp_size,
         tensor_model_parallel_size=tp_size,
         # FSDP tracks gradients through .grad, not a fused weight.main_grad.
         gradient_accumulation_fusion=False,
