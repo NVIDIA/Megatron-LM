@@ -464,6 +464,7 @@ class TestGroupedExpertChainClassification:
         assert not gtp_module._chain_is_graphed("GTP_ungraphed")
         assert gtp_module._chain_is_graphed("GTP_graphed")
 
+
 class TestGroupedDoubleBuffer:
     """One-block-ahead grouped chains must double-buffer: consecutive MoE layers get distinct
     gather buffers (else prefetching layer N+1 clobbers layer N's in-use weight). Pure cache-key
@@ -500,7 +501,9 @@ class TestGroupedDoubleBuffer:
     def test_fc1_fc2_never_share_a_buffer(self):
         # Both can be in-flight at once on the shared IB stream; role folded into key keeps
         # them distinct even when gathered shapes match (as in this fake).
-        assert self._key("GTP_remat_grouped_fc1_ungraphed") != self._key("GTP_remat_grouped_fc2_ungraphed")
+        assert self._key("GTP_remat_grouped_fc1_ungraphed") != self._key(
+            "GTP_remat_grouped_fc2_ungraphed"
+        )
 
     def test_non_grouped_key_unchanged(self):
         assert self._key("GTP_ungraphed") == ((128, 256), torch.bfloat16, 0, False)
