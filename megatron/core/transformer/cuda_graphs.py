@@ -304,6 +304,12 @@ class ArgMetadata:
             if hasattr(arg, "cg_buffer_metadata"):
                 # Its important this is a reference copy
                 self.cg_buffer_metadata = arg.cg_buffer_metadata
+                if self.is_prebound_cudagraph_input:
+                    # ``detach`` preserves storage but drops Python attributes. Replay-copy
+                    # elision relies on the captured input carrying this metadata.
+                    self.prebound_cudagraph_input.cg_buffer_metadata = (
+                        _copy_cudagraph_buffer_metadata(arg.cg_buffer_metadata)
+                    )
         else:
             self.value = arg
 

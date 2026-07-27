@@ -1848,7 +1848,12 @@ class TestInlineCaptureManager:
         module.my_op(static_input, cache_key="prebound")
 
         runner = manager.cudagraph_runners[0]
-        assert runner.fwd_graph_input_surface[0].data_ptr() == static_input.data_ptr()
+        captured_input = runner.fwd_graph_input_surface[0]
+        assert captured_input.data_ptr() == static_input.data_ptr()
+        assert captured_input.cg_buffer_metadata.input_use_count == 1
+
+        # The exact prebound allocation skips the replay copy without losing its metadata.
+        module.my_op(static_input, cache_key="prebound")
 
         wrong_allocation = mark_cuda_graph_prebound_input(torch.empty_like(static_input))
         with pytest.raises(AssertionError, match="prebound input requires"):
@@ -1858,10 +1863,15 @@ class TestInlineCaptureManager:
         static_input = mark_cuda_graph_prebound_input(
             torch.randn(4, 32, device="cuda", requires_grad=True)
         )
+        static_input.cg_buffer_metadata = CudagraphBufferMetadata(
+            is_cudagraph_input=True,
+            input_use_count=1,
+        )
         metadata = ArgMetadata(static_input)
 
         assert metadata.prebound_cudagraph_input.requires_grad
         assert metadata.prebound_cudagraph_input.data_ptr() == static_input.data_ptr()
+        assert metadata.prebound_cudagraph_input.cg_buffer_metadata.input_use_count == 1
 
 
 class TestSkipFp8WeightUpdateTensor:
