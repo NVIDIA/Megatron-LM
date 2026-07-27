@@ -1708,11 +1708,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             large_logits[0, row, col] = 10.0
         controller._all_logits_cuda = large_logits
 
-        sampled = controller._run_async_sched_sample()
+        sampled_tokens_gpu = controller._run_async_sched_sample().sampled_tokens_gpu
 
-        assert sampled.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
+        assert sampled_tokens_gpu.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
         assert controller._sampled_tokens_cuda.numel() == capacity
-        assert torch.equal(sampled, large_expected)
+        assert torch.equal(sampled_tokens_gpu, large_expected)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
