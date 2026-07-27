@@ -2886,6 +2886,14 @@ class CompressedSparseAttention(MegatronModule):
                     raise RuntimeError(
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
+                # Switch 1: take the load-balanced CP path via config flag. Fall back to the
+                # contiguous path for CP<=1 or short sequences, where the redistribute overhead
+                # outweighs the imbalance savings.
+                use_balance = (
+                    self.config.dsa_cp_balance_indexer
+                    and cp_size > 1
+                    and max_seqlen_q >= (self.config.dsa_cp_balance_min_seqlen or 0)
+                )
 
                 nvtx_range_push("dsv4_cp_indexer_k_compressor")
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
@@ -2948,41 +2956,68 @@ class CompressedSparseAttention(MegatronModule):
                 # (their backward nodes must be newer than the edges) and while
                 # the Indexer-K all-gather is still in flight.
                 nvtx_range_push("dsv4_cp_indexer_q_weights")
-                q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)
-                q_indexer_cp = q_indexer_cp.reshape(
-                    l_local, indexer.index_n_heads, indexer.index_head_dim
-                )
-                if self.config.apply_rope_fusion:
-                    rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
-                        max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
-                    )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
-                        q_indexer_cp,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                    )
+                # q_indexer_cp (projected + roped) feeds the contiguous top-k and the train-time
+                # fused sparse-attn + indexer-loss path (which consumes it regardless of
+                # indexer_loss_coeff); the balanced path re-projects per chunk. Skip this
+                # projection only when neither consumer runs: balanced path in eval/no-grad.
+                if use_balance and not training_with_grad:
+                    q_indexer_cp = None
                 else:
-                    rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
-                    rotary_pos_emb = (
-                        rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                    q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)
+                    q_indexer_cp = q_indexer_cp.reshape(
+                        l_local, indexer.index_n_heads, indexer.index_head_dim
                     )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
-                        q_indexer_cp,
-                        rotary_pos_emb,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                        self.config,
-                    )
-                q_indexer_cp = rotate_activation(q_indexer_cp)
+                    if self.config.apply_rope_fusion:
+                        rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
+                            max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+                        )
+                        q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
+                            q_indexer_cp,
+                            rotary_pos_cos,
+                            rotary_pos_sin,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                        )
+                    else:
+                        rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+                        rotary_pos_emb = (
+                            rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                        )
+                        q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
+                            q_indexer_cp,
+                            rotary_pos_emb,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                            self.config,
+                        )
+                    q_indexer_cp = rotate_activation(q_indexer_cp)
                 weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                 weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
                 nvtx_range_pop("dsv4_cp_indexer_q_weights")
+
+                bal_dispatch_mode = None
+                bal_dispatch_handle = None
+                if use_balance:
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    # The hybridEP (DeepEP) all-to-all is not CUDA-graph capturable; fall back to
+                    # the graph-safe NCCL alltoall backend under any graph capture.
+                    bal_dispatch_mode = self.config.dsa_cp_balance_dispatch
+                    if bal_dispatch_mode == "hybridep" and self.config.cuda_graph_impl != "none":
+                        bal_dispatch_mode = "alltoall"
+                    if bal_dispatch_mode != "hybridep":
+                        # Issue the chunk dispatch now (async) so the transfer overlaps with the
+                        # in-flight compressed-K/KV all-gathers instead of sitting on the
+                        # critical path right before the top-k.
+                        bal_dispatch_handle = cp_balanced_indexer.dispatch_chunks_async(
+                            indexer_qr, weights_indexer_cp, cp_group, cp_size, l_local
+                        )
 
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_wait")
                 k_indexer_rank_major = k_indexer_gather.wait()
@@ -2994,66 +3029,104 @@ class CompressedSparseAttention(MegatronModule):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                indexer_layout = cp_utils.build_cp_indexer_layout(
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    l_local,
-                    k_indexer_seq_major.shape[0],
-                )
-                topk_indexer_layout = indexer_layout
-                k_indexer_for_topk = k_indexer_seq_major
-                if self.use_fused_kernels:
-                    topk_indexer_layout, source_row_map = cp_utils.build_cp_compact_indexer_layout(
-                        indexer_layout, cu_seqlens_compressed, k_indexer_seq_major.shape[0], ratio
-                    )
-                    k_indexer_for_topk = cp_utils.pack_cp_compact_indexer_k(
-                        k_indexer_seq_major, source_row_map
-                    )
-                return_indexer_softmax = (
-                    self.use_fused_kernels
-                    and training_with_grad
-                    and sparse_indexer_loss
-                    and indexer_loss_coeff > 0
-                )
-                compact_workspace = None
-                if self.use_fused_kernels:
-                    compact_workspace = self._get_thd_compact_indexer_workspace(
-                        q_indexer_cp,
-                        k_indexer_for_topk,
-                        topk=indexer.index_topk,
-                        ratio=ratio,
-                        cu_seqlens_q=topk_indexer_layout[0],
-                        cu_seqlens_k=topk_indexer_layout[1],
-                        max_seqlen_q=max_seqlen_q,
-                        max_seqlen_k=max_seqlen_q // ratio + 2,
-                        q_causal_offsets=topk_indexer_layout[2],
-                        return_softmax=return_indexer_softmax,
-                    )
                 # Each top-k entry is still a logical compressed id within that
-                # query's sequence here. Only the ids are remapped later; the
-                # compact softmax slots remain aligned with their selected keys.
-                compressed_topk, indexer_layout, compact_indexer_predict = (
-                    cp_utils.compute_cp_indexer_topk(
-                        q_indexer_cp,
-                        weights_indexer_cp,
-                        k_indexer_for_topk,
+                # query's sequence here.
+                if use_balance:
+                    # Load-balanced CP indexer: process a head chunk + tail chunk per rank so each
+                    # rank does ~constant work, then combine the top-k back to contiguous order (a
+                    # drop-in for compute_cp_indexer_topk, same contiguous layout downstream).
+                    # cu_seqlens is constant across layers within a microbatch, so the chunk
+                    # layouts are cached on this microbatch's PackedSeqParams.
+                    bal_layout_cache = getattr(
+                        packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                    )
+                    if bal_layout_cache is None:
+                        bal_layout_cache = {}
+                        packed_seq_params._dsa_cp_balance_layout_cache = bal_layout_cache
+                    compressed_topk, indexer_layout = (
+                        cp_balanced_indexer.balanced_compute_cp_indexer_topk(
+                            indexer_qr,
+                            weights_indexer_cp,
+                            indexer,
+                            k_indexer_seq_major,
+                            cu_seqlens,
+                            cu_seqlens_compressed,
+                            self.config,
+                            cp_group,
+                            cp_size,
+                            l_local,
+                            global_start,
+                            ratio,
+                            indexer.index_topk,
+                            indexer.softmax_scale,
+                            max_seqlen_q,
+                            use_fused=self.use_fused_kernels,
+                            dispatch=bal_dispatch_mode,
+                            dispatch_handle=bal_dispatch_handle,
+                            layout_cache=bal_layout_cache,
+                        )
+                    )
+                else:
+                    indexer_layout = cp_utils.build_cp_indexer_layout(
                         cu_seqlens,
                         cu_seqlens_compressed,
                         global_start,
-                        ratio,
-                        indexer.index_topk,
-                        indexer.softmax_scale,
-                        max_seqlen_q=max_seqlen_q,
-                        use_fused=self.use_fused_kernels,
-                        deterministic=self.config.deterministic_mode,
-                        precision=self.config.dsa_indexer_precision,
-                        compact_workspace=compact_workspace,
-                        return_softmax=return_indexer_softmax,
-                        indexer_layout=topk_indexer_layout,
-                        logical_indexer_layout=indexer_layout,
+                        l_local,
+                        k_indexer_seq_major.shape[0],
                     )
-                )
+                    topk_indexer_layout = indexer_layout
+                    k_indexer_for_topk = k_indexer_seq_major
+                    if self.use_fused_kernels:
+                        topk_indexer_layout, source_row_map = cp_utils.build_cp_compact_indexer_layout(
+                            indexer_layout, cu_seqlens_compressed, k_indexer_seq_major.shape[0], ratio
+                        )
+                        k_indexer_for_topk = cp_utils.pack_cp_compact_indexer_k(
+                            k_indexer_seq_major, source_row_map
+                        )
+                    return_indexer_softmax = (
+                        self.use_fused_kernels
+                        and training_with_grad
+                        and sparse_indexer_loss
+                        and indexer_loss_coeff > 0
+                    )
+                    compact_workspace = None
+                    if self.use_fused_kernels:
+                        compact_workspace = self._get_thd_compact_indexer_workspace(
+                            q_indexer_cp,
+                            k_indexer_for_topk,
+                            topk=indexer.index_topk,
+                            ratio=ratio,
+                            cu_seqlens_q=topk_indexer_layout[0],
+                            cu_seqlens_k=topk_indexer_layout[1],
+                            max_seqlen_q=max_seqlen_q,
+                            max_seqlen_k=max_seqlen_q // ratio + 2,
+                            q_causal_offsets=topk_indexer_layout[2],
+                            return_softmax=return_indexer_softmax,
+                        )
+                    # Each top-k entry is still a logical compressed id within that
+                    # query's sequence here. Only the ids are remapped later; the
+                    # compact softmax slots remain aligned with their selected keys.
+                    compressed_topk, indexer_layout, compact_indexer_predict = (
+                        cp_utils.compute_cp_indexer_topk(
+                            q_indexer_cp,
+                            weights_indexer_cp,
+                            k_indexer_for_topk,
+                            cu_seqlens,
+                            cu_seqlens_compressed,
+                            global_start,
+                            ratio,
+                            indexer.index_topk,
+                            indexer.softmax_scale,
+                            max_seqlen_q=max_seqlen_q,
+                            use_fused=self.use_fused_kernels,
+                            deterministic=self.config.deterministic_mode,
+                            precision=self.config.dsa_indexer_precision,
+                            compact_workspace=compact_workspace,
+                            return_softmax=return_indexer_softmax,
+                            indexer_layout=topk_indexer_layout,
+                            logical_indexer_layout=indexer_layout,
+                        )
+                    )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
                 nvtx_range_push("dsv4_cp_attention_kv_all_gather_wait")

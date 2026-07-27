@@ -288,6 +288,33 @@ def build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
+@torch.compile
+def _build_cp_indexer_layout(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    global_start: int,
+    local_rows: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the indexer's packed local-Q/full-K metadata."""
+    # Each real Q segment intersects its sequence with this rank's row interval,
+    # while K keeps the sequence's full compressed segment. The final synthetic
+    # segment holds CP capacity padding and has zero K rows. Causal offsets
+    # restore each non-empty local Q segment's position in the original sequence.
+    global_end = global_start + local_rows
+    zero = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=cu_seqlens_q.device)
+    local_starts = cu_seqlens_q[:-1].clamp_min(global_start)
+    local_ends = cu_seqlens_q[1:].clamp_max(global_end)
+    q_lens = (local_ends - local_starts).clamp_min(0)
+    q_prefix = torch.cumsum(q_lens, dim=0, dtype=torch.int32)
+    padding_q = (global_end - cu_seqlens_q[-1].clamp_min(global_start)).clamp_min(0)
+    cu_q_topk = torch.cat((zero, q_prefix, (q_prefix[-1] + padding_q).view(1)))
+    cu_k_topk = torch.cat((cu_seqlens_compressed, cu_seqlens_compressed[-1:]))
+    q_causal_offsets = torch.cat(
+        (torch.where(q_lens > 0, local_starts - cu_seqlens_q[:-1], 0), zero)
+    )
+    return cu_q_topk, cu_k_topk, q_causal_offsets
+
+
 def build_cp_compact_indexer_layout(
     logical_layout: CPIndexerLayout,
     cu_seqlens_compressed: torch.Tensor,
@@ -327,12 +354,20 @@ def compute_cp_indexer_topk(
     return_softmax: bool = False,
     indexer_layout: Optional[CPIndexerLayout] = None,
     logical_indexer_layout: Optional[CPIndexerLayout] = None,
+    max_seqlen_kv: Optional[int] = None,
+    prebuilt_layout: Optional[CPIndexerLayout] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[CPIndexerLayout], Optional[torch.Tensor]]:
-    """Return local top-k, packed layout, and optional compact Top-K softmax."""
+    """Return local top-k, packed layout, and optional compact Top-K softmax.
+
+    The prebuilt_layout argument is the existing balanced indexer's
+    local-Q/full-K layout. It uses the dense scorer, with an optional tight
+    max_seqlen_kv bound. Ordinary callers retain the compact layout and
+    workspace contract.
+    """
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None, None, None
-    max_seqlen_kv = int(max_seqlen_q) // int(ratio)
+    max_seqlen_kv = int(max_seqlen_q) // int(ratio) if max_seqlen_kv is None else int(max_seqlen_kv)
     if max_seqlen_kv == 0:
         return None, None, None
 
@@ -344,21 +379,24 @@ def compute_cp_indexer_topk(
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
 
-    if logical_indexer_layout is None:
-        logical_indexer_layout = build_cp_indexer_layout(
-            cu_seqlens_q, cu_seqlens_compressed, global_start, l_local, k_indexer_seq_major.shape[0]
-        )
-    if not use_fused:
-        indexer_layout = logical_indexer_layout
-    elif indexer_layout is None:
-        indexer_layout, source_row_map = build_cp_compact_indexer_layout(
-            logical_indexer_layout, cu_seqlens_compressed, k_indexer_seq_major.shape[0], ratio
-        )
-        k_indexer_seq_major = pack_cp_compact_indexer_k(k_indexer_seq_major, source_row_map)
+    if prebuilt_layout is not None:
+        logical_indexer_layout = indexer_layout = prebuilt_layout
+    else:
+        if logical_indexer_layout is None:
+            logical_indexer_layout = build_cp_indexer_layout(
+                cu_seqlens_q, cu_seqlens_compressed, global_start, l_local, k_indexer_seq_major.shape[0]
+            )
+        if not use_fused:
+            indexer_layout = logical_indexer_layout
+        elif indexer_layout is None:
+            indexer_layout, source_row_map = build_cp_compact_indexer_layout(
+                logical_indexer_layout, cu_seqlens_compressed, k_indexer_seq_major.shape[0], ratio
+            )
+            k_indexer_seq_major = pack_cp_compact_indexer_k(k_indexer_seq_major, source_row_map)
 
-    if use_fused:
-        # Each real segment has one or two invisible K padding rows.
-        max_seqlen_kv += 2
+        if use_fused:
+            # Each real segment has one or two invisible K padding rows.
+            max_seqlen_kv += 2
     cu_q_topk, cu_k_topk, q_causal_offsets = indexer_layout
 
     if not use_fused:
@@ -424,6 +462,7 @@ def compute_cp_indexer_topk(
         max_seqlen_kv=int(max_seqlen_kv),
         q_causal_offsets=q_causal_offsets,
         compact_workspace=compact_workspace,
+        use_compact=prebuilt_layout is None,
         precision=precision,
         deterministic=deterministic,
         return_softmax=return_softmax,
