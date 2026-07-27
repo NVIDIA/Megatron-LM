@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
+    _localize_qkv_split_shapes,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
@@ -768,6 +769,8 @@ def _get_megatron_emerging_optimizer(
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
+    if config.muon_split_qkv_per_head and not config.muon_split_qkv:
+        raise ValueError("muon_split_qkv_per_head requires muon_split_qkv=True")
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -785,8 +788,52 @@ def _get_megatron_emerging_optimizer(
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
-                if param.shape[0] % sum(qkv_split_shapes) == 0:
+                    qkv_split_shapes = _get_qkv_split_shapes(
+                        model_chunk.config,
+                        split_qkv_per_head=config.muon_split_qkv_per_head,
+                    )
+                if config.muon_split_qkv_per_head:
+                    param.is_qkv = True
+                    param.qkv_split_shapes_global = qkv_split_shapes
+
+                    tp_group = (
+                        pg_collection.expt_tp
+                        if getattr(param, 'expert_tp', False)
+                        else pg_collection.tp
+                    )
+                    tp_size = get_pg_size(tp_group)
+                    tp_rank = get_pg_rank(tp_group)
+                    gtp_remat_group = (
+                        pg_collection.expt_gtp_remat
+                        if getattr(param, 'expert_tp', False)
+                        else pg_collection.gtp_remat
+                    )
+                    if getattr(param, 'is_gtp_weight_remat', False):
+                        gtp_size = get_pg_size(gtp_remat_group)
+                        gtp_rank = get_pg_rank(gtp_remat_group)
+                    else:
+                        gtp_size = 1
+                        gtp_rank = 0
+
+                    tp_local_rows = param.shape[0] * gtp_size
+                    expected_global_rows = tp_local_rows * tp_size
+                    if expected_global_rows != sum(qkv_split_shapes):
+                        raise RuntimeError(
+                            f"Muon per-head QKV layout mismatch for {name}: "
+                            f"global_rows={sum(qkv_split_shapes)}, "
+                            f"local_rows={param.shape[0]}, tp_size={tp_size}, "
+                            f"gtp_remat_size={gtp_size}"
+                        )
+                    local_start = tp_rank * tp_local_rows + gtp_rank * param.shape[0]
+                    (
+                        param.qkv_split_shapes,
+                        param.qkv_split_heads_are_complete,
+                    ) = _localize_qkv_split_shapes(
+                        qkv_split_shapes,
+                        local_start=local_start,
+                        local_rows=param.shape[0],
+                    )
+                elif param.shape[0] % sum(qkv_split_shapes) == 0:
                     param.is_qkv = True
                     param.qkv_split_shapes = qkv_split_shapes
                 else:
