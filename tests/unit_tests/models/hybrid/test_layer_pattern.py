@@ -350,9 +350,9 @@ class TestLayerConfigSymbols:
         m = MambaLayerConfig(common_config=common)
         mlp = MLPLayerConfig(common_config=common, ffn_hidden_size=192)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, m, mlp, loss]
-        )._lower()
+        compiled = _lower(
+            HybridModelConfig(common_config=common, layer_pattern=[emb, m, mlp, loss])
+        )
         assert compiled.layer_type_list == [Symbols.MAMBA, Symbols.MLP]
         assert compiled.layer_config_list[1].ffn_hidden_size == 192
 
@@ -681,9 +681,9 @@ class TestHybridModelConfigLowering:
         a1 = AttentionLayerConfig(common_config=common, num_attention_heads=8)
         a2 = AttentionLayerConfig(common_config=common, num_attention_heads=4)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common, layer_pattern=[emb, a1, a2, loss]
-        )._lower()
+        compiled = _lower(
+            HybridModelConfig(common_config=common, layer_pattern=[emb, a1, a2, loss])
+        )
         assert compiled.layer_config_list[0].num_attention_heads == 8
         assert compiled.layer_config_list[1].num_attention_heads == 4
 
@@ -712,15 +712,17 @@ class TestHeterogeneousMoE:
         loss = CrossEntropyLayerConfig()
         # Pattern: [emb, a, dense, a, sparse, loss] — 4 decoder layers, 2 MoE.
         # Heterogeneous MoE requires explicit stack-TC pins.
-        compiled = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[emb, a, dense, a, sparse, loss],
-            tensor_model_parallel_size=2,
-            expert_model_parallel_size=2,
-            expert_tensor_parallel_size=1,
-            stack_moe_num_experts=8,
-            stack_moe_ffn_hidden_size=256,
-        )._lower()
+        compiled = _lower(
+            HybridModelConfig(
+                common_config=common,
+                layer_pattern=[emb, a, dense, a, sparse, loss],
+                tensor_model_parallel_size=2,
+                expert_model_parallel_size=2,
+                expert_tensor_parallel_size=1,
+                stack_moe_num_experts=8,
+                stack_moe_ffn_hidden_size=256,
+            )
+        )
         tcs = compiled.layer_config_list
         # Decoder indices: 0=att, 1=dense MoE, 2=att, 3=sparse MoE.
         dense_tc, sparse_tc = tcs[1], tcs[3]
@@ -739,14 +741,16 @@ class TestHeterogeneousMoE:
         dense = MoELayerConfig(common_config=common, num_experts=8, top_k=2)
         sparse = MoELayerConfig(common_config=common, num_experts=4, top_k=2)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[emb, a, dense, a, sparse, loss],
-            tensor_model_parallel_size=2,
-            expert_model_parallel_size=2,
-            expert_tensor_parallel_size=1,
-            stack_moe_num_experts=8,
-        )._lower()
+        compiled = _lower(
+            HybridModelConfig(
+                common_config=common,
+                layer_pattern=[emb, a, dense, a, sparse, loss],
+                tensor_model_parallel_size=2,
+                expert_model_parallel_size=2,
+                expert_tensor_parallel_size=1,
+                stack_moe_num_experts=8,
+            )
+        )
         dense_tc, sparse_tc = compiled.layer_config_list[1], compiled.layer_config_list[3]
         assert dense_tc.expert_model_parallel_size == 2
         assert sparse_tc.expert_model_parallel_size == 2
@@ -761,14 +765,16 @@ class TestHeterogeneousMoE:
         dense = MoELayerConfig(common_config=common, num_experts=8, top_k=2)
         sparse = MoELayerConfig(common_config=common, num_experts=4, top_k=2)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[emb, a, dense, a, sparse, loss],
-            tensor_model_parallel_size=2,
-            expert_model_parallel_size=2,
-            expert_tensor_parallel_size=1,
-            stack_moe_num_experts=8,
-        )._lower()
+        compiled = _lower(
+            HybridModelConfig(
+                common_config=common,
+                layer_pattern=[emb, a, dense, a, sparse, loss],
+                tensor_model_parallel_size=2,
+                expert_model_parallel_size=2,
+                expert_tensor_parallel_size=1,
+                stack_moe_num_experts=8,
+            )
+        )
         # Indices 0 and 2 are attention layers in the pattern above.
         att_tc_0, att_tc_2 = compiled.layer_config_list[0], compiled.layer_config_list[2]
         for tc in (att_tc_0, att_tc_2):
@@ -790,13 +796,15 @@ class TestHeterogeneousMoE:
             router_topk_scaling_factor=2.5,
         )
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[emb, a, moe, a, moe, loss],
-            tensor_model_parallel_size=2,
-            expert_model_parallel_size=2,
-            expert_tensor_parallel_size=1,
-        )._lower()
+        compiled = _lower(
+            HybridModelConfig(
+                common_config=common,
+                layer_pattern=[emb, a, moe, a, moe, loss],
+                tensor_model_parallel_size=2,
+                expert_model_parallel_size=2,
+                expert_tensor_parallel_size=1,
+            )
+        )
         assert compiled.config.num_moe_experts == 128
         assert compiled.config.moe_router_topk == 6
         assert compiled.config.moe_router_score_function == "sigmoid"
@@ -832,14 +840,16 @@ class TestHeterogeneousMoE:
         dense = MoELayerConfig(common_config=common, num_experts=128, top_k=2)
         sparse = MoELayerConfig(common_config=common, num_experts=64, top_k=2)
         loss = CrossEntropyLayerConfig()
-        compiled = HybridModelConfig(
-            common_config=common,
-            layer_pattern=[emb, a, dense, a, sparse, loss],
-            tensor_model_parallel_size=2,
-            expert_model_parallel_size=2,
-            expert_tensor_parallel_size=1,
-            stack_moe_num_experts=128,
-        )._lower()
+        compiled = _lower(
+            HybridModelConfig(
+                common_config=common,
+                layer_pattern=[emb, a, dense, a, sparse, loss],
+                tensor_model_parallel_size=2,
+                expert_model_parallel_size=2,
+                expert_tensor_parallel_size=1,
+                stack_moe_num_experts=128,
+            )
+        )
         assert compiled.config.num_moe_experts == 128
 
     def test_heterogeneous_moe_ffn_hidden_size_requires_override(self):
