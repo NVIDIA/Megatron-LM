@@ -203,7 +203,10 @@ def test_optimizer_state_lives_on_full_mesh(distributed_setup):
         parameters, before, reference_optimizer.param_groups[0]["params"]
     ):
         after = parameter.to_local()
-        assert not torch.equal(after, before_tensor)
+        # Flat DP packing gives some ranks no shard of a given tensor (dp rank 0
+        # here owns only column_weight), and an empty shard has nothing to update.
+        if after.numel():
+            assert not torch.equal(after, before_tensor)
         torch.testing.assert_close(after, reference_parameter.detach())
 
 
