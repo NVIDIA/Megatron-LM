@@ -179,17 +179,17 @@ def get_thd_padding_kwargs(
     - ``max`` pads token-like tensors to ``max_seqlen_per_dp_cp_rank``;
     - a positive value pads token-like tensors to a multiple of that value.
 
-    Padding cu_seqlens to ``thd_max_packed_sequences + 1`` is a CUDA Graph static-input
-    requirement. Eager pad-to-max should preserve sequence metadata so kernels
-    continue to see the real packed sequence boundaries.
+    When ``thd_max_packed_sequences`` is set, cu_seqlens tensors are padded to
+    ``thd_max_packed_sequences + 1`` entries in both eager and CUDA Graph modes.
+    Leaving it unset preserves dynamic sequence metadata in eager mode.
     """
     if cuda_graph_static:
         return None, int(max_seqlen_per_dp_cp_rank), thd_max_packed_sequences
 
     if pad_packed_seq_alignment == "max":
-        return None, int(max_seqlen_per_dp_cp_rank), None
+        return None, int(max_seqlen_per_dp_cp_rank), thd_max_packed_sequences
 
-    return int(pad_packed_seq_alignment), None, None
+    return int(pad_packed_seq_alignment), None, thd_max_packed_sequences
 
 
 def _resolve_thd_padding_lengths(
@@ -372,7 +372,7 @@ def pad_sequence_for_thd(
         target_len: If set, pad token-like tensors to this CP-local length.
             Exactly one of ``alignment`` and ``target_len`` must be provided.
         max_num_seqs: If set, pad cu_seqlens tensors to
-            ``max_num_seqs + 1`` entries for static CUDA Graph inputs.
+            ``max_num_seqs + 1`` entries for static eager or CUDA Graph inputs.
         pad_by_appending_dummy_seq: If true, represent the post-pack padding
             tail as an extra dummy sequence in cu_seqlens metadata.
         padding_mask: Existing bool padding mask for already-packed tokens,
@@ -390,8 +390,9 @@ def pad_sequence_for_thd(
           padding mask ask TE which packed rows this CP rank would receive.
         - When ``pad_by_appending_dummy_seq`` is true, the padding tail is also
           represented as an ordinary dummy sequence in cu_seqlens metadata.
-        - ``max_num_seqs`` pads all four cu_seqlens tensors; this is required
-          by CUDA Graph replay because those tensors are graph inputs.
+        - ``max_num_seqs`` pads all four cu_seqlens tensors. CUDA Graph replay
+          requires this because those tensors are graph inputs; eager mode can
+          opt into the same static metadata contract.
 
     Returns:
         Padded (tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask)
@@ -451,7 +452,7 @@ def pad_sequence_for_thd(
         cu_seqlens_q_padded = _append_dummy_seq(cu_seqlens_q_padded, global_target_len)
         cu_seqlens_kv_padded = _append_dummy_seq(cu_seqlens_kv_padded, global_target_len)
 
-    # Pad cu_seqlens entry counts for static CUDA Graph inputs.
+    # Pad cu_seqlens entry counts when a static sequence capacity is configured.
     if target_cu_entries is not None:
         cu_seqlens_q = _pad_cu_seqlens(cu_seqlens_q, target_cu_entries)
         cu_seqlens_kv = _pad_cu_seqlens(cu_seqlens_kv, target_cu_entries)

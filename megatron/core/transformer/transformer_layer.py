@@ -2129,6 +2129,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
         nvtx_range_pop(suffix="mlp_hyper_connection")
+        # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical
+        # stability of the mixing weights, and that fp32 propagates through the residual
+        # stream. MoE layers absorb it in their own routing dtype handling, but a dense
+        # MLP feeds it straight into a low-precision TE layer whose fused layernorm weight
+        # is in params_dtype, so restore params_dtype for dense (non-MoE) layers.
+        if not self.is_moe_layer and hidden_states.dtype != self.config.params_dtype:
+            hidden_states = hidden_states.to(self.config.params_dtype)
 
         # Optional Layer norm post the cross-attention.
         checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
@@ -2217,6 +2224,43 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
         )
 
+    def _forward_mhc_mlp_post_core(
+        self,
+        mlp_output_with_bias,
+        mlp_h_res,
+        residual,
+        mlp_hc_h_post,
+        mhc_mlp_bda_recompute_manager: Optional['CheckpointManager'] = None,
+    ):
+        """Run the fused mHC post-MLP H_res/H_post/BDA computation."""
+        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
+                mlp_h_res,
+                residual,
+                mlp_hc_h_post,
+                mlp_output_with_bias,
+                self.hidden_dropout,
+                self.training,
+                self.config.bias_dropout_fusion,
+                mhc_mlp_bda_recompute_manager,
+            )
+        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+        return hidden_states
+
+    def _forward_mhc_mlp_post(
+        self,
+        mlp_output,
+        mlp_h_res,
+        residual,
+        mlp_hc_h_post,
+        mhc_mlp_bda_recompute_manager: Optional['CheckpointManager'] = None,
+    ):
+        """Run mHC post-MLP fused H_res/H_post/BDA without MLP norm offload."""
+        return self._forward_mhc_mlp_post_core(
+            (mlp_output, None), mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_recompute_manager
+        )
+
     def _forward_post_mlp_with_fused_hyper_connection(
         self,
         mlp_output_with_bias,
@@ -2247,19 +2291,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mlp_output_with_bias[0]
             )
 
-        nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
-                mlp_h_res,
-                residual,
-                mlp_hc_h_post,
-                mlp_output_with_bias,
-                self.hidden_dropout,
-                self.training,
-                self.config.bias_dropout_fusion,
-                mhc_mlp_bda_recompute_manager,
-            )
-        nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+        hidden_states = self._forward_mhc_mlp_post_core(
+            mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_recompute_manager
+        )
 
         hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
 
@@ -2346,7 +2380,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 probs, routing_map = self.mlp.route(hidden_states)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
-                return residual, hidden_states, probs, shared_expert_output
+                return (
+                    residual,
+                    hidden_states,
+                    probs,
+                    shared_expert_output,
+                    mlp_h_res,
+                    mlp_hc_h_post,
+                )
             mlp_output_with_bias = self.mlp(hidden_states)
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
@@ -2359,6 +2400,42 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
             self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
+            if self.config.overlap_moe_expert_parallel_comm:
+                assert (
+                    len(cuda_graph_output) == 1
+                ), "CUDA Graph output should be the attention output."
+                hidden_states = cuda_graph_output.pop()
+                if not self.is_moe_layer:
+                    return hidden_states, None, None, None
+
+                nvtx_range_push(suffix="mlp_hyper_connection")
+                hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
+                    hidden_states
+                )
+                nvtx_range_pop(suffix="mlp_hyper_connection")
+
+                hidden_states = apply_module(self.pre_mlp_layernorm)(hidden_states)
+                if isinstance(hidden_states, tuple):
+                    if len(hidden_states) != 2:
+                        raise ValueError(
+                            "When the output of pre_mlp_layernorm is a tuple, it is "
+                            f"expected to have 2 elements (output, residual), but "
+                            f"got {len(hidden_states)}"
+                        )
+                    hidden_states, _ = hidden_states
+
+                shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
+                probs, routing_map = self.mlp.route(hidden_states)
+                hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
+                return (
+                    residual,
+                    hidden_states,
+                    probs,
+                    shared_expert_output,
+                    mlp_h_res,
+                    mlp_hc_h_post,
+                )
+
             output = self._forward_mlp(
                 *cuda_graph_output,
                 input_ids=kwargs.get("input_ids", None),

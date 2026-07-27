@@ -156,6 +156,8 @@ class ScheduleNode:
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
+        forward_nvtx_name: Optional[str] = None,
+        backward_nvtx_name: Optional[str] = None,
     ):
         """Initialize a schedule node.
 
@@ -173,8 +175,12 @@ class ScheduleNode:
             free_input (bool): Flag to indicate if the input should be freed after the
                 forward pass.
             name (str): Name of the node for debugging purposes.
+            forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
+            backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
         """
         self.name = name
+        self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
+        self.backward_nvtx_name = backward_nvtx_name or f"{name} backward"
         self.forward_func = forward_func
         self.backward_func = backward_func if backward_func else self.default_backward_func
         self.stream = stream
@@ -206,7 +212,7 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(f"{self.name} forward"):
+        with self.stream_acquire_context(self.forward_nvtx_name):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
@@ -215,7 +221,9 @@ class ScheduleNode:
             data = tuple(self.inputs)
             data = self.forward_func(*data)
 
-            if not isinstance(data, tuple):
+            if data is None:
+                pass
+            elif not isinstance(data, tuple):
                 data = make_viewless(data)
             else:
                 data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
@@ -246,7 +254,7 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(f"{self.name} backward"):
+        with self.stream_acquire_context(self.backward_nvtx_name):
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)

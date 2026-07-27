@@ -1154,13 +1154,13 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
-    thd_max_packed_sequences: int = field(
-        default=32, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
+    thd_max_packed_sequences: Optional[int] = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--thd-max-packed-sequences"]}}
     )
-    """Maximum number of THD packed sequences per microbatch, including any dummy
-    sequence appended for a padding tail. The dp_balanced packing scheduler reserves
-    that dummy slot when THD padding appends one. When CUDA Graph is enabled, cu_seqlens
-    tensors are padded to this size + 1.
+    """Optional maximum number of THD packed sequences per microbatch, including any
+    dummy sequence appended for a padding tail. The dp_balanced packing scheduler reserves
+    that dummy slot when THD padding appends one. When set, cu_seqlens tensors are padded
+    to this size + 1 in both eager and CUDA Graph modes. THD CUDA Graph requires this value.
 
     Sizing guidance: choose a value that comfortably covers the worst-case packing,
     roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
@@ -1204,18 +1204,20 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers per MHC recompute block.
-    
-    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
-    layer in the transformer block) will:
-    - NOT checkpoint its final MLP BDA
-    - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointManager is created for subsequent layers
-    
-    If None, all layers in the transformer block share a single recompute block.
+    """Number of layers in each mHC recompute group.
 
-    Must be a positive integer when set."""
+    Layers are grouped in their local transformer-block order. The last layer in each group leaves
+    its final MLP BDA output uncheckpointed and closes the current ``CheckpointManager``; a new
+    manager is created for the next group.
+
+    In the standard forward path, the group-ending layer registers a unified recompute hook on its
+    MLP BDA output. In the fine-grained expert-parallel overlap schedule, the group outputs are
+    discarded explicitly and a compute-stream schedule node replays the group before its backward
+    computation.
+
+    If ``None``, all local layers in the transformer block share one recompute group. The value must
+    be a positive integer when set.
+    """
 
     ####################
     # miscellaneous
@@ -2195,7 +2197,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.fine_grained_activation_offloading and self.offload_modules:
                 # mHC checkpoints wrap input_layernorm (inside attn_norm offload context)
                 # and pre_mlp_layernorm (inside mlp_norm offload context). The unified
-                # recompute hook fires before GroupCommitFunction.backward() initializes
+                # recompute trigger runs before GroupCommitFunction.backward() initializes
                 # the backward chunk, so tensor_pop hits a None chunk for these modules.
                 # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
                 # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
@@ -2205,12 +2207,25 @@ class TransformerConfig(ModelParallelConfig):
                 if conflicting:
                     raise ValueError(
                         f"'mhc' in recompute_modules is incompatible with "
-                        f"offload_modules {conflicting}. The mHC recompute hook fires "
+                        f"offload_modules {conflicting}. The mHC recompute replay starts "
                         f"before the offloading backward chunk is initialized for these "
                         f"modules, causing tensor_pop on a None chunk. Remove "
                         f"{conflicting} from offload_modules or remove 'mhc' from "
                         f"recompute_modules."
                     )
+
+        if (
+            self.overlap_moe_expert_parallel_comm
+            and self.recompute_granularity == "selective"
+            and "mhc" in self.recompute_modules
+            and (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            )
+        ):
+            raise ValueError(
+                "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
+                "to be disabled because explicit group replay is eager-only."
+            )
 
         if self.enable_hyper_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
@@ -3308,6 +3323,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
+            if self.thd_max_packed_sequences is None:
+                raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")
             assert (
                 self.pad_packed_seq_alignment is not None
             ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
