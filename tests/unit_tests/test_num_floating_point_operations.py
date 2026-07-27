@@ -472,6 +472,60 @@ class TestAccumulator:
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
 
 
+class TestAccumulatorVirtualPipeline:
+    """Interleaved (virtual) pipeline parallelism must not multiply the stats.
+
+    With ``virtual_pipeline_model_parallel_size = V``, the schedule calls the
+    user ``forward_step`` once per (micro-batch, model chunk) and every chunk
+    observes an identical micro-batch through its cached iterator view. The
+    whole-model FLOPs formula already covers all ``args.num_layers``, so only
+    virtual stage 0 may contribute -- otherwise reported FLOPs inflate by
+    exactly ``V``.
+    """
+
+    def setup_method(self):
+        _reset_seqlen_accumulator()
+
+    def teardown_method(self):
+        _reset_seqlen_accumulator()
+
+    def test_only_virtual_stage_zero_records(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        # Simulate VPP=4: the same micro-batch is seen by four model chunks.
+        for vp_stage in range(4):
+            update_seqlen_stats_from_cu_seqlens(cu, vp_stage=vp_stage)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        # Counted once, not four times.
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
+    def test_none_vp_stage_means_no_interleaving(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        update_seqlen_stats_from_cu_seqlens(cu, vp_stage=None)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
+    def test_non_primary_chunk_alone_records_nothing(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        update_seqlen_stats_from_cu_seqlens(cu, vp_stage=1)
+        assert training_module._seqlen_stats_active is False
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens is None
+        assert seqlen_squared_sum is None
+
+    def test_multiple_microbatches_on_stage_zero_accumulate(self):
+        """VPP gating must not drop legitimate per-micro-batch accumulation."""
+        cu_a = torch.tensor([0, 100, 300], dtype=torch.int32)
+        cu_b = torch.tensor([0, 50], dtype=torch.int32)
+        for cu in (cu_a, cu_b):
+            for vp_stage in range(2):  # VPP=2
+                update_seqlen_stats_from_cu_seqlens(cu, vp_stage=vp_stage)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == (100 + 200) + 50
+        assert seqlen_squared_sum == (100**2 + 200**2) + 50**2
+
+
 class TestAccumulatorDistributed:
     """All-reduce + ``TP*CP*PP`` deduplication.
 
