@@ -1856,6 +1856,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert gbuf_world_numel_unpadded <= gbuf_world_numel
                     assert gbuf_world_numel % data_parallel_world_size == 0
                     gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
+                    # Number of elements in this rank's DP-local bucket shard that fall within the
+                    # global unpadded range. This is the full local size on earlier ranks, partial
+                    # on the boundary rank, and zero on ranks containing only bucket-end padding.
                     gbuf_local_numel_unpadded = max(
                         0,
                         min(
