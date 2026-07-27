@@ -1139,7 +1139,10 @@ class TestRLUtils:
         current_iteration = 6
         if inject_placeholders:
             for lst, sentinel in (
-                (traj_lens, 0), (rewards, 0.0), (num_turns, 0), (num_evictions, 0),
+                (traj_lens, 0),
+                (rewards, 0.0),
+                (num_turns, 0),
+                (num_evictions, 0),
             ):
                 for group in lst:
                     group.append(sentinel)
@@ -1176,7 +1179,8 @@ class TestRLUtils:
         assert metrics["mean_advantage"] == 0.5
         # The rollout table lists real rollouts only, in either case.
         rollout_table_calls = [
-            c for c in writer.Table.call_args_list
+            c
+            for c in writer.Table.call_args_list
             if c.kwargs.get("columns", [None])[:2] == ["reward", "traj_length"]
         ]
         assert len(rollout_table_calls) == 1
