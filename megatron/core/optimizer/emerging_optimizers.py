@@ -188,6 +188,16 @@ def _localize_qkv_split_shapes(
     return local_split_shapes, all_heads_complete
 
 
+def _qkv_split_groups_are_complete(
+    split_shapes: list[int], local_start: int, local_rows: int
+) -> bool:
+    """Return whether a local row range contains only complete fused QKV groups."""
+    split_width = sum(split_shapes)
+    if split_width <= 0:
+        raise ValueError(f"Muon QKV split shapes must sum to a positive size: {split_shapes}")
+    return local_start % split_width == 0 and local_rows % split_width == 0
+
+
 # ===========================================================================
 # Registry – populated below only when emerging_optimizers is installed.
 # ===========================================================================
@@ -286,6 +296,69 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             else None
         )
 
+    def _gather_qkv_grad(self, p, grad, tp_group, expected_rows, gather_gtp=True):
+        """Reconstruct a fused QKV gradient and record how to restore its local shard."""
+        gathered_grad = grad
+        gtp_slice = None
+        gtp_remat_group = self._get_gtp_remat_group(p)
+        if (
+            gather_gtp
+            and gtp_remat_group is not None
+            and get_pg_size(gtp_remat_group) > 1
+            and getattr(p, 'is_gtp_weight_remat', False)
+        ):
+            gtp_size = get_pg_size(gtp_remat_group)
+            gtp_rank = get_pg_rank(gtp_remat_group)
+            gtp_local_rows = gathered_grad.shape[0]
+            shards = [torch.empty_like(gathered_grad) for _ in range(gtp_size)]
+            torch.distributed.all_gather(shards, gathered_grad, gtp_remat_group)
+            gathered_grad = torch.cat(shards, dim=0)
+            gtp_slice = (gtp_rank, gtp_local_rows)
+
+        tp_slice = None
+        if gathered_grad.shape[0] != expected_rows:
+            partition_dim = getattr(p, "partition_dim", None)
+            if partition_dim != 0 or tp_group is None:
+                raise RuntimeError(
+                    f"Muon QKV split shape mismatch: grad_shape={tuple(gathered_grad.shape)}, "
+                    f"expected_rows={expected_rows}, partition_dim={partition_dim}"
+                )
+            tp_size = get_pg_size(tp_group)
+            if gathered_grad.shape[0] * tp_size != expected_rows:
+                raise RuntimeError(
+                    "Muon QKV split cannot reconstruct the global tensor: "
+                    f"local_grad_shape={tuple(gathered_grad.shape)}, tp_size={tp_size}, "
+                    f"expected_rows={expected_rows}"
+                )
+            tp_rank = get_pg_rank(tp_group)
+            tp_local_rows = gathered_grad.shape[0]
+            shards = [torch.empty_like(gathered_grad) for _ in range(tp_size)]
+            torch.distributed.all_gather(shards, gathered_grad, tp_group)
+            gathered_grad = torch.cat(shards, dim=0)
+            tp_slice = (tp_rank, tp_local_rows)
+
+        if gathered_grad.shape[0] != expected_rows:
+            raise RuntimeError(
+                "Muon QKV split shape mismatch after gathering: "
+                f"grad_shape={tuple(gathered_grad.shape)}, expected_rows={expected_rows}"
+            )
+        return gathered_grad, tp_slice, gtp_slice
+
+    @staticmethod
+    def _restore_local_qkv_grad(gathered_grad, tp_slice, gtp_slice):
+        """Restore the TP and GTP-remat shards recorded by ``_gather_qkv_grad``."""
+        if tp_slice is not None:
+            tp_rank, tp_local_rows = tp_slice
+            gathered_grad = gathered_grad[
+                tp_rank * tp_local_rows : (tp_rank + 1) * tp_local_rows
+            ]
+        if gtp_slice is not None:
+            gtp_rank, gtp_local_rows = gtp_slice
+            gathered_grad = gathered_grad[
+                gtp_rank * gtp_local_rows : (gtp_rank + 1) * gtp_local_rows
+            ]
+        return gathered_grad.contiguous()
+
     def _orthogonalize_split_qkv(self, grad, split_shapes, orthogonalize_fn):
         """Split and reconstruct Megatron's interleaved fused QKV update."""
         if grad.ndim != 2:
@@ -381,53 +454,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if qkv_split_shapes is None:
             raise RuntimeError("Muon per-head QKV split requested but qkv_split_shapes is not set")
         if not qkv_split_shapes or any(size <= 0 for size in qkv_split_shapes):
-            raise RuntimeError(f"Muon per-head QKV split shapes must be positive: {qkv_split_shapes}")
-
-        gathered_grad = grad
-        gtp_slice = None
-        gtp_remat_group = self._get_gtp_remat_group(p)
-        if (
-            not use_local_layout
-            and gtp_remat_group is not None
-            and get_pg_size(gtp_remat_group) > 1
-            and getattr(p, 'is_gtp_weight_remat', False)
-        ):
-            gtp_size = get_pg_size(gtp_remat_group)
-            gtp_rank = get_pg_rank(gtp_remat_group)
-            gtp_local_rows = gathered_grad.shape[0]
-            shards = [torch.empty_like(gathered_grad) for _ in range(gtp_size)]
-            torch.distributed.all_gather(shards, gathered_grad, gtp_remat_group)
-            gathered_grad = torch.cat(shards, dim=0)
-            gtp_slice = (gtp_rank, gtp_local_rows)
+            raise RuntimeError(
+                f"Muon per-head QKV split shapes must be positive: {qkv_split_shapes}"
+            )
 
         expected_rows = sum(qkv_split_shapes)
-        tp_slice = None
-        if gathered_grad.shape[0] != expected_rows:
-            partition_dim = getattr(p, "partition_dim", None)
-            if partition_dim != 0 or tp_group is None:
-                raise RuntimeError(
-                    f"Muon per-head QKV split shape mismatch: grad_shape={tuple(gathered_grad.shape)}, "
-                    f"split_shapes={qkv_split_shapes}, partition_dim={partition_dim}"
-                )
-            tp_size = get_pg_size(tp_group)
-            if gathered_grad.shape[0] * tp_size != expected_rows:
-                raise RuntimeError(
-                    "Muon per-head QKV split cannot reconstruct the global tensor: "
-                    f"local_grad_shape={tuple(gathered_grad.shape)}, tp_size={tp_size}, "
-                    f"split_shapes={qkv_split_shapes}"
-                )
-            tp_rank = get_pg_rank(tp_group)
-            tp_local_rows = gathered_grad.shape[0]
-            shards = [torch.empty_like(gathered_grad) for _ in range(tp_size)]
-            torch.distributed.all_gather(shards, gathered_grad, tp_group)
-            gathered_grad = torch.cat(shards, dim=0)
-            tp_slice = (tp_rank, tp_local_rows)
-
-        if gathered_grad.shape[0] != expected_rows:
-            raise RuntimeError(
-                "Muon per-head QKV split shape mismatch after gathering: "
-                f"grad_shape={tuple(gathered_grad.shape)}, split_shapes={qkv_split_shapes}"
-            )
+        gathered_grad, tp_slice, gtp_slice = self._gather_qkv_grad(
+            p, grad, tp_group, expected_rows, gather_gtp=not use_local_layout
+        )
 
         gathered_grad = self._orthogonalize_split_qkv(
             gathered_grad,
@@ -437,17 +471,31 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             ),
         )
 
-        if tp_slice is not None:
-            tp_rank, tp_local_rows = tp_slice
-            gathered_grad = gathered_grad[
-                tp_rank * tp_local_rows : (tp_rank + 1) * tp_local_rows
-            ]
-        if gtp_slice is not None:
-            gtp_rank, gtp_local_rows = gtp_slice
-            gathered_grad = gathered_grad[
-                gtp_rank * gtp_local_rows : (gtp_rank + 1) * gtp_local_rows
-            ]
-        return gathered_grad.contiguous()
+        return self._restore_local_qkv_grad(gathered_grad, tp_slice, gtp_slice)
+
+    def _orthogonalize_fragmented_qkv(self, p, grad, tp_group, split_shapes):
+        """Orthogonalize projections after reconstructing fragmented query-group blocks."""
+        global_split_shapes = getattr(p, "qkv_split_shapes_global", None)
+        if global_split_shapes is None:
+            raise RuntimeError("Muon fragmented QKV split requires global split shapes")
+        expected_rows = sum(global_split_shapes)
+        if expected_rows % sum(split_shapes) != 0:
+            raise RuntimeError(
+                f"Muon global QKV layout does not contain complete query groups: "
+                f"global_split_shapes={global_split_shapes}, split_shapes={split_shapes}"
+            )
+
+        gathered_grad, tp_slice, gtp_slice = self._gather_qkv_grad(
+            p, grad, tp_group, expected_rows
+        )
+        gathered_grad = self._orthogonalize_split_qkv(
+            gathered_grad,
+            split_shapes,
+            lambda projection_grad: self.scaled_orthogonalize_fn(
+                projection_grad, tp_group=None, partition_dim=None
+            ),
+        )
+        return self._restore_local_qkv_grad(gathered_grad, tp_slice, gtp_slice)
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
@@ -484,6 +532,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 qkv_split_shapes = self.qkv_split_shapes
             if qkv_split_shapes is None:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
+            if (
+                getattr(p, "qkv_split_groups_are_complete", None) is False
+                and getattr(p, "qkv_split_shapes_global", None) is not None
+            ):
+                return self._orthogonalize_fragmented_qkv(
+                    p, grad, tp_group, qkv_split_shapes
+                )
             qkv_split_dim = sum(qkv_split_shapes)
             if grad_shape[0] % qkv_split_dim != 0:
                 raise RuntimeError(

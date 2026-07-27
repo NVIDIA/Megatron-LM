@@ -17,6 +17,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     TensorParallelMuon,
     _get_qkv_split_shapes,
     _localize_qkv_split_shapes,
+    _qkv_split_groups_are_complete,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
@@ -105,6 +106,16 @@ def test_muon_local_qkv_head_split_shapes_can_differ_by_tp_rank():
     assert not rank_1_complete
     assert aligned_shapes == [64] * 10
     assert aligned_complete
+
+
+def test_muon_qkv_query_group_layout_localization():
+    """Projection splitting detects query groups fragmented by TP row ranges."""
+    split_shapes = [256, 64, 64]
+
+    assert _qkv_split_groups_are_complete(split_shapes, local_start=0, local_rows=384)
+    assert _qkv_split_groups_are_complete(split_shapes, local_start=384, local_rows=768)
+    assert not _qkv_split_groups_are_complete(split_shapes, local_start=0, local_rows=192)
+    assert not _qkv_split_groups_are_complete(split_shapes, local_start=192, local_rows=192)
 
 
 def test_muon_optimizer_smoke():
@@ -578,6 +589,57 @@ class TestMuonOptimizerMultiRankTP:
             dim=0,
         )
         expected = expected_global[tp_rank * 3 : (tp_rank + 1) * 3]
+        torch.testing.assert_close(actual, expected)
+
+    @pytest.mark.parametrize("split_shapes", ([4, 2, 2], [4, 4, 2, 2]))
+    def test_muon_optimizer_projection_split_gathers_fragmented_query_group(
+        self, split_shapes
+    ):
+        """Projection splitting reconstructs a query group split over TP ranks."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_group = pg_collection.tp
+        tp_rank = tp_group.rank()
+        global_rows = sum(split_shapes)
+        assert global_rows % tp_group.size() == 0
+        local_rows = global_rows // tp_group.size()
+        local_grad = torch.arange(local_rows * 4, dtype=torch.float32, device='cuda').view(
+            local_rows, 4
+        )
+        local_grad = local_grad + tp_rank * local_grad.numel()
+        param = torch.nn.Parameter(torch.zeros_like(local_grad))
+        param.partition_dim = 0
+        param.is_qkv = True
+        param.qkv_split_shapes = split_shapes
+        param.qkv_split_shapes_global = split_shapes
+        param.qkv_split_groups_are_complete = False
+
+        optimizer = TensorParallelMuon(
+            params=[param],
+            split_qkv=True,
+            is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+            qkv_split_shapes=split_shapes,
+            pg_collection=pg_collection,
+            tp_mode="blockwise",
+        )
+
+        def center_rows(x, tp_group=None, partition_dim=None):
+            del tp_group, partition_dim
+            return x - x.mean(dim=-2, keepdim=True)
+
+        optimizer.scaled_orthogonalize_fn = center_rows
+        actual = optimizer.orthogonalize(param, local_grad)
+
+        shards = [torch.empty_like(local_grad) for _ in range(tp_group.size())]
+        torch.distributed.all_gather(shards, local_grad, tp_group)
+        global_grad = torch.cat(shards, dim=0)
+        expected_global = torch.cat(
+            [
+                center_rows(projection)
+                for projection in torch.split(global_grad, split_shapes, dim=0)
+            ],
+            dim=0,
+        )
+        expected = expected_global[tp_rank * local_rows : (tp_rank + 1) * local_rows]
         torch.testing.assert_close(actual, expected)
 
 

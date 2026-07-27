@@ -65,6 +65,7 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "is_qkv": False,
     "qkv_split_shapes": None,
     "qkv_split_shapes_global": None,
+    "qkv_split_groups_are_complete": False,
     "qkv_split_heads_are_complete": False,
     "tensor_model_parallel": False,
     "partition_dim": -1,
