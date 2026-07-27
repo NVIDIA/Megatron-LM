@@ -9,6 +9,7 @@ CUDA-graph compatible: all indirection table construction happens on-device
 via Triton kernels with fixed-size buffers and valid_tokens gating.
 """
 
+import os
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -97,6 +98,55 @@ def _get_default_config(M: int, E: int, top_k: int) -> dict:
         'num_warps': num_warps,
         'num_stages': num_stages,
     }
+
+
+# Retune the two grouped GEMMs independently for the MoE *decode* regime.
+# Env-toggleable for A/B; the tuned path is the same kernel with different tile
+# sizes, so it differs from the default only in fp32 accumulation order.
+_TUNE_DECODE_GEMM: bool = os.environ.get("MCORE_MOE_GEMM_TUNE", "0") == "1"
+
+
+def _get_decode_tuned_configs(M: int, E: int, top_k: int) -> tuple[dict, dict]:
+    """Per-GEMM launch configs for the decode regime; returns (fc1, fc2).
+
+    Measured on GB200 at the Qwen3-30B-A3B EP4 decode shape (hidden 2048,
+    moe_ffn 768, 32 local experts, top-8, 256 tokens): expert-weight traffic is
+    302 MB per layer against a 6.08 TB/s streaming-read ceiling, i.e. a 49.7 us
+    floor, while `_get_default_config` lands at 72.1 us. The gap is *not* FLOPs
+    (63-83 TFLOP/s achieved, ~3% of BF16 peak) and not the indirection-table
+    padding (shrinking it 3.9x -> 1.5x buys only ~1.2x); it is tile-quantized
+    SM occupancy. `_get_default_config` picks BLOCK_SIZE_N=128 for both GEMMs,
+    which leaves FC1 at ceil(768/128)=6 N-tiles x 32 M-tiles = 192 CTAs on 148
+    SMs — 1.3 waves, so ~30% of the machine idles in the tail.
+
+    So the two GEMMs want opposite N-tiles at decode: FC1 (narrow N=768) needs a
+    *small* BLOCK_SIZE_N to manufacture enough CTAs to fill the GPU, while FC2
+    (wide N=2048) already has plenty and prefers a *large* one for weight-load
+    efficiency. `_get_default_config` cannot express that because vLLM shares one
+    config across both passes. BLOCK_SIZE_M stays shared — one indirection table
+    is built for both GEMMs — and is dropped to 16 to cut padded rows as well.
+
+    Measured FC1+FC2, median of 3 x 300 iters: 72.13 us default -> 57.24 us here
+    (1.26x), i.e. 1.15x off the streaming-read floor.
+
+    Falls back to the shared default outside the decode regime (large M is
+    compute-bound and vLLM's heuristic is tuned for it).
+    """
+    default = _get_default_config(M, E, top_k)
+    # Measured CUDA-graph device time vs the default config: 1.289x at 128
+    # tokens, 1.197x at 256 (the decode point, = local_tokens * ep_size),
+    # 1.120x at 384, but 0.952x at 512 — past ~384 tokens there are already
+    # enough M-tiles to fill the GPU and the narrow FC1 tile starts costing
+    # weight-load efficiency. Hand back to upstream's heuristic there.
+    if M > 384:
+        return default, default
+    shared = dict(default)
+    shared['BLOCK_SIZE_M'] = 16
+    shared['GROUP_SIZE_M'] = 1
+    shared['BLOCK_SIZE_K'] = 64
+    fc1 = dict(shared, BLOCK_SIZE_N=64, num_warps=4, num_stages=3)
+    fc2 = dict(shared, BLOCK_SIZE_N=256, num_warps=8, num_stages=4)
+    return fc1, fc2
 
 
 @triton.jit
@@ -319,6 +369,424 @@ def _fill_expert_block_ids_kernel(
         tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
 
 
+@triton.jit
+def _prefix_fill_init_kernel(
+    tokens_per_expert_ptr,  # [num_local_experts] raw token counts
+    exclusive_offsets_ptr,  # [num_local_experts] out: exclusive prefix sum (scatter counters)
+    inclusive_offsets_ptr,  # [num_local_experts] out: inclusive prefix sum
+    expert_ids_ptr,  # [max_blocks] out: expert index per BLOCK_SIZE_M block
+    sorted_token_ids_ptr,  # [max_sorted] out: SENTINEL-initialized indirection table
+    num_local_experts,
+    SENTINEL: tl.constexpr,
+    ALIGNMENT: tl.constexpr,  # = BLOCK_SIZE_M
+    NLE_POW2: tl.constexpr,  # next_power_of_2(num_local_experts) for tl.cumsum
+    FILL_BLOCK: tl.constexpr,  # vectorized store width
+):
+    """Fused prefix-sum + expert_ids fill + sorted_token_ids SENTINEL init.
+
+    Merges three kernels of the original indirection-table build
+    (``_init_sorted_ids_kernel`` + ``_prefix_sum_kernel`` +
+    ``_fill_expert_block_ids_kernel``) into one launch. Grid: one CTA per local
+    expert. Every CTA recomputes the (tiny, num_local_experts-wide) aligned
+    cumsum in registers, then CTA ``e`` writes only its own disjoint slices:
+
+      - exclusive_offsets[e], inclusive_offsets[e]   (offset arrays)
+      - expert_ids[excl_e//BM : incl_e//BM] = e      (block→expert map)
+      - sorted_token_ids[excl_e : incl_e] = SENTINEL (padding for its block)
+
+    The union of the per-expert [excl_e, incl_e) ranges is exactly
+    [0, num_tokens_post_padded), which is the only region the grouped-GEMM
+    reads (it strides tiles up to cdiv(num_tokens_post_padded, BM)); the buffer
+    tail beyond that is never read, so it needs no initialization. The
+    subsequent scatter overwrites the real token slots at the front of each
+    expert's block, leaving the alignment padding at SENTINEL. Correctness is
+    identical to the 3-kernel path; the only difference is fewer launches.
+    """
+    e = tl.program_id(0)
+    r = tl.arange(0, NLE_POW2)
+    mask = r < num_local_experts
+    h = tl.load(tokens_per_expert_ptr + r, mask=mask, other=0)
+    if ALIGNMENT > 1:
+        h = tl.where(h > 0, ((h + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT, h)
+    inc = tl.cumsum(h, axis=0)
+    exc = inc - h
+    # Select this CTA's own offsets by masked reduction over the lane axis.
+    excl_e = tl.sum(tl.where(r == e, exc, 0))
+    incl_e = tl.sum(tl.where(r == e, inc, 0))
+    tl.store(exclusive_offsets_ptr + e, excl_e)
+    tl.store(inclusive_offsets_ptr + e, incl_e)
+
+    start_block = excl_e // ALIGNMENT
+    end_block = incl_e // ALIGNMENT
+    for off in tl.range(start_block, end_block, FILL_BLOCK):
+        idxs = off + tl.arange(0, FILL_BLOCK)
+        tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
+
+    for off in tl.range(excl_e, incl_e, FILL_BLOCK):
+        idxs = off + tl.arange(0, FILL_BLOCK)
+        tl.store(sorted_token_ids_ptr + idxs, SENTINEL, mask=idxs < incl_e)
+
+
+@triton.jit
+def _count_prefix_fill_init_kernel(
+    routing_map_ptr,  # [max_tokens, topk] expert assignments (global IDs)
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: valid tokens this iteration
+    exclusive_offsets_ptr,  # [num_local_experts] out: exclusive prefix sum (scatter counters)
+    inclusive_offsets_ptr,  # [num_local_experts] out: inclusive prefix sum
+    expert_ids_ptr,  # [max_blocks] out: expert index per BLOCK_SIZE_M block
+    sorted_token_ids_ptr,  # [max_sorted] out: SENTINEL-initialized indirection table
+    num_local_experts,
+    local_expert_start,
+    topk: tl.constexpr,
+    SENTINEL: tl.constexpr,
+    ALIGNMENT: tl.constexpr,  # = BLOCK_SIZE_M
+    NUM_BINS: tl.constexpr,  # next_power_of_2(num_local_experts + 1)
+    COUNT_BLOCK: tl.constexpr,  # pairs histogrammed per iteration
+    FILL_BLOCK: tl.constexpr,  # vectorized store width
+):
+    """``_prefix_fill_init_kernel`` with the per-expert token count folded in.
+
+    ``_prefix_fill_init_kernel`` already has every CTA redundantly recompute the
+    tiny ``num_local_experts``-wide cumsum in registers, and its only input is
+    the count vector. That vector costs two extra launches to produce: a
+    ``torch.zeros`` fill for the counters plus
+    ``_count_local_tokens_kernel_persistent``. Recomputing the histogram
+    redundantly in every CTA removes both launches.
+
+    The count kernel is far more expensive than its work implies (measured 7.52
+    us of device time in the BS256 decode graph, against a 0.72 us empty-kernel
+    floor, to bucket 2048 int32s): with ``BLOCK_SIZE=1024`` and 2048 valid pairs
+    only 2 of its 152 CTAs receive any work, and each issues 1024 global atomics
+    contending on 32 counters. Here each CTA instead accumulates a private
+    register histogram over the same pairs, so there are no global atomics and
+    no cross-CTA ordering at all.
+
+    Counts are integer-identical to the atomic path, so the whole indirection
+    table -- and therefore the GEMM output -- is unchanged.
+
+    Redundant work is the trade: every CTA reads all ``valid_pairs`` entries, so
+    the read volume is ``num_local_experts x`` the atomic path's. At decode that
+    is 32 x 8 KB from L2 and free; the caller restricts this variant to the
+    decode regime for that reason.
+    """
+    e = tl.program_id(0)
+    valid_pairs = tl.load(valid_tokens_ptr) * topk
+
+    # Private per-CTA histogram of local expert IDs. Non-local and out-of-range
+    # pairs are folded into the dropped bin `num_local_experts`, which NUM_BINS
+    # is sized to hold and the mask below discards.
+    acc = tl.zeros([NUM_BINS], dtype=tl.int32)
+    for base in tl.range(0, valid_pairs, COUNT_BLOCK):
+        offs = base + tl.arange(0, COUNT_BLOCK)
+        m = offs < valid_pairs
+        eids = tl.load(routing_map_ptr + offs, mask=m, other=-1)
+        lids = eids - local_expert_start
+        is_local = (lids >= 0) & (lids < num_local_experts) & m
+        # routing_map is int64; tl.histogram wants int32 bin indices.
+        bins = tl.where(is_local, lids, num_local_experts).to(tl.int32)
+        acc += tl.histogram(bins, NUM_BINS)
+
+    r = tl.arange(0, NUM_BINS)
+    mask = r < num_local_experts
+    h = tl.where(mask, acc, 0)
+    if ALIGNMENT > 1:
+        h = tl.where(h > 0, ((h + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT, h)
+    inc = tl.cumsum(h, axis=0)
+    exc = inc - h
+    excl_e = tl.sum(tl.where(r == e, exc, 0))
+    incl_e = tl.sum(tl.where(r == e, inc, 0))
+    tl.store(exclusive_offsets_ptr + e, excl_e)
+    tl.store(inclusive_offsets_ptr + e, incl_e)
+
+    start_block = excl_e // ALIGNMENT
+    end_block = incl_e // ALIGNMENT
+    for off in tl.range(start_block, end_block, FILL_BLOCK):
+        idxs = off + tl.arange(0, FILL_BLOCK)
+        tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
+
+    for off in tl.range(excl_e, incl_e, FILL_BLOCK):
+        idxs = off + tl.arange(0, FILL_BLOCK)
+        tl.store(sorted_token_ids_ptr + idxs, SENTINEL, mask=idxs < incl_e)
+
+
+@triton.jit
+def _align_single_kernel(
+    routing_map_ptr,  # [max_tokens, topk] expert assignments (global IDs)
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: valid tokens this iteration
+    exclusive_offsets_ptr,  # [num_local_experts] out: exclusive prefix sum
+    inclusive_offsets_ptr,  # [num_local_experts] out: inclusive prefix sum
+    expert_ids_ptr,  # [max_blocks] out: expert index per BLOCK_SIZE_M block
+    sorted_token_ids_ptr,  # [max_sorted] out: indirection table
+    num_local_experts,
+    local_expert_start,
+    topk: tl.constexpr,
+    SENTINEL: tl.constexpr,
+    ALIGNMENT: tl.constexpr,  # = BLOCK_SIZE_M
+    NUM_BINS: tl.constexpr,  # next_power_of_2(num_local_experts + 1)
+    COUNT_BLOCK: tl.constexpr,  # pairs processed per iteration
+    FILL_BLOCK: tl.constexpr,  # vectorized store width
+):
+    """``_count_prefix_fill_init_kernel`` with the scatter folded in: the whole
+    indirection-table build in one launch.
+
+    CTA ``e`` owns local expert ``e`` and the disjoint output slice
+    ``[excl_e, incl_e)``. It already streams every valid pair once to build its
+    private histogram; a second streaming pass over the same (L2-resident, 16 KB
+    at decode) pairs lets it place its own pairs itself. Within a pass the
+    destination is ``excl_e + written_so_far + exclusive_cumsum(is_mine)``, so
+    no global atomics and no cross-CTA ordering are involved, and the resulting
+    table is deterministic (ascending pair index within each expert block)
+    rather than atomically permuted.
+
+    The second pass is why this is not free: it doubles the redundant read of
+    the routing map. The pairs are tiny and cached, so the trade is one removed
+    launch (``_scatter_token_indices_kernel``, measured 2.66 us + 0.55 us of
+    dispatch gap per layer in the BS256 decode graph) against that extra pass.
+
+    Row order within an expert block does not affect the result: each row of
+    ``sorted_token_ids`` is a ``token * topk + slot`` pair index, and the FC2
+    output is indexed by that same pair index, so any permutation within a
+    block produces identical values downstream.
+    """
+    e = tl.program_id(0)
+    valid_pairs = tl.load(valid_tokens_ptr) * topk
+
+    acc = tl.zeros([NUM_BINS], dtype=tl.int32)
+    for base in tl.range(0, valid_pairs, COUNT_BLOCK):
+        offs = base + tl.arange(0, COUNT_BLOCK)
+        m = offs < valid_pairs
+        eids = tl.load(routing_map_ptr + offs, mask=m, other=-1)
+        lids = eids - local_expert_start
+        is_local = (lids >= 0) & (lids < num_local_experts) & m
+        bins = tl.where(is_local, lids, num_local_experts).to(tl.int32)
+        acc += tl.histogram(bins, NUM_BINS)
+
+    r = tl.arange(0, NUM_BINS)
+    mask = r < num_local_experts
+    h = tl.where(mask, acc, 0)
+    if ALIGNMENT > 1:
+        h = tl.where(h > 0, ((h + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT, h)
+    inc = tl.cumsum(h, axis=0)
+    exc = inc - h
+    excl_e = tl.sum(tl.where(r == e, exc, 0))
+    incl_e = tl.sum(tl.where(r == e, inc, 0))
+    tl.store(exclusive_offsets_ptr + e, excl_e)
+    tl.store(inclusive_offsets_ptr + e, incl_e)
+
+    start_block = excl_e // ALIGNMENT
+    end_block = incl_e // ALIGNMENT
+    for off in tl.range(start_block, end_block, FILL_BLOCK):
+        idxs = off + tl.arange(0, FILL_BLOCK)
+        tl.store(expert_ids_ptr + idxs, e, mask=idxs < end_block)
+
+    # SENTINEL-fill this expert's slice first; the scatter below overwrites the
+    # real pairs at the front of it and leaves the alignment padding sentinel.
+    for off in tl.range(excl_e, incl_e, FILL_BLOCK):
+        idxs = off + tl.arange(0, FILL_BLOCK)
+        tl.store(sorted_token_ids_ptr + idxs, SENTINEL, mask=idxs < incl_e)
+
+    pos = excl_e
+    for base in tl.range(0, valid_pairs, COUNT_BLOCK):
+        offs = base + tl.arange(0, COUNT_BLOCK)
+        m = offs < valid_pairs
+        eids = tl.load(routing_map_ptr + offs, mask=m, other=-1)
+        is_mine = (eids - local_expert_start == e) & m
+        sel = is_mine.to(tl.int32)
+        rank = tl.cumsum(sel, axis=0) - sel
+        tl.store(sorted_token_ids_ptr + pos + rank, offs, mask=is_mine)
+        pos += tl.sum(sel)
+
+
+# Fuse init + prefix-sum + expert-block fill (3 tiny serial kernels) into one
+# launch in the decode indirection-table build. Env-toggleable for A/B; the
+# fused path is numerically identical to the default (only launch count differs).
+_USE_FUSED_ALIGN: bool = os.environ.get("MCORE_MOE_FUSED_ALIGN", "0") == "1"
+
+# Additionally fold the per-expert token count (and the `torch.zeros` fill of its
+# counter buffer) into that same launch, taking the decode indirection-table
+# build from 4 kernels to 2. Requires MCORE_MOE_FUSED_ALIGN. Integer-exact.
+_USE_FUSED_COUNT: bool = os.environ.get("MCORE_MOE_FUSED_COUNT", "0") == "1"
+
+# Above this token hint the redundant per-CTA histogram stops being free, so hand
+# back to the atomic count kernel, whose read volume does not scale with the
+# expert count. 512 matches the decode regime `_get_decode_tuned_configs` targets.
+_FUSED_COUNT_MAX_TOKENS = 512
+
+# Additionally fold the scatter into that same launch, taking the decode
+# indirection-table build from 2 kernels to 1. Requires MCORE_MOE_FUSED_COUNT.
+# Produces the same table up to row order within an expert block, which the
+# downstream pair-indexed GEMM is invariant to.
+_USE_FUSED_SCATTER: bool = os.environ.get("MCORE_MOE_FUSED_SCATTER", "0") == "1"
+
+
+def _moe_align_block_size_fused(
+    routing_map: torch.Tensor,
+    block_size: int,
+    num_local_experts: int,
+    local_expert_start: int,
+    valid_tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """3-kernel indirection-table build (count -> prefix_fill_init -> scatter).
+
+    Drop-in replacement for ``_moe_align_block_size_cuda_graphable`` that folds
+    the separate init + prefix-sum + fill kernels into ``_prefix_fill_init_kernel``.
+    Returns the same (sorted_token_ids, expert_ids, num_tokens_post_padded).
+    """
+    max_tokens, topk = routing_map.shape
+    device = routing_map.device
+
+    max_sorted = max_tokens * topk + block_size * (num_local_experts + 1)
+    max_blocks = _ceil_div(max_sorted, block_size)
+    sentinel = max_tokens * topk
+
+    sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
+    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+
+    tokens_per_expert = compute_local_tokens_per_expert(
+        routing_map, local_expert_start, num_local_experts, valid_tokens, persistent=True
+    )
+    exclusive_offsets = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+    inclusive_offsets = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+
+    _prefix_fill_init_kernel[(num_local_experts,)](
+        tokens_per_expert,
+        exclusive_offsets,
+        inclusive_offsets,
+        expert_ids,
+        sorted_token_ids,
+        num_local_experts,
+        SENTINEL=sentinel,
+        ALIGNMENT=block_size,
+        NLE_POW2=triton.next_power_of_2(num_local_experts),
+        FILL_BLOCK=128,
+    )
+
+    max_pairs = max_tokens * topk
+    SCATTER_BLOCK = 256
+    scatter_grid = _ceil_div(max_pairs, SCATTER_BLOCK)
+    _scatter_token_indices_kernel[(scatter_grid,)](
+        routing_map,
+        sorted_token_ids,
+        exclusive_offsets,
+        valid_tokens,
+        topk,
+        local_expert_start,
+        num_local_experts,
+        max_pairs,
+        BLOCK_SIZE=SCATTER_BLOCK,
+    )
+
+    num_tokens_post_padded = inclusive_offsets[-1:]
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+
+def _moe_align_block_size_count_fused(
+    routing_map: torch.Tensor,
+    block_size: int,
+    num_local_experts: int,
+    local_expert_start: int,
+    valid_tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """2-kernel indirection-table build (count_prefix_fill_init -> scatter).
+
+    Same contract and same outputs as ``_moe_align_block_size_fused``; it just
+    folds the token count and its counter-buffer zero-fill into the first launch.
+    """
+    max_tokens, topk = routing_map.shape
+    device = routing_map.device
+
+    max_sorted = max_tokens * topk + block_size * (num_local_experts + 1)
+    max_blocks = _ceil_div(max_sorted, block_size)
+    sentinel = max_tokens * topk
+
+    sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
+    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+    exclusive_offsets = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+    inclusive_offsets = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+
+    _count_prefix_fill_init_kernel[(num_local_experts,)](
+        routing_map,
+        valid_tokens,
+        exclusive_offsets,
+        inclusive_offsets,
+        expert_ids,
+        sorted_token_ids,
+        num_local_experts,
+        local_expert_start,
+        topk=topk,
+        SENTINEL=sentinel,
+        ALIGNMENT=block_size,
+        NUM_BINS=triton.next_power_of_2(num_local_experts + 1),
+        COUNT_BLOCK=1024,
+        FILL_BLOCK=128,
+    )
+
+    max_pairs = max_tokens * topk
+    SCATTER_BLOCK = 256
+    scatter_grid = _ceil_div(max_pairs, SCATTER_BLOCK)
+    _scatter_token_indices_kernel[(scatter_grid,)](
+        routing_map,
+        sorted_token_ids,
+        exclusive_offsets,
+        valid_tokens,
+        topk,
+        local_expert_start,
+        num_local_experts,
+        max_pairs,
+        BLOCK_SIZE=SCATTER_BLOCK,
+    )
+
+    num_tokens_post_padded = inclusive_offsets[-1:]
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+
+def _moe_align_block_size_single(
+    routing_map: torch.Tensor,
+    block_size: int,
+    num_local_experts: int,
+    local_expert_start: int,
+    valid_tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """1-kernel indirection-table build.
+
+    Same contract and same outputs as ``_moe_align_block_size_count_fused``,
+    with the scatter folded into the single launch as well. Row order within an
+    expert block is ascending pair index instead of atomically permuted; the
+    downstream GEMM indexes rows by pair id, so the result is unchanged.
+    """
+    max_tokens, topk = routing_map.shape
+    device = routing_map.device
+
+    max_sorted = max_tokens * topk + block_size * (num_local_experts + 1)
+    max_blocks = _ceil_div(max_sorted, block_size)
+    sentinel = max_tokens * topk
+
+    sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
+    expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
+    exclusive_offsets = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+    inclusive_offsets = torch.empty(num_local_experts, dtype=torch.int32, device=device)
+
+    _align_single_kernel[(num_local_experts,)](
+        routing_map,
+        valid_tokens,
+        exclusive_offsets,
+        inclusive_offsets,
+        expert_ids,
+        sorted_token_ids,
+        num_local_experts,
+        local_expert_start,
+        topk=topk,
+        SENTINEL=sentinel,
+        ALIGNMENT=block_size,
+        NUM_BINS=triton.next_power_of_2(num_local_experts + 1),
+        COUNT_BLOCK=1024,
+        FILL_BLOCK=128,
+    )
+
+    num_tokens_post_padded = inclusive_offsets[-1:]
+    return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+
 def _moe_align_block_size_cuda_graphable(
     routing_map: torch.Tensor,
     block_size: int,
@@ -525,6 +993,70 @@ def _moe_sum_kernel(
             tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
 
 
+@triton.jit
+def _moe_sum_kernel_fast(
+    input_ptr,
+    output_ptr,
+    topk_weights_ptr,
+    valid_tokens_ptr,
+    routing_map_ptr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
+    K,
+    topk: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+):
+    """``_moe_sum_kernel`` with the locality test predicated instead of branched.
+
+    Same reduction, same order, same fp32 arithmetic — so bit-exact — but the
+    ``if lid >= 0 and lid < num_local_experts`` guard becomes a load mask. In the
+    branched form each of the ``topk`` iterations is a uniform scalar branch
+    gated on a dependent global load of ``routing_map``, so the compiler cannot
+    overlap iteration ``t``'s data load with iteration ``t+1``'s index load and
+    the CTA walks the topk slots serially. Predicating lets all ``topk`` data
+    loads issue back to back; masked-off lanes read nothing and contribute an
+    exact fp32 zero.
+
+    Measured cost of the branched form in the BS256 decode graph: 7.79 us per
+    layer to move ~6.3 MB, i.e. 7x its own ~1.05 us bandwidth floor at the
+    6.08 TB/s measured in QWEN-012.
+    """
+    pid = tl.program_id(0)
+    valid_tokens = tl.load(valid_tokens_ptr)
+
+    for token_id in tl.range(pid, valid_tokens, BLOCK_M):
+        token_id_i64 = token_id.to(tl.int64)
+        base = token_id_i64 * topk * K
+
+        for k_idx in range(NUM_K_BLOCKS):
+            offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+
+            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+            for t in tl.static_range(topk):
+                eid = tl.load(routing_map_ptr + token_id * topk + t)
+                lid = eid - local_expert_start
+                is_local = (lid >= 0) & (lid < num_local_experts)
+                v = tl.load(
+                    input_ptr + base + t * K + offs_k, mask=k_mask & is_local, other=0.0
+                )
+                w = tl.load(topk_weights_ptr + token_id * topk + t)
+                acc += v.to(tl.float32) * tl.where(is_local, w, 0.0)
+
+            tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
+
+
+# Use the predicated `_moe_sum_kernel_fast` (bit-exact) with a full-K tile in the
+# decode topk reduction. Env-toggleable for A/B; default off.
+_USE_FAST_MOE_SUM: bool = os.environ.get("MCORE_MOE_SUM_FAST", "0") == "1"
+
+# Full hidden-size K tile: one pass over topk per token instead of NUM_K_BLOCKS
+# passes, so the per-token routing_map/prob index loads are issued once.
+_FAST_MOE_SUM_MAX_BLOCK_K = 2048
+
+
 def _moe_sum(
     input: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -550,9 +1082,28 @@ def _moe_sum(
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
+    BLOCK_M = _get_num_sms(input.device)
+    if _USE_FAST_MOE_SUM:
+        BLOCK_K = min(triton.next_power_of_2(K), _FAST_MOE_SUM_MAX_BLOCK_K)
+        NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
+        _moe_sum_kernel_fast[(BLOCK_M,)](
+            input,
+            out,
+            topk_weights,
+            valid_tokens,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            K,
+            topk=topk,
+            BLOCK_M=BLOCK_M,
+            BLOCK_K=BLOCK_K,
+            NUM_K_BLOCKS=NUM_K_BLOCKS,
+            num_warps=8,
+        )
+        return out
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    BLOCK_M = _get_num_sms(input.device)
     _moe_sum_kernel[(BLOCK_M,)](
         input,
         out,
@@ -626,10 +1177,30 @@ def vllm_fused_moe(
 
     # Mirror upstream vLLM: pick the full launch config (tile sizes, warps,
     # stages) host-side from the token-count hint, not from the worst-case
-    # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
-    config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
+    # buffer size. Same config is used for both FC1 and FC2 (matches vLLM),
+    # unless the decode retune is enabled, which tiles the two passes
+    # separately (they have very different N) around a shared BLOCK_SIZE_M.
+    if _TUNE_DECODE_GEMM:
+        config_fc1, config_fc2 = _get_decode_tuned_configs(
+            M=effective_tokens, E=num_local_experts, top_k=topk
+        )
+    else:
+        config_fc1 = config_fc2 = _get_default_config(
+            M=effective_tokens, E=num_local_experts, top_k=topk
+        )
+    # BLOCK_SIZE_M is shared: one indirection table feeds both GEMMs.
+    config = config_fc1
 
-    sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
+    if _USE_FUSED_ALIGN and _USE_FUSED_COUNT and effective_tokens <= _FUSED_COUNT_MAX_TOKENS:
+        if _USE_FUSED_SCATTER:
+            align_fn = _moe_align_block_size_single
+        else:
+            align_fn = _moe_align_block_size_count_fused
+    elif _USE_FUSED_ALIGN:
+        align_fn = _moe_align_block_size_fused
+    else:
+        align_fn = _moe_align_block_size_cuda_graphable
+    sorted_token_ids, expert_ids, num_post_padded = align_fn(
         routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
     )
     num_valid = max_tokens * topk
@@ -653,8 +1224,8 @@ def vllm_fused_moe(
     block_m = config['BLOCK_SIZE_M']
     em_hint = effective_tokens * topk + block_m * num_local_experts
     num_pid_m_hint = _ceil_div(em_hint, block_m)
-    num_pid_n_fc1 = _ceil_div(fc1_out_width, config['BLOCK_SIZE_N'])
-    num_pid_n_fc2 = _ceil_div(K, config['BLOCK_SIZE_N'])
+    num_pid_n_fc1 = _ceil_div(fc1_out_width, config_fc1['BLOCK_SIZE_N'])
+    num_pid_n_fc2 = _ceil_div(K, config_fc2['BLOCK_SIZE_N'])
     grid_size_fc1 = num_pid_m_hint * num_pid_n_fc1
     grid_size_fc2 = num_pid_m_hint * num_pid_n_fc2
 
@@ -678,7 +1249,7 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=topk,
-        config=config,
+        config=config_fc1,
         grid_size=grid_size_fc1,
         fuse_squared_relu=not is_swiglu,
         fuse_swiglu=use_fused_swiglu,
@@ -707,7 +1278,7 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=1,
-        config=config,
+        config=config_fc2,
         grid_size=grid_size_fc2,
     )
 

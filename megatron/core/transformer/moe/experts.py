@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -1203,7 +1204,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # Fuse SiLU(gate)*up into the FC1 epilogue: removes the standalone
             # bounded_silu_mul kernel and the 2N intermediate HBM round-trip.
             # No-op for non-SwiGLU activations. ~1.25x on the decode MoE path.
-            fuse_fc1_activation=True,
+            # Env-gated (default on) so the clean baseline can A/B it in-session.
+            fuse_fc1_activation=os.environ.get("MCORE_FUSE_FC1_ACT", "1") == "1",
         )
         return output, None
 
