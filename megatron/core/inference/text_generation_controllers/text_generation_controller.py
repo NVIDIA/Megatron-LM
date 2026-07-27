@@ -198,8 +198,10 @@ class TextGenerationController:
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             self.pp_group = pg_collection.pp
+            self.dp_group = pg_collection.dp
         else:
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
+            self.dp_group = parallel_state.get_data_parallel_group()
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
@@ -211,8 +213,20 @@ class TextGenerationController:
         else:
             self.vocab_size = unwrapped_model.vocab_size
 
+        # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
+        # unique generation seed (avoids identical samples when the same prompt is
+        # assigned to multiple DP ranks, which can corrupt RL training). Controlled by
+        # InferenceConfig.offset_sampling_seed_by_dp_rank, but deactivated when enabling
+        # --deterministic-mode (model_config.deterministic_mode).
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
+        seed = self.model_config.inference_sampling_seed
+        offset_by_dp = (
+            inference_config.offset_sampling_seed_by_dp_rank
+            and not self.model_config.deterministic_mode
+        )
+        if offset_by_dp:
+            seed += torch.distributed.get_rank(group=self.dp_group)
+        self.sampling_rng.manual_seed(seed)
 
         if not self.num_speculative_tokens:
             self.num_mtp_depths = 0
@@ -890,10 +904,13 @@ class TextGenerationController:
         Returns:
             Tensor: Sampled tokens of shape [num_requests].
         """
+        no_top_k, no_top_p = self._active_requests_sampling_filter_flags()
         return self._sampling.sample_kernel(
             logits_2d,
             logits_2d.shape[0],
             self.inference_wrapped_model.inference_context,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
             eager=True,
         )
 
@@ -1081,24 +1098,17 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Sampling-side request counts: padded when running a captured graph.
-        # Verify uses the actual counts so the Triton kernels operate on the real workload.
-        use_graph_for_sampling = (
-            self._sampling_backend == "flashinfer"
-            and self._enable_cuda_graph
-            and context.using_cuda_graph_this_step()
-        )
-        if use_graph_for_sampling:
-            sample_num_decode = context.padded_batch_dimensions.decode_req_count
-            sample_num_prefill = context.padded_batch_dimensions.prefill_req_count
-        else:
-            sample_num_decode = context.num_decode_requests
-            sample_num_prefill = context.num_prefill_requests
+        # The FlashInfer sampler runs eagerly (never CUDA-graphed), so verify with the
+        # actual request counts. When the forward pass is graphed `required_logits` is
+        # padded to a static shape, but sampling only the actual token prefix (below)
+        # leaves the trailing padded rows unsampled.
+        sample_num_decode = context.num_decode_requests
+        sample_num_prefill = context.num_prefill_requests
 
         # Logit indices for tokens that need sampling.
-        # Padded under graph capture so the captured `gather_indices` input has a stable shape.
-        # Padded slots resolve to row 0; verify and prepare-next read only the actual prefix,
-        # so the padded-row samples produced by the captured kernel are discarded.
+        # `speculative_required_logit_indices()` pads to a static shape when the forward
+        # pass is graphed (trailing slots resolve to row 0); sampling uses the actual
+        # counts, so those padded slots are never sampled.
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
@@ -1128,12 +1138,6 @@ class TextGenerationController:
             self.num_speculative_tokens,
             context,
             gather_indices=sample_gather_indices,
-            eager=not use_graph_for_sampling,
-            cache_key=(
-                ("sample_speculative", sample_num_decode, sample_num_prefill)
-                if use_graph_for_sampling
-                else None
-            ),
         )
         nvtx_range_pop("mtp-spec-decoding/verify/sample")
 
@@ -1212,13 +1216,9 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        use_graph = (
-            self._sampling_backend == "flashinfer"
-            and self._enable_cuda_graph
-            and context.using_cuda_graph_this_step()
-        )
-        # Padded count when running a captured graph (cache key buckets); actual otherwise.
-        n = context.padded_active_request_count if use_graph else active_request_count
+        # The FlashInfer sampler runs eagerly (never CUDA-graphed), so sample the
+        # actual active rows -- there is no captured static shape to pad up to.
+        n = active_request_count
         # When `materialize_only_last_token_logits` is true the forward pass already
         # selected the right rows. Otherwise we point the kernel at the per-request
         # last-token positions via `gather_indices`; padded slots safely fan in to row 0.
@@ -1227,17 +1227,45 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.gpu_view.active_request_last_token_idxs
         )
-        sampled_tokens_cuda = self._sampling.sample_kernel(
+        no_top_k, no_top_p = self._active_requests_sampling_filter_flags(active_request_count)
+        sampled_tokens = self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
             gather_indices=gather_indices,
-            eager=not use_graph,
-            cache_key=("sample", n) if use_graph else None,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
         )
-        self._sampled_tokens_cuda[:active_request_count].copy_(
-            sampled_tokens_cuda[:active_request_count]
+        # Copy into the stable `max_requests` buffer rather than rebinding it. The spec
+        # (`sampled_tokens_buf`) and async-scheduling (`torch.max(out=...)`) paths both
+        # write into this buffer in place and rely on its address staying fixed, so this
+        # path must keep the same contract (see the `__init__` allocation comment).
+        self._sampled_tokens_cuda[:n].copy_(sampled_tokens)
+
+    def _active_requests_sampling_filter_flags(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """Return ``(no_top_k, no_top_p)`` batch-level escape hatches for the active batch.
+
+        These drive the FlashInfer sampler's dispatch (top-p-only / top-k-only /
+        joint) and are read from the pinned CPU sampling metadata, so they incur no
+        GPU sync. A filter is "absent" only when NO active request uses it. Padded
+        rows carry a neutral 0 and never flip a flag.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
         )
+        if active_request_count <= 0:
+            return True, True
+
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        no_top_k = bool((active_metadata["top_k"][active_slice] == 0).all())
+        no_top_p = bool((active_metadata["top_p"][active_slice] == 0.0).all())
+        return no_top_k, no_top_p
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -3419,11 +3447,11 @@ class TextGenerationController:
 
             request.status = Status.COMPLETED
 
+            # Detokenize up to input_prompt_length + required_sequence_length for this idx.
+            sequence_length = input_prompt_length + required_sequence_length
             text, segments = self.detokenize_generations(
-                batch_prompt_tokens_with_generations[
-                    idx, : (input_prompt_length + required_sequence_length)
-                ],
-                input_prompt_length + generated_sequence_lengths,
+                batch_prompt_tokens_with_generations[idx, :sequence_length],
+                torch.tensor([sequence_length], device=batch_prompt_tokens_with_generations.device),
                 sampling_params.return_segments,
             )
             request.text = text  # Inference server returns prompts & generations together

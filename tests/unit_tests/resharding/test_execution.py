@@ -6,7 +6,7 @@ These test the send/recv submission logic, writeback paths, and
 non-collocated mode handling.  Requires CUDA (uses torch.cuda.synchronize).
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -261,6 +261,17 @@ class TestTransformPath:
 
 class TestEdgeCases:
     """Test edge cases in execute_reshard_plan."""
+
+    def test_service_can_skip_process_group_barrier(self):
+        """A self-synchronizing backend does not use the executor's barrier."""
+        Utils.initialize_distributed()
+        service = MockCopyService()
+        service.requires_process_group_barrier = False
+
+        with patch("megatron.core.resharding.execution.dist.barrier") as barrier:
+            execute_reshard_plan(ReshardPlan(send_ops=[], recv_ops=[]), None, None, service)
+
+        barrier.assert_not_called()
 
     def test_empty_plan(self):
         """Empty plan (no ops) should complete without error."""

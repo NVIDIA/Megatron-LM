@@ -2,6 +2,7 @@
 
 """Layout helpers for DeepSeek sparse attention."""
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -10,6 +11,8 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import get_pg_size
 
 __all__ = [
+    "PackedCPIndexerLayout",
+    "build_packed_cp_indexer_layout",
     "build_packed_allgather_cp_local_positions",
     "build_packed_allgather_cp_query_positions_and_key_reorder",
     "build_zigzag_allgather_cp_key_reorder",
@@ -20,6 +23,93 @@ __all__ = [
     "get_packed_qk_cu_seqlens",
     "normalize_cp_comm_type",
 ]
+
+
+@dataclass(frozen=True)
+class PackedCPIndexerLayout:
+    """Segment metadata shared by packed-CP DSA indexer backends."""
+
+    segment_q_lengths: torch.Tensor
+    segment_k_lengths: torch.Tensor
+    segment_cu_q: torch.Tensor
+    segment_cu_k: torch.Tensor
+    segment_key_starts: torch.Tensor
+    source_indices: torch.Tensor
+
+
+def build_packed_cp_indexer_layout(
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    *,
+    cp_size: int,
+    cp_rank: int,
+    key_size: int,
+    local_key_layout: bool = False,
+) -> PackedCPIndexerLayout:
+    """Build packed-CP front/back segment metadata for fused DSA indexers.
+
+    ``local_key_layout`` describes the single-sequence optimization where the
+    key tensor contains only this CP rank's local front/back chunks. Otherwise,
+    ``key_size`` is the globally ordered packed key length.
+    """
+    if cp_size <= 1 or not 0 <= cp_rank < cp_size:
+        raise RuntimeError("packed CP indexer layout requires a valid CP rank and cp_size > 1")
+    if cu_seqlens_q.shape != cu_seqlens_kv.shape or cu_seqlens_q.numel() < 2:
+        raise RuntimeError("packed CP indexer layout requires matching non-empty q/k cu_seqlens")
+
+    device = cu_seqlens_q.device
+    cu_q = cu_seqlens_q.to(device=device, dtype=torch.int64).contiguous()
+    cu_k = cu_seqlens_kv.to(device=device, dtype=torch.int64).contiguous()
+    segment_divisor = 2 * cp_size
+
+    if local_key_layout:
+        if cu_q.numel() != 2 or key_size % 2 != 0:
+            raise RuntimeError(
+                "local-key packed CP indexer layout requires one sequence and even key rows"
+            )
+        half = key_size // 2
+        segment_q_lengths = torch.full((2,), half, dtype=torch.int64, device=device)
+        segment_k_lengths = torch.tensor((half, key_size), dtype=torch.int64, device=device)
+        segment_key_starts = torch.zeros(2, dtype=torch.int64, device=device)
+        total_segment_k = key_size + half
+    else:
+        if key_size % segment_divisor != 0:
+            raise RuntimeError(
+                f"packed CP key length must be divisible by {segment_divisor}, got {key_size}"
+            )
+        q_lengths = cu_q[1:] - cu_q[:-1]
+        k_lengths = cu_k[1:] - cu_k[:-1]
+        q_half = q_lengths // segment_divisor
+        k_half = k_lengths // segment_divisor
+        segment_q_lengths = torch.stack((q_half, q_half), dim=1).reshape(-1)
+        segment_k_lengths = torch.stack(
+            ((cp_rank + 1) * k_half, k_lengths - cp_rank * k_half), dim=1
+        ).reshape(-1)
+        segment_key_starts = cu_k[:-1].repeat_interleave(2)
+        total_segment_k = key_size + key_size // segment_divisor
+
+    zero = torch.zeros(1, dtype=torch.int64, device=device)
+    segment_cu_q = torch.cat((zero, segment_q_lengths.cumsum(dim=0))).contiguous()
+    segment_cu_k = torch.cat((zero, segment_k_lengths.cumsum(dim=0))).contiguous()
+
+    segment_ids = torch.repeat_interleave(
+        torch.arange(segment_k_lengths.numel(), device=device),
+        segment_k_lengths,
+        output_size=total_segment_k,
+    )
+    segment_offsets = torch.arange(total_segment_k, device=device, dtype=torch.int64)
+    segment_offsets -= torch.repeat_interleave(
+        segment_cu_k[:-1], segment_k_lengths, output_size=total_segment_k
+    )
+    source_indices = segment_key_starts.index_select(0, segment_ids) + segment_offsets
+    return PackedCPIndexerLayout(
+        segment_q_lengths=segment_q_lengths,
+        segment_k_lengths=segment_k_lengths,
+        segment_cu_q=segment_cu_q,
+        segment_cu_k=segment_cu_k,
+        segment_key_starts=segment_key_starts,
+        source_indices=source_indices,
+    )
 
 
 def normalize_cp_comm_type(cp_comm_type: Optional[str]) -> str:
