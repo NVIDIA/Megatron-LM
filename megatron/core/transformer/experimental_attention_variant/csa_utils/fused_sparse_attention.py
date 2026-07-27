@@ -36,6 +36,8 @@ from megatron.core.quantization.indexer_quantization import (
     IndexerMXFP8QuantizationBuffers,
     create_indexer_mxfp8_quantization_buffers,
     indexer_mxfp8_scale_shape,
+    indexer_mxfp8_thd_scale_shape,
+    make_indexer_mxfp8_scale_cu_seqlens,
     quantize_indexer_mxfp8,
 )
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
@@ -126,6 +128,8 @@ class MXFP8IndexerWorkspace:
     k_buffers: IndexerMXFP8QuantizationBuffers
     q_scale: Tensor
     k_scale: Tensor
+    cu_seqlens_q_scale_padded: Tensor | None = None
+    cu_seqlens_k_scale_padded: Tensor | None = None
 
 
 @dataclass
@@ -182,6 +186,8 @@ class BSHDCompactIndexerWorkspace:
                     mxfp8.k_scale.dtype == torch.float8_e8m0fnu,
                     tuple(mxfp8.k_scale.shape) == k_scale_shape,
                     mxfp8.k_scale.is_contiguous(),
+                    mxfp8.cu_seqlens_q_scale_padded is None,
+                    mxfp8.cu_seqlens_k_scale_padded is None,
                 )
             )
         return all(
@@ -325,23 +331,38 @@ class THDCompactIndexerWorkspace:
         )
         mxfp8_valid = self.mxfp8 is None
         if precision == "mxfp8":
-            q_scale_shape = indexer_mxfp8_scale_shape(
-                batch_size, max_seqlen_q, q.shape[1], q.shape[2]
-            )
-            k_scale_shape = indexer_mxfp8_scale_shape(batch_size, max_seqlen_k, 1, k.shape[1])
             mxfp8 = self.mxfp8
-            mxfp8_valid = mxfp8 is not None and all(
-                (
-                    mxfp8.q_scale.device == q.device,
-                    mxfp8.q_scale.dtype == torch.float8_e8m0fnu,
-                    tuple(mxfp8.q_scale.shape) == q_scale_shape,
-                    mxfp8.q_scale.is_contiguous(),
-                    mxfp8.k_scale.device == q.device,
-                    mxfp8.k_scale.dtype == torch.float8_e8m0fnu,
-                    tuple(mxfp8.k_scale.shape) == k_scale_shape,
-                    mxfp8.k_scale.is_contiguous(),
-                    mxfp8.q_buffers.matches(q),
-                    mxfp8.k_buffers.matches(k),
+            scale_prefixes_valid = mxfp8 is not None and all(
+                prefix is not None
+                and prefix.device == q.device
+                and prefix.dtype == torch.int32
+                and prefix.ndim == 1
+                and prefix.numel() == batch_size + 1
+                and prefix.is_contiguous()
+                for prefix in (mxfp8.cu_seqlens_q_scale_padded, mxfp8.cu_seqlens_k_scale_padded)
+            )
+            mxfp8_valid = (
+                mxfp8 is not None
+                and scale_prefixes_valid
+                and all(
+                    (
+                        mxfp8.q_scale.device == q.device,
+                        mxfp8.q_scale.dtype == torch.float8_e8m0fnu,
+                        mxfp8.q_scale.ndim == 3,
+                        mxfp8.q_scale.shape[0] == 1,
+                        mxfp8.q_scale.shape[1] % 128 == 0,
+                        mxfp8.q_scale.shape[2] == ((q.shape[2] // 32 + 3) // 4) * 4,
+                        mxfp8.q_scale.is_contiguous(),
+                        mxfp8.k_scale.device == q.device,
+                        mxfp8.k_scale.dtype == torch.float8_e8m0fnu,
+                        mxfp8.k_scale.ndim == 3,
+                        mxfp8.k_scale.shape[0] == 1,
+                        mxfp8.k_scale.shape[1] % 128 == 0,
+                        mxfp8.k_scale.shape[2] == ((k.shape[1] // 32 + 3) // 4) * 4,
+                        mxfp8.k_scale.is_contiguous(),
+                        mxfp8.q_buffers.matches(q),
+                        mxfp8.k_buffers.matches(k),
+                    )
                 )
             )
         static_valid = (
@@ -514,6 +535,28 @@ def prepare_bshd_compact_indexer_workspace(
     )
 
 
+@torch.compile
+def _refresh_thd_compact_cand_batch_offsets(
+    destination: Tensor, cu_seqlens_q: Tensor, ratio: int, q_causal_offsets: Tensor | None
+) -> None:
+    """Refresh caller-owned THD candidate offsets from graph inputs."""
+    cu_q = cu_seqlens_q.to(torch.int64)
+    q_lengths = cu_q[1:] - cu_q[:-1]
+    if q_causal_offsets is None:
+        q_starts = torch.zeros_like(q_lengths)
+    else:
+        q_starts = q_causal_offsets.to(torch.int64)
+
+    def prefix_candidate_count(length: Tensor) -> Tensor:
+        quotient = torch.div(length, ratio, rounding_mode="floor")
+        remainder = length - quotient * ratio
+        return ratio * quotient * (quotient - 1) // 2 + quotient * (remainder + 1)
+
+    per_sequence = prefix_candidate_count(q_starts + q_lengths) - prefix_candidate_count(q_starts)
+    destination.zero_()
+    torch.cumsum(per_sequence, dim=0, out=destination[1:])
+
+
 def prepare_thd_compact_indexer_workspace(
     q: Tensor,
     k: Tensor,
@@ -547,25 +590,36 @@ def prepare_thd_compact_indexer_workspace(
         cu_seqlens_q, cu_seqlens_k, ratio, q_causal_offsets=q_causal_offsets
     )
     device = q.device
+    # Sequence boundaries may change between graph capture and replay while
+    # tensor shapes and maxima remain static. Reserve the geometry-wide upper
+    # bound so refreshed candidate offsets always address valid storage.
+    cand_floats = max(cand_floats, q.shape[0] * int(max_seqlen_k))
     out_shape = (q.shape[0], topk)
     mxfp8_workspace = None
     if precision == "mxfp8":
-        batch_size = cu_seqlens_q.numel() - 1
         q_buffers = create_indexer_mxfp8_quantization_buffers(q)
         k_buffers = create_indexer_mxfp8_quantization_buffers(k)
+        cu_seqlens_q_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_q, q.shape[1])
+        cu_seqlens_k_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_k, 1)
         mxfp8_workspace = MXFP8IndexerWorkspace(
             q_buffers=q_buffers,
             k_buffers=k_buffers,
             q_scale=torch.empty(
-                indexer_mxfp8_scale_shape(batch_size, max_seqlen_q, q.shape[1], q.shape[2]),
+                indexer_mxfp8_thd_scale_shape(
+                    int(cu_seqlens_q_scale_padded[-1].item()), q.shape[1], q.shape[2]
+                ),
                 dtype=torch.float8_e8m0fnu,
                 device=device,
             ),
             k_scale=torch.empty(
-                indexer_mxfp8_scale_shape(batch_size, max_seqlen_k, 1, k.shape[1]),
+                indexer_mxfp8_thd_scale_shape(
+                    int(cu_seqlens_k_scale_padded[-1].item()), 1, k.shape[1]
+                ),
                 dtype=torch.float8_e8m0fnu,
                 device=device,
             ),
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
         )
     return THDCompactIndexerWorkspace(
         cand_batch_offsets=cand_batch_offsets,
@@ -1085,9 +1139,13 @@ def build_thd_compact_k_layout(
     kernel_rows = torch.arange(
         int(total_k_rows) + num_sequences, dtype=cu_seqlens_k.dtype, device=cu_seqlens_k.device
     )
-    kernel_sequence_ids = torch.bucketize(
-        kernel_rows, compact_cu_seqlens_k[1:], out_int32=True, right=True
-    ).clamp_max(num_sequences)
+    # Avoid ``torch.bucketize`` here: ``torch.compile`` can miscompile CUDA
+    # bucketize when the boundaries are produced inside the same graph.
+    kernel_sequence_ids = (
+        (kernel_rows.unsqueeze(1) >= compact_cu_seqlens_k[1:].unsqueeze(0))
+        .sum(dim=1, dtype=torch.int64)
+        .clamp_max(num_sequences)
+    )
     safe_sequence_ids = kernel_sequence_ids.clamp_max(num_sequences - 1)
     kernel_positions = kernel_rows - compact_cu_seqlens_k[kernel_sequence_ids]
     valid_source = (kernel_sequence_ids < num_sequences) & (
@@ -1544,6 +1602,9 @@ def _indexer_topk_core(
                     capturing=capturing,
                     precision=precision,
                 )
+                _refresh_thd_compact_cand_batch_offsets(
+                    compact_workspace.cand_batch_offsets, cu_seqlens_q, ratio, q_causal_offsets
+                )
             compact_kwargs.update(
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_kv,
@@ -1581,22 +1642,42 @@ def _indexer_topk_core(
         kernel_q, kernel_k = q, k
         if precision == "mxfp8":
             mxfp8_workspace = compact_workspace.mxfp8 if compact_workspace is not None else None
+            cu_seqlens_q_scale_padded = None
+            cu_seqlens_k_scale_padded = None
+            if is_thd:
+                if mxfp8_workspace is not None:
+                    cu_seqlens_q_scale_padded = mxfp8_workspace.cu_seqlens_q_scale_padded
+                    cu_seqlens_k_scale_padded = mxfp8_workspace.cu_seqlens_k_scale_padded
+                    assert cu_seqlens_q_scale_padded is not None
+                    assert cu_seqlens_k_scale_padded is not None
+                else:
+                    cu_seqlens_q_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_q, q.shape[1]
+                    )
+                    cu_seqlens_k_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_kv, 1
+                    )
 
             kernel_q, q_scale = quantize_indexer_mxfp8(
                 q,
                 cu_seqlens=cu_seqlens_q,
-                max_seqlen=max_seqlen_q,
+                cu_seqlens_scale_padded=cu_seqlens_q_scale_padded,
                 buffers=(mxfp8_workspace.q_buffers if mxfp8_workspace is not None else None),
                 out_scale=(mxfp8_workspace.q_scale if mxfp8_workspace is not None else None),
             )
             kernel_k, k_scale = quantize_indexer_mxfp8(
                 k,
                 cu_seqlens=cu_seqlens_kv,
-                max_seqlen=max_seqlen_kv,
+                cu_seqlens_scale_padded=cu_seqlens_k_scale_padded,
                 buffers=(mxfp8_workspace.k_buffers if mxfp8_workspace is not None else None),
                 out_scale=(mxfp8_workspace.k_scale if mxfp8_workspace is not None else None),
             )
             compact_kwargs.update(q_scale=q_scale, k_scale=k_scale, sf_vec_size=32)
+            if is_thd:
+                compact_kwargs.update(
+                    cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+                    cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+                )
 
         if is_thd:
             compact_result = compact_wrapper(
@@ -1622,7 +1703,8 @@ def _indexer_topk_core(
                 if actual.data_ptr() != expected.data_ptr():
                     layout = "THD" if is_thd else "BSHD"
                     raise RuntimeError(
-                        f"cuDNN compact {layout} {name} did not alias the caller-owned workspace buffer"
+                        f"cuDNN compact {layout} {name} did not alias "
+                        "the caller-owned workspace buffer"
                     )
 
         topk_indices = topk_indices.int()
@@ -2340,7 +2422,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             topk_length.masked_fill_(padding_row_mask, 1)
 
         # ---- 5. Derive predict from indexer_scores, compute target. ----------
-        if loss_coeff > 0:
+        if loss_coeff <= 0:
+            indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
+        else:
             # Layout-specific attention tensors are detached because the loss
             # is not differentiable through the attention-score target.
             if is_thd:
@@ -2372,115 +2456,115 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                     compact_predict = compact_predict.clone()
                     compact_predict[padding_row_mask] = 0
 
-        if loss_coeff <= 0:
-            indexer_loss = torch.zeros((), device=query.device, dtype=torch.float32)
-        elif sparse_loss:
-            if compact_predict is not None:
-                predict = compact_predict
-            else:
-                # Fallback: gather Top-K scores from the dense score tensor.
-                assert indexer_scores is not None
-                safe_indices = topk_indices_cmp.clamp(min=0).long()
-                gathered_scores = torch.gather(indexer_scores, dim=-1, index=safe_indices)
-                gathered_scores = torch.where(
-                    topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
-                )
-                predict = torch.softmax(gathered_scores, dim=-1)
+            if sparse_loss:
+                if compact_predict is not None:
+                    predict = compact_predict
+                else:
+                    # Fallback: gather Top-K scores from the dense score tensor.
+                    assert indexer_scores is not None
+                    safe_indices = topk_indices_cmp.clamp(min=0).long()
+                    gathered_scores = torch.gather(indexer_scores, dim=-1, index=safe_indices)
+                    gathered_scores = torch.where(
+                        topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
+                    )
+                    predict = torch.softmax(gathered_scores, dim=-1)
 
-            # THD: _compute_attn_target's kernel addresses K by flat ids over
-            # the packed (total_k, D) buffer, so promote per-segment-local
-            # indices to flat-global against cu_seqlens_compressed_idx.
-            if is_thd:
-                topk_for_target = local_to_global_flat(
-                    topk_indices_cmp,
-                    batch_size=-1,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_compressed_idx,
-                )
-            else:
-                topk_for_target = topk_indices_cmp
-
-            target = _compute_attn_target(
-                q_attn_det,
-                k_attn_compressed_det,
-                sparse_teacher_lse,
-                topk_for_target,
-                softmax_scale,
-                qhead_per_kv_head=np_,
-                topk_indices_global=is_thd,
-            )
-
-            indexer_loss = _kl_loss_from_target_predict(
-                target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
-            )
-        else:
-            if indexer_scores is None:
-                k_unsqueeze_dim = 1 if is_thd else 2
-                dense_indexer_kwargs = {}
+                # THD: _compute_attn_target's kernel addresses K by flat ids over
+                # the packed (total_k, D) buffer, so promote per-segment-local
+                # indices to flat-global against cu_seqlens_compressed_idx.
                 if is_thd:
-                    dense_indexer_kwargs = dict(
+                    topk_for_target = local_to_global_flat(
+                        topk_indices_cmp,
+                        batch_size=-1,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_compressed_idx,
+                    )
+                else:
+                    topk_for_target = topk_indices_cmp
+
+                target = _compute_attn_target(
+                    q_attn_det,
+                    k_attn_compressed_det,
+                    sparse_teacher_lse,
+                    topk_for_target,
+                    softmax_scale,
+                    qhead_per_kv_head=np_,
+                    topk_indices_global=is_thd,
+                )
+
+                indexer_loss = _kl_loss_from_target_predict(
+                    target, predict, topk_indices_cmp, loss_coeff, calculate_per_token_loss
+                )
+            else:
+                if indexer_scores is None:
+                    k_unsqueeze_dim = 1 if is_thd else 2
+                    dense_indexer_kwargs = {}
+                    if is_thd:
+                        dense_indexer_kwargs = dict(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_compressed_idx,
+                            max_seqlen_q=int(max_seqlen_q),
+                            max_seqlen_kv=int(max_seqlen_compressed_idx),
+                        )
+                    index_score, index_lse = _compute_dense_indexer_score(
+                        q_indexer_flat,
+                        k_indexer_flat.unsqueeze(k_unsqueeze_dim),
+                        w_indexer,
+                        qhead_per_kv_head=idx_nh,
+                        indexer_softmax_scale=indexer_softmax_scale,
+                        ratio=ratio,
+                        **dense_indexer_kwargs,
+                    )
+                else:
+                    index_score = indexer_scores
+                    index_lse = torch.logsumexp(indexer_scores, dim=-1)
+                if padding_row_mask is not None:
+                    index_score = index_score.masked_fill(
+                        padding_row_mask.unsqueeze(-1), float("-inf")
+                    )
+                    index_lse = index_lse.masked_fill(padding_row_mask, float("-inf"))
+
+                k_unsqueeze_dim = 1 if is_thd else 2
+                dense_attn_kwargs = {}
+                if is_thd:
+                    dense_attn_kwargs = dict(
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_kv=cu_seqlens_compressed_idx,
                         max_seqlen_q=int(max_seqlen_q),
                         max_seqlen_kv=int(max_seqlen_compressed_idx),
                     )
-                index_score, index_lse = _compute_dense_indexer_score(
-                    q_indexer_flat,
-                    k_indexer_flat.unsqueeze(k_unsqueeze_dim),
-                    w_indexer,
-                    qhead_per_kv_head=idx_nh,
-                    indexer_softmax_scale=indexer_softmax_scale,
+                dense_teacher_lse = _compute_full_csa_teacher_lse(
+                    q_attn_det,
+                    q_flat,
+                    kv_flat,
+                    k_attn_compressed_det,
+                    attn_sink,
+                    window_global_idxs,
+                    softmax_scale,
+                    ratio,
+                    **dense_attn_kwargs,
+                )
+                attn_score, attn_l1norm = _compute_dense_attn_score(
+                    q_attn_det,
+                    k_attn_compressed_det.unsqueeze(k_unsqueeze_dim),
+                    dense_teacher_lse,
+                    qhead_per_kv_head=np_,
+                    softmax_scale=softmax_scale,
                     ratio=ratio,
-                    **dense_indexer_kwargs,
+                    **dense_attn_kwargs,
                 )
-            else:
-                index_score = indexer_scores
-                index_lse = torch.logsumexp(indexer_scores, dim=-1)
-            if padding_row_mask is not None:
-                index_score = index_score.masked_fill(padding_row_mask.unsqueeze(-1), float("-inf"))
-                index_lse = index_lse.masked_fill(padding_row_mask, float("-inf"))
+                if padding_row_mask is not None:
+                    attn_score = attn_score.masked_fill(padding_row_mask.unsqueeze(-1), 0)
+                    attn_l1norm = attn_l1norm.masked_fill(padding_row_mask, 0)
 
-            k_unsqueeze_dim = 1 if is_thd else 2
-            dense_attn_kwargs = {}
-            if is_thd:
-                dense_attn_kwargs = dict(
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_compressed_idx,
-                    max_seqlen_q=int(max_seqlen_q),
-                    max_seqlen_kv=int(max_seqlen_compressed_idx),
+                indexer_loss = _kl_loss_from_dense_scores(
+                    attn_score,
+                    attn_l1norm,
+                    index_score,
+                    index_lse,
+                    loss_coeff,
+                    calculate_per_token_loss,
                 )
-            dense_teacher_lse = _compute_full_csa_teacher_lse(
-                q_attn_det,
-                q_flat,
-                kv_flat,
-                k_attn_compressed_det,
-                attn_sink,
-                window_global_idxs,
-                softmax_scale,
-                ratio,
-                **dense_attn_kwargs,
-            )
-            attn_score, attn_l1norm = _compute_dense_attn_score(
-                q_attn_det,
-                k_attn_compressed_det.unsqueeze(k_unsqueeze_dim),
-                dense_teacher_lse,
-                qhead_per_kv_head=np_,
-                softmax_scale=softmax_scale,
-                ratio=ratio,
-                **dense_attn_kwargs,
-            )
-            if padding_row_mask is not None:
-                attn_score = attn_score.masked_fill(padding_row_mask.unsqueeze(-1), 0)
-                attn_l1norm = attn_l1norm.masked_fill(padding_row_mask, 0)
-
-            indexer_loss = _kl_loss_from_dense_scores(
-                attn_score,
-                attn_l1norm,
-                index_score,
-                index_lse,
-                loss_coeff,
-                calculate_per_token_loss,
-            )
 
         # ---- 6. Eagerly compute indexer backward (grad_loss=1). ------------
         # The actual grad_loss scaling is deferred to backward (when

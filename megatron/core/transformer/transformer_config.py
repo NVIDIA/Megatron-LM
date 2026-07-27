@@ -1879,7 +1879,8 @@ class TransformerConfig(ModelParallelConfig):
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
                 raise ValueError(
-                    f"dsa_indexer_precision must be 'bf16' or 'mxfp8', got {self.dsa_indexer_precision!r}"
+                    "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                    f"got {self.dsa_indexer_precision!r}"
                 )
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -1957,7 +1958,14 @@ class TransformerConfig(ModelParallelConfig):
                     required_parameters = {"deterministic"}
                     if uses_mxfp8_indexer:
                         required_parameters.update(
-                            {"precision", "q_scale", "k_scale", "sf_vec_size"}
+                            {
+                                "precision",
+                                "q_scale",
+                                "k_scale",
+                                "cu_seqlens_q_scale_padded",
+                                "cu_seqlens_k_scale_padded",
+                                "sf_vec_size",
+                            }
                         )
                     wrapper_parameters = (
                         set(inspect.signature(compact_wrapper).parameters)

@@ -552,6 +552,26 @@ class TestDenseCsaTeacherLseReference:
                 compressed_lse = torch.logsumexp(logits, dim=-1)
             expected[row] = torch.logaddexp(non_compressed_lse[row], compressed_lse)
         torch.testing.assert_close(actual, expected)
+# ---------------------------------------------------------------------------
+# build_thd_compact_k_layout
+# ---------------------------------------------------------------------------
+
+
+class TestBuildThdCompactKLayout:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_compiled_source_row_map_preserves_k_and_appends_padding(self):
+        cu_seqlens_q = torch.tensor([0, 128], dtype=torch.int32, device='cuda')
+        cu_seqlens_k = torch.tensor([0, 512], dtype=torch.int32, device='cuda')
+
+        compact_cu_seqlens_k, source_row_map = dk.build_thd_compact_k_layout(
+            cu_seqlens_q, cu_seqlens_k, total_k_rows=512, ratio=4
+        )
+
+        expected_source_row_map = torch.arange(513, dtype=torch.int64, device='cuda')
+        assert torch.equal(
+            compact_cu_seqlens_k, torch.tensor([0, 513], dtype=torch.int32, device='cuda')
+        )
+        assert torch.equal(source_row_map, expected_source_row_map)
 
 
 # ---------------------------------------------------------------------------
@@ -2556,7 +2576,10 @@ def _ref_indexer_full_score(
 
 
 def _dequantize_thd_indexer_mxfp8(
-    data: torch.Tensor, packed_scale: torch.Tensor, lengths: list[int], max_seqlen: int
+    data: torch.Tensor,
+    packed_scale: torch.Tensor,
+    lengths: list[int],
+    cu_seqlens_scale_padded: torch.Tensor,
 ) -> torch.Tensor:
     """Dequantize the packed THD MXFP8 representation for reference checks."""
     has_heads = data.ndim == 3
@@ -2565,14 +2588,11 @@ def _dequantize_thd_indexer_mxfp8(
     scale_groups = head_dim // 32
     _, _, padded_groups = packed_scale.shape
 
-    logical_rows = max_seqlen * num_heads
+    logical_rows = packed_scale.shape[1]
     rows = torch.arange(logical_rows, device=data.device).view(-1, 1)
     groups = torch.arange(scale_groups, device=data.device).view(1, -1)
     tile_idx = (rows // 128) * (padded_groups // 4) + groups // 4
     offsets = tile_idx * 512 + (rows % 32) * 16 + ((rows % 128) // 32) * 4 + groups % 4
-    bytes_per_batch = packed_scale.shape[1] * padded_groups
-    batch_offsets = torch.arange(len(lengths), device=data.device).view(-1, 1, 1)
-    offsets = offsets.unsqueeze(0) + batch_offsets * bytes_per_batch
     logical_scale = (
         packed_scale.view(torch.uint8)
         .flatten()[offsets]
@@ -2585,7 +2605,8 @@ def _dequantize_thd_indexer_mxfp8(
     start = 0
     for batch, length in enumerate(lengths):
         values = data[start : start + length].float().reshape(length, num_heads, scale_groups, 32)
-        scale = logical_scale[batch, : length * num_heads].reshape(
+        scale_start = int(cu_seqlens_scale_padded[batch].item()) * num_heads
+        scale = logical_scale[scale_start : scale_start + length * num_heads].reshape(
             length, num_heads, scale_groups, 1
         )
         dequantized = (values * scale).reshape(length, num_heads, head_dim)
@@ -3124,9 +3145,9 @@ class TestRealKernelIndexerTopk:
         if not hasattr(DSA, 'compress_topk_cand_buffer_size_thd'):
             pytest.skip("installed cuDNN Frontend lacks the compact THD workspace helper")
         compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
-        if precision == "mxfp8" and (
-            compact_wrapper is None
-            or "q_scale" not in inspect.signature(compact_wrapper).parameters
+        mxfp8_parameters = {"q_scale", "cu_seqlens_q_scale_padded", "cu_seqlens_k_scale_padded"}
+        if precision == "mxfp8" and mxfp8_parameters - set(
+            inspect.signature(compact_wrapper).parameters if callable(compact_wrapper) else ()
         ):
             pytest.skip("installed cuDNN Frontend lacks compact MXFP8 indexer support")
 
@@ -3157,6 +3178,18 @@ class TestRealKernelIndexerTopk:
         assert workspace is not None
         assert workspace.softmax_out is not None
         assert (workspace.mxfp8 is not None) == (precision == "mxfp8")
+        if precision == "mxfp8":
+            assert workspace.mxfp8 is not None
+            assert torch.equal(
+                workspace.mxfp8.cu_seqlens_q_scale_padded,
+                torch.tensor([0, 64, 160], dtype=torch.int32, device="cuda"),
+            )
+            assert torch.equal(
+                workspace.mxfp8.cu_seqlens_k_scale_padded,
+                torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda"),
+            )
+            assert workspace.mxfp8.q_scale.shape == (1, 160 * idx_nh, 4)
+            assert workspace.mxfp8.k_scale.shape == (1, 256, 4)
 
         def run():
             return dk._indexer_topk_core(
@@ -3216,11 +3249,19 @@ class TestRealKernelIndexerTopk:
         # the original BF16 inputs would measure expected quantization error.
         if precision == "mxfp8":
             assert workspace.mxfp8 is not None
+            assert workspace.mxfp8.cu_seqlens_q_scale_padded is not None
+            assert workspace.mxfp8.cu_seqlens_k_scale_padded is not None
             ref_q = _dequantize_thd_indexer_mxfp8(
-                workspace.mxfp8.q_buffers.data, workspace.mxfp8.q_scale, q_lens, max(q_lens)
+                workspace.mxfp8.q_buffers.data,
+                workspace.mxfp8.q_scale,
+                q_lens,
+                workspace.mxfp8.cu_seqlens_q_scale_padded,
             )
             ref_k = _dequantize_thd_indexer_mxfp8(
-                workspace.mxfp8.k_buffers.data, workspace.mxfp8.k_scale, k_lens, max(k_lens)
+                workspace.mxfp8.k_buffers.data,
+                workspace.mxfp8.k_scale,
+                k_lens,
+                workspace.mxfp8.cu_seqlens_k_scale_padded,
             )
             ref_w, ref_sm_scale = w.float(), 1.0
         else:

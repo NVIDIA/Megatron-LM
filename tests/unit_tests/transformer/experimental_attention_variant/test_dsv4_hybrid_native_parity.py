@@ -999,9 +999,9 @@ class TestDSv4HybridNativeParity:
         from cudnn import DSA
 
         compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
-        if (
-            compact_wrapper is None
-            or "q_scale" not in inspect.signature(compact_wrapper).parameters
+        required_parameters = {"q_scale", "cu_seqlens_q_scale_padded", "cu_seqlens_k_scale_padded"}
+        if not callable(compact_wrapper) or required_parameters - set(
+            inspect.signature(compact_wrapper).parameters
         ):
             pytest.skip("installed cuDNN Frontend lacks MXFP8 compact indexer support")
 
