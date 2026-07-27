@@ -34,6 +34,10 @@ class SamplingParams:
         None  # List of strings that will stop generation when produced
     )
     detokenize_stop_sequence: bool = False  # Keep stop words and EOD in generated text
+    # Echo prompt token ids back in the response. When False (default), the engine
+    # drops prompt_tokens before serializing the finished request, saving the ZMQ
+    # transmission cost for long prompts. Opt in when the client needs them.
+    return_prompt_tokens: bool = False
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.

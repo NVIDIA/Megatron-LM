@@ -18,6 +18,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -148,6 +149,7 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -307,6 +309,7 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
+                async_sched_mode=test_config.async_sched_mode,
             ),
         )
 
@@ -678,48 +681,56 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 for layer in model.decoder.layers:
                     assert layer.cudagraph_manager.cudagraph_runners
 
-        # Validate generated tokens.
-        gpt_expected_generated_tokens = [
-            [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 54, 47],
-            [29, 54, 33, 72, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98, 76],
-            [35, 78, 54, 16, 79, 98, 22, 5, 60, 0, 1, 76, 77, 11, 25, 7],
-            [25, 75, 57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0, 64, 45],
-            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 89, 20, 49, 28, 38, 81],
-            [33, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
-            [82, 78, 78, 65, 26, 5, 69, 36, 37, 99],
-            [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
-        ]
+        # Because the TextGenerationController produces different outputs on different DP ranks,
+        # only verify the accuracy of the output on DP rank 0.
+        if parallel_state.get_data_parallel_rank() == 0:
 
-        mamba_expected_generated_tokens = [
-            [69, 85, 55, 74, 85, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
-            [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
-            [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
-            [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
-            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 35, 20, 49, 28, 34, 81],
-            [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
-            [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
-            [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
-        ]
+            # Validate generated tokens.
+            gpt_expected_generated_tokens = [
+                [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 54, 47],
+                [29, 54, 33, 72, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98, 76],
+                [35, 78, 54, 16, 79, 98, 22, 5, 60, 0, 1, 76, 77, 11, 25, 7],
+                [25, 75, 57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0, 64, 45],
+                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 89, 20, 49, 28, 38, 81],
+                [33, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
+                [82, 78, 78, 65, 26, 5, 69, 36, 37, 99],
+                [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
+            ]
 
-        if model_provider == "gpt":
-            expected_generated_tokens_list = gpt_expected_generated_tokens
-        elif model_provider == "hybrid":
-            expected_generated_tokens_list = mamba_expected_generated_tokens
-        else:
-            raise ValueError(f"Invalid model_provider {model_provider}")
+            mamba_expected_generated_tokens = [
+                [69, 85, 55, 74, 85, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
+                [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
+                [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
+                [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
+                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 35, 20, 49, 28, 34, 81],
+                [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
+                [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
+                [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
+            ]
 
-        print(f"Validating {len(env.requests)} requests.")
-        print(f"Expected generated tokens: {expected_generated_tokens_list}")
-        print(f"Actual generated tokens: {[request.generated_tokens for request in env.requests]}")
+            if model_provider == "gpt":
+                expected_generated_tokens_list = gpt_expected_generated_tokens
+            elif model_provider == "hybrid":
+                expected_generated_tokens_list = mamba_expected_generated_tokens
+            else:
+                raise ValueError(f"Invalid model_provider {model_provider}")
 
-        assert len(env.requests) == len(expected_generated_tokens_list)
-
-        for request, expected_generated_tokens in zip(env.requests, expected_generated_tokens_list):
-            assert request.generated_tokens == expected_generated_tokens, (
-                f"request {request.request_id}, "
-                f"result ({request.generated_tokens}) != "
-                f"expected ({expected_generated_tokens})."
+            print(f"Validating {len(env.requests)} requests.")
+            print(f"Expected generated tokens: {expected_generated_tokens_list}")
+            print(
+                f"Actual generated tokens: {[request.generated_tokens for request in env.requests]}"
             )
+
+            assert len(env.requests) == len(expected_generated_tokens_list)
+
+            for request, expected_generated_tokens in zip(
+                env.requests, expected_generated_tokens_list
+            ):
+                assert request.generated_tokens == expected_generated_tokens, (
+                    f"request {request.request_id}, "
+                    f"result ({request.generated_tokens}) != "
+                    f"expected ({expected_generated_tokens})."
+                )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1087,6 +1098,46 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 )
 
             engine_task.cancel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_async_sched_run_engine_accepts_request_during_decode(self):
+        """Verify async decode yields so a new request can enter a running engine."""
+        with torch.inference_mode():
+            test_config = DynamicEngineTestConfig(
+                num_requests=2,
+                min_prompt_length=4,
+                max_prompt_length=4,
+                num_tokens_to_generate=16,
+                async_sched_mode=AsyncScheduleMode.OVERLAP,
+            )
+            env = self._build_test_env(test_config)
+            long_request, short_request = env.requests
+            for request in env.requests:
+                request.sampling_params.top_k = 1
+                request.sampling_params.top_p = 0.0
+                request.sampling_params.termination_id = -1
+            short_request.sampling_params.num_tokens_to_generate = 2
+
+            engine_task = asyncio.create_task(env.engine.run_engine())
+            try:
+                long_request_future = env.engine._add_request(long_request)
+
+                while len(long_request.generated_tokens) < 2:
+                    await asyncio.sleep(0)
+
+                generated_count_at_submission = len(long_request.generated_tokens)
+                short_request_future = env.engine._add_request(short_request)
+                await asyncio.gather(long_request_future, short_request_future)
+
+                assert generated_count_at_submission < 16
+                assert len(short_request.generated_tokens) == 2
+            finally:
+                engine_task.cancel()
+                await engine_task
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -2386,15 +2437,20 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
-            assert step_count == 23
         else:
             assert max_requests < len(env.requests), (
                 f"Test is only useful if max_requests ({max_requests}) < "
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-            assert step_count == 35
-        assert context.kv_block_allocator.active_count == 655
+        # Exact step counts and KV occupancy depend on sampled token sequences.
+        # With DP-offset sampling seeds, only DP rank 0 matches the golden seed.
+        if parallel_state.get_data_parallel_rank() == 0:
+            if max_requests is None:
+                assert step_count == 23
+            else:
+                assert step_count == 35
+            assert context.kv_block_allocator.active_count == 655
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -4183,8 +4239,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         env.engine.controller.tokenizer.detokenize = lambda tokens, **kw: f"tok_{tokens[0]}"
 
-        # top_n must be >= top_k so the sampled token is guaranteed to appear
-        # in the top-n dict for the consistency check below.
+        # top_n must be >= top_k so the top_k-sampled token is guaranteed to
+        # have a higher probability than the least probable token in top_n.
         top_n = 10
         num_requests = 3
         prompt_lengths = [4, 6, 8]
@@ -4223,20 +4279,30 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert isinstance(top_n_dict, dict)
                 assert 0 < len(top_n_dict) <= top_n
 
-            # Consistency: selected token's log prob should appear in top-n.
+            # Consistency: selected token's log prob should appear in top-n when the
+            # sampled token is among the strict top-n indices. With nearly-tied logits
+            # (random models), top-k filtering keeps all ties at the cutoff, so a sampled
+            # token can fall outside a separate top-n index list. In that case the
+            # selected logprob must still be no worse than the weakest top-n entry.
             if req.generated_log_probs is not None:
                 for j, (lp, top_n_dict, token_id) in enumerate(
                     zip(req.generated_log_probs, req.generated_top_n_logprobs, req.generated_tokens)
                 ):
                     token_str = env.engine.controller.tokenizer.detokenize([token_id])
-                    assert token_str in top_n_dict, (
-                        f"Request {req.request_id}, token {j}: "
-                        f"selected token '{token_str}' not in top-n"
-                    )
-                    assert abs(lp - top_n_dict[token_str]) < 0.01, (
-                        f"Request {req.request_id}, token {j}: "
-                        f"log_prob {lp} vs top-n {top_n_dict[token_str]}"
-                    )
+                    if token_str in top_n_dict:
+                        # Sampled token is in Top N.
+                        assert abs(lp - top_n_dict[token_str]) < 0.01, (
+                            f"Request {req.request_id}, token {j}: "
+                            f"log_prob {lp} vs top-n {top_n_dict[token_str]}"
+                        )
+                    else:
+                        # Sampled token is not in the Top N. It must be a tie.
+                        # Check that it is at least as probable as Top N tokens.
+                        assert lp + 0.01 >= min(top_n_dict.values()), (
+                            f"Request {req.request_id}, token {j}: "
+                            f"selected token '{token_str}' log_prob {lp} is worse than "
+                            f"top-n minimum {min(top_n_dict.values())}"
+                        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
