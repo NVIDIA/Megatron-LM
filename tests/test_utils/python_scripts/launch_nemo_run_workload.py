@@ -55,6 +55,11 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
     )
 
 
+def _is_hang_prone_flaky_failure(concat_allranks_logs: str) -> bool:
+    """Return whether a streamed failure may prevent the attempt from exiting."""
+    return "Watchdog caught collective operation timeout" in concat_allranks_logs
+
+
 class _ThreadSafeBuffer:
     """Collect output shared between the log tailer and flaky-failure monitor."""
 
@@ -86,7 +91,7 @@ def _cancel_on_flaky_failure(
 ) -> None:
     """Cancel an active attempt as soon as its streamed logs show a flaky failure."""
     while not stop_event.wait(poll_interval):
-        if is_flaky_failure(log_buffer.getvalue()):
+        if _is_hang_prone_flaky_failure(log_buffer.getvalue()):
             logger.warning(
                 "Detected flaky failure while job is running; cancelling current attempt."
             )
