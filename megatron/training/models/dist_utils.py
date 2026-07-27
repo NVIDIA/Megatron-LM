@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -295,17 +294,16 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    ddp_stream = None
     if get_model_config(model[0]).cuda_graph_impl == "full_iteration":
         # DDP initialization must use the full-iteration capture stream so its retained
         # AccumulateGrad nodes do not reference a different, non-capturing stream.
         ddp_stream = get_shared_capture_stream()
-        ddp_stream.wait_stream(torch.cuda.current_stream())
-        ddp_context = torch.cuda.stream(ddp_stream)
     else:
-        ddp_context = nullcontext()
+        # Preserve a dedicated initialization stream for all other implementations.
+        ddp_stream = torch.cuda.Stream()
+    ddp_stream.wait_stream(torch.cuda.current_stream())
 
-    with ddp_context:
+    with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
         if not use_torch_fsdp2:
             dp_init_kwargs["pg_collection"] = pg_collection
@@ -350,9 +348,8 @@ def _ddp_wrap(
             wrapped_model.append(wrapped_chunk)
         model = wrapped_model
 
-    # Ensure capture-stream work completes before touching params on the default stream.
-    if ddp_stream is not None:
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+    # Ensure initialization-stream work completes before touching params on the default stream.
+    torch.cuda.current_stream().wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
     if data_parallel_random_init:
