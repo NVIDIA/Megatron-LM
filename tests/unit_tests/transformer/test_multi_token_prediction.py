@@ -21,6 +21,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
@@ -33,6 +34,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version, unwrap_model
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -515,7 +517,7 @@ class TestMultiTokenPrediction:
         args.num_layers = 2
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocab_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 256
@@ -647,8 +649,15 @@ class TestMultiTokenPrediction:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        gpt_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
-        gpt_model = unwrap_model(gpt_model)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = gpt_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        gpt_model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
         sharded_state_dict = gpt_model[0].sharded_state_dict()
         for i in range(args.mtp_num_layers):
             assert f"mtp.layers.{i}.enorm.weight" in sharded_state_dict.keys()
@@ -676,7 +685,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         output_ref = gpt_model_ref[0].forward(
             input_ids=tokens,
@@ -725,7 +734,7 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder, self.model_provider
             )
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
@@ -782,7 +791,7 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
 
         output = gpt_model[0].forward(
@@ -825,8 +834,14 @@ class TestMultiTokenPrediction:
         packed_seq_params = batch['packed_seq_params']
 
         # Create model
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         # Forward pass with packed sequences
@@ -887,8 +902,15 @@ class TestMultiTokenPrediction:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
 
         batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         gpt_model, _, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output = gpt_model[0].forward(
@@ -1302,7 +1324,7 @@ class TestMTPLossLoggingHelper:
         assert tracker["avg_group"] is None
 
     def test_save_loss_to_tracker(self):
-        """Test saving a normalized loss to the tracker."""
+        """Test saving a legacy normalized loss to the tracker."""
         loss_sum = torch.tensor(1.3)
         num_tokens = torch.tensor(5.0)
         layer_number = 2
@@ -1322,6 +1344,30 @@ class TestMTPLossLoggingHelper:
         )
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
+
+    def test_save_loss_to_tracker_per_token_stores_raw_loss_and_tokens(self):
+        """Per-token logging keeps raw sums so reduction can weight by tokens."""
+        loss_sum = torch.tensor(1.3)
+        num_tokens = torch.tensor(5.0)
+        layer_number = 2
+        num_layers = self.num_layers
+
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=loss_sum,
+            num_tokens=num_tokens,
+            layer_number=layer_number,
+            num_layers=num_layers,
+            calculate_per_token_loss=True,
+        )
+
+        tracker = MTPLossLoggingHelper.tracker
+        assert "loss_sums" in tracker
+        assert "num_tokens" in tracker
+        assert tracker["calculate_per_token_loss"] is True
+        assert torch.isclose(tracker["loss_sums"][layer_number], loss_sum)
+        assert torch.isclose(tracker["num_tokens"][layer_number], num_tokens)
+        assert tracker["reduce_group"] is None
+        assert tracker["avg_group"] is None
 
     def test_mtp_logits_are_vocab_sharded(self):
         """Test detection for vocab-sharded versus gathered MTP logits."""
@@ -1466,6 +1512,41 @@ class TestMTPLossLoggingHelper:
         assert torch.isclose(logged_loss, microbatch_mean_average)
         assert not torch.isclose(logged_loss, global_token_weighted)
 
+    def test_per_token_loss_is_globally_token_weighted(self):
+        """Per-token MTP logging must match calculate-per-token-loss semantics."""
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(8.0),
+            num_tokens=torch.tensor(2.0),
+            layer_number=0,
+            num_layers=1,
+            calculate_per_token_loss=True,
+        )
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(4.0),
+            num_tokens=torch.tensor(4.0),
+            layer_number=0,
+            num_layers=1,
+            calculate_per_token_loss=True,
+        )
+
+        class DummyWriter:
+            def __init__(self):
+                self.scalars = {}
+
+            def add_scalar(self, name, value, iteration):
+                self.scalars[name] = value
+
+        writer = DummyWriter()
+        MTPLossLoggingHelper.track_mtp_metrics(
+            loss_scale=1.0, iteration=1, writer=writer, total_loss_dict={}
+        )
+
+        logged_loss = torch.as_tensor(writer.scalars["mtp_1 loss"])
+        microbatch_mean_average = torch.tensor(((8.0 / 2.0) + (4.0 / 4.0)) / 2.0)
+        global_token_weighted = torch.tensor((8.0 + 4.0) / (2.0 + 4.0))
+        assert torch.isclose(logged_loss, global_token_weighted)
+        assert not torch.isclose(logged_loss, microbatch_mean_average)
+
     def test_track_mtp_loss_preserves_legacy_normalized_loss_semantics(self):
         """MTP loss logging should not become token-weighted when acceptance counters are added."""
         first_loss = torch.tensor(10.0)
@@ -1554,7 +1635,7 @@ class TestMultiTokenPredictionHybrid:
         args = parse_args()
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
-        args.vocab_size = 128800
+        args.padded_vocab_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.num_query_groups = 8
@@ -1578,7 +1659,6 @@ class TestMultiTokenPredictionHybrid:
         args.bf16 = True
         # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
         args.hybrid_layer_pattern = "M*M*/M*/M*"
-        args.spec = "megatron.core.models.hybrid.hybrid_layer_specs.hybrid_stack_spec"
 
         if fp8 is not None:
             args.fp8 = 'e4m3'
@@ -1621,8 +1701,15 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
-        mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
-        mamba_model = unwrap_model(mamba_model)
+
+        model_parallel_cuda_manual_seed(_SEED)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = hybrid_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        mamba_model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
         sharded_state_dict = mamba_model[0].sharded_state_dict()
 
         # Verify MTP layers are in the state dict
@@ -1646,8 +1733,14 @@ class TestMultiTokenPredictionHybrid:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
 
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -1691,8 +1784,15 @@ class TestMultiTokenPredictionHybrid:
             set_ckpt_path(ckpt_dir)
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+
+            model_parallel_cuda_manual_seed(_SEED)
+            cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                ModelType.encoder_or_decoder,
+                self.model_provider,
+                cfg_container=cfg_container,
+                pg_collection=pg_collection,
             )
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 
@@ -1734,8 +1834,15 @@ class TestMultiTokenPredictionHybrid:
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_cfg = hybrid_config_from_args(args)
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
         try:
-            mamba_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
+            model_parallel_cuda_manual_seed(_SEED)
+            mamba_model = builder.build_distributed_models(
+                pg_collection=pg_collection, wrap_with_ddp=False
+            )
             mamba_model = unwrap_model(mamba_model)
             assert isinstance(mamba_model[0], HybridModel)
             assert mamba_model[0].mtp is not None
@@ -1992,7 +2099,7 @@ class TestMHCMTPIntegration:
                 vp_stage=vp_stage,
             )
 
-        gpt_model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
+        gpt_model, _, _ = setup_model_and_optimizer(ModelType.encoder_or_decoder, model_provider)
 
         data = list(range(seq_length))
         tokens = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()

@@ -34,6 +34,8 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
+from megatron.rl.inference import ReturnsRaw
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -164,6 +166,135 @@ class TestRLUtils:
         args = validate_args(args)
         set_global_variables(args, False)
         return args
+
+    def test_rl_granularity_defaults(self):
+        args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
+
+        assert args.rl_submission_granularity == "B"
+        assert args.rl_consumption_granularity == "B"
+        assert args.rl_generation_lag == 0
+        assert not hasattr(args, "rl_parallel_generation_tasks")
+        assert get_rl_parallel_generation_tasks(args) == 1
+
+    @pytest.mark.parametrize(
+        "submission_granularity, generation_lag, expected_parallel_generation_tasks",
+        [
+            pytest.param("B", 0, 1, id="batch"),
+            pytest.param("B", 2, 3, id="batch_with_lag"),
+            pytest.param("G", 0, 8, id="group"),
+            pytest.param("G", 2, 24, id="group_with_lag"),
+            pytest.param("R", 0, 32, id="rollout"),
+            pytest.param("R", 2, 96, id="rollout_with_lag"),
+        ],
+    )
+    def test_get_rl_parallel_generation_tasks(
+        self, submission_granularity, generation_lag, expected_parallel_generation_tasks
+    ):
+        args = SimpleNamespace(
+            rl_submission_granularity=submission_granularity,
+            rl_generation_lag=generation_lag,
+            grpo_prompts_per_step=8,
+            grpo_group_size=4,
+        )
+
+        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
+
+    @pytest.mark.parametrize(
+        "rl_partial_rollouts, submission_granularity",
+        [
+            pytest.param(False, "B", id="non_streaming_batch"),
+            pytest.param(True, "B", id="streaming_batch"),
+            pytest.param(True, "G", id="streaming_group"),
+            pytest.param(True, "R", id="streaming_rollout"),
+        ],
+    )
+    def test_get_rollout_generator_keeps_num_groups_at_trainer_batch_size(
+        self, monkeypatch, rl_partial_rollouts, submission_granularity
+    ):
+        """Regression for the removed ``num_groups=1`` streaming override.
+
+        Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
+        streamed with a non-batch submission granularity. For a multi-environment
+        agent that collapses the per-env group distribution so some environments
+        receive zero groups (and a degenerate all-zero ``agent_slots``), stalling
+        ``get_grouped_rollouts``. ``num_groups`` must stay at the trainer batch size
+        (``n_prompts``) regardless of streaming or submission granularity.
+        """
+        n_prompts = 8
+        captured = {}
+        rollout_generator = object()
+
+        class Agent:
+            def get_grouped_rollouts(self, request):
+                captured["request"] = request
+                return rollout_generator
+
+        def get_agent(_args, parallel_generation_tasks=None):
+            captured["parallel_generation_tasks"] = parallel_generation_tasks
+            return Agent()
+
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
+        monkeypatch.setattr(rl_utils, "get_agent", get_agent)
+
+        args = SimpleNamespace(
+            rl_partial_rollouts=rl_partial_rollouts,
+            rl_submission_granularity=submission_granularity,
+            rl_consumption_granularity="B",
+            rl_generation_lag=0,
+            grpo_prompts_per_step=n_prompts,
+            grpo_group_size=4,
+            rl_default_temperature=1.0,
+            inference_max_seq_length=128,
+            rl_default_top_p=1.0,
+            rl_default_top_k=0,
+            grpo_filter_groups_with_same_reward=False,
+        )
+
+        result = rl_utils.get_rollout_generator(
+            args, inference_interface=ReturnsRaw(), n_prompts=n_prompts, samples_per_group=4
+        )
+
+        assert result is rollout_generator
+        assert captured["request"].num_groups == n_prompts
+        assert captured["request"].streaming == rl_partial_rollouts
+        assert captured["request"].submission_granularity == submission_granularity
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            pytest.param(
+                {"rl_generation_lag": 1},
+                "--rl-generation-lag requires --rl-partial-rollouts",
+                id="lag_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_submission_granularity": "R"},
+                "Rollout submission granularity requires streaming grouped rollouts",
+                id="rollout_submission_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_consumption_granularity": "R"},
+                "--rl-consumption-granularity R is not currently supported",
+                id="rollout_consumption_unsupported",
+            ),
+            pytest.param(
+                {"rl_submission_granularity": "B", "rl_consumption_granularity": "G"},
+                "--rl-submission-granularity B with --rl-consumption-granularity G",
+                id="batch_submit_group_consume_unsupported",
+            ),
+        ],
+    )
+    def test_rl_granularity_validation_rejects_unsupported_modes(self, overrides, match):
+        with pytest.raises(AssertionError, match=match):
+            self.create_test_args(perform_rl_step=True, **overrides)
+
+    @pytest.mark.parametrize(
+        "flag", ["--rl-submission-granularity", "--rl-consumption-granularity"]
+    )
+    def test_rl_granularity_choices_reject_unknown_value(self, monkeypatch, flag):
+        monkeypatch.setattr("sys.argv", ["test", flag, "X"])
+        with pytest.raises(SystemExit):
+            parse_args(ignore_unknown_args=False)
 
     def _patch_rl_inference_mode_deps(self, monkeypatch, args):
         interface = MagicMock()
@@ -897,6 +1028,9 @@ class TestRLUtils:
 
         # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs
         wrapped_model = Float16Module(transformer_config, model)
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in wrapped_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         # Create test inputs (batch_size=1 required for thd format with sequence packing)
         batch_size = 1

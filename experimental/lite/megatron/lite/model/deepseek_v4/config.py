@@ -47,6 +47,12 @@ class DeepseekV4Config:
     mtp_loss_scaling_factor: float = 0.1
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
+    # Preserved from the HF config so DS4 fp8 resync can read the quant contract
+    # (_quantization_contract requires config.quantization_config; from_hf copies
+    # keys that match a dataclass field, so these must be declared).
+    expert_dtype: str = "fp4"
+    quantization_config: dict[str, Any] = field(default_factory=dict)
+    topk_method: str = "noaux_tc"
 
     @property
     def num_experts(self) -> int:

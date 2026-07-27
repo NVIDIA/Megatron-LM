@@ -69,6 +69,13 @@ class DeepseekV4MoE(nn.Module):
             scores = logits.float().sigmoid()
         indices = self.gate.tid2eid[input_ids.reshape(-1).to(torch.int64)]
         weights = scores.gather(1, indices)
+        # R3's rollout tensor contains one column for every DS4 MoE layer,
+        # including the input-deterministic hash layers.  Consume/replay those
+        # columns here so later learned-router layers retain the same global
+        # layer index as vLLM.  Replay changes only indices; normalization and
+        # route scaling below still use this actor's live scores.
+        if self.gate.router_replay is not None:
+            weights, indices = self.gate.router_replay.apply(scores, weights, indices)
         if self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return (weights * self.route_scale).to(dtype=x.dtype), indices
