@@ -88,6 +88,7 @@ class HybridStack(MegatronModule):
         pp_layer_offset: int = 0,
         logical_layer_offset: int = 0,
         is_layer_group_stack: bool = False,
+        transformer_sharded_keys: bool = False,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
@@ -98,6 +99,12 @@ class HybridStack(MegatronModule):
     ) -> None:
         """
         Args:
+            transformer_sharded_keys (bool): emit ``TransformerBlock``-style sharded
+                checkpoint keys (``final_layernorm`` instead of ``final_norm``) so the
+                checkpoint is interchangeable with a ``GPTModel`` one. Only set for
+                bracketed-group patterns, whose logical layers map one-to-one onto
+                transformer layers; leaving it off keeps the historical hybrid keys so
+                existing non-grouped hybrid checkpoints stay loadable.
             name (str | None): module instance name passed top-down from its paranet module
         """
         super().__init__(config=config)
@@ -107,6 +114,7 @@ class HybridStack(MegatronModule):
         self.is_mtp_layer = is_mtp_layer
         self.logical_layer_offset = logical_layer_offset
         self.is_layer_group_stack = is_layer_group_stack
+        self.transformer_sharded_keys = transformer_sharded_keys
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -155,6 +163,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=physical_layer_offset,
                         logical_layer_offset=logical_layer_offset + len(self.layers),
                         is_layer_group_stack=True,
+                        transformer_sharded_keys=transformer_sharded_keys,
                         post_layer_norm=False,
                         post_process=False,
                         device=device,
@@ -529,7 +538,12 @@ class HybridStack(MegatronModule):
                 module_sharded_state_dict = sharded_state_dict_default(
                     module, module_prefix, sharded_offsets, metadata, tp_group=self.tp_group
                 )
-                if name == 'final_norm':
+                # The registered submodule stays ``final_norm`` (local state-dict keys
+                # are unchanged), but grouped stacks publish the sharded key under
+                # TransformerBlock's ``final_layernorm`` name so their checkpoints
+                # cross-load with GPTModel. Non-grouped stacks keep ``final_norm`` so
+                # hybrid checkpoints written before this feature still load.
+                if name == 'final_norm' and self.transformer_sharded_keys:
                     replace_prefix_for_sharding(
                         module_sharded_state_dict, module_prefix, f'{prefix}final_layernorm.'
                     )

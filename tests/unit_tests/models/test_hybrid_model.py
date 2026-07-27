@@ -166,6 +166,47 @@ def test_hybrid_postprocess_forwards_rl_mtp_inputs(monkeypatch):
     assert captured_kwargs["tp_group"] is model.tp_group
 
 
+def test_hybrid_postprocess_uses_output_processor_hook():
+    """A caller-supplied output processor replaces the default logits / loss path."""
+    captured_kwargs = {}
+    sentinel = torch.randn(2, 4, 8)
+
+    def output_processor(**kwargs):
+        captured_kwargs.update(kwargs)
+        return sentinel
+
+    model = _make_postprocess_stub(
+        SimpleNamespace(
+            mtp_num_layers=None, inference_cuda_graph_scope=InferenceCudaGraphScope.none
+        ),
+        training=True,
+    )
+    hidden_states = torch.randn(4, 2, 8)
+    labels = torch.zeros(2, 4, dtype=torch.long)
+    context = object()
+
+    output = HybridModel._postprocess(
+        model,
+        hidden_states=hidden_states,
+        input_ids=torch.zeros(2, 4, dtype=torch.long),
+        position_ids=torch.zeros(2, 4, dtype=torch.long),
+        labels=labels,
+        rotary_pos_emb=None,
+        mtp_in_postprocess=False,
+        runtime_gather_output=False,
+        inference_context=None,
+        output_processor=output_processor,
+        output_processor_context=context,
+    )
+
+    assert output is sentinel
+    assert captured_kwargs["hidden_states"] is hidden_states
+    assert captured_kwargs["labels"] is labels
+    assert captured_kwargs["context"] is context
+    assert captured_kwargs["output_layer"] is model.output_layer
+    assert captured_kwargs["compute_language_model_loss"] is model.compute_language_model_loss
+
+
 def test_hybrid_logging_process_groups_are_paired():
     tp_group = object()
     dp_cp_group = object()
@@ -476,6 +517,25 @@ class TestHybridModel:
         assert "decoder.final_layernorm.weight" in sharded_keys
         assert "decoder.final_norm.weight" not in sharded_keys
         assert "output_layer._extra_state" not in sharded_state_dict
+
+    def test_ungrouped_sharded_state_dict_keeps_hybrid_final_norm_key(self):
+        """Non-grouped patterns keep ``final_norm`` so older hybrid checkpoints load."""
+        model_config = TransformerConfig(
+            num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="*-",
+        )
+
+        sharded_state_dict = model.sharded_state_dict()
+        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+
+        assert "decoder.final_norm.weight" in sharded_keys
+        assert "decoder.final_layernorm.weight" not in sharded_keys
 
     def test_layer_numbers(self):
         """
