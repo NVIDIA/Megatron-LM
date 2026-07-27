@@ -10,6 +10,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.per_parameter_stats import RAW_MOMENT_FIELDS
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.utils import common_utils
 from tests.unit_tests.test_utilities import Utils
@@ -77,7 +78,15 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
         pytest.skip("test requires a world size divisible by four")
 
     monkeypatch.setattr(
-        common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False, bf16=False)
+        common_utils,
+        "get_args",
+        lambda: SimpleNamespace(
+            use_megatron_fsdp=False,
+            use_torch_fsdp2=False,
+            bf16=False,
+            expert_model_parallel_size=expert_parallel_size,
+            moe_grouped_gemm=True,
+        ),
     )
 
     try:
@@ -110,8 +119,15 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
         _fill_parameters_with_ones(distributed_model)
 
         actual_norm = common_utils.calc_params_l2_norm(distributed_model)
+        raw_moments = common_utils.calc_params_raw_moments_by_param(distributed_model)
+        aggregate_moments = {
+            field: sum(moments[field] for _, moments in raw_moments) for field in RAW_MOMENT_FIELDS
+        }
 
         assert actual_norm == pytest.approx(expected_norm)
+        assert aggregate_moments == pytest.approx(
+            {field: expected_numel for field in RAW_MOMENT_FIELDS}
+        )
     finally:
         Utils.destroy_model_parallel()
 

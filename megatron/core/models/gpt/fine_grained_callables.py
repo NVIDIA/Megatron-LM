@@ -11,6 +11,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode
+from megatron.core.transformer.cuda_graphs import is_cuda_graph_replay_suspended
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
@@ -75,6 +76,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             isinstance(layer, GraphableMegatronModule)
             and hasattr(layer, 'cuda_graphs')
             and layer.cuda_graphs
+            and not is_cuda_graph_replay_suspended()
         ):
             layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
@@ -215,7 +217,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = layer.mlp.postprocess(output, shared_expert_output)
 
         mlp_output_with_bias = (output, None)
-        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
+        if (
+            hasattr(layer, 'cuda_graphs')
+            and layer.cuda_graphs
+            and not is_cuda_graph_replay_suspended()
+        ):
             layer.mlp.cudagraph_tensor_store.clear()
         with layer.bias_dropout_add_exec_handler():
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(

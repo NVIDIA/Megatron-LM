@@ -12,10 +12,15 @@ from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import maybe_msc
+from megatron.core.per_parameter_stats import (
+    NamedTensorBucket,
+    get_or_create_per_parameter_stat_registry,
+    reduce_raw_moments_by_param,
+)
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -47,6 +52,9 @@ from megatron.core.utils import (
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
 
+# Relative tolerance for the raw-moments self-check: sqrt(sum_2), recombined into an aggregate,
+# must match the independently-computed scalar norm to within this much.
+_RAW_MOMENTS_BY_PARAM_NORM_RTOL = 1e-2
 
 
 def _compute_norm_2(params_list):
@@ -78,10 +86,54 @@ def _get_param_data(param, force_create_fp32_copy, bf16):
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
-    """Calculate l2 norm of parameters"""
+    """Calculate l2 norm of parameters."""
+    return _calc_params_l2_norm_or_raw_moments(
+        model, force_create_fp32_copy=force_create_fp32_copy, raw_moments_by_param=False
+    )
+
+
+def calc_params_raw_moments_by_param(
+    model, force_create_fp32_copy=False, expert_model_parallel_group=None
+):
+    """Calculate per-parameter raw moments of parameters."""
+    return _calc_params_l2_norm_or_raw_moments(
+        model,
+        force_create_fp32_copy=force_create_fp32_copy,
+        raw_moments_by_param=True,
+        expert_model_parallel_group=expert_model_parallel_group,
+    )
+
+
+def _calc_params_l2_norm_or_raw_moments(
+    model,
+    force_create_fp32_copy=False,
+    raw_moments_by_param=False,
+    expert_model_parallel_group=None,
+):
+    """Calculate scalar parameter norm or per-parameter raw moments.
+
+    If ``raw_moments_by_param`` is false, returns the aggregate l2 norm as a scalar float.
+    Otherwise, returns ``(parameter_name, moments)`` tuples reduced across the same ownership
+    groups as the aggregate norm. Expert parallelism is currently supported only with grouped
+    GEMM.
+    """
     args = get_args()
     if not isinstance(model, list):
         model = [model]
+
+    if raw_moments_by_param and getattr(args, 'expert_model_parallel_size', 1) > 1:
+        assert getattr(args, 'moe_grouped_gemm', False), (
+            "calc_params_raw_moments_by_param() with expert parallelism is only supported with "
+            "--moe-grouped-gemm."
+        )
+
+    if raw_moments_by_param and (
+        getattr(args, 'use_megatron_fsdp', False) or getattr(args, 'use_torch_fsdp2', False)
+    ):
+        raise RuntimeError(
+            "calc_params_raw_moments_by_param() is not implemented for Megatron-FSDP "
+            "or Torch-FSDP2"
+        )
 
     if getattr(args, 'use_megatron_fsdp', False):
         # All Megatron FSDP parameters are expected to be PyTorch DTensor.
@@ -99,6 +151,17 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
         return calc_dtensor_params_l2_norm(params)
 
+    if raw_moments_by_param and expert_model_parallel_group is None:
+        expert_model_parallel_group = mpu.get_expert_model_parallel_group(check_initialized=False)
+
+    raw_moments_registry = (
+        get_or_create_per_parameter_stat_registry(
+            model, expert_model_parallel_group=expert_model_parallel_group
+        )
+        if raw_moments_by_param
+        else None
+    )
+
     # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
     # Each category needs different reduction groups.
     params_data = []                # Dense, non-sharded
@@ -109,53 +172,136 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
     moe_gtp_params_data = []        # MoE-GTP_remat, non-sharded
     moe_gtp_sharded_params_data = []  # MoE-GTP_remat sharded → expert_dp
+    params_data_names = []
+    sharded_params_data_names = []
+    gtp_params_data_names = []
+    gtp_sharded_params_data_names = []
+    moe_params_data_names = []
+    moe_sharded_params_data_names = []
+    moe_gtp_params_data_names = []
+    moe_gtp_sharded_params_data_names = []
 
     gtp_rank = mpu.get_gtp_weight_remat_rank()
     egtp_rank = mpu.get_expert_gtp_weight_remat_rank()
     tp_group = mpu.get_tensor_model_parallel_group()
     expert_tp_group = mpu.get_expert_tensor_parallel_group()
 
-    for model_chunk in model:
-        for param in model_chunk.parameters():
-            is_gtp = getattr(param, 'is_gtp_weight_remat', False)
+    if raw_moments_by_param:
+        named_params = (
+            (param_name, param) for param, param_name in raw_moments_registry.param_to_name.items()
+        )
+    else:
+        named_params = (
+            (None, param) for model_chunk in model for param in model_chunk.parameters()
+        )
 
-            # Filter TP duplicates. GTP_remat params are always unique across TP ranks
-            # so skip this check for them.
-            if not is_gtp and not param_is_not_tensor_parallel_duplicate(
-                param, tp_group=tp_group, expert_tp_group=expert_tp_group
-            ):
+    for param_name, param in named_params:
+        is_gtp = getattr(param, 'is_gtp_weight_remat', False)
+
+        # Filter TP duplicates. GTP_remat params are always unique across TP ranks
+        # so skip this check for them.
+        if not is_gtp and not param_is_not_tensor_parallel_duplicate(
+            param, tp_group=tp_group, expert_tp_group=expert_tp_group
+        ):
+            continue
+        is_expert = not getattr(param, 'allreduce', True)
+
+        # Filter GTP_remat duplicates: non-GTP_remat params replicate across GTP_remat ranks.
+        if is_expert:
+            if not is_gtp and egtp_rank != 0:
                 continue
-            is_expert = not getattr(param, 'allreduce', True)
+        elif not is_gtp and gtp_rank != 0:
+            continue
 
-            # Filter GTP_remat duplicates: non-GTP_remat params replicate across GTP_remat ranks.
-            if is_expert:
-                if not is_gtp and egtp_rank != 0:
-                    continue
+        # Route to the correct bucket.
+        if is_expert:
+            assert param_is_not_shared(param)
+            param = to_local_if_dtensor(param)
+            data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+            if data is None:
+                continue
+            if is_gtp:
+                data_bucket = (
+                    moe_gtp_sharded_params_data if is_sharded else moe_gtp_params_data
+                )
+                name_bucket = (
+                    moe_gtp_sharded_params_data_names
+                    if is_sharded
+                    else moe_gtp_params_data_names
+                )
             else:
-                if not is_gtp and gtp_rank != 0:
-                    continue
+                data_bucket = moe_sharded_params_data if is_sharded else moe_params_data
+                name_bucket = (
+                    moe_sharded_params_data_names if is_sharded else moe_params_data_names
+                )
+        elif param_is_not_shared(param):
+            param = to_local_if_dtensor(param)
+            data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+            if data is None:
+                continue
+            if is_gtp:
+                data_bucket = gtp_sharded_params_data if is_sharded else gtp_params_data
+                name_bucket = (
+                    gtp_sharded_params_data_names if is_sharded else gtp_params_data_names
+                )
+            else:
+                data_bucket = sharded_params_data if is_sharded else params_data
+                name_bucket = sharded_params_data_names if is_sharded else params_data_names
+        else:
+            continue
 
-            # Route to the correct bucket.
-            if is_expert:
-                assert param_is_not_shared(param)
-                param = to_local_if_dtensor(param)
-                data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
-                if data is None:
-                    continue
-                if is_gtp:
-                    (moe_gtp_sharded_params_data if is_sharded else moe_gtp_params_data).append(data)
-                else:
-                    (moe_sharded_params_data if is_sharded else moe_params_data).append(data)
-            else:
-                if param_is_not_shared(param):
-                    param = to_local_if_dtensor(param)
-                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
-                    if data is None:
-                        continue
-                    if is_gtp:
-                        (gtp_sharded_params_data if is_sharded else gtp_params_data).append(data)
-                    else:
-                        (sharded_params_data if is_sharded else params_data).append(data)
+        data_bucket.append(data)
+        if raw_moments_by_param:
+            name_bucket.append(param_name)
+
+    dense_reduce_group = mpu.get_model_parallel_group()
+    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+    data_parallel_group = mpu.get_data_parallel_group(
+        with_context_parallel=True, with_gtp_remat=False
+    )
+    expert_data_parallel_group = mpu.get_expert_data_parallel_group(with_gtp_remat=False)
+    expert_gtp_group = mpu.get_expert_gtp_weight_remat_group()
+
+    if raw_moments_by_param:
+        raw_moments_by_param_result, aggregate_moments = reduce_raw_moments_by_param(
+            raw_moments_registry,
+            [
+                NamedTensorBucket(
+                    params_data_names, params_data, (dense_reduce_group,)
+                ),
+                NamedTensorBucket(
+                    sharded_params_data_names,
+                    sharded_params_data,
+                    (data_parallel_group, dense_reduce_group),
+                ),
+                NamedTensorBucket(
+                    gtp_params_data_names, gtp_params_data, (dense_reduce_group,)
+                ),
+                NamedTensorBucket(
+                    gtp_sharded_params_data_names,
+                    gtp_sharded_params_data,
+                    (data_parallel_group, dense_reduce_group),
+                ),
+                NamedTensorBucket(
+                    moe_params_data_names, moe_params_data, (expert_reduce_group,)
+                ),
+                NamedTensorBucket(
+                    moe_sharded_params_data_names,
+                    moe_sharded_params_data,
+                    (expert_data_parallel_group, expert_reduce_group),
+                ),
+                NamedTensorBucket(
+                    moe_gtp_params_data_names,
+                    moe_gtp_params_data,
+                    (expert_gtp_group, expert_reduce_group),
+                ),
+                NamedTensorBucket(
+                    moe_gtp_sharded_params_data_names,
+                    moe_gtp_sharded_params_data,
+                    (expert_data_parallel_group, expert_gtp_group, expert_reduce_group),
+                ),
+            ],
+        )
 
     # --- Compute local norm^2 for each bucket ---
     params_norm_2 = _compute_norm_2(params_data)
@@ -176,14 +322,14 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # over-count by gtp_remat. No-op for non-GTP_remat runs.
     _sum_reduce(
         sharded_norm_2,
-        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
+        data_parallel_group,
     )
     _sum_reduce(
         gtp_sharded_norm_2,
-        mpu.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False),
+        data_parallel_group,
     )
-    _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
-    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp_remat=False))
+    _sum_reduce(moe_sharded_norm_2, expert_data_parallel_group)
+    _sum_reduce(moe_gtp_sharded_norm_2, expert_data_parallel_group)
 
     # --- Combine dense + GTP_remat norms ---
     # model_parallel group = TP×GTP_remat×PP, so GTP_remat reduction is implicit.
@@ -193,12 +339,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # expert_model_parallel = TP×EP×PP (does NOT include EGTP_remat), so we need
     # an explicit EGTP_remat reduction for MoE-GTP_remat before the model-parallel reduce.
     moe_gtp_combined_norm_2 = moe_gtp_norm_2 + moe_gtp_sharded_norm_2
-    _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_gtp_weight_remat_group())
+    _sum_reduce(moe_gtp_combined_norm_2, expert_gtp_group)
     moe_total_norm_2 = moe_norm_2 + moe_sharded_norm_2 + moe_gtp_combined_norm_2
 
     # --- Model-parallel reductions ---
-    dense_reduce_group = mpu.get_model_parallel_group()
-    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
     ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
     ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
 
@@ -210,7 +354,21 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         _sum_reduce(moe_total_norm_2, expert_reduce_group)
         norm_2 += moe_total_norm_2
 
-    return norm_2.item() ** 0.5
+    scalar_norm = norm_2.item() ** 0.5
+    if raw_moments_by_param:
+        reconstructed_norm = aggregate_moments["sum_2"] ** 0.5
+        rel_diff = abs(reconstructed_norm - scalar_norm) / scalar_norm if scalar_norm > 0 else 0.0
+        if rel_diff > _RAW_MOMENTS_BY_PARAM_NORM_RTOL:
+            warn_rank_0(
+                "calc_params_raw_moments_by_param(): per-parameter sum_2 recombines to an "
+                f"aggregate of {reconstructed_norm:.6e}, but the directly-computed norm is "
+                f"{scalar_norm:.6e} (relative difference {rel_diff:.2e} > "
+                f"{_RAW_MOMENTS_BY_PARAM_NORM_RTOL:.0e}). The per-parameter reduction is likely "
+                "incorrect for this parallelism configuration; treat the raw moments with caution."
+            )
+        return raw_moments_by_param_result
+
+    return scalar_norm
 
 
 def calc_dtensor_params_l2_norm(params):

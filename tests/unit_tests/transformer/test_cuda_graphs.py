@@ -9,6 +9,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.enums import ModelType
+from megatron.core.models.common.utils import _BackwardDWWrapper
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -36,15 +37,17 @@ from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
     create_cudagraphs,
+    is_cuda_graph_replay_suspended,
+    suspend_cuda_graph_replay,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version
 from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -1571,12 +1574,104 @@ class _SimpleNonModule:
         return x @ self.weight
 
 
+class _SimpleGraphableModule(GraphableMegatronModule):
+    """Minimal graphable module for testing eager fallback from TE replay."""
+
+    def forward(self, x):
+        return x + 1
+
+
 def _make_simple_module(config):
     return _SimpleModule(config).cuda().eval()
 
 
 def _make_simple_non_module(config):
     return _SimpleNonModule(config)
+
+
+class TestCudaGraphReplaySuspension:
+    """Tests for temporarily dispatching graphable modules through eager execution."""
+
+    def _make_te_module(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+        )
+        module = _SimpleGraphableModule(config)
+        module.cuda_graphs = [object()]
+        return module
+
+    def test_te_replay_suspension_restores_eager_module_hooks(self):
+        module = self._make_te_module()
+        module._te_cuda_graph_replay = lambda x: x + 2
+        hook_calls = []
+        module.register_forward_hook(lambda *_: hook_calls.append(True))
+        x = torch.tensor(1.0)
+
+        assert module(x).item() == 3.0
+        assert hook_calls == []
+        with suspend_cuda_graph_replay():
+            assert is_cuda_graph_replay_suspended()
+            assert module(x).item() == 2.0
+        assert not is_cuda_graph_replay_suspended()
+        assert hook_calls == [True]
+
+    def test_suspension_precedes_overridden_graph_predicate(self):
+        module = self._make_te_module()
+        graph_calls = []
+        module._should_call_local_cudagraph = lambda *args, **kwargs: True
+        module.cudagraph_manager = lambda _module, args, kwargs: graph_calls.append(True) or args[0]
+        x = torch.tensor(1.0)
+
+        assert module(x) is x
+        assert graph_calls == [True]
+        with suspend_cuda_graph_replay():
+            assert module(x).item() == 2.0
+        assert graph_calls == [True]
+
+    def test_suspension_selects_eager_delayed_wgrad(self):
+        calls = []
+
+        def make_wrapper():
+            wrapper = object.__new__(_BackwardDWWrapper)
+            wrapper.layer = self._make_te_module()
+            wrapper.graphed_backward_dw_callable = lambda: calls.append("graph")
+            wrapper.attn_dw_callable = lambda: calls.append("attn")
+            wrapper.shared_expert_dw_callable = lambda: calls.append("shared_expert")
+            wrapper.cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+            return wrapper
+
+        make_wrapper().backward_dw()
+        assert calls == ["graph"]
+
+        calls.clear()
+        with suspend_cuda_graph_replay():
+            make_wrapper().backward_dw()
+        assert calls == ["shared_expert", "attn"]
+
+    def test_suspension_bypasses_partial_moe_graphs(self, monkeypatch):
+        layer = object.__new__(MoETransformerLayer)
+        object.__setattr__(layer, "use_partial_cudagraphs", True)
+        object.__setattr__(layer, "mlp", type("MLP", (), {"fwd_execution_map": "expert_compute"})())
+        eager_result = object()
+        eager_calls = []
+
+        def eager_forward(
+            _layer, hidden_states, inference_context=None, padding_mask=None, packed_seq_params=None
+        ):
+            eager_calls.append((hidden_states, padding_mask, packed_seq_params))
+            return eager_result
+
+        monkeypatch.setattr(TransformerLayer, "_forward_mlp", eager_forward)
+        with suspend_cuda_graph_replay():
+            result = layer._forward_mlp("hidden", padding_mask="mask", packed_seq_params="packed")
+
+        assert result is eager_result
+        assert eager_calls == [("hidden", "mask", "packed")]
+        assert layer.mlp.fwd_execution_map == ["route", "expert_compute", "postprocess"]
 
 
 class TestInlineCaptureManager:
@@ -1658,6 +1753,26 @@ class TestInlineCaptureManager:
         _ = module.my_op(x, eager=True)
         _ = module.my_op(x, eager=True)
         assert len(mgr.cudagraph_runners) == 0, "eager=True should not create runners"
+
+    @torch.inference_mode()
+    def test_suspended_replay_bypasses_method_graph(self):
+        """The suspension context must bypass local method graph capture."""
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+
+        mgr = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        with suspend_cuda_graph_replay():
+            _ = module.my_op(x)
+        assert len(mgr.cudagraph_runners) == 0
 
     @torch.inference_mode()
     def test_cache_key_routing(self):

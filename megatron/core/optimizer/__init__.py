@@ -691,6 +691,8 @@ def _get_megatron_optimizer_based_on_param_groups(
     # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
     setattr(optimizer, 'tp_group', tp_group)
     setattr(optimizer, 'expert_tp_group', expert_tp_group)
+    if not hasattr(optimizer, 'model_chunks'):
+        setattr(optimizer, 'model_chunks', model_chunks)
 
     return optimizer
 
