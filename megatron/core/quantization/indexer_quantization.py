@@ -15,6 +15,7 @@ host SM90 FP8 and future indexer quantization paths without ambiguity.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,7 +55,7 @@ def _ceil_div(a: int, b: int) -> int:
 def indexer_mxfp8_scale_shape(
     batch_size: int, max_seqlen: int, num_heads: int, head_dim: int, sf_vec_size: int = 32
 ) -> tuple[int, int, int]:
-    """Return the physical E8M0 scale shape expected by the DSA kernel."""
+    """Return the physical BSHD E8M0 scale shape expected by the DSA kernel."""
     if min(batch_size, max_seqlen, num_heads, head_dim) <= 0:
         raise ValueError("MXFP8 indexer scale dimensions must all be positive")
     if sf_vec_size != 32:
@@ -66,6 +67,50 @@ def indexer_mxfp8_scale_shape(
     packed_rows = _ceil_div(max_seqlen * num_heads, 128) * 128
     packed_groups = _ceil_div(scale_groups, 4) * 4
     return batch_size, packed_rows, packed_groups
+
+
+def make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens: Tensor, num_heads: int) -> Tensor:
+    """Return compact THD scale prefixes with independently padded sequences.
+
+    ``num_heads`` is the number of logical scale rows per token. Each returned
+    sequence span is minimally padded so that its packed scale rows are a
+    multiple of the Blackwell 128-row atom.
+    """
+    if (
+        cu_seqlens.dtype != torch.int32
+        or cu_seqlens.ndim != 1
+        or cu_seqlens.numel() < 2
+        or not cu_seqlens.is_contiguous()
+    ):
+        raise ValueError("cu_seqlens must be a contiguous int32 tensor with at least two elements")
+    if num_heads <= 0:
+        raise ValueError("num_heads must be positive")
+
+    token_alignment = 128 // math.gcd(128, num_heads)
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    padded_lengths = ((lengths + token_alignment - 1) // token_alignment) * token_alignment
+    out = torch.zeros_like(cu_seqlens)
+    torch.cumsum(padded_lengths, dim=0, out=out[1:])
+    return out
+
+
+def indexer_mxfp8_thd_scale_shape(
+    padded_tokens: int, num_heads: int, head_dim: int, sf_vec_size: int = 32
+) -> tuple[int, int, int]:
+    """Return the compact THD E8M0 scale shape expected by the DSA kernel."""
+    if min(padded_tokens, num_heads, head_dim) <= 0:
+        raise ValueError("MXFP8 indexer scale dimensions must all be positive")
+    if sf_vec_size != 32:
+        raise ValueError(f"MXFP8 indexer only supports sf_vec_size=32, got {sf_vec_size}")
+    if head_dim % sf_vec_size != 0:
+        raise ValueError(f"MXFP8 indexer head_dim ({head_dim}) must be divisible by {sf_vec_size}")
+
+    packed_rows = padded_tokens * num_heads
+    if packed_rows % 128 != 0:
+        raise ValueError("THD MXFP8 scale rows must be a multiple of 128")
+    scale_groups = head_dim // sf_vec_size
+    packed_groups = _ceil_div(scale_groups, 4) * 4
+    return 1, packed_rows, packed_groups
 
 
 @dataclass
@@ -150,10 +195,9 @@ def create_indexer_mxfp8_quantization_buffers(x: Tensor) -> IndexerMXFP8Quantiza
 
 
 @triton.jit
-def _pack_indexer_mxfp8_scale_kernel(
+def _pack_indexer_mxfp8_scale_bshd_kernel(
     out_ptr,
     logical_scale_ptr,
-    cu_seqlens_ptr,
     seqlen,
     total_out_bytes,
     NUM_HEADS: tl.constexpr,
@@ -161,10 +205,9 @@ def _pack_indexer_mxfp8_scale_kernel(
     LOGICAL_PADDED_GROUPS: tl.constexpr,
     PADDED_ROWS: tl.constexpr,
     PADDED_GROUPS: tl.constexpr,
-    IS_THD: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Pack logical TE scale bytes directly into the Indexer physical layout."""
+    """Pack logical BSHD TE scale bytes into the Indexer physical layout."""
     out_linear = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     in_bounds = out_linear < total_out_bytes
     bytes_per_batch = PADDED_ROWS * PADDED_GROUPS
@@ -175,16 +218,8 @@ def _pack_indexer_mxfp8_scale_kernel(
     local_token = packed_row // NUM_HEADS
     head = packed_row - local_token * NUM_HEADS
 
-    if IS_THD:
-        seq_start = tl.load(cu_seqlens_ptr + batch, mask=in_bounds, other=0)
-        seq_end = tl.load(cu_seqlens_ptr + batch + 1, mask=in_bounds, other=0)
-        seq_len = seq_end - seq_start
-        global_token = seq_start + local_token
-    else:
-        seq_len = seqlen
-        global_token = batch * seqlen + local_token
-
-    valid = in_bounds & (local_token < seq_len) & (scale_group < REAL_GROUPS)
+    global_token = batch * seqlen + local_token
+    valid = in_bounds & (local_token < seqlen) & (scale_group < REAL_GROUPS)
     source_row = global_token * NUM_HEADS + head
     source_offset = source_row * LOGICAL_PADDED_GROUPS + scale_group
     value = tl.load(logical_scale_ptr + source_offset, mask=valid, other=0)
@@ -201,6 +236,60 @@ def _pack_indexer_mxfp8_scale_kernel(
     tl.store(out_ptr + physical_offset, value, mask=in_bounds)
 
 
+@triton.jit
+def _pack_indexer_mxfp8_scale_thd_kernel(
+    out_ptr,
+    logical_scale_ptr,
+    cu_seqlens_ptr,
+    cu_seqlens_scale_padded_ptr,
+    NUM_HEADS: tl.constexpr,
+    REAL_GROUPS: tl.constexpr,
+    LOGICAL_PADDED_GROUPS: tl.constexpr,
+    PADDED_GROUPS: tl.constexpr,
+    BATCH_SIZE: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+):
+    """Pack logical THD TE scale bytes into concatenated padded scale spans."""
+    tile_idx = tl.program_id(0)
+    scale_tiles = PADDED_GROUPS // 4
+    mn_tile = tile_idx // scale_tiles
+    scale_tile = tile_idx - mn_tile * scale_tiles
+    packed_row_start = mn_tile * 128
+
+    batch_lo = 0
+    batch_hi = BATCH_SIZE
+    for _ in range(SEARCH_STEPS):
+        batch_mid = (batch_lo + batch_hi) // 2
+        next_packed_row = tl.load(cu_seqlens_scale_padded_ptr + batch_mid + 1) * NUM_HEADS
+        in_lower_half = packed_row_start < next_packed_row
+        batch_hi = tl.where(in_lower_half, batch_mid, batch_hi)
+        batch_lo = tl.where(in_lower_half, batch_lo, batch_mid + 1)
+    batch = tl.minimum(batch_lo, BATCH_SIZE - 1)
+
+    logical = tl.arange(0, 512)
+    row_in_tile = logical // 4
+    packed_row = packed_row_start + row_in_tile
+    scale_group = scale_tile * 4 + logical % 4
+
+    scale_row_start = tl.load(cu_seqlens_scale_padded_ptr + batch) * NUM_HEADS
+    local_row = packed_row - scale_row_start
+    local_token = local_row // NUM_HEADS
+    head = local_row - local_token * NUM_HEADS
+    seq_start = tl.load(cu_seqlens_ptr + batch)
+    seq_end = tl.load(cu_seqlens_ptr + batch + 1)
+    seq_len = seq_end - seq_start
+
+    valid = (local_token < seq_len) & (scale_group < REAL_GROUPS)
+    source_row = (seq_start + local_token) * NUM_HEADS + head
+    source_offset = source_row * LOGICAL_PADDED_GROUPS + scale_group
+    value = tl.load(logical_scale_ptr + source_offset, mask=valid, other=0)
+
+    physical_offset = (
+        tile_idx * 512 + (row_in_tile % 32) * 16 + ((row_in_tile % 128) // 32) * 4 + logical % 4
+    )
+    tl.store(out_ptr + physical_offset, value)
+
+
 def pack_indexer_mxfp8_scale(
     logical_scale: Tensor,
     out_scale: Tensor,
@@ -208,6 +297,7 @@ def pack_indexer_mxfp8_scale(
     num_heads: int,
     real_groups: int,
     cu_seqlens: Tensor | None = None,
+    cu_seqlens_scale_padded: Tensor | None = None,
     seqlen: int = 0,
 ) -> Tensor:
     """Pack TE logical E8M0 bytes into caller-owned Indexer scale storage."""
@@ -240,32 +330,57 @@ def pack_indexer_mxfp8_scale(
             cu_seqlens.device != logical_scale.device
             or cu_seqlens.dtype != torch.int32
             or cu_seqlens.ndim != 1
-            or cu_seqlens.numel() != out_scale.shape[0] + 1
+            or cu_seqlens.numel() < 2
             or not cu_seqlens.is_contiguous()
         ):
+            raise ValueError("cu_seqlens must be contiguous CUDA int32 storage")
+        if (
+            cu_seqlens_scale_padded is None
+            or cu_seqlens_scale_padded.device != logical_scale.device
+            or cu_seqlens_scale_padded.dtype != torch.int32
+            or cu_seqlens_scale_padded.ndim != 1
+            or cu_seqlens_scale_padded.numel() != cu_seqlens.numel()
+            or not cu_seqlens_scale_padded.is_contiguous()
+        ):
             raise ValueError(
-                "cu_seqlens must be contiguous CUDA int32 storage for out_scale batches"
+                "cu_seqlens_scale_padded must be contiguous CUDA int32 storage "
+                "matching cu_seqlens"
             )
+        if out_scale.shape[0] != 1 or out_scale.shape[1] % num_heads != 0:
+            raise ValueError("THD out_scale must have one L dimension and whole-token rows")
     elif seqlen <= 0:
         raise ValueError("BSHD scale packing requires a positive seqlen")
+    elif cu_seqlens_scale_padded is not None:
+        raise ValueError("cu_seqlens_scale_padded is only valid for THD scale packing")
 
-    total_out_bytes = out_scale.numel()
-    block = 256
-    cu_seqlens_ptr = cu_seqlens if cu_seqlens is not None else logical_scale
-    _pack_indexer_mxfp8_scale_kernel[(triton.cdiv(total_out_bytes, block),)](
-        out_scale.view(torch.uint8),
-        logical_scale,
-        cu_seqlens_ptr,
-        seqlen,
-        total_out_bytes,
-        NUM_HEADS=num_heads,
-        REAL_GROUPS=real_groups,
-        LOGICAL_PADDED_GROUPS=logical_scale.shape[1],
-        PADDED_ROWS=out_scale.shape[1],
-        PADDED_GROUPS=out_scale.shape[2],
-        IS_THD=is_thd,
-        BLOCK=block,
-    )
+    if is_thd:
+        _pack_indexer_mxfp8_scale_thd_kernel[(out_scale.numel() // 512,)](
+            out_scale.view(torch.uint8),
+            logical_scale,
+            cu_seqlens,
+            cu_seqlens_scale_padded,
+            NUM_HEADS=num_heads,
+            REAL_GROUPS=real_groups,
+            LOGICAL_PADDED_GROUPS=logical_scale.shape[1],
+            PADDED_GROUPS=out_scale.shape[2],
+            BATCH_SIZE=cu_seqlens.numel() - 1,
+            SEARCH_STEPS=(cu_seqlens.numel() - 1).bit_length(),
+        )
+    else:
+        total_out_bytes = out_scale.numel()
+        block = 256
+        _pack_indexer_mxfp8_scale_bshd_kernel[(triton.cdiv(total_out_bytes, block),)](
+            out_scale.view(torch.uint8),
+            logical_scale,
+            seqlen,
+            total_out_bytes,
+            NUM_HEADS=num_heads,
+            REAL_GROUPS=real_groups,
+            LOGICAL_PADDED_GROUPS=logical_scale.shape[1],
+            PADDED_ROWS=out_scale.shape[1],
+            PADDED_GROUPS=out_scale.shape[2],
+            BLOCK=block,
+        )
     return out_scale
 
 
@@ -273,7 +388,7 @@ def quantize_indexer_mxfp8(
     x: Tensor,
     *,
     cu_seqlens: Tensor | None = None,
-    max_seqlen: int | None = None,
+    cu_seqlens_scale_padded: Tensor | None = None,
     buffers: IndexerMXFP8QuantizationBuffers | None = None,
     out_scale: Tensor | None = None,
     sf_vec_size: int = 32,
@@ -298,9 +413,8 @@ def quantize_indexer_mxfp8(
             num_heads = 1
         else:
             raise ValueError(f"Packed THD MXFP8 input must be 2D or 3D, got shape {x.shape}")
-        if max_seqlen is None:
-            raise ValueError("Packed THD MXFP8 quantization requires max_seqlen")
-        batch_size = cu_seqlens.numel() - 1
+        if cu_seqlens_scale_padded is None:
+            raise ValueError("Packed THD MXFP8 quantization requires padded scale cu_seqlens")
         seqlen = 0
     else:
         if x.ndim == 4:
@@ -310,7 +424,8 @@ def quantize_indexer_mxfp8(
             num_heads = 1
         else:
             raise ValueError(f"BSHD MXFP8 input must be 3D or 4D, got shape {x.shape}")
-        max_seqlen = seqlen
+        if cu_seqlens_scale_padded is not None:
+            raise ValueError("Padded scale cu_seqlens are only valid for packed THD input")
 
     if buffers is None:
         buffers = create_indexer_mxfp8_quantization_buffers(x)
@@ -323,12 +438,37 @@ def quantize_indexer_mxfp8(
         source = buffers.padded_input
     buffers.quantizer.update_quantized(source, buffers.quantized)
 
-    expected_scale_shape = indexer_mxfp8_scale_shape(
-        batch_size, int(max_seqlen), num_heads, head_dim, sf_vec_size
-    )
+    if is_thd:
+        if out_scale is None and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("THD MXFP8 CUDA graph capture requires preallocated scale storage")
+        expected_scale_shape = (
+            indexer_mxfp8_thd_scale_shape(
+                int(cu_seqlens_scale_padded[-1].item()), num_heads, head_dim, sf_vec_size
+            )
+            if out_scale is None
+            else None
+        )
+    else:
+        expected_scale_shape = indexer_mxfp8_scale_shape(
+            batch_size, seqlen, num_heads, head_dim, sf_vec_size
+        )
     if out_scale is None:
+        assert expected_scale_shape is not None
         out_scale = torch.empty(expected_scale_shape, dtype=torch.float8_e8m0fnu, device=x.device)
-    elif (
+    elif is_thd and (
+        out_scale.device != x.device
+        or out_scale.dtype != torch.float8_e8m0fnu
+        or out_scale.ndim != 3
+        or out_scale.shape[0] != 1
+        or out_scale.shape[1] % 128 != 0
+        or out_scale.shape[2] != _ceil_div(head_dim // sf_vec_size, 4) * 4
+        or not out_scale.is_contiguous()
+    ):
+        raise ValueError(
+            "THD out_scale must be contiguous E8M0 storage with shape "
+            "(1, multiple_of_128, padded_scale_groups)"
+        )
+    elif not is_thd and (
         out_scale.device != x.device
         or out_scale.dtype != torch.float8_e8m0fnu
         or tuple(out_scale.shape) != expected_scale_shape
@@ -344,6 +484,7 @@ def quantize_indexer_mxfp8(
         num_heads=num_heads,
         real_groups=head_dim // sf_vec_size,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_scale_padded=cu_seqlens_scale_padded,
         seqlen=seqlen,
     )
     return buffers.data, out_scale
@@ -355,6 +496,8 @@ __all__ = [
     "IndexerMXFP8QuantizationBuffers",
     "create_indexer_mxfp8_quantization_buffers",
     "indexer_mxfp8_scale_shape",
+    "indexer_mxfp8_thd_scale_shape",
+    "make_indexer_mxfp8_scale_cu_seqlens",
     "pack_indexer_mxfp8_scale",
     "quantize_indexer_mxfp8",
 ]

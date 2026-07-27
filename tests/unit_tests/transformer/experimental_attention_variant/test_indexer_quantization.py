@@ -10,6 +10,8 @@ from megatron.core.quantization.indexer_quantization import (
     HAVE_TRITON,
     create_indexer_mxfp8_quantization_buffers,
     indexer_mxfp8_scale_shape,
+    indexer_mxfp8_thd_scale_shape,
+    make_indexer_mxfp8_scale_cu_seqlens,
     quantize_indexer_mxfp8,
 )
 
@@ -24,18 +26,17 @@ pytestmark = [
 ]
 
 
-def _unpack_scales(scale: torch.Tensor, max_seqlen: int, num_heads: int) -> torch.Tensor:
-    """Undo the Blackwell 128x4 scale swizzle into logical ``(B, M, G)``."""
-    batch_size, _, padded_groups = scale.shape
-    logical_rows = max_seqlen * num_heads
+def _unpack_scales(scale: torch.Tensor, logical_rows: int) -> torch.Tensor:
+    """Undo the Blackwell 128x4 scale swizzle into logical ``(L, M, G)``."""
+    l_size, _, padded_groups = scale.shape
     scale_groups = 4
     rows = torch.arange(logical_rows, device=scale.device).view(-1, 1)
     groups = torch.arange(scale_groups, device=scale.device).view(1, -1)
     tile_idx = (rows // 128) * (padded_groups // 4) + groups // 4
     offsets = tile_idx * 512 + (rows % 32) * 16 + ((rows % 128) // 32) * 4 + groups % 4
-    bytes_per_batch = scale.shape[1] * padded_groups
-    batch_offsets = torch.arange(batch_size, device=scale.device).view(-1, 1, 1)
-    offsets = offsets.unsqueeze(0) + batch_offsets * bytes_per_batch
+    bytes_per_l = scale.shape[1] * padded_groups
+    l_offsets = torch.arange(l_size, device=scale.device).view(-1, 1, 1)
+    offsets = offsets.unsqueeze(0) + l_offsets * bytes_per_l
     scale_bytes = scale.view(torch.uint8).flatten()[offsets]
     return scale_bytes.contiguous().view(torch.float8_e8m0fnu).float()
 
@@ -62,7 +63,7 @@ def test_bshd_quantization_matches_reference():
 
     data, packed_scale = quantize_indexer_mxfp8(x)
     ref_data, ref_scale = _reference_quantize(x)
-    unpacked_scale = _unpack_scales(packed_scale, seqlen, num_heads).reshape_as(ref_scale)
+    unpacked_scale = _unpack_scales(packed_scale, seqlen * num_heads).reshape_as(ref_scale)
 
     assert data.dtype == torch.float8_e4m3fn
     assert packed_scale.dtype == torch.float8_e8m0fnu
@@ -71,23 +72,36 @@ def test_bshd_quantization_matches_reference():
     torch.testing.assert_close(unpacked_scale, ref_scale, rtol=0, atol=0)
 
 
-def test_thd_quantization_resets_scale_rows_per_segment():
+def test_thd_quantization_uses_concatenated_padded_scale_spans():
     torch.manual_seed(456)
-    q_lens = [2, 3]
-    max_seqlen, num_heads, head_dim = max(q_lens), 64, 128
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32, device="cuda")
+    q_lens = [1, 2, 3, 4, 5]
+    num_heads, head_dim = 64, 128
+    cu_seqlens = torch.tensor([0, 1, 3, 6, 10, 15], dtype=torch.int32, device="cuda")
+    cu_seqlens_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens, num_heads)
     x = torch.randn(sum(q_lens), num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
 
-    data, packed_scale = quantize_indexer_mxfp8(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    data, packed_scale = quantize_indexer_mxfp8(
+        x, cu_seqlens=cu_seqlens, cu_seqlens_scale_padded=cu_seqlens_scale_padded
+    )
     ref_data, ref_scale = _reference_quantize(x)
-    unpacked_scale = _unpack_scales(packed_scale, max_seqlen, num_heads)
+    unpacked_scale = _unpack_scales(packed_scale, packed_scale.shape[1])[0]
 
     assert torch.equal(data.float(), ref_data.float())
+    assert torch.equal(
+        cu_seqlens_scale_padded,
+        torch.tensor([0, 2, 4, 8, 12, 18], dtype=torch.int32, device="cuda"),
+    )
+    assert packed_scale.shape == indexer_mxfp8_thd_scale_shape(18, num_heads, head_dim)
     start = 0
     for batch, length in enumerate(q_lens):
-        actual = unpacked_scale[batch, : length * num_heads]
+        scale_start = int(cu_seqlens_scale_padded[batch].item()) * num_heads
+        actual = unpacked_scale[scale_start : scale_start + length * num_heads]
         expected = ref_scale[start : start + length].reshape(length * num_heads, -1)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        padded_end = int(cu_seqlens_scale_padded[batch + 1].item()) * num_heads
+        padding = unpacked_scale[scale_start + length * num_heads : padded_end]
+        # E8M0 has no numerical zero: a zero storage byte decodes to its minimum value.
+        assert torch.all(padding == torch.finfo(torch.float8_e8m0fnu).tiny)
         start += length
 
 
@@ -95,21 +109,26 @@ def test_thd_quantization_resets_scale_rows_per_segment():
 def test_thd_preallocated_quantization_cuda_graph_replay(num_heads):
     torch.manual_seed(789)
     q_lens = [2, 3]
-    max_seqlen, head_dim = max(q_lens), 128
+    head_dim = 128
     total_tokens = sum(q_lens)
     cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32, device="cuda")
+    cu_seqlens_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens, num_heads)
     shape = (total_tokens, num_heads, head_dim) if num_heads > 1 else (total_tokens, head_dim)
     x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
     buffers = create_indexer_mxfp8_quantization_buffers(x)
     out_scale = torch.zeros(
-        indexer_mxfp8_scale_shape(2, max_seqlen, num_heads, head_dim),
+        indexer_mxfp8_thd_scale_shape(int(cu_seqlens_scale_padded[-1].item()), num_heads, head_dim),
         dtype=torch.float8_e8m0fnu,
         device="cuda",
     )
 
     def run():
         return quantize_indexer_mxfp8(
-            x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, buffers=buffers, out_scale=out_scale
+            x,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_scale_padded=cu_seqlens_scale_padded,
+            buffers=buffers,
+            out_scale=out_scale,
         )
 
     for _ in range(3):
@@ -126,7 +145,7 @@ def test_thd_preallocated_quantization_cuda_graph_replay(num_heads):
     graph.replay()
     torch.cuda.synchronize()
     expected_data, expected_scale = quantize_indexer_mxfp8(
-        x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+        x, cu_seqlens=cu_seqlens, cu_seqlens_scale_padded=cu_seqlens_scale_padded
     )
     assert not torch.equal(captured_data.float(), first_data)
     assert torch.equal(captured_data.float(), expected_data.float())

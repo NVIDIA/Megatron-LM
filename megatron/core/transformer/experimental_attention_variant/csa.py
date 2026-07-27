@@ -2563,27 +2563,37 @@ class CompressedSparseAttention(MegatronModule):
             topk_indices_cmp = torch.full((total_q, 0), -1, dtype=torch.int32, device=query.device)
         else:
             k_thd = k_indexer.squeeze(1)
+            topk_k_thd = k_thd
+            topk_cu_seqlens_k = cu_seqlens_compressed_idx
+            topk_max_seqlen_k = max_seqlen_compressed_idx
+            if thd_compact_indexer_available(q_thd, k_thd, self.config.dsa_indexer_precision):
+                topk_cu_seqlens_k, source_row_map = build_thd_compact_k_layout(
+                    cu_seqlens_q, cu_seqlens_compressed_idx, k_thd.shape[0], self.compress_ratio
+                )
+                topk_k_thd = pack_thd_compact_k(k_thd, source_row_map)
+                topk_max_seqlen_k += 2
+
             compact_workspace = self._get_thd_compact_indexer_workspace(
                 q_thd,
-                k_thd,
+                topk_k_thd,
                 topk=self.indexer.index_topk,
                 ratio=self.compress_ratio,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_compressed_idx,
+                cu_seqlens_k=topk_cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_compressed_idx,
+                max_seqlen_k=topk_max_seqlen_k,
             )
             topk_indices_cmp, _ = indexer_topk(
                 q_thd,
-                k_thd,
+                topk_k_thd,
                 w_thd,
                 topk=self.indexer.index_topk,
                 ratio=self.compress_ratio,
                 indexer_softmax_scale=self.indexer.softmax_scale,
                 cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_compressed_idx,
+                cu_seqlens_kv=topk_cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_compressed_idx,
+                max_seqlen_kv=topk_max_seqlen_k,
                 compact_workspace=compact_workspace,
                 precision=self.config.dsa_indexer_precision,
                 deterministic=self.config.deterministic_mode,
