@@ -102,7 +102,7 @@ class TextGenerationControllerTestBase:
             hidden_size=self.hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            attention_backend=AttnBackend.flash if inference_optimized else AttnBackend.local,
+            attention_backend=AttnBackend.auto if inference_optimized else AttnBackend.local,
             params_dtype=dtype,
             symmetric_ar_type=symmetric_ar_type,
             fp8="hybrid" if fp8 else None,
