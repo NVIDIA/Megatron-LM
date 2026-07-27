@@ -49,9 +49,16 @@ from .validation import (
 
 logger = logging.getLogger(__name__)
 
-# monkeypatch needed for ModelOpt
-# will be removed once MLM updated to newer ModelOpt
-get_default_load_sharded_strategy = TorchDistLoadShardedStrategy
+
+def get_default_load_sharded_strategy(checkpoint_dir: str | Path | None = None):
+    """Create the default torch distributed load strategy."""
+    return TorchDistLoadShardedStrategy(checkpoint_name=checkpoint_dir)
+
+
+def get_default_save_sharded_strategy(backend: str = "torch_dist"):
+    """Create the default torch distributed save strategy."""
+    return TorchDistSaveShardedStrategy(backend=backend)
+
 
 # flat state dict with sharded objects without any data
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
