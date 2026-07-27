@@ -2357,7 +2357,7 @@ no-pypi-wheels = [
 test = [
     { name = "coverage" },
     { name = "mock" },
-    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=1ea2e1795926f491424a24fec1802f46a9b32ab5" },
+    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=ddd40a8f24847f5c919f911d0240bd622653612f" },
     { name = "nltk" },
     { name = "pydantic" },
     { name = "pygithub" },
@@ -2709,8 +2709,8 @@ wheels = [
 
 [[package]]
 name = "nemo-run"
-version = "0.11.0+1ea2e17"
-source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=1ea2e1795926f491424a24fec1802f46a9b32ab5#1ea2e1795926f491424a24fec1802f46a9b32ab5" }
+version = "0.11.0+ddd40a8"
+source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=ddd40a8f24847f5c919f911d0240bd622653612f#ddd40a8f24847f5c919f911d0240bd622653612f" }
 dependencies = [
     { name = "catalogue" },
     { name = "fabric" },
