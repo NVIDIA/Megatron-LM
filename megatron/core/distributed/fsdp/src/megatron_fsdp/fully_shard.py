@@ -499,10 +499,8 @@ def fully_shard_optimizer(
     optimizer_step_base_func = type(optimizer).step
     optimizer_zero_grad_base_func = type(optimizer).zero_grad
 
-    # Pre-initialize the optimizer state for checkpoint loading via DCP. Keep this
-    # allocation-only step numerically inert: a regular Adam/AdamW step would advance
-    # its step counter (changing the bias correction for the first training update),
-    # and weight decay could modify parameters even with zero gradients.
+    # Materialize lazy optimizer state so DCP has state tensors to load into. This
+    # synthetic step must have no effect on subsequent training.
     for group in optimizer.param_groups:
         for param in group["params"]:
             if param.numel() == 0 or (
@@ -512,6 +510,11 @@ def fully_shard_optimizer(
                 continue
             # Optimizer state is built from wgrad.
             param.grad = torch.zeros_like(param)
+
+    # A zero gradient alone does not make optimizer.step() inert. Set lr to zero
+    # to prevent parameter updates. Also disable weight decay because optimizers
+    # with coupled decay add it to the gradient before updating their persistent
+    # moment buffers, independently of lr.
     optimizer_group_settings = []
     for group in optimizer.param_groups:
         optimizer_group_settings.append(
@@ -520,12 +523,13 @@ def fully_shard_optimizer(
         group["lr"] = 0.0
         if "weight_decay" in group:
             group["weight_decay"] = 0.0
-    try:
-        # Non-lazy optimizer state initialization.
-        optimizer.step()
-    finally:
-        for group, settings in optimizer_group_settings:
-            group.update(settings)
+    # Allocate the state, then restore the caller's optimizer settings.
+    optimizer.step()
+    for group, settings in optimizer_group_settings:
+        group.update(settings)
+
+    # Optimizers advance their step counters even when lr is zero. Reset them so
+    # the first real update uses step 1 for bias correction.
     for group in optimizer.param_groups:
         if "step" not in group:
             continue
@@ -540,6 +544,8 @@ def fully_shard_optimizer(
             state["step"].zero_()
         else:
             state["step"] = 0
+
+    # Remove the synthetic gradients installed above.
     optimizer.zero_grad()
 
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
