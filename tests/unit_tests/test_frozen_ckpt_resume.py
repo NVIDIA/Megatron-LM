@@ -1,11 +1,12 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for ``--logits-save-frozen-ckpt`` auto-resume iteration reading.
+"""Unit tests for --freeze-all-layers auto-resume iteration reading.
 
 ``read_frozen_resume_iteration`` reads the progress tracker
-(``latest_checkpointed_iteration.txt``) that a frozen offline-KD logits dump writes
-to its save dir, so an identical resubmitted job continues where it stopped instead
-of re-dumping. It is pure file I/O (no CUDA, no distributed init), so it runs on CPU.
+(``latest_checkpointed_iteration.txt``) that a frozen (--freeze-all-layers) run writes
+to its --save dir, so an identical resubmitted job continues where it stopped instead
+of restarting. Its main use today is offline-KD teacher-logit dumps. Pure file I/O
+(no CUDA, no distributed init), so it runs on CPU.
 """
 
 from megatron.training.checkpointing import (

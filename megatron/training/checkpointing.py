@@ -46,7 +46,7 @@ from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from .utils import append_to_progress_log, is_last_rank, print_rank_0
+from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -355,18 +355,18 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def read_frozen_resume_iteration(load_dir):
-    """Resume iteration for a ``--logits-save-frozen-ckpt`` dump.
+def read_frozen_resume_iteration(save_dir):
+    """Resume iteration for a ``--freeze-all-layers`` run.
 
-    Returns the integer recorded in ``load_dir``'s progress tracker
+    Returns the integer recorded in ``save_dir``'s progress tracker
     (``latest_checkpointed_iteration.txt``), or ``0`` when there is none -- i.e. a
-    fresh dump, equivalent to ``--finetune`` on the first run. Unlike
+    fresh run, equivalent to ``--finetune`` on the first launch. Unlike
     :func:`read_metadata` (which returns ``-1`` / errors on a missing or malformed
     file), a missing tracker here simply means "start from the beginning".
     """
-    if load_dir is None:
+    if save_dir is None:
         return 0
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+    tracker_filename = get_checkpoint_tracker_filename(save_dir)
     if not maybe_msc.os.path.isfile(tracker_filename):
         return 0
     iteration, _release = read_metadata(tracker_filename)
@@ -549,11 +549,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
-    # Offline-KD frozen teacher dump (--logits-save-frozen-ckpt): the model weights are frozen
-    # and loaded from a fixed teacher, so there is nothing new to persist. Skip the weight write
-    # and the normal tracker / one_logger / wandb finalizers; dump progress is instead recorded to
-    # the tracker as a post-logits finalize (see the async block below).
-    skip_weight_ckpt = getattr(args, 'logits_save_frozen_ckpt', None) is not None
+    # --freeze-all-layers: the model weights are frozen and never change, so there is nothing new
+    # to persist -- skip the weight write and the normal tracker / one_logger / wandb finalizers.
+    # When logits are also being dumped, run progress is instead recorded to the tracker as a
+    # post-logits finalize (see the async block below) so a resubmit can resume the data position.
+    skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
 
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
@@ -955,16 +955,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
-            async_request_cls = get_async_strategy(args.async_strategy)[1]["AsyncRequest"]
             # In frozen-dump mode there is no checkpoint request (async_save_request is None); the
             # logits request then owns its own finalize_fns.
-            logits_finalize_fns = (
-                async_save_request.finalize_fns.copy()
-                if async_save_request is not None else []
-            )
             if async_save_request is not None:
+                logits_finalize_fns = async_save_request.finalize_fns.copy()
                 async_save_request.finalize_fns.clear()
-            # Record dump progress AFTER the logits tar is confirmed written, so a resumed job
+            else:
+                logits_finalize_fns = []
+            # Record run progress AFTER the logits tar is confirmed written, so a resumed job
             # never skips or replays a window. Written by a single rank -- the last rank, which
             # lives on the last pipeline stage where the logits saver is attached (get_logits_saver
             # is None on earlier stages, including global rank 0 when PP > 1).
@@ -975,9 +973,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     tracker_filename = get_checkpoint_tracker_filename(args.save)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
-                    print_rank_0(f"  recorded logits-dump progress: iteration "
-                                 f"{iteration} to {tracker_filename}")
+                    print_rank_last(f"  recorded logits-dump progress: iteration "
+                                    f"{iteration} to {tracker_filename}")
                 logits_finalize_fns.append(progress_finalize_fn)
+            async_request_cls = get_async_strategy(args.async_strategy)[1]["AsyncRequest"]
             async_logits_request = async_request_cls(
                 async_fn=logits_saver._write_batched_tar,
                 async_fn_args=logits_saver.take_pending_data(),
@@ -1810,19 +1809,21 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    # Offline-KD frozen teacher dump (--logits-save-frozen-ckpt): load weights from the fixed
-    # teacher (finetune-style: weights only), and auto-resume the dump by feeding the progress
-    # tracker in --load into the standard --override-ckpt-iteration path. --load holds only the
-    # tracker (no iter_N/ weight dir), so weights come from the frozen teacher instead.
-    frozen_ckpt = getattr(args, 'logits_save_frozen_ckpt', None)
-    if frozen_ckpt is not None:
-        # An explicit --override-ckpt-iteration wins; otherwise resume from the tracker (if any).
-        if args.override_ckpt_iteration is None:
-            tracker_iteration = read_frozen_resume_iteration(load_dir)
-            if tracker_iteration > 0:
-                args.override_ckpt_iteration = tracker_iteration
-        load_dir = frozen_ckpt
+    # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
+    # and auto-resume the data position by feeding this run's own progress tracker -- written to
+    # --save on the previous launch -- into the standard --override-ckpt-iteration path. Reading
+    # progress from --save (this job's output) rather than --load lets --load stay pinned to a
+    # fixed checkpoint across resubmits. An explicit --override-ckpt-iteration wins. (The main use
+    # today is offline-KD teacher-logit dumps.)
+    if getattr(args, 'freeze_all_layers', False):
+        # Weights only: don't adopt the loaded checkpoint's optimizer / LR-scheduler / rng, or run
+        # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
+        # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
         args.finetune = True
+        if args.override_ckpt_iteration is None:
+            progress_iteration = read_frozen_resume_iteration(args.save)
+            if progress_iteration > 0:
+                args.override_ckpt_iteration = progress_iteration
 
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
@@ -2118,12 +2119,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 ckpt_global_batch_size is not None
                 and ckpt_global_batch_size != args.global_batch_size
             ):
-                raise RuntimeError(
-                    '--override-ckpt-iteration recomputes consumed_train_samples from the target '
-                    f'iteration and current global_batch_size, but checkpoint global_batch_size '
-                    f'({ckpt_global_batch_size}) != current global_batch_size '
-                    f'({args.global_batch_size}). This would replay the data loader from the '
-                    'wrong sample offset.'
+                warn_rank_0(
+                    '--override-ckpt-iteration recomputes consumed_train_samples = target_iter * '
+                    f'current global_batch_size ({args.global_batch_size}), but this checkpoint '
+                    f'was saved at global_batch_size {ckpt_global_batch_size}. If the target '
+                    "iteration is in the checkpoint run's units, the data loader resumes from a "
+                    'shifted sample offset.'
                 )
         iteration = args.override_ckpt_iteration
         args.consumed_train_samples = iteration * args.global_batch_size
