@@ -44,7 +44,7 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
 
     assert torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch is not None
     model = torch.nn.Linear(4, 4, device="cuda")
-    model.config = Mock()
+    model.config = Mock(cuda_graph_impl="full_iteration")
     ddp_config = Mock(
         num_buckets=None,
         bucket_size=1024,
