@@ -500,7 +500,12 @@ def fully_shard_optimizer(
     optimizer_zero_grad_base_func = type(optimizer).zero_grad
 
     # Materialize lazy optimizer state so DCP has state tensors to load into. This
-    # synthetic step must have no effect on subsequent training.
+    # follows PyTorch DCP's `_init_optim_state`, which takes a synthetic zero-gradient
+    # step before loading optimizer state.
+    # TODO: Consider moving this initialization to the checkpoint-loading path, as in
+    # the MFSDP v2 checkpoint API (#6024), where checkpoint state immediately
+    # overwrites the synthetic state. Keeping it in fully_shard_optimizer() means that
+    # fresh training may follow, so this synthetic step must be numerically inert.
     for group in optimizer.param_groups:
         for param in group["params"]:
             if param.numel() == 0 or (
