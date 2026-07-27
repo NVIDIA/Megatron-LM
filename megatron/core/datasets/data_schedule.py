@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.datasets.data_schedule_utils import _get_global_seqlens_and_ids
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
@@ -60,53 +61,26 @@ class HybridCPDataLoaderWrapper:
 
         We find the number of subsamples each rank holds and then gather the
         sequence lengths of all subsamples from all ranks.
+
+        Delegates to ``data_schedule_utils._get_global_seqlens_and_ids``. The
+        shared helper returns ``offsets`` with one extra trailing entry (the
+        total subsample count); this method preserves the original contract of
+        returning per-rank start offsets only.
         """
-        # Collect the number of subsamples from all ranks
-        local_len = torch.tensor([subsample_seqlens.shape[0]], dtype=torch.int32).cuda()
-        dp_subsample_count = [torch.zeros_like(local_len) for _ in range(self.dp_group.size())]
-        torch.distributed.all_gather(dp_subsample_count, local_len, group=self.dp_group)
-
-        # Find the max number of subsamples across all ranks and pad subsample_seqlens to max length
-        dp_subsample_counts = torch.stack(dp_subsample_count, dim=0).cpu().view(-1)
-        max_sub_samples = int(dp_subsample_counts.max().item())
-
-        if local_len.item() < max_sub_samples:
-            subsample_seqlens_padded = torch.cat(
-                [
-                    subsample_seqlens,
-                    torch.zeros(max_sub_samples - local_len.item(), dtype=torch.int32).cuda(),
-                ],
-                dim=0,
-            )
-        else:
-            subsample_seqlens_padded = subsample_seqlens
-
-        # Gather the subsample_seqlens from all ranks
-        seqlens_gathered = [
-            torch.empty_like(subsample_seqlens_padded) for _ in range(self.dp_group.size())
-        ]
-        torch.distributed.all_gather(
-            seqlens_gathered, subsample_seqlens_padded, group=self.dp_group
+        _, _, offsets, seqlens_gathered = _get_global_seqlens_and_ids(
+            subsample_seqlens, self.dp_group
         )
-
-        # Trim each seqlens_gathered to the length of the correct sample
-        for dp_rank, seqlen in enumerate(seqlens_gathered):
-            seqlens_gathered[dp_rank] = seqlen[: dp_subsample_counts[dp_rank]]
-
-        seqlens_gathered = torch.cat(seqlens_gathered, dim=0)
-        seqlens_gathered = seqlens_gathered.cpu().tolist()
-
-        # Calculate the offsets to assign unique global ID to each subsample.
-        csum = torch.cumsum(dp_subsample_counts, dim=0, dtype=torch.int32)
-        offsets = torch.cat([torch.zeros(1, dtype=torch.int32), csum[:-1]], dim=0)
-
-        return seqlens_gathered, offsets
+        return seqlens_gathered, offsets[:-1]
 
     def get_global_id_seqlens(self, num_local_subsamples, offsets, seqlens_gathered):
         """
         Calculates the global ID for each subsample.
 
         We assign a unique global ID to each subsample.
+
+        Kept as a local implementation: the shared helper fuses this pure
+        indexing step with the collective gather, so delegating here would
+        re-run the all-gathers.
 
         Returns:
         global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
@@ -133,6 +107,16 @@ class HybridCPDataLoaderWrapper:
         )
         return hdp_rank
 
+    # NOTE: data_schedule_utils.reroute_samples_to_dcp_ranks is the sequence-
+    # packing generalization of this method. It is intentionally NOT used here
+    # because it is not behavior-preserving for the hybrid-CP path:
+    #   * its empty-send fallback allocates a 1-element (not 0-element) buffer,
+    #     which fails all_to_all_single split validation when a rank has
+    #     nothing to send (reachable here);
+    #   * it transports the "original_seq_len"/"padded_seq_len" metadata keys
+    #     with count-based splits, keys the hybrid-CP batch does not carry;
+    #   * its rank mapping applies "% dp_cp_group.size()" for PP support,
+    #     while hybrid CP asserts pipeline_model_parallel_size == 1.
     def reroute_samples_to_hdp_ranks(
         self, batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
     ):
@@ -242,6 +226,13 @@ class HybridCPDataLoaderWrapper:
         }
         return recv_sample_with_id
 
+    # NOTE: data_schedule_utils._unpack_batch is the sequence-packing variant
+    # of this method. It is intentionally NOT used here because it changes the
+    # sub-sample contract for the hybrid-CP path: it copies a fixed key list
+    # (dropping any extra dataset keys), squeezes 2-D tensors in place, and
+    # adds synthesized "original_seq_len"/"padded_seq_len" keys, which would
+    # alter the all-to-all key set in reroute_samples_to_hdp_ranks and the
+    # samples returned from __next__.
     def unpack_batch(self, batch):
         """
         Unpacks the packed samples into a list of sub-samples.
@@ -284,10 +275,8 @@ class HybridCPDataLoaderWrapper:
         subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
         subsample_seqlens = subsample_seqlens[subsample_seqlens != 0]
 
-        seqlens_gathered, offsets = self.get_global_seqlens(subsample_seqlens)
-
-        global_id_seqlens, global_ids_this_rank = self.get_global_id_seqlens(
-            subsample_seqlens.shape[0], offsets, seqlens_gathered
+        global_id_seqlens, global_ids_this_rank, offsets, _ = _get_global_seqlens_and_ids(
+            subsample_seqlens, self.dp_group
         )
 
         groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(
