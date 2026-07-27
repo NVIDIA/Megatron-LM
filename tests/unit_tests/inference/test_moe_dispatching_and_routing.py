@@ -442,7 +442,7 @@ class TestNVLSAllGatherVDispatcher:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# symmetric-memory collective ordering (barrier-before-reuse tracking)
+# symmetric-memory collective ordering (explicit barrier-before-reuse)
 # ──────────────────────────────────────────────────────────────────────
 
 # Hidden size chosen so each bf16 row is 16-byte aligned (an NVLS requirement).
@@ -452,20 +452,20 @@ _ORDERING_LOCAL_ROWS = 4
 
 @pytest.mark.internal
 class TestSymmCollectiveOrdering:
-    """Buffer-level barrier-before-reuse tracking driven by real NVLS collectives.
+    """Explicit ``barrier_before`` buffer-reuse ordering over real NVLS collectives.
 
     These run the real Triton multimem all-gather / reduce-scatter kernels on
-    actual symmetric memory and verify the tracking that decides whether an
-    all-gather must barrier before reusing the buffer:
+    actual symmetric memory and verify that the callers' explicit
+    ``barrier_before`` decision produces correct data:
 
-      - a reduce-scatter already synchronizes ranks, so a following all-gather
-        needs no barrier;
-      - two consecutive all-gathers reuse the buffer, so the second must barrier
-        (the MTP hazard the tracking replaces the old name-sniffing with).
+      - a reduce-scatter already synchronizes ranks, so a following all-gather is
+        correct with ``barrier_before=False``;
+      - two consecutive all-gathers reuse the buffer, so the second must pass
+        ``barrier_before=True`` (the MTP eh_proj / output-projection hazard) and
+        still gather correctly.
 
-    The decision is read from ``all_gather_needs_barrier`` — the same helper the
-    production ``multimem_all_gather`` consults — and every step runs a real
-    collective so the recorded state reflects the true call path.
+    The barrier is requested explicitly at the call site — there is no global op
+    tracking — so these tests exercise the flag the production layers set.
     """
 
     @classmethod
@@ -498,7 +498,7 @@ class TestSymmCollectiveOrdering:
             pytest.skip(f"symmetric memory unavailable: {buf.init_failure_reason}")
         return tp_group, buf
 
-    def _run_all_gather(self, buf, tp_group, *, barrier_before=None):
+    def _run_all_gather(self, buf, tp_group, *, barrier_before=False):
         """Real all-gather of a rank-tagged tensor into the shared 'tp' buffer."""
         from megatron.core.inference.communication.torch_symm_triton.collectives import (
             multimem_all_gather,
@@ -544,74 +544,34 @@ class TestSymmCollectiveOrdering:
         multimem_reduce_scatter(out, symm["tensor"], symm["handle"])
         return out, world
 
-    def test_all_gather_after_reduce_scatter_needs_no_barrier(self):
-        from megatron.core.inference.communication.torch_symm_triton.collectives import (
-            all_gather_needs_barrier,
-            reset_collective_ordering,
-        )
-
+    def test_all_gather_after_reduce_scatter_no_barrier(self):
         tp_group, buf = self._require_nvls_buffer()
-        reset_collective_ordering()
 
-        # A reduce-scatter already synchronizes ranks, so a following all-gather
-        # must not request the extra barrier.
+        # A reduce-scatter already synchronizes ranks, so a following all-gather is
+        # correct without the extra barrier.
         rs_out, world = self._run_reduce_scatter(buf, tp_group)
         assert torch.all(rs_out == float(world)), "reduce-scatter should sum ones across ranks"
-        assert all_gather_needs_barrier(buf.symm_mem_hdl) is False
 
-        # The all-gather runs correctly and then records itself as the last op.
-        ag_out, world = self._run_all_gather(buf, tp_group)
+        ag_out, world = self._run_all_gather(buf, tp_group, barrier_before=False)
         self._assert_gather_correct(ag_out, world)
-        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
 
-    def test_consecutive_all_gathers_need_barrier(self):
-        from megatron.core.inference.communication.torch_symm_triton.collectives import (
-            all_gather_needs_barrier,
-            reset_collective_ordering,
-        )
-
+    def test_consecutive_all_gathers_with_barrier_are_correct(self):
         tp_group, buf = self._require_nvls_buffer()
-        reset_collective_ordering()
 
-        first_out, world = self._run_all_gather(buf, tp_group)
+        first_out, world = self._run_all_gather(buf, tp_group, barrier_before=False)
         self._assert_gather_correct(first_out, world)
-        # The buffer now records an all-gather, so the next all-gather auto-derives
-        # barrier_before=True. It must still produce correct data under the barrier.
-        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
 
-        second_out, world = self._run_all_gather(buf, tp_group)
+        # The second all-gather reuses the buffer immediately after the first, so it
+        # must barrier before overwriting; it must still gather correct data.
+        second_out, world = self._run_all_gather(buf, tp_group, barrier_before=True)
         self._assert_gather_correct(second_out, world)
-        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
 
-    def test_reset_clears_tracked_state(self):
-        from megatron.core.inference.communication.torch_symm_triton.collectives import (
-            all_gather_needs_barrier,
-            reset_collective_ordering,
-        )
-
+    def test_explicit_barrier_runs_correctly(self):
         tp_group, buf = self._require_nvls_buffer()
-        reset_collective_ordering()
 
-        self._run_all_gather(buf, tp_group)
-        assert all_gather_needs_barrier(buf.symm_mem_hdl) is True
-
-        reset_collective_ordering()
-        assert all_gather_needs_barrier(buf.symm_mem_hdl) is False
-
-    def test_explicit_barrier_override_runs_correctly(self):
-        from megatron.core.inference.communication.torch_symm_triton.collectives import (
-            all_gather_needs_barrier,
-            reset_collective_ordering,
-        )
-
-        tp_group, buf = self._require_nvls_buffer()
-        reset_collective_ordering()
-
-        # After a reduce-scatter the auto-decision is "no barrier", but an explicit
-        # barrier_before=True must still be honored and produce correct output.
+        # An explicit barrier_before=True must always be honored and produce correct
+        # output regardless of the preceding op.
         self._run_reduce_scatter(buf, tp_group)
-        assert all_gather_needs_barrier(buf.symm_mem_hdl) is False
-
         out, world = self._run_all_gather(buf, tp_group, barrier_before=True)
         self._assert_gather_correct(out, world)
 
