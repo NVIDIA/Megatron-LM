@@ -135,6 +135,8 @@ def _tag_cudagraph_buffer_saved_for_backward(tensor):
     # can preserve the saved-for-backward lifetime.
     metadata = _apply_cudagraph_buffer_metadata(tensor)
     metadata.is_saved_for_backward = True
+
+
 _GTP_RUNNER_STREAMS: List[torch.cuda.Stream] = []
 
 
@@ -496,15 +498,13 @@ class _CudagraphGlobalRecord:
 
         function_ctx = torch.autograd.function.FunctionCtx
         original_save_for_backward = function_ctx.save_for_backward
+
         def observing_save_for_backward(ctx, *tensors):
             for tensor in tensors:
                 _tag_cudagraph_buffer_saved_for_backward(tensor)
             return original_save_for_backward(ctx, *tensors)
 
-        cls._saved_tensors_observer = (
-            original_save_for_backward,
-            observing_save_for_backward,
-        )
+        cls._saved_tensors_observer = (original_save_for_backward, observing_save_for_backward)
         function_ctx.save_for_backward = observing_save_for_backward
 
     @classmethod
@@ -775,8 +775,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
             ) and getattr(user_input, "can_skip_replay_copy", True)
 
             # When the same input (like cu_seqlens) is passed to multiple cudagraphs, the first
-            # cudagraph copies it into the corresponding 'cudagraph_input'. Subsequent cudagraphs 
-            # will then read the same cudagraph_input, leading to a case where the passed tensor 
+            # cudagraph copies it into the corresponding 'cudagraph_input'. Subsequent cudagraphs
+            # will then read the same cudagraph_input, leading to a case where the passed tensor
             # doesn't need a copy despite being a different data_ptr as its 'cudagraph_input'.
             if can_skip_replay_copy and cudagraph_input.cg_buffer_metadata.input_use_count == 1:
                 assert user_input.data_ptr() == cudagraph_input.data_ptr()
@@ -1076,9 +1076,7 @@ class _CudaGraphRunner(torch.nn.Module):
         # Return module params that were found in the graph, preserving original order
         return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
 
-    def _weakref_forward_buffers(
-        self, preserve_forward_to_backward_lifetimes: bool
-    ) -> None:
+    def _weakref_forward_buffers(self, preserve_forward_to_backward_lifetimes: bool) -> None:
         """Release ownership only when CUDA graph topology proves the buffer reclaimable.
 
         `make_weakref` preserves a captured address but releases allocator ownership.
@@ -1089,16 +1087,14 @@ class _CudaGraphRunner(torch.nn.Module):
 
         def is_saved_for_backward(tensor) -> bool:
             """Return whether a tensor is needed for the backward pass graph.
-            
+
             Preserving allocator ownership guards against the graph pool reusing and overwriting
             that storage before backward capture records the read.
             """
 
             metadata = getattr(tensor, "cg_buffer_metadata", None)
             return bool(
-                torch.is_tensor(tensor)
-                and metadata is not None
-                and metadata.is_saved_for_backward
+                torch.is_tensor(tensor) and metadata is not None and metadata.is_saved_for_backward
             )
 
         def is_differentiable_cudagraph_output_escape(tensor) -> bool:
@@ -1106,7 +1102,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
             Outputs that are also inputs to another CUDA graph are protected by graph-to-graph
             reuse accounting. However, an output that is not another graph's input has no
-            such owner. Preserving it's ownership guards against premature graph-pool storage 
+            such owner. Preserving it's ownership guards against premature graph-pool storage
             reuse across that graph boundary.
             """
             metadata = getattr(tensor, "cg_buffer_metadata", None)

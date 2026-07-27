@@ -18,7 +18,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -1629,9 +1629,8 @@ class MoETransformerLayer(TransformerLayer):
             if torch.is_tensor(attr):
                 attr_names.append(attr_name)
                 token_dispatcher_attr_outputs.append(attr)
-        
-        return tuple(attr_names), token_dispatcher_attr_outputs
 
+        return tuple(attr_names), token_dispatcher_attr_outputs
 
     def _forward_mlp_router(self, hidden_states, padding_mask=None):
         """
