@@ -216,6 +216,16 @@ class MoETokenDispatcher:
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
 
+    def get_expert_zero_copy_buffers(self):
+        """Buffers the experts should write their output / grad input into, if any.
+
+        Returns:
+            A ``(output_buffer, grad_input_buffer)`` tuple. ``(None, None)`` unless the
+            dispatcher supports zero-copy, in which case the experts write straight into
+            the communication buffers instead of into fresh allocations.
+        """
+        return None, None
+
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """

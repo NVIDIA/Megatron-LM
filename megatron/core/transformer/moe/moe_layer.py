@@ -549,10 +549,7 @@ class MoELayer(BaseMoELayer):
             # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
             # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
             # these kwargs).
-            get_zc_buffers = getattr(self.token_dispatcher, "get_expert_zero_copy_buffers", None)
-            output_buffer, grad_input_buffer = (
-                get_zc_buffers() if get_zc_buffers is not None else (None, None)
-            )
+            output_buffer, grad_input_buffer = self.token_dispatcher.get_expert_zero_copy_buffers()
             expert_kwargs = {}
             if output_buffer is not None:
                 expert_kwargs["output_buffer"] = output_buffer

@@ -676,8 +676,9 @@ class TEGroupedMLP(MegatronModule):
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
-            # NCCL-EP zero-copy: the fused-MLP input aliases the persistent symm buffer (also the
-            # fc2 output combine reads), whose storage is non-resizable — don't force-release it.
+            # NCCL-EP zero-copy is active exactly when ``output_buffer`` is not None, and then the
+            # fused-MLP input aliases the persistent symm buffer (also the fc2 output combine
+            # reads), whose storage is non-resizable — so skip the force-release in that case.
             forced_released_tensors = (
                 [permuted_local_hidden_states]
                 if fine_grained_activation_offloading and output_buffer is None
