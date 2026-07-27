@@ -26,6 +26,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
+    is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
@@ -1011,6 +1012,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             tp_group=pg_collection.tp if pg_collection is not None else None,
             name=(name + ".eh_proj") if name is not None else None,
         )
+        # eh_proj's input all-gather reuses the shared "tp" symmetric buffer right
+        # after the preceding layer's all-gather (the fused rs-add-norm-ag terminates
+        # with one, as does the previous MTP step's output all-gather), so it must
+        # barrier before overwriting. Only the inference-optimized linear implements
+        # this all-gather; other eh_proj impls have no such buffer to guard.
+        if is_inference_column_parallel_linear(self.eh_proj):
+            self.eh_proj.set_barrier_before_all_gather(True)
 
         # Build inner layers: two possible paths
         # 1. Hybrid path: use HybridStack for hybrid pattern support
@@ -1045,6 +1053,31 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
+
+        # The MTP inner block's first attention all-gather (the first layer's
+        # self_attention.linear_qkv) reuses the same "tp" symmetric buffer that
+        # _concat_embeddings' output all-gather just wrote, with no reduce-scatter in
+        # between, so it must also barrier before overwriting. Later all-gathers in the
+        # inner block are each preceded by a reduce-scatter and need no barrier. Dispatch
+        # to the first inner layer the same way _proj_and_transformer_layer does.
+        if self.mtp_layer_pattern is not None:
+            # Hybrid path: HybridStack of layers.
+            first_inner_layer = self.mtp_model_layer.layers[0]
+        else:
+            # GPT path: single TransformerLayer.
+            first_inner_layer = self.mtp_model_layer
+
+        assert hasattr(first_inner_layer, "self_attention") and hasattr(
+            first_inner_layer.self_attention, "linear_qkv"
+        ), (
+            "MTP inner-block barrier wiring expects the first inner layer to be an "
+            "attention layer exposing self_attention.linear_qkv. The MTP head structure "
+            "has changed; revisit which all-gather reuses the 'tp' symmetric buffer after "
+            "the output projection and set barrier_before_all_gather on it accordingly."
+        )
+        inner_qkv = first_inner_layer.self_attention.linear_qkv
+        if is_inference_column_parallel_linear(inner_qkv):
+            inner_qkv.set_barrier_before_all_gather(True)
 
         self.final_layernorm = self.submodules.layer_norm(
             config=self.config,
@@ -1132,11 +1165,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection.
         if InferenceMode.is_active():
-            # This all-gather immediately follows the input all-gather inside eh_proj
-            # on the same symmetric buffer, so the buffer-reuse barrier is required;
-            # it is derived automatically from the op sequence (see multimem_all_gather).
+            # This all-gather immediately follows eh_proj's input all-gather on the
+            # same symmetric buffer (only eh_proj's local matmul runs in between), so
+            # it must barrier before overwriting the buffer's previous contents.
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
-                hidden_states, self.tp_group, self.config
+                hidden_states, self.tp_group, self.config, barrier_before=True
             )
         else:
             hidden_states = gather_from_tensor_model_parallel_region(

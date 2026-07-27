@@ -165,11 +165,26 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
+        # Explicit toggle for the pre-all-gather buffer-reuse barrier. Left False by
+        # default; a caller sets it True when this layer's input all-gather directly
+        # follows another all-gather on the shared symmetric buffer with no
+        # reduce-scatter in between (e.g. the MTP eh_proj projection).
+        self.barrier_before_all_gather = False
+
         # Boolean to be toggled externally for skipping norm and all-gather.
         # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
+
+    def set_barrier_before_all_gather(self, value: bool = True) -> None:
+        """Request a barrier before this layer's input all-gather reuses the buffer.
+
+        Set by callers whose op sequence places another all-gather on the shared
+        symmetric buffer immediately before this layer's all-gather (e.g. the MTP
+        eh_proj projection), so the kernel synchronizes ranks before overwriting.
+        """
+        self.barrier_before_all_gather = value
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -197,9 +212,14 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
-            # do multimem all gather; the barrier-before-reuse decision is derived
-            # from the last collective on this buffer (see multimem_all_gather).
-            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            # do multimem all gather; barrier before reusing the buffer only when this
+            # all-gather follows another all-gather on it (see barrier_before_all_gather).
+            multimem_all_gather(
+                symm_mem_buffer["tensor"],
+                x,
+                symm_mem_buffer["handle"],
+                barrier_before=self.barrier_before_all_gather,
+            )
             return symm_mem_buffer["tensor"]
         else:
             # revert to torch dist (NCCL) all gather
@@ -293,6 +313,21 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
+        # Explicit toggle for the pre-all-gather buffer-reuse barrier. Left False by
+        # default; a caller sets it True when this layer's input all-gather directly
+        # follows another all-gather on the shared symmetric buffer with no
+        # reduce-scatter in between (e.g. the MTP eh_proj projection).
+        self.barrier_before_all_gather = False
+
+    def set_barrier_before_all_gather(self, value: bool = True) -> None:
+        """Request a barrier before this layer's input all-gather reuses the buffer.
+
+        Set by callers whose op sequence places another all-gather on the shared
+        symmetric buffer immediately before this layer's all-gather (e.g. the MTP
+        eh_proj projection), so the kernel synchronizes ranks before overwriting.
+        """
+        self.barrier_before_all_gather = value
+
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
         Attempt to allocate symmetric memory buffer for all-gather.
@@ -317,9 +352,14 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
-            # The barrier-before-reuse decision is derived from the last collective
-            # on this buffer (see multimem_all_gather).
-            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            # Barrier before reusing the buffer only when this all-gather follows
+            # another all-gather on it (see barrier_before_all_gather).
+            multimem_all_gather(
+                symm_mem_buffer["tensor"],
+                x,
+                symm_mem_buffer["handle"],
+                barrier_before=self.barrier_before_all_gather,
+            )
             return symm_mem_buffer["tensor"]
         else:
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
@@ -490,11 +530,23 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             return x, None
 
 
+def is_inference_column_parallel_linear(module) -> bool:
+    """Whether ``module`` is an inference-optimized column-parallel linear.
+
+    These are the layers that perform a symmetric-memory all-gather and therefore
+    expose ``set_barrier_before_all_gather``. Returns ``False`` for anything else
+    (including ``None`` and non-inference linear implementations).
+    """
+    return isinstance(
+        module, (InferenceColumnParallelLinear, InferenceLayerNormColumnParallelLinear)
+    )
+
+
 def inference_all_gather_from_tensor_model_parallel_region(
     x: torch.Tensor,
     tp_group: torch.distributed.ProcessGroup,
     config: TransformerConfig,
-    barrier_before: Optional[bool] = None,
+    barrier_before: bool = False,
 ) -> torch.Tensor:
     """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
 
@@ -506,9 +558,9 @@ def inference_all_gather_from_tensor_model_parallel_region(
     semantics as `_gather_along_last_dim` but using hardware multicast when
     possible.
 
-    ``barrier_before`` is forwarded to `multimem_all_gather`: leave it as ``None``
-    to derive the buffer-reuse barrier from the op sequence, or pass ``True`` to
-    force it on.
+    ``barrier_before`` is forwarded to `multimem_all_gather`: pass ``True`` when
+    this all-gather directly follows another all-gather on the shared symmetric
+    buffer so it barriers before overwriting the previous contents.
     """
     tp_size = dist.get_world_size(tp_group)
     if tp_size == 1:
