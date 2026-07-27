@@ -105,6 +105,13 @@ def get_qwen35_vl_vision_config(
     if num_layers_override is not None:
         num_layers = num_layers_override
 
+    vision_head_dim = vcfg["kv_channels"]
+    assert vision_head_dim % 4 == 0, (
+        "Qwen3.5-VL vision RoPE expects the per-head dimension to split "
+        f"evenly across row/column frequencies, got {vision_head_dim}"
+    )
+    vision_rope_axis_dim = vision_head_dim // 4
+
     return TransformerConfig(
         num_layers=num_layers,
         hidden_size=vcfg["hidden_size"],
@@ -120,6 +127,12 @@ def get_qwen35_vl_vision_config(
         bias_activation_fusion=False,
         apply_query_key_layer_scaling=False,
         apply_rope_fusion=False,
+        # Vision RoPE is 2D row/column RoPE.  Represent it as sectioned raw
+        # mRoPE with a zero temporal section so the fused mRoPE dispatcher can
+        # reuse the same Triton kernel when rope fusion is enabled.
+        mrope_section=[0, vision_rope_axis_dim, vision_rope_axis_dim],
+        mrope_interleaved=False,
+        rotary_interleaved=False,
         bf16=False,
     )
 
