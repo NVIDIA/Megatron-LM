@@ -414,6 +414,8 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
         or "Fatal glibc error" in concat_allranks_logs
+        or "Disk quota exceeded" in concat_allranks_logs
+        or "basic_ios::clear: iostream error" in concat_allranks_logs
     )
 
 
@@ -665,12 +667,13 @@ def main(
 
             n_iteration += 1
 
-    send_slack_alert(
-        test_case=test_case,
-        context="max attempts exhausted",
-        n_iteration=n_iteration,
-        n_attempts=n_attempts,
-    )
+    if test_type == "release":
+        send_slack_alert(
+            test_case=test_case,
+            context="max attempts exhausted",
+            n_iteration=n_iteration,
+            n_attempts=n_attempts,
+        )
     telemetrics_and_exit(
         success=False,
         test_case=test_case,
