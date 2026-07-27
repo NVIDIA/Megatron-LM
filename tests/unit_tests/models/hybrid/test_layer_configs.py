@@ -263,6 +263,19 @@ class TestLayerConfigToTransformerConfig:
         assert tc.multi_latent_attention is True
         assert tc.experimental_attention_variant == "dsa"
 
+    def test_dsa_derives_add_bias_linear_false(self):
+        """DSA is built on AbsorbedMLASelfAttention, which cannot carry a
+        linear bias; ``TransformerConfig`` raises when the two are combined.
+        ``CommonLayerConfig.add_bias_linear`` defaults to ``True``, so the
+        DSA layer must derive it rather than leave every recipe author to
+        remember it. ``add_qkv_bias`` stays independently settable."""
+        common = _make_common()
+        assert common.add_bias_linear is True, "fixture must exercise the default"
+        layer = DSALayerConfig(common_config=common, num_attention_heads=4, add_qkv_bias=True)
+        tc = layer.to_transformer_config(num_layers=2)
+        assert tc.add_bias_linear is False
+        assert tc.add_qkv_bias is True
+
     def test_dsa_mla_knobs_curated(self):
         common = _make_common()
         layer = DSALayerConfig(

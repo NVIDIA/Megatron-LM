@@ -326,6 +326,15 @@ class DSALayerConfig(LayerConfig):
             "kv_channels": self.kv_channels,
             "multi_latent_attention": True,
             "experimental_attention_variant": "dsa",
+            # DSA is built on AbsorbedMLASelfAttention, which cannot carry a
+            # linear bias -- TransformerConfig.__post_init__ raises outright
+            # when experimental_attention_variant == "dsa" and
+            # add_bias_linear is set. CommonLayerConfig.add_bias_linear
+            # defaults to True (mirroring TransformerConfig), so deriving it
+            # here keeps a model-wide default from breaking every DSA recipe.
+            # Bias on the QKV projection specifically is still available via
+            # the curated ``add_qkv_bias`` field below.
+            "add_bias_linear": False,
             "q_lora_rank": self.q_lora_rank,
             "kv_lora_rank": self.kv_lora_rank,
             "qk_head_dim": self.qk_head_dim,
