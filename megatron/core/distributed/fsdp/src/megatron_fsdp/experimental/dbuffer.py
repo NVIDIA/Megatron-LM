@@ -468,7 +468,7 @@ class DBuffer:
         should build the full-mesh DTensor at the ``FsdpParameterGroup`` layer,
         which owns the full user-provided mesh.
         """
-        torch_placements = tuple(to_dtensor_placement(placement) for placement in self.placements)
+        dtensor_placements = tuple(to_dtensor_placement(placement) for placement in self.placements)
 
         local_tensor = self.get_local_tensor(index)
         tensor_shape = self.layout.tensor_shapes[index]
@@ -477,7 +477,7 @@ class DBuffer:
         return DTensor.from_local(
             local_tensor=local_tensor,
             device_mesh=self.mesh,
-            placements=torch_placements,
+            placements=dtensor_placements,
             run_check=False,
             shape=tensor_shape,
             stride=local_tensor.stride(),
