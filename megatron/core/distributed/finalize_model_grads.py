@@ -1,8 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from collections import defaultdict
 from functools import partial
 from typing import Callable, Dict, List, Optional, Union
-from collections import defaultdict
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -320,8 +320,11 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
     """
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if (config.moe_router_enable_expert_bias and hasattr(module, 'expert_bias') 
-            and getattr(module, 'local_tokens_per_expert', None) is not None):
+            if (
+                config.moe_router_enable_expert_bias
+                and hasattr(module, 'expert_bias')
+                and getattr(module, 'local_tokens_per_expert', None) is not None
+            ):
                 module.local_tokens_per_expert.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
@@ -368,7 +371,8 @@ def _update_router_expert_bias(
         updated = get_updated_expert_bias(
             torch.stack([t for t, _ in pairs], dim=0),
             torch.stack([b for _, b in pairs], dim=0),
-            config.moe_router_bias_update_rate, tp_dp_cp_group=tp_dp_cp_group,
+            config.moe_router_bias_update_rate,
+            tp_dp_cp_group=tp_dp_cp_group,
         )
         for (_, bias), new_bias in zip(pairs, updated):
             bias.copy_(new_bias)
