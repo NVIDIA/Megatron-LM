@@ -140,12 +140,15 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
-def check_checkpoint_args(checkpoint_args):
+def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
     args = get_args()
+    skip_args = skip_args or set()
 
     def _compare(arg_name, old_arg_name=None, default=None):
+        if arg_name in skip_args:
+            return
         if old_arg_name is not None:
             ckpt_arg_name = old_arg_name
         else:
@@ -2021,13 +2024,6 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
             '--hybrid-layer-pattern so checkpoint layers can be paired with '
             'hybrid layer positions.'
         )
-    if not args.finetune:
-        raise RuntimeError(
-            'Loading a GPT checkpoint into a hybrid model requires --finetune: the '
-            'hybrid architecture has a different layer count than the GPT checkpoint, '
-            'so iteration bookkeeping and the LR schedule restart fresh. Optimizer '
-            'state is still translated and loaded unless --no-load-optim is set.'
-        )
     try:
         layer_maps = gpt_compatible_layer_maps(args.hybrid_layer_pattern)
     except ValueError as exc:
@@ -2204,8 +2200,8 @@ def load_checkpoint(
         )
 
         # Determine if optimizer state will be loaded. For a GPT->hybrid load the
-        # optimizer state is retargeted at the GPT checkpoint even though --finetune
-        # is set (finetune only resets iteration and the LR schedule here).
+        # optimizer state is retargeted at the GPT checkpoint even under --finetune,
+        # which independently controls iteration and LR-schedule reset semantics.
         if (
             not release
             and (not args.finetune or gpt_compat_load_optim)
@@ -2491,7 +2487,12 @@ def load_checkpoint(
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
-        check_checkpoint_args(checkpoint_args)
+        # A GPT block is split into separate attention and MLP positions in
+        # HybridModel, so num_layers intentionally differs even for an
+        # architecture-preserving load. Keep every other resume-time argument
+        # compatibility check.
+        skip_args = {'num_layers'} if gpt_compat_layer_maps is not None else None
+        check_checkpoint_args(checkpoint_args, skip_args=skip_args)
         args.consumed_train_samples = getattr(checkpoint_args, 'consumed_train_samples', 0)
         args.skipped_train_samples = getattr(checkpoint_args, 'skipped_train_samples', 0)
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
@@ -2590,8 +2591,7 @@ def load_checkpoint(
                     update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
                 )
 
-            # Load scheduler. Skipped under --finetune (including a GPT->hybrid load):
-            # the LR schedule restarts fresh alongside the reset iteration count.
+            # Load scheduler unless --finetune requests a fresh iteration and LR schedule.
             if opt_param_scheduler is not None and not args.finetune:
                 if 'lr_scheduler' in state_dict:  # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])

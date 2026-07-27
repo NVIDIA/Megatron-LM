@@ -41,6 +41,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args
@@ -629,7 +633,14 @@ def _configure_checkpoint_args(args, ckpt_dir, parallel, moe, use_megatron_fsdp)
 
 
 def _run_gpt_to_hybrid_optimizer_load(
-    tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe, *, use_megatron_fsdp=False
+    tmp_path_dist_ckpt,
+    src_parallel,
+    dest_parallel,
+    pattern,
+    moe,
+    *,
+    finetune=True,
+    use_megatron_fsdp=False,
 ):
     layer_maps = gpt_compatible_layer_maps(pattern)
     num_gpt_layers = layer_maps.num_gpt_layers
@@ -691,15 +702,27 @@ def _run_gpt_to_hybrid_optimizer_load(
             moments_before = _optimizer_moment_fingerprint(hybrid_optimizer)
 
             _configure_checkpoint_args(mock_args, ckpt_dir, dest_parallel, moe, use_megatron_fsdp)
-            mock_args.finetune = True  # required for a GPT->hybrid load
+            mock_args.finetune = finetune
             mock_args.hybrid_layer_pattern = pattern
             mock_args.num_layers = len(pattern.replace('|', ''))
 
-            iteration, _ = load_checkpoint(hybrid_model, hybrid_optimizer, None)
+            if not finetune:
+                data_parallel_size = ps.get_data_parallel_world_size()
+                init_num_microbatches_calculator(
+                    rank=torch.distributed.get_rank(),
+                    global_batch_size=data_parallel_size,
+                    micro_batch_size=1,
+                    data_parallel_size=data_parallel_size,
+                )
+            try:
+                iteration, _ = load_checkpoint(hybrid_model, hybrid_optimizer, None)
+            finally:
+                if not finetune:
+                    destroy_num_microbatches_calculator()
 
-            # Finetune semantics: iteration restarts even though the optimizer
-            # moments were warm-started.
-            assert iteration == 0
+            # GPT-to-Hybrid translation does not select checkpoint semantics:
+            # --finetune restarts iteration, while a regular load resumes it.
+            assert iteration == (0 if finetune else 10)
             assert any(
                 not torch.equal(param, model_before[name])
                 for name, param in hybrid_module.named_parameters()
@@ -720,30 +743,40 @@ class TestGPTToHybridOptimizerLoad:
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        ('src_parallel', 'dest_parallel', 'pattern', 'moe'),
+        ('src_parallel', 'dest_parallel', 'pattern', 'moe', 'finetune'),
         [
-            pytest.param((1, 1, 1, 1, 1), (1, 1, 1, 1, 1), '*-*-', False, id='dp8-dense'),
-            pytest.param((1, 1, 1, 1, 1), (1, 1, 1, 1, 1), 'M*-M*-', False, id='dp8-hybrid'),
-            pytest.param((1, 1, 1, 1, 1), (2, 1, 1, 1, 1), 'M*-M*-', False, id='dp8-to-tp2-dp4'),
             pytest.param(
-                (2, 1, 1, 1, 1), (1, 2, 1, 1, 1), 'M*-M*-', False, id='tp2-dp4-to-pp2-dp4'
+                (1, 1, 1, 1, 1),
+                (1, 1, 1, 1, 1),
+                'M*-M*-',
+                False,
+                False,
+                id='resume-without-finetune',
+            ),
+            pytest.param((1, 1, 1, 1, 1), (1, 1, 1, 1, 1), '*-*-', False, True, id='dp8-dense'),
+            pytest.param((1, 1, 1, 1, 1), (1, 1, 1, 1, 1), 'M*-M*-', False, True, id='dp8-hybrid'),
+            pytest.param(
+                (1, 1, 1, 1, 1), (2, 1, 1, 1, 1), 'M*-M*-', False, True, id='dp8-to-tp2-dp4'
             ),
             pytest.param(
-                (1, 1, 2, 1, 1), (2, 1, 1, 1, 1), 'M*-M*-', False, id='cp2-dp4-to-tp2-dp4'
+                (2, 1, 1, 1, 1), (1, 2, 1, 1, 1), 'M*-M*-', False, True, id='tp2-dp4-to-pp2-dp4'
             ),
             pytest.param(
-                (1, 1, 2, 4, 1), (2, 1, 1, 2, 2), 'M*EM*E', True, id='cp2-ep4-to-tp2-ep2-etp2'
+                (1, 1, 2, 1, 1), (2, 1, 1, 1, 1), 'M*-M*-', False, True, id='cp2-dp4-to-tp2-dp4'
             ),
             pytest.param(
-                (2, 1, 1, 2, 2), (1, 2, 1, 4, 1), 'M*EM*E', True, id='tp2-ep2-etp2-to-pp2-ep4'
+                (1, 1, 2, 4, 1), (2, 1, 1, 2, 2), 'M*EM*E', True, True, id='cp2-ep4-to-tp2-ep2-etp2'
+            ),
+            pytest.param(
+                (2, 1, 1, 2, 2), (1, 2, 1, 4, 1), 'M*EM*E', True, True, id='tp2-ep2-etp2-to-pp2-ep4'
             ),
         ],
     )
     def test_gpt_optimizer_state_loads_into_hybrid(
-        self, tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe
+        self, tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe, finetune
     ):
         _run_gpt_to_hybrid_optimizer_load(
-            tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe
+            tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe, finetune=finetune
         )
 
 
@@ -753,27 +786,42 @@ class TestGPTToHybridFSDPLoad:
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        ('src_parallel', 'dest_parallel', 'pattern', 'moe'),
+        ('src_parallel', 'dest_parallel', 'pattern', 'moe', 'finetune'),
         [
-            pytest.param((1, 1, 1, 1, 1), (1, 1, 1, 1, 1), '*-*-', False, id='fsdp4-dense'),
             pytest.param(
-                (2, 1, 1, 1, 1), (1, 1, 1, 1, 1), 'M*-M*-', False, id='tp2-fsdp2-to-fsdp4'
+                (1, 1, 1, 1, 1),
+                (1, 1, 1, 1, 1),
+                'M*-M*-',
+                False,
+                False,
+                id='resume-without-finetune',
+            ),
+            pytest.param((1, 1, 1, 1, 1), (1, 1, 1, 1, 1), '*-*-', False, True, id='fsdp4-dense'),
+            pytest.param(
+                (2, 1, 1, 1, 1), (1, 1, 1, 1, 1), 'M*-M*-', False, True, id='tp2-fsdp2-to-fsdp4'
             ),
             pytest.param(
-                (1, 1, 2, 1, 1), (2, 1, 1, 1, 1), 'M*-M*-', False, id='cp2-fsdp2-to-tp2-fsdp2'
+                (1, 1, 2, 1, 1), (2, 1, 1, 1, 1), 'M*-M*-', False, True, id='cp2-fsdp2-to-tp2-fsdp2'
             ),
             pytest.param(
                 (1, 1, 1, 2, 1),
                 (2, 1, 1, 2, 2),
                 'M*EM*E',
                 True,
+                True,
                 id='fsdp4-ep2-to-tp2-fsdp2-ep2-etp2',
             ),
         ],
     )
     def test_gpt_fsdp_model_and_optimizer_load_into_hybrid(
-        self, tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe
+        self, tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe, finetune
     ):
         _run_gpt_to_hybrid_optimizer_load(
-            tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe, use_megatron_fsdp=True
+            tmp_path_dist_ckpt,
+            src_parallel,
+            dest_parallel,
+            pattern,
+            moe,
+            finetune=finetune,
+            use_megatron_fsdp=True,
         )
