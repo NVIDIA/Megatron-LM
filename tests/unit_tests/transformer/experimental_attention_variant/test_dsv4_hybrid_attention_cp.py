@@ -124,6 +124,8 @@ def _dsv4_cp_mxfp8_kernels_available():
         "precision",
         "q_scale",
         "k_scale",
+        "cu_seqlens_q_scale_padded",
+        "cu_seqlens_k_scale_padded",
         "sf_vec_size",
         "q_causal_offsets",
     }
@@ -585,6 +587,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
+            cuda_graph_impl="local",
         )
         attn = _build_attention(config, layer_number=layer_number, pg_collection=self.ref_pg).cuda()
         hidden_values, grad_values = _make_hidden_and_grad(padded_tokens, config.hidden_size)
@@ -1079,6 +1082,7 @@ class TestDSv4HybridAttentionTHDCP:
                 dsa_indexer_use_sparse_loss=True,
                 use_fused_kernels=dsa_fused,
                 apply_rope_fusion=rope_fused,
+                cuda_graph_impl="local",
             )
             graph_attn = _build_attention(
                 config, layer_number=layer_number, pg_collection=self.pg
@@ -1261,6 +1265,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_use_sparse_loss=True,
             use_fused_kernels=True,
             apply_rope_fusion=True,
+            cuda_graph_impl="local",
         )
         graph_attn = _build_attention(
             config, layer_number=layer_number, pg_collection=self.pg
@@ -1417,6 +1422,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
+            cuda_graph_impl="local",
         )
         cp_attn = _build_attention(
             config_cp, layer_number=layer_number, pg_collection=self.pg
