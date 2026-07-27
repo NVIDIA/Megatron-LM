@@ -479,9 +479,11 @@ class TestA2AOverlap:
     def test_transformer_layer_overlap_zero_copy(self):
         """ncclEP zero-copy under 1F1B a2a overlap must match the non-overlap reference.
 
-        Validates the overlap dispatch-backward path (_StageDispatchBwdGrad staging into the symm
-        buffer + the free_input symm guard): zero-copy stays enabled in both runs, so this isolates
-        the overlap schedule. bf16 op-fuser (SwiGLU, tp=1) -- no fp8/Blackwell dependency.
+        Zero-copy stays enabled in both runs, so this isolates the overlap schedule. It also
+        compares the two ways zero-copy makes the dispatch-backward gradient symm-mem-backed:
+        the reference gets it from the op-fuser's ``grad_input_buffer``, the overlap run from
+        ``StageDispatchBwdGrad`` staging into the same buffer (plus the free_input symm guard).
+        bf16 op-fuser (SwiGLU, tp=1) -- no fp8/Blackwell dependency.
         """
         extra_kwargs = {}
         apply_flex_backend_kwargs(extra_kwargs, "flex", "ncclep")
@@ -491,46 +493,54 @@ class TestA2AOverlap:
             use_transformer_engine_op_fuser=True,
             gated_linear_unit=True,
             activation_func=F.silu,
-            # gates the zero-copy dispatch-bwd staging (_StageDispatchBwdGrad); the a2a-overlap run
-            # exercises the 1F1B schedule that this flag represents in production.
             overlap_moe_expert_parallel_comm=True,
         )
         config = get_test_config(extra_kwargs=extra_kwargs)
         microbatches = 4
-        with deterministic_mode():
-            transformer_layer_spec = get_gpt_decoder_block_spec(
-                config=config, use_transformer_engine=True
-            )
-            gpt_model = GPTModel(
-                config=config,
-                transformer_layer_spec=transformer_layer_spec,
-                vocab_size=100,
-                pre_process=True,
-                post_process=True,
-                max_sequence_length=300,
-            )
-            params = reset_model(gpt_model)
-            input_tensors = [build_data() for _ in range(microbatches)]
-
-            capture_ref = run_transformer_layer_ref_with_capture(
-                gpt_model, input_tensors, microbatches
-            )
-            reset_model(gpt_model, params)
-            capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
-                gpt_model, input_tensors, microbatches
-            )
-            comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
-            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
-
-        # zero-copy sets process-global ncclEP state (ep bootstrap mode + shared symm classvars);
-        # reset so later non-zero-copy ncclEP tests in this process are not polluted.
         from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
         from megatron.core.transformer.moe.token_dispatcher import _NCCLEPManager
 
-        nccl_ep_finalize()
-        _NCCLEPManager._zc_fwd_token_buf = None
-        _NCCLEPManager._zc_bwd_token_buf = None
-        _NCCLEPManager._zc_recv_topk_weights_buf = None
+        try:
+            with deterministic_mode():
+                transformer_layer_spec = get_gpt_decoder_block_spec(
+                    config=config, use_transformer_engine=True
+                )
+                gpt_model = GPTModel(
+                    config=config,
+                    transformer_layer_spec=transformer_layer_spec,
+                    vocab_size=100,
+                    pre_process=True,
+                    post_process=True,
+                    max_sequence_length=300,
+                )
+                params = reset_model(gpt_model)
+                input_tensors = [build_data() for _ in range(microbatches)]
+
+                # The reference runs the layer directly instead of through the 1F1B schedule, so it
+                # must declare overlap=False: that is what makes get_expert_zero_copy_buffers hand
+                # the op-fuser the symm grad_input_buffer for the fc1 dgrad. Under overlap=True the
+                # buffer is withheld (the schedule detaches the dispatch output, so autograd would
+                # discard it) and StageDispatchBwdGrad supplies the symm gradient instead.
+                config.overlap_moe_expert_parallel_comm = False
+                capture_ref = run_transformer_layer_ref_with_capture(
+                    gpt_model, input_tensors, microbatches
+                )
+                config.overlap_moe_expert_parallel_comm = True
+
+                reset_model(gpt_model, params)
+                capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
+                    gpt_model, input_tensors, microbatches
+                )
+                comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
+                assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+        finally:
+            # zero-copy sets process-global ncclEP state (ep bootstrap mode + shared symm
+            # classvars). Reset in a finally: on failure the leaked classvars would otherwise make
+            # every later ncclEP test in this process fail too, hiding the real error.
+            nccl_ep_finalize()
+            _NCCLEPManager._zc_fwd_token_buf = None
+            _NCCLEPManager._zc_bwd_token_buf = None
+            _NCCLEPManager._zc_recv_topk_weights_buf = None
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())

@@ -25,6 +25,38 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class StageDispatchBwdGrad(torch.autograd.Function):
+    """1F1B + NCCL-EP zero-copy only: redirect the dispatch-backward grad into the persistent
+    symm buffer so the one-sided ``dispatch_bwd`` can consume it.
+
+    Under the 1F1B overlap schedule the dispatch output is consumed by the next node, which
+    detaches it into a leaf; autograd therefore hands ``dispatch_bwd`` a non-symm
+    ``AccumulateGrad`` clone. Applying this identity node to the dispatch output — while it is
+    still inside the dispatch node's own graph segment — makes it the sole consumer, moving that
+    accumulation to *our* output; the backward then does a single plain->symm copy into the
+    dispatcher's ``_zc_bwd_token_buf``. That buffer is free to stage into precisely because
+    ``get_expert_zero_copy_buffers`` withholds it from the op-fuser under overlap.
+    Forward is identity (no numeric effect).
+    """
+
+    @staticmethod
+    def forward(ctx, dispatched_tokens, token_dispatcher):  # type: ignore[override]
+        """Identity forward; stashes the dispatcher so backward can reach its symm buffer."""
+        ctx.token_dispatcher = token_dispatcher
+        return dispatched_tokens
+
+    @staticmethod
+    def backward(ctx, grad):  # type: ignore[override]
+        """Stage the incoming gradient into the symm dispatch-backward buffer."""
+        buf = ctx.token_dispatcher._comm_manager._zc_bwd_token_buf
+        assert buf is not None, "zero-copy staging buffer not allocated before dispatch-backward"
+        assert (
+            buf.shape == grad.shape
+        ), f"dispatch-bwd grad {tuple(grad.shape)} != staging buffer {tuple(buf.shape)}"
+        buf.copy_(grad)
+        return buf, None
+
+
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
     return get_pg_rank(pp_group) == 0
