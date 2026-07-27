@@ -31,9 +31,9 @@ distributed-optimizer state, reshardable into any target TP/PP/EP/CP/VPP on load
     [`docs/user-guide/features/megatron_fsdp.md`](../../docs/user-guide/features/megatron_fsdp.md)
     → "Converting Megatron-FSDP (`fsdp_dtensor`) to N-D Parallel (`torch_dist`)"
     (resume flags, supported architectures, memory ceiling, multi-process convert).
-  - Validation harness:
-    [`tools/checkpoint/fsdp_dtensor_to_torch_dist_validation/README.md`](../../tools/checkpoint/fsdp_dtensor_to_torch_dist_validation/README.md)
-    (what is tested, how, expected results, and how to extend it).
+  - End-to-end suite:
+    [`tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist/README.md`](../../tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist/README.md)
+    (the opt-in pytest suite — what is tested, how, and how to extend it).
   - Unit tests: `tests/unit_tests/tools/checkpoint/test_reverse_convert.py` and
     `test_reverse_convert_roundtrip.py`.
 
@@ -46,19 +46,18 @@ distributed-optimizer state, reshardable into any target TP/PP/EP/CP/VPP on load
    config. Do not reason about it yet.
 2. **Set up the environment.** GPU work runs in the mcore dev container — see the
    [build & dependency skill](../mcore-build-and-dependency/SKILL.md). On older
-   images, clear a stale `nvidia-resiliency-ext` first
-   (`bash tools/checkpoint/fsdp_dtensor_to_torch_dist_validation/common.sh preflight`).
+   images, clear a stale `nvidia-resiliency-ext` (<0.6.0) that breaks
+   `import megatron.core` before running anything.
 3. **Convert / validate.** For a one-off conversion, use the CLI above. To prove a
-   conversion is correct, use the harness (choose by what you need to show):
-   - `validate_resume.sh <model>` — resume-continuity (1 GPU).
-   - `validate_bitexact.py <model> --iter {60|80}` — decisive per-tensor diff (1 GPU).
-   - `validate_reshard.sh <model>` — load-side TP/PP/EP resharding (≥2 GPUs).
-   - `validate_source_sharding.sh <model> [DP2|TP2|PP2|EP2]` — source-side sharding:
-     train the FSDP source across ≥2 GPUs, then convert + resume (≥2 GPUs).
-   - `run_all.sh [--with-bitexact --with-reshard --with-source-sharding]` — the set.
-4. **Read the PASS criteria from the README**, not from intuition: loads at the
+   conversion is correct, run the opt-in end-to-end suite as **plain pytest** (it
+   spawns its own torchrun — do not launch it under `torch.distributed.run`):
+   `MCORE_CHECKPOINT_E2E=1 uv run pytest
+   tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist --run-e2e`.
+   Scope with `-k` by family and by check (`test_resume` / `test_bitexact` [1 GPU],
+   `test_reshard` / `test_source_sharding` [≥2 GPUs]).
+4. **Read the PASS criteria from the suite README**, not from intuition: loads at the
    right iter, first resumed `lm loss` ≈ FSDP loss within bf16 tolerance, LR exact,
-   and (bit-exact) an empty diff.
+   and (bit-exact) a clean per-tensor diff.
 5. **Report** the `[Convert]` line, the load-at-iter confirmation, and the numeric
    verdict; link the canonical doc for human readers.
 
@@ -66,17 +65,20 @@ distributed-optimizer state, reshardable into any target TP/PP/EP/CP/VPP on load
 
 ## Key facts & gotchas
 
-- **Single source of truth for arch flags** is `models/<name>.sh` in the harness;
-  `common.sh emit-args <model>` feeds both the shell drivers and the Python
-  bit-exact tool. Add a model = drop one `models/<name>.sh` file.
+- **Single source of truth for arch flags** is the `ModelFamily` registry in the
+  e2e suite (`tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist/registry.py`);
+  the same entries feed every check and the bit-exact worker. Add a family = one
+  `ModelFamily(...)` entry.
 - **Dropped by design:** RNG state, rerun-state, and all `_extra_state` (incl. FP8
   amax history). FP8 resume re-initializes amax, so it tracks ~1% looser than bf16
   tolerance — expected, not a bug.
 - **`gdn_hybrid` needs `flash-linear-attention`** (the image's `fla` stub is
-  insufficient); `validate_resume.sh` installs it automatically.
+  insufficient); it is pinned in the `dev` extra, and the e2e suite skips the family
+  if `fla` is not importable (it never pip-installs at test time).
 - **Under GPU contention**, prefer the single-rank resume + bit-exact checks; the
   2-GPU reshard sweep can deadlock on a shared GPU.
-- **`results/` is git-ignored** and safe to delete between runs.
+- **Suite outputs** land in a tmp dir (or `RESULTS_DIR` if set) and are safe to
+  delete between runs.
 - **Scale is out of scope for the harness** (1–8 GPUs). The CPU-memory ceiling and
   the multi-process (`torchrun -N`) convert for large checkpoints are in the user
   guide.
@@ -87,8 +89,11 @@ distributed-optimizer state, reshardable into any target TP/PP/EP/CP/VPP on load
 
 Pure-logic and round-trip coverage belong in
 `tests/unit_tests/tools/checkpoint/test_reverse_convert*.py` — see the
-[testing skill](../mcore-testing/SKILL.md). The GPU end-to-end harness is the manual
-complement, not a CI recipe.
+[testing skill](../mcore-testing/SKILL.md). The GPU end-to-end coverage lives in the
+opt-in pytest suite at
+`tests/integration_tests/tools/checkpoint/fsdp_dtensor_to_torch_dist/` (add a family
+= one `ModelFamily` entry in its `registry.py`); it is a real-checkpoint complement
+to the unit tests, gated behind `--run-e2e` / `MCORE_CHECKPOINT_E2E=1`.
 
 ## Documentation drift
 
