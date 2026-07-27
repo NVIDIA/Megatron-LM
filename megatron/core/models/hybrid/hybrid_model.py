@@ -200,6 +200,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Parse unified pattern to extract main and MTP components.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
             parse_hybrid_pattern,
             select_pipeline_segment_with_logical_offset,
         )
@@ -234,6 +235,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Validate TP communication overlap after determining whether this rank builds MTP,
         # before constructing the decoder or MTP modules.
         layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
+
+        # Bracketed-group patterns give every logical layer the structure of a
+        # transformer layer, so their checkpoints are made key-compatible with
+        # GPTModel. Derived from the full pattern rather than this rank's segment so
+        # every PP stage agrees on the naming. Non-grouped patterns keep the
+        # historical hybrid keys, which existing hybrid checkpoints were saved with.
+        transformer_sharded_keys = Symbols.GROUP_START in (parsed.main_pattern or '')
 
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
 
@@ -304,6 +312,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
             logical_layer_offset=logical_layer_offset,
+            transformer_sharded_keys=transformer_sharded_keys,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
@@ -570,6 +579,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         MTP forward runs here. ``compute_mtp_loss`` disables the MTP auxiliary
         objective (see ``forward``); ``cp_batch`` / ``mhc_multistream`` feed the MTP
         block's CP-layout preparation on the eager path.
+        ``output_processor`` replaces the default logits / loss computation with a
+        caller-supplied hook (used by RL and other custom output paths); it is
+        forwarded by ``PostProcessNode`` and handled here exactly as in
+        ``GPTModel._postprocess``.
         """
         in_inference_mode = InferenceMode.is_active()
         if in_inference_mode:
@@ -695,6 +708,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 )
 
         sequence_parallel_override = False
+
+        if output_processor is not None:
+            return output_processor(
+                hidden_states=hidden_states,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                labels=labels,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                runtime_gather_output=runtime_gather_output,
+                context=output_processor_context,
+                compute_language_model_loss=self.compute_language_model_loss,
+                scale_logits=self._scale_logits,
+                config=self.config,
+            )
+
         if (
             in_inference_mode
             and inference_context is not None
