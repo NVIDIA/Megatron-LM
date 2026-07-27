@@ -35,7 +35,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -175,23 +175,10 @@ def check_checkpoint_args(checkpoint_args):
         _compare('tensor_model_parallel_size')
         _compare('pipeline_model_parallel_size')
 
-
-def isfile(filename) -> bool:
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        return msc.os.path.isfile(filename)
-    else:
-        return os.path.isfile(filename)
-
-
 def ensure_directory_exists(filename, check_parent=True):
     """Build filename's path if it does not already exists."""
     dirname = os.path.dirname(filename) if check_parent else filename
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        msc.os.makedirs(dirname, exist_ok=True)
-    else:
-        os.makedirs(dirname, exist_ok=True)
+    maybe_msc.os.makedirs(dirname, exist_ok=True)
 
 
 def get_checkpoint_name(checkpoints_path, iteration, release=False,
@@ -243,7 +230,7 @@ def get_load_checkpoint_path_by_args(args, load_arg="load"):
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if isfile(tracker_filename):
+        if maybe_msc.os.path.isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
@@ -272,7 +259,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=False, expert_rank=0)
-    if isfile(filename):
+    if maybe_msc.os.path.isfile(filename):
         return filename
 
     # Look for checkpoint with no pipelining and expert parallelism
@@ -280,7 +267,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=True, expert_rank=0)
-    if isfile(filename):
+    if maybe_msc.os.path.isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and no expert parallelism
@@ -288,7 +275,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=False, expert_rank=0)
-    if isfile(filename):
+    if maybe_msc.os.path.isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and expert parallelism
@@ -296,7 +283,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=True, expert_rank=0)
-    if isfile(filename):
+    if maybe_msc.os.path.isfile(filename):
         return filename
 
     # Look for a distributed checkpoint
@@ -320,7 +307,7 @@ def checkpoint_exists(checkpoints_path):
     if checkpoints_path is None:
         return False
     path = get_checkpoint_tracker_filename(checkpoints_path)
-    return isfile(path)
+    return maybe_msc.os.path.isfile(path)
 
 
 def read_metadata(tracker_filename):
@@ -329,7 +316,7 @@ def read_metadata(tracker_filename):
     iteration = -1
     release = False
 
-    with open_file(tracker_filename, 'r') as f:
+    with maybe_msc.open(tracker_filename, 'r') as f:
         metastring = f.read().strip()
         try:
             iteration = int(metastring)
@@ -590,8 +577,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     checkpoint_name = get_checkpoint_name(save_dir, iteration, release=release, pipeline_parallel=pipeline_parallel,
         tensor_rank=tensor_rank, pipeline_rank=pipeline_rank, expert_parallel=expert_parallel, expert_rank=expert_rank, return_base_dir=return_base_dir)
 
-    # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
-    maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
+    # Save dataloader state if the external dataloader supports it.
+    maybe_save_dataloader_state(
+        train_data_iterator,
+        iteration,
+        getattr(args, "dataloader_save", None),
+        tp_group=tp_group,
+        pp_group=pp_group,
+        dp_group=dp_group,
+    )
 
     # Save distributed optimizer's custom parameter state.
     if (
@@ -844,19 +838,22 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 pipeline_rank, pp_group,
                 mpu.get_pipeline_model_parallel_rank, mpu.get_pipeline_model_parallel_world_size,
             )
+            gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
+            gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
             def iter_finalize_fn():
                 prev_iteration = 0
                 save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
                 if save_retain_interval is not None:
-                    if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
-                        with open_file(tracker_filename, 'r') as f:
+                    if maybe_msc.os.path.exists(tracker_filename):
+                        with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
-                with open_file(tracker_filename, 'w') as f:
+                with maybe_msc.open(tracker_filename, 'w') as f:
                     f.write("release" if release else str(iteration))
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
                              f"checkpoint from iteration {int(iteration):7d} to {args.save} "
                              f"[ t {tensor_mp_rank}/{tp_size_to_print}, "
+                             f"gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, "
                              f"p {pipeline_mp_rank}/{pp_size_to_print} ]")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
@@ -1012,12 +1009,19 @@ def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=F
         remove_iter_ckpts(rm_iter_ckpts)
 
 
-def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path):
+def maybe_save_dataloader_state(
+    train_iterator,
+    iteration,
+    dataloader_save_path,
+    *,
+    tp_group=None,
+    pp_group=None,
+    dp_group=None,
+):
     """Saves dataloader state if the dataloader supports it.
 
-    Currently, this is only used by Megatron Energon dataloader (multimodal) to store its state at a
-    specific iteration. The Megatron built-in dataloader (text-only) creates index files upfront
-    to track its state.
+    External dataloaders use this to store state at a specific iteration. The Megatron built-in
+    dataloader creates index files upfront to track its state.
 
     If the provided dataloader has `save_state` method, then it is called to save the state.
     Otherwise, no state is saved.
@@ -1026,6 +1030,9 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
         train_iterator (iterable): Train dataloader.
         iteration (int): Current iteration.
         dataloader_save_path (str): Path where the dataloader state is saved.
+        tp_group (ProcessGroup): Tensor-parallel group, or MPU fallback when unset.
+        pp_group (ProcessGroup): Pipeline-parallel group, or MPU fallback when unset.
+        dp_group (ProcessGroup): Data-parallel group, or MPU fallback when unset.
     """
     # If no dataloader or saving path is provided, exit early, otherwise, raise an error.
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == "":
@@ -1036,25 +1043,48 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
         raise RuntimeError(f"Could not find a save_state for the train_iterator of type {type(train_iterator)}")
 
     # Save dataloader state for each data parallel rank only once.
-    first_rank = mpu.is_pipeline_first_stage(ignore_virtual=True) and mpu.get_tensor_model_parallel_rank() == 0
+    first_rank = (
+        get_pg_rank(pp_group) == 0
+        if pp_group is not None
+        else mpu.is_pipeline_first_stage(ignore_virtual=True)
+    ) and (
+        get_pg_rank(tp_group) == 0
+        if tp_group is not None
+        else mpu.get_tensor_model_parallel_rank() == 0
+    )
     if not first_rank:
         return
 
-    dp_rank = mpu.get_data_parallel_rank()
+    dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+    train_dataloader_state_dict = train_iterator.iterable.save_state()
     if dp_rank == 0:
         print(f"saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}")
-    train_dataloader_state_dict = train_iterator.iterable.save_state()
     data_state_save_path = get_checkpoint_name(
-        dataloader_save_path, iteration,
-        basename=f'train_dataloader_dprank{dp_rank:03d}.pt'
+        dataloader_save_path,
+        iteration,
+        pipeline_parallel=(
+            get_pg_size(pp_group) > 1
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_world_size() > 1
+        ),
+        # Dataloader state is sharded only by DP rank. Keep it in the canonical TP0/PP0 directory.
+        tensor_rank=0,
+        pipeline_rank=0,
+        expert_parallel=False,
+        expert_rank=0,
+        basename=f'train_dataloader_dprank{dp_rank:03d}.pt',
     )
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
+    torch.distributed.barrier(group=data_parallel_group)
 
-    if mpu.get_data_parallel_rank() == 0:
+    if dp_rank == 0:
         ensure_directory_exists(data_state_save_path)
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    torch.distributed.barrier(group=data_parallel_group)
+
+    if train_dataloader_state_dict is None:
+        return
 
     dataloader_save_dict = {}
     dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
@@ -1236,7 +1266,7 @@ def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing
         return -1
     elif args.non_persistent_ckpt_type == "global":
         tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
-        if isfile(tracker_filename):
+        if maybe_msc.os.path.isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
             if release:
                 raise RuntimeError('Non-persistent checkpoint can\'t be a release checkpoint')
@@ -1358,14 +1388,9 @@ def _load_global_dist_base_checkpoint(
 
 def _get_checkpoint_format(checkpoint_name, args):
     """Get the format of an existing checkpoint."""
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        checkpoint_dir = msc.Path(checkpoint_name)
-        is_torch_ckpt = any([f.name.startswith("mp_rank_0") for f in checkpoint_dir.iterdir()])
-        is_torch_dcp = checkpoint_dir.joinpath(".metadata").exists()
-    else:
-        is_torch_ckpt = any([f.startswith("mp_rank_0") for f in os.listdir(checkpoint_name)])
-        is_torch_dcp = os.path.exists(os.path.join(checkpoint_name, ".metadata"))
+    checkpoint_dir = maybe_msc.Path(checkpoint_name)
+    is_torch_ckpt = any([f.name.startswith("mp_rank_0") for f in checkpoint_dir.iterdir()])
+    is_torch_dcp = checkpoint_dir.joinpath(".metadata").exists()
 
     ckpt_format = None
     if dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name):
@@ -1408,7 +1433,7 @@ def _load_base_checkpoint(
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if isfile(tracker_filename):
+        if maybe_msc.os.path.isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
@@ -2038,12 +2063,26 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
+        # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
+        # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if HAVE_GTP:
+            from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
+
+            load_ctx = lambda: gtp_native_fp8_load_context(module)
+        else:
+            from contextlib import nullcontext
+
+            load_ctx = nullcontext
         try:
-            module.load_state_dict(state_dict, strict=strict)
+            with load_ctx():
+                module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
-                load_return = module.load_state_dict(state_dict, strict=False)
+                with load_ctx():
+                    load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
     # Model.
     if not skip_load_to_model_and_opt:
@@ -2180,8 +2219,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     _tp_w = get_pg_size(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_world_size()
     _pp_r = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
     _pp_w = get_pg_size(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_world_size()
+    _gtp_remat_r = mpu.get_gtp_weight_remat_rank()
+    _gtp_remat_w = mpu.get_gtp_weight_remat_world_size()
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {_tp_r + 1}/{_tp_w}, '
+                 f'gtp_remat {_gtp_remat_r + 1}/{_gtp_remat_w}, '
                  f'p {_pp_r + 1}/{_pp_w} ] '
                  f'at iteration {iteration}')
 
@@ -2209,25 +2251,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg="After loading checkpoint")
-
-        # Load teacher model in Distillation mode.
-        if getattr(args, "export_kd_teacher_load", None):
-            from megatron.post_training.checkpointing import load_modelopt_checkpoint
-
-            unwrapped_model = unwrap_model(model)[0]
-            # Note: load_modelopt_checkpoint may call this function so we prevent infinite recursion.
-            if hasattr(unwrapped_model, 'teacher_model'):
-                teacher = unwrapped_model.teacher_model
-                print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
-                # [WAR]: To avoid error out on loading teacher's checkpoint, we temporarily
-                # set args.finetune to True while loading the teacher checkpoint.
-                original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
-                args.finetune = True
-                if args.export_kd_teacher_ckpt_format is not None:
-                    args.ckpt_format = args.export_kd_teacher_ckpt_format
-                load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
-                args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
-                print_rank_0("... teacher loaded successfully.")
 
     return iteration, num_floating_point_operations_so_far
 
@@ -2261,7 +2284,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
 
     tracker_filename = get_checkpoint_tracker_filename(load_path)
 
-    with open_file(tracker_filename, 'r') as f:
+    with maybe_msc.open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
     checkpoint_name = get_checkpoint_name(load_path, iteration,

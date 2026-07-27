@@ -20,6 +20,7 @@ CHECK_THRESHOLDS = {
     "num-zeros": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.20)],
     "generated_tokens": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "logprobs": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
+    "total loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
 }
 
 
