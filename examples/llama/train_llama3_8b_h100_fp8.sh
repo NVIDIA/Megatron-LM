@@ -9,8 +9,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 #export NCCL_P2P_NET_CHUNKSIZE=${NCCL_P2P_NET_CHUNKSIZE:-2097152}
 #export NCCL_AVOID_RECORD_STREAMS=${NCCL_AVOID_RECORD_STREAMS:-1}
 
-CHECKPOINT_PATH=${1:-"checkpoints/llama3_8b_fp8"}
-TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama3_8b_fp8"}
+CHECKPOINT_PATH=${1:-"checkpoints/llama3_8b_moe_fp4"}
+TENSORBOARD_LOGS_PATH=${2:-"tensorboard_logs/llama3_8b_moe_fp4"}
 TOKENIZER_ARG=${3:-"MOCK"} # Path to tokenizer model, or "MOCK"
 DATA_ARG=${4:-"MOCK"}     # Data prefix, or "MOCK"
 
@@ -19,7 +19,7 @@ mkdir -p "$(dirname "$CHECKPOINT_PATH")"
 mkdir -p "$(dirname "$TENSORBOARD_LOGS_PATH")"
 
 # Distributed training setup
-GPUS_PER_NODE=8
+GPUS_PER_NODE=4
 NUM_NODES=1
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-29500}
@@ -30,13 +30,16 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
 
 # Fixed model and training parameters
-TP_SIZE=1     
-CP_SIZE=1     
-PP_SIZE=1     
+TP_SIZE=1
+CP_SIZE=1
+PP_SIZE=1
+EP_SIZE=1
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=128
 NUM_LAYERS=32  
-DTYPE="fp8"
+NUM_EXPERTS=4
+MOE_FFN_HIDDEN_SIZE=3584
+DTYPE="fp4"
 SEQ_LENGTH=8192
 MAX_POSITION_EMBEDDINGS=8192
 
@@ -77,6 +80,16 @@ MODEL_ARGS=(
     --disable-bias-linear 
 )
 
+MOE_ARGS=(
+    --num-experts $NUM_EXPERTS
+    --moe-ffn-hidden-size $MOE_FFN_HIDDEN_SIZE
+    --moe-router-topk 2
+    --moe-router-load-balancing-type aux_loss
+    --moe-aux-loss-coeff 1e-2
+    --moe-grouped-gemm
+    --moe-token-dispatcher-type alltoall
+)
+
 TRAINING_ARGS=(
     --micro-batch-size $MICRO_BATCH_SIZE
     --global-batch-size $GLOBAL_BATCH_SIZE
@@ -109,6 +122,15 @@ if [[ "$DTYPE" == "fp8" ]]; then
         "--fp8-amax-history-len 1024"
         "--fp8-amax-compute-algo max"
         "--fp8-param-gather"
+        "--fp8-recipe tensorwise"
+    )
+elif [[ "$DTYPE" == "fp4" ]]; then
+    DTYPE_ARGS+=(
+        "--first-last-layers-bf16"
+        "--num-layers-at-start-in-bf16 0"
+        "--num-layers-at-end-in-bf16 3"
+        "--fp4-recipe nvfp4"
+        "--fp4-format e2m1"
     )
 fi
 
@@ -116,7 +138,8 @@ fi
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size $TP_SIZE
     --context-parallel-size $CP_SIZE
-    # --pipeline-model-parallel-size $PP_SIZE # Not explicitly set in llama script options, assume 1 if not multi-node PP
+    --expert-model-parallel-size $EP_SIZE
+    --pipeline-model-parallel-size $PP_SIZE # Not explicitly set in llama script options, assume 1 if not multi-node PP
     --sequence-parallel  # Always enable sequence parallelism with TP_SIZE=2
 )
 
@@ -164,7 +187,7 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --eval-iters 32
     --eval-interval 100
-    --save-interval 1000
+    --save-interval 5
     --log-throughput
     --profile
     --profile-step-start 4
@@ -174,6 +197,11 @@ EVAL_AND_LOGGING_ARGS=(
     --save "$CHECKPOINT_PATH"
     --load "$CHECKPOINT_PATH" 
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
+    --buffer-quantized-scaling-factors
+    --quantized-scaling-factor-buffering-decay 0.0
+    --async-save
+    --use-persistent-ckpt-worker
+    --ckpt-fully-parallel-save
 )
 
 # Ensure pretrain_gpt.py is found
@@ -187,6 +215,7 @@ fi
 torchrun ${DISTRIBUTED_ARGS[@]} \
     "$PRETRAIN_SCRIPT_PATH" \
     ${MODEL_ARGS[@]} \
+    ${MOE_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${DTYPE_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
