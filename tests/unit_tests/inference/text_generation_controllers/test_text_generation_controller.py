@@ -2527,9 +2527,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             events.append((symm_mem_hdl.multicast_ptr, "FUSED_RS_AG", False))
             return real_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs)
 
-        with mock.patch.object(il, "multimem_all_gather", rec_ag), mock.patch.object(
-            il, "multimem_reduce_scatter", rec_rs
-        ), mock.patch.object(il, "fused_multimem_rs_add_norm_ag", rec_fused):
+        with (
+            mock.patch.object(il, "multimem_all_gather", rec_ag),
+            mock.patch.object(il, "multimem_reduce_scatter", rec_rs),
+            mock.patch.object(il, "fused_multimem_rs_add_norm_ag", rec_fused),
+        ):
             self._run_serial_mtp_step()
 
         return events
