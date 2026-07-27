@@ -1262,9 +1262,11 @@ class Compressor(MegatronModule):
         if total_comp == 0:
             return None, cu_seqlens_compressed
 
-        # Token-wise projections on the FULL flat input — no boundary issue.
-        kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
-        score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
+        # Run the compressor GEMMs in high precision (BF16) even under FP8 training.
+        with get_fp8_disabled_context(self.config):
+            # Token-wise projections on the FULL flat input — no boundary issue.
+            kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
+            score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
 
         # Additive fused fast path (CuTe DSL, one kernel per direction) for the
         # gather / overlap-window / softmax / weighted-sum region below. Returns None
