@@ -1997,31 +1997,6 @@ class TextGenerationController:
             self._async_sched_logits.cuda_graph_request_count, survivor_token_row_indices
         )
 
-    def _record_fresh_async_sched_event(
-        self, reference_tensor: Optional[Tensor] = None
-    ) -> Optional[torch.cuda.Event]:
-        """Record a fresh event on the current CUDA stream when CUDA work is active.
-
-        Forward completion events can remain in flight while resolution runs,
-        so each overlapping forward owns a fresh event. Transfer events are
-        reused separately because they are synchronized within each step.
-
-        Args:
-            reference_tensor (Optional[Tensor]): Tensor used to determine whether
-                CUDA work is active.
-
-        Returns:
-            Optional[torch.cuda.Event]: Recorded CUDA event, or `None` when no
-            CUDA work is active.
-        """
-        if reference_tensor is not None and not reference_tensor.is_cuda:
-            return None
-        if not torch.cuda.is_available():
-            return None
-        event = torch.cuda.Event()
-        event.record()
-        return event
-
     @staticmethod
     def _synchronize_async_sched_event(event: Optional[torch.cuda.Event]) -> None:
         """Block the host until an async-scheduling CUDA event completes.
@@ -2341,10 +2316,7 @@ class TextGenerationController:
         return True, bookkeeping_done_event
 
     def _run_async_sched_resolve(
-        self,
-        sample_result: _AsyncScheduleSampleResult,
-        resolved_sequence_lengths: Tensor,
-        next_forward_done_event: Optional[torch.cuda.Event],
+        self, sample_result: _AsyncScheduleSampleResult, resolved_sequence_lengths: Tensor
     ) -> _AsyncScheduleRequestResult:
         """Resolve request state and compact speculative forward logits.
 
@@ -2352,8 +2324,6 @@ class TextGenerationController:
             sample_result (_AsyncScheduleSampleResult): Sampling outputs in reusable CPU views.
             resolved_sequence_lengths (Tensor): Sequence lengths after accepting
                 current output and before preparing unverified successor tokens.
-            next_forward_done_event (Optional[torch.cuda.Event]): Event marking
-                successor forward completion, or `None` when no successor exists.
 
         Returns:
             _AsyncScheduleRequestResult: Sampled tokens, resolved request row
@@ -2374,10 +2344,6 @@ class TextGenerationController:
         )
         range_pop()
 
-        # Finish the successor forward before releasing resources that it still uses.
-        if next_forward_done_event is not None and finished_request_ids.numel() > 0:
-            self._synchronize_async_sched_event(next_forward_done_event)
-
         # Resolve CPU request lifecycle state.
         range_push("resolve_requests")
         resolved_finished_request_ids, survivor_idxs = context.resolve_requests(active_request_mask)
@@ -2385,9 +2351,8 @@ class TextGenerationController:
 
         assert torch.equal(finished_request_ids, resolved_finished_request_ids)
 
-        # Compact pending successor logits only while the async chain continues.
-        if next_forward_done_event is not None:
-            self._compact_async_sched_logits(survivor_idxs)
+        # Enqueue compaction behind the successor forward on the current CUDA stream.
+        self._compact_async_sched_logits(survivor_idxs)
 
         # Return the resolution result.
         return _AsyncScheduleRequestResult(
@@ -2617,7 +2582,6 @@ class TextGenerationController:
 
             range_push("async_sched_forward_pass")
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
-            next_forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
             range_pop()
 
             # -------------------------------------------------------------------------
@@ -2627,10 +2591,8 @@ class TextGenerationController:
             self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
             self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            # Resolve N while forward N+1 continues unless finished resources are needed.
-            resolve_result = self._run_async_sched_resolve(
-                sample_result, resolved_sequence_lengths, next_forward_done_event
-            )
+            # Resolve N while forward N+1 continues.
+            resolve_result = self._run_async_sched_resolve(sample_result, resolved_sequence_lengths)
 
             # Commit CPU input IDs in the resolved survivor order.
             context.commit_sampled_tokens(
@@ -2694,7 +2656,6 @@ class TextGenerationController:
 
             range_push("async_sched_forward_pass")
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
-            next_forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
             range_pop()
 
             # -------------------------------------------------------------------------
@@ -2704,9 +2665,7 @@ class TextGenerationController:
             self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
             self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            resolve_result = self._run_async_sched_resolve(
-                sample_result, resolved_sequence_lengths, next_forward_done_event
-            )
+            resolve_result = self._run_async_sched_resolve(sample_result, resolved_sequence_lengths)
 
             # Commit CPU input IDs in the resolved survivor order.
             survivor_idxs = resolve_result.survivor_idxs
