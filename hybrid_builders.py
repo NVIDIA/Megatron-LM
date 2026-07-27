@@ -13,7 +13,6 @@ from model_provider import count_parameters_in_layer
 def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     """Construct a HybridModel from CLI args, dispatching on ``--model-recipe``."""
     print_rank_0('building Hybrid model ...')
-    assert args.use_legacy_models is False, "Hybrid model only supported in Mcore!"
 
     # --model-recipe path: the recipe is the source of truth for the model
     # architecture (config + layer pattern). Skip args→config conversion entirely.
