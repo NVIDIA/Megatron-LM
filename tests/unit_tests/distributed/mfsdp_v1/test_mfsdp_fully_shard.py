@@ -749,39 +749,58 @@ class TestMegatronFsdpFullyShard:
             optimizer.zero_grad()
 
     @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS, OPTIM_GRADS_PARAMS])
-    @pytest.mark.parametrize("optimizer_type", ["adamw", "fused_adam"])
-    def test_optimizer_preinitialization_does_not_advance_step(
-        self, shard_strategy, optimizer_type
-    ):
-        """Optimizer state pre-initialization must not consume a training step."""
+    @pytest.mark.parametrize("optimizer_type", ["adam", "adamw", "fused_adam"])
+    def test_optimizer_loss_curve_matches_reference(self, shard_strategy, optimizer_type):
+        """Fully sharding an optimizer must not alter its loss curve."""
         if optimizer_type == "fused_adam" and not HAVE_TE_FUSED_ADAM:
             pytest.skip("Transformer Engine FusedAdam is not available")
 
         torch.manual_seed(1234)
+        reference_model = RootParamModel().cuda()
         model = RootParamModel().cuda()
-        model_input = torch.randn(DIM_SIZE, DIM_SIZE, device="cuda")
-        expected_output = model(model_input).detach().clone()
+        model.load_state_dict(reference_model.state_dict())
 
-        mfsdp_model = fully_shard_model(
+        model = fully_shard_model(
             module=model, fsdp_unit_modules=[RootParamModel], zero_dp_strategy=shard_strategy
         )
-        optimizer_cls = torch.optim.AdamW if optimizer_type == "adamw" else FusedAdam
+        if optimizer_type == "adam":
+            optimizer_cls = torch.optim.Adam
+        elif optimizer_type == "adamw":
+            optimizer_cls = torch.optim.AdamW
+        else:
+            optimizer_cls = FusedAdam
+        reference_optimizer = optimizer_cls(reference_model.parameters(), lr=0.01, weight_decay=0.1)
         optimizer = fully_shard_optimizer(
-            optimizer_cls(mfsdp_model.parameters(), lr=0.01, weight_decay=0.1)
+            optimizer_cls(model.parameters(), lr=0.01, weight_decay=0.1)
         )
 
-        # State must exist for loading a DCP checkpoint, but wrapping the optimizer
-        # must neither apply weight decay nor alter the first-step bias correction.
-        torch.testing.assert_close(mfsdp_model(model_input), expected_output)
-        assert optimizer.state
-        optimizer_steps = [group["step"] for group in optimizer.param_groups if "step" in group]
-        for state in optimizer.state.values():
-            if "step" in state:
-                optimizer_steps.append(state["step"])
-        assert optimizer_steps
-        for step in optimizer_steps:
-            step_value = step.item() if isinstance(step, torch.Tensor) else step
-            assert step_value == 0
+        data_generator = torch.Generator(device="cuda").manual_seed(
+            91011 + torch.distributed.get_rank()
+        )
+        model_input = torch.randn(DIM_SIZE, DIM_SIZE, device="cuda", generator=data_generator)
+        target = torch.randn(DIM_SIZE, DIM_SIZE, device="cuda", generator=data_generator)
+
+        reference_losses = []
+        losses = []
+        for _ in range(NUM_STEPS):
+            reference_optimizer.zero_grad()
+            optimizer.zero_grad()
+            reference_loss = mse_loss(reference_model(model_input), target)
+            loss = mse_loss(model(model_input), target)
+            reference_losses.append(reference_loss.detach())
+            losses.append(loss.detach())
+
+            reference_loss.backward()
+            loss.backward()
+            # The reference model is not wrapped in DDP, so explicitly average its
+            # rank-local gradients to match MFSDP's automatic DP synchronization.
+            for param in reference_model.parameters():
+                torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.AVG)
+
+            reference_optimizer.step()
+            optimizer.step()
+
+        torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
 
     def test_root_module_forward_uses_gathered_parameters(self):
         """
