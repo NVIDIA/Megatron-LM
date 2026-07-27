@@ -116,7 +116,7 @@ class PrefixCachingTestBase:
     def _fill_pool_with_one_evictable_block(ctx):
         """Exhaust the free pool while leaving exactly one LRU block evictable."""
         alloc = ctx.kv_block_allocator
-        drained_block_ids = alloc.allocate_memory_blocks(alloc.total_avail)
+        drained_block_ids = alloc.allocate_memory_blocks(alloc.free_count)
         assert drained_block_ids is not None and drained_block_ids.numel() > 0
 
         cached_block_id = drained_block_ids[0].item()
@@ -126,7 +126,8 @@ class PrefixCachingTestBase:
         alloc.register_kv_block_hashes([cached_block_id], [cached_hash], parent_hashes=[0])
         alloc.release_memory_blocks(drained_block_ids[:1])
 
-        assert alloc.total_avail == 0
+        assert alloc.free_count == 0
+        assert alloc.total_avail == 1
         assert int(alloc.get_evictable_block_count()) == 1
         return cached_block_id, cached_hash
 
@@ -277,10 +278,10 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         prompt = self._prompt(bs * 3)
         ctx.add_request(self._req(ctx, prompt.clone()))
         first_blocks = self._block_ids(ctx, 0, 3)
-        avail_after_first = alloc.total_avail
+        avail_after_first = alloc.free_count
         for i in range(2, 11):
             ctx.add_request(self._req(ctx, prompt.clone(), request_id=i))
-        assert alloc.total_avail == avail_after_first
+        assert alloc.free_count == avail_after_first
         for req_idx in range(1, 10):
             assert self._block_ids(ctx, req_idx, 3) == first_blocks
         for bid in first_blocks:
@@ -375,26 +376,26 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         prompt = self._prompt(bs * 4)
         ctx.add_request(self._req(ctx, prompt.clone()))
         first_blocks = self._block_ids(ctx, 0, 4)
-        avail = alloc.total_avail
+        avail = alloc.free_count
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert self._block_ids(ctx, 1, 4) == first_blocks and alloc.total_avail == avail
+        assert self._block_ids(ctx, 1, 4) == first_blocks and alloc.free_count == avail
 
         # extended prompt allocates only new blocks
         ctx2 = self._ctx()
         alloc2 = ctx2.kv_block_allocator
         p2a = self._prompt(bs * 3)
         ctx2.add_request(self._req(ctx2, p2a))
-        avail2 = alloc2.total_avail
+        avail2 = alloc2.free_count
         p2b = torch.cat([p2a, self._prompt(bs * 2, offset=1000)])
         ctx2.add_request(self._req(ctx2, p2b, request_id=2))
-        assert alloc2.total_avail == avail2 - 2
+        assert alloc2.free_count == avail2 - 2
 
         # check_availability accounts for prefix match
         ctx3 = self._ctx(buffer_size_gb=0.01, rounder=1)
         alloc3 = ctx3.kv_block_allocator
         p3 = self._prompt(ctx3.block_size_tokens * 2)
         ctx3.add_request(self._req(ctx3, p3.clone()))
-        while alloc3.total_avail > 0:
+        while alloc3.free_count > 0:
             alloc3.allocate_memory_blocks(1)
         _, _, kv_available = ctx3.check_availability(self._req(ctx3, p3.clone(), request_id=2))
         assert kv_available
@@ -490,7 +491,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_ref_counts[sx].item() == 0
 
         # Force a full pool: the new block for H2 can only come from eviction.
-        alloc.total_avail = 0
+        alloc.free_count = 0
 
         # Incoming prompt H0 -> H1 -> H2: first two blocks match the cached chain,
         # the third (H2) is new and must trigger a single eviction.
@@ -544,7 +545,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
 
         # Free pool exhausted: the one new block B needs (H2) can only come from
         # evicting SX. The already-pinned matches S0/S1 must not be reserved.
-        alloc.total_avail = 0
+        alloc.free_count = 0
 
         # Request B shares H0/H1 with A and needs one new block for H2.
         req_b = self._req(ctx, self._prompt(bs * 3), request_id=3)
@@ -559,7 +560,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_resume_boundary_crossing_evicts_lru_block_when_free_pool_empty(self):
-        """A boundary-crossing request resumes from LRU capacity at total_avail=0."""
+        """A boundary-crossing request resumes when only LRU capacity remains."""
         ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
         alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
@@ -588,6 +589,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.block_hashes[new_block_id].item() == -1
         assert alloc.block_ref_counts[original_block_id].item() == 1
         assert alloc.block_ref_counts[new_block_id].item() == 1
+        assert alloc.free_count == 0
         assert alloc.total_avail == 0
         assert int(alloc.get_evictable_block_count()) == 0
         assert ctx.token_to_block_idx[0].item() == new_block_id
@@ -621,6 +623,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert ctx.request_last_kv_block_id[2].item() == original_last_block_ids[2].item()
         assert cached_hash not in alloc.kv_hash_to_block_id
         assert alloc.block_ref_counts[cached_block_id].item() == 1
+        assert alloc.free_count == 0
         assert alloc.total_avail == 0
         assert int(alloc.get_evictable_block_count()) == 0
 
@@ -636,13 +639,13 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         b0, b1 = self._block_ids(ctx, 0, 2)
         b0_hash = alloc.block_hashes[b0].item()
-        avail_before = alloc.total_avail
+        avail_before = alloc.free_count
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0 and b0_hash not in alloc.kv_hash_to_block_id
         assert alloc.block_hashes[b0].item() == -1 and alloc.block_hashes[b1].item() == -1
-        assert alloc.total_avail == avail_before + 2
+        assert alloc.free_count == avail_before + 2
 
         # released blocks not discoverable
         ctx2 = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
@@ -790,7 +793,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req1 = self._req(ctx, prompt.clone())
         ctx.add_request(req1)
         first_blocks = self._block_ids(ctx, 0, 3)
-        avail = alloc.total_avail
+        avail = alloc.free_count
         tokens_after = ctx.active_token_count
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
@@ -800,7 +803,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         ctx.add_request(req2)
         # blocks reused (pool unchanged), ref counts incremented
-        assert alloc.total_avail == avail
+        assert alloc.free_count == avail
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 2
         # all tokens processed (none skipped)

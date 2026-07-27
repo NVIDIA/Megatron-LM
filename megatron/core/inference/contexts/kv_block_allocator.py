@@ -22,8 +22,8 @@ class KVBlockAllocator:
     Args:
         context (DynamicInferenceContext): Dynamic inference context.
         total_count (int): Total number of blocks in the buffer.
-        paused_count (int): Number of paused blocks in the buffer. Must be less
-            than `total_count`.
+        paused_count (int): Paused-request block retention budget. Must leave at
+            least one non-dummy block outside the budget.
     """
 
     def __init__(
@@ -42,11 +42,13 @@ class KVBlockAllocator:
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
 
+        assert (
+            0 <= paused_count <= total_count - 2
+        ), "paused block budget must leave at least one usable block outside the budget"
+
         self.total_count = total_count
-        self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
+        self.free_count = total_count - 1  # -1 for dummy_block_idx (see below)
         self.paused_count = paused_count
-        self.active_count = total_count - paused_count - 1  # -1 for dummy_block_idx
-        assert self.active_count >= 1  # ensures paused_count < total_count - 1
         self.dummy_block_idx = self.total_count - 1
 
         # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
@@ -94,14 +96,29 @@ class KVBlockAllocator:
 
     def __str__(self):
         return (
-            f"using: total {self.get_total_used()}/{self.total_count - 1}"
-            f"; active {self.get_active_used()}/{self.active_count}"
-            f"; paused {self.get_paused_used()}/{self.paused_count}"
+            f"blocks: occupied {self.get_total_used()}/{self.total_count - 1}"
+            f"; allocatable {self.total_avail}"
+            f"; active-used {self.get_active_used()}"
+            f"; paused-used {self.get_paused_used()}/{self.paused_count}"
         )
 
+    @property
+    def total_avail(self) -> int:
+        """Compute the number of blocks available for allocation.
+
+        Includes both blocks in the free pool and, under LRU prefix caching,
+        registered ref-zero blocks that can be evicted.
+        """
+        if (
+            self.enable_prefix_caching
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        ):
+            return self.free_count + int(self.get_evictable_block_count())
+        return self.free_count
+
     def get_total_used(self):
-        """Compute number of total blocks used."""
-        return self.total_count - self.total_avail - 1
+        """Compute number of physical blocks outside the free pool."""
+        return self.total_count - self.free_count - 1
 
     def get_active_used(self):
         """Compute number of active blocks used."""
@@ -139,36 +156,6 @@ class KVBlockAllocator:
                 return int(torch.unique(valid_ids).numel())
         return 0
 
-    def get_active_avail(self):
-        """Compute number of active blocks available."""
-        return self.active_count - self.get_active_used()
-
-    def get_paused_avail(self):
-        """Compute number of paused blocks available."""
-        return self.paused_count - self.get_paused_used()
-
-    def get_allocatable_block_count(self, potential_matched_count: int = 0) -> int:
-        """Get the number of blocks available for allocation.
-
-        Includes both free pool blocks and registered, evictable cached blocks.
-
-        Args:
-            potential_matched_count (int): Number of currently-evictable cached
-                blocks to subtract because the caller will pin them before
-                allocating. Must not exceed the evictable block count.
-
-        Returns:
-            Number of blocks available for allocation.
-        """
-        if (
-            not self.enable_prefix_caching
-            or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
-        ):
-            return self.total_avail
-
-        evictable_count = int(self.get_evictable_block_count()) - potential_matched_count
-        return self.total_avail + evictable_count
-
     def is_memory_available(self, num_blocks: int, potential_matched_count: int = 0) -> bool:
         """Check if memory blocks are available.
 
@@ -187,10 +174,11 @@ class KVBlockAllocator:
         Return:
             (bool) Is memory available?
         """
-        # Fast path: avoid expensive evictable count computation when free pool suffices
-        if self.total_avail >= num_blocks:
+        # Fast path: avoid computing the evictable count when the free pool
+        # suffices. Soon-to-be-pinned matches do not affect raw free capacity.
+        if self.free_count >= num_blocks:
             return True
-        return self.get_allocatable_block_count(potential_matched_count) >= num_blocks
+        return self.total_avail - potential_matched_count >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
@@ -204,19 +192,19 @@ class KVBlockAllocator:
             (Optional[Tensor]) Allocated block IDs.
         """
         # Try to evict cached blocks if free pool is insufficient
-        if self.total_avail < num_blocks:
+        if self.free_count < num_blocks:
             if (
                 not self.enable_prefix_caching
                 or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
             ):
                 return None  # RZ: no eviction path; disabled: no cached blocks
-            blocks_needed_from_eviction = num_blocks - self.total_avail
+            blocks_needed_from_eviction = num_blocks - self.free_count
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
                 return None  # Not enough blocks even after eviction
 
         # Now allocate from the free pool
-        self.total_avail -= num_blocks
-        block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
+        self.free_count -= num_blocks
+        block_ids = self.block_bag[self.free_count : (self.free_count + num_blocks)]
         assert num_blocks == block_ids.numel()
 
         if self.enable_prefix_caching:
@@ -247,28 +235,33 @@ class KVBlockAllocator:
             return
 
         if self.enable_prefix_caching:
-            self.block_ref_counts[blocks] -= 1
+            unique_blocks, release_counts = torch.unique(blocks, return_counts=True)
+            remaining_ref_counts = self.block_ref_counts[unique_blocks] - release_counts.to(
+                dtype=self.block_ref_counts.dtype
+            )
+            assert torch.all(
+                remaining_ref_counts >= 0
+            ), "released more KV block references than the allocator owns"
+            self.block_ref_counts[unique_blocks] = remaining_ref_counts
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
-                zero_mask = self.block_ref_counts[blocks] == 0
+                zero_mask = remaining_ref_counts == 0
                 if zero_mask.any():
-                    self._deregister_blocks(blocks[zero_mask])
+                    self._deregister_blocks(unique_blocks[zero_mask])
             elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 # Unregistered blocks (hash == -1, ref_count == 0) have no hash
                 # entry to preserve for reuse (e.g., partial blocks at the end of
                 # a request). Return them directly to the free pool so they are not
                 # leaked.
-                unreg_mask = (self.block_ref_counts[blocks] == 0) & (
-                    self.block_hashes[blocks] == -1
-                )
+                unreg_mask = (remaining_ref_counts == 0) & (self.block_hashes[unique_blocks] == -1)
                 if unreg_mask.any():
-                    unreg_blocks = blocks[unreg_mask]
+                    unreg_blocks = unique_blocks[unreg_mask]
                     num_unreg = unreg_blocks.numel()
-                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
-                    self.total_avail += num_unreg
+                    self.block_bag[self.free_count : self.free_count + num_unreg] = unreg_blocks
+                    self.free_count += num_unreg
         else:
             num_blocks = blocks.numel()
-            self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
-            self.total_avail += num_blocks
+            self.block_bag[self.free_count : self.free_count + num_blocks] = blocks
+            self.free_count += num_blocks
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -287,7 +280,7 @@ class KVBlockAllocator:
         # generations.
         self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
 
-        self.total_avail = self.total_count - 1
+        self.free_count = self.total_count - 1
 
         if self.enable_prefix_caching:
             # Reset all block hashes
@@ -403,8 +396,8 @@ class KVBlockAllocator:
         self.block_ref_counts[block_ids] = 0
 
         # Return blocks to free pool
-        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
-        self.total_avail += num_blocks
+        self.block_bag[self.free_count : self.free_count + num_blocks] = block_ids
+        self.free_count += num_blocks
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
