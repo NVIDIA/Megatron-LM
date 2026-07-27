@@ -12,6 +12,7 @@ The absorption is mathematically equivalent to standard MLA but enables MQA-styl
 can be more efficient for certain attention variants.
 """
 
+import copy
 import math
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
@@ -360,6 +361,9 @@ class AbsorbedMLASelfAttention(Attention):
             **kv_down_proj_kwargs,
         )
 
+        kv_up_proj_config = copy.copy(self.config)
+        kv_up_proj_config.delay_wgrad_compute = False
+
         self._uses_combined_kv_up_projection = submodules.linear_kv_up_proj is not None
         if submodules.linear_kv_up_proj is not None and (
             submodules.linear_k_up_proj is not None or submodules.linear_v_up_proj is not None
@@ -376,7 +380,7 @@ class AbsorbedMLASelfAttention(Attention):
                 self.config.kv_lora_rank,
                 self.config.num_attention_heads
                 * (self.config.qk_head_dim + self.config.v_head_dim),
-                config=self.config,
+                config=kv_up_proj_config,
                 init_method=self.config.init_method,
                 gather_output=False,
                 bias=False,
@@ -391,7 +395,7 @@ class AbsorbedMLASelfAttention(Attention):
                 submodules.linear_k_up_proj,
                 self.config.kv_lora_rank,
                 self.config.num_attention_heads * self.config.qk_head_dim,
-                config=self.config,
+                config=kv_up_proj_config,
                 init_method=self.config.init_method,
                 gather_output=False,
                 bias=False,
@@ -405,7 +409,7 @@ class AbsorbedMLASelfAttention(Attention):
                 submodules.linear_v_up_proj,
                 self.config.kv_lora_rank,
                 self.config.num_attention_heads * self.config.v_head_dim,
-                config=self.config,
+                config=kv_up_proj_config,
                 init_method=self.config.init_method,
                 gather_output=False,
                 bias=False,
@@ -1002,15 +1006,13 @@ class AbsorbedMLASelfAttention(Attention):
         """Execute weight gradient computation."""
         self._backward_kv_proj()
         self._backward_q_proj()
+        core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
+        if core_attention_backward_dw is not None:
+            core_attention_backward_dw()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
         """Computes weight gradients of KV projection layers."""
-        if self._uses_combined_kv_up_projection:
-            self.linear_kv_up_proj.backward_dw()
-        else:
-            self.linear_k_up_proj.backward_dw()
-            self.linear_v_up_proj.backward_dw()
         self.linear_kv_down_proj.backward_dw()
 
     def _backward_q_proj(self):
