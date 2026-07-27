@@ -993,6 +993,8 @@ def save_checkpoint(
                 mpu.get_pipeline_model_parallel_rank,
                 mpu.get_pipeline_model_parallel_world_size,
             )
+            gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
+            gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
             def iter_finalize_fn():
                 prev_iteration = 0
@@ -1004,13 +1006,12 @@ def save_checkpoint(
                         with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
                 with maybe_msc.open(tracker_filename, 'w') as f:
-                    f.write('release' if release else str(iteration))
-                print_rank_0(
-                    f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] successfully saved '
-                    f'checkpoint from iteration {int(iteration):7d} to {args.save} '
-                    f'[ t {tensor_mp_rank}/{tp_size_to_print}, '
-                    f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
-                )
+                    f.write("release" if release else str(iteration))
+                print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
+                             f"checkpoint from iteration {int(iteration):7d} to {args.save} "
+                             f"[ t {tensor_mp_rank}/{tp_size_to_print}, "
+                             f"gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, "
+                             f"p {pipeline_mp_rank}/{pp_size_to_print} ]")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
@@ -2504,12 +2505,26 @@ def load_checkpoint(
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
+        # GTP native-FP8 weights: load_state_dict's copy_ re-quantizes into the FP8 param, which
+        # TE's IsMXFP8Tensor check rejects for our subclass. Present the base FP8 class for it.
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if HAVE_GTP:
+            from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
+
+            load_ctx = lambda: gtp_native_fp8_load_context(module)
+        else:
+            from contextlib import nullcontext
+
+            load_ctx = nullcontext
         try:
-            module.load_state_dict(state_dict, strict=strict)
+            with load_ctx():
+                module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
             if strict:
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
-                load_return = module.load_state_dict(state_dict, strict=False)
+                with load_ctx():
+                    load_return = module.load_state_dict(state_dict, strict=False)
                 print(f'load_return: {load_return}')
 
     # Megatron-FSDP DTensors are loaded into the model buffers in-place above.
@@ -2696,9 +2711,12 @@ def load_checkpoint(
         if pp_group is not None
         else mpu.get_pipeline_model_parallel_world_size()
     )
+    _gtp_remat_r = mpu.get_gtp_weight_remat_rank()
+    _gtp_remat_w = mpu.get_gtp_weight_remat_world_size()
     print_rank_0(
         f'  successfully loaded checkpoint from {load_dir} '
         f'[ t {_tp_r + 1}/{_tp_w}, '
+        f'gtp_remat {_gtp_remat_r + 1}/{_gtp_remat_w}, '
         f'p {_pp_r + 1}/{_pp_w} ] '
         f'at iteration {iteration}'
     )
