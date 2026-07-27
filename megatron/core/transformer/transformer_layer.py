@@ -1674,7 +1674,6 @@ class MoETransformerLayer(TransformerLayer):
         self.use_partial_cudagraphs = False
         self.moe_layer_recompute = False
         self._local_cudagraph_attr_names = None
-        self.token_dispatcher_attrs = {}
 
         super().__init__(*args, **kwargs)
 
@@ -1775,11 +1774,11 @@ class MoETransformerLayer(TransformerLayer):
         return obj, leaf_attr_name or attr_name
 
     def _restore_token_dispatcher_attrs(self, attr_outputs):
+        assert self._local_cudagraph_attr_names is not None
         assert len(attr_outputs) == len(self._local_cudagraph_attr_names)
         for attr_name, attr in zip(self._local_cudagraph_attr_names, attr_outputs):
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
             setattr(obj, name, attr)
-
     def _get_token_dispatcher_attrs(self):
         attr_names = []
         token_dispatcher_attr_outputs = []
@@ -1792,63 +1791,14 @@ class MoETransformerLayer(TransformerLayer):
 
         return tuple(attr_names), token_dispatcher_attr_outputs
 
-    def _synchronize_router_host_outputs(self, attr_outputs):
-        """Wait for partial-router graph outputs only when they reside on the host."""
-        if not any(attr.device.type == "cpu" for attr in attr_outputs):
-            return
-
-        if not hasattr(self, '_router_dtoh_event'):
-            self._router_dtoh_event = torch.cuda.Event()
-        self._router_dtoh_event.record()
-        self._router_dtoh_event.synchronize()
-
-    def _capture_token_dispatcher_attrs(self, token_dispatcher_attrs=None):
-        """Retain dispatcher tensors produced by a CUDA graph for eager dispatch."""
-        if not is_graph_capturing() or is_graph_warmup():
-            return
-
-        cached_attrs = (
-            self.token_dispatcher_attrs
-            if token_dispatcher_attrs is None
-            else token_dispatcher_attrs
-        )
-        for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
-            obj, name = self._resolve_token_dispatcher_attr(attr_name)
-            attr = getattr(obj, name)
-            if torch.is_tensor(attr):
-                attr.is_from_global_mempool = True
-                cached_attrs[attr_name] = attr
-
-    def _weakref_token_dispatcher_attrs(self, token_dispatcher_attrs=None):
-        """Release strong references to captured dispatcher tensors after graph capture."""
-        if not is_graph_capturing() or is_graph_warmup():
-            return
-
-        cached_attrs = (
-            self.token_dispatcher_attrs
-            if token_dispatcher_attrs is None
-            else token_dispatcher_attrs
-        )
-        for attr_name, attr in cached_attrs.items():
-            weak_ref = make_weakref(attr, inplace=False)
-            cached_attrs[attr_name] = weak_ref
-            obj, name = self._resolve_token_dispatcher_attr(attr_name)
-            setattr(obj, name, weak_ref)
-
-    def _restore_token_dispatcher_attrs_for_dispatch(
-        self, probs, token_dispatcher_attrs=None
-    ):
-        """Restore cached dispatcher state while retaining the live router autograd edge."""
-        cached_attrs = (
-            self.token_dispatcher_attrs
-            if token_dispatcher_attrs is None
-            else token_dispatcher_attrs
-        )
-        if '_comm_manager.token_probs' in cached_attrs:
-            cached_attrs['_comm_manager.token_probs'] = probs
-        for attr_name, attr in cached_attrs.items():
-            obj, name = self._resolve_token_dispatcher_attr(attr_name)
-            setattr(obj, name, attr)
+    def _get_local_cudagraph_attr_outputs(self):
+        """Return stable dispatcher tensor outputs for a partial CUDA-graph boundary."""
+        attr_names, attr_outputs = self._get_token_dispatcher_attrs()
+        if self._local_cudagraph_attr_names is None:
+            self._local_cudagraph_attr_names = attr_names
+        else:
+            assert attr_names == self._local_cudagraph_attr_names
+        return attr_outputs
 
     def _forward_mlp_router(self, hidden_states, padding_mask=None, shortcut_hidden=None):
         """
@@ -1887,11 +1837,7 @@ class MoETransformerLayer(TransformerLayer):
         )
 
         if self.use_partial_cudagraphs:
-            attr_names, token_dispatcher_attr_outputs = self._get_token_dispatcher_attrs()
-            if self._local_cudagraph_attr_names is None:
-                self._local_cudagraph_attr_names = attr_names
-            else:
-                assert attr_names == self._local_cudagraph_attr_names
+            token_dispatcher_attr_outputs = self._get_local_cudagraph_attr_outputs()
         else:
             # For eager mode, no need to pass the token_dispatcher attributes
             token_dispatcher_attr_outputs = []
@@ -1970,9 +1916,12 @@ class MoETransformerLayer(TransformerLayer):
                 *token_dispatcher_attr_outputs,
             ) = router_outputs
 
-            # CUDA outputs remain ordered by the graph-completion event. Only host outputs need
-            # a CPU-blocking wait before the eager dispatcher can consume them.
-            self._synchronize_router_host_outputs(token_dispatcher_attr_outputs)
+            # After the router graph replays, the captured .copy_() operations that update
+            # the returned dispatcher tensors via `_maybe_dtoh_and_synchronize` are queued on
+            # the current stream but may not have completed. Record an event after the router
+            # graph and wait on it, so we block only until the router's D2H copies complete.
+            self._router_dtoh_event.record()
+            self._router_dtoh_event.synchronize()
 
             expert_output, mlp_bias = self._forward_mlp_expert_compute(
                 hidden_states, probs, token_dispatcher_attr_outputs
@@ -2024,9 +1973,7 @@ class MoETransformerLayer(TransformerLayer):
                 shortcut_hidden=shortcut_hidden,
             )
 
-    def shortcut_route_preprocess(
-        self, shortcut_hidden, padding_mask=None, token_dispatcher_attrs=None
-    ):
+    def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
         shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
         if padding_mask is not None:
@@ -2037,9 +1984,10 @@ class MoETransformerLayer(TransformerLayer):
             probs,
             routing_map,
         )
+        token_dispatcher_attr_outputs = []
         if getattr(self, '_shortcut_graph_shared_experts', False):
-            self._capture_token_dispatcher_attrs(token_dispatcher_attrs)
-        return permuted_input, probs
+            token_dispatcher_attr_outputs = self._get_local_cudagraph_attr_outputs()
+        return permuted_input, probs, *token_dispatcher_attr_outputs
 
     def shortcut_prepare_dispatch(self, shortcut_input, probs, routing_map):
         """Prepare routed shortcut tokens for dispatch on the current stream."""
@@ -2093,7 +2041,6 @@ class MoETransformerLayer(TransformerLayer):
         hidden_states,
         combined_output,
         shared_expert_output,
-        token_dispatcher_attrs=None,
     ):
         """Finish a shortcut layer after combine has completed."""
         residual = hidden_states
@@ -2104,5 +2051,4 @@ class MoETransformerLayer(TransformerLayer):
         output = self._forward_post_mlp((output, None), residual)
         if isinstance(output, tuple):
             output = output[0]
-        self._weakref_token_dispatcher_attrs(token_dispatcher_attrs)
         return output

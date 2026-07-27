@@ -75,7 +75,6 @@ class _RouteInputCompute(GraphableMegatronModule):
         is_mamba: bool,
         execution_mode: ShortcutExecutionMode,
         persistent_slot_count: int,
-        token_dispatcher_attr_slots: tuple[dict, ...],
     ):
         self._execution_mode = execution_mode
         self._enable_cudagraph = execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
@@ -87,7 +86,6 @@ class _RouteInputCompute(GraphableMegatronModule):
         # Keep ownership static without registering a duplicate MoE module path.
         object.__setattr__(self, 'moe_layer', moe_layer)
         self._persistent_slots = []
-        self._token_dispatcher_attr_slots = token_dispatcher_attr_slots
 
         if self._enable_cudagraph:
             self._persistent_slots = [
@@ -143,14 +141,12 @@ class _RouteInputCompute(GraphableMegatronModule):
         persistent_slot: int = 0,
     ):
         slot = None
-        token_dispatcher_attrs = None
         if self._enable_cudagraph:
             slot = self.get_persistent_slot(persistent_slot)
-            token_dispatcher_attrs = self._token_dispatcher_attr_slots[persistent_slot]
-        route_kwargs = dict(shortcut_hidden=hidden_states, padding_mask=padding_mask)
-        if token_dispatcher_attrs is not None:
-            route_kwargs["token_dispatcher_attrs"] = token_dispatcher_attrs
-        route_input, route_probs = self.moe_layer.shortcut_route_preprocess(**route_kwargs)
+        route_outputs = self.moe_layer.shortcut_route_preprocess(
+            shortcut_hidden=hidden_states, padding_mask=padding_mask
+        )
+        route_input, route_probs, *token_dispatcher_attr_outputs = route_outputs
 
         route_grad_dependency = None
         if self._enable_cudagraph:
@@ -186,7 +182,7 @@ class _RouteInputCompute(GraphableMegatronModule):
 
         if self._enable_cudagraph:
             paired_state = (paired_state[0] + route_grad_dependency, *paired_state[1:])
-            return paired_state
+            return (*paired_state, *token_dispatcher_attr_outputs)
         return route_input, route_probs, paired_state
 
 
@@ -200,7 +196,6 @@ class _OutputProjSharedExperts(GraphableMegatronModule):
         is_mamba: bool,
         execution_mode: ShortcutExecutionMode,
         persistent_slot_count: int,
-        token_dispatcher_attr_slots: tuple[dict, ...],
     ):
         self._enable_cudagraph = execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
         if self._enable_cudagraph:
@@ -213,7 +208,6 @@ class _OutputProjSharedExperts(GraphableMegatronModule):
         self.is_last_layer = getattr(moe_layer, "is_last_layer", False)
 
         self._persistent_slots = []
-        self._token_dispatcher_attr_slots = token_dispatcher_attr_slots
 
         # Each outstanding fused output/shared/postprocess graph consumes its own allocation after
         # the side-stream combine populates it. Events are external so their wait/record operations
@@ -310,11 +304,6 @@ class _OutputProjSharedExperts(GraphableMegatronModule):
             hidden_states,
             combined_output,
             shared_expert_output,
-            token_dispatcher_attrs=(
-                self._token_dispatcher_attr_slots[persistent_slot]
-                if self._enable_cudagraph
-                else None
-            ),
         )
 
     def postprocess(
@@ -322,20 +311,12 @@ class _OutputProjSharedExperts(GraphableMegatronModule):
         hidden_states,
         combined_output,
         shared_expert_output,
-        token_dispatcher_attrs=None,
     ):
         """Apply shortcut postprocess through the module shared by every schedule."""
-        if token_dispatcher_attrs is None:
-            return self.moe_layer.shortcut_postprocess_with_combined_output(
-                hidden_states,
-                combined_output,
-                shared_expert_output,
-            )
         return self.moe_layer.shortcut_postprocess_with_combined_output(
             hidden_states,
             combined_output,
             shared_expert_output,
-            token_dispatcher_attrs=token_dispatcher_attrs,
         )
 
 
@@ -367,8 +348,10 @@ class ShortcutMoEBlock:
                 raise ValueError("Repeated MTP shortcut CUDA graphs require mtp_num_layers > 0")
             self._persistent_slot_count = compute_layer.config.mtp_num_layers
         self._next_persistent_slot = 0
-        self._token_dispatcher_attr_slots = tuple(
-            {} for _ in range(self._persistent_slot_count)
+        self._router_dtoh_event = (
+            torch.cuda.Event()
+            if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
+            else None
         )
         self.route_input_compute = _RouteInputCompute(
             compute_layer,
@@ -376,7 +359,6 @@ class ShortcutMoEBlock:
             is_mamba=is_mamba,
             execution_mode=self.execution_mode,
             persistent_slot_count=self._persistent_slot_count,
-            token_dispatcher_attr_slots=self._token_dispatcher_attr_slots,
         )
         self.output_shared = _OutputProjSharedExperts(
             compute_layer,
@@ -384,7 +366,6 @@ class ShortcutMoEBlock:
             is_mamba=is_mamba,
             execution_mode=self.execution_mode,
             persistent_slot_count=self._persistent_slot_count,
-            token_dispatcher_attr_slots=self._token_dispatcher_attr_slots,
         )
 
     def _acquire_persistent_slot(self) -> int:
@@ -422,7 +403,12 @@ class ShortcutMoEBlock:
             persistent_slot=persistent_slot,
         )
 
-    def launch_dispatch(self, persistent_slot: int, backward_dependency: torch.Tensor):
+    def launch_dispatch(
+        self,
+        persistent_slot: int,
+        backward_dependency: torch.Tensor,
+        token_dispatcher_attr_outputs,
+    ):
         """Launch dispatch from persistent inputs after the route/input graph is queued."""
         if not self.route_input_compute._enable_cudagraph:
             raise RuntimeError("Persistent dispatch inputs require shortcut CUDA-graph mode")
@@ -430,10 +416,7 @@ class ShortcutMoEBlock:
         slot = self.route_input_compute.get_persistent_slot(persistent_slot)
         route_input = slot.route_input_buffer.tensor
         route_probs = slot.route_probs_buffer.tensor
-        self.moe_layer._restore_token_dispatcher_attrs_for_dispatch(
-            route_probs,
-            self._token_dispatcher_attr_slots[persistent_slot],
-        )
+        self.moe_layer._restore_token_dispatcher_attrs(token_dispatcher_attr_outputs)
         self.moe_layer.shortcut_launch_dispatch(
             route_input,
             route_probs,
@@ -599,7 +582,7 @@ class ShortcutMoEBlock:
         persistent_slot = self._acquire_persistent_slot()
 
         with quant_context_factory(quant_config, layer_number):
-            paired_state = self.route_input_compute(
+            route_outputs = self.route_input_compute(
                 hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
@@ -610,7 +593,25 @@ class ShortcutMoEBlock:
                 persistent_slot=persistent_slot,
             )
 
-        self.launch_dispatch(persistent_slot, paired_state[0])
+        # Match partial-MoE CUDA graphs: dispatcher D2H copies returned by the route graph must
+        # complete before eager dispatch reads their CPU-side metadata.
+        self._router_dtoh_event.record()
+        self._router_dtoh_event.synchronize()
+
+        attr_names = self.moe_layer._local_cudagraph_attr_names or ()
+        attr_count = len(attr_names)
+        if attr_count:
+            paired_state = tuple(route_outputs[:-attr_count])
+            token_dispatcher_attr_outputs = tuple(route_outputs[-attr_count:])
+        else:
+            paired_state = tuple(route_outputs)
+            token_dispatcher_attr_outputs = ()
+
+        self.launch_dispatch(
+            persistent_slot,
+            paired_state[0],
+            token_dispatcher_attr_outputs,
+        )
 
         with quant_context_factory(quant_config, layer_number):
             output_slot = self.output_shared.get_persistent_slot(persistent_slot)

@@ -680,6 +680,7 @@ def test_shortcut_block_selects_a2a_schedule(
     shared_expert_output = object()
     combined_output = object()
     expected_combined_output = combined_output
+    dispatcher_attr_output = object()
     final_output = object()
 
     def route_preprocess(*, shortcut_hidden, padding_mask):
@@ -707,9 +708,11 @@ def test_shortcut_block_selects_a2a_schedule(
         route_preprocess(shortcut_hidden=actual_hidden, padding_mask=kwargs["padding_mask"])
         if execution_mode != ShortcutExecutionMode.EAGER_SERIAL:
             calls.append("record_event")
-        paired_state = input_projection(hidden_states=actual_hidden, **kwargs)
+        compute_kwargs = dict(kwargs)
+        compute_kwargs.pop("persistent_slot", None)
+        paired_state = input_projection(hidden_states=actual_hidden, **compute_kwargs)
         if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            return paired_state
+            return (*paired_state, dispatcher_attr_output)
         return permuted_input, dispatch_probs, paired_state
 
     route_ready_event = SimpleNamespace(record=lambda stream: calls.append("record_event"))
@@ -766,7 +769,9 @@ def test_shortcut_block_selects_a2a_schedule(
         combined_output=None,
         inference_context,
         padding_mask,
+        persistent_slot=0,
     ):
+        assert persistent_slot == 0
         assert paired_state == (compute_dependency, compute_aux)
         assert inference_context is expected_inference_context
         assert padding_mask is expected_padding_mask
@@ -786,6 +791,7 @@ def test_shortcut_block_selects_a2a_schedule(
 
     moe_layer = SimpleNamespace(
         layer_number=8,
+        _local_cudagraph_attr_names=("dispatcher_attr",),
         mlp=SimpleNamespace(
             dispatch=dispatch,
             routed_experts_compute=routed_experts,
@@ -804,20 +810,33 @@ def test_shortcut_block_selects_a2a_schedule(
     block.compute_layer = compute_layer
     block.moe_layer = moe_layer
     block.execution_mode = execution_mode
+    block._persistent_slot_count = 1
+    block._next_persistent_slot = 0
+    block._router_dtoh_event = SimpleNamespace(
+        record=lambda: None,
+        synchronize=lambda: None,
+    )
     route_input_compute.route_ready_event = route_ready_event
     block.route_input_compute = route_input_compute
-    output_shared.get_persistent_combined_output_buffer = lambda tensor: tensor
+    output_shared.get_persistent_slot = lambda slot: SimpleNamespace(
+        combine_ready_event=combine_ready_event,
+        combine_grad_ready_event=combine_grad_ready_event,
+    )
+    output_shared.get_persistent_combined_output_buffer = lambda slot, tensor: tensor
     output_shared.combine_ready_event = combine_ready_event
     output_shared.combine_grad_ready_event = combine_grad_ready_event
     block.output_shared = output_shared
     if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
 
-        def launch_unified_dispatch():
+        def launch_unified_dispatch(
+            persistent_slot, backward_dependency, token_dispatcher_attr_outputs
+        ):
+            assert persistent_slot == 0
+            assert backward_dependency is compute_dependency
+            assert token_dispatcher_attr_outputs == (dispatcher_attr_output,)
             calls.append("launch_dispatch")
 
-        monkeypatch.setattr(
-            block, "launch_dispatch_with_partial_cudagraph", launch_unified_dispatch
-        )
+        monkeypatch.setattr(block, "launch_dispatch", launch_unified_dispatch)
 
     @contextmanager
     def quant_context_factory(actual_config, layer_number):
