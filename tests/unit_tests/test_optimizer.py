@@ -27,6 +27,7 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -78,6 +79,16 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+def test_copy_optimizer_param_metadata_preserves_allreduce():
+    source = torch.empty(1)
+    destination = torch.empty_like(source)
+    source.allreduce = False
+
+    copy_optimizer_param_metadata(destination, source)
+
+    assert destination.allreduce is False
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
