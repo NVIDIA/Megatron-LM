@@ -212,6 +212,10 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
     async def test_streaming(self):
         self.setup_engine(legacy=True)
 
+        # Possible for a rank to not generate any tokens, i.e. EOD only.
+        # Make that impossible when testing streaming.
+        self.mock_tokenizer.eod = self.vocab_size
+
         async def collect_stream(stream_generator, num_tokens_to_generate):
             prev_log_probs = None
             prev_text = ""
