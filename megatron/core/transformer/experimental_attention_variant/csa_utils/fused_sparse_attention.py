@@ -1870,6 +1870,7 @@ def indexer_topk(
     q_causal_offsets: Optional[Tensor] = None,
     compact_workspace: BSHDCompactIndexerWorkspace | THDCompactIndexerWorkspace | None = None,
     precision: str = "bf16",
+    use_compact: bool = True,
     deterministic: bool = False,
     return_softmax: bool = False,
 ) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Optional[Tensor]]:
@@ -1948,7 +1949,7 @@ def indexer_topk(
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
         q_causal_offsets=q_causal_offsets,
-        use_compact=True,
+        use_compact=use_compact,
         return_softmax=return_softmax,
         compact_workspace=compact_workspace,
         precision=precision,
