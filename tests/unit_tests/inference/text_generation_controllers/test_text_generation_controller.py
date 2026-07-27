@@ -54,7 +54,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
 class TextGenerationControllerTestBase:
@@ -87,6 +87,12 @@ class TextGenerationControllerTestBase:
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
         # every other caller leaves it None and gets the unchanged local-spec build.
         inference_optimized = transformer_impl == "inference_optimized"
+        if inference_optimized:
+            # The inference-optimized layers use TE attention with the "auto" backend,
+            # which conflicts with the NVTE_FLASH_ATTN/NVTE_FUSED_ATTN=0 pinned by the
+            # autouse conftest set_env fixture. Clear them so TE can select flash — the
+            # same thing the dynamic inference engine test does.
+            clear_nvte_env_vars()
         if use_training_random_init:
             # This is necessary to induce the training behavior which permutes the random seed
             # for every rank; otherwise, every rank will have the same seed.
