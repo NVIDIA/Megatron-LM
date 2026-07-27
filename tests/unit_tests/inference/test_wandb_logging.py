@@ -104,7 +104,7 @@ class TestInferenceWandbLogging:
         assert stats['paused_request_count'] == 0
         assert stats['active_token_count'] == 0
         assert stats['total_request_count'] == 0
-        assert stats['block_count_avail'] == dynamic_context.kv_block_allocator.free_count
+        assert stats['block_count_avail'] == dynamic_context.kv_block_allocator.total_avail
 
         # Now add a request and verify stats update correctly
         context_length = 144
@@ -146,7 +146,7 @@ class TestInferenceWandbLogging:
 
         # Verify block availability decreased after allocation
         assert stats_after['block_count_avail'] < stats['block_count_avail']
-        assert stats_after['block_count_avail'] == dynamic_context.kv_block_allocator.free_count
+        assert stats_after['block_count_avail'] == dynamic_context.kv_block_allocator.total_avail
 
         # Physical occupancy plus raw free blocks and the dummy block equals total.
         assert (

@@ -47,7 +47,7 @@ class KVBlockAllocator:
         ), "paused block budget must leave at least one usable block outside the budget"
 
         self.total_count = total_count
-        self.free_count = total_count - 1  # -1 for dummy_block_idx (see below)
+        self.total_avail = total_count - 1  # Raw free-pool count; -1 for dummy_block_idx.
         self.paused_count = paused_count
         self.dummy_block_idx = self.total_count - 1
 
@@ -97,28 +97,14 @@ class KVBlockAllocator:
     def __str__(self):
         return (
             f"blocks: occupied {self.get_total_used()}/{self.total_count - 1}"
-            f"; allocatable {self.total_avail}"
+            f"; allocatable {self.get_allocatable_count()}"
             f"; active-used {self.get_active_used()}"
             f"; paused-used {self.get_paused_used()}/{self.paused_count}"
         )
 
-    @property
-    def total_avail(self) -> int:
-        """Compute the number of blocks available for allocation.
-
-        Includes both blocks in the free pool and, under LRU prefix caching,
-        registered ref-zero blocks that can be evicted.
-        """
-        if (
-            self.enable_prefix_caching
-            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
-        ):
-            return self.free_count + int(self.get_evictable_block_count())
-        return self.free_count
-
     def get_total_used(self):
         """Compute number of physical blocks outside the free pool."""
-        return self.total_count - self.free_count - 1
+        return self.total_count - self.total_avail - 1
 
     def get_active_used(self):
         """Compute number of active blocks used."""
@@ -176,9 +162,9 @@ class KVBlockAllocator:
         """
         # Fast path: avoid computing the evictable count when the free pool
         # suffices. Soon-to-be-pinned matches do not affect raw free capacity.
-        if self.free_count >= num_blocks:
+        if self.total_avail >= num_blocks:
             return True
-        return self.total_avail - potential_matched_count >= num_blocks
+        return self.get_allocatable_count() - potential_matched_count >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
@@ -192,19 +178,19 @@ class KVBlockAllocator:
             (Optional[Tensor]) Allocated block IDs.
         """
         # Try to evict cached blocks if free pool is insufficient
-        if self.free_count < num_blocks:
+        if self.total_avail < num_blocks:
             if (
                 not self.enable_prefix_caching
                 or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
             ):
                 return None  # RZ: no eviction path; disabled: no cached blocks
-            blocks_needed_from_eviction = num_blocks - self.free_count
+            blocks_needed_from_eviction = num_blocks - self.total_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
                 return None  # Not enough blocks even after eviction
 
         # Now allocate from the free pool
-        self.free_count -= num_blocks
-        block_ids = self.block_bag[self.free_count : (self.free_count + num_blocks)]
+        self.total_avail -= num_blocks
+        block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
 
         if self.enable_prefix_caching:
@@ -256,12 +242,12 @@ class KVBlockAllocator:
                 if unreg_mask.any():
                     unreg_blocks = unique_blocks[unreg_mask]
                     num_unreg = unreg_blocks.numel()
-                    self.block_bag[self.free_count : self.free_count + num_unreg] = unreg_blocks
-                    self.free_count += num_unreg
+                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
+                    self.total_avail += num_unreg
         else:
             num_blocks = blocks.numel()
-            self.block_bag[self.free_count : self.free_count + num_blocks] = blocks
-            self.free_count += num_blocks
+            self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
+            self.total_avail += num_blocks
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -280,7 +266,7 @@ class KVBlockAllocator:
         # generations.
         self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
 
-        self.free_count = self.total_count - 1
+        self.total_avail = self.total_count - 1
 
         if self.enable_prefix_caching:
             # Reset all block hashes
@@ -396,8 +382,8 @@ class KVBlockAllocator:
         self.block_ref_counts[block_ids] = 0
 
         # Return blocks to free pool
-        self.block_bag[self.free_count : self.free_count + num_blocks] = block_ids
-        self.free_count += num_blocks
+        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
+        self.total_avail += num_blocks
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
@@ -420,6 +406,22 @@ class KVBlockAllocator:
         """
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
         return cached_mask.sum()
+
+    def get_allocatable_count(self) -> int:
+        """Compute the number of blocks available for allocation.
+
+        Includes both blocks in the free pool and, under LRU prefix caching,
+        registered ref-zero blocks that can be evicted.
+
+        Returns:
+            Number of blocks that can currently be allocated.
+        """
+        if (
+            self.enable_prefix_caching
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        ):
+            return self.total_avail + int(self.get_evictable_block_count())
+        return self.total_avail
 
     def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
         """Evict LRU cached blocks to free up space in the pool.

@@ -3458,9 +3458,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             if candidate_count > 0:
                 new_block_counts_cumsum = needs_new_block[:candidate_count].cumsum(dim=0)
                 max_new_block_count = int(new_block_counts_cumsum[-1].item())
-                block_count_avail = self.kv_block_allocator.free_count
+                block_count_avail = self.kv_block_allocator.total_avail
                 if max_new_block_count > block_count_avail:
-                    block_count_avail = self.kv_block_allocator.total_avail
+                    block_count_avail = self.kv_block_allocator.get_allocatable_count()
                 resume_request_count = int(
                     torch.count_nonzero(new_block_counts_cumsum <= block_count_avail).item()
                 )
@@ -3543,7 +3543,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         releasable_block_counts = self._get_releasable_block_counts(
             retained_paused_request_count, self.paused_request_count
         )
-        block_count_avail = self.kv_block_allocator.total_avail
+        block_count_avail = self.kv_block_allocator.get_allocatable_count()
 
         # Preserve current ordering: evict the smallest right-most suffix whose
         # physical releases let every remaining overflow request resume.
@@ -3648,7 +3648,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         num_new_blocks = rows_requiring_new_block.sum().item()
         if num_new_blocks > 0:
-            if num_new_blocks > self.kv_block_allocator.total_avail:
+            if num_new_blocks > self.kv_block_allocator.get_allocatable_count():
                 raise RuntimeError("Async scheduling cannot pause requests to allocate new blocks.")
 
             block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
@@ -4376,7 +4376,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # Total usable blocks exclude the reserved dummy block.
         total_blocks = max(self.kv_block_allocator.total_count - 1, 1)
-        block_count_avail = int(self.kv_block_allocator.free_count)
+        block_count_avail = int(self.kv_block_allocator.total_avail)
 
         # Overall allocated blocks in the buffer right now.
         allocated_blocks = (self.kv_block_allocator.total_count - 1) - block_count_avail

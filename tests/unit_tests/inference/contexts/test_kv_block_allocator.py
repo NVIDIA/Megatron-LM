@@ -40,8 +40,8 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     bag (popping IDs off the top), release returns them, reset rewinds.
 
     Also covers the surrounding invariants the allocator must preserve:
-    free_count bookkeeping, paused-budget headroom validation, the read-only
-    total_avail view, the is_memory_available fast-path + no-eviction fallback,
+    total_avail bookkeeping, paused-budget headroom validation, the computed
+    allocatable count, the is_memory_available fast-path + no-eviction fallback,
     and the noop behaviour of release([]).
     """
     ctx = _make_context()
@@ -56,46 +56,44 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
 
     a = KVBlockAllocator(ctx, total_count=TOTAL_COUNT, paused_count=PAUSED_COUNT)
     # Initial state: TOTAL_COUNT - 1 (dummy block) available, nothing used.
-    assert a.free_count == TOTAL_COUNT - 1
     assert a.total_avail == TOTAL_COUNT - 1
+    assert a.get_allocatable_count() == TOTAL_COUNT - 1
     assert a.get_total_used() == 0
     assert not hasattr(a, "active_count")
     assert not hasattr(a, "get_active_avail")
     assert not hasattr(a, "get_paused_avail")
     assert not hasattr(a, "get_allocatable_block_count")
     assert str(a) == "blocks: occupied 0/9; allocatable 9; active-used 0; paused-used 0/2"
-    with pytest.raises(AttributeError):
-        a.total_avail = 0
     # is_memory_available short-circuits True when free pool has enough.
     assert a.is_memory_available(5) is True
 
     # Allocate 3 → pop IDs off the top of the bag.
     ids = a.allocate_memory_blocks(3)
     assert ids is not None and ids.numel() == 3
-    assert a.free_count == TOTAL_COUNT - 1 - 3
     assert a.total_avail == TOTAL_COUNT - 1 - 3
+    assert a.get_allocatable_count() == TOTAL_COUNT - 1 - 3
 
     # Empty release is a no-op; non-empty release returns IDs to the bag.
-    before = a.free_count
+    before = a.total_avail
     a.release_memory_blocks(torch.tensor([], dtype=torch.int32))
-    assert a.free_count == before
+    assert a.total_avail == before
     a.release_memory_blocks(ids)
-    assert a.free_count == before + 3
     assert a.total_avail == before + 3
+    assert a.get_allocatable_count() == before + 3
 
     # Free pool exhausted: without prefix caching there's no eviction path,
     # so both is_memory_available and allocate_memory_blocks return failure.
     small_alloc = KVBlockAllocator(ctx, total_count=4, paused_count=1)
-    assert small_alloc.free_count == 3
     assert small_alloc.total_avail == 3
+    assert small_alloc.get_allocatable_count() == 3
     assert small_alloc.is_memory_available(5) is False
     assert small_alloc.allocate_memory_blocks(5) is None
 
     # reset rewinds the bag back to arange(total_count) and clears routing state.
     a.allocate_memory_blocks(4)
     a.reset()
-    assert a.free_count == TOTAL_COUNT - 1
     assert a.total_avail == TOTAL_COUNT - 1
+    assert a.get_allocatable_count() == TOTAL_COUNT - 1
     assert a.block_bag.tolist() == list(range(TOTAL_COUNT))
     assert a.block_routing == {}
 
@@ -195,8 +193,8 @@ def test_prefix_caching_allocate_and_hash_registration():
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
     )
-    assert small.free_count == 3
     assert small.total_avail == 3
+    assert small.get_allocatable_count() == 3
     assert small.is_memory_available(5) is False
 
 
@@ -215,7 +213,7 @@ def test_release_shared_block_aggregates_duplicate_references(policy):
     )
     block = a.allocate_memory_blocks(1)
     block_id = int(block.item())
-    free_after_allocate = a.free_count
+    raw_avail_after_allocate = a.total_avail
     a.register_kv_block_hashes(block_ids=[block_id], block_hashes=[111])
 
     # Model two requests sharing the same registered prefix block, then release
@@ -226,19 +224,19 @@ def test_release_shared_block_aggregates_duplicate_references(policy):
     assert a.block_ref_counts[block_id].item() == 0
     if policy == PrefixCachingEvictionPolicy.REF_ZERO:
         assert a.block_hashes[block_id].item() == -1
-        assert a.free_count == free_after_allocate + 1
+        assert a.total_avail == raw_avail_after_allocate + 1
         assert a.get_total_used() == 0
     else:
         # LRU keeps the physical block outside the free pool but exposes it
-        # through total_avail because the registered block is now evictable.
+        # through get_allocatable_count because it is now evictable.
         assert a.block_hashes[block_id].item() == 111
-        assert a.free_count == free_after_allocate
-        assert a.total_avail == free_after_allocate + 1
+        assert a.total_avail == raw_avail_after_allocate
+        assert a.get_allocatable_count() == raw_avail_after_allocate + 1
         assert a.get_total_used() == 1
 
     # In either policy the allocator tracks exactly one allocatable physical
     # copy, whether raw-free or evictable.
-    assert a.total_avail == free_after_allocate + 1
+    assert a.get_allocatable_count() == raw_avail_after_allocate + 1
 
 
 @pytest.mark.parametrize(
@@ -292,8 +290,8 @@ def _seed_cached_chain(a, block_ids, hashes, parents, timestamps):
     a.block_ref_counts[ids] = 0  # cached / evictable
     a.block_timestamps[ids] = torch.tensor(timestamps, dtype=torch.int64)
     # Mark the blocks as out of the free pool so _deregister_blocks (which pushes
-    # them back) keeps free_count bookkeeping consistent.
-    a.free_count -= len(block_ids)
+    # them back) keeps total_avail bookkeeping consistent.
+    a.total_avail -= len(block_ids)
 
 
 def _assert_prefix_invariant(a):
@@ -396,7 +394,7 @@ def test_evict_lru_cached_child_with_pinned_parent_treated_as_root():
     # nothing here, but in general orphan its children.
     a.block_ref_counts[ids] = torch.tensor([1, 0, 0], dtype=torch.int32)
     a.block_timestamps[ids] = torch.tensor([0, 1, 9], dtype=torch.int64)
-    a.free_count -= 3
+    a.total_avail -= 3
 
     # Only S1 and SX are candidates; the pinned S0 is excluded.
     assert int(a.get_evictable_block_count()) == 2
@@ -499,19 +497,19 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     once those blocks (e.g. prefix matches) are pinned."""
     a = _lru_allocator(total_count=6, paused_count=1)
     # Drain the free pool: every block is allocated (ref_count == 1), none free.
-    a.allocate_memory_blocks(a.free_count)
-    assert a.free_count == 0
+    a.allocate_memory_blocks(a.total_avail)
     assert a.total_avail == 0
+    assert a.get_allocatable_count() == 0
     # Mark two blocks as cached/evictable, mirroring an LRU release: ref_count
     # drops to 0 and the hash is retained, but the block stays out of the free
-    # pool (free_count unchanged).
+    # pool (total_avail unchanged).
     a.register_kv_block_hashes(block_ids=[0, 1], block_hashes=[10, 20], parent_hashes=[0, 10])
     a.block_ref_counts[torch.tensor([0, 1])] = 0
-    assert a.free_count == 0
-    assert a.total_avail == 2
+    assert a.total_avail == 0
+    assert a.get_allocatable_count() == 2
     assert int(a.get_evictable_block_count()) == 2
 
-    # Both evictable blocks count toward the read-only availability view.
+    # Both evictable blocks count toward the computed allocatable count.
     assert a.is_memory_available(2) is True
     # Excluding one (it will be pinned) leaves only one usable for the request.
     assert a.is_memory_available(2, potential_matched_count=1) is False
@@ -520,11 +518,12 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     assert a.is_memory_available(1, potential_matched_count=2) is False
 
     # Allocation must evict the cached blocks into the raw free pool before
-    # popping them, even though total_avail already reports their capacity.
+    # popping them, even though get_allocatable_count already reports their
+    # capacity.
     allocated = a.allocate_memory_blocks(2)
     assert allocated is not None and allocated.numel() == 2
-    assert a.free_count == 0
     assert a.total_avail == 0
+    assert a.get_allocatable_count() == 0
     assert a.kv_hash_to_block_id == {}
 
 

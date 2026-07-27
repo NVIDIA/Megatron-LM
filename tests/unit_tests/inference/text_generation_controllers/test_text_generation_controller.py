@@ -1758,7 +1758,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Initialize allocator and states
-        ctx.kv_block_allocator.free_count = 100
+        ctx.kv_block_allocator.total_avail = 100
         ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device=context_device)
         ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device=context_device)
 
@@ -1810,7 +1810,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Assert released block is cleared
         assert ctx.request_to_kv_block_ids[1, 3].item() == -1
-        assert ctx.kv_block_allocator.free_count == 101  # 1 block released
+        assert ctx.kv_block_allocator.total_avail == 101  # 1 block released
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
@@ -2014,7 +2014,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.kv_block_allocator.block_ref_counts[20] = 2
         ctx.kv_block_allocator.block_ref_counts[10] = 1
 
-        initial_avail = ctx.kv_block_allocator.free_count
+        initial_avail = ctx.kv_block_allocator.total_avail
 
         # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -2060,7 +2060,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
-        ctx.kv_block_allocator.free_count = 50
+        ctx.kv_block_allocator.total_avail = 50
 
         self.text_generation_controller._init_mtp_sampling_tensors()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
@@ -2074,7 +2074,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert ctx.request_kv_block_counts[0].item() == 3
         assert ctx.request_last_kv_block_id[0].item() == 30
         assert ctx.request_to_kv_block_ids[0, 3].item() == -1
-        assert ctx.kv_block_allocator.free_count == 51  # exactly 1 block released
+        assert ctx.kv_block_allocator.total_avail == 51  # exactly 1 block released
 
         # Prefix blocks remain in request_to_kv_block_ids.
         assert ctx.request_to_kv_block_ids[0, 0].item() == 10

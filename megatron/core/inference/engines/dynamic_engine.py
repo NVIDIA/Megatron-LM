@@ -1250,7 +1250,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
-            blocks_allocated = block_allocator.total_count - block_allocator.free_count
+            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
             if block_allocator.enable_prefix_caching:
                 blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
                 blocks_ref_count = block_allocator.block_ref_counts.sum().item()
@@ -1996,7 +1996,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "kv_stats": kvcache_util_stats,
                 "usable_block_count": self.context.kv_block_allocator.total_count - 1,
                 "occupied_block_count": self.context.kv_block_allocator.get_total_used(),
-                "allocatable_block_count": self.context.kv_block_allocator.total_avail,
+                "allocatable_block_count": self.context.kv_block_allocator.get_allocatable_count(),
                 "active_used_block_count": self.context.kv_block_allocator.get_active_used(),
                 "paused_used_block_count": self.context.kv_block_allocator.get_paused_used(),
                 "paused_block_budget": self.context.kv_block_allocator.paused_count,
