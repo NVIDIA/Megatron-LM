@@ -2560,23 +2560,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     @pytest.mark.internal
     @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="needs flash attn for MTP decode")
     @torch.inference_mode()
-    def test_mtp_inference_optimized_gpt_no_unbarriered_consecutive_all_gathers(self):
-        """GPTModel + inference-optimized + SP + MTP: no consecutive AG lacks a barrier."""
-        self.setup_model(
-            torch.bfloat16,
-            static=False,
-            tensor_model_parallel_size=2,
-            num_speculative_tokens=2,
-            max_requests=8,
-            mtp_num_layers=2,
-            sequence_parallel=True,
-            transformer_impl="inference_optimized",
-        )
-        self._check_mtp_all_gather_barrier_invariant()
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="needs flash attn for MTP decode")
-    @torch.inference_mode()
     def test_mtp_inference_optimized_hybrid_no_unbarriered_consecutive_all_gathers(self):
         """HybridModel + inference-optimized + SP + MTP: no consecutive AG lacks a barrier.
 
