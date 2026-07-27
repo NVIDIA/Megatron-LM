@@ -24,7 +24,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
 
 # Keep this in the internal-only stage so public CI has no internal service dependency.
 ARG CI_SERVER_URL
-ARG NEMO_CI_TRIAGE_COMMIT=5474f95417758c76c75523ae5319727a1e703437
+ARG NEMO_CI_TRIAGE_COMMIT=6e24e567ae2855e8acad5e2f780c7c26c195ab46
 RUN --mount=type=secret,id=NEMO_CI_TRIAGE_TOKEN \
       GIT_CONFIG_COUNT=1 \
       GIT_CONFIG_KEY_0=http.extraHeader \
