@@ -4,40 +4,61 @@
 
 > 📦 **Requires TransformerEngine >= 2.19** (GTP support is merged into TE main). On an older TE, GTP is disabled at import (`HAVE_GTP = False`) and enabling it raises an `ImportError` — please install TransformerEngine >= 2.19.
 
-**At a glance.** GTP factors the weight-parallel domain into two orthogonal sub-axes — `GTP = TP × GTP_remat`. Each linear weight is sharded `1/(TP × GTP_remat)` along `out_features`:
+**Generalized Tensor Parallelism (GTP)** is a lightweight, high-performance, memory-efficient distributed-training strategy implemented jointly in Megatron-LM and TransformerEngine. It **shards weight tensors across a GTP process group and reconstructs them on demand via asynchronous all-gather**, so larger models fit in the same memory without sacrificing throughput — the communication is overlapped with computation rather than added to it.
 
-- **`TP`** slice — kept sharded through the GEMM. Ordinary tensor parallelism; the output is TP-sharded.
-- **`GTP_remat`** slice — *rematerialized* just before the GEMM. Only the `GTP_remat` group all-gathers its part, so each rank's GEMM sees the full TP slice. The wgrad is reduce-scattered the same way on the way back. Both collectives overlap the previous layer's compute (forward and backward).
+GTP splits the weight-parallel domain into two orthogonal sub-axes — **`GTP = TP × GTP_remat`** — so every rank stores `1/(TP × GTP_remat)` of each linear weight, together with the matching slice of its gradient and optimizer state.
 
-This is **ZeRO-3-on-the-weight, on top of TP**. Per-GPU weight (and optimizer/grad) memory shrinks to `1/(TP × GTP_remat)`. It composes orthogonally with TP / SP / EP / DDP / CUDA Graphs. The `GTP_remat` degree is `gtp_weight_remat_size`, derived from `--tensor-parallel-num-weight-shards` (= `tensor_model_parallel_size × gtp_weight_remat_size`); when it is 1, GTP is inactive — byte-identical to plain TP+DP.
+**GTP_remat is an implementation of ZeRO-3**, and obeys the same contract: shard the weight (plus grad and optimizer state), all-gather it just before it is needed, use it, free it, reduce-scatter the gradient on the way back. What distinguishes it from the familiar ZeRO-3 / FSDP implementations is *where* it shards and *how finely* it materializes:
 
-**Scope**: a high-level summary of GTP_remat — design intent, public CLI surface, and Megatron-LM ↔ TransformerEngine integration touchpoints.
+- **It shards along a model-parallel axis, not the data-parallel one.** `GTP_remat` is a sub-axis of the weight-parallel grid that sits *on top of* TP — the `TP` slice stays sharded through the GEMM, and only the `GTP_remat` slice is rebuilt. It therefore composes with TP instead of competing with it for the same weight dimension.
+- **It materializes one weight at a time, not a bucket.** Each `GTPShardedParam` gathers, computes and frees on its own schedule, which is what makes the per-weight prefetch chain (§3.4) and the low-precision gather (§1.3) possible — see the FSDP contrast in §1.1.
 
-Core implementation: `megatron/core/tensor_parallel/generalized_tensor_parallelism.py`. The public surface is re-exported from `megatron/core/tensor_parallel/gtp.py`. Low-precision tensor primitives (FP8 / MXFP8 / NVFP4) remain in TransformerEngine and are imported by `generalized_tensor_parallelism.py`.
+| slice | stored | at GEMM time |
+|---|---|---|
+| **`TP`** | `1/TP` of the weight, permanently | **stays sharded** — ordinary tensor parallelism; the output is TP-sharded |
+| **`GTP_remat`** | `1/GTP_remat` of the TP slice, permanently | **rematerialized**: all-gathered across the `GTP_remat` group just before the GEMM, so the GEMM sees the full TP slice; freed afterwards, and the wgrad is reduce-scattered back on the way out |
+
+Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the previous layer's compute in forward *and* backward — the gather is off the critical path, not merely asynchronous. Note the two cuts do not always fall on the same axis of the weight (§1.4).
+
+**Turning it on.** The `GTP_remat` degree is `gtp_weight_remat_size`, derived from `--tensor-parallel-num-weight-shards` (= `tensor_model_parallel_size × gtp_weight_remat_size`). At **`gtp_weight_remat_size = 1` GTP is inactive and the path is byte-identical to plain TP + DP**, so it is safe to leave in the code path. It composes orthogonally with TP / SP / EP / DDP / CUDA Graphs.
+
+**Scope of this document**: a high-level summary of GTP_remat — design intent, public CLI surface, and Megatron-LM ↔ TransformerEngine integration touchpoints.
+
+**Source**: core implementation in `megatron/core/tensor_parallel/generalized_tensor_parallelism.py`, public surface re-exported from `megatron/core/tensor_parallel/gtp_api.py`. Low-precision tensor primitives (FP8 / MXFP8 / NVFP4) stay in TransformerEngine and are imported by the implementation module.
 
 **Outline:**
 
-1. [Features](#1-features)
-   - 1.1 [Fine-grained, per-weight materialization & gradient reduction](#11-fine-grained-per-weight-materialization--gradient-reduction)
-   - 1.2 [CUDA graph compatibility](#12-cuda-graph-compatibility)
-   - 1.3 [Low-precision gather (native FP8 / NVFP4 param)](#13-low-precision-gather-native-fp8--nvfp4-param)
-   - 1.4 [Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
-   - 1.5 [Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
-   - 1.6 [Optimizer-agnostic (Adam + Muon)](#16-optimizer-agnostic-adam--muon)
-   - 1.7 [Scaling](#17-scaling)
-   - 1.8 [Native distributed checkpointing (DCP)](#18-native-distributed-checkpointing-dcp)
-2. [Usage](#2-usage)
-   - 2.1 [Required flags](#21-required-flags)
-   - 2.2 [High-priority streams (Blackwell and later)](#22-high-priority-streams-blackwell-and-later)
-   - 2.3 [Minimal end-to-end example](#23-minimal-end-to-end-example)
-   - 2.4 [Tuning knobs](#24-tuning-knobs)
-3. [Implementation details](#3-implementation-details)
-   - 3.1 [GTP_remat architecture (Mcore ↔ TE integration)](#31-gtp_remat-architecture-mcore--te-integration)
-     - [Class hierarchy: which linears shard](#class-hierarchy-which-linears-shard)
-   - 3.2 [DDP buckets with (E)GTP_remat](#32-ddp-buckets-with-egtp_remat)
-   - 3.3 [Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp)
-   - 3.4 [Prefetch-chain construction and its design assumptions](#34-prefetch-chain-construction-and-its-design-assumptions)
-4. [Testing](#4-testing)
+- [Generalized Tensor Parallelism (GTP)](#generalized-tensor-parallelism-gtp)
+  - [1. Features](#1-features)
+    - [1.1 Fine-grained, per-weight materialization \& gradient reduction](#11-fine-grained-per-weight-materialization--gradient-reduction)
+    - [1.2 CUDA graph compatibility](#12-cuda-graph-compatibility)
+    - [1.3 Low-precision gather (native FP8 / NVFP4 param)](#13-low-precision-gather-native-fp8--nvfp4-param)
+      - [Per-microbatch schedule](#per-microbatch-schedule)
+      - [Communication volume breakdown](#communication-volume-breakdown)
+      - [GTP + NVFP4 (native NVFP4 param)](#gtp--nvfp4-native-nvfp4-param)
+    - [1.4 Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
+    - [1.5 Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
+    - [1.6 Optimizer-agnostic (Adam + Muon)](#16-optimizer-agnostic-adam--muon)
+    - [1.7 Scaling](#17-scaling)
+    - [1.8 Native distributed checkpointing (DCP)](#18-native-distributed-checkpointing-dcp)
+  - [2. Usage](#2-usage)
+    - [2.1 Required flags](#21-required-flags)
+    - [2.2 High-priority streams (Blackwell and later)](#22-high-priority-streams-blackwell-and-later)
+    - [2.3 Minimal end-to-end example](#23-minimal-end-to-end-example)
+    - [2.4 Tuning knobs](#24-tuning-knobs)
+  - [3. Implementation details](#3-implementation-details)
+    - [3.1 GTP\_remat architecture (Mcore ↔ TE integration)](#31-gtp_remat-architecture-mcore--te-integration)
+      - [What the flags do under the hood](#what-the-flags-do-under-the-hood)
+      - [Class hierarchy: which linears shard](#class-hierarchy-which-linears-shard)
+      - [Buffer / memory management](#buffer--memory-management)
+      - [Overlap design summary](#overlap-design-summary)
+        - [wgrad-before-dgrad schedule  *(deferred to a follow-up MR)*](#wgrad-before-dgrad-schedule--deferred-to-a-follow-up-mr)
+        - [Recompute-forward prefetch chain  *(GTP\_remat + activation recompute)*](#recompute-forward-prefetch-chain--gtp_remat--activation-recompute)
+    - [3.2 DDP buckets with (E)GTP\_remat](#32-ddp-buckets-with-egtp_remat)
+    - [3.3 Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp)
+    - [3.4 Prefetch-chain construction and its design assumptions](#34-prefetch-chain-construction-and-its-design-assumptions)
+      - [Grouped-expert chains (one-block-ahead)](#grouped-expert-chains-one-block-ahead)
+  - [4. Testing](#4-testing)
 
 ---
 
@@ -48,7 +69,7 @@ Core implementation: `megatron/core/tensor_parallel/generalized_tensor_paralleli
 Each weight is sharded 1/N across a GTP_remat group along `out_features`, stored as a `GTPShardedParam` subclass of `nn.Parameter`. Materialization and gradient reduction are both **per-weight, per-call** — not per-model or per-module:
 
 - **Independent state per param**: each has its own AG state (`state`) and RS state (`rs_state`) machines, both cycling `NONE → ASYNC_WAIT → DATA_READY → NONE` and tracked separately so fwd and bwd async ops don't interfere.
-- **Prefetch chain for AG** (doubly-linked `prev_w` / `next_w`): during fwd, each weight's `all_gather_and_prefetch` issues async AG for `next_w`; during bwd, `all_gather_and_prefetch_bwd` issues async AG for `prev_w`. Layer *i*'s AG overlaps with layer *i−1*'s GEMM. For an L-layer model, L−1 all-gathers are fully hidden behind compute. When activation recompute is enabled, a **third** chain prefetches the recompute-forward gathers during backward — see §3.1 *Recompute-forward prefetch chain*.
+- **Prefetch chain for AG** (doubly-linked `prev_w` / `next_w`): during fwd, each weight's `all_gather_and_prefetch` issues async AG for `next_w`; during bwd, `all_gather_and_prefetch_bwd` issues async AG for `prev_w`. Layer *i*'s AG overlaps with layer *i−1*'s GEMM. For an L-layer model, L−1 all-gathers are fully hidden behind compute. When activation recompute is enabled, a **third** chain prefetches the recompute-forward gathers during backward — see §3.1 *Recompute-forward prefetch chain*. One GEMM of runway covers a gather that stays inside the NVLink domain, but **not one that leaves it** — the case for MoE routed-expert weights, which also dominate the bytes gathered per block; those get their own *one-block-ahead* chains — see §3.4 *Grouped-expert chains*.
 - **Deferred RS finalize for wgrad**: `wgrad_reduce_scatter` on param *i* launches an **async** reduce-scatter (handle stashed in `_wgrad_rs_handle`) and returns `None` to autograd — the wgrad is NOT finalized into `main_grad` yet. Finalization is **deferred one step**: the next bwd step (param *i−1*'s `wgrad_reduce_scatter`) calls `self.next_w._wait_reduce_scatter()` + `_finalize_wgrad()`, which waits on the stashed handle, accumulates the reduced wgrad into `main_grad`, and fires the DDP `register_grad_ready` hook. The chain's head (first-in-fwd, last-in-bwd) uses a synchronous RS since nothing follows it. This one-step deferral is what lets layer *i*'s RS overlap with layer *i−1*'s bwd GEMMs.
 - **Cold start only**: every weight's very first AG is synchronous (`DATA_READY_SYNC`, no prefetch has run yet); the async prefetch chain kicks in from the second forward onward.
 
@@ -60,7 +81,7 @@ Contrast with FSDP: FSDP gathers at module-group granularity in full precision w
 
 CG compatibility is designed-in from day one, not retrofitted. The entire sync / buffer / chain architecture is shaped around making **captured fwd/bwd replays produce identical bit-for-bit behavior** — without the usual capture-vs-eager pitfalls that force other weight-sharding schemes to either disable CG or require special handling.
 
-- **Two chains, never cross-linked** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
+- **Chains never cross-link across the capture axis** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`, plus the eager-only grouped-expert chains of §3.4). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
 - **`torch.cuda.Event(external=True)`** for `ag_event` / `rs_event` — the events survive CG capture boundaries and can be waited on from replay-time streams.
 - **Idempotent ticket cache**: `GTPWeightCache.get(ticket)` keeps `slot.buf` set even after `release()`, so replays read the same buffer address as capture. `clear()` drops buffers while keeping tickets valid → supports CG re-capture with lazy re-allocation.
 - **Allocate-in-pool at creation** (`set_cuda_graph_mempool` + `_graphed_alloc`): GRAPHED-chain AG/RS buffers and quantized weight storage are allocated **directly into the CG memory pool** at first creation (during warmup, before capture), so no CUDA allocations happen inside the captured graph — and no post-hoc reallocation/clone is needed. UNGRAPHED buffers stay in regular allocator memory.
@@ -126,6 +147,14 @@ NVFP4 GTP_remat keeps each shard as a native `NVFP4Tensor` and all-gathers it as
 ### 1.4 Composability with TP / SP / EP / DDP
 
 - **TP** (intra-layer): orthogonal axis — GTP_remat shards `out_features` regardless of TP's parallel mode (column or row). 2D grid naturally formed via `tp_group × gtp_remat_group`.
+
+> ⚠️ **The two cuts are not always on the same axis.** `GTP_remat` **always** slices `out_features` (dim 0) of the TP-local weight — independent of TP's `partition_dim`:
+>
+> | linear | TP cuts | `GTP_remat` cuts | |
+> |---|---|---|---|
+> | **column-parallel** (`linear_qkv`, `linear_fc1`) | `out_features` | `out_features` | same axis → `out_features/(TP × GTP_remat)` |
+> | **row-parallel** (`linear_proj`, `linear_fc2`) | `in_features` | `out_features` | **perpendicular** → `in_features/TP` × `out_features/GTP_remat` |
+
 - **SP** (sequence-parallel): transparent — GTP_remat operates at weight dim, SP at sequence dim.
 - **EP** (MoE): `GroupedLinear` with GTP_remat → each routed expert sharded across `EXPERT_GTP_WEIGHT_REMAT_GROUP`, independent of EP. MoE AllToAll (HybridEP/NVLink) runs independently of GTP_remat AG/RS (NCCL/IB).
 - **DDP**: GTP_remat bypasses autograd's grad accumulator (async RS returns `None`; `_finalize_wgrad` accumulates directly into `main_grad`). DDP registers its grad-ready hook on GTP_remat params via `register_grad_accum_hook` (not autograd's `AccumulateGrad`); GTP_remat invokes it from `_finalize_wgrad` (eager path) and `_CudagraphReplayNode.backward` (captured path) **after** the wgrad lands in `main_grad`, so a bucket's DDP reduce-scatter runs strictly after every GTP_remat param's `{RS → main_grad add}` — never over a stale `main_grad` — and DDP↔GTP_remat NIC deadlock at IB scale is avoided. See §3.2.
@@ -250,7 +279,7 @@ GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False
 
 ### 2.4 Tuning knobs
 
-Set via `from megatron.core.tensor_parallel.gtp import GTP_CONFIG, update_gtp_config`:
+Set via `from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG, update_gtp_config`:
 
 ```python
 update_gtp_config(
@@ -330,6 +359,9 @@ GTP_remat runs up to **three** independent prefetch chains, all following one ru
 | 1 | fwd | weight `i` | `next_w` = i+1 ‖ `GEMM_i` | rowwise (`fwd=True`) | `_prefetch_handle` |
 | 2 | bwd dgrad | weight `i` | `prev_w` = i−1 ‖ `Dgrad_i` | columnwise (`fwd=False`) | `_prefetch_handle` |
 | 3 | bwd recompute | weight `i` | `_recompute_next` = i+1 ‖ `recompute_GEMM_i` | rowwise (`fwd=True`) | `_recompute_prefetch_handle` (separate) |
+| 1b | fwd (MoE, eager) | expert weight `i` | same role in MoE block i+1 ‖ *whole block i* | rowwise (`fwd=True`) | `_prefetch_handle` |
+
+Row 1b is chain 1 applied to a *homogeneous* chain: routed-expert `fc1`/`fc2` link across consecutive MoE blocks, so the runway is a full block rather than one GEMM (§3.4 *Grouped-expert chains*).
 
 Chain 3 exists only when activation recompute is on. It mirrors chain 1 (rowwise, prefetch `next`) but runs *during* backward, so it overlaps chain 2 in time on the same weight — hence its **own** slot. fwd (1) and bwd-dgrad (2) never overlap in time, so they safely share `_prefetch_handle`. See *Recompute-forward prefetch chain* below.
 
@@ -382,7 +414,7 @@ Everything else — bucketing, the reduce-scatter/all-reduce schedule and its ov
 **Why this matters:**
 
 - **Free reuse of a mature stack.** GTP_remat inherits DDP's bucketing + comm/compute overlap, the distributed optimizer's fp32-master + Adam-moment sharding, grad-norm/clip, and the existing checkpoint format — no parallel re-implementation to write or maintain (contrast FSDP, which replaces all of these).
-- **Orthogonal composability.** Because GTP_remat is a rank-grid sub-axis cut like TP (along `out_features`), it composes with TP/EP/CP/PP and the DistOpt the same way TP does — no special nesting logic.
+- **Orthogonal composability.** Because GTP_remat is a rank-grid sub-axis cut along `out_features` (dim 0, whichever axis TP used), it composes with TP/EP/CP/PP and the DistOpt the same way TP does — no special nesting logic.
 - **Zero-cost when off.** With GTP_remat disabled the gtp_remat axis is size-1 and the hooks become no-ops, so non-GTP_remat runs hit byte-identical behavior — GTP_remat can be toggled without forking the DDP/optimizer code paths.
 - **Small, auditable surface.** These three hooks are the whole integration contract, which is what makes the correctness argument below tractable.
 
@@ -434,7 +466,7 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_remat_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP_remat recomputes.
 
->> Note: Mamba's `in_proj` is a special case: it **all-gathers its GTP_remat shards** back to the logical TP-local size and strips the pad *before* saving, so its global is topology-independent and needs no `allow_shape_mismatch`.
+> Note: Mamba's `in_proj` is a special case: it **all-gathers its GTP_remat shards** back to the logical TP-local size and strips the pad *before* saving, so its global is topology-independent and needs no `allow_shape_mismatch`.
 
 **Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP_remat/EGTP_remat each peer owns a *different* master shard (the optimizer shards over the gtp_remat/egtp_remat-**excluded** replicate group), so the index is taken from the gtp_remat/egtp_remat-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_remat_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
 
@@ -446,7 +478,10 @@ The prefetch chains (§3.1) are **not configured — they are observed at runtim
 
 **Construction (two steps).**
 
-1. **Classification (once, at build).** `classify_gtp_chains(model)` runs in `training.py`'s `get_model` after the model is built. It walks `named_parameters()` and, for each `GTPShardedParam`, sets `chain_id` to `GRAPHED` or `UNGRAPHED` (via `_classify_param_chain`, from the active `cuda_graph_modules`) and to the dense vs. expert chain. Membership is fixed from here on; re-classifying an already-linked param into a different chain is rejected.
+1. **Classification (once, at build).** `classify_gtp_chains(model)` runs in `training.py`'s `get_model` after the model is built. It walks `named_parameters()` and, for each `GTPShardedParam`, sets `chain_id` (via `_classify_param_chain`, from the active `cuda_graph_modules`) and the dense vs. expert chain. Membership is fixed from here on; re-classifying an already-linked param into a different chain is rejected.
+
+   Routed grouped experts are the exception: their `fc1`/`fc2` weights get their own homogeneous chains for a deeper prefetch — see [Grouped-expert chains](#grouped-expert-chains-one-block-ahead) below.
+
 2. **Linking (lazily, on the first forward).** The doubly-linked list (`prev_w` / `next_w`) is built the **first time each weight is materialized** inside `all_gather_and_prefetch`: a class-level per-chain cursor (`GTPShardedParam._chain_state[chain_id]["last_weight"]`) records the previously-seen weight, and the current weight links itself after it. The chain therefore **encodes the forward execution order of the first step** and replays it every step after to predict the next weight to prefetch. The recompute chain (`_recompute_next`) self-populates the same way, from the weights re-gathered while `in_fp8_activation_recompute_phase()` is true.
 
 Weights that must **not** join a chain (embedding, output_layer — they all-gather synchronously and run outside the CUDA-graph boundary) are excluded by setting `weight.prefetch_initialized = True` (and `_need_weight_prefetch = False`) at construction, which skips registration entirely.
@@ -468,6 +503,36 @@ Weights that must **not** join a chain (embedding, output_layer — they all-gat
 - `prefetch_initialized = True` keeps a weight out of the chain — but it is opt-*out* by convention; a new weight that forgets it silently joins.
 
 **Rule of thumb:** any change that creates/replaces params at runtime, makes forward order data-dependent, runs GTP_remat concurrently, or builds multiple GTP models per process must be checked against the table above. When in doubt, exclude the affected weights so they fall back to synchronous, chain-free all-gather.
+
+#### Grouped-expert chains (one-block-ahead)
+
+*Problem.* A chain gives every all-gather exactly **one consume-step of runway** — layer *i*'s AG hides behind layer *i−1*'s GEMM — which suffices only while the transfer stays inside the NVLink domain. Routed-expert weights fail that test twice over: by **volume**, a block gathers `2 × num_experts / EP` expert weights — NCCL-coalesced into just **two** all-gathers, one per role — so those two transfers carry most of the block's bytes; by **distance**, `EGTP_remat` is the group that leaves the NVLink domain. The expert transfer therefore stays partly exposed in **every** MoE block, and the exposure grows as expert count rises and per-GEMM time falls.
+
+*Design.* When MoE is *not* captured, `linear_fc1` and `linear_fc2` each get their own homogeneous chain (`GTP_remat_grouped_fc1_ungraphed` / `GTP_remat_grouped_fc2_ungraphed`) instead of sharing the general `UNGRAPHED` chain. A homogeneous chain links the **same weight role of consecutive MoE blocks**, so `next_w` points a whole block ahead rather than one GEMM ahead. The roles stay in *separate* chains deliberately: merging them would link `layer_N.fc1 → layer_N.fc2 → layer_{N+1}.fc1 → …`, so `fc1` would prefetch the **same block's** `fc2` — one GEMM of runway again — and only `fc2` would reach across the block boundary.
+
+*Result.* The win is **resource overlap**, not faster compute and not a faster network:
+
+- **Runway** — an expert gather now hides behind the entire preceding **MoE block** instead of a single GEMM.
+- **Utilization** — the interconnect works under the dense window where it used to idle, and the GPU no longer stalls waiting on the gather: both are busy at once.
+- **Cost** — one extra buffer per weight role (see *mandatory double buffering* below). No extra collectives, no change to the math.
+- **Bound** — same transfers, same GEMMs, only a different schedule, so the recovered time is exactly the transfer that used to sit on the critical path.
+
+The figure below puts both schedules on one time axis, aligned at *block start* (**top:** shared chain, **bottom:** per-role chains). **Shaded bands** mark which resource is idle — red where one side waits, green where both are busy; **dashed arrows** trace each gather from the GEMM that launches it to the GEMM that consumes it; the **arrow at the right** is the recovered time, equal to the two hatched `STALL` bars above it.
+
+![GTP grouped-expert AG prefetch — one-step-ahead vs one-block-ahead](../../images/generalized_tensor_parallel/0725_gtp_grouped_oneblock_prefetch.png)
+
+Three consequences:
+- **One shared stream.** `_stream_key` collapses the fc1/fc2 role, so both chains resolve to a single AG stream and their all-gathers serialize instead of splitting interconnect bandwidth. The capture-axis suffix is preserved, so eager and captured ops still never share a stream.
+- **Mandatory double buffering** — this is what makes the deeper prefetch *safe*, and it is not optional:
+  - the weight cache keys **one buffer per `(shape, dtype, expert_idx)`**, which assumes at most one same-key weight is live;
+  - one-block-ahead makes block *N* and block *N+1* weights **live at the same time** — same key, two tensors in flight;
+  - fix: a chain-position **parity (0,1,0,1…)** is folded into the cache key, so consecutive blocks alternate between **exactly two** buffers (counter cleared by `reset_gtp_state()`);
+  - without it the prefetch would **overwrite the weight the running GEMM is still reading** — a silent-correctness bug, not a crash.
+- **Eager only** — the optimization disables itself under CUDA-graph capture:
+  - `_classify_param_chain` evaluates `graphed = _FULL_ITERATION or ("moe" in cuda_graph_modules)` **before** the split, and returns the plain `GRAPHED` chain when it is true;
+  - so with `--cuda-graph-impl full_iteration` **every** param is `GRAPHED` — expert weights included — and they keep the ordinary one-step-ahead prefetch;
+  - why it must: `cuda_graphs.py` drains with `wait_async_comms(GTPChain.GRAPHED.value)`, matching the id **literally**, so a weight in `GTP_remat_grouped_fc1_ungraphed` would never be joined at the graph boundary — a **correctness** hazard, not just a lost overlap;
+  - lifting it would mean draining by chain-id *prefix* (`_chain_is_grouped`) or registering the grouped streams before capture — neither is done today.
 
 ## 4. Testing
 

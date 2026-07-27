@@ -415,6 +415,109 @@ class TestGTPPrefetchChain:
         _run_distributed(_worker_chain_async_prefetch, 4)
 
 
+class TestGroupedExpertChainClassification:
+    """Routed grouped experts get their own per-role homogeneous prefetch chains
+    (one-block-ahead), while sharing a single IB stream. Pure classification logic,
+    no GPU/distributed needed."""
+
+    FC1 = "decoder.layers.3.mlp.experts.linear_fc1.weight0"
+    FC2 = "decoder.layers.3.mlp.experts.linear_fc2.weight0"
+    SHARED = "decoder.layers.3.mlp.shared_experts.linear_fc1.weight"
+    MIXER = "decoder.layers.3.mixer.in_proj.weight"
+
+    def teardown_method(self, method):
+        # Restore the module default so other tests see a clean CG config.
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+
+    def test_ungraphed_moe_splits_fc1_fc2_into_own_chains(self):
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+        c1 = gtp_module._classify_param_chain(self.FC1)
+        c2 = gtp_module._classify_param_chain(self.FC2)
+        assert c1 == "GTP_remat_grouped_fc1_ungraphed", c1
+        assert c2 == "GTP_remat_grouped_fc2_ungraphed", c2
+        # Separate linked-list chains so next_w links consecutive MoE layers (one-block-ahead).
+        assert c1 != c2
+        # Removed from the general chain; other layer kinds are unaffected.
+        assert gtp_module._classify_param_chain(self.SHARED) == "GTP_ungraphed"
+        assert gtp_module._classify_param_chain(self.MIXER) == "GTP_ungraphed"
+
+    def test_fc1_fc2_share_one_ib_stream(self):
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+        group = object()  # same EGTP group for both roles
+        c1 = gtp_module._classify_param_chain(self.FC1)
+        c2 = gtp_module._classify_param_chain(self.FC2)
+        # Distinct chains but ONE shared IB stream (serialize fc1 then fc2).
+        assert gtp_module._stream_key(c1, group) == gtp_module._stream_key(c2, group)
+        # Distinct from the general ungraphed chain's stream.
+        assert gtp_module._stream_key(c1, group) != gtp_module._stream_key("GTP_ungraphed", group)
+
+    def test_graphed_moe_keeps_grouped_in_plain_graphed_chain(self):
+        # When MoE is captured, grouped weights stay in the plain GRAPHED chain so the
+        # cross-graph drain wait_async_comms(GRAPHED) still targets them by exact chain id.
+        gtp_module.set_cuda_graph_modules({"moe"}, cuda_graph_impl="local")
+        assert gtp_module._classify_param_chain(self.FC1) == "GTP_graphed"
+        assert gtp_module._classify_param_chain(self.FC2) == "GTP_graphed"
+
+    def test_graphness_helpers(self):
+        # "ungraphed" is the eager suffix; everything else is captured.
+        assert not gtp_module._chain_is_graphed("GTP_remat_grouped_fc1_ungraphed")
+        assert not gtp_module._chain_is_graphed("GTP_ungraphed")
+        assert gtp_module._chain_is_graphed("GTP_graphed")
+
+
+class TestGroupedDoubleBuffer:
+    """One-block-ahead grouped chains must double-buffer: consecutive MoE layers get distinct
+    gather buffers (else prefetching layer N+1 clobbers layer N's in-use weight). Pure cache-key
+    logic, no GPU/distributed needed."""
+
+    class _Fake:
+        _unsharded_shape_padded = (128, 256)
+        expert_idx = 0
+
+        def __init__(self, chain_id):
+            self.chain_id = chain_id
+
+        _double_buffer_parity = gtp_module.GTPShardedParam._double_buffer_parity
+        _get_cache_key = gtp_module.GTPShardedParam._get_cache_key
+
+    def setup_method(self, method):
+        gtp_module.reset_gtp_state()
+
+    def teardown_method(self, method):
+        gtp_module.reset_gtp_state()
+
+    def _key(self, chain_id):
+        return self._Fake(chain_id)._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
+
+    def test_consecutive_layers_use_two_alternating_buffers(self):
+        keys = [self._key("GTP_remat_grouped_fc1_ungraphed") for _ in range(4)]
+        # Consecutive layers differ (no clobber); alternating layers share; exactly two buffers.
+        assert keys[0] != keys[1]
+        assert keys[1] != keys[2]
+        assert keys[0] == keys[2]
+        assert keys[1] == keys[3]
+        assert len(set(keys)) == 2
+
+    def test_fc1_fc2_never_share_a_buffer(self):
+        # Both can be in-flight at once on the shared IB stream; role folded into key keeps
+        # them distinct even when gathered shapes match (as in this fake).
+        assert self._key("GTP_remat_grouped_fc1_ungraphed") != self._key(
+            "GTP_remat_grouped_fc2_ungraphed"
+        )
+
+    def test_non_grouped_key_unchanged(self):
+        assert self._key("GTP_ungraphed") == ((128, 256), torch.bfloat16, 0, False)
+
+    def test_parity_cached_and_stable(self):
+        f = self._Fake("GTP_remat_grouped_fc1_ungraphed")
+        fwd = f._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
+        bwd = f._get_cache_key(torch.bfloat16, fwd=False, reduce_scatter=False)
+        rs = f._get_cache_key(torch.bfloat16, fwd=False, reduce_scatter=True)
+        # Same parity for all of this weight's buffers (distinct from neighbours, consistent here).
+        assert f._buf_parity == 0
+        assert fwd[-1] == 0 and bwd[-1] == 0 and rs[-1] == 0
+
+
 # ---------------------------------------------------------------------------
 # Wgrad reduce-scatter: shape and deferred async path
 # ---------------------------------------------------------------------------
