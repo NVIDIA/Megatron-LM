@@ -775,6 +775,9 @@ class TestHybridBlock:
             layer_config_list=layer_config_list,
             pp_layer_offset=0,
             logical_layer_offset=0,
+            # HybridModel sets this from the full layer pattern; a directly
+            # constructed stack has to opt in itself.
+            transformer_sharded_keys=True,
             pg_collection=self.get_pg_collection(),
         )
 
@@ -786,6 +789,31 @@ class TestHybridBlock:
         assert "decoder.layers.1.mlp.linear_fc1.weight" not in sharded_keys
         assert "decoder.final_layernorm.weight" in sharded_keys
         assert "decoder.final_norm.weight" not in sharded_keys
+
+    def test_sharded_state_dict_keeps_final_norm_key_without_transformer_keys(self):
+        """Default (non-grouped) stacks keep the historical ``final_norm`` sharded key."""
+        layer_pattern = "*-"
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=_num_physical_layers(layer_pattern),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+        )
+        layer_config_list = validate_segment_layers(layer_pattern, transformer_config)
+        block = HybridStack(
+            transformer_config,
+            hybrid_stack_spec.submodules,
+            layer_config_list=layer_config_list,
+            pp_layer_offset=0,
+            logical_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+
+        sharded_state_dict = block.sharded_state_dict(prefix="decoder.")
+        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+
+        assert "decoder.final_norm.weight" in sharded_keys
+        assert "decoder.final_layernorm.weight" not in sharded_keys
 
     def test_group_forward_matches_equivalent_flat_layers(self):
         """A bracket group is only a scheduling/checkpoint boundary, not new math."""
