@@ -390,6 +390,25 @@ class TransformerConfig(ModelParallelConfig):
     backend. The final index scores remain FP32 independently of this option. This option does
     not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
+    dsa_cp_balance_indexer: bool = False
+    """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
+    causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
+    the indexer instead processes a head chunk and a tail chunk per rank (two launches of the
+    existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
+    contiguous order. When False, the indexer uses the contiguous CP split."""
+
+    dsa_cp_balance_min_seqlen: int = 0
+    """Minimum ``max_seqlen_q`` required to use the balanced CP indexer. Below this length the
+    indexer falls back to the contiguous CP split, since the redistribute overhead outweighs the
+    savings for short sequences. 0 means no lower bound (always balance when enabled)."""
+
+    dsa_cp_balance_dispatch: Literal['alltoall', 'hybridep'] = 'alltoall'
+    """Dispatch backend for the balanced CP indexer. 'alltoall' moves only the two chunks each rank
+    needs via an NCCL all_to_all_single over the fixed chunk permutation (static splits, CUDA-graph
+    capturable); 'hybridep' uses the DeepEP all-to-all instead. 'hybridep' is not CUDA-graph
+    capturable and automatically falls back to 'alltoall' whenever CUDA graphs are enabled
+    (``cuda_graph_impl != 'none'``)."""
+
     ####################
     # DeepSeek-v4 hybrid attention
     ####################
@@ -1722,6 +1741,14 @@ class TransformerConfig(ModelParallelConfig):
                         "DSv4 Hybrid with context parallelism requires "
                         "cp_partition_mode='contiguous'."
                     )
+
+        if self.dsa_cp_balance_dispatch not in ('alltoall', 'hybridep'):
+            # Literal annotations are not enforced for direct/YAML construction; a
+            # typo would otherwise silently select the alltoall backend.
+            raise ValueError(
+                "dsa_cp_balance_dispatch must be 'alltoall' or 'hybridep', got "
+                f"{self.dsa_cp_balance_dispatch!r}."
+            )
 
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately
@@ -3439,6 +3466,9 @@ class TransformerConfig(ModelParallelConfig):
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
+        # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
+        # indexer operates natively on the contiguous layout and performs no
+        # module-local THD CP layout conversion.)
         if (
             (self.context_parallel_size > 1 or self.dynamic_context_parallel)
             and self.sequence_packing_scheduler is not None
