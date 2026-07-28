@@ -32,6 +32,7 @@ from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem", "nixl"]
+_ParallelConfig = Tuple[int, int, int, int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -41,9 +42,9 @@ class _PlanCacheKey:
     """
 
     rank: int
-    # Parallelism configuration: (TP, PP, EP, DP, expt_tp) or None for non-collocated ranks
-    src_config: Optional[Tuple[int, int, int, int, int]]
-    dst_config: Optional[Tuple[int, int, int, int, int]]
+    # (TP, PP, EP, DP, expert TP, GTP remat, expert GTP remat), or None.
+    src_config: Optional[_ParallelConfig]
+    dst_config: Optional[_ParallelConfig]
     num_experts: Optional[int]
     # Adding inference nodes leaves the configs and offsets unchanged, so without
     # world_size the stale pre-growth plan would be reused.
@@ -58,8 +59,8 @@ class _PlanCacheKey:
     pool_index: int = 0
 
 
-def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
-    """Extract (TP, PP, EP, DP, expt_tp) sizes from a model core, memoized on the core.
+def _get_config_tuple(core) -> Optional[_ParallelConfig]:
+    """Extract TP/PP/EP/DP/expert-TP/GTP/expert-GTP sizes, memoized on the core.
 
     Process-group sizes don't change after init, so the result is cached on the
     core object itself to avoid repeated ``get_process_group_ranks`` calls on
@@ -72,12 +73,16 @@ def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
         return cached
     pg = core.pg_collection
     expt_tp = getattr(pg, 'expt_tp', None)
+    gtp_remat = getattr(pg, 'gtp_remat', None)
+    expt_gtp_remat = getattr(pg, 'expt_gtp_remat', None)
     result = (
         pg.tp.size() if pg.tp else 1,
         pg.pp.size() if pg.pp else 1,
         pg.ep.size() if pg.ep else 1,
         pg.dp.size() if pg.dp else 1,
         expt_tp.size() if expt_tp else 1,
+        gtp_remat.size() if gtp_remat else 1,
+        expt_gtp_remat.size() if expt_gtp_remat else 1,
     )
     core._refit_config_tuple = result
     return result
@@ -192,7 +197,7 @@ def _unwrap_model_cores(src_model, target_model):
             raise RuntimeError("Source model missing pg_collection required for reshard")
         # Fill missing DP group on the source using Megatron's parallel state if not provided
         if getattr(src_core.pg_collection, "dp", None) is None:
-            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
+            src_core.pg_collection.dp = parallel_state.get_data_parallel_group(with_gtp_remat=False)
 
     if target_model is not None:
         tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
