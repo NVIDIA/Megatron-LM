@@ -173,25 +173,36 @@ class TestWrapModuleParams:
 
 
 # ---------------------------------------------------------------------------
-# classify_gtp_chains: output-layer fwd->bwd weight reuse opt-in
+# Output-layer weight is gathered once per step, not twice
 # ---------------------------------------------------------------------------
 
 
-def _worker_output_layer_reuse_optin(rank, world_size, port):
-    """Only the output layer opts into fwd->bwd weight reuse.
+def _worker_output_layer_weight_gathered_once(rank, world_size, port):
+    """The output layer gathers its weight in forward and reuses it in backward.
 
-    The opt-in is name-based, mirroring the embedding bwd-prefetch opt-out. A tied output
-    weight is registered under an "embedding..." name, so it must NOT be opted in: its bwd
-    is a scatter-add with no gather to reuse.
+    Its backward would otherwise re-gather the identical full weight, so the forward
+    result is retained and reused, saving one collective. Two halves are covered here:
+
+    * Which layers opt in. The opt-in is a name match, mirroring the embedding
+      bwd-prefetch opt-out. A tied output weight is registered under an "embedding..."
+      name and must not opt in, because its backward is a scatter-add with no gather
+      to reuse; ordinary weights must not opt in either.
+    * That the reuse actually happens. The retained weight must be populated after
+      forward and cleared after backward, which is what distinguishes the reuse branch
+      from a silent fallback re-gather, and the input gradient must still match a
+      reference built from an explicit all-gather.
     """
+    torch.manual_seed(0)
+    batch, in_f, out_f = 16, 64, 128  # out_f % (16*world_size)==0 -> no padding
+    dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
 
     class _Model(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.embedding = _make_gtp_linear(64, 128, gtp_remat_group)
-            self.decoder_fc1 = _make_gtp_linear(64, 128, gtp_remat_group)
-            self.output_layer = _make_gtp_linear(64, 128, gtp_remat_group)
+            self.embedding = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+            self.decoder_fc1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+            self.output_layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
 
     model = _Model()
     gtp_module.classify_gtp_chains(model)
@@ -200,19 +211,48 @@ def _worker_output_layer_reuse_optin(rank, world_size, port):
     emb_w = model.embedding.weight
     fc1_w = model.decoder_fc1.weight
 
-    assert out_w._reuse_fwd_weight_in_bwd is True, "output_layer must opt into fwd->bwd reuse"
-    assert emb_w._reuse_fwd_weight_in_bwd is False, "a tied/embedding weight must not opt in"
-    assert fc1_w._reuse_fwd_weight_in_bwd is False, "ordinary weights must not opt in"
+    assert out_w._reuse_fwd_weight_in_bwd is True, "output_layer must reuse its forward weight"
+    assert emb_w._reuse_fwd_weight_in_bwd is False, "a tied/embedding weight must not reuse"
+    assert fc1_w._reuse_fwd_weight_in_bwd is False, "ordinary weights must not reuse"
 
-    # The sibling embedding opt-out must be unaffected by the reuse opt-in.
+    # The sibling embedding opt-out must be unaffected.
     assert emb_w._need_weight_prefetch_bwd is False, "embedding still skips its bwd AG"
     assert out_w._need_weight_prefetch_bwd is True, "output_layer still prefetches in bwd"
 
+    # Reference full weight, reconstructed from the shards.
+    shard = out_w.data.clone()
+    all_shards = [torch.zeros_like(shard) for _ in range(world_size)]
+    dist.all_gather(all_shards, shard, group=gtp_remat_group)
+    full_weight = torch.cat(all_shards, dim=0).float()[:out_f]
 
-class TestOutputLayerReuseOptIn:
-    def test_only_output_layer_opts_in(self):
+    inp = torch.randn(batch, in_f, dtype=dtype, device="cuda")
+    dist.broadcast(inp, src=0)
+    inp_gtp = inp.clone().requires_grad_(True)
+    inp_ref = inp.clone().requires_grad_(True)
+
+    out_gtp = model.output_layer(inp_gtp, is_first_microbatch=True)
+    assert out_w._retained_fwd_weight is not None, "forward must retain the gathered weight"
+
+    out_ref = (inp_ref.float() @ full_weight.T).to(dtype)
+
+    # wgrad RS path always accumulates into main_grad; allocate before backward.
+    out_w.main_grad = torch.zeros(out_w.shape, dtype=dtype, device="cuda")
+    grad_out = torch.randn_like(out_gtp)
+    dist.broadcast(grad_out, src=0)
+    out_gtp.backward(grad_out)
+    out_ref.backward(grad_out.float())
+
+    assert out_w._retained_fwd_weight is None, "backward must consume the retained weight"
+    assert inp_gtp.grad is not None
+    assert torch.allclose(
+        inp_gtp.grad.float(), inp_ref.grad.float(), atol=1e-5, rtol=1e-5
+    ), f"dX mismatch max_diff={(inp_gtp.grad.float()-inp_ref.grad.float()).abs().max():.4f}"
+
+
+class TestOutputLayerWeightGatheredOnce:
+    def test_backward_reuses_forward_weight_and_gradients_match(self):
         _requires_multi_gpu(4)
-        _run_distributed(_worker_output_layer_reuse_optin, 4)
+        _run_distributed(_worker_output_layer_weight_gathered_once, 4)
 
 
 # ---------------------------------------------------------------------------
