@@ -1125,7 +1125,7 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
         )
         request_block_count = math.ceil(max_request_tokens / self.context.block_size_tokens)
-        total_blocks = self.context.kv_block_allocator.total_count - 1  # -1 for dummy block
+        total_blocks = self.context.kv_block_allocator.pool_size - 1  # -1 for dummy block
         if request_block_count > total_blocks:
             request.status = Status.FAILED
             request.add_event_error_nontransient(BlockOverflowError(request_id))
@@ -1250,7 +1250,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
-            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+            blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
             if block_allocator.enable_prefix_caching:
                 blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
                 blocks_ref_count = block_allocator.block_ref_counts.sum().item()
@@ -1322,7 +1322,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             if block_allocator.enable_prefix_caching:
                                 event = request.add_event_generated_token(
                                     token,
-                                    blocks_total=block_allocator.total_count,
+                                    blocks_total=block_allocator.pool_size,
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
                                     blocks_ref_count=blocks_ref_count,
@@ -1332,7 +1332,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             else:
                                 event = request.add_event_generated_token(
                                     token,
-                                    blocks_total=block_allocator.total_count,
+                                    blocks_total=block_allocator.pool_size,
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
                                     pre_fwd_active_token_count=pre_fwd_active_token_count,
@@ -1994,12 +1994,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 "finished_request_count": self.finished_request_count,
                 "evicted_request_count": self.evicted_request_count,
                 "kv_stats": kvcache_util_stats,
-                "usable_block_count": self.context.kv_block_allocator.total_count - 1,
+                "usable_block_count": self.context.kv_block_allocator.pool_size - 1,
                 "occupied_block_count": self.context.kv_block_allocator.get_total_used(),
                 "allocatable_block_count": self.context.kv_block_allocator.get_allocatable_count(),
                 "active_used_block_count": self.context.kv_block_allocator.get_active_used(),
                 "paused_used_block_count": self.context.kv_block_allocator.get_paused_used(),
-                "paused_block_budget": self.context.kv_block_allocator.paused_count,
+                "paused_block_budget": self.context.kv_block_allocator.paused_limit,
             }
             context_state = {**pre_step_context_state, **post_step_context_state}
         else:
@@ -2275,7 +2275,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 kv_alloc = self.context.kv_block_allocator
                 output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
                     len(kv_alloc.kv_hash_to_block_id),
-                    kv_alloc.total_count,
+                    kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )
                 msa = self.context.mamba_slot_allocator

@@ -8,8 +8,8 @@ import torch
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 
-TOTAL_COUNT = 10
-PAUSED_COUNT = 2
+POOL_SIZE = 10
+PAUSED_LIMIT = 2
 MAX_REQUESTS = 8
 MAX_BLOCKS_PER_REQ = 4
 
@@ -40,24 +40,24 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     bag (popping IDs off the top), release returns them, reset rewinds.
 
     Also covers the surrounding invariants the allocator must preserve:
-    total_avail bookkeeping, paused-budget headroom validation, the computed
+    pool_avail bookkeeping, paused-limit headroom validation, the computed
     allocatable count, the is_memory_available fast-path + no-eviction fallback,
     and the noop behaviour of release([]).
     """
     ctx = _make_context()
 
-    # The paused budget must leave one usable non-dummy block for liveness.
+    # The paused limit must leave one usable non-dummy block for liveness.
     with pytest.raises(AssertionError):
-        KVBlockAllocator(ctx, total_count=3, paused_count=2)
+        KVBlockAllocator(ctx, pool_size=3, paused_limit=2)
     with pytest.raises(AssertionError):
-        KVBlockAllocator(ctx, total_count=3, paused_count=-1)
+        KVBlockAllocator(ctx, pool_size=3, paused_limit=-1)
     with pytest.raises(AssertionError):
-        KVBlockAllocator(ctx, total_count=1, paused_count=0)
+        KVBlockAllocator(ctx, pool_size=1, paused_limit=0)
 
-    a = KVBlockAllocator(ctx, total_count=TOTAL_COUNT, paused_count=PAUSED_COUNT)
-    # Initial state: TOTAL_COUNT - 1 (dummy block) available, nothing used.
-    assert a.total_avail == TOTAL_COUNT - 1
-    assert a.get_allocatable_count() == TOTAL_COUNT - 1
+    a = KVBlockAllocator(ctx, pool_size=POOL_SIZE, paused_limit=PAUSED_LIMIT)
+    # Initial state: POOL_SIZE - 1 (dummy block) available, nothing used.
+    assert a.pool_avail == POOL_SIZE - 1
+    assert a.get_allocatable_count() == POOL_SIZE - 1
     assert a.get_total_used() == 0
     assert not hasattr(a, "active_count")
     assert not hasattr(a, "get_active_avail")
@@ -70,31 +70,31 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     # Allocate 3 → pop IDs off the top of the bag.
     ids = a.allocate_memory_blocks(3)
     assert ids is not None and ids.numel() == 3
-    assert a.total_avail == TOTAL_COUNT - 1 - 3
-    assert a.get_allocatable_count() == TOTAL_COUNT - 1 - 3
+    assert a.pool_avail == POOL_SIZE - 1 - 3
+    assert a.get_allocatable_count() == POOL_SIZE - 1 - 3
 
     # Empty release is a no-op; non-empty release returns IDs to the bag.
-    before = a.total_avail
+    before = a.pool_avail
     a.release_memory_blocks(torch.tensor([], dtype=torch.int32))
-    assert a.total_avail == before
+    assert a.pool_avail == before
     a.release_memory_blocks(ids)
-    assert a.total_avail == before + 3
+    assert a.pool_avail == before + 3
     assert a.get_allocatable_count() == before + 3
 
     # Free pool exhausted: without prefix caching there's no eviction path,
     # so both is_memory_available and allocate_memory_blocks return failure.
-    small_alloc = KVBlockAllocator(ctx, total_count=4, paused_count=1)
-    assert small_alloc.total_avail == 3
+    small_alloc = KVBlockAllocator(ctx, pool_size=4, paused_limit=1)
+    assert small_alloc.pool_avail == 3
     assert small_alloc.get_allocatable_count() == 3
     assert small_alloc.is_memory_available(5) is False
     assert small_alloc.allocate_memory_blocks(5) is None
 
-    # reset rewinds the bag back to arange(total_count) and clears routing state.
+    # reset rewinds the bag back to arange(pool_size) and clears routing state.
     a.allocate_memory_blocks(4)
     a.reset()
-    assert a.total_avail == TOTAL_COUNT - 1
-    assert a.get_allocatable_count() == TOTAL_COUNT - 1
-    assert a.block_bag.tolist() == list(range(TOTAL_COUNT))
+    assert a.pool_avail == POOL_SIZE - 1
+    assert a.get_allocatable_count() == POOL_SIZE - 1
+    assert a.block_bag.tolist() == list(range(POOL_SIZE))
     assert a.block_routing == {}
 
 
@@ -116,7 +116,7 @@ def test_block_usage_counts_no_prefix_caching(
         total_request_count=total,
         request_kv_block_counts=torch.tensor(counts, dtype=torch.int32),
     )
-    a = KVBlockAllocator(ctx, total_count=TOTAL_COUNT, paused_count=3)
+    a = KVBlockAllocator(ctx, pool_size=POOL_SIZE, paused_limit=3)
     assert a.get_active_used() == expected_active
     assert a.get_paused_used() == expected_paused
 
@@ -132,8 +132,8 @@ def test_prefix_caching_state_layout(policy, expect_timestamps):
     does not."""
     a = KVBlockAllocator(
         _make_context(),
-        total_count=8,
-        paused_count=2,
+        pool_size=8,
+        paused_limit=2,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=policy,
     )
@@ -155,8 +155,8 @@ def test_prefix_caching_allocate_and_hash_registration():
     the free pool can't satisfy and no cached blocks are evictable."""
     a = KVBlockAllocator(
         _make_context(),
-        total_count=8,
-        paused_count=2,
+        pool_size=8,
+        paused_limit=2,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
     )
@@ -188,12 +188,12 @@ def test_prefix_caching_allocate_and_hash_registration():
     # REF_ZERO has no eviction path when the free pool is short.
     small = KVBlockAllocator(
         _make_context(),
-        total_count=4,
-        paused_count=1,
+        pool_size=4,
+        paused_limit=1,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
     )
-    assert small.total_avail == 3
+    assert small.pool_avail == 3
     assert small.get_allocatable_count() == 3
     assert small.is_memory_available(5) is False
 
@@ -206,14 +206,14 @@ def test_release_shared_block_aggregates_duplicate_references(policy):
     returns the physical block to the free pool at most once."""
     a = KVBlockAllocator(
         _make_context(),
-        total_count=6,
-        paused_count=1,
+        pool_size=6,
+        paused_limit=1,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=policy,
     )
     block = a.allocate_memory_blocks(1)
     block_id = int(block.item())
-    raw_avail_after_allocate = a.total_avail
+    raw_avail_after_allocate = a.pool_avail
     a.register_kv_block_hashes(block_ids=[block_id], block_hashes=[111])
 
     # Model two requests sharing the same registered prefix block, then release
@@ -224,13 +224,13 @@ def test_release_shared_block_aggregates_duplicate_references(policy):
     assert a.block_ref_counts[block_id].item() == 0
     if policy == PrefixCachingEvictionPolicy.REF_ZERO:
         assert a.block_hashes[block_id].item() == -1
-        assert a.total_avail == raw_avail_after_allocate + 1
+        assert a.pool_avail == raw_avail_after_allocate + 1
         assert a.get_total_used() == 0
     else:
         # LRU keeps the physical block outside the free pool but exposes it
         # through get_allocatable_count because it is now evictable.
         assert a.block_hashes[block_id].item() == 111
-        assert a.total_avail == raw_avail_after_allocate
+        assert a.pool_avail == raw_avail_after_allocate
         assert a.get_allocatable_count() == raw_avail_after_allocate + 1
         assert a.get_total_used() == 1
 
@@ -261,7 +261,7 @@ def test_block_usage_counts_with_prefix_caching(
         total_request_count=total,
         request_to_kv_block_ids=request_to_kv,
     )
-    a = KVBlockAllocator(ctx, total_count=TOTAL_COUNT, paused_count=3, enable_prefix_caching=True)
+    a = KVBlockAllocator(ctx, pool_size=POOL_SIZE, paused_limit=3, enable_prefix_caching=True)
     assert a.get_active_used() == expected_active
     assert a.get_paused_used() == expected_paused
 
@@ -271,12 +271,12 @@ def test_block_usage_counts_with_prefix_caching(
 # ---------------------------------------------------------------------------
 
 
-def _lru_allocator(total_count=16, paused_count=1):
+def _lru_allocator(pool_size=16, paused_limit=1):
     """LRU-mode prefix-caching allocator over a fresh fake context."""
     return KVBlockAllocator(
         _make_context(),
-        total_count=total_count,
-        paused_count=paused_count,
+        pool_size=pool_size,
+        paused_limit=paused_limit,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
     )
@@ -290,8 +290,8 @@ def _seed_cached_chain(a, block_ids, hashes, parents, timestamps):
     a.block_ref_counts[ids] = 0  # cached / evictable
     a.block_timestamps[ids] = torch.tensor(timestamps, dtype=torch.int64)
     # Mark the blocks as out of the free pool so _deregister_blocks (which pushes
-    # them back) keeps total_avail bookkeeping consistent.
-    a.total_avail -= len(block_ids)
+    # them back) keeps pool_avail bookkeeping consistent.
+    a.pool_avail -= len(block_ids)
 
 
 def _assert_prefix_invariant(a):
@@ -394,7 +394,7 @@ def test_evict_lru_cached_child_with_pinned_parent_treated_as_root():
     # nothing here, but in general orphan its children.
     a.block_ref_counts[ids] = torch.tensor([1, 0, 0], dtype=torch.int32)
     a.block_timestamps[ids] = torch.tensor([0, 1, 9], dtype=torch.int64)
-    a.total_avail -= 3
+    a.pool_avail -= 3
 
     # Only S1 and SX are candidates; the pinned S0 is excluded.
     assert int(a.get_evictable_block_count()) == 2
@@ -457,7 +457,7 @@ def test_evict_lru_keeps_hottest_leaf_over_cold_interior_parent():
                           \-> F(ts 3)
                 \-> D(ts 3) -> E(ts 5)
     """
-    a = _lru_allocator(total_count=8)
+    a = _lru_allocator(pool_size=8)
     # hashes: A=10, B=20, C=30, F=40, D=50, E=60
     _seed_cached_chain(
         a,
@@ -495,17 +495,17 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     """potential_matched_count removes soon-to-be-pinned cached blocks from the
     evictable capacity, so availability matches what allocation can satisfy
     once those blocks (e.g. prefix matches) are pinned."""
-    a = _lru_allocator(total_count=6, paused_count=1)
+    a = _lru_allocator(pool_size=6, paused_limit=1)
     # Drain the free pool: every block is allocated (ref_count == 1), none free.
-    a.allocate_memory_blocks(a.total_avail)
-    assert a.total_avail == 0
+    a.allocate_memory_blocks(a.pool_avail)
+    assert a.pool_avail == 0
     assert a.get_allocatable_count() == 0
     # Mark two blocks as cached/evictable, mirroring an LRU release: ref_count
     # drops to 0 and the hash is retained, but the block stays out of the free
-    # pool (total_avail unchanged).
+    # pool (pool_avail unchanged).
     a.register_kv_block_hashes(block_ids=[0, 1], block_hashes=[10, 20], parent_hashes=[0, 10])
     a.block_ref_counts[torch.tensor([0, 1])] = 0
-    assert a.total_avail == 0
+    assert a.pool_avail == 0
     assert a.get_allocatable_count() == 2
     assert int(a.get_evictable_block_count()) == 2
 
@@ -522,7 +522,7 @@ def test_is_memory_available_excludes_soon_to_be_pinned_blocks():
     # capacity.
     allocated = a.allocate_memory_blocks(2)
     assert allocated is not None and allocated.numel() == 2
-    assert a.total_avail == 0
+    assert a.pool_avail == 0
     assert a.get_allocatable_count() == 0
     assert a.kv_hash_to_block_id == {}
 
@@ -565,7 +565,7 @@ def test_evict_lru_preserves_invariant_under_random_chains():
     torch.manual_seed(0)
     for _ in range(50):
         n = int(torch.randint(2, 10, (1,)).item())
-        a = _lru_allocator(total_count=n + 4)
+        a = _lru_allocator(pool_size=n + 4)
         block_ids = list(range(n))
         # Build a forest: block k's parent is a random earlier block or a root.
         hashes = [100 + k for k in range(n)]

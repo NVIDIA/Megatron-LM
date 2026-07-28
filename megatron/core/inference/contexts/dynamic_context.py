@@ -550,10 +550,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.kv_block_allocator = KVBlockAllocator(
             context=self,
-            total_count=(
+            pool_size=(
                 block_count if self.unified_memory_level == 0 else block_count + paused_block_count
             ),
-            paused_count=paused_block_count,
+            paused_limit=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
         )
@@ -580,7 +580,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
-            self.max_requests = self.kv_block_allocator.total_count - 1  # -1 for dummy block
+            self.max_requests = self.kv_block_allocator.pool_size - 1  # -1 for dummy block
 
             # Adjust max_requests for Mamba memory constraints if necessary
             if self.is_hybrid_model and mamba_max_requests < self.max_requests:
@@ -619,7 +619,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.non_graph_attn_metadata = {}
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
-            block_count_total=self.kv_block_allocator.total_count,
+            block_count_total=self.kv_block_allocator.pool_size,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
@@ -627,7 +627,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
-            block_count_total=self.kv_block_allocator.total_count,
+            block_count_total=self.kv_block_allocator.pool_size,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
@@ -748,9 +748,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
-        usable_blocks = self.kv_block_allocator.total_count - 1
-        total_blocks = self.kv_block_allocator.total_count
-        paused_block_budget = self.kv_block_allocator.paused_count
+        usable_blocks = self.kv_block_allocator.pool_size - 1
+        total_blocks = self.kv_block_allocator.pool_size
+        paused_block_budget = self.kv_block_allocator.paused_limit
         usable_kv_bytes = usable_blocks * self.block_size_bytes
         total_kv_bytes = total_blocks * self.block_size_bytes
         paused_kv_budget_bytes = paused_block_budget * self.block_size_bytes
@@ -838,7 +838,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.memory_buffer = torch.empty(
                 (
                     self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
+                    self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.kv_reduced_dim,
                 ),
@@ -850,7 +850,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (
                     2,  # key and value
                     self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
+                    self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.num_attention_heads_per_partition,
                     self.hidden_size_per_attention_head,
@@ -3362,7 +3362,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count == 0:
             return 0
 
-        block_budget = self.kv_block_allocator.paused_count
+        block_budget = self.kv_block_allocator.paused_limit
         if not self.enable_prefix_caching:
             paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
             cumulative_block_counts = paused_block_counts.cumsum(dim=0)
@@ -3458,7 +3458,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             if candidate_count > 0:
                 new_block_counts_cumsum = needs_new_block[:candidate_count].cumsum(dim=0)
                 max_new_block_count = int(new_block_counts_cumsum[-1].item())
-                block_count_avail = self.kv_block_allocator.total_avail
+                block_count_avail = self.kv_block_allocator.pool_avail
                 if max_new_block_count > block_count_avail:
                     block_count_avail = self.kv_block_allocator.get_allocatable_count()
                 resume_request_count = int(
@@ -4375,11 +4375,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             }
         """
         # Total usable blocks exclude the reserved dummy block.
-        total_blocks = max(self.kv_block_allocator.total_count - 1, 1)
-        block_count_avail = int(self.kv_block_allocator.total_avail)
+        total_blocks = max(self.kv_block_allocator.pool_size - 1, 1)
+        block_count_avail = int(self.kv_block_allocator.pool_avail)
 
         # Overall allocated blocks in the buffer right now.
-        allocated_blocks = (self.kv_block_allocator.total_count - 1) - block_count_avail
+        allocated_blocks = (self.kv_block_allocator.pool_size - 1) - block_count_avail
         allocated_blocks = int(max(0, allocated_blocks))
 
         # Active unique blocks referenced by current active requests only.

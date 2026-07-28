@@ -48,7 +48,7 @@ class MambaSlotAllocator:
         self.num_mamba_layers = num_mamba_layers
 
         gpu_device = torch.cuda.current_device()
-        num_blocks = context.kv_block_allocator.total_count
+        num_blocks = context.kv_block_allocator.pool_size
 
         # Block <-> slot mappings (CPU for bookkeeping).
         self.block_to_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device='cpu')
@@ -201,8 +201,8 @@ class MambaSlotAllocator:
         """
         kv_alloc = self.context.kv_block_allocator
         # Find blocks that have mamba slots and ref_count == 0
-        has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
-        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
+        has_slot_mask = self.block_to_slot[: kv_alloc.pool_size] >= 0
+        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.pool_size] == 0
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
