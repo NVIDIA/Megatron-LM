@@ -34,7 +34,7 @@ permissions:
 
 env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-  container-registry-gb200: 766267172432.dkr.ecr.us-east-2.amazonaws.com
+  container-registry-gb200: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm
 
 jobs:
   is-not-external-contributor:
@@ -44,7 +44,7 @@ jobs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
       selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
-      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
+      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
       pull-requests: write
