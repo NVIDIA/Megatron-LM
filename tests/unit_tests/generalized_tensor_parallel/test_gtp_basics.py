@@ -173,6 +173,49 @@ class TestWrapModuleParams:
 
 
 # ---------------------------------------------------------------------------
+# classify_gtp_chains: output-layer fwd->bwd weight reuse opt-in
+# ---------------------------------------------------------------------------
+
+
+def _worker_output_layer_reuse_optin(rank, world_size, port):
+    """Only the output layer opts into fwd->bwd weight reuse.
+
+    The opt-in is name-based, mirroring the embedding bwd-prefetch opt-out. A tied output
+    weight is registered under an "embedding..." name, so it must NOT be opted in: its bwd
+    is a scatter-add with no gather to reuse.
+    """
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = _make_gtp_linear(64, 128, gtp_remat_group)
+            self.decoder_fc1 = _make_gtp_linear(64, 128, gtp_remat_group)
+            self.output_layer = _make_gtp_linear(64, 128, gtp_remat_group)
+
+    model = _Model()
+    gtp_module.classify_gtp_chains(model)
+
+    out_w = model.output_layer.weight
+    emb_w = model.embedding.weight
+    fc1_w = model.decoder_fc1.weight
+
+    assert out_w._reuse_fwd_weight_in_bwd is True, "output_layer must opt into fwd->bwd reuse"
+    assert emb_w._reuse_fwd_weight_in_bwd is False, "a tied/embedding weight must not opt in"
+    assert fc1_w._reuse_fwd_weight_in_bwd is False, "ordinary weights must not opt in"
+
+    # The sibling embedding opt-out must be unaffected by the reuse opt-in.
+    assert emb_w._need_weight_prefetch_bwd is False, "embedding still skips its bwd AG"
+    assert out_w._need_weight_prefetch_bwd is True, "output_layer still prefetches in bwd"
+
+
+class TestOutputLayerReuseOptIn:
+    def test_only_output_layer_opts_in(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_output_layer_reuse_optin, 4)
+
+
+# ---------------------------------------------------------------------------
 # Linear forward/backward numerical correctness
 # ---------------------------------------------------------------------------
 
