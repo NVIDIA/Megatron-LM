@@ -255,8 +255,10 @@ def _distopt_stub(optimizer, use_megatron_fsdp=False, use_precision_aware_optimi
 
     ``_copy_model_params_to_main_params`` only reads these attributes before the
     ``HybridDeviceOptimizer`` branch returns, so these dispatch tests need neither a
-    process group nor a GPU. They cover which branch is taken; the re-seed itself is
-    covered functionally by ``test_reload_model_params_preserves_loaded_weights``.
+    process group nor a GPU. They cover which branch is taken; the actual re-seed is
+    covered functionally by ``test_reload_model_params_preserves_loaded_weights`` and the
+    shard-master copy is the pre-existing ``copy_group_params`` code, mocked here as
+    ``_copy_model_params_to_shard_main_params``.
     """
     return SimpleNamespace(
         ddp_config=SimpleNamespace(use_megatron_fsdp=use_megatron_fsdp),
@@ -264,6 +266,7 @@ def _distopt_stub(optimizer, use_megatron_fsdp=False, use_precision_aware_optimi
             use_precision_aware_optimizer_no_fp8_or_ds_fp8=use_precision_aware_optimizer
         ),
         optimizer=optimizer,
+        _copy_model_params_to_shard_main_params=MagicMock(),
         model_float16_groups=[],
         model_fp32_groups=[],
         shard_fp32_from_float16_groups=[],
@@ -271,18 +274,59 @@ def _distopt_stub(optimizer, use_megatron_fsdp=False, use_precision_aware_optimi
     )
 
 
-def test_distributed_optimizer_reloads_hybrid_optimizer():
-    """The hybrid optimizer's detached copies must be re-seeded, not just the FP32 ones.
+def test_precision_aware_hdo_reseeds_only_internal_copies():
+    """Precision-aware HDO: shard masters are None, so only re-seed the optimizer copies.
 
     Upstream called ``update_fp32_param_by_new_param`` here, which refreshes
     ``param_to_fp32_param`` but leaves the pinned CPU clones stale. ``spec`` makes
     ``isinstance`` succeed and pins the method name, so a rename fails loudly.
     """
     hdo = MagicMock(spec=HybridDeviceOptimizer)
+    stub = _distopt_stub(hdo, use_precision_aware_optimizer=True)
 
-    DistributedOptimizer._copy_model_params_to_main_params(_distopt_stub(hdo))
+    DistributedOptimizer._copy_model_params_to_main_params(stub)
 
     hdo.reload_model_params.assert_called_once_with()
+    stub._copy_model_params_to_shard_main_params.assert_not_called()
+
+
+def test_non_precision_aware_hdo_refreshes_shard_masters_then_reseeds():
+    """Without precision-aware the real FP32 shard masters must be refreshed first.
+
+    They are what the sub-optimizers step on, and re-seeding the detached copies from
+    stale masters would still discard the loaded weights.
+    """
+    hdo = MagicMock(spec=HybridDeviceOptimizer)
+    stub = _distopt_stub(hdo, use_precision_aware_optimizer=False)
+
+    DistributedOptimizer._copy_model_params_to_main_params(stub)
+
+    stub._copy_model_params_to_shard_main_params.assert_called_once_with(None)
+    hdo.reload_model_params.assert_called_once_with()
+
+
+def test_non_precision_aware_hdo_seeds_masters_from_state_dict():
+    """``--load-main-params-from-ckpt`` must seed the masters from the checkpoint."""
+    hdo = MagicMock(spec=HybridDeviceOptimizer)
+    stub = _distopt_stub(hdo, use_precision_aware_optimizer=False)
+    state_dict = {"model": {}}
+
+    DistributedOptimizer._copy_model_params_to_main_params(stub, state_dict=state_dict)
+
+    stub._copy_model_params_to_shard_main_params.assert_called_once_with(state_dict)
+
+
+def test_precision_aware_hdo_rejects_main_params_from_state_dict():
+    """Precision-aware HDO holds masters internally and cannot seed them from a ckpt here.
+
+    Reject rather than silently discard the checkpoint's master weights. This matches the
+    non-offload precision-aware branch, which also does not consume ``state_dict``.
+    """
+    hdo = MagicMock(spec=HybridDeviceOptimizer)
+    stub = _distopt_stub(hdo, use_precision_aware_optimizer=True)
+
+    with pytest.raises(AssertionError, match="load-main-params-from-ckpt"):
+        DistributedOptimizer._copy_model_params_to_main_params(stub, state_dict={"model": {}})
 
 
 def test_megatron_fsdp_ordering_is_unchanged():
