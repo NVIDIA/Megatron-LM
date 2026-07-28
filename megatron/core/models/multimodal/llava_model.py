@@ -1017,6 +1017,7 @@ class LLaVAModel(MegatronModule):
                         images,
                         imgs_sizes,
                         vision_packed_seq_params,
+                        cp_group=self.cp_group,
                         fp8_enabled=False,
                         fp8_recipe=getattr(self.config, "fp8_recipe", None),
                         patch_dim=self.vision_model.patch_dim,
@@ -1062,7 +1063,7 @@ class LLaVAModel(MegatronModule):
                 # matching number of tiles on every rank.
                 if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
                     image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
-                        image_embeddings, num_padded_imgs
+                        image_embeddings, self.cp_group, num_padded_imgs
                     )
 
                 # After temporal grouping each tubelet is one "tile" for LLaVAModel's
