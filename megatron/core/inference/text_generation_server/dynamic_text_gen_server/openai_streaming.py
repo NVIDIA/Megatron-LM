@@ -197,26 +197,34 @@ class StreamingChatParser:
             if self._tool_names_sent[index]:
                 previous_arguments = self._previous_arguments[index]
                 call_is_complete = finished or index + 1 < len(tool_calls)
-                stable_arguments = (
-                    current_arguments
-                    if call_is_complete
-                    else _common_prefix(previous_arguments, current_arguments)
+                # The Qwen parser reports ``{}`` as soon as the function name is
+                # complete, before any <parameter> block has arrived. Treat that
+                # as a placeholder until the call completes; otherwise ``{}``
+                # advances the high-water mark and blocks the real arguments.
+                arguments_are_placeholder = (
+                    not call_is_complete and current_arguments.strip() == "{}"
                 )
-                already_sent = self._streamed_arguments[index]
-                if stable_arguments.startswith(already_sent):
-                    argument_delta = stable_arguments[len(already_sent) :]
-                    if argument_delta:
-                        deltas.append(
-                            {
-                                "tool_calls": [
-                                    {
-                                        "index": index,
-                                        "function": {"arguments": argument_delta},
-                                    }
-                                ]
-                            }
-                        )
-                        self._streamed_arguments[index] += argument_delta
+                if not arguments_are_placeholder:
+                    stable_arguments = (
+                        current_arguments
+                        if call_is_complete
+                        else _common_prefix(previous_arguments, current_arguments)
+                    )
+                    already_sent = self._streamed_arguments[index]
+                    if stable_arguments.startswith(already_sent):
+                        argument_delta = stable_arguments[len(already_sent) :]
+                        if argument_delta:
+                            deltas.append(
+                                {
+                                    "tool_calls": [
+                                        {
+                                            "index": index,
+                                            "function": {"arguments": argument_delta},
+                                        }
+                                    ]
+                                }
+                            )
+                            self._streamed_arguments[index] += argument_delta
 
             self._previous_arguments[index] = current_arguments
 
