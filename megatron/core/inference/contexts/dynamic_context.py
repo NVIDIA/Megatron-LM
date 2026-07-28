@@ -598,6 +598,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
+        # Per-step upper bound on Mamba intermediate-state extractions, shared with
+        # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
+        # budget accounting agree. Bounded both by the token budget (one block
+        # boundary per block_size_tokens) and by the request budget
+        # (MAX_INTERMEDIATE_OFFSETS_PER_REQUEST per request);
+        token_based_count = math.ceil(self.max_tokens / self.block_size_tokens)
+        request_based_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+        self.max_mamba_intermediate_states_per_step = min(token_based_count, request_based_count)
+
         assert self.max_tokens >= self.max_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
             f"max_requests ({self.max_requests}), "
@@ -805,7 +814,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # budget first, then the rest sizes the "durable" cache
                 # (ssm_states/conv_states). mamba_bytes_per_req is the shared
                 # per-slot footprint of both.
-                scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+                scratch_slots = self.max_mamba_intermediate_states_per_step
                 scratch_bytes = scratch_slots * mamba_bytes_per_req
                 durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
                 durable_slots = max(durable_slots, 0)
@@ -864,6 +873,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
+                max_intermediate_count=self.max_mamba_intermediate_states_per_step,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
             )
@@ -1700,26 +1710,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         #                       `max_slots` slots (computed below).
         #   - "scratch" buffers: self.intermediate_ssm_out / self.intermediate_conv_out,
         #                       fixed CUDA-graph-safe staging for intermediate-state
-        #                       extraction, sized to the per-step worst case of
-        #                       `scratch_slots` = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
-        #                       * max_requests slots.
+        #                       extraction, sized to the per-step token-budget cap
+        #                       `scratch_slots` = max_mamba_intermediate_states_per_step.
         # The scratch is not part of the durable cache but consumes the same
         # per-slot bytes, so reserve it from the budget up front before sizing the
         # durable cache; otherwise total usage silently exceeds mamba_gb (and can
         # OOM) when scratch_slots > max_slots.
-        scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+        scratch_slots = self.max_mamba_intermediate_states_per_step
         scratch_bytes = scratch_slots * per_slot_bytes
         max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
         if max_slots < 1:
             raise ValueError(
                 f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
                 f"is too small. The CUDA-graph extraction scratch reserves "
-                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots = "
-                f"{MAX_INTERMEDIATE_OFFSETS_PER_REQUEST} offsets x {self.max_requests} "
-                f"requests x {per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
+                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots x "
+                f"{per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
                 f"fewer than one durable cache slot. Increase prefix_caching_mamba_gb "
                 f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
-                f"reduce max_requests."
+                f"reduce max_tokens."
             )
 
         self.mamba_slot_allocator = MambaSlotAllocator(
@@ -2929,14 +2937,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (_, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+        (matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 
         request_tokens_can_be_added = (
             self.active_token_count + effective_prefill_chunk_length <= self.max_tokens
         )
-        kv_cache_available = self.kv_block_allocator.is_memory_available(num_blocks_from_pool)
+        # add_request pins the matched blocks before allocating. Only matches that
+        # are currently evictable (ref_count == 0) count against the evictable
+        # pool; matches already pinned by another in-flight request are not in
+        # get_evictable_block_count() and pinning them frees nothing. Reserve only
+        # the ref_count == 0 matches so availability is not under-reported.
+        potential_matched_count = 0
+        if matched_block_ids:
+            matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
+            potential_matched_count = int(
+                (self.kv_block_allocator.block_ref_counts[matched_tensor] == 0).sum()
+            )
+        kv_cache_available = self.kv_block_allocator.is_memory_available(
+            num_blocks_from_pool, potential_matched_count=potential_matched_count
+        )
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def _find_kv_match_count(
@@ -3037,18 +3058,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
 
-        new_block_ids = None
-        if num_blocks_from_pool > 0:
-            new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
-            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
-                raise BlockOverflowError(req.request_id)
-
-        # Increment ref counts and update timestamps for matched (shared) blocks
+        # Pin matched (shared) blocks BEFORE allocation. allocate_memory_blocks()
+        # may trigger LRU eviction, and a matched block still at ref_count == 0
+        # would be an eviction candidate — descendant-first LRU could evict a
+        # matched leaf and immediately reuse its ID for a new block, leaving the
+        # block table with a duplicate ID and a dangling parent. Incrementing ref
+        # counts first removes matched blocks from the evictable set (see
+        # evict_lru_blocks / get_evictable_block_count), so eviction falls back to
+        # genuinely unused cached blocks.
+        matched_tensor = None
         if num_matched_blocks > 0:
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
             self.kv_block_allocator.block_ref_counts[matched_tensor] += 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.kv_block_allocator.update_timestamps(matched_tensor)
+
+        new_block_ids = None
+        if num_blocks_from_pool > 0:
+            new_block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks_from_pool)
+            if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
+                # Roll back the pin so a failed add does not leak ref counts on
+                # the matched blocks (which would make them permanently unevictable).
+                if matched_tensor is not None:
+                    self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
+                raise BlockOverflowError(req.request_id)
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -3151,8 +3184,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     return
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
+                # Parent hash of block k is the hash of block k-1 in the chain;
+                # block 0 is a root (parent hash 0). Enables LRU eviction to keep
+                # parents cached until their children are gone.
+                parent_hashes_slice = [
+                    req.precomputed_block_hashes[k - 1] if k > 0 else 0 for k in range(start, end)
+                ]
                 self.kv_block_allocator.register_kv_block_hashes(
-                    block_ids_to_hash, block_hashes_slice
+                    block_ids_to_hash, block_hashes_slice, parent_hashes_slice
                 )
 
             # Range 1: prior-chunk partial block that this chunk just completed
