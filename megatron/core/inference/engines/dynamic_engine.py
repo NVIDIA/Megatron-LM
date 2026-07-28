@@ -1062,11 +1062,6 @@ class DynamicInferenceEngine(AbstractEngine):
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
         sampling_params = request.sampling_params
-        if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
-            raise ValueError(
-                "Async scheduling only supports greedy sampling "
-                "(SamplingParams.top_k == 1 and top_p == 0.0)."
-            )
         if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
             raise ValueError("Async scheduling does not support log probabilities.")
         if sampling_params.stop_words:

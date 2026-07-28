@@ -198,6 +198,14 @@ class TextGenerationControllerTestBase:
 
 def _make_async_sched_context(total_request_count=2, paused_request_count=0):
     metadata_len = max(total_request_count, 1)
+    request_metadata = {
+        "temperature": torch.ones(metadata_len),
+        "top_k": torch.ones(metadata_len, dtype=torch.int64),
+        "top_p": torch.zeros(metadata_len),
+        "return_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
+        "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
+        "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
+    }
     context = SimpleNamespace(
         config=SimpleNamespace(
             materialize_only_last_token_logits=True, async_sched_mode=AsyncScheduleMode.ASYNC
@@ -214,13 +222,16 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         prefix_cache_lru_clock=0,
         lifetime_prefill_token_count=0,
         request_ids=torch.arange(10, 10 + metadata_len, dtype=torch.int32),
-        request_metadata={
-            "top_k": torch.ones(metadata_len, dtype=torch.int64),
-            "top_p": torch.zeros(metadata_len),
-            "return_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
-            "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
-            "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
+        request_metadata=request_metadata,
+        active_request_metadata={
+            label: metadata.clone() for label, metadata in request_metadata.items()
         },
+        gpu_view=SimpleNamespace(
+            temperature=request_metadata["temperature"].clone(),
+            top_k=request_metadata["top_k"].to(torch.int32).clone(),
+            top_p=request_metadata["top_p"].clone(),
+            active_request_last_token_idxs=torch.arange(metadata_len, dtype=torch.int32),
+        ),
         async_sched_step_count=0,
         async_sched_compaction_step_count=0,
         get_active_sequence_lengths=mock.Mock(
@@ -261,10 +272,21 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller.model_config = model_config
     controller.num_speculative_tokens = 0
     controller._enable_cuda_graph = False
+    controller._sampling_backend = "torch"
     controller._async_sched_logits = AsyncScheduleLogitsState(is_valid=True)
     controller._async_sched_mtp_token_row_indices = None
     controller._all_logits_cuda = torch.empty(0)
     controller._sampled_tokens_cuda = torch.empty(context.max_requests, dtype=torch.int64)
+
+    def sample_kernel(logits, n, _context, **kwargs):
+        sampled_tokens = torch.argmax(logits[:n], dim=-1)
+        output = kwargs.get("output")
+        if output is None:
+            return sampled_tokens
+        output.copy_(sampled_tokens)
+        return output
+
+    controller._sampling = SimpleNamespace(sample_kernel=mock.Mock(side_effect=sample_kernel))
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -394,7 +416,24 @@ def test_async_sched_logits_state_rejects_removed_ready_event():
     ],
 )
 def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expected_compaction):
-    controller = _make_async_sched_controller()
+    context = _make_async_sched_context(total_request_count=4)
+    context.active_request_metadata["temperature"].copy_(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+    context.active_request_metadata["top_k"].copy_(torch.tensor([1, 2, 3, 4]))
+    context.active_request_metadata["top_p"].copy_(torch.tensor([0.5, 0.6, 0.7, 0.8]))
+    context.gpu_view.temperature.copy_(context.active_request_metadata["temperature"])
+    context.gpu_view.top_k.copy_(context.active_request_metadata["top_k"])
+    context.gpu_view.top_p.copy_(context.active_request_metadata["top_p"])
+    original_cpu_metadata = {
+        label: context.active_request_metadata[label].clone()
+        for label in ("temperature", "top_k", "top_p")
+    }
+    gpu_metadata = {
+        "temperature": context.gpu_view.temperature,
+        "top_k": context.gpu_view.top_k,
+        "top_p": context.gpu_view.top_p,
+    }
+    original_gpu_metadata = {label: metadata.clone() for label, metadata in gpu_metadata.items()}
+    controller = _make_async_sched_controller(context)
     controller._enable_cuda_graph = enable_cuda_graph
     controller._async_sched_logits = AsyncScheduleLogitsState(
         is_valid=True, cuda_graph_request_count=8
@@ -412,6 +451,9 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
 
     if not expected_compaction:
         assert torch.equal(controller._all_logits_cuda, logits)
+        for label in ("temperature", "top_k", "top_p"):
+            assert torch.equal(context.active_request_metadata[label], original_cpu_metadata[label])
+            assert torch.equal(gpu_metadata[label], original_gpu_metadata[label])
         return
 
     expected_logits = logits[:, survivor_idxs, :]
@@ -422,13 +464,22 @@ def test_async_sched_logits_compaction(enable_cuda_graph, survivor_idxs, expecte
         assert controller._all_logits_cuda.shape == logits.shape
     else:
         assert torch.equal(controller._all_logits_cuda, expected_logits)
+    survivor_count = survivor_idxs.numel()
+    for label in ("temperature", "top_k", "top_p"):
+        assert torch.equal(
+            context.active_request_metadata[label][:survivor_count],
+            original_cpu_metadata[label][survivor_idxs],
+        )
+        assert torch.equal(
+            gpu_metadata[label][:survivor_count], original_gpu_metadata[label][survivor_idxs]
+        )
     assert controller._async_sched_logits.is_valid
     assert controller._async_sched_logits.cuda_graph_request_count == 8
 
 
 def test_async_sched_mtp_logits_compaction_preserves_input_rows():
     """MTP survivor logits retain the pending forward rows used for verification."""
-    controller = _make_async_sched_controller()
+    controller = _make_async_sched_controller(_make_async_sched_context(total_request_count=3))
     controller.num_speculative_tokens = 1
     controller._all_logits_cuda = torch.arange(18).reshape(1, 6, 3)
     controller._async_sched_logits = AsyncScheduleLogitsState(
@@ -695,6 +746,17 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert result.sampled_tokens_gpu.data_ptr() == controller._sampled_tokens_cuda.data_ptr()
     assert torch.equal(result.sampled_tokens_gpu, expected_tokens)
     assert torch.equal(result.sampled_tokens_cpu_view, expected_tokens)
+    controller._sampling.sample_kernel.assert_called_once()
+    logits, n, called_context = controller._sampling.sample_kernel.call_args.args
+    assert torch.equal(logits, controller._all_logits_cuda.squeeze(0))
+    assert n == 3
+    assert called_context is context
+    sample_kwargs = controller._sampling.sample_kernel.call_args.kwargs
+    assert set(sample_kwargs) == {"gather_indices", "no_top_k", "no_top_p", "output"}
+    assert sample_kwargs["gather_indices"] is None
+    assert not sample_kwargs["no_top_k"]
+    assert sample_kwargs["no_top_p"]
+    assert sample_kwargs["output"].data_ptr() == controller._sampled_tokens_cuda.data_ptr()
 
 
 @pytest.mark.internal
@@ -1569,7 +1631,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
     ):
         if backend == "flashinfer":
             pytest.importorskip("flashinfer")
-        batch_size = 15
+        batch_size = 18
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
@@ -1590,6 +1652,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             (SamplingParams(top_p=0.8), [4, 1, 7]),
             (SamplingParams(temperature=10.0, top_k=5), [11, 5, 8]),
             (SamplingParams(temperature=0.0, top_k=1), [12, 13, 14]),
+            (SamplingParams(temperature=1.2), [15, 16, 17]),
         ]
         # For non-torch backends, test simultaneous top_k and top_p sampling.
         if backend != "torch":
@@ -1656,10 +1719,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         """`_sampled_tokens_cuda` is a single `max_requests` buffer written in place by
         every sampling path. The non-speculative path (`_dynamic_step_sample_logits`)
         writes its `active_request_count` prefix, and the async-scheduling path
-        (`_run_async_sched_sample`) writes its own prefix via `torch.max(out=...)`. The
-        buffer must retain its full capacity across successive steps regardless of each
-        step's active count, so a later step with more active requests than an earlier
-        one still has an in-bounds destination.
+        (`_run_async_sched_sample`) writes its own prefix through `sample_kernel`. The buffer
+        must retain its full capacity across successive steps regardless of each step's
+        active count, so a later step with more active requests than an earlier one still
+        has an in-bounds destination.
 
         Drive a small-batch non-speculative sample followed by a larger-batch async
         sample through the same buffer, and confirm the buffer keeps its capacity and
@@ -1699,10 +1762,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert controller._sampled_tokens_cuda.data_ptr() == buffer_ptr
         assert torch.equal(controller._sampled_tokens_cuda[:small_count], small_expected)
 
-        # Async-scheduling sample over a larger active batch through the same buffer;
-        # its `torch.max(out=...)` destination is `_sampled_tokens_cuda[:large_count]`.
+        # Async-scheduling sample over a larger active batch through the same buffer.
         context.total_request_count = large_count
         context.paused_request_count = 0
+        context.active_request_metadata["temperature"][:large_count].fill_(1.0)
+        context.active_request_metadata["top_k"][:large_count].fill_(1)
+        context.active_request_metadata["top_p"][:large_count].fill_(0.0)
         large_expected = torch.tensor([0, 1, 2, 3, 4], device="cuda")
         large_logits = torch.zeros(1, large_count, self.vocab_size, device="cuda")
         for row, col in enumerate(large_expected.tolist()):

@@ -1225,19 +1225,15 @@ class TextGenerationController:
             else context.gpu_view.active_request_last_token_idxs
         )
         no_top_k, no_top_p = self._active_requests_sampling_filter_flags(active_request_count)
-        sampled_tokens = self._sampling.sample_kernel(
+        self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
             gather_indices=gather_indices,
             no_top_k=no_top_k,
             no_top_p=no_top_p,
+            output=self._sampled_tokens_cuda[:n],
         )
-        # Copy into the stable `max_requests` buffer rather than rebinding it. The spec
-        # (`sampled_tokens_buf`) and async-scheduling (`torch.max(out=...)`) paths both
-        # write into this buffer in place and rely on its address staying fixed, so this
-        # path must keep the same contract (see the `__init__` allocation comment).
-        self._sampled_tokens_cuda[:n].copy_(sampled_tokens)
 
     def _active_requests_sampling_filter_flags(
         self, active_request_count: Optional[int] = None
@@ -1946,7 +1942,7 @@ class TextGenerationController:
             raise RuntimeError("Async scheduling overlap does not support paused requests.")
 
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
-        """Compact cached logits from old active-row order into survivor order.
+        """Compact pending logits and sampling metadata into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
@@ -1987,6 +1983,21 @@ class TextGenerationController:
             self._all_logits_cuda[:, : survivor_token_idxs.numel(), :].copy_(compacted_logits)
         else:
             self._all_logits_cuda = compacted_logits
+
+        context = self.inference_wrapped_model.inference_context
+        gpu_view = context.gpu_view
+        survivor_count = survivor_idxs.numel()
+        survivor_idxs_cpu = survivor_idxs.to("cpu")
+        survivor_idxs_cuda = survivor_idxs.to(gpu_view.temperature.device)
+        for label in ("temperature", "top_k", "top_p"):
+            compacted_metadata = context.active_request_metadata[label][survivor_idxs_cpu]
+            context.active_request_metadata[label][:survivor_count].copy_(compacted_metadata)
+        compacted_temperature = gpu_view.temperature[survivor_idxs_cuda].contiguous()
+        compacted_top_k = gpu_view.top_k[survivor_idxs_cuda].contiguous()
+        compacted_top_p = gpu_view.top_p[survivor_idxs_cuda].contiguous()
+        gpu_view.temperature[:survivor_count].copy_(compacted_temperature)
+        gpu_view.top_k[:survivor_count].copy_(compacted_top_k)
+        gpu_view.top_p[:survivor_count].copy_(compacted_top_p)
 
         self._async_sched_logits.set_pending(
             self._async_sched_logits.cuda_graph_request_count, survivor_token_row_indices
@@ -2133,10 +2144,8 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         range_push("sampling")
+        self._dynamic_step_sample_logits()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        torch.argmax(
-            self._all_logits_cuda.squeeze(0)[:active_request_count], dim=-1, out=sampled_tokens_gpu
-        )
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
                 torch.cuda.current_stream(sampled_tokens_gpu.device)

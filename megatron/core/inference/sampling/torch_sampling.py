@@ -148,10 +148,11 @@ class TorchSampling(Sampling):
         no_top_p: bool,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
+        output: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
-        """Bucket active requests by `(temperature, top_k, top_p)` and sample each bucket.
+        """Bucket active requests by sampling parameters and sample each bucket.
 
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
@@ -163,11 +164,12 @@ class TorchSampling(Sampling):
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
+            output: Optional caller-owned destination tensor of shape `[n]`.
             eager: Accepted for API symmetry; ignored (TorchSampling has no graph wrapper).
             cache_key: Accepted for API symmetry; ignored.
 
         Returns:
-            Sampled token ids of shape `[n]`.
+            Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
         del eager, cache_key, no_top_k, no_top_p
 
@@ -191,7 +193,8 @@ class TorchSampling(Sampling):
         if gather_indices is not None:
             logits = logits[gather_indices[:n], :]
 
-        output = torch.empty(n, device=logits.device, dtype=torch.int64)
+        if output is None:
+            output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
         indices_list = []
         for idx_tensor, (_, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):

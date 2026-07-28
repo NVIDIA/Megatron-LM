@@ -149,6 +149,9 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 0.0
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
@@ -248,6 +251,9 @@ class DynamicInferenceEngineTestBase:
                 ),
                 return_log_probs=test_config.return_log_probs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
+                temperature=test_config.temperature,
+                top_k=test_config.top_k,
+                top_p=test_config.top_p,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
                 # Remove this if statement branch in megatron-core 0.16
@@ -1198,6 +1204,81 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert async_engine.context.async_sched_step_count > 0
         if enable_prefix_caching:
             assert async_engine._prefill_tokens_skipped > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "feature_config, sampling_backend, temperature, top_k, top_p, num_cuda_graphs",
+        [
+            pytest.param({}, "torch", 0.8, 10, 0.0, None, id="torch-eager-top-k"),
+            pytest.param({}, "torch", 1.0, 0, 0.9, 2, id="torch-graphed-forward-top-p"),
+            pytest.param({}, "flashinfer", 1.2, 0, 0.0, None, id="flashinfer-eager-unfiltered"),
+            pytest.param({}, "flashinfer", 0.8, 10, 0.9, 2, id="flashinfer-graphed-forward"),
+            pytest.param(
+                {
+                    "model_provider": "hybrid",
+                    "num_speculative_tokens": 1,
+                    "num_requests": 2,
+                    "num_tokens_to_generate": 4,
+                },
+                "torch",
+                0.8,
+                8,
+                0.0,
+                None,
+                id="mamba-mtp-top-k",
+            ),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_sched_sampling_matches_legacy(
+        self, feature_config, sampling_backend, temperature, top_k, top_p, num_cuda_graphs
+    ):
+        """Require seeded sampling parity across scheduling modes.
+
+        Args:
+            feature_config (dict): Additional cumulative feature configuration.
+            sampling_backend (str): Sampling implementation under test.
+            temperature (float): Sampling temperature used by every request.
+            top_k (int): Top-k filter used by every request.
+            top_p (float): Top-p filter used by every request.
+            num_cuda_graphs (Optional[int]): Number of CUDA graph buckets, or
+                `None` for eager execution.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        if feature_config.get("model_provider") == "hybrid":
+            skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        common_config = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            context_max_requests=8,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        common_config.update(feature_config)
+        generated_tokens = {}
+        final_env = None
+        for mode in (AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC):
+            final_env = self._run_test(async_sched_mode=mode, **common_config)
+            assert all(request.status == Status.COMPLETED for request in final_env.requests)
+            generated_tokens[mode] = [request.generated_tokens for request in final_env.requests]
+
+        assert (
+            generated_tokens[AsyncScheduleMode.ASYNC] == generated_tokens[AsyncScheduleMode.LEGACY]
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -5104,6 +5185,43 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             expert_tensor_parallel_size=1,
         )
         return super()._build_test_env(test_config)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "async_sched_mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC]
+    )
+    @torch.inference_mode()
+    def test_non_greedy_sampling_with_mamba_mtp_ep(self, async_sched_mode):
+        """Run cumulative Mamba, MTP, and EP sampling support to completion.
+
+        Args:
+            async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
+        """
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            num_requests=2,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            use_fixed_output_lengths=True,
+            model_provider="hybrid",
+            expert_model_parallel_size=2,
+            num_speculative_tokens=1,
+            sampling_backend="torch",
+            temperature=0.8,
+            top_k=8,
+            context_max_requests=8,
+            async_sched_mode=async_sched_mode,
+        )
+
+        assert all(request.status == Status.COMPLETED for request in env.requests)
 
     @pytest.mark.internal
     @pytest.mark.skipif(

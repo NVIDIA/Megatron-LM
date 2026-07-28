@@ -103,8 +103,10 @@ def test_validate_async_sched_support_for_config(overrides, should_raise):
     [
         (AsyncScheduleMode.LEGACY, SamplingParams(top_k=0, top_p=0.5), False),
         (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0), False),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=0, top_p=0.0), True),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.5), True),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=0, top_p=0.0), False),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=0, top_p=0.9), False),
+        (AsyncScheduleMode.ASYNC, SamplingParams(temperature=0.7, top_k=8), False),
+        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=8, top_p=0.9), False),
         (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, return_log_probs=True), True),
         (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, top_n_logprobs=1), True),
         (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, stop_words=["END"]), True),
