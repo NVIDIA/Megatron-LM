@@ -355,13 +355,7 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
-    # Join GTP's async AG/RS side streams back to the current stream. This is REQUIRED under
-    # full-iteration CUDA-graph capture: wait_async_comms() above runs real work on rs_stream
-    # (the RS wait, and main_grad.add_ via finalize_after_drain), forked from the capture stream
-    # via a recorded event. Without joining it back, capture_end sees an un-rejoined fork and
-    # fails with cudaErrorStreamCaptureUnjoined. The join is legal under capture — the per-layer
-    # CG path does the identical current_stream().wait_stream(side_stream) inside torch.cuda.graph()
-    # (see cuda_graphs._wait_side_streams) and captures fine.
+    # Join the async AG/RS side streams for both eager and cuda-graph capture paths.
     for s in _AG_STREAMS.values():
         cur.wait_stream(s)
     for s in _RS_STREAMS.values():

@@ -373,28 +373,25 @@ class DistributedDataParallel(_BaseDataParallel):
                                         self._make_backward_post_hook(param)
                                     )
                                     break
-                elif getattr(param, 'is_gtp_weight_remat', False) and hasattr(
-                    param, 'register_grad_accum_hook'
-                ):
-                    # GTP_remat computes wgrad via an async reduce-scatter on a side stream, so
-                    # autograd's AccumulateGrad receives only a dummy; grad-ready is driven
-                    # manually from _handle_megatron_grad_accum after the RS finalize (passed as
-                    # the hook below). We materialize the AccumulateGrad node and hand it to
-                    # register_grad_accum_hook, which RETAINS it — keeping it live places it on
-                    # the capture stream like a normal param, so full-iteration CUDA-graph capture
-                    # doesn't trip on a leaf node stranded on the default/legacy stream. It is NOT
-                    # added to grad_accs (that list is for autograd-hooked nodes), and the DDP
-                    # post-hook is not registered on it (that would fire grad-ready early).
-                    param_tmp = param.expand_as(param)
-                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    param.register_grad_accum_hook(grad_acc, self._make_backward_post_hook(param))
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
-                    self.grad_accs.append(grad_acc)
+                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                        param, 'register_grad_accum_hook'
+                    ):
+                        # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
+                        # AccumulateGrad sees only a dummy: grad-ready is driven manually from
+                        # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
+                        # keeps it on the capture stream for full-iteration CUDA-graph capture.
+                        # No autograd hook / grad_accs entry: that fires on a stale main_grad.
+                        param.register_grad_accum_hook(
+                            grad_acc, self._make_backward_post_hook(param)
+                        )
+                    else:
+                        grad_acc.register_hook(self._make_backward_post_hook(param))
+                        self.grad_accs.append(grad_acc)
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True

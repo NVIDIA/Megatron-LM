@@ -1194,18 +1194,14 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
             assert (
                 getattr(w, "_grad_accum_hook", None) is not None
             ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
-            # The AccumulateGrad node must also be materialized and RETAINED. Keeping a live
-            # strong reference across the warmup->capture boundary is what places the node on
-            # the capture stream; an un-retained node stays stranded on the default/legacy
-            # stream and aborts full-iteration CUDA-graph capture with
-            # cudaErrorStreamCaptureImplicit.
+            # The node must also be RETAINED: a live strong reference across the
+            # warmup->capture boundary is what keeps the leaf on the capture stream.
             node = getattr(w, "_grad_accum_node", None)
             assert node is not None, (
                 f"{name}.weight must retain its AccumulateGrad node "
                 "(required for full-iteration CUDA-graph capture)"
             )
-            # Identity check: re-materializing must yield the same node, proving the retained
-            # reference is what keeps it alive (a dropped node would be recreated here).
+            # Identity, not just non-None: a dropped node would be recreated by expand_as here.
             assert (
                 node is w.expand_as(w).grad_fn.next_functions[0][0]
             ), f"{name}.weight retained a stale/foreign AccumulateGrad node"
