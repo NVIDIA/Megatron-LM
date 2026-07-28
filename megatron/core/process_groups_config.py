@@ -203,8 +203,18 @@ class ProcessGroupCollection:
 
     @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
-        """
-        Use the default process groups from parallel_state.
+        """Build a collection from the global process groups in ``parallel_state``.
+
+        .. warning::
+            **This is a backward-compatibility shim, not a migration target.** It reads the
+            single global parallel grid from :mod:`megatron.core.parallel_state`, so it carries
+            exactly the same problem as calling ``parallel_state.get_*_group()`` directly:
+            for a model built on **independent** parallel grids it returns the wrong grid, and
+            the result is silently incorrect.
+
+            Replacing a direct ``parallel_state`` accessor with this method is a lateral move,
+            not progress. New code must accept a ``ProcessGroupCollection`` from its caller.
+            Existing call sites are being removed; do not add more.
 
         Args:
             required_pgs (List[str], optional): List of process group names to initialize.
