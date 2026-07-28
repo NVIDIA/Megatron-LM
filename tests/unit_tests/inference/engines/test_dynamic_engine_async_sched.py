@@ -81,7 +81,7 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
             },
             False,
         ),
-        ({"materialize_only_last_token_logits": False}, True),
+        ({"materialize_only_last_token_logits": False}, False),
         ({"model_config_expert_model_parallel_size": 2}, False),
         ({"model_config_num_moe_experts": 4}, False),
         ({"model_config_moe_enable_routing_replay": True}, True),
@@ -107,8 +107,16 @@ def test_validate_async_sched_support_for_config(overrides, should_raise):
         (AsyncScheduleMode.ASYNC, SamplingParams(top_k=0, top_p=0.9), False),
         (AsyncScheduleMode.ASYNC, SamplingParams(temperature=0.7, top_k=8), False),
         (AsyncScheduleMode.ASYNC, SamplingParams(top_k=8, top_p=0.9), False),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, return_log_probs=True), True),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, top_n_logprobs=1), True),
+        (
+            AsyncScheduleMode.ASYNC,
+            SamplingParams(top_k=1, top_p=0.0, return_log_probs=True),
+            False,
+        ),
+        (
+            AsyncScheduleMode.ASYNC,
+            SamplingParams(top_k=1, top_p=0.0, return_log_probs=True, top_n_logprobs=1),
+            False,
+        ),
         (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, stop_words=["END"]), True),
     ],
 )

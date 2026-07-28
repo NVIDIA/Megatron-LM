@@ -204,6 +204,7 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         "top_p": torch.zeros(metadata_len),
         "return_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
         "top_n_logprobs": torch.zeros(metadata_len, dtype=torch.int64),
+        "skip_prompt_log_probs": torch.zeros(metadata_len, dtype=torch.bool),
         "termination_id": torch.full((metadata_len,), 99, dtype=torch.int64),
     }
     context = SimpleNamespace(
@@ -231,6 +232,8 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
             top_k=request_metadata["top_k"].to(torch.int32).clone(),
             top_p=request_metadata["top_p"].clone(),
             active_request_last_token_idxs=torch.arange(metadata_len, dtype=torch.int32),
+            request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
+            token_to_input_ids=torch.arange(32, dtype=torch.int64),
         ),
         async_sched_step_count=0,
         async_sched_compaction_step_count=0,
@@ -251,6 +254,8 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         transfer_bookkeeping_to_gpu=mock.Mock(return_value="bookkeeping"),
         using_cuda_graph_this_step=mock.Mock(return_value=False),
         max_requests=metadata_len,
+        max_tokens=32,
+        request_query_lengths=torch.ones(metadata_len, dtype=torch.int32),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
     return context
@@ -290,6 +295,14 @@ def _make_async_sched_controller(context=None, model_config=None):
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
+    controller._tp_size = 1
+    controller._sp_enabled = False
+    controller._async_sched_selected_log_probs_cpu_buffer = torch.empty(
+        context.max_tokens, dtype=torch.float32
+    )
+    controller._async_sched_top_n_log_probs_cpu_buffer = None
+    controller._async_sched_top_n_token_ids_cpu_buffer = None
+    controller._async_sched_top_n_capacity = 0
     return controller
 
 
@@ -759,6 +772,91 @@ def test_run_async_sched_sample_reuses_gpu_buffer(logits_dtype):
     assert sample_kwargs["output"].data_ptr() == controller._sampled_tokens_cuda.data_ptr()
 
 
+def test_async_sched_log_probs_materializes_decode_top_n_without_padding():
+    """Async logprobs exclude padded graph rows from top-n results."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.num_decode_requests = 3
+    context.active_request_metadata["return_log_probs"].fill_(True)
+    context.active_request_metadata["top_n_logprobs"].copy_(torch.tensor([0, 2, 1]))
+    context.calculate_log_probs_tensors = mock.Mock(
+        return_value=(
+            torch.tensor([-0.1, -0.2, -0.3]),
+            torch.tensor(
+                [
+                    [-4.0, -1.0, -3.0, -2.0],
+                    [-0.4, -0.1, -0.3, -0.2],
+                    [-2.0, -4.0, -1.0, -3.0],
+                    [10.0, 9.0, 8.0, 7.0],
+                ]
+            ),
+        )
+    )
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.empty(1, 3, 4)
+    sampled_tokens = torch.tensor([1, 1, 2])
+
+    gpu_result = controller._run_async_sched_log_probs(
+        SimpleNamespace(sampled_tokens_gpu=sampled_tokens, accepted_counts_gpu=None)
+    )
+    transfer = controller._copy_async_sched_log_probs_to_cpu(gpu_result)
+    log_probs, top_n_logprobs = controller._materialize_async_sched_log_probs(transfer)
+
+    assert [values[0] for values in log_probs] == pytest.approx([-0.1, -0.2, -0.3])
+    assert set(top_n_logprobs) == {1, 2}
+    assert torch.equal(top_n_logprobs[1][0][1], torch.tensor([1, 3]))
+    assert torch.equal(top_n_logprobs[2][0][1], torch.tensor([2]))
+
+
+def test_async_sched_log_probs_materializes_mtp_and_prefill_rows():
+    """Async logprobs preserve variable MTP acceptance and prompt row boundaries."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.config.materialize_only_last_token_logits = False
+    context.num_decode_requests = 2
+    context.num_prefill_requests = 1
+    context.active_token_count = 9
+    context.request_query_lengths.copy_(torch.tensor([3, 3, 3]))
+    context.gpu_view.request_query_lengths.copy_(torch.tensor([3, 3, 3]))
+    context.gpu_view.token_to_input_ids[:9].copy_(torch.tensor([1, 2, 3, 4, 5, 6, 30, 31, 32]))
+    context.active_request_metadata["return_log_probs"].fill_(True)
+    context.active_request_metadata["top_n_logprobs"].copy_(torch.tensor([0, 0, 2]))
+    context.active_request_metadata["skip_prompt_log_probs"].copy_(
+        torch.tensor([False, False, True])
+    )
+    context.calculate_log_probs_tensors = mock.Mock(
+        return_value=(
+            -torch.arange(1, 10, dtype=torch.float32) / 10,
+            torch.arange(36, dtype=torch.float32).view(9, 4),
+        )
+    )
+    controller = _make_async_sched_controller(context)
+    controller.num_speculative_tokens = 2
+    controller._all_logits_cuda = torch.empty(1, 9, 4)
+    controller._accepted_tokens_per_request = torch.tensor([[10, -1], [11, 12], [-1, -1]])
+    sample_result = SimpleNamespace(
+        sampled_tokens_gpu=torch.tensor([20, 21, 22]), accepted_counts_gpu=torch.tensor([1, 2, 0])
+    )
+
+    gpu_result = controller._run_async_sched_log_probs(sample_result)
+    transfer = controller._copy_async_sched_log_probs_to_cpu(gpu_result)
+    log_probs, top_n_logprobs = controller._materialize_async_sched_log_probs(
+        transfer, torch.tensor([1, 2, 0])
+    )
+
+    assert log_probs[0] == pytest.approx([-0.1, -0.2])
+    assert log_probs[1] == pytest.approx([-0.4, -0.5, -0.6])
+    assert log_probs[2] == pytest.approx([-0.7, -0.8, -0.9])
+    assert len(top_n_logprobs[2]) == 1
+    assert torch.equal(top_n_logprobs[2][0][1], torch.tensor([3, 2]))
+    assert torch.equal(
+        context.calculate_log_probs_tensors.call_args.args[1],
+        torch.tensor([10, 20, 20, 11, 12, 21, 31, 32, 22]),
+    )
+    assert torch.equal(
+        context.calculate_log_probs_tensors.call_args.kwargs["row_to_request"],
+        torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2]),
+    )
+
+
 @pytest.mark.internal
 def test_run_async_sched_sample_records_gpu_ready_event():
     context = _make_async_sched_context(total_request_count=3)
@@ -812,6 +910,45 @@ def test_copy_async_sched_sample_to_cpu_uses_reusable_buffer_and_copy_stream():
     assert torch.equal(sampled_tokens_cpu_view, sampled_tokens_gpu.cpu())
     assert sampled_mtp_tokens_cpu is None
     assert accepted_tokens_cpu is None
+
+
+@pytest.mark.internal
+def test_copy_async_sched_log_probs_to_cpu_uses_reusable_buffers_and_copy_stream():
+    """Async logprob D2H copies reuse pinned storage and report completion."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.num_decode_requests = 3
+    context.active_request_metadata["return_log_probs"].fill_(True)
+    context.active_request_metadata["top_n_logprobs"].copy_(torch.tensor([0, 2, 1]))
+    context.calculate_log_probs_tensors = mock.Mock(
+        return_value=(
+            torch.tensor([-0.1, -0.2, -0.3], device="cuda"),
+            torch.tensor(
+                [[-4.0, -1.0, -3.0, -2.0], [-0.4, -0.1, -0.3, -0.2], [-2.0, -4.0, -1.0, -3.0]],
+                device="cuda",
+            ),
+        )
+    )
+    controller = _make_async_sched_controller(context)
+    controller._all_logits_cuda = torch.empty(1, 3, 4, device="cuda")
+    controller._async_sched_selected_log_probs_cpu_buffer = torch.empty(
+        3, dtype=torch.float32, device="cpu", pin_memory=True
+    )
+    controller._async_sched_log_probs_gpu_ready_event = torch.cuda.Event()
+    controller._async_sched_log_probs_cpu_ready_event = torch.cuda.Event()
+    controller._async_sched_copy_stream = torch.cuda.Stream()
+
+    gpu_result = controller._run_async_sched_log_probs(
+        SimpleNamespace(
+            sampled_tokens_gpu=torch.tensor([1, 1, 2], device="cuda"), accepted_counts_gpu=None
+        )
+    )
+    transfer = controller._copy_async_sched_log_probs_to_cpu(gpu_result)
+    transfer.cpu_ready_event.synchronize()
+    log_probs, top_n_logprobs = controller._materialize_async_sched_log_probs(transfer)
+
+    assert [values[0] for values in log_probs] == pytest.approx([-0.1, -0.2, -0.3])
+    assert torch.equal(top_n_logprobs[1][0][1], torch.tensor([1, 3]))
+    assert torch.equal(top_n_logprobs[2][0][1], torch.tensor([2]))
 
 
 def test_build_async_sched_request_state_uses_resolved_lengths():
@@ -878,6 +1015,7 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(termination_ids):
 
 
 def test_async_sched_step_overlap_order():
+    """Logprob transfer overlaps after current-logit GPU work is queued."""
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     sampled_tokens_cpu = sample_tokens.clone()
     input_ids = torch.tensor([[101, 102, 103]])
@@ -908,6 +1046,18 @@ def test_async_sched_step_overlap_order():
     )
     context.copy_async_sched_sample_to_forward = mock.Mock(
         side_effect=lambda _: call_order.append("copy_input")
+    )
+    log_probs_gpu_result = object()
+    log_probs_transfer = SimpleNamespace(cpu_ready_event="log_probs")
+    controller._run_async_sched_log_probs = mock.Mock(
+        side_effect=lambda _: call_order.append("log_probs") or log_probs_gpu_result
+    )
+    controller._copy_async_sched_log_probs_to_cpu = mock.Mock(
+        side_effect=lambda _: call_order.append("copy_log_probs") or log_probs_transfer
+    )
+    controller._materialize_async_sched_log_probs = mock.Mock(
+        side_effect=lambda *_: call_order.append("materialize_log_probs")
+        or ([[0.1], [0.2], [0.3]], None)
     )
     context.commit_sampled_tokens = mock.Mock(side_effect=lambda *_: call_order.append("commit"))
     controller._run_async_sched_publish_bookkeeping = mock.Mock(
@@ -941,6 +1091,7 @@ def test_async_sched_step_overlap_order():
 
     assert result.output["sample"].tolist() == sample_tokens.tolist()
     assert result.decode_only == DecodeOnly(consumed=True, launched=True)
+    assert result.output["log_probs"] == [[0.1], [0.2], [0.3]]
     assert result.output["cuda_graph_request_count"] == 7
     assert context.async_sched_step_count == 1
     assert context.async_sched_compaction_step_count == 1
@@ -948,12 +1099,16 @@ def test_async_sched_step_overlap_order():
         "prepare",
         "sample",
         "copy_input",
+        "log_probs",
+        "copy_log_probs",
         "publish",
         "forward",
         "wait:sample",
         "wait:bookkeeping",
         "resolve",
         "commit",
+        "wait:log_probs",
+        "materialize_log_probs",
         "yield",
     ]
     assert torch.equal(
@@ -1186,6 +1341,17 @@ def test_async_sched_no_overlap_updates_before_admission(
         return request_result
 
     controller._run_async_sched_update_requests = mock.Mock(side_effect=update_request_state)
+    log_probs_gpu_result = object()
+    log_probs_transfer = SimpleNamespace(cpu_ready_event="log_probs")
+    controller._run_async_sched_log_probs = mock.Mock(
+        side_effect=lambda _: call_order.append("log_probs") or log_probs_gpu_result
+    )
+    controller._copy_async_sched_log_probs_to_cpu = mock.Mock(
+        side_effect=lambda _: call_order.append("copy_log_probs") or log_probs_transfer
+    )
+    controller._materialize_async_sched_log_probs = mock.Mock(
+        side_effect=lambda *_: call_order.append("materialize_log_probs") or ([[0.1], [0.2]], None)
+    )
     controller._dynamic_step_context_init = mock.Mock(
         side_effect=lambda: call_order.append("context_init") or (input_ids, position_ids, None)
     )
@@ -1213,13 +1379,18 @@ def test_async_sched_no_overlap_updates_before_admission(
     assert result.decode_only == DecodeOnly(
         consumed=consumed_prefill_requests == 0, launched=launched_prefill_requests == 0
     )
+    assert result.output["log_probs"] == [[0.1], [0.2]]
     assert call_order == [
         "sample",
+        "log_probs",
+        "copy_log_probs",
         "wait:sample",
         "update",
         "admit",
         "context_init",
         "forward",
+        "wait:log_probs",
+        "materialize_log_probs",
         "yield",
     ]
     context.resolve_requests.assert_not_called()
@@ -1295,6 +1466,7 @@ def test_async_sched_mtp_overlap_step_order():
         sampled_mtp_tokens_gpu=sampled_mtp_tokens,
         sampled_mtp_tokens_cpu_view=sampled_mtp_tokens,
         accepted_tokens_cpu_view=accepted_tokens,
+        accepted_counts_cpu_view=torch.tensor([1, 1, 1]),
         sample_cpu_ready_event="sample",
     )
     resolve_result = SimpleNamespace(
@@ -1315,6 +1487,18 @@ def test_async_sched_mtp_overlap_step_order():
     )
     controller._run_async_sched_mtp_rewind = mock.Mock(
         side_effect=lambda *_args, **_kwargs: call_order.append("rewind")
+    )
+    log_probs_gpu_result = object()
+    log_probs_transfer = SimpleNamespace(cpu_ready_event="log_probs")
+    controller._run_async_sched_log_probs = mock.Mock(
+        side_effect=lambda _: call_order.append("log_probs") or log_probs_gpu_result
+    )
+    controller._copy_async_sched_log_probs_to_cpu = mock.Mock(
+        side_effect=lambda _: call_order.append("copy_log_probs") or log_probs_transfer
+    )
+    controller._materialize_async_sched_log_probs = mock.Mock(
+        side_effect=lambda *_: call_order.append("materialize_log_probs")
+        or ([[0.1], [0.2], [0.3]], None)
     )
     controller._run_async_sched_prepare = mock.Mock(
         side_effect=lambda: call_order.append("prepare") or (input_ids, position_ids)
@@ -1340,9 +1524,12 @@ def test_async_sched_mtp_overlap_step_order():
 
     assert result.output["accepted_tokens"].tolist() == [9, 10, 11]
     assert result.decode_only == DecodeOnly(consumed=True, launched=True)
+    assert result.output["log_probs"] == [[0.1], [0.2], [0.3]]
     assert call_order == [
         "sample_mtp",
         "rewind",
+        "log_probs",
+        "copy_log_probs",
         "prepare",
         "copy_input",
         "publish",
@@ -1351,6 +1538,8 @@ def test_async_sched_mtp_overlap_step_order():
         "wait:bookkeeping",
         "resolve",
         "commit",
+        "wait:log_probs",
+        "materialize_log_probs",
     ]
     committed_tokens, committed_mtp_tokens = context.commit_sampled_tokens.call_args.args
     assert torch.equal(committed_tokens, torch.tensor([7, 4]))
@@ -1481,6 +1670,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             [context.block_size_tokens - 1, 0], dtype=torch.int32
         )
         context.request_metadata["termination_id"][active_slice] = 99
+        context.build_active_slices(2)
 
         block_ids = context.kv_block_allocator.allocate_memory_blocks(2)
         context.request_to_kv_block_ids[active_slice, 0] = block_ids

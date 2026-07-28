@@ -140,9 +140,31 @@ class FlashInferSampling(Sampling):
         return output
 
     def log_probs_kernel(
-        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
     ) -> Tensor:
-        """Per-row log-probs of the FlashInfer top-k / top-p sampling distribution."""
+        """Per-row log-probs of the FlashInfer top-k / top-p sampling distribution.
+
+        Args:
+            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
+            context: Active dynamic inference context providing GPU sampling metadata.
+            token_to_request_index (Optional[Tensor]): Optional mapping from each
+                logits row to its request index.
+
+        Returns:
+            Tensor: Per-row log probabilities for the processed distribution.
+        """
+        gpu_view = context.gpu_view
+        if token_to_request_index is None:
+            num_rows = logits.size(0)
+            temperature = gpu_view.temperature[:num_rows]
+            top_k = gpu_view.top_k[:num_rows]
+            top_p = gpu_view.top_p[:num_rows]
+        else:
+            token_to_request_index = token_to_request_index.to(logits.device, non_blocking=True)
+            temperature = gpu_view.temperature[token_to_request_index]
+            top_k = gpu_view.top_k[token_to_request_index]
+            top_p = gpu_view.top_p[token_to_request_index]
+
         temperature = temperature.clamp(min=1e-6)
         probs = torch.softmax(logits / temperature.unsqueeze(1), dim=-1)
 

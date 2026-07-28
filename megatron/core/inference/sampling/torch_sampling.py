@@ -114,14 +114,34 @@ class TorchSampling(Sampling):
         return sampled
 
     def log_probs_kernel(
-        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
     ) -> Tensor:
         """Per-row log-probs of the temperature, top-k/top-p sampling distribution.
 
         Buckets rows by identical (temperature, top_k, top_p) and reuses `filter_logits`
-        (the same filter as `sample_from_logits`) so log-probs match how this backend
-        samples. `temperature`/`top_k`/`top_p` are per-row `[num_rows]` tensors.
+        (the same filter as `sample_from_logits`) so log-probs match how this backend samples.
+
+        Args:
+            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
+            context: Active dynamic inference context providing CPU sampling metadata.
+            token_to_request_index (Optional[Tensor]): Optional CPU mapping from
+                each logits row to its request index.
+
+        Returns:
+            Tensor: Per-row log probabilities for the processed distribution.
         """
+        active_request_count = context.total_request_count - context.paused_request_count
+        metadata = context.active_request_metadata
+        if token_to_request_index is None:
+            temperature = metadata["temperature"][:active_request_count]
+            top_k = metadata["top_k"][:active_request_count]
+            top_p = metadata["top_p"][:active_request_count]
+        else:
+            assert not token_to_request_index.is_cuda
+            temperature = metadata["temperature"][:active_request_count][token_to_request_index]
+            top_k = metadata["top_k"][:active_request_count][token_to_request_index]
+            top_p = metadata["top_p"][:active_request_count][token_to_request_index]
+
         temps = temperature.tolist()
         top_ks = top_k.tolist()
         top_ps = top_p.tolist()

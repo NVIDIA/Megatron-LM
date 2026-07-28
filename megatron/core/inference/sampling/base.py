@@ -120,13 +120,15 @@ class Sampling(ABC):
 
     @abstractmethod
     def log_probs_kernel(
-        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
     ) -> Tensor:
         """Per-row log-probs of the distribution this backend samples from.
 
         Args:
             logits: `[num_rows, vocab_size]` raw logits.
-            temperature, top_k, top_p: `[num_rows]` per-row sampling params.
+            context: The active DynamicInferenceContext.
+            token_to_request_index: Optional per-row request mapping. When
+                omitted, each logits row maps to the request at the same index.
 
         Returns:
             `[num_rows, vocab_size]` log-probs; filtered-out tokens are `-inf`.
