@@ -44,5 +44,20 @@
 --no-use-tokenizer-model-from-checkpoint-args
 --no-load-optim
 --inference-ckpt-non-strict
+# Inference perf flags. NOTE: reviewer asked for the full kitchen-sink list
+# (--transformer-impl inference_optimized, --cuda-graph-impl local, --cuda-
+# graph-scope full_iteration_inference, --inference-dynamic-batching-num-cuda-
+# graphs -1, --inference-grouped-gemm-backend vllm, --moe-shared-expert-
+# overlap, --inference-moe-token-dispatcher-type nvls). Three blockers:
+#   1. `inference_optimized` rejects --swiglu, which this model uses.
+#   2. The vllm-fused-MoE / nvls dispatcher / shared-expert overlap args all
+#      require inference_optimized, so they're out by transitive closure.
+#   3. CUDA graphs at full_iteration_inference scope crash during capture
+#      because the alltoall MoE dispatcher does a d2h event.synchronize()
+#      inside its forward (token_dispatcher.py:_maybe_dtoh_and_synchronize)
+#      which is illegal in a capturing stream.
+# Until a graph-friendly MoE dispatcher is available for the transformer_engine
+# path, we keep the safe subset: chunked prefill.
 --transformer-impl transformer_engine
 --distributed-backend nccl
+--enable-chunked-prefill

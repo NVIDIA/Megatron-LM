@@ -52,11 +52,13 @@ def _chunk_cumsum_fwd_kernel(
     dt_out_ptr,
     dA_cumsum_ptr,
     chunk_offsets_ptr,
+    target_rows_ptr,
     # Matrix dimension
     seqlen,
     nheads: tl.constexpr,
     chunk_size: tl.constexpr,
     HAS_CHUNK_STARTS: tl.constexpr,
+    HAS_TARGET_ROWS: tl.constexpr,
     dt_min: tl.constexpr,
     dt_max: tl.constexpr,
     # Strides
@@ -80,6 +82,9 @@ def _chunk_cumsum_fwd_kernel(
     # https://github.com/triton-lang/triton/issues/1058
     pid_c = tl.program_id(axis=0).to(tl.int64)
     pid_h = tl.program_id(axis=1)
+    if HAS_TARGET_ROWS:
+        if tl.load(target_rows_ptr + pid_c) < 0:
+            return
 
     chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
     if HAS_CHUNK_STARTS:
@@ -293,12 +298,17 @@ def _chunk_cumsum_fwd(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     chunk_starts=None,
+    target_rows=None,
 ):
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
-    if chunk_starts is not None:
+    has_target_rows = target_rows is not None
+    assert (
+        chunk_starts is not None
+    ) == has_target_rows, "target_rows and chunk_starts must be provided together"
+    if has_target_rows:
         chunk_offsets = chunk_starts
         nchunks = chunk_starts.shape[0]
     else:
@@ -315,6 +325,7 @@ def _chunk_cumsum_fwd(
             dt_out_ptr=dt_out,
             dA_cumsum_ptr=dA_cumsum,
             chunk_offsets_ptr=chunk_offsets,
+            target_rows_ptr=target_rows,
             seqlen=seqlen,
             nheads=nheads,
             chunk_size=chunk_size,
@@ -331,6 +342,7 @@ def _chunk_cumsum_fwd(
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
             HAS_CHUNK_STARTS=chunk_starts is not None,
+            HAS_TARGET_ROWS=has_target_rows,
             DT_SOFTPLUS=dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),

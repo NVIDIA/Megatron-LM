@@ -7,8 +7,10 @@ import torch
 
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -93,6 +95,8 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
+            calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
         # init moe layer
@@ -418,6 +422,55 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
+def is_nccl_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    return HAVE_TE_EP
+
+
+def test_hybridep_pad_uneven_dispatch_inputs_metadata(monkeypatch):
+    manager = _HybridEPManager.__new__(_HybridEPManager)
+    manager.group = object()
+    manager.num_local_experts = 2
+    manager.num_experts = 4
+    manager.config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_hybridep_pad_uneven_dispatch_inputs=True,
+    )
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    local_num_tokens = 17
+    max_num_tokens_across_ep = 70
+    padded_num_tokens = (
+        max_num_tokens_across_ep + -max_num_tokens_across_ep % HYBRIDEP_TOKEN_ALIGNMENT
+    )
+    routing_map = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.bool)
+    probs = torch.ones((local_num_tokens, manager.num_experts), dtype=torch.float32)
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is manager.group
+        tensor.fill_(max_num_tokens_across_ep)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert manager._original_num_tokens == local_num_tokens
+    assert manager._padded_num_tokens == padded_num_tokens
+    assert manager.routing_map.shape == (padded_num_tokens, manager.num_experts)
+    assert manager.token_probs.shape == (padded_num_tokens, manager.num_experts)
+    torch.testing.assert_close(manager.routing_map[:local_num_tokens], routing_map)
+    torch.testing.assert_close(manager.token_probs[:local_num_tokens], probs)
+    assert not manager.routing_map[local_num_tokens:].any()
+    assert not manager.token_probs[local_num_tokens:].any()
+
+
 @pytest.mark.skipif(
     not is_deep_ep_available() and not is_hybrid_ep_available(),
     reason="Deep EP and Hybrid EP are not available",
@@ -427,13 +480,22 @@ class TestFlexDispatcher:
         pass
 
     def teardown_method(self, method):
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("moe_flex_dispatcher_backend", ["deepep", "hybridep"])
+    @pytest.mark.parametrize(
+        "moe_flex_dispatcher_backend",
+        [
+            "deepep",
+            "hybridep",
+            # NCCL EP aborts in dev CI with a pybind11 GIL dec_ref failure.
+            pytest.param("ncclep", marks=pytest.mark.flaky_in_dev),
+        ],
+    )
     @pytest.mark.parametrize("moe_permute_fusion_into_hybridep", [True, False])
     def test_forward_backward(
         self,
@@ -447,6 +509,8 @@ class TestFlexDispatcher:
             pytest.skip("Deep EP is not available")
         if moe_flex_dispatcher_backend == "hybridep" and not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
+        if moe_flex_dispatcher_backend == "ncclep" and not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
         if moe_permute_fusion_into_hybridep:
             if permute_fusion or moe_flex_dispatcher_backend != "hybridep":
                 pytest.skip(
@@ -466,6 +530,13 @@ class TestFlexDispatcher:
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
+            # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS (device-side
+            # em_scan check -> CUDA launch failure), so size it generously: small token counts have
+            # high routing-imbalance variance and a tight factor traps. The staging buffer is tiny
+            # at this model size, so a large factor costs little.
+            moe_expert_rank_capacity_factor=(
+                8.0 if moe_flex_dispatcher_backend == "ncclep" else None
+            ),
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()

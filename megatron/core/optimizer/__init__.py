@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _get_qkv_split_shapes,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
@@ -775,6 +776,7 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
+        qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -782,10 +784,29 @@ def _get_megatron_emerging_optimizer(
                 param.expert_tp = True
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                param.is_qkv = True
+                if qkv_split_shapes is None:
+                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
+                if param.shape[0] % sum(qkv_split_shapes) == 0:
+                    param.is_qkv = True
+                    param.qkv_split_shapes = qkv_split_shapes
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"Emerging optimizer QKV split skipped for {name}: "
+                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                    )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
+    # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
+    # deep-copy the registry defaults before rewriting so we never mutate shared state.
+    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    if eopt_name in ('muon', 'adaptive_muon'):
+        for override in default_param_overrides.values():
+            if override.get('optimizer') in ('adam', 'lion'):
+                override['optimizer'] = config.muon_scalar_optimizer
+    config_overrides.update(default_param_overrides)
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
@@ -818,7 +839,10 @@ def _get_megatron_emerging_optimizer(
             "fall back to the legacy LayerWise ping-pong path."
         )
     if use_separate_distributed_optimizer and any(
-        opt_name not in _EMERGING_OPTIMIZERS
+        # A separate DistributedOptimizer with byte-level sharding handles any group
+        # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
+        # e.g., Muon). This includes scalar optimizers like Adam or Lion.
+        not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
@@ -857,7 +881,10 @@ def _get_megatron_emerging_optimizer(
 
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
-        if opt_name in _EMERGING_OPTIMIZERS:
+        # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
+        # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
+        # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
+        if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
@@ -882,7 +909,7 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             if use_separate_distributed_optimizer:
-                # Route non-emerging params through a real DistributedOptimizer
+                # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise.
                 for group in groups:
                     assert not group['is_expert_parallel'], (
@@ -988,6 +1015,17 @@ def get_megatron_optimizer(
     Returns:
         Instance of MegatronOptimizer.
     """
+
+    # A MimoModel routes to the heterogeneous per-module optimizer builder.
+    from megatron.core.models.mimo.model.base import MimoModel
+
+    if isinstance(model_chunks[0], MimoModel):
+        from megatron.core.models.mimo.optimizer import get_mimo_optimizer
+
+        assert (
+            len(model_chunks) == 1
+        ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
+        return get_mimo_optimizer(model_chunks[0], config)
 
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.

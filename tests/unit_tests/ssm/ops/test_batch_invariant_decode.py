@@ -29,7 +29,7 @@ def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
         C,
         chunk_size,
         D=D,
-        z=None,
+        z=x,
         dt_bias=dt_bias,
         dt_softplus=True,
         initial_states=initial_states,
@@ -128,6 +128,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         # Here total == prefill_len since we have 1 sequence.
         bufs.seed(
             x[0, :prefill_len],
+            x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
             C[0, :prefill_len],
@@ -141,6 +142,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         return batch_invariant_decode_buffered_scan(
             bufs,
+            x[:, pos : pos + 1],
             x[:, pos : pos + 1],
             dt[:, pos : pos + 1],
             B[:, pos : pos + 1],
@@ -283,6 +285,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
                 bufs.seed(
                     x[0, :prefill_len],
+                    x[0, :prefill_len],
                     dt[0, :prefill_len],
                     B[0, :prefill_len],
                     C[0, :prefill_len],
@@ -331,6 +334,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 cu = torch.tensor([0, final_chunk_len], dtype=torch.int32, device=self.device)
                 bufs.seed(
                     x[0, first_chunk_len:prefill_len],
+                    x[0, first_chunk_len:prefill_len],
                     dt[0, first_chunk_len:prefill_len],
                     B[0, first_chunk_len:prefill_len],
                     C[0, first_chunk_len:prefill_len],
@@ -371,6 +375,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
             torch.cat([x[0, :prefill_len], nan_x], dim=0),
+            torch.cat([x[0, :prefill_len], nan_x], dim=0),
             torch.cat([dt[0, :prefill_len], nan_dt], dim=0),
             torch.cat([B[0, :prefill_len], nan_B], dim=0),
             torch.cat([C[0, :prefill_len], nan_C], dim=0),
@@ -378,6 +383,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             batch_indices,
         )
         self.assertTrue(torch.isfinite(bufs.x[slot]).all())
+        self.assertTrue(torch.isfinite(bufs.z[slot]).all())
         self.assertTrue(torch.isfinite(bufs.dt[slot]).all())
         self.assertTrue(torch.isfinite(bufs.B[slot]).all())
         self.assertTrue(torch.isfinite(bufs.C[slot]).all())
@@ -469,6 +475,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         y_batch_invariant = batch_invariant_decode_buffered_scan(
             bufs,
             x_step,
+            x_step,
             dt_step,
             B_step,
             C_step,
@@ -485,9 +492,9 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
     def test_inactive_padding_entries(self):
         """batch_indices mixing -1 padding entries with active slot 0 (the CUDA-
-        graph padding pattern). Padding entries must not perturb slot 0's buffer
-        or output — they are redirected to the buffers' trash row."""
-        max_batch, slot = 2, 0
+        graph padding pattern). Padding entries must not write replay buffers,
+        perturb slot 0, or produce nonzero output."""
+        max_batch, slot = 3, 0
         prefill_len = 50
         n_decode = 8
         total = prefill_len + n_decode
@@ -497,6 +504,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         bufs = self._make_bufs(max_batch)
         ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
         batch_indices = torch.tensor([slot, -1, -1], dtype=torch.int32, device=self.device)
+        inactive_counts = bufs.num_buffered[1:].clone()
         for k in range(n_decode):
             pos = prefill_len + k
 
@@ -507,6 +515,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
             y_batch_invariant = batch_invariant_decode_buffered_scan(
                 bufs,
+                pad3(x[:, pos : pos + 1]),
                 pad3(x[:, pos : pos + 1]),
                 pad3(dt[:, pos : pos + 1]),
                 pad3(B[:, pos : pos + 1]),
@@ -520,6 +529,38 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             self._assert_bitwise(y_batch_invariant[0, 0], y_full[0, pos], f"padded step k={k}")
             # Padding entries must return zeros.
             self.assertEqual(y_batch_invariant[1:].abs().max().item(), 0.0)
+            torch.testing.assert_close(bufs.num_buffered[1:], inactive_counts)
+
+    def test_seed_skips_padding_entries(self):
+        """Padded prefill entries must not write any persistent replay state."""
+        prefill_len = 20
+        x, dt, B, C = self._make_seq(prefill_len)
+        bufs = self._make_bufs(3)
+        bufs.x[1].normal_()
+        bufs.z[1].normal_()
+        bufs.dt[1].normal_()
+        bufs.B[1].normal_()
+        bufs.C[1].normal_()
+        bufs.num_buffered[1] = 7
+        before = tuple(
+            tensor[1].clone()
+            for tensor in (bufs.x, bufs.z, bufs.dt, bufs.B, bufs.C, bufs.num_buffered)
+        )
+
+        bufs.seed(
+            x[0],
+            x[0],
+            dt[0],
+            B[0],
+            C[0],
+            torch.tensor([0, prefill_len, prefill_len], dtype=torch.int32, device=self.device),
+            torch.tensor([0, -1], dtype=torch.int32, device=self.device),
+        )
+
+        for tensor, expected in zip(
+            (bufs.x, bufs.z, bufs.dt, bufs.B, bufs.C, bufs.num_buffered), before
+        ):
+            torch.testing.assert_close(tensor[1], expected)
 
     def test_cuda_graph_replay_matches_full_scan(self):
         """A captured decode step advances persistent state exactly across replays."""
@@ -539,6 +580,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         static_x = x[:, prefill_len : prefill_len + 1].clone()
+        static_z = static_x.clone()
         static_dt = dt[:, prefill_len : prefill_len + 1].clone()
         static_B = B[:, prefill_len : prefill_len + 1].clone()
         static_C = C[:, prefill_len : prefill_len + 1].clone()
@@ -548,6 +590,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             graph_output = batch_invariant_decode_buffered_scan(
                 bufs,
                 static_x,
+                static_z,
                 static_dt,
                 static_B,
                 static_C,
@@ -562,6 +605,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         bufs.seed(
             x[0, :prefill_len],
+            x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
             C[0, :prefill_len],
@@ -572,6 +616,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         self._assert_bitwise(graph_output[0, 0], y_full[0, prefill_len], "CUDA graph replay step 0")
 
         static_x.copy_(x[:, prefill_len + 1 : prefill_len + 2])
+        static_z.copy_(x[:, prefill_len + 1 : prefill_len + 2])
         static_dt.copy_(dt[:, prefill_len + 1 : prefill_len + 2])
         static_B.copy_(B[:, prefill_len + 1 : prefill_len + 2])
         static_C.copy_(C[:, prefill_len + 1 : prefill_len + 2])
@@ -602,7 +647,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             C,
             self.chunk_size,
             D=self.D,
-            z=None,
+            z=x,
             dt_bias=self.dt_bias,
             dt_softplus=True,
             initial_states=None,
@@ -615,6 +660,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
             x[0, :prefill_len],
+            x[0, :prefill_len],
             dt[0, :prefill_len],
             B[0, :prefill_len],
             C[0, :prefill_len],
@@ -625,6 +671,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             pos = prefill_len + k
             y_batch_invariant = batch_invariant_decode_buffered_scan(
                 bufs,
+                x[:, pos : pos + 1],
                 x[:, pos : pos + 1],
                 dt[:, pos : pos + 1],
                 B[:, pos : pos + 1],

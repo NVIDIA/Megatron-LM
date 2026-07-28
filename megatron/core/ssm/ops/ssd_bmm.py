@@ -104,6 +104,8 @@ def _bmm_chunk_fwd_kernel(
     if HAS_TARGET_ROWS:
         # Keep the target row's tile and its causal column tiles.
         tr = tl.load(target_rows_ptr + pid_c)
+        if tr < 0:
+            return
         if pid_m != tr // BLOCK_SIZE_M:
             return
         if pid_n * BLOCK_SIZE_N > tr:

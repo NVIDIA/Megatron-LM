@@ -162,6 +162,7 @@ def _mamba_chunk_scan_combined_fwd(
 
 def mamba_chunk_scan_decode_rows(
     x,
+    z,
     dt,
     A,
     B,
@@ -191,7 +192,7 @@ def mamba_chunk_scan_decode_rows(
     kernels, so the outputs match a full scan bitwise.
 
     Args:
-        x/dt/B/C: flattened persistent buffers, (num_rows * chunk_size, ...).
+        x/z/dt/B/C: flattened persistent buffers, (num_rows * chunk_size, ...).
         chunk_starts: (nseq,) int32, window offset per chunk
             (slot * chunk_size for per-slot buffers).
         slots: (nseq,) int32, live-cache row containing each chunk's incoming
@@ -211,6 +212,7 @@ def mamba_chunk_scan_decode_rows(
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         chunk_starts=chunk_starts,
+        target_rows=target_rows,
     )
     # Only boundary-crossing chunks produce a state; state passing masks the rest.
     states = _chunk_state_fwd(
@@ -248,6 +250,7 @@ def mamba_chunk_scan_decode_rows(
         out,
         slots,
         D=D,
+        z=z,
         initial_states=initial_states,
         target_rows=target_rows,
         chunk_starts=chunk_starts,

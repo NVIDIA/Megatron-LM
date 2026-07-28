@@ -468,7 +468,7 @@ def _unpermute_tokens_kernel(
 
 def unpermute_tokens(
     expert_output: torch.Tensor,
-    permuted_probs: torch.Tensor,
+    permuted_probs: Optional[torch.Tensor],
     permutation_map: torch.Tensor,
     num_tokens: int,
     n_used: torch.Tensor,
@@ -483,7 +483,8 @@ def unpermute_tokens(
 
     Args:
         expert_output: [output_size, hidden_dim] expert outputs in permuted order.
-        permuted_probs: [output_size] fp32 routing probabilities.
+        permuted_probs: [output_size] fp32 routing probabilities, or None when
+            batch-invariant inference applied them before FC2.
         permutation_map: [output_size] int32, original token index or -1 for padding.
         num_tokens: max token count (output buffer height); always fixed for CG.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1]. Rows
@@ -495,9 +496,6 @@ def unpermute_tokens(
             Pass a symmetric memory tensor to scatter directly into it, avoiding
             a separate copy before RSV. If None, a local buffer is allocated.
     """
-    assert (
-        permuted_probs.dtype == torch.float32
-    ), f"permuted_probs must be fp32, got {permuted_probs.dtype}"
     output_size, hidden_dim = expert_output.shape
 
     # Triton kernel below uses tl.atomic_add (non-deterministic). Batch-invariant
@@ -511,9 +509,12 @@ def unpermute_tokens(
         # rows for tokens with no local expert contribution. Rows beyond
         # valid_tokens are not read by the graphed RSV combine.
         return batch_invariant.unpermute_tokens_in_expert_order(
-            expert_output, permuted_probs, batch_invariant_inverse_map, valid_tokens, out
+            expert_output, batch_invariant_inverse_map, valid_tokens, out
         )
 
+    assert (
+        permuted_probs is not None and permuted_probs.dtype == torch.float32
+    ), "permuted_probs must be fp32"
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     if out is None:
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)

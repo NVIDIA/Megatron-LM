@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 from typing import Optional, Tuple
@@ -110,6 +110,12 @@ class LanguageModule(MegatronModule):
 
         Transformer engine works based on optout. By default all three attention backend flags are set to 1. So if the user choses a particular attention backend we set the other two to 0. If the user choses local, we set all 3 TE env variables to 0.
         """
+        if self.config.batch_invariant_mode:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                assert_te_supports_batch_invariant_attention,
+            )
+
+            assert_te_supports_batch_invariant_attention()
 
         def check_and_set_env_variable(
             env_variable_name: str, expected_value: int, attn_type: AttnBackend
@@ -140,6 +146,17 @@ class LanguageModule(MegatronModule):
             check_and_set_env_variable("NVTE_FLASH_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_FUSED_ATTN", 1, AttnBackend.auto)
             check_and_set_env_variable("NVTE_UNFUSED_ATTN", 1, AttnBackend.auto)
+
+        # Pin the FlashAttention generation for TransformerEngine by disabling the
+        # other versions via NVTE_FLASH_ATTN_V2/V3/V4 (default 1). This keeps the
+        # training-side attention on the same kernel as the mcore inference path,
+        # which honors config.flash_attention_version directly.
+        if self.config.flash_attention_version is not None:
+            for version in (2, 3, 4):
+                if version != self.config.flash_attention_version:
+                    check_and_set_env_variable(
+                        f"NVTE_FLASH_ATTN_V{version}", 0, self.config.attention_backend
+                    )
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
@@ -180,7 +197,9 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(
+                logits, labels, tp_group=self.tp_group
+            )
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
@@ -202,7 +221,12 @@ class LanguageModule(MegatronModule):
 
         # Mark embedding and output layer for decoupled_lr and other features.
         # This is the original Megatron attribute used by decoupled_lr, Muon, FSDP, etc.
-        if self.pre_process and hasattr(self, 'embedding'):
+        # Include MTP-stage embedding too: it is a duplicated copy of the pre_process
+        # embedding (kept in sync via cross-stage all-reduce). Without this tag, the
+        # LayerWise distributed optimizer routes it to its Muon-managed buffer and
+        # `_emit_bucket(shared_embedding=True)` replicates the (vocab x hidden) tensor
+        # across all dp_size shards, blowing up the chunk's buffer by ~8x.
+        if (self.pre_process or getattr(self, 'mtp_process', False)) and hasattr(self, 'embedding'):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         if (
             self.post_process

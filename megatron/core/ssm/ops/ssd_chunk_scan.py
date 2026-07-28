@@ -149,7 +149,10 @@ def _chunk_scan_fwd_kernel(
     pid_n = tl.program_id(axis=0) % num_pid_n
     if HAS_TARGET_ROWS:
         # Keep the tile containing the only output row consumed.
-        if pid_m != tl.load(target_rows_ptr + pid_c) // BLOCK_SIZE_M:
+        target_row = tl.load(target_rows_ptr + pid_c)
+        if target_row < 0:
+            return
+        if pid_m != target_row // BLOCK_SIZE_M:
             return
     cb_ptr += pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
     chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)

@@ -90,6 +90,7 @@ class InferenceLinear(TELinear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -105,6 +106,7 @@ class InferenceLinear(TELinear):
             is_expert=is_expert,
             symmetric_ar_type=symmetric_ar_type,
             tp_group=tp_group,
+            name=name,
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
@@ -136,6 +138,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -151,6 +154,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            name=name,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -263,6 +267,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -278,6 +283,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            name=name,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -359,6 +365,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -372,6 +379,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            name=name,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)

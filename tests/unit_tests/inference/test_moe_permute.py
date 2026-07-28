@@ -49,6 +49,26 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
     return hidden, probs, routing_map
 
 
+def test_batch_invariant_squared_relu_applies_probs_before_fc2():
+    """Match training's BF16 activation and probability rounding order."""
+    from megatron.core.activations import squared_relu
+    from megatron.core.inference.moe.activations import padded_squared_relu
+
+    torch.manual_seed(17)
+    rows, hidden = 37, 1856
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    unweighted = padded_squared_relu(x, permutation_map, _vt(rows))
+    actual = padded_squared_relu(x, permutation_map, _vt(rows), probs=probs)
+    expected_unweighted = squared_relu(x)
+    expected = (squared_relu(x) * probs.unsqueeze(1)).to(torch.bfloat16)
+
+    assert torch.equal(unweighted, expected_unweighted)
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 

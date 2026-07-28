@@ -73,7 +73,7 @@ def _state_passing_fwd_kernel(
     states_ptrs = states_ptr + offs_m * stride_states_dim
     out_ptrs = out_ptr + offs_m * stride_out_dim
 
-    if HAS_INITSTATES:
+    if HAS_INITSTATES and not HAS_DST_STATES:
         initstates_ptrs = (
             initstates_ptr + pid_h * stride_initstates_head + offs_m * stride_initstates_dim
         )
@@ -82,42 +82,36 @@ def _state_passing_fwd_kernel(
     else:
         states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    prev_seq_idx = 0
+    prev_seq_idx = tl.full((), 0, tl.int64)
     for c in range(nchunks):
         if HAS_DST_STATES:
             dst_flag = tl.load(dst_flags_ptr + c) != 0
         else:
             dst_flag = True
-        # Unflagged destination chunks have no chunk state.
-        new_states = tl.load(states_ptrs, mask=(offs_m < dim) & dst_flag, other=0.0).to(tl.float32)
-        dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
-        seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk)
-        if HAS_DST_STATES:
-            # Destination chunks start from their indexed initial state.
-            is_new_seq = True
-        else:
-            is_new_seq = prev_seq_idx != seq_idx
-        # we have started a new sequence
-        if is_new_seq:
-            if HAS_INITSTATES:
-                initstates_ptrs = (
-                    initstates_ptr
-                    + seq_idx * stride_initstates_batch
-                    + pid_h * stride_initstates_head
-                    + offs_m * stride_initstates_dim
-                )
-                states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+        if dst_flag:
+            new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+            dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
+            seq_idx = tl.load(seq_idx_ptr + c * stride_seq_idx_chunk).to(tl.int64)
+            if HAS_DST_STATES:
+                # Destination chunks start from their indexed initial state.
+                is_new_seq = True
             else:
-                states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+                is_new_seq = prev_seq_idx != seq_idx
+            if is_new_seq:
+                if HAS_INITSTATES:
+                    initstates_ptrs = (
+                        initstates_ptr
+                        + seq_idx * stride_initstates_batch
+                        + pid_h * stride_initstates_head
+                        + offs_m * stride_initstates_dim
+                    )
+                    states = tl.load(initstates_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
+                else:
+                    states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-        prev_seq_idx = seq_idx
-        states = tl.exp(dA_cs) * states + new_states
-        if not HAS_DST_STATES:
-            tl.store(out_ptrs, states, mask=offs_m < dim)
-
-        if HAS_DST_STATES:
-            # Commit completed chunks directly to the state cache.
-            if dst_flag:
+            prev_seq_idx = seq_idx
+            states = tl.exp(dA_cs) * states + new_states
+            if HAS_DST_STATES:
                 dst_idx = tl.load(dst_indices_ptr + c).to(tl.int64)
                 dst_ptrs = (
                     dst_states_ptr
@@ -126,6 +120,8 @@ def _state_passing_fwd_kernel(
                     + offs_m * stride_dst_dim
                 )
                 tl.store(dst_ptrs, states, mask=offs_m < dim)
+            else:
+                tl.store(out_ptrs, states, mask=offs_m < dim)
 
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk

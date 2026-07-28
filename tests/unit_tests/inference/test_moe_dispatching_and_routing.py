@@ -239,6 +239,8 @@ class TestNCCLAllGatherDispatcher:
             self._make_dispatcher(
                 batch_invariant_mode=True,
                 attention_backend=AttnBackend.flash,
+                flash_attention_version=4,
+                attention_dropout=0.0,
                 inference_grouped_gemm_backend="torch",
                 inference_moe_token_dispatcher_type="nccl",
             )
@@ -573,6 +575,8 @@ class TestNVLSAllGatherVDispatcher:
             inference_moe_token_dispatcher_type="nvls",
             batch_invariant_mode=True,
             attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
             moe_shared_expert_intermediate_size=None,
         )
         ep_group = get_expert_model_parallel_group()
@@ -656,3 +660,137 @@ class TestNVLSAllGatherVDispatcher:
         assert ordered_calls["value"] > 0
         assert graph_output.shape == hidden_states.shape
         assert graph_output.dtype == torch.bfloat16
+
+    def test_batch_invariant_moe_matches_training(self):
+        """The NVLS inference MoE path should exactly match training AllToAll."""
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size < 2:
+            pytest.skip("Training-to-inference MoE parity requires expert parallelism.")
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        if not HAVE_DEEPGEMM_BF16:
+            pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
+
+        torch.manual_seed(2028)
+        torch.cuda.manual_seed(2028)
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="torch",
+            inference_moe_token_dispatcher_type="nvls",
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+            moe_shared_expert_intermediate_size=None,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+        )
+
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        local_tokens = 17 + torch.distributed.get_rank()
+        hidden_states = torch.randn(
+            local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+
+        with torch.no_grad(), set_batch_invariant_mode(True):
+            training_output, _ = layer(hidden_states.clone())
+            with InferenceMode.active():
+                inference_output, _ = layer(hidden_states.clone())
+
+        torch.testing.assert_close(inference_output, training_output, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# mask_routing_padding kernel
+# ──────────────────────────────────────────────────────────────────────
+
+from megatron.core.transformer.moe.inference_routing_mask_kernel import (  # noqa: E402
+    HAVE_TRITON,
+    mask_routing_padding,
+)
+
+requires_triton_cuda = pytest.mark.skipif(
+    not HAVE_TRITON or not torch.cuda.is_available(),
+    reason="mask_routing_padding requires triton and CUDA",
+)
+
+
+@pytest.mark.internal
+@requires_triton_cuda
+class TestMaskRoutingPadding:
+    """Unit tests for the CUDA-graph padding-row routing mask.
+
+    ``mask_routing_padding`` fills ``routing_map[real_token_count:, :]`` with -1 so
+    the NVLS dispatcher routes padding rows to no expert. ``real_token_count`` is in
+    the global (pre-SP-shard) frame; a non-zero ``tp_rank`` shifts local rows into
+    that frame before the comparison. Runs standalone — no context or NVLS hardware.
+    """
+
+    TOPK = 6
+
+    def _routing_map(self, n_rows, fill=3):
+        # All entries non-negative so masked (-1) slots are unambiguous.
+        return torch.full((n_rows, self.TOPK), fill, dtype=torch.int64, device="cuda")
+
+    def _real_token_count(self, count):
+        return torch.tensor([count], dtype=torch.int32, device="cuda")
+
+    @pytest.mark.parametrize("n_rows, real_count", [(16, 10), (128, 1), (7, 7), (64, 0)])
+    def test_masks_rows_past_real_count(self, n_rows, real_count):
+        """Rows >= real_count become -1; rows < real_count are untouched (tp_rank=0)."""
+        routing_map = self._routing_map(n_rows)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(real_count), tp_rank=0)
+
+        torch.testing.assert_close(routing_map[:real_count], original[:real_count])
+        assert torch.all(routing_map[real_count:] == -1)
+
+    def test_real_count_equal_rows_is_noop(self):
+        """real_count == n_rows masks nothing (the unpadded decode case)."""
+        routing_map = self._routing_map(32)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(32), tp_rank=0)
+
+        torch.testing.assert_close(routing_map, original)
+
+    def test_sp_rank_offset(self):
+        """Local rows are shifted by tp_rank * n_rows into the global frame.
+
+        With 8 local rows on SP rank 1, local row r is global row r + 8. A global
+        real_count of 11 keeps global rows [8, 11) real (local [0, 3)) and masks
+        global rows [11, 16) (local [3, 8)).
+        """
+        routing_map = self._routing_map(8)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(11), tp_rank=1)
+
+        torch.testing.assert_close(routing_map[:3], original[:3])
+        assert torch.all(routing_map[3:] == -1)
+
+    def test_sp_rank_fully_masked(self):
+        """An SP rank entirely beyond real_count is fully masked.
+
+        8 local rows on rank 1 cover global rows [8, 16); real_count=8 masks all.
+        """
+        routing_map = self._routing_map(8)
+
+        mask_routing_padding(routing_map, self._real_token_count(8), tp_rank=1)
+
+        assert torch.all(routing_map == -1)

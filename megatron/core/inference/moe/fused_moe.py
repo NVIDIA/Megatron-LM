@@ -200,7 +200,11 @@ def mcore_fused_moe(
     # number of rows actually used by experts this iteration (valid tokens + alignment
     # padding within expert blocks). Passed to activation and unpermute to skip unused rows.
     n_used = offs[-1:]
-    activation_out = activation_func(fc1_output, permutation_map, n_used)
+    if batch_invariant_mode:
+        # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
+        activation_out = activation_func(fc1_output, permutation_map, n_used, probs=permuted_probs)
+    else:
+        activation_out = activation_func(fc1_output, permutation_map, n_used)
     # Fused activation+quant returns MXFP8Tensor; otherwise quantize separately.
     if use_mxfp8 and not isinstance(activation_out, MXFP8Tensor):
         activation_out = MXFP8Tensor.from_bf16(activation_out, backend="triton")
@@ -209,7 +213,7 @@ def mcore_fused_moe(
     # --- Post-processing: unpermute ---
     return unpermute_tokens(
         fc2_output,
-        permuted_probs,
+        None if batch_invariant_mode else permuted_probs,
         permutation_map,
         max_tokens,
         n_used,

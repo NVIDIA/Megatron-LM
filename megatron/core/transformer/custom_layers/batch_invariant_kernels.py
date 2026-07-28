@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
 import torch
+from packaging.version import Version
 
 try:
     import triton
@@ -51,11 +52,38 @@ __all__ = [
     "enable_batch_invariant_mode",
     "grouped_gemm_batch_invariant",
     "grouped_gemm_batch_invariant_alignment",
+    "assert_te_supports_batch_invariant_attention",
+    "te_supports_batch_invariant_attention",
     "HAVE_DEEPGEMM_BF16",
 ]
 
 
 _LOGGER = logging.getLogger(__name__)
+_TE_BATCH_INVARIANT_COMMIT = "cb4a45fd"
+_TE_BATCH_INVARIANT_MIN_VERSION = Version("2.18")
+
+
+def te_supports_batch_invariant_attention() -> bool:
+    """Return whether TE supports explicit FlashAttention version selection."""
+    import transformer_engine
+
+    te_version = Version(transformer_engine.__version__)
+    te_revision = te_version.local or ""
+    return te_version >= _TE_BATCH_INVARIANT_MIN_VERSION or te_revision.startswith(
+        _TE_BATCH_INVARIANT_COMMIT
+    )
+
+
+def assert_te_supports_batch_invariant_attention() -> None:
+    """Require TE's explicit FlashAttention version selection."""
+    import transformer_engine
+
+    te_version = Version(transformer_engine.__version__)
+    assert te_supports_batch_invariant_attention(), (
+        "Batch-invariant attention requires TransformerEngine PR #3204 "
+        f"({_TE_BATCH_INVARIANT_COMMIT}) or TransformerEngine >= "
+        f"{_TE_BATCH_INVARIANT_MIN_VERSION}; found {te_version}."
+    )
 
 
 def _matmul_launch_metadata(
@@ -331,7 +359,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Args:
         input: Input tensor
         dim: Dimension along which to compute log_softmax (only -1 or last dim supported)
-    >> Stashed changes
+
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
@@ -497,12 +525,8 @@ def mean_dim(
     return output
 
 
-# Kernel backend for mm / addmm. Production uses DeepGEMM; the Triton option
-# remains available to tests that exercise non-bf16 operators.
-#   "deepgemm" (default): DeepGEMM `bf16_gemm_nn` — bitwise-identical to
-#       `torch.mm`. Requires bf16 CUDA inputs on Hopper/Blackwell.
-#   "triton": batch-invariant Triton `matmul_persistent` — works on any CUDA
-#       device with bf16/fp16/fp32. Has small rounding drift vs `torch.mm`.
+# Production uses DeepGEMM for bf16 and the deterministic Triton kernel for
+# intentional higher-precision operations such as the fp32 MoE router.
 _BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton")
 _BATCH_INVARIANT_BACKEND: str = "deepgemm"
 
@@ -527,14 +551,22 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 def mm_batch_invariant(a, b):
     """Batch-invariant replacement for `aten::mm`."""
-    if _BATCH_INVARIANT_BACKEND == "deepgemm":
+    if (
+        _BATCH_INVARIANT_BACKEND == "deepgemm"
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+    ):
         return _mm_deepgemm(a, b)
     return matmul_persistent(a, b)
 
 
 def addmm_batch_invariant(bias, a, b):
     """Batch-invariant replacement for `aten::addmm`."""
-    if _BATCH_INVARIANT_BACKEND == "deepgemm":
+    if (
+        _BATCH_INVARIANT_BACKEND == "deepgemm"
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+    ):
         out = _mm_deepgemm(a, b)
         if bias is not None:
             out = out + bias
@@ -580,10 +612,15 @@ _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GROUPED_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+_TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
 
 
 def _import_module_if_available(name: str):
-    spec = importlib.util.find_spec(name)
+    try:
+        spec = importlib.util.find_spec(name)
+    except ModuleNotFoundError:
+        # find_spec on a submodule raises when the parent package is absent.
+        return None
     if spec is None:
         return None
     return importlib.import_module(name)
@@ -675,6 +712,30 @@ def _te_patch_for_batch_invariant():
     # Patch TE.general_grouped_gemm at every known import site so that
     # TEGroupedMLP (forward + dgrad + wgrad) goes through DeepGEMM in bf16.
     _te_patch_general_grouped_gemm()
+
+    # Fused LayerNormLinear and LayerNormMLP call apply_normalization
+    # instead of RMSNorm.forward.
+    import transformer_engine.pytorch.module._common as te_common
+
+    for mod_name, mod in (
+        ("module._common", te_common),
+        (
+            "module.layernorm_linear",
+            _import_module_if_available("transformer_engine.pytorch.module.layernorm_linear"),
+        ),
+        (
+            "module.layernorm_mlp",
+            _import_module_if_available("transformer_engine.pytorch.module.layernorm_mlp"),
+        ),
+    ):
+        key = f"{mod_name}.apply_normalization"
+        if (
+            mod is not None
+            and hasattr(mod, "apply_normalization")
+            and key not in _TE_APPLY_NORM_ORIGS
+        ):
+            _TE_APPLY_NORM_ORIGS[key] = mod.apply_normalization
+            mod.apply_normalization = _te_apply_normalization_patched
 
 
 def _te_patch_general_grouped_gemm() -> None:
@@ -1036,6 +1097,14 @@ def _te_unpatch_for_batch_invariant():
     elif meg_te is None:
         _MEG_TE_GENERAL_GEMM_ORIG = None
 
+    # Restore fused-module apply_normalization entries
+    for key, orig in list(_TE_APPLY_NORM_ORIGS.items()):
+        mod_name = key.rsplit(".apply_normalization", 1)[0]
+        mod = _import_module_if_available(f"transformer_engine.pytorch.{mod_name}")
+        if mod is not None and hasattr(mod, "apply_normalization"):
+            mod.apply_normalization = orig
+        _TE_APPLY_NORM_ORIGS.pop(key, None)
+
     # Restore TE module-level RMSNorm functions
     te_layernorm_mod = _import_module_if_available("transformer_engine.pytorch.module.layernorm")
     if te_layernorm_mod is not None:
@@ -1212,6 +1281,72 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             dbias = None
 
         return dA, dB, dbias, None, None
+
+
+def _te_apply_normalization_patched(
+    inputmat,
+    ln_out,
+    ln_weight,
+    ln_bias,
+    eps,
+    output_quantizer,
+    output_dtype,
+    normalization,
+    fwd_ln_sm_margin,
+    zero_centered_gamma,
+):
+    """Batch-invariant replacement for TE's fused-module `apply_normalization`.
+
+    Routes RMSNorm through the batch-invariant implementation (fp32 stats via
+    `mean_dim`, deterministic within-row reduction independent of row count).
+    Falls back to the original TE kernel for configurations the BI path does
+    not cover (LayerNorm, fp8 quantized output).
+
+    Returns `(ln_out, mu, rsigma)` like TE: `mu` is None for RMSNorm and
+    `rsigma` is fp32 with shape [rows], which TE's rmsnorm backward consumes.
+    """
+    orig = _TE_APPLY_NORM_ORIGS.get("module._common.apply_normalization")
+    if (
+        not is_batch_invariant_mode_enabled()
+        or normalization != "RMSNorm"
+        or output_quantizer is not None
+        or ln_bias is not None
+    ):
+        assert orig is not None, "TE apply_normalization original not captured"
+        return orig(
+            inputmat,
+            ln_out,
+            ln_weight,
+            ln_bias,
+            eps,
+            output_quantizer,
+            output_dtype,
+            normalization,
+            fwd_ln_sm_margin,
+            zero_centered_gamma,
+        )
+
+    x_fp32 = inputmat.float()
+    w_fp32 = ln_weight.float()
+    if zero_centered_gamma:
+        w_fp32 = w_fp32 + 1.0
+    ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
+    rsigma = torch.rsqrt(ms + eps)
+    out_fp32 = (x_fp32 * rsigma) * w_fp32
+
+    # The fused-module callers (layernorm_linear / layernorm_mlp) pass a torch.dtype
+    # output_dtype (inputmat.dtype); assert that so we never silently ignore a TE
+    # DType or other unexpected value here.
+    assert isinstance(output_dtype, torch.dtype), (
+        "batch-invariant apply_normalization expects a torch.dtype output_dtype, got "
+        f"{type(output_dtype)}"
+    )
+    if ln_out is not None:
+        # copy_ casts to ln_out.dtype in place, avoiding an intermediate allocation.
+        ln_out.copy_(out_fp32)
+    else:
+        ln_out = out_fp32.to(output_dtype)
+    return ln_out, None, rsigma.squeeze(-1)
 
 
 def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:

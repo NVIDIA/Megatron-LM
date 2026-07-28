@@ -1,12 +1,18 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
+from unittest.mock import MagicMock, patch
+
 import pytest
 import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from tests.unit_tests.test_utilities import Utils
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -30,11 +36,52 @@ def dtype_tols(dtype):
 
 
 class FakeCPGroup:
+    def __init__(self, size=1, rank=0):
+        self._size = size
+        self._rank = rank
+
     def size(self):
-        return 1
+        return self._size
 
     def rank(self):
-        return 0
+        return self._rank
+
+
+class TestApplyRotaryPosEmbTHD:
+    def test_packed_freqs_returns_offset_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=0)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(8, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, cp_group=cp_group)
+
+        expected_freqs = torch.cat([freqs[0:1], freqs[3:4], freqs[4:5], freqs[7:8]], dim=0)
+        expected = rope_utils_module._apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1), expected_freqs
+        ).squeeze(1)
+
+        torch.testing.assert_close(out, expected)
+
+    def test_max_seqlen_freqs_returns_sequence_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=1)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, cp_group=cp_group)
+
+        expected_freqs = torch.cat([freqs[1:2], freqs[2:3]], dim=0)
+        expected_slices = []
+        for x in torch.split(t, [2, 2]):
+            expected_slices.append(
+                rope_utils_module._apply_rotary_pos_emb_bshd(
+                    x.unsqueeze(1), expected_freqs
+                ).squeeze(1)
+            )
+        expected = torch.cat(expected_slices, dim=0)
+
+        torch.testing.assert_close(out, expected)
 
 
 def _test_fused_apply_mla_rope_for_q(input_format):
@@ -91,7 +138,13 @@ def _test_fused_apply_mla_rope_for_q(input_format):
 
     no_pe, pe = torch.split(pytorch_fwd_input, [q_dim, emb_dim], dim=-1)
     pe_output = apply_rotary_pos_emb(
-        pe, freqs, transformer_config, cu_seqlens=cu_seqlens, mscale=mscale, cp_group=FakeCPGroup()
+        pe,
+        freqs,
+        transformer_config,
+        cu_seqlens=cu_seqlens,
+        mscale=mscale,
+        cp_group=FakeCPGroup(),
+        mla_rotary_interleaved=True,
     )
     pytorch_output = torch.concat([no_pe, pe_output], dim=-1)
     pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
@@ -190,6 +243,7 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         cu_seqlens=cu_seqlens,
         mscale=mscale,
         cp_group=FakeCPGroup(),
+        mla_rotary_interleaved=True,
     )
     if input_format == "sbhd":
         pe_output = pe_output.expand(-1, -1, num_heads, -1)
@@ -254,3 +308,59 @@ class TestFusedApplyMLARope:
 
     def test_forward_backward_for_kv(self, input_format):
         _test_fused_apply_mla_rope_for_kv(input_format)
+
+
+class TestApplyRotaryPosEmbMlaFusionConflict:
+    """Test apply_rotary_pos_emb: mla_rotary_interleaved vs apply_rope_fusion conflict."""
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.seq_len = 16
+        self.num_heads = 2
+        self.kv_channels = 32
+        self.rot_dim = self.kv_channels
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_mla_rotary_interleaved_with_apply_rope_fusion_emits_warning_and_uses_unfused(self):
+        """When apply_rope_fusion=True and mla_rotary_interleaved=True, expect warning and unfused path."""
+        config = TransformerConfig(
+            num_attention_heads=self.num_heads,
+            num_layers=1,
+            apply_rope_fusion=True,
+            rotary_interleaved=False,
+        )
+        t = torch.randn(
+            self.seq_len, 1, self.num_heads, self.kv_channels, device="cuda", dtype=torch.float32
+        )
+        freqs = torch.randn(self.seq_len, 1, 1, self.rot_dim, device="cuda", dtype=torch.float32)
+
+        fused_mock = MagicMock(return_value=t.clone())
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb", fused_mock),
+            patch.object(
+                rope_utils_module,
+                "_apply_rotary_pos_emb_bshd",
+                wraps=rope_utils_module._apply_rotary_pos_emb_bshd,
+            ) as unfused_spy,
+        ):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                out = apply_rotary_pos_emb(t, freqs, config, mla_rotary_interleaved=True)
+            # Should have warned about MLA + fusion conflict
+            mla_fusion_warnings = [
+                x for x in w if "apply_rope_fusion does not support MLA-style" in str(x.message)
+            ]
+            assert (
+                len(mla_fusion_warnings) >= 1
+            ), "Expected warning when mla_rotary_interleaved and apply_rope_fusion both enabled"
+            # Fused kernel must not be used
+            fused_mock.assert_not_called()
+            # Unfused path must have been used
+            unfused_spy.assert_called_once()
+            call_kw = unfused_spy.call_args[1]
+            assert call_kw["mla_rotary_interleaved"] is True
+        assert out.shape == t.shape

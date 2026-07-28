@@ -171,6 +171,8 @@ def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1):
         params_dtype=torch.bfloat16,
         bf16=True,
         attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
         batch_invariant_mode=True,
     )
     submodules = get_submodules(

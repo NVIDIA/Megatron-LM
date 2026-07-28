@@ -35,10 +35,12 @@ def _squared_relu_kernel(
     output_ptr,
     src_idx_ptr,
     n_used_ptr,
+    probs_ptr,
     N,
     max_rows,  # output_size (fixed for CG)
     BLOCK_N: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+    APPLY_PROBS: tl.constexpr,
 ):
     """Squared ReLU that skips rows beyond n_used and alignment-padding rows (perm_map == -1).
 
@@ -57,11 +59,18 @@ def _squared_relu_kernel(
                     m = o < N
                     x = tl.load(input_ptr + row * N + o, mask=m).to(tl.float32)
                     r = tl.maximum(x, 0.0)
-                    tl.store(output_ptr + row * N + o, (r * r).to(tl.bfloat16), mask=m)
+                    activated = (r * r).to(tl.bfloat16)
+                    if APPLY_PROBS:
+                        prob = tl.load(probs_ptr + row)
+                        activated = (activated.to(tl.float32) * prob).to(tl.bfloat16)
+                    tl.store(output_ptr + row * N + o, activated, mask=m)
 
 
 def padded_squared_relu(
-    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Squared ReLU activation that skips rows beyond n_used and alignment-padding rows.
 
@@ -69,13 +78,25 @@ def padded_squared_relu(
         x: [output_size, ffn_hidden] BF16 FC1 output.
         permutation_map: [output_size] int32, original token index or -1 for padding.
         n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1].
+        probs: optional FP32 router probabilities applied after the BF16
+            activation rounding, matching the training path before FC2.
     """
     M, N = x.shape
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
     NUM_BLOCKS = min(M, 512)
+    probs_ptr = probs if probs is not None else permutation_map
     _squared_relu_kernel[(NUM_BLOCKS,)](
-        x, out, permutation_map, n_used, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
+        x,
+        out,
+        permutation_map,
+        n_used,
+        probs_ptr,
+        N,
+        M,
+        BLOCK_N=BLOCK_N,
+        NUM_BLOCKS=NUM_BLOCKS,
+        APPLY_PROBS=probs is not None,
     )
     return out
 

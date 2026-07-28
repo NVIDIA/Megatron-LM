@@ -15,10 +15,17 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.utils import (
+    get_batch_on_this_cp_rank,
+    get_te_version,
+    is_te_min_version,
+    unwrap_model,
+)
+from megatron.training.argument_utils import gpt_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -27,11 +34,6 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    unwrap_model,
-)
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_TE:
@@ -93,7 +95,7 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     sys.argv = ['test_upcycling.py']
     args = parse_args()
     args.num_layers = 2
-    args.vocal_size = 256
+    args.padded_vocab_size = 256
     args.hidden_size = 128
     args.num_attention_heads = 8
     args.max_position_embeddings = 256
@@ -158,16 +160,6 @@ def set_bias_value(dense_model):
     dense_model[0].load_state_dict(state_dict, strict=True)
 
 
-def get_batch(data_iterator):
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
-        return None, None, None, None, None
-
-    batch = get_batch_on_this_tp_rank(data_iterator)
-    batch = get_batch_on_this_cp_rank(batch)
-
-    return batch.values()
-
-
 class TestGPTModel:
     def setup_method(self, method):
         Utils.destroy_model_parallel()
@@ -193,8 +185,17 @@ class TestGPTModel:
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         )
 
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        cfg_container.model.transformer_layer_spec = get_gpt_layer_local_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -216,7 +217,17 @@ class TestGPTModel:
         )
         set_upcycling_args(ep, granularity, num_experts=2)
         # model_parallel_cuda_manual_seed(_SEED+1)
-        moe_model = get_model(model_provider, ModelType.encoder_or_decoder)
+        model_cfg = gpt_config_from_args(args)
+        model_cfg.transformer_layer_spec = get_gpt_layer_local_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        moe_model = builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg_container.ddp,
+            data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
+        )
 
         # Upcycle the dense model to the MoE model
         moe_model = unwrap_model(moe_model)
@@ -264,8 +275,17 @@ class TestGPTModel:
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         )
 
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        cfg_container.model.transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder,
+            model_provider,
+            cfg_container=cfg_container,
+            pg_collection=pg_collection,
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -287,7 +307,17 @@ class TestGPTModel:
         )
         set_upcycling_args(ep, granularity)
         # model_parallel_cuda_manual_seed(_SEED+1)
-        moe_model = get_model(model_provider, ModelType.encoder_or_decoder)
+        model_cfg = gpt_config_from_args(args)
+        model_cfg.transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+        )
+        builder_cls = model_cfg.get_builder_cls()
+        builder = builder_cls(model_cfg)
+        moe_model = builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg_container.ddp,
+            data_parallel_random_init=cfg_container.rng.data_parallel_random_init,
+        )
 
         # Upcycle the dense model to the MoE model
         moe_model = unwrap_model(moe_model)

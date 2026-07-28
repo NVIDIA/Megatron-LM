@@ -5,6 +5,7 @@ import os
 import sys
 from functools import partial
 
+from megatron.training.arguments import parse_and_validate_args
 import torch
 import yaml
 
@@ -28,7 +29,8 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.training.utils import is_last_rank, get_batch_on_this_cp_rank
+from megatron.core.utils import get_batch_on_this_cp_rank
+from megatron.training.utils import is_last_rank
 
 
 def get_batch(data_iterator, image_token_index, img_seq_len):
@@ -382,13 +384,16 @@ if __name__ == "__main__":
 
     train_valid_test_dataloaders_provider.is_distributed = True
 
+    args = parse_and_validate_args(
+        extra_args_provider=add_multimodal_extra_args,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )
+    full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         train_valid_test_dataloaders_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_multimodal_extra_args,
+        model_provider,
         process_non_loss_data_func=write_online_eval_to_tensorboard,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,

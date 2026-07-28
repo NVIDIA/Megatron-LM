@@ -20,14 +20,27 @@ import modelopt.torch.opt as mto
 import modelopt.torch.prune as mtp
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.prune.plugins.mcore_minitron import SUPPORTED_HPARAMS
-from modelopt.torch.utils.dataset_utils import get_dataset_dataloader, get_supported_datasets
+from modelopt.torch.utils import get_dataset_samples
+from modelopt.torch.utils.dataset_utils import get_supported_datasets
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
+
+# modelopt 0.45+ exposes a shared Megatron calibration forward loop. Fall back to an
+# inline pack=True implementation on 0.44 so this script works on both releases.
+try:
+    from modelopt.torch.utils.plugins.megatron_calibration import (
+        get_megatron_calibration_forward_loop,
+    )
+
+    _HAS_SHARED_CALIB = True
+except ImportError:
+    _HAS_SHARED_CALIB = False
 from utils import get_hf_tokenizer
 
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_tensor_model_parallel_group,
 )
+from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -35,7 +48,7 @@ from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.utils import print_rank_0, unwrap_model
+from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
@@ -63,7 +76,7 @@ def add_prune_args(parser):
     group.add_argument(
         "--calib-max-sequence-length",
         type=int,
-        default=512,
+        default=4096,
         help="Maximum sequence length for calibration samples.",
     )
     group.add_argument(
@@ -224,24 +237,44 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    def _hf_dataset_forward_loop_func(model):
-        if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        dataloader = get_dataset_dataloader(
+    if _HAS_SHARED_CALIB:
+        forward_loop = get_megatron_calibration_forward_loop(
+            tokenizer,
             dataset_name=args.calib_dataset,
-            tokenizer=tokenizer,
             num_samples=args.calib_size,
-            max_sample_length=args.calib_max_sequence_length,
+            seq_length=args.calib_max_sequence_length,
             batch_size=1,
-            device="cuda",
+            # pack=True uses Megatron pretraining-style global-stream document packing
             pack=True,
         )
-        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
-            megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
+    else:
+        # modelopt 0.44 fallback: inline pack=True (concatenate raw samples into a single
+        # EOS-separated token stream, slice into fixed-length chunks). Equivalent in
+        # behavior to get_megatron_calibration_forward_loop at batch_size=1.
+        def forward_loop(model):
+            if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            seq_len = args.calib_max_sequence_length
+            samples = get_dataset_samples(args.calib_dataset, num_samples=args.calib_size * 2)
+            sep_id = tokenizer.eos_token_id
+            token_stream: list[int] = []
+            for s in samples:
+                token_stream.extend(tokenizer.encode(s, add_special_tokens=False))
+                token_stream.append(sep_id)
+                if len(token_stream) >= args.calib_size * seq_len:
+                    break
+            n_chunks = min(args.calib_size, len(token_stream) // seq_len)
+            print_rank_0(
+                f"Calibration packing: {len(samples)} raw samples -> {len(token_stream)} tokens "
+                f"-> {n_chunks} chunks of {seq_len} tokens."
+            )
+            for i in tqdm(range(n_chunks), disable=torch.distributed.get_rank()):
+                chunk = token_stream[i * seq_len : (i + 1) * seq_len]
+                input_ids = torch.tensor([chunk], dtype=torch.long, device="cuda")
+                megatron_prefill(model, input_ids, skip_return_logits=True)
 
     print_rank_0(f"Pruning model with export_config: {args.prune_export_config}")
-    config = {"forward_loop": _hf_dataset_forward_loop_func}
+    config = {"forward_loop": forward_loop}
     if args.prune_intermediate_ckpt is not None:
         config["checkpoint"] = args.prune_intermediate_ckpt
     mtp.prune(
