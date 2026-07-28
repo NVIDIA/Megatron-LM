@@ -58,7 +58,17 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
         ({"enable_chunked_prefill": True}, True),
         ({"num_speculative_tokens": 1}, True),
         ({"num_speculative_tokens": 1, "controller_num_mtp_depths": 1}, False),
-        ({"context_is_hybrid_model": True}, True),
+        ({"context_is_hybrid_model": True}, False),
+        (
+            {
+                "context_is_hybrid_model": True,
+                "num_speculative_tokens": 1,
+                "controller_num_mtp_depths": 1,
+                "model_config_expert_model_parallel_size": 2,
+                "model_config_num_moe_experts": 4,
+            },
+            False,
+        ),
         ({"context_enable_prefix_caching": True}, True),
         ({"materialize_only_last_token_logits": False}, True),
         ({"model_config_expert_model_parallel_size": 2}, False),

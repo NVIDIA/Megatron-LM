@@ -1046,8 +1046,6 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support chunked prefill.")
         if self.num_speculative_tokens > self.controller.num_mtp_depths:
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
-        if self.context.is_hybrid_model:
-            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
         if self.context.enable_prefix_caching:
             raise ValueError("Async scheduling does not support prefix caching.")
         if not self.materialize_only_last_token_logits:
