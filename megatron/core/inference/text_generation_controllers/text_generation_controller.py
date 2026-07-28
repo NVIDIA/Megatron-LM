@@ -1867,6 +1867,27 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
+    def _apply_stop_word_finished_ids(
+        self, active_request_ids: Tensor, active_request_mask: Tensor
+    ) -> None:
+        """Mark requests whose generated output matched a stop word as finished.
+
+        Args:
+            active_request_ids (Tensor): IDs for requests active during the current step.
+            active_request_mask (Tensor): Mask updated in place for requests that remain active.
+        """
+        if self._get_stop_word_finished_ids_callback is None:
+            return
+
+        request_ids = active_request_ids.tolist()
+        stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids)
+        if not stop_word_finished_ids:
+            return
+
+        for idx, request_id in enumerate(request_ids):
+            if request_id in stop_word_finished_ids:
+                active_request_mask[idx] = 0
+
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -1913,15 +1934,8 @@ class TextGenerationController:
             != context.active_request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
-        # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
-        if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
+        # Apply stop words detected during the previous engine bookkeeping step.
+        self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
 
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
@@ -2157,6 +2171,8 @@ class TextGenerationController:
         active_request_mask = (
             sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(resolved_sequence_lengths, max_sequence_lengths).byte()
+
+        self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
 
         if context.chunked_prefill_request_id != -1:
             chunked_prefill_rows = torch.nonzero(

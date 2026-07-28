@@ -1047,27 +1047,19 @@ class DynamicInferenceEngine(AbstractEngine):
         if model_config.moe_enable_routing_replay:
             raise ValueError("Async scheduling does not support routing replay.")
 
-    def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
-        """Validate request-level restrictions for async scheduling.
-
-        Args:
-            request (DynamicInferenceRequest): Request being added to the engine.
-        """
-        mode = self.context.config.async_sched_mode
-        if mode == AsyncScheduleMode.LEGACY:
-            return
-        if mode != AsyncScheduleMode.ASYNC:
-            raise AssertionError(f"Unexpected async scheduling mode: {mode}")
-
-        if request.sampling_params.stop_words:
-            raise ValueError("Async scheduling does not support stop words.")
-
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
+        """Add a request to the engine.
+
+        Args:
+            request (DynamicInferenceRequest): Request to add.
+
+        Returns:
+            asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
+        """
 
         request_id = request.request_id
-        self._validate_async_sched_support_for_request(request)
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.

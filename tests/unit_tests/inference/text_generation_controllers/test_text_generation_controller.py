@@ -292,6 +292,7 @@ def _make_async_sched_controller(context=None, model_config=None):
         return output
 
     controller._sampling = SimpleNamespace(sample_kernel=mock.Mock(side_effect=sample_kernel))
+    controller._get_stop_word_finished_ids_callback = None
     controller._async_sched_sampled_tokens_cpu_buffer = torch.empty(
         context.max_requests, dtype=torch.int64
     )
@@ -980,15 +981,24 @@ def test_build_async_sched_request_state_keeps_partial_chunk_active():
     assert finished_request_ids.tolist() == [11]
 
 
-@pytest.mark.parametrize("termination_ids", [[99, 99, 99], [99, 2, 99]])
-def test_run_async_sched_resolve_compacts_without_forward_sync(termination_ids):
+@pytest.mark.parametrize(
+    "termination_ids, stop_word_finished_ids",
+    [([99, 99, 99], set()), ([99, 2, 99], set()), ([99, 99, 99], {11})],
+)
+def test_run_async_sched_resolve_compacts_without_forward_sync(
+    termination_ids, stop_word_finished_ids
+):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     context = _make_async_sched_context(total_request_count=3)
     context.request_metadata["termination_id"] = torch.tensor(termination_ids)
     controller = _make_async_sched_controller(context)
     controller._synchronize_async_sched_event = mock.Mock()
+    controller._get_stop_word_finished_ids_callback = mock.Mock(return_value=stop_word_finished_ids)
 
     expected_mask = (sample_tokens != context.request_metadata["termination_id"]).byte()
+    for request_idx, request_id in enumerate(context.request_ids.tolist()):
+        if request_id in stop_word_finished_ids:
+            expected_mask[request_idx] = 0
     expected_finished_ids = context.request_ids[expected_mask == 0].clone()
     expected_survivor_idxs = torch.nonzero(expected_mask, as_tuple=True)[0]
     context.resolve_requests = mock.Mock(
@@ -1012,6 +1022,7 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(termination_ids):
     context.commit_sampled_tokens.assert_not_called()
     context.resolve_requests.assert_called_once()
     assert torch.equal(context.resolve_requests.call_args.args[0], expected_mask)
+    controller._get_stop_word_finished_ids_callback.assert_called_once_with([10, 11, 12])
 
 
 def test_async_sched_step_overlap_order():
