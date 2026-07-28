@@ -441,7 +441,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
-            input_ids, position_ids = self.controller._dynamic_step_context_init(
+            input_ids, position_ids, _ = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
             )
             # Progress.
@@ -993,11 +993,11 @@ class DynamicInferenceEngine(AbstractEngine):
         return self.requests[request_id].record[-1]
 
     def _validate_async_sched_support_for_config(self) -> None:
-        """Validate config-level restrictions for serial async scheduling.
+        """Validate config-level restrictions for async scheduling.
 
-        Raises if the config does not support serial async scheduling.
+        Raises if the config does not support async scheduling.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         model_config = self.controller.inference_wrapped_model.model.config
@@ -1017,12 +1017,12 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError("Async scheduling does not support routing replay.")
 
     def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
-        """Validate request-level restrictions for serial async scheduling.
+        """Validate request-level restrictions for async scheduling.
 
         Args:
             request (DynamicInferenceRequest): Request being added to the engine.
         """
-        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+        if self.context.config.async_sched_mode == AsyncScheduleMode.LEGACY:
             return
 
         sampling_params = request.sampling_params
@@ -1851,6 +1851,35 @@ class DynamicInferenceEngine(AbstractEngine):
                     computed_chunk = computed_budget
 
                 prefill_chunk_length = prefix_skip + computed_chunk
+
+                # Mamba prefix caching: keep chunk boundaries block-aligned.
+                # compute_and_store_offsets() records a recurrent-state snapshot at a
+                # KV-block boundary only when that boundary lands on a multiple of the
+                # SSM chunk size measured FROM the start of the current prefill chunk
+                # (it filters on `offset % mamba_chunk_size == 0`, where the chunk start
+                # equals `finished_chunk_token_count` on continuation chunks). Block
+                # boundaries are multiples of `block_size_tokens` (itself a multiple of
+                # the SSM chunk size), so the filter only passes when
+                # `finished_chunk_token_count` is block-aligned. If a chunk ends at an
+                # arbitrary token offset, every candidate boundary in the following
+                # chunks becomes unrecordable and the last-block snapshot that lets a
+                # future request skip prefill is silently dropped. Stop a partial
+                # (non-final) chunk short at the nearest lower block boundary so the
+                # running `finished_chunk_token_count` stays block-aligned.
+                if (
+                    self.context.is_hybrid_model
+                    and self.context.mamba_slot_allocator is not None
+                    and prefill_chunk_length < remaining_len
+                ):
+                    block_size = self.context.block_size_tokens
+                    chunk_end = req.finished_chunk_token_count + prefill_chunk_length
+                    aligned_end = (chunk_end // block_size) * block_size
+                    aligned_chunk_length = aligned_end - req.finished_chunk_token_count
+                    # Only snap down when the aligned chunk still computes at least one
+                    # token beyond the skipped prefix (a chunk whose budget is smaller
+                    # than a block cannot be block-aligned; leave it unchanged).
+                    if aligned_chunk_length > prefix_skip:
+                        prefill_chunk_length = aligned_chunk_length
 
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
                 # final chunk, reduce by 1 (or defer if we only have 1 computed token).

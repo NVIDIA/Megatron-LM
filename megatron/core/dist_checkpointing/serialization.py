@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Entrypoints for saving and loading the distributed checkpoints.
 
@@ -16,7 +16,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import maybe_msc
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -49,9 +49,16 @@ from .validation import (
 
 logger = logging.getLogger(__name__)
 
-# monkeypatch needed for ModelOpt
-# will be removed once MLM updated to newer ModelOpt
-get_default_load_sharded_strategy = TorchDistLoadShardedStrategy
+
+def get_default_load_sharded_strategy(checkpoint_dir: str | Path | None = None):
+    """Create the default torch distributed load strategy."""
+    return TorchDistLoadShardedStrategy(checkpoint_name=checkpoint_dir)
+
+
+def get_default_save_sharded_strategy(backend: str = "torch_dist"):
+    """Create the default torch distributed save strategy."""
+    return TorchDistSaveShardedStrategy(backend=backend)
+
 
 # flat state dict with sharded objects without any data
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
@@ -122,7 +129,15 @@ def load(
     #      params with a high-precision state dict;
     #   2. When using delayed scaling, this loading process writes an extra value into the global
     #      amax_history buffer of Transformer Engine, which is undesirable.
-    force_all_tensors_to_non_fp8(sharded_state_dict)
+    #
+    # When the sharded strategy supports per-tensor streaming dequantize
+    # (``stream_ckpt_dequant``), both concerns are handled inside the
+    # LoadPlanner on a per-tensor basis, which avoids peaking GPU memory
+    # with N simultaneous high-precision scratch tensors before the load
+    # begins. Covers FP8/MXFP8/blockwise-FP8/NVFP4 via the common
+    # ``QuantizedTensor`` base class.
+    if not getattr(sharded_strategy, "stream_ckpt_dequant", False):
+        force_all_tensors_to_non_fp8(sharded_state_dict)
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
@@ -180,10 +195,7 @@ def load(
 def _legacy_common_state_exists(checkpoint_dir: str) -> bool:
     """Check whether the checkpoint stores common data in a legacy common.pt file."""
     path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        return msc.Path(path).exists()
-    return os.path.exists(path)
+    return maybe_msc.Path(path).exists()
 
 
 def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
@@ -326,7 +338,7 @@ def load_content_metadata(
 def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
     """determine the appropriate sharding strategy and delegate removal to the sharded strategy"""
     verify_checkpoint(checkpoint_dir)
-    TorchDistSaveShardedStrategy.remove_sharded_tensors(checkpoint_dir, key_prefix)
+    TorchDistLoadShardedStrategy().remove_sharded_tensors(checkpoint_dir, key_prefix)
 
 
 def save(
@@ -398,11 +410,7 @@ def save(
     from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 
     if torch.distributed.get_rank() == 0:
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            checkpoint_dir_path = msc.Path(str(checkpoint_dir))
-        else:
-            checkpoint_dir_path = Path(checkpoint_dir)
+        checkpoint_dir_path = maybe_msc.Path(str(checkpoint_dir))
 
         if next(checkpoint_dir_path.iterdir(), None) is not None:
             # Don't throw exception here since this could cause a cascade of failures
