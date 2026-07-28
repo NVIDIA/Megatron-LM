@@ -3178,6 +3178,23 @@ class TransformerConfig(ModelParallelConfig):
                     'overlap_moe_expert_parallel_comm full recompute is not yet supported '
                     'together with moe_paged_stash.'
                 )
+                # Delayed-scaling FP8 accumulates amax into a persistent
+                # amax_history across microbatches. Both the initial no_grad forward
+                # and the backward-time recompute run under the delayed FP8 autocast,
+                # and this path does not enter TE's activation-recompute
+                # (recompute_phase) machinery that te_checkpoint uses to snapshot and
+                # restore FP8 metadata, so the recompute would update amax_history a
+                # second time and silently diverge. Current-scaling recipes
+                # (tensorwise / mxfp8 / blockwise) derive scales from the current
+                # tensor each pass, so the replayed forward re-derives identical
+                # scales (validated bitwise-identical to recompute-off); only delayed
+                # scaling is rejected here.
+                assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.delayed), (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'with delayed-scaling FP8 (fp8_recipe="delayed"): the backward-time '
+                    'recompute would double-update the persistent amax_history. Use a '
+                    'current-scaling recipe (tensorwise / mxfp8 / blockwise) instead.'
+                )
             else:
                 assert self.recompute_method is None, (
                     'disable recomputation method when enabling ' 'overlap_moe_expert_parallel_comm'
