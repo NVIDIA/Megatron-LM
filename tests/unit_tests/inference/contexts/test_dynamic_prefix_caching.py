@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import deque
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,6 +10,10 @@ import torch
 
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.mamba_slot_allocator import (
+    MambaSlotAllocator,
+    MambaSlotCapacityError,
+)
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -1247,6 +1252,87 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list[2]) == fresh_ql
         assert len(log_probs_list[3]) == cached_ql
         assert len(log_probs_list[4]) == fresh_ql
+
+
+def _make_cpu_mamba_slot_allocator(
+    monkeypatch, *, total_blocks: int, max_slots: int
+) -> MambaSlotAllocator:
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    kv_allocator = SimpleNamespace(
+        total_count=total_blocks,
+        block_ref_counts=torch.ones(total_blocks, dtype=torch.int32),
+        block_timestamps=torch.zeros(total_blocks, dtype=torch.int64),
+        block_hashes=torch.full((total_blocks,), -1, dtype=torch.int64),
+    )
+    context = SimpleNamespace(
+        max_requests=1,
+        max_mamba_intermediate_states_per_step=1,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        kv_block_allocator=kv_allocator,
+    )
+    return MambaSlotAllocator(
+        context=context,
+        max_slots=max_slots,
+        num_mamba_layers=1,
+        conv_states_shape=(1,),
+        ssm_states_shape=(1,),
+        conv_states_dtype=torch.float32,
+        ssm_states_dtype=torch.float32,
+    )
+
+
+def test_mamba_slot_allocation_failure_is_atomic(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=2)
+    allocator.allocate_slots_batch([0])
+    block_to_slot_before = allocator.block_to_slot.clone()
+    slot_to_block_before = allocator.slot_to_block.clone()
+    free_count_before = allocator.free_count
+
+    with pytest.raises(MambaSlotCapacityError, match="only 1 free or evictable"):
+        allocator.allocate_slots_batch([1, 2])
+
+    assert allocator.free_count == free_count_before
+    assert torch.equal(allocator.block_to_slot, block_to_slot_before)
+    assert torch.equal(allocator.slot_to_block, slot_to_block_before)
+
+
+def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=6, max_slots=4)
+    allocator.allocate_slots_batch([0, 1, 2, 3])
+    allocator.context.kv_block_allocator.block_ref_counts[:4] = 0
+    allocator.context.kv_block_allocator.block_timestamps[:4] = torch.tensor([40, 10, 30, 20])
+    allocator.context.kv_block_allocator.block_hashes[:4] = torch.tensor([100, 101, 102, 103])
+    allocator.register_block_hashes_batch([0, 1, 2, 3], [100, 101, 102, 103])
+
+    allocator.allocate_slots_batch([4, 5])
+
+    assert allocator.block_to_slot.tolist()[1] == -1
+    assert allocator.block_to_slot.tolist()[3] == -1
+
+
+def test_optional_mamba_checkpoint_commit_skips_at_capacity():
+    allocator = object.__new__(MambaSlotAllocator)
+    allocator._collect_commit_data = lambda: ([11], [0], [12], [0], [101, 102])
+
+    def raise_capacity(_):
+        raise MambaSlotCapacityError(required=2, available=0)
+
+    allocator.allocate_slots_batch = raise_capacity
+    allocator._copy_intermediate_to_cache = lambda *_: pytest.fail(
+        "state copy must not run without durable capacity"
+    )
+    allocator.store_from_live_batch = lambda *_: pytest.fail(
+        "live-state copy must not run without durable capacity"
+    )
+    allocator.register_block_hashes_batch = lambda *_: pytest.fail(
+        "hash registration must not run without durable capacity"
+    )
+    clear_calls = []
+    allocator._clear_intermediate_state = lambda: clear_calls.append(True)
+
+    allocator.commit_intermediate_states()
+
+    assert clear_calls == [True]
 
 
 class TestMambaSlotAllocator(PrefixCachingTestBase):
