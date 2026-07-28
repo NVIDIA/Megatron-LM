@@ -94,7 +94,7 @@ class ParameterMetadata:
 
 @dataclass
 class ShardingDescriptor:
-    """Descriptor for a sharded dimension for a parameter."""
+    """Legacy sharding descriptor kept for import compatibility."""
 
     name: str  # "tp" | "ep" | custom label
     dim: int
@@ -515,7 +515,7 @@ def _filter_by_ep_local_rank(
         filter ensures dst EP local 0 uses src EP local 0 (same global experts).
       - Different size (EP=8→EP=16): dst EP local 8 has no corresponding src
         EP local → skip filter; expert reassignment is handled by resolved_name
-        matching, and the LCM/TP planner handles any TP dimension changes.
+        matching, and the shard planner handles any TP dimension changes.
     """
     dst_ep_group = dst_metadata.expert_parallel_group_ranks
     if dst_ep_group is None:
@@ -596,9 +596,9 @@ def select_src_metadata_balanced(
 ) -> ParameterMetadata:
     """Choose a representative source `ParameterMetadata` for a destination rank.
 
-    The selected metadata supplies topology (TP/EP/DP group ranks) to the LCM
-    planner.  Selection prefers a local copy when ``dst_rank`` itself owns a
-    source replica, then round-robins across source DP groups to balance load.
+    The selected metadata identifies one complete source replica. Selection
+    prefers a local copy when ``dst_rank`` itself owns a source replica, then
+    round-robins across source DP groups to balance load.
     A local copy is essentially free (``tensor.copy_()`` on same GPU), while
     any remote transfer incurs significant overhead even within the same node.
     """

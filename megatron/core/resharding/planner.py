@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import logging
-import math
 import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
-from .gtp_planner import plan_gtp
+from .shard_planner import plan_sharded_transfer
 from .utils import (
     ParameterMetadata,
     ReshardPlan,
@@ -17,7 +16,6 @@ from .utils import (
     TensorReshardSpec,
     TransferOp,
     _build_layer_module_prefix_map,
-    _get_rank_in_group,
     extract_param_metadata,
     named_refit_tensors,
     select_src_metadata_balanced,
@@ -365,8 +363,8 @@ def _iter_global_transfer_ops(
                 )
             # Choose a representative source metadata with DP round-robin balancing.
             src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
-            sources = _determine_source_ranks_for_dst_param(
-                resolved_name, src_meta_list, src_metadata, dst_metadata, dst_rank
+            sources = plan_sharded_transfer(
+                resolved_name, src_meta_list, src_metadata, dst_metadata
             )
             for src_rank, src_slice, dst_slice in sources:
                 task_id = next_task_id

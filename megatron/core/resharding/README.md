@@ -12,7 +12,7 @@ refit.py            High-level API: swap_model_weights, caching, MXFP8 auto-dete
     |
 planner.py          Local plan builder (every rank all-gathers metadata, replays
                     the same deterministic schedule, keeps only its own ops)
-gtp_planner.py      Logical-coordinate planner for TP x GTP shard layouts
+shard_planner.py    Logical-coordinate planner for replicated, TP, and GTP layouts
     |
 execution.py        Submits send/recv ops to a CopyService, handles writebacks
     |
@@ -149,9 +149,9 @@ API or the ReFIT benchmark.
    (`_iter_global_transfer_ops`):
    - Iterate destination ranks, then each rank's destination params in gathered
      order; for each destination param, find the matching source param(s) by name.
-   - Route to a dimension-specific planner (LCM tiling for standard TP,
-     block-interleaved for partitioned params like Mamba `in_proj`, and
-     logical-coordinate intersections for weights involving GTP).
+   - Map source and destination storage into logical global-weight coordinates,
+     then intersect those regions. The same algorithm handles replicated, TP,
+     packed/strided TP, GTP, and combined TP x GTP layouts.
    - Assign a monotonic `task_id` per sub-op.  Because the iteration order and
      counter are a pure function of the gathered metadata, the send op computed
      on the sender and the recv op computed on the receiver get the **same**
@@ -161,10 +161,10 @@ API or the ReFIT benchmark.
 
 ## Generalized Tensor Parallelism
 
-GTP stores a contiguous dim-0 slice of the already TP-local weight. The refit
-planner represents each local slice as intervals in the logical, unpadded
-global weight and intersects source intervals with destination intervals. This
-single rule covers:
+GTP stores a contiguous dim-0 slice of the already TP-local weight. The shard
+planner represents every local weight as intervals in the logical, unpadded
+global weight and intersects source intervals with destination intervals. GTP
+therefore uses the same algorithm as ordinary TP. This single rule covers:
 
 - column parallel weights, where TP and GTP both cut dim 0;
 - row parallel weights, where TP cuts dim 1 and GTP cuts dim 0;
@@ -233,8 +233,8 @@ attribute with the following groups:
 | File | Role |
 |------|------|
 | `refit.py` | Public API, caching, MXFP8 auto-detection |
-| `planner.py` | Local deterministic plan builder (metadata, LCM/block-interleaved planners) |
-| `gtp_planner.py` | TP/GTP local-to-global coordinate mapping and intersection planner |
+| `planner.py` | Local deterministic schedule builder |
+| `shard_planner.py` | Replicated/TP/GTP local-to-global mapping and intersection planner |
 | `execution.py` | Plan executor (send/recv submission, writeback, format conversion) |
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |
