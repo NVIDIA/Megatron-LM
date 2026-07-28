@@ -842,12 +842,23 @@ class MegatronFSDP(torch.nn.Module):
             return args, kwargs
 
         def _root_post_backward(*unused):
+            # The combined 1F1B schedule finalizes each microbatch explicitly.
+            # A root autograd callback may already be queued for that same
+            # microbatch (notably when MTP shares the embedding parameter).
+            # Once the explicit call resets the pre-backward state, ignore the
+            # stale callback instead of reducing/resetting the bucket twice.
+            if not self._root_pre_backward_hook_issued:
+                return
+
             # Make sure all the gradients are handled.
             ordered_params = sorted(
                 list(self._params_require_handle_grad), key=lambda p: self.param_to_name[p]
             )
             for param in ordered_params:
                 _grad_acc(param)
+            # Root-owned/shared parameters do not pass through
+            # _process_post_backward_gradients(), so consume them here.
+            self._params_require_handle_grad.difference_update(ordered_params)
 
             # Reduce the remaining gradients.
             grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [
