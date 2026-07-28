@@ -426,7 +426,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
-        compute_mtp_loss: bool = True,
+        run_mtp_forward: bool = True,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -435,10 +435,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         It either returns the Loss values if labels are given or the final hidden units
 
         Args:
-            compute_mtp_loss (bool): Whether to execute the training/evaluation MTP block and
-                attach its auxiliary loss outside ``InferenceMode``. Disabling this leaves the
-                MTP module and checkpoint state intact. Serial MTP speculative decoding is
-                configured through the inference context and controller. Defaults to True.
+            run_mtp_forward (bool): Whether to execute the non-inference MTP forward and attach
+                its auxiliary loss. Disabling this leaves the MTP module and checkpoint state
+                intact. Serial MTP speculative decoding is configured through the inference
+                context and controller. Defaults to True.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -543,7 +543,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         )
 
         mtp_forward_ran = (
-            self.mtp_process and compute_mtp_loss and not (in_inference_mode or is_spec_decode)
+            self.mtp_process and run_mtp_forward and not (in_inference_mode or is_spec_decode)
         )
         if mtp_forward_ran:
             hidden_states = self.mtp(

@@ -1419,14 +1419,14 @@ class TestMultiTokenPredictionHybrid:
         ("forward_kwargs", "expected_mtp_calls", "expected_loss_calls"),
         [
             pytest.param({}, 1, 1, id="defaults"),
-            pytest.param({"compute_mtp_loss": True}, 1, 1, id="explicitly-enabled"),
-            pytest.param({"compute_mtp_loss": False}, 0, 0, id="disabled"),
+            pytest.param({"run_mtp_forward": True}, 1, 1, id="explicitly-enabled"),
+            pytest.param({"run_mtp_forward": False}, 0, 0, id="disabled"),
         ],
     )
-    def test_forward_mtp_loss_control(
+    def test_forward_mtp_control(
         self, monkeypatch, forward_kwargs, expected_mtp_calls, expected_loss_calls
     ):
-        """Test enabled and disabled HybridModel MTP loss computation."""
+        """Test enabled and disabled HybridModel MTP forward execution and loss processing."""
         model, hidden_states, call_counts = self._make_forward_stub()
 
         def process_mtp_loss_spy(**kwargs):
@@ -1454,12 +1454,12 @@ class TestMultiTokenPredictionHybrid:
     @pytest.mark.parametrize(
         "forward_kwargs",
         [
-            pytest.param({"compute_mtp_loss": True}, id="enabled"),
-            pytest.param({"compute_mtp_loss": False}, id="disabled"),
+            pytest.param({"run_mtp_forward": True}, id="enabled"),
+            pytest.param({"run_mtp_forward": False}, id="disabled"),
         ],
     )
-    def test_forward_mtp_loss_control_on_non_mtp_rank(self, forward_kwargs):
-        """Test that the loss control does not access MTP on a pipeline rank without it."""
+    def test_forward_mtp_control_on_non_mtp_rank(self, forward_kwargs):
+        """Test that the MTP control does not access MTP on a pipeline rank without it."""
         model, hidden_states, call_counts = self._make_forward_stub(mtp_process=False)
 
         output = HybridModel.forward(
@@ -1484,14 +1484,14 @@ class TestMultiTokenPredictionHybrid:
             position_ids=torch.arange(2).unsqueeze(0),
             attention_mask=None,
             decoder_input=hidden_states,
-            compute_mtp_loss=False,
+            run_mtp_forward=False,
         )
 
         torch.testing.assert_close(output, hidden_states)
         assert call_counts == {"mtp": 0, "loss": 0}
 
-    def test_forward_mtp_loss_control_does_not_disable_speculative_decoding(self, monkeypatch):
-        """Test that the loss control does not disable speculative decoding state."""
+    def test_forward_mtp_control_does_not_disable_speculative_decoding(self, monkeypatch):
+        """Test that the MTP control does not disable speculative decoding state."""
         model, hidden_states, call_counts = self._make_forward_stub()
         inference_context = types.SimpleNamespace(
             is_dynamic_batching=lambda: True,
@@ -1517,7 +1517,7 @@ class TestMultiTokenPredictionHybrid:
                 decoder_input=hidden_states,
                 inference_context=inference_context,
                 runtime_gather_output=True,
-                compute_mtp_loss=False,
+                run_mtp_forward=False,
             )
 
         torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
