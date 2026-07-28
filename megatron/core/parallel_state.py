@@ -266,6 +266,34 @@ def create_group(
     return group
 
 
+def _create_local_sync_group_for_rank(
+    rank_groups,
+    rank,
+    timeout=None,
+    backend=None,
+    pg_options=None,
+    group_desc=None,
+):
+    """Create one local-sync group per rank for a disjoint group family.
+
+    Non-members create an unused singleton group so that later local-sync group
+    names are derived from the same process-group count on every rank.
+    """
+    local_rank_groups = [ranks for ranks in rank_groups if rank in ranks]
+    assert len(local_rank_groups) <= 1, f"{group_desc} rank groups must be disjoint"
+    is_member = bool(local_rank_groups)
+    local_ranks = local_rank_groups[0] if is_member else [rank]
+    group = create_group(
+        local_ranks,
+        timeout=timeout,
+        backend=backend,
+        pg_options=pg_options,
+        use_local_synchronization=True,
+        group_desc=group_desc if is_member else f"{group_desc}_LOCAL_SYNC_PADDING",
+    )
+    return (group, local_ranks) if is_member else (None, None)
+
+
 def generate_masked_orthogonal_rank_groups(
     world_size: int, parallel_size: List[int], mask: List[bool]
 ) -> List[List[int]]:
@@ -1250,7 +1278,8 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    for ranks in decoder_rank_generator.get_ranks('pp'):
+    pipeline_rank_groups = decoder_rank_generator.get_ranks('pp')
+    for ranks in pipeline_rank_groups:
         assert (
             pipeline_model_parallel_comm_backend == None
             or pipeline_model_parallel_comm_backend == "nccl"
@@ -1280,29 +1309,31 @@ def initialize_model_parallel(
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
 
-        embedding_ranks = get_embedding_ranks(ranks)
-        if rank in embedding_ranks:
-            group = create_group(
-                embedding_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("embd", nccl_comm_cfgs),
-                use_local_synchronization=True,
-                group_desc="EMBEDDING_GROUP",
-            )
-            _EMBEDDING_GROUP = group
-            _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+    embedding_rank_groups = [get_embedding_ranks(ranks) for ranks in pipeline_rank_groups]
+    group, embedding_ranks = _create_local_sync_group_for_rank(
+        embedding_rank_groups,
+        rank,
+        timeout=timeout,
+        pg_options=get_nccl_options("embd", nccl_comm_cfgs),
+        group_desc="EMBEDDING_GROUP",
+    )
+    if group is not None:
+        _EMBEDDING_GROUP = group
+        _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        position_embedding_ranks = get_position_embedding_ranks(ranks)
-        if rank in position_embedding_ranks:
-            group = create_group(
-                position_embedding_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
-                use_local_synchronization=True,
-                group_desc="POSITION_EMBEDDING_GROUP",
-            )
-            _POSITION_EMBEDDING_GROUP = group
-            _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+    position_embedding_rank_groups = [
+        get_position_embedding_ranks(ranks) for ranks in pipeline_rank_groups
+    ]
+    group, position_embedding_ranks = _create_local_sync_group_for_rank(
+        position_embedding_rank_groups,
+        rank,
+        timeout=timeout,
+        pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
+        group_desc="POSITION_EMBEDDING_GROUP",
+    )
+    if group is not None:
+        _POSITION_EMBEDDING_GROUP = group
+        _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
@@ -1384,6 +1415,9 @@ def initialize_model_parallel(
             )
             _EXPERT_MODEL_PARALLEL_GROUP = group
             _EXPERT_MODEL_PARALLEL_RANKS = ranks
+    # These expert group families overlap differently.  With local synchronization,
+    # keep all ranks on the same family before constructing the next one.
+    torch.distributed.barrier()
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1400,6 +1434,7 @@ def initialize_model_parallel(
                 group_desc="EXPERT_TENSOR_PARALLEL_GROUP",
             )
             _EXPERT_TENSOR_PARALLEL_GROUP = group
+    torch.distributed.barrier()
 
     # Build the tensor + expert parallel groups
     global _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
@@ -1416,6 +1451,7 @@ def initialize_model_parallel(
                 group_desc="EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP",
             )
             _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = group
+    torch.distributed.barrier()
 
     # Build the expert+tensor+pipeline parallel groups
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
