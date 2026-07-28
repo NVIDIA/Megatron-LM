@@ -49,9 +49,16 @@ from .validation import (
 
 logger = logging.getLogger(__name__)
 
-# monkeypatch needed for ModelOpt
-# will be removed once MLM updated to newer ModelOpt
-get_default_load_sharded_strategy = TorchDistLoadShardedStrategy
+
+def get_default_load_sharded_strategy(checkpoint_dir: str | Path | None = None):
+    """Create the default torch distributed load strategy."""
+    return TorchDistLoadShardedStrategy(checkpoint_name=checkpoint_dir)
+
+
+def get_default_save_sharded_strategy(backend: str = "torch_dist"):
+    """Create the default torch distributed save strategy."""
+    return TorchDistSaveShardedStrategy(backend=backend)
+
 
 # flat state dict with sharded objects without any data
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
@@ -122,7 +129,15 @@ def load(
     #      params with a high-precision state dict;
     #   2. When using delayed scaling, this loading process writes an extra value into the global
     #      amax_history buffer of Transformer Engine, which is undesirable.
-    force_all_tensors_to_non_fp8(sharded_state_dict)
+    #
+    # When the sharded strategy supports per-tensor streaming dequantize
+    # (``stream_ckpt_dequant``), both concerns are handled inside the
+    # LoadPlanner on a per-tensor basis, which avoids peaking GPU memory
+    # with N simultaneous high-precision scratch tensors before the load
+    # begins. Covers FP8/MXFP8/blockwise-FP8/NVFP4 via the common
+    # ``QuantizedTensor`` base class.
+    if not getattr(sharded_strategy, "stream_ckpt_dequant", False):
+        force_all_tensors_to_non_fp8(sharded_state_dict)
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
