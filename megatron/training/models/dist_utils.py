@@ -355,12 +355,24 @@ def _ddp_wrap(
                 effective_bucket_size = (
                     None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
                 )
+                # Size the layout by the group the optimizer actually shards over, which is
+                # the intra-instance group when there are several optimizer instances. Using
+                # the full dp_cp would report more shards than the reduce-scatter uses and
+                # leave the trailing shard of every bucket owned by no rank.
+                intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
+                intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
                 chunk_kwargs["full_param_layout"] = compute_layout(
                     all_params,
                     effective_bucket_size,
-                    pg_collection.dp_cp.size(),
+                    (
+                        intra_dp_cp_group if intra_dp_cp_group is not None else pg_collection.dp_cp
+                    ).size(),
                     ddp_config,
-                    expert_data_parallel_world_size=pg_collection.expt_dp.size(),
+                    expert_data_parallel_world_size=(
+                        intra_expt_dp_group
+                        if intra_expt_dp_group is not None
+                        else pg_collection.expt_dp
+                    ).size(),
                 )
 
             wrapped_chunk = DP(

@@ -79,9 +79,9 @@ class PerBufferParamLayout:
         param_indices: The index of each param among same-dtype params (using the "fake"
             high-precision dtype for FP8/NVFP4 params). Needed for loading non-native-fp8
             checkpoints in native-fp8 mode. Order matches param_index_map iteration order.
-        num_optimizer_shards: Number of shards the bucket boundaries were aligned to. Set only
-            by ``LayerWiseDistributedOptimizer``, to recover a param's shard index; ``None`` for
-            ``DistributedOptimizer``, which takes the count from the buffer's data_parallel_group.
+        num_optimizer_shards: Number of optimizer shards. Set by the distributed optimizer
+            that computes the layout so that shard assignment at runtime uses the same
+            value. ``None`` for non-distributed-optimizer layouts.
     """
 
     param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
