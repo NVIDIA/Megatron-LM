@@ -858,9 +858,7 @@ class LLaVAModel(MegatronModule):
                 from megatron.core.parallel_state import get_context_parallel_group
                 from megatron.core.utils import get_batch_on_this_cp_rank
 
-                batch = get_batch_on_this_cp_rank(
-                    batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
-                )
+                batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=self.cp_group)
             else:
                 assert HAVE_TEX and is_te_min_version(
                     "1.10.0"

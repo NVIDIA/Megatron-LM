@@ -24,9 +24,6 @@ from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -1790,10 +1787,10 @@ class SelfAttention(Attention):
                 "DP",
             )
 
-        rank = get_tensor_model_parallel_rank()
-        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+        rank = self.tp_group.rank()
+        tp_list = [torch.empty_like(inputs) for _ in range(self.tp_group.size())]
         tp_list[rank] = inputs
-        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+        torch.distributed.all_gather(tp_list, inputs, group=self.tp_group)
 
         for i, tp in enumerate(tp_list):
             q_w, q_b, k_w, k_b = torch.unbind(tp)
@@ -1930,9 +1927,7 @@ class SelfAttention(Attention):
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
             if self.config.num_query_groups < self.world_size:
-                idx = get_tensor_model_parallel_rank() % (
-                    self.world_size // self.config.num_query_groups
-                )
+                idx = self.tp_group.rank() % (self.world_size // self.config.num_query_groups)
                 size = self.num_attention_heads_per_partition // (
                     self.world_size // self.config.num_query_groups
                 )

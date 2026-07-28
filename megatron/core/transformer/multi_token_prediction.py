@@ -1371,7 +1371,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.tp_group,
                     hidden_states,
                     decoder_input,
                     attention_mask,
