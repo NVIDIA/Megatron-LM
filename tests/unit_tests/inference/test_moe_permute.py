@@ -50,14 +50,15 @@ def _make_inputs(num_tokens, hidden_dim, topk, num_experts, seed=42):
 
 
 def test_batch_invariant_squared_relu_applies_probs_before_fc2():
-    """Match training's BF16 activation and probability rounding order."""
+    """Match training's probability placement and BF16 rounding before FC2."""
     from megatron.core.activations import squared_relu
     from megatron.core.inference.moe.activations import padded_squared_relu
 
     torch.manual_seed(17)
-    rows, hidden = 37, 1856
+    rows, hidden, output_size = 37, 1856, 512
     x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
     probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    fc2_weight = torch.randn(output_size, hidden, device="cuda", dtype=torch.bfloat16)
     permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
 
     unweighted = padded_squared_relu(x, permutation_map, _vt(rows))
@@ -67,6 +68,15 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
 
     assert torch.equal(unweighted, expected_unweighted)
     assert torch.equal(actual, expected)
+
+    training_output = expected @ fc2_weight.T
+    inference_output = actual @ fc2_weight.T
+    old_inference_output = ((unweighted @ fc2_weight.T).float() * probs.unsqueeze(1)).to(
+        torch.bfloat16
+    )
+
+    assert torch.equal(inference_output, training_output)
+    assert not torch.equal(old_inference_output, training_output)
 
 
 @pytest.mark.internal

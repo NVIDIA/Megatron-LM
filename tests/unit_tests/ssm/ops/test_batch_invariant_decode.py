@@ -81,9 +81,9 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             torch.randn(1, total_len, ng, n, device=self.device, dtype=self.dtype) * 0.1,
         )
 
-    def _make_bufs(self, max_batch):
+    def _make_bufs(self, max_requests):
         return BatchInvariantDecodeBuffers.allocate(
-            max_batch,
+            max_requests,
             self.chunk_size,
             self.nh,
             self.headdim,
@@ -93,19 +93,24 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             self.dtype,
         )
 
-    def _make_ssm_state(self, max_batch):
+    def _make_ssm_state(self, max_requests):
         """Production BIK state cache: FP32 carry across Mamba chunks."""
         return torch.zeros(
-            max_batch, self.nh, self.headdim, self.dstate, device=self.device, dtype=torch.float32
+            max_requests,
+            self.nh,
+            self.headdim,
+            self.dstate,
+            device=self.device,
+            dtype=torch.float32,
         )
 
-    def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_batch):
+    def _seed_from_prefill(self, bufs, x, dt, B, C, prefill_len, slot, max_requests):
         """Run the prefill through the reference scan, store its ssm_state at
         the slot, and seed the batch-invariant buffer with the partial-chunk tail."""
         # Production batch-invariant prefill keeps ssm_state at a full Mamba chunk
         # boundary. Short prefills therefore keep the zero initial boundary;
         # longer prefills store the largest chunk-aligned prefix state.
-        ssm_state = self._make_ssm_state(max_batch)
+        ssm_state = self._make_ssm_state(max_requests)
         if prefill_len >= self.chunk_size:
             # Prefill on the largest chunk-aligned prefix; the tail goes in the buffer.
             aligned = (prefill_len // self.chunk_size) * self.chunk_size
@@ -211,7 +216,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
     def test_single_decode_matches_full_scan(self):
         """Default case: prefill > chunk_size, single decode token, partial tail."""
-        max_batch, slot = 4, 1
+        max_requests, slot = 4, 1
         for prefill_len in [33, 50, 95, 128]:
             with self.subTest(prefill_len=prefill_len):
                 total = prefill_len + 1
@@ -219,8 +224,10 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 # Reference: full scan over the whole (prefill + 1) sequence.
                 y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
                 # batch-invariant: seed from prefill, then one decode step.
-                bufs = self._make_bufs(max_batch)
-                ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
+                bufs = self._make_bufs(max_requests)
+                ssm_state = self._seed_from_prefill(
+                    bufs, x, dt, B, C, prefill_len, slot, max_requests
+                )
                 y_batch_invariant = self._decode_one_step(
                     bufs, x, dt, B, C, prefill_len, slot, ssm_state
                 )
@@ -231,7 +238,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
     def test_rejects_bf16_state_cache(self):
         """A rounded state cache cannot preserve carry across multiple chunks."""
         x, dt, B, C = self._make_seq(1)
-        bufs = self._make_bufs(max_batch=2)
+        bufs = self._make_bufs(max_requests=2)
         ssm_state = torch.zeros(
             2, self.nh, self.headdim, self.dstate, device=self.device, dtype=torch.bfloat16
         )
@@ -267,7 +274,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         """Production prefill returns the prompt-end state too, but batch-invariant decode
         must keep the cache at the last full chunk boundary and put the tail in
         the replay buffer."""
-        max_batch, slot = 4, 1
+        max_requests, slot = 4, 1
         for prefill_len in [31, 33, 50, 95, 128]:
             with self.subTest(prefill_len=prefill_len):
                 total = prefill_len + 1
@@ -277,10 +284,10 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                 _, boundary_state = self._varlen_boundary_state_from_prefill(
                     x, dt, B, C, prefill_len
                 )
-                ssm_state = torch.randn_like(self._make_ssm_state(max_batch))
+                ssm_state = torch.randn_like(self._make_ssm_state(max_requests))
                 ssm_state[slot] = boundary_state[0]
 
-                bufs = self._make_bufs(max_batch)
+                bufs = self._make_bufs(max_requests)
                 cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
                 batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
                 bufs.seed(
@@ -303,7 +310,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
     def test_chunked_prefill_handoff_matches_full_scan(self):
         """Splitting prefill at a Mamba boundary preserves exact decode output."""
-        max_batch, slot = 2, 0
+        max_requests, slot = 2, 0
         first_chunk_len = 2 * self.chunk_size
 
         for final_chunk_len in [20, self.chunk_size + 13]:
@@ -328,9 +335,9 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
                     initial_states=first_boundary,
                 )
 
-                ssm_state = self._make_ssm_state(max_batch)
+                ssm_state = self._make_ssm_state(max_requests)
                 ssm_state[slot] = final_boundary[0]
-                bufs = self._make_bufs(max_batch)
+                bufs = self._make_bufs(max_requests)
                 cu = torch.tensor([0, final_chunk_len], dtype=torch.int32, device=self.device)
                 bufs.seed(
                     x[0, first_chunk_len:prefill_len],
@@ -355,14 +362,14 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         prefix. Seed must duplicate a valid per-sequence tail token into unused
         replay-buffer rows; otherwise masked future rows can still poison the
         row-gated Triton dot as 0 * NaN."""
-        max_batch, slot = 4, 0
+        max_requests, slot = 4, 0
         prefill_len = self.chunk_size + 1
         total = prefill_len + 1
         x, dt, B, C = self._make_seq(total)
         y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
 
         _, boundary_state = self._varlen_boundary_state_from_prefill(x, dt, B, C, prefill_len)
-        ssm_state = self._make_ssm_state(max_batch)
+        ssm_state = self._make_ssm_state(max_requests)
         ssm_state[slot] = boundary_state[0]
 
         nan_x = torch.full_like(x[0, :1], float("nan"))
@@ -370,7 +377,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         nan_B = torch.full_like(B[0, :1], float("nan"))
         nan_C = torch.full_like(C[0, :1], float("nan"))
 
-        bufs = self._make_bufs(max_batch)
+        bufs = self._make_bufs(max_requests)
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
@@ -395,14 +402,16 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
     def test_short_prefill_uses_zero_boundary_state(self):
         """prefill_len < chunk_size: decode replays from the zero boundary."""
-        max_batch, slot = 2, 0
+        max_requests, slot = 2, 0
         for prefill_len in [1, 7, 16, 31]:
             with self.subTest(prefill_len=prefill_len):
                 total = prefill_len + 1
                 x, dt, B, C = self._make_seq(total)
                 y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
-                bufs = self._make_bufs(max_batch)
-                ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
+                bufs = self._make_bufs(max_requests)
+                ssm_state = self._seed_from_prefill(
+                    bufs, x, dt, B, C, prefill_len, slot, max_requests
+                )
                 y_batch_invariant = self._decode_one_step(
                     bufs, x, dt, B, C, prefill_len, slot, ssm_state
                 )
@@ -413,15 +422,15 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
     def test_multi_step_decode_across_chunk_boundary(self):
         """Step decode several times so the per-slot buffer fills, crosses
         a chunk boundary, and resets. Each step must match the full scan."""
-        max_batch, slot = 2, 0
+        max_requests, slot = 2, 0
         prefill_len = 20  # < chunk_size, so first decode step will keep growing buf
         n_decode = self.chunk_size + 5  # enough to cross at least one boundary
         total = prefill_len + n_decode
         x, dt, B, C = self._make_seq(total)
         y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
 
-        bufs = self._make_bufs(max_batch)
-        ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
+        bufs = self._make_bufs(max_requests)
+        ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_requests)
 
         for k in range(n_decode):
             pos = prefill_len + k
@@ -435,7 +444,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
     def test_multi_slot_independent_streams(self):
         """Two slots with different prefill lengths decoded in the same call —
         each slot's output must match its own full scan."""
-        max_batch = 4
+        max_requests = 4
         slots = [0, 2]
         prefill_lens = [25, 70]  # one short, one long with a boundary state
         x_per_slot, dt_per_slot, B_per_slot, C_per_slot = [], [], [], []
@@ -449,13 +458,13 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
             y_refs.append(y_full[0, plen])
 
-        bufs = self._make_bufs(max_batch)
+        bufs = self._make_bufs(max_requests)
         # Per-slot seeding (each slot's prefill done independently).
-        ssm_state = self._make_ssm_state(max_batch)
+        ssm_state = self._make_ssm_state(max_requests)
         for slot, plen, x, dt, B, C in zip(
             slots, prefill_lens, x_per_slot, dt_per_slot, B_per_slot, C_per_slot
         ):
-            partial = self._seed_from_prefill(bufs, x, dt, B, C, plen, slot, max_batch)
+            partial = self._seed_from_prefill(bufs, x, dt, B, C, plen, slot, max_requests)
             ssm_state[slot] = partial[slot]
 
         # Both slots step at once.
@@ -494,15 +503,15 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         """batch_indices mixing -1 padding entries with active slot 0 (the CUDA-
         graph padding pattern). Padding entries must not write replay buffers,
         perturb slot 0, or produce nonzero output."""
-        max_batch, slot = 3, 0
+        max_requests, slot = 3, 0
         prefill_len = 50
         n_decode = 8
         total = prefill_len + n_decode
         x, dt, B, C = self._make_seq(total)
         y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
 
-        bufs = self._make_bufs(max_batch)
-        ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
+        bufs = self._make_bufs(max_requests)
+        ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_requests)
         batch_indices = torch.tensor([slot, -1, -1], dtype=torch.int32, device=self.device)
         inactive_counts = bufs.num_buffered[1:].clone()
         for k in range(n_decode):
@@ -564,20 +573,20 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
     def test_cuda_graph_replay_matches_full_scan(self):
         """A captured decode step advances persistent state exactly across replays."""
-        max_batch, slot = 2, 0
+        max_requests, slot = 2, 0
         prefill_len = 20
         x, dt, B, C = self._make_seq(prefill_len + 2)
         y_full, _ = _full_scan(x, dt, self.A, B, C, self.D, self.dt_bias, self.chunk_size)
 
         # Compile Triton before capture without touching the graph's buffers.
-        warmup_bufs = self._make_bufs(max_batch)
+        warmup_bufs = self._make_bufs(max_requests)
         warmup_state = self._seed_from_prefill(
-            warmup_bufs, x, dt, B, C, prefill_len, slot, max_batch
+            warmup_bufs, x, dt, B, C, prefill_len, slot, max_requests
         )
         self._decode_one_step(warmup_bufs, x, dt, B, C, prefill_len, slot, warmup_state)
 
-        bufs = self._make_bufs(max_batch)
-        ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
+        bufs = self._make_bufs(max_requests)
+        ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_requests)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         static_x = x[:, prefill_len : prefill_len + 1].clone()
         static_z = static_x.clone()
@@ -630,7 +639,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         (weak decay: A ~ -0.01 → exp(dA_cs) ≈ 1). Guards the pipeline
         ordering and FP32 state-passing carry. With strong decay, either
         corruption can round away in BF16 and hide."""
-        max_batch, slot = 2, 0
+        max_requests, slot = 2, 0
         prefill_len = 20
         # Cross twice: the second transition detects an accidental BF16
         # store/reload of state passing's FP32 carry.
@@ -654,8 +663,8 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             return_final_states=True,
         )
 
-        bufs = self._make_bufs(max_batch)
-        ssm_state = self._make_ssm_state(max_batch)
+        bufs = self._make_bufs(max_requests)
+        ssm_state = self._make_ssm_state(max_requests)
         cu = torch.tensor([0, prefill_len], dtype=torch.int32, device=self.device)
         batch_indices = torch.tensor([slot], dtype=torch.int32, device=self.device)
         bufs.seed(
@@ -686,15 +695,15 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
     def test_deterministic_across_calls(self):
         """Same inputs → bitwise-identical output across repeated invocations."""
-        max_batch, slot = 2, 0
+        max_requests, slot = 2, 0
         prefill_len = 50
         total = prefill_len + 1
         x, dt, B, C = self._make_seq(total)
 
         outs = []
         for _ in range(3):
-            bufs = self._make_bufs(max_batch)
-            ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_batch)
+            bufs = self._make_bufs(max_requests)
+            ssm_state = self._seed_from_prefill(bufs, x, dt, B, C, prefill_len, slot, max_requests)
             outs.append(self._decode_one_step(bufs, x, dt, B, C, prefill_len, slot, ssm_state))
         for i in range(1, len(outs)):
             self.assertTrue(

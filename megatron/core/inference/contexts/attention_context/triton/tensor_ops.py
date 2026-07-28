@@ -128,9 +128,7 @@ def _tensor_masked_update_kernel_2d(
         + (row_offsets.to(tl.int64) * stride_state_d0)
     )
     src_ptr = (
-        NEW_STATES_PTR
-        + (pid_batch * stride_new_b.to(tl.int64))
-        + (row_offsets.to(tl.int64) * stride_new_d0)
+        NEW_STATES_PTR + (pid_batch * stride_new_b) + (row_offsets.to(tl.int64) * stride_new_d0)
     )
 
     val = tl.load(src_ptr, mask=mask)
@@ -170,21 +168,17 @@ def _tensor_masked_update_kernel_3d(
     # Given shape (batch, D0, D1)
     # idx_d1 = flat_idx % D1
     # idx_d0 = flat_idx // D1
-    idx_d1 = flat_offsets % SIZE_D1.to(tl.int64)
-    idx_d0 = flat_offsets // SIZE_D1.to(tl.int64)
+    idx_d1 = flat_offsets % SIZE_D1
+    idx_d0 = flat_offsets // SIZE_D1
 
     # Calculate pointers using specific strides
     dst_offset = (
-        (target_idx.to(tl.int64) * stride_state_b.to(tl.int64))
+        (target_idx.to(tl.int64) * stride_state_b)
         + (idx_d0 * stride_state_d0)
         + (idx_d1 * stride_state_d1)
     )
 
-    src_offset = (
-        (pid_batch * stride_new_b.to(tl.int64))
-        + (idx_d0 * stride_new_d0)
-        + (idx_d1 * stride_new_d1)
-    )
+    src_offset = (pid_batch * stride_new_b) + (idx_d0 * stride_new_d0) + (idx_d1 * stride_new_d1)
 
     dst_ptr = STATES_PTR + dst_offset
     src_ptr = NEW_STATES_PTR + src_offset
@@ -232,21 +226,21 @@ def _tensor_masked_update_kernel_4d(
     # idx_d1 = temp % D1
     # idx_d0 = temp // D1
 
-    idx_d2 = flat_offsets % SIZE_D2.to(tl.int64)
-    temp = flat_offsets // SIZE_D2.to(tl.int64)
-    idx_d1 = temp % SIZE_D1.to(tl.int64)
-    idx_d0 = temp // SIZE_D1.to(tl.int64)
+    idx_d2 = flat_offsets % SIZE_D2
+    temp = flat_offsets // SIZE_D2
+    idx_d1 = temp % SIZE_D1
+    idx_d0 = temp // SIZE_D1
 
     # Calculate pointers using specific strides
     dst_offset = (
-        (target_idx.to(tl.int64) * stride_state_b.to(tl.int64))
+        (target_idx.to(tl.int64) * stride_state_b)
         + (idx_d0 * stride_state_d0)
         + (idx_d1 * stride_state_d1)
         + (idx_d2 * stride_state_d2)
     )
 
     src_offset = (
-        (pid_batch * stride_new_b.to(tl.int64))
+        (pid_batch * stride_new_b)
         + (idx_d0 * stride_new_d0)
         + (idx_d1 * stride_new_d1)
         + (idx_d2 * stride_new_d2)
