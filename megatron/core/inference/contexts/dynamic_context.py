@@ -748,12 +748,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
-        usable_blocks = self.kv_block_allocator.pool_size - 1
-        total_blocks = self.kv_block_allocator.pool_size
-        paused_block_budget = self.kv_block_allocator.paused_limit
-        usable_kv_bytes = usable_blocks * self.block_size_bytes
-        total_kv_bytes = total_blocks * self.block_size_bytes
-        paused_kv_budget_bytes = paused_block_budget * self.block_size_bytes
+        pool_size = self.kv_block_allocator.pool_size
+        usable_blocks = pool_size - 1
+        paused_limit = self.kv_block_allocator.paused_limit
+        pool_size_bytes = pool_size * self.block_size_bytes
+        usable_bytes = usable_blocks * self.block_size_bytes
+        paused_limit_bytes = paused_limit * self.block_size_bytes
 
         log_lines = [
             "DynamicInferenceContext: configuration summary",
@@ -764,10 +764,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"  max_kv_blocks_per_req:   {self.max_kv_block_count}",
             f"  KV cache:",
             f"    block_size_bytes:      {get_mem_size_str(self.block_size_bytes)}",
-            f"    usable_blocks:         {usable_blocks} ({get_mem_size_str(usable_kv_bytes)})",
-            f"    paused_block_budget:   {paused_block_budget} "
-            f"({get_mem_size_str(paused_kv_budget_bytes)})",
-            f"    total_blocks:          {total_blocks} ({get_mem_size_str(total_kv_bytes)})",
+            f"    pool_size:             {pool_size} ({get_mem_size_str(pool_size_bytes)})",
+            f"    usable_blocks:         {usable_blocks} ({get_mem_size_str(usable_bytes)})",
+            f"    paused_limit:          {paused_limit} "
+            f"({get_mem_size_str(paused_limit_bytes)})",
         ]
 
         if self.is_hybrid_model:
