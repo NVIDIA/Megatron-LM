@@ -875,6 +875,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    moe_hybridep_pad_uneven_dispatch_inputs: bool = False
+    """Pad uneven HybridEP dispatch inputs to the group maximum before dispatch.
+    Enable when local HybridEP input token counts can differ across ranks, for example
+    with dynamically packed THD inputs. Leave disabled when dispatcher inputs are
+    already padded to equal token counts.
+    """
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -1014,7 +1021,9 @@ class TransformerConfig(ModelParallelConfig):
     more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
 
     cuda_graph_warmup_steps: int = 3
-    """Number of warmup steps for CUDA graphs"""
+    """Number of warmup steps for CUDA graphs. Note: GTP (``gtp_weight_remat_size > 1``) forces a
+    minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
+    the weight-prefetch chain and the second exercises the prefetch path before capture."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
@@ -2563,6 +2572,27 @@ class TransformerConfig(ModelParallelConfig):
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
 
+                    if (
+                        self.gtp_weight_remat_size > 1
+                        and self.cuda_graph_impl == "local"
+                        and (self.fp8 is not None or self.fp4 is not None)
+                        and self.moe_shared_expert_intermediate_size is not None
+                        and not self.moe_shared_expert_overlap
+                        and (
+                            full_cudagraph
+                            or CudaGraphModule.moe in self.cuda_graph_modules
+                            or CudaGraphModule.moe_router in self.cuda_graph_modules
+                        )
+                    ):
+                        assert "shared_experts" not in self.recompute_modules, (
+                            "GTP + local CUDA graphs that capture shared_experts "
+                            "(moe_router/moe scope) cannot recompute it under fp8/fp4: "
+                            "te_checkpoint requires .backward(), but the local fwd-graph "
+                            "warmup uses .grad(). Drop 'shared_experts' from "
+                            "--recompute-modules (GTP-shard + offload instead), or use "
+                            "--cuda-graph-impl full_iteration."
+                        )
+
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
                 if self.cuda_graph_impl == "local":
@@ -2676,9 +2706,11 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.mtp_num_layers is None or self.mtp_num_layers == 1
-            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            assert self.mtp_num_layers in (
+                None,
+                0,
+                1,
+            ), 'MTP supports at most one layer when enabling overlap_moe_expert_parallel_comm.'
 
             # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
             # configs are not yet safe under the 1F1B split and are gated here.
