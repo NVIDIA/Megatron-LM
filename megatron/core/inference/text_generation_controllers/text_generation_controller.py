@@ -1944,8 +1944,6 @@ class TextGenerationController:
 
         if run_async_overlap and context.paused_request_count != 0:
             raise RuntimeError("Async scheduling overlap does not support paused requests.")
-        if context.chunked_prefill_request_id != -1:
-            raise RuntimeError("Async scheduling does not support chunked prefill.")
 
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
         """Compact cached logits from old active-row order into survivor order.
@@ -2108,6 +2106,15 @@ class TextGenerationController:
             sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(resolved_sequence_lengths, max_sequence_lengths).byte()
 
+        if context.chunked_prefill_request_id != -1:
+            chunked_prefill_rows = torch.nonzero(
+                active_request_ids == context.chunked_prefill_request_id, as_tuple=True
+            )[0]
+            assert (
+                chunked_prefill_rows.numel() == 1
+            ), "The active chunked-prefill request must have exactly one row."
+            active_request_mask[chunked_prefill_rows[0]] = 1
+
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -2254,6 +2261,12 @@ class TextGenerationController:
             skip_token_input_ids=True, record_done_event=True
         )
 
+    def _commit_mamba_intermediate_states(self) -> None:
+        """Commit prefix-cacheable Mamba states produced by the current forward."""
+        context = self.inference_wrapped_model.inference_context
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
     def _run_async_sched_forward(
         self, input_ids_gpu_view: Tensor, position_ids_gpu_view: Tensor
     ) -> None:
@@ -2271,6 +2284,7 @@ class TextGenerationController:
         # Forward.
         range_push("forward_pass")
         self._dynamic_step_forward_logits(input_ids_gpu_view, position_ids_gpu_view)
+        self._commit_mamba_intermediate_states()
         range_pop()
 
         # Record the logits and identity mapping for this forward's input rows.
@@ -2729,8 +2743,7 @@ class TextGenerationController:
             # may swap request indices. The Python lists tracking EOS block IDs
             # and intermediate offsets are not swapped along with tensors, so
             # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
+            self._commit_mamba_intermediate_states()
 
             # Collect flat routing indices and scatter them into per-block storage.
             # Must be done before update_requests while token-to-block mappings are valid.

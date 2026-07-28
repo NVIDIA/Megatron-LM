@@ -350,6 +350,7 @@ def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
     context.config.materialize_only_last_token_logits = False
     context.is_hybrid_model = True
     context.enable_prefix_caching = True
+    context.chunked_prefill_request_id = 10
     context.request_metadata["top_k"] = torch.tensor([0, 0])
     context.request_metadata["top_p"] = torch.tensor([0.5, 0.5])
     context.request_metadata["return_log_probs"] = torch.tensor([True, True])
@@ -366,14 +367,10 @@ def test_validate_async_sched_support_for_step_ignores_immutable_restrictions():
     controller._validate_async_sched_support_for_step(run_async_overlap=True)
 
 
-@pytest.mark.parametrize("unsupported_case", ["paused_request", "chunked_prefill"])
-def test_validate_async_sched_support_for_step_errors(unsupported_case):
+def test_validate_async_sched_support_for_step_errors_on_paused_overlap():
     context = _make_async_sched_context(total_request_count=2)
     controller = _make_async_sched_controller(context)
-    if unsupported_case == "paused_request":
-        context.paused_request_count = 1
-    elif unsupported_case == "chunked_prefill":
-        context.chunked_prefill_request_id = 0
+    context.paused_request_count = 1
 
     with pytest.raises(RuntimeError, match="Async scheduling"):
         controller._validate_async_sched_support_for_step(run_async_overlap=True)
@@ -556,8 +553,23 @@ def test_run_async_sched_forward_records_pending_logits(
     )
 
 
-def test_run_dummy_async_sched_base_step_resets_context():
+def test_run_async_sched_forward_commits_mamba_prefix_states():
+    """A real async forward commits cacheable Mamba states before row resolution."""
     context = _make_async_sched_context()
+    context.is_hybrid_model = True
+    context.mamba_slot_allocator = SimpleNamespace(commit_intermediate_states=mock.Mock())
+    controller = _make_async_sched_controller(context)
+    controller._dynamic_step_forward_logits = mock.Mock()
+
+    controller._run_async_sched_forward(torch.tensor([[10, 11]]), torch.tensor([[0, 1]]))
+
+    context.mamba_slot_allocator.commit_intermediate_states.assert_called_once_with()
+
+
+def test_run_dummy_async_sched_base_step_resets_without_committing_mamba_state():
+    context = _make_async_sched_context()
+    context.is_hybrid_model = True
+    context.mamba_slot_allocator = SimpleNamespace(commit_intermediate_states=mock.Mock())
     controller = _make_async_sched_controller(context)
     input_ids = torch.tensor([[10]])
     position_ids = torch.tensor([[0]])
@@ -568,6 +580,7 @@ def test_run_dummy_async_sched_base_step_resets_context():
 
     assert result is None
     controller._run_dummy_base_forward.assert_called_once_with(input_ids, position_ids)
+    context.mamba_slot_allocator.commit_intermediate_states.assert_not_called()
     context.reset.assert_called_once_with(preserve_prefix_cache=True, preserve_counters=True)
 
 
@@ -750,6 +763,21 @@ def test_build_async_sched_request_state_uses_resolved_lengths():
     )
 
     assert active_mask.tolist() == [1, 0]
+    assert finished_request_ids.tolist() == [11]
+
+
+def test_build_async_sched_request_state_keeps_partial_chunk_active():
+    """A partial chunk ignores its provisional sample and remains schedulable."""
+    context = _make_async_sched_context(total_request_count=3)
+    context.chunked_prefill_request_id = 12
+    context.get_max_sequence_lengths.return_value = torch.tensor([4, 4, 4])
+    controller = _make_async_sched_controller(context)
+
+    _, finished_request_ids, active_mask = controller._build_async_sched_request_state(
+        torch.tensor([1, 2, 3]), torch.tensor([3, 4, 4])
+    )
+
+    assert active_mask.tolist() == [1, 0, 1]
     assert finished_request_ids.tolist() == [11]
 
 

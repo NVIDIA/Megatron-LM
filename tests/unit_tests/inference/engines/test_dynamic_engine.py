@@ -1143,6 +1143,66 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize(
+        ("enable_chunked_prefill", "enable_prefix_caching"),
+        [(True, False), (False, True), (True, True)],
+    )
+    @torch.inference_mode()
+    def test_async_sched_prefix_caching_and_chunked_prefill_e2e(
+        self, enable_chunked_prefill, enable_prefix_caching
+    ):
+        """Async output matches legacy for chunking, KV caching, and their combination."""
+
+        def run(mode):
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,
+                num_tokens_to_generate=4,
+                max_sequence_length=768,
+                context_block_size_tokens=256,
+                context_max_tokens=384 if enable_chunked_prefill else 1024,
+                context_max_requests=4,
+                enable_chunked_prefill=enable_chunked_prefill,
+                enable_prefix_caching=enable_prefix_caching,
+                async_sched_mode=mode,
+            )
+            env = self._build_test_env(test_config)
+            prompt = torch.arange(512, dtype=torch.int64, device="cuda") % (
+                test_config.vocab_size - 1
+            )
+            outputs = {}
+
+            def add_request(request_id):
+                env.engine.add_request(
+                    request_id=request_id,
+                    prompt=prompt.clone(),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=4, termination_id=-1, top_k=1, top_p=0.0
+                    ),
+                )
+
+            add_request(0)
+            env.engine.step_modern()
+            add_request(1)
+            while env.engine.has_unfinished_requests():
+                result = env.engine.step_modern()
+                for record in result["finished_request_records"]:
+                    request = record.merge()
+                    outputs[request.request_id] = list(request.generated_tokens)
+            return env.engine, outputs
+
+        _, legacy_outputs = run(AsyncScheduleMode.LEGACY)
+        async_engine, async_outputs = run(AsyncScheduleMode.ASYNC)
+
+        assert async_outputs == legacy_outputs
+        assert all(len(tokens) == 4 for tokens in async_outputs.values())
+        assert async_engine.context.async_sched_step_count > 0
+        if enable_prefix_caching:
+            assert async_engine._prefill_tokens_skipped > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_fp8_inference(self, model_provider: str):
