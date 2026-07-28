@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Transfer planning for parameters sharded with generalized tensor parallelism."""
+"""Transfer planning in logical weight coordinates."""
 
 import math
 from itertools import product
@@ -17,8 +17,8 @@ class _Segment(NamedTuple):
     length: int
 
 
-def _gtp_layout(metadata: ParameterMetadata, dim: int) -> tuple[int, int, int]:
-    """Return this shard's start/stop and the unpadded TP-local dimension size."""
+def _storage_interval(metadata: ParameterMetadata, dim: int) -> tuple[int, int, int]:
+    """Return local storage bounds in the unpadded TP-local weight."""
     local_size = metadata.shape[dim]
     if not metadata.is_gtp or dim != 0:
         return 0, local_size, local_size
@@ -94,16 +94,16 @@ def _local_segments(metadata: ParameterMetadata, dim: int) -> list[_Segment]:
     that slice with the TP segments naturally handles column, row, strided, and
     packed tensor-parallel layouts.
     """
-    gtp_start, gtp_stop, tp_local_size = _gtp_layout(metadata, dim)
+    storage_start, storage_stop, tp_local_size = _storage_interval(metadata, dim)
     segments = []
     for tp_segment in _tp_segments(metadata, dim, tp_local_size):
         tp_stop = tp_segment.local_start + tp_segment.length
-        start = max(gtp_start, tp_segment.local_start)
-        stop = min(gtp_stop, tp_stop)
+        start = max(storage_start, tp_segment.local_start)
+        stop = min(storage_stop, tp_stop)
         if start < stop:
             segments.append(
                 _Segment(
-                    start - gtp_start,
+                    start - storage_start,
                     tp_segment.global_start + start - tp_segment.local_start,
                     stop - start,
                 )
@@ -115,7 +115,7 @@ def _global_shape(metadata: ParameterMetadata) -> tuple[int, ...]:
     """Return the unpadded shape after materializing TP and GTP."""
     shape = []
     for dim in range(len(metadata.shape)):
-        _, _, tp_local_size = _gtp_layout(metadata, dim)
+        _, _, tp_local_size = _storage_interval(metadata, dim)
         if metadata.is_tp and metadata.partition_dim == dim:
             group = metadata.tensor_parallel_group_ranks
             if not group:
@@ -126,10 +126,10 @@ def _global_shape(metadata: ParameterMetadata) -> tuple[int, ...]:
 
 
 def _source_shards(
-    src_metadata: list[ParameterMetadata], selected: ParameterMetadata
+    all_src_metadata: list[ParameterMetadata], selected: ParameterMetadata
 ) -> list[ParameterMetadata]:
     """Find the TP x GTP shard grid containing the selected source replica."""
-    by_rank = {metadata.owner_rank: metadata for metadata in src_metadata}
+    by_rank = {metadata.owner_rank: metadata for metadata in all_src_metadata}
     pending = [selected.owner_rank]
     ranks = {selected.owner_rank}
 
@@ -174,14 +174,14 @@ def _overlap(
     return overlaps
 
 
-def plan_gtp(
+def plan_sharded_transfer(
     param_name: str,
-    src_metadata: list[ParameterMetadata],
+    all_src_metadata: list[ParameterMetadata],
     selected_src: ParameterMetadata,
     dst_metadata: ParameterMetadata,
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
-    """Plan transfers by intersecting TP/GTP shards in logical weight coordinates."""
-    src_shards = _source_shards(src_metadata, selected_src)
+    """Plan a transfer by intersecting source and destination logical shards."""
+    src_shards = _source_shards(all_src_metadata, selected_src)
     dst_shape = _global_shape(dst_metadata)
     dst_segments = [_local_segments(dst_metadata, dim) for dim in range(len(dst_metadata.shape))]
 
