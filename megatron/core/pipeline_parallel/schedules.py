@@ -671,6 +671,30 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def _build_default_pg_collection() -> ProcessGroupCollection:
+    """Build a ``ProcessGroupCollection`` from the global ``parallel_state`` defaults.
+
+    Used by the schedule entry points as the fallback when the caller does not
+    supply a ``pg_collection`` explicitly.
+    """
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
+    pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.embd = parallel_state.get_embedding_group(check_initialized=False)
+    pg_collection.pos_embd = parallel_state.get_position_embedding_group(check_initialized=False)
+    pg_collection.pp = parallel_state.get_pipeline_model_parallel_group()
+    pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+        with_context_parallel=True, partial_data_parallel=False
+    )
+    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+        with_context_parallel=True
+    )
+    pg_collection.dp = parallel_state.get_data_parallel_group(
+        with_context_parallel=False, partial_data_parallel=False
+    )
+    return pg_collection
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -691,23 +715,7 @@ def forward_backward_no_pipelining(
     """Run forward and backward passes with no pipeline parallelism"""
 
     if pg_collection is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
+        pg_collection = _build_default_pg_collection()
 
     elif pg_collection is not None:
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
@@ -1131,25 +1139,10 @@ def forward_backward_pipelining_with_interleaving(
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = _build_default_pg_collection()
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
         cp_size = cp_group.size()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
@@ -2328,25 +2321,10 @@ def forward_backward_pipelining_without_interleaving(
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = _build_default_pg_collection()
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
         cp_size = cp_group.size()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.pp = pp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.cp = cp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
