@@ -251,8 +251,10 @@ def classify_gtp_chains(model) -> None:
         # safe where no same-key gather falls between the two: the output layer is last in
         # fwd and first in bwd, so its window is empty. A mid-chain param would also need
         # _need_weight_prefetch_bwd = False, or its successor still prefetches it. Excluded
-        # under native FP8 (fwd gathers rowwise-, bwd columnwise-scaled data). Tied
-        # embeddings are an "embedding..."-named param, so this stays False there.
+        # under native FP8 (fwd gathers rowwise-, bwd columnwise-scaled data). Tied models
+        # are also excluded, not supported: the shared weight is registered under an
+        # "embedding..." name, and it gathers twice per fwd (lookup + output projection),
+        # so the retention would have to key off the second one.
         if "output_layer" in name and not getattr(param, "_gtp_native_fp8", False):
             param._retain_for_bwd = True
     if conflicts:
@@ -1757,10 +1759,10 @@ class _TicketSlot:
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
     # Buffer is held from its fwd gather until the bwd dgrad consumes it, so it must never be
-    # pooled again once bound (see GTPWeightCache._pinned_bufs). Slots that adopted it BEFORE
-    # the pin may still reference it; safe only while no co-owner gathers inside that window.
-    # Tickets are minted in fwd order and a pinned slot pops once at birth, so every co-owner
-    # is earlier in fwd, hence later in bwd. Read only by get().
+    # pooled again once bound (see GTPWeightCache._pinned_bufs). Slots created BEFORE the pin
+    # may still share it: they gather earlier in fwd and later in bwd, so never inside that
+    # window. Slots created AFTER it -- the ones that would gather inside the window -- can
+    # never share it, because the pin keeps the buffer out of the pool. Read only by get().
     pin_for_fwd: bool = False
 
 
@@ -2121,8 +2123,7 @@ class GTPEmbeddingWeight(torch.autograd.Function):
 
 
 def reset_gtp_state():
-    """Clear the process-global GTP prefetch-chain state (GTPShardedParam._chain_state /
-    ._recompute_chain_state).
+    """Clear the process-global GTP prefetch-chain state and gather-buffer cache.
 
     These class-level dicts survive model teardown, so a GTP model rebuilt in-process would
     inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
@@ -2131,6 +2132,11 @@ def reset_gtp_state():
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
+    # Buffers outlive the params that allocated them. Pooled ones are recycled by the rebuilt
+    # model, but a pinned buffer is never pooled, so it would be stranded once per rebuild.
+    # Safe here: this runs after model build and before the first forward, so no pinned buffer
+    # is mid-retention.
+    get_global_GTP_cache().clear()
 
 
 # ------------------------------------------------------------------------

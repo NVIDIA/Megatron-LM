@@ -184,9 +184,9 @@ def _worker_output_layer_weight_gathered_once(rank, world_size, port):
     result is retained and reused, saving one collective. Two halves are covered here:
 
     * Which layers opt in. The opt-in is a name match, mirroring the embedding
-      bwd-prefetch opt-out. A tied output weight is registered under an "embedding..."
-      name and must not opt in, because its backward is a scatter-add with no gather
-      to reuse; ordinary weights must not opt in either.
+      bwd-prefetch opt-out. Ordinary weights must not opt in, and neither must an
+      "embedding..."-named one -- which is how a tied output weight is registered, so
+      tied models simply do not get this optimization.
     * That the reuse actually happens. No backward gather ticket may be reserved -- that
       is what distinguishes the reuse from a silent fallback re-gather -- and the input
       gradient must still match a reference built from an explicit all-gather.
