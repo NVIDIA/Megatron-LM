@@ -492,7 +492,9 @@ class TestDynamicResCPDistributed:
             (1, 4, 8), float(cp_rank + 1), dtype=torch.float32, device="cuda", requires_grad=True
         )
 
-        gathered = GatherFromContextParallelRanks.apply(local_t)
+        gathered = GatherFromContextParallelRanks.apply(
+            local_t, parallel_state.get_context_parallel_group()
+        )
         loss = gathered.sum()
         loss.backward()
 
