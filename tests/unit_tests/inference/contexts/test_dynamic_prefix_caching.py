@@ -813,19 +813,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req6 = self._req(ctx6, p6.clone(), request_id=2)
         assert ctx6._find_mamba_match_count(req6, 0, len(req6.precomputed_block_hashes)) == 2
 
-        # BIK restores only at Mamba chunk boundaries. A later unaligned
-        # cached state would change the reduction grouping after the restore.
-        ctx_bik = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        p_bik = self._prompt(32 * 8)
-        ctx_bik.add_request(self._req(ctx_bik, p_bik.clone()))
-        self._mamba_allocate_and_register(ctx_bik, self._block_ids(ctx_bik, 0, 8)[:5])
-        req_bik = self._req(ctx_bik, p_bik.clone(), request_id=2)
-        assert (
-            ctx_bik._find_mamba_match_count(req_bik, 0, len(req_bik.precomputed_block_hashes)) == 4
-        )
-        *_, prefix_skip, effective_prefill = ctx_bik._compute_prefix_match(req_bik, len(p_bik))
-        assert prefix_skip == 128 and effective_prefill == 128
-
         # no match when no mamba hashes registered
         ctx7 = self._mctx()
         ctx7.add_request(self._req(ctx7, self._prompt(bs * 3)))
@@ -941,22 +928,21 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
-        ctx = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
+        ctx = self._mctx(
+            block_size_tokens=32, batch_invariant_mode=True, enable_prefix_caching=False
+        )
         engine = _StubEngine(ctx, enable_chunked_prefill=True)
-        req = self._req(ctx, self._prompt(500))
+        req = self._req(ctx, self._prompt(500), enable_prefix_caching=False)
 
         assert engine._mamba_batch_invariant_prefill_chunk_length(req, 300) == 256
         assert engine._mamba_batch_invariant_prefill_chunk_length(req, 100) == 0
 
-        short_req = self._req(ctx, self._prompt(200), request_id=2)
+        short_req = self._req(ctx, self._prompt(200), request_id=2, enable_prefix_caching=False)
         assert engine._mamba_batch_invariant_prefill_chunk_length(short_req, 300) == 200
-        assert engine._mamba_batch_invariant_prefill_chunk_length(req, 200, prefix_skip=128) == 256
-        assert (
-            engine._mamba_batch_invariant_prefill_chunk_length(short_req, 72, prefix_skip=128)
-            == 200
-        )
 
-        one_left_req = self._req(ctx, self._prompt(ctx.mamba_chunk_size + 1), request_id=3)
+        one_left_req = self._req(
+            ctx, self._prompt(ctx.mamba_chunk_size + 1), request_id=3, enable_prefix_caching=False
+        )
         assert (
             engine._mamba_batch_invariant_prefill_chunk_length(one_left_req, ctx.mamba_chunk_size)
             == 0
@@ -971,10 +957,14 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         with pytest.raises(AssertionError, match="max_tokens > mamba_chunk_size"):
             self._mctx(
                 batch_invariant_mode=True,
+                enable_prefix_caching=False,
                 enable_chunked_prefill=True,
                 max_tokens=ctx.mamba_chunk_size,
                 max_requests=64,
             )
+
+        with pytest.raises(AssertionError, match="does not support Mamba prefix caching"):
+            self._mctx(batch_invariant_mode=True)
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):
@@ -1036,17 +1026,6 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx3.initialize_attention_state()
         ctx3.transfer_bookkeeping_to_gpu()
         assert ctx3.mamba_slot_allocator._eos_cache_block_id_cpu[1].item() >= 0
-
-        # BIK does not spend durable slots on block boundaries that cannot be
-        # restored without changing Mamba's chunk reduction grouping.
-        ctx_bik_unaligned = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        ctx_bik_unaligned.add_request(self._req(ctx_bik_unaligned, self._prompt(160).clone()))
-        assert ctx_bik_unaligned.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() < 0
-        assert ctx_bik_unaligned.mamba_slot_allocator._intermediate_offsets_cpu[0, 0].item() == 128
-
-        ctx_bik_aligned = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
-        ctx_bik_aligned.add_request(self._req(ctx_bik_aligned, self._prompt(128).clone()))
-        assert ctx_bik_aligned.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() >= 0
 
         # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()

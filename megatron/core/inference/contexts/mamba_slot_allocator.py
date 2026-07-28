@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import math
 from typing import TYPE_CHECKING, Dict
 
 import torch
@@ -438,19 +437,10 @@ class MambaSlotAllocator:
         # in MambaMetadata (offset -> chunk-index conversion) to stay consistent.
         mamba_chunk_size = ctx.mamba_chunk_size
 
-        candidates = (kv_div_abs, last_aligned_abs, penultimate_abs)
-        if ctx.batch_invariant_mode:
-            # A reusable BIK state must be on both the KV-block and Mamba-chunk
-            # grids. Round candidates back so a short suffix is recomputed.
-            restore_stride = math.lcm(bs, mamba_chunk_size)
-            candidates = tuple(
-                position // restore_stride * restore_stride for position in candidates
-            )
-
         # Keep only boundaries that land inside this chunk's computed tokens and on
         # a mamba-chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
-        for abs_pos in candidates:
+        for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
             offset = abs_pos - chunk_start
             if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
                 offsets_set.add(offset)
@@ -476,15 +466,7 @@ class MambaSlotAllocator:
         # cached directly. Only valid on the final chunk (otherwise the live state
         # is mid-prompt). Non-block-aligned prompts cache their last complete block
         # via the intermediate-extraction path above instead.
-        is_reusable_mamba_boundary = (
-            not ctx.batch_invariant_mode or prompt_len % mamba_chunk_size == 0
-        )
-        if (
-            is_last_chunk
-            and last_aligned_abs == prompt_len
-            and prompt_len > 0
-            and is_reusable_mamba_boundary
-        ):
+        if is_last_chunk and last_aligned_abs == prompt_len and prompt_len > 0:
             last_block_idx = prompt_len // bs - 1
             if last_block_idx >= 0:
                 self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][

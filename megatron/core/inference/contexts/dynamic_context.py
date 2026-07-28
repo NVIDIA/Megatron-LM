@@ -358,6 +358,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
 
             if self.batch_invariant_mode:
+                assert not self.enable_prefix_caching, (
+                    "batch_invariant_mode does not support Mamba prefix caching; "
+                    "set enable_prefix_caching=False."
+                )
                 assert self.num_speculative_tokens == 0, (
                     "batch_invariant_mode for Mamba dynamic inference only supports "
                     "one-token decode; set num_speculative_tokens=0."
@@ -2847,15 +2851,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_map = self.mamba_slot_allocator.hash_to_block_id
         hashes = req.precomputed_block_hashes[start_block:end_block]
         for i in range(len(hashes) - 1, -1, -1):
-            block_count = start_block + i + 1
-            if (
-                self.batch_invariant_mode
-                and (block_count * self.block_size_tokens) % self.mamba_chunk_size
-            ):
-                # Restarting between Mamba chunk boundaries changes the
-                # subsequent reduction grouping. Recompute from the latest
-                # aligned cached state instead.
-                continue
             if hashes[i] in mamba_map:
                 return i + 1
         return 0
