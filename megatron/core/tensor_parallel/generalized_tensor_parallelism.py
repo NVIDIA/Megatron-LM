@@ -355,14 +355,13 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
-    # Join the async AG/RS side streams for both eager and cuda-graph capture paths.
+    # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
     for s in _AG_STREAMS.values():
         cur.wait_stream(s)
     for s in _RS_STREAMS.values():
         cur.wait_stream(s)
-    # The per-layer CG runner replay streams only exist in the eager / per-layer-CG path; under
-    # whole-step capture there are no runners, and get_gtp_runner_streams is a per-layer concept,
-    # so stop here while capturing.
+    # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
+    # whole-step capture there are no runners, so stop here while capturing.
     if torch.cuda.is_current_stream_capturing():
         return
     # Local import: cuda_graphs imports this module, so a module-level import would be circular.
@@ -1465,11 +1464,11 @@ class GTPShardedParam(torch.nn.Parameter):
         hook never fires; the integrator (Graphed.backward for captured chains, or the eager
         chain-tail cascade) calls this hook explicitly after RS wait + accumulation, so DDP's
         register_grad_ready fires at the right time. We retain grad_accum_node (the weight's
-        AccumulateGrad) here: keeping a live strong reference across the warmup->capture
-        boundary is what places the node on the capture stream for full-iteration CG — an
-        un-retained node stays stranded on the default stream and trips capture. It is NOT put
-        in DDP's grad_accs (that list is for autograd-hooked nodes) and is never .register_hook'd
-        — grad-ready is fired manually via _grad_accum_hook, not by autograd.
+        AccumulateGrad) here. Keeping a live strong reference across the warmup->capture
+        boundary is what places the node on the capture stream for full-iteration CG; an
+        un-retained node stays stranded on the default stream and trips capture. The node is
+        not added to DDP's grad_accs (that list is for autograd-hooked nodes) and never gets
+        .register_hook'd, because grad-ready is fired manually via _grad_accum_hook.
         """
         self._grad_accum_node = grad_accum_node
         self._grad_accum_hook = hook

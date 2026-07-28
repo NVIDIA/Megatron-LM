@@ -1153,9 +1153,9 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
     register_grad_accum_hook (fired after the add) and skips the autograd hook. This pins that
     wiring: every GTP weight has _grad_accum_hook set and none falls through to the autograd list.
 
-    It also pins that the AccumulateGrad node is materialized and retained on the param: the
-    retained reference is what keeps the leaf on the capture stream for full-iteration
-    CUDA-graph capture.
+    It also checks that the AccumulateGrad node is materialized and stored on the param. Holding
+    that reference is what keeps the leaf on the capture stream for full-iteration CUDA-graph
+    capture.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
