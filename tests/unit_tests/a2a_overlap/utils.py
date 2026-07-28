@@ -383,14 +383,17 @@ def overlap_train_step(model, optimizer, config, data, num_microbatches=1):
     return loss
 
 
-def fsdp_train_step(model, optimizer, data):
+def fsdp_train_step(model, optimizer, data, num_microbatches=1):
     """One standard forward-backward-optimizer step through FSDP. Return scalar loss."""
     from megatron.core.transformer.module import float16_to_fp32
 
     optimizer.zero_grad()
-    loss = model(**data)
-    loss = float16_to_fp32(loss).sum()
-    loss.backward()
+    loss = torch.zeros([], dtype=torch.float32, device="cuda")
+    for _ in range(num_microbatches):
+        microbatch_loss = model(**data)
+        microbatch_loss = float16_to_fp32(microbatch_loss).sum()
+        (microbatch_loss / num_microbatches).backward()
+        loss += microbatch_loss.detach() / num_microbatches
     optimizer.step()
     return loss.detach().clone()
 

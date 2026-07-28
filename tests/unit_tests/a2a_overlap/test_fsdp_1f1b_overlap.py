@@ -195,6 +195,17 @@ class TestFSDP1F1BOverlap:
             gc.collect()
             torch.cuda.empty_cache()
 
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+    def test_fsdp_1f1b_mtp_multi_microbatch(self):
+        """MTP shared root parameters must be finalized once per microbatch."""
+        self._run_test_helper(
+            dispatcher_type="alltoall",
+            sharding_strategy="optim_grads_params",
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=0.1,
+            num_microbatches=2,
+        )
+
     def _run_test_helper(
         self,
         dispatcher_type="alltoall",
@@ -204,6 +215,9 @@ class TestFSDP1F1BOverlap:
         recompute_modules=None,
         offload_modules=None,
         flex_backend=None,
+        num_microbatches=1,
+        mtp_num_layers=None,
+        mtp_loss_scaling_factor=None,
     ):
         """Verify multi-step FSDP training with overlap produces identical
         per-step loss and final weights as standard FSDP training.
@@ -226,6 +240,9 @@ class TestFSDP1F1BOverlap:
         if offload_modules:
             extra_kwargs["fine_grained_activation_offloading"] = True
             extra_kwargs["offload_modules"] = offload_modules
+        if mtp_num_layers is not None:
+            extra_kwargs["mtp_num_layers"] = mtp_num_layers
+            extra_kwargs["mtp_loss_scaling_factor"] = mtp_loss_scaling_factor
 
         def _make_ddp_config():
             return DistributedDataParallelConfig(
@@ -295,8 +312,12 @@ class TestFSDP1F1BOverlap:
             for step in range(NUM_STEPS):
                 if hasattr(ref_fsdp, 'set_is_first_microbatch'):
                     ref_fsdp.set_is_first_microbatch()
-                ref_loss = fsdp_train_step(ref_fsdp, ref_opt, data)
-                test_loss = overlap_train_step(test_fsdp, test_opt, test_config, data)
+                ref_loss = fsdp_train_step(
+                    ref_fsdp, ref_opt, data, num_microbatches=num_microbatches
+                )
+                test_loss = overlap_train_step(
+                    test_fsdp, test_opt, test_config, data, num_microbatches=num_microbatches
+                )
 
                 assert torch.equal(ref_loss, test_loss), (
                     f"[rank {rank}] Loss mismatch at step {step}: "
