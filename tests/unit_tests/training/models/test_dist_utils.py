@@ -33,6 +33,9 @@ def _make_pg():
     pg.pp.size.return_value = 1
     pg.dp_cp.size.return_value = 1
     pg.expt_dp.size.return_value = 1
+    # With a single optimizer instance the intra-instance groups are the full groups.
+    pg.intra_dp_cp.size.return_value = 1
+    pg.intra_expt_dp.size.return_value = 1
     return pg
 
 
@@ -617,6 +620,9 @@ class TestDdpWrapFullParamLayout:
         self.pg = _make_pg()
         self.pg.dp_cp.size.return_value = 4
         self.pg.expt_dp.size.return_value = 2
+        # Single optimizer instance, so the intra-instance groups match the full groups.
+        self.pg.intra_dp_cp.size.return_value = 4
+        self.pg.intra_expt_dp.size.return_value = 2
         self._opt_patcher = patch("megatron.training.models.dist_utils.DistributedOptimizer")
         self._opt = self._opt_patcher.start()
         self._opt.compute_full_param_layout.return_value = "LAYOUT"
