@@ -75,23 +75,31 @@ def copy_tensors_in_struct(src):
 def clone_tensors_in_struct(tgt, src):
     """Copy src to pre-existing tensors in tgt."""
     if isinstance(src, tuple):
-        raise Exception(f"Unsupported copy for tuple yet: {type(src)}")
+        if not isinstance(tgt, tuple) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
+        return tuple(clone_tensors_in_struct(t, s) for t, s in zip(tgt, src))
     elif isinstance(src, list):
+        if not isinstance(tgt, list) or len(tgt) != len(src):
+            return copy_tensors_in_struct(src)
         for i in range(len(src)):
-            if isinstance(src[i], (tuple, list, dict, torch.Tensor)):
-                clone_tensors_in_struct(tgt[i], src[i])
-            else:
-                tgt[i] = src[i]
+            tgt[i] = clone_tensors_in_struct(tgt[i], src[i])
+        return tgt
     elif isinstance(src, dict):
+        if not isinstance(tgt, dict):
+            return copy_tensors_in_struct(src)
         for k in src:
-            if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
-                clone_tensors_in_struct(tgt[k], src[k])
+            if k in tgt:
+                tgt[k] = clone_tensors_in_struct(tgt[k], src[k])
             else:
-                tgt[k] = src[k]
+                tgt[k] = copy_tensors_in_struct(src[k])
+        return tgt
     elif isinstance(src, torch.Tensor):
+        if not isinstance(tgt, torch.Tensor) or tgt.shape != src.shape or tgt.dtype != src.dtype:
+            return copy_tensors_in_struct(src)
         tgt.copy_(src, non_blocking=True)
+        return tgt
     else:
-        raise Exception(f"Expect top-level as container type but got: {type(src)}")
+        return src
 
 
 # Class to copy dataloader output to static CUDA tensors for CUDA graph input. This
