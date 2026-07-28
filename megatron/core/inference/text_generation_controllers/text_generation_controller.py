@@ -171,6 +171,14 @@ class TextGenerationController:
                     self.num_speculative_tokens, self.model_config.mtp_num_layers
                 )
 
+        # MTP KV cache + chunked prefill: the last main hidden state of the in-flight chunked
+        # request's most recent chunk, carried one step so the next chunk can seed the position
+        # straddling the two chunks (f(h_{off+c-1} + emb(t_{off+c}))). There is at most one chunked
+        # request at a time and it is never paused, so a single tensor keyed by its request id
+        # suffices. None when no chunk is in flight; see `_mtp_commit_pass`.
+        self._mtp_chunk_boundary_hidden = None
+        self._mtp_chunk_boundary_req_id = -1
+
         if (
             self.model_config.cuda_graph_impl == "local"
             and self.model_config.expert_model_parallel_size > 1
@@ -830,16 +838,17 @@ class TextGenerationController:
           - decode: the a_r accepted-draft positions this step (base + drafts 0..a-2), from this
             step's main hiddens for the accepted forwarded tokens. The LAST accepted position is
             written by decode depth 0, so this covers the earlier a_r positions (start = base-1-a_r).
-          - prefill: the prompt positions 0..L-2 (seed from empty, start = 0).
+          - prefill: the chunk's positions off..off+q-2 (start = off = request_kv_length_offset);
+            for a continuation chunk (off > 0) the straddling position off-1 is also seeded from the
+            carried-over previous-chunk hidden. off == 0 and q == full prompt length in the common
+            (single-chunk) case.
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """
-        if context.chunked_prefill_request_id != -1:
-            raise NotImplementedError("MTP KV cache does not yet support chunked prefill (v1).")
-
         device = gathered_hidden.device
         stride = self.num_speculative_tokens + 1
         decode_len = num_decode_requests * stride
         active_slice = slice(context.paused_request_count, context.total_request_count)
+        chunked_id = context.chunked_prefill_request_id
 
         hidden_parts, token_parts, append_parts, start_parts = [], [], [], []
 
@@ -867,31 +876,68 @@ class TextGenerationController:
                 hidden_parts.append(decode_hidden[hidden_idx])
                 token_parts.append(decode_tokens[hidden_idx + 1])  # draft_0..draft_{a-1}
 
-        # --- Prefill requests: seed prompt positions 0..L-2 from main hiddens. ---
+        # --- Prefill requests: seed their prompt positions from main hiddens (roll-by-one). ---
+        # request_query_lengths is this step's CHUNK length `q` and request_kv_length_offsets is how
+        # many prompt tokens prior chunks already prefilled (`off`), so each request seeds positions
+        # off..off+q-2 (its last chunk position off+q-1 is seeded next chunk, or by the decode draft
+        # loop on the final/only chunk). For a continuation chunk (off > 0) the position straddling
+        # the previous chunk, off-1, is also seeded here from the carried-over previous-chunk hidden
+        # h_{off-1} paired with this chunk's first token t_off. Built per request (num_prefill is
+        # small and this forward is eager) so the continuation stays ONE segment -> the segment count
+        # stays active_request_count and the fixed-size MHA-metadata buffers never overflow.
+        # request_* are CPU pinned tensors, so `.tolist()` is a cheap host read (no GPU sync).
         if active_request_count > num_decode_requests:
-            query_lengths = (
-                context.request_query_lengths[active_slice][
-                    num_decode_requests:active_request_count
-                ]
-                .to(device, non_blocking=True)
-                .to(torch.long)
-            )
-            append_parts.append(query_lengths - 1)
-            start_parts.append(torch.zeros_like(query_lengths))
-            total_prompt = int(query_lengths.sum().item())
-            if total_prompt > 0:
-                prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
-                prefill_tokens = context.gpu_view.token_to_input_ids[
-                    decode_len : decode_len + total_prompt
-                ].to(device)
-                seg_start = torch.cumsum(query_lengths, 0) - query_lengths
-                seg_end = torch.cumsum(query_lengths, 0) - 1
-                keep_hidden = torch.ones(total_prompt, dtype=torch.bool, device=device)
-                keep_hidden[seg_end] = False  # drop each request's last hidden (no next token)
-                keep_token = torch.ones(total_prompt, dtype=torch.bool, device=device)
-                keep_token[seg_start] = False  # drop each request's first token (no prior hidden)
-                hidden_parts.append(prefill_hidden[keep_hidden])
-                token_parts.append(prefill_tokens[keep_token])
+            prefill_slice = slice(num_decode_requests, active_request_count)
+            q_list = context.request_query_lengths[active_slice][prefill_slice].tolist()
+            off_list = context.request_kv_length_offsets[active_slice][prefill_slice].tolist()
+            id_list = context.request_ids[active_slice][prefill_slice].tolist()
+            total_prompt = sum(q_list)
+            prefill_hidden = gathered_hidden[decode_len : decode_len + total_prompt]
+            prefill_tokens = context.gpu_view.token_to_input_ids[
+                decode_len : decode_len + total_prompt
+            ].to(device)
+
+            p_counts, p_starts, p_hidden_segs, p_token_segs = [], [], [], []
+            cum = 0
+            for q, off, rid in zip(q_list, off_list, id_list):
+                h_i = prefill_hidden[cum : cum + q]  # [q, 1, H] this chunk's hiddens
+                t_i = prefill_tokens[cum : cum + q]  # [q]     this chunk's tokens
+                cum += q
+                if off > 0:
+                    # Continuation chunk: boundary position off-1 = f(carried h_{off-1} + t_off),
+                    # then this chunk's roll-by-one off..off+q-2. count = q, start = off-1.
+                    assert (
+                        self._mtp_chunk_boundary_hidden is not None
+                        and self._mtp_chunk_boundary_req_id == rid
+                    ), "chunked-prefill MTP boundary hidden missing or mismatched"
+                    p_hidden_segs.append(self._mtp_chunk_boundary_hidden.to(device))
+                    p_hidden_segs.append(h_i[:-1])
+                    p_token_segs.append(t_i[:1])
+                    p_token_segs.append(t_i[1:])
+                    p_counts.append(q)
+                    p_starts.append(off - 1)
+                else:
+                    # First/only chunk: drop first token (no prior hidden) and last hidden (no next
+                    # token this chunk). count = q-1, start = 0.
+                    p_hidden_segs.append(h_i[:-1])
+                    p_token_segs.append(t_i[1:])
+                    p_counts.append(q - 1)
+                    p_starts.append(0)
+                # Carry this step's in-flight chunk's last hidden for the next chunk's boundary.
+                if chunked_id != -1 and rid == chunked_id:
+                    self._mtp_chunk_boundary_hidden = h_i[-1].detach().clone().view(1, 1, -1)
+                    self._mtp_chunk_boundary_req_id = chunked_id
+
+            append_parts.append(torch.tensor(p_counts, dtype=torch.long, device=device))
+            start_parts.append(torch.tensor(p_starts, dtype=torch.long, device=device))
+            hidden_parts.append(torch.cat(p_hidden_segs))
+            token_parts.append(torch.cat(p_token_segs))
+
+        # No in-flight chunked request (none, or it finished its final chunk this step): drop the
+        # carried boundary hidden so a later request can never match a stale id.
+        if chunked_id == -1:
+            self._mtp_chunk_boundary_hidden = None
+            self._mtp_chunk_boundary_req_id = -1
 
         append_counts = torch.cat(append_parts)
         request_start_positions = torch.cat(start_parts)
@@ -1117,9 +1163,18 @@ class TextGenerationController:
         # cache with no valid block table), so it uses the cache-free graph; both still issue
         # identical fixed-size (expert-padded) MoE all-to-alls, keeping EP in lockstep.
         mtp_graph_key_prefix = "mtp_kv" if mtp_kv_cache_on else "mtp"
+        # A still-prefilling chunked request (chunked_prefill_request_id != -1) is always the last
+        # active request and has base_position mid-prompt, so it must not draft — it decodes only
+        # once its prompt completes. Excluding it (reducing the draft count by 1) makes it a padding
+        # row in _mtp_setup_decode_step (no draft KV write); its chunk KV was already seeded by the
+        # commit pass. padded_count (the graph size) and the MTP-forward count are unchanged, so the
+        # captured graph, EP parity, and dummy path are unaffected.
+        num_mtp_draft_requests = active_request_count - (
+            1 if context.chunked_prefill_request_id != -1 else 0
+        )
         if mtp_kv_cache_on:
             context._mtp_begin_decode(
-                active_request_count, padded_count, base_position - 1, graphed=mtp_graphed
+                num_mtp_draft_requests, padded_count, base_position - 1, graphed=mtp_graphed
             )
 
         for depth in range(self.num_mtp_depths):
