@@ -186,6 +186,10 @@ def setup_model_and_optimizer(
     optimizer='adam',
     use_param_layout=False,
     muon_scalar_optimizer='adam',
+    cp=1,
+    ep=1,
+    etp=1,
+    use_megatron_fsdp=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -206,6 +210,20 @@ def setup_model_and_optimizer(
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
+        mock_args.context_parallel_size = cp
+        mock_args.expert_model_parallel_size = ep
+        mock_args.expert_tensor_parallel_size = etp
+        mock_args.use_megatron_fsdp = use_megatron_fsdp
+        mock_args.data_parallel_sharding_strategy = (
+            'optim_grads_params' if use_megatron_fsdp else 'no_shard'
+        )
+        if use_megatron_fsdp:
+            # parse_args() leaves these as CLI strings until validate_args()
+            # maps them to the torch.dtype values expected by Megatron-FSDP.
+            mock_args.megatron_fsdp_main_params_dtype = torch.float32
+            mock_args.megatron_fsdp_main_grads_dtype = None
+            mock_args.megatron_fsdp_grad_comm_dtype = None
+        mock_args.gradient_accumulation_fusion = False
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -217,6 +235,9 @@ def setup_model_and_optimizer(
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
                 pipeline_dtype=torch.bfloat16,
+                context_parallel_size=cp,
+                expert_model_parallel_size=ep,
+                expert_tensor_parallel_size=etp,
                 bf16=bf16,
             )
         )
@@ -229,6 +250,10 @@ def setup_model_and_optimizer(
         optimizer=optimizer,
         muon_scalar_optimizer=muon_scalar_optimizer,
     )
+    if use_megatron_fsdp:
+        # The FSDP DTensor sharded-state path may materialize missing optimizer
+        # slots with a dummy step, which requires a concrete learning rate.
+        config.lr = 1.0e-3
 
     if optimizer_type in ('muon', 'dist_muon'):
         config.lr = 0.0
@@ -269,7 +294,10 @@ def setup_model_and_optimizer(
                     for key in state_keys:
                         optimizer.optimizer.state[p][key] = torch.rand_like(p.data)
 
-    optimizer.reload_model_params()
+    # Megatron-FSDP owns the model/main-parameter synchronization and its
+    # DistributedOptimizer intentionally does not implement this legacy copy.
+    if not use_megatron_fsdp:
+        optimizer.reload_model_params()
     CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
 
