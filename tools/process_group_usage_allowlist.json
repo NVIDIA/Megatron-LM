@@ -1,0 +1,308 @@
+{
+  "_comment": "Grandfathered reads of global process-group state in megatron/core. This list must only shrink. Regenerate with `python tools/check_process_group_usage.py --update` after REMOVING usage -- never to silence a new violation.",
+  "allowed": {
+    "megatron/core/datasets/data_schedule.py": [
+      "34:accessor:parallel_state.get_data_parallel_group",
+      "35:accessor:parallel_state.get_data_parallel_group",
+      "36:accessor:parallel_state.get_tensor_model_parallel_group"
+    ],
+    "megatron/core/distributed/finalize_model_grads.py": [
+      "102:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "190:accessor:parallel_state.get_embedding_group",
+      "193:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "285:accessor:parallel_state.get_pipeline_model_parallel_world_size",
+      "305:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "492:accessor:parallel_state.get_tensor_model_parallel_group",
+      "493:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "494:accessor:parallel_state.get_embedding_group",
+      "495:accessor:parallel_state.get_position_embedding_group",
+      "496:accessor:parallel_state.get_data_parallel_group",
+      "540:accessor:parallel_state.get_tensor_and_data_parallel_group"
+    ],
+    "megatron/core/distributed/fsdp/mcore_fsdp_adapter.py": [
+      "329:accessor:parallel_state.get_tensor_model_parallel_group",
+      "330:accessor:parallel_state.get_expert_tensor_parallel_group",
+      "332:accessor:parallel_state.get_data_parallel_group",
+      "335:accessor:parallel_state.get_inter_distributed_optimizer_instance_group",
+      "336:accessor:parallel_state.get_data_parallel_group",
+      "339:accessor:parallel_state.get_expert_data_parallel_group",
+      "342:accessor:parallel_state.get_expert_data_parallel_group",
+      "345:accessor:parallel_state.get_expert_model_parallel_group",
+      "347:accessor:parallel_state.get_data_parallel_group",
+      "352:accessor:parallel_state.get_expert_data_parallel_group",
+      "353:accessor:parallel_state.get_expert_model_parallel_group"
+    ],
+    "megatron/core/distributed/param_and_grad_buffer.py": [
+      "977:accessor:parallel_state.get_data_and_context_parallel_group",
+      "980:accessor:parallel_state.get_tensor_model_parallel_group"
+    ],
+    "megatron/core/distributed/torch_fully_sharded_data_parallel.py": [
+      "77:accessor:parallel_state.get_data_parallel_group"
+    ],
+    "megatron/core/export/trtllm/trtllm_weights_converter/distributed_trtllm_model_weights_converter.py": [
+      "71:accessor:parallel_state.get_pipeline_model_parallel_world_size",
+      "72:accessor:parallel_state.get_tensor_model_parallel_world_size",
+      "73:accessor:parallel_state.get_tensor_model_parallel_rank",
+      "74:accessor:parallel_state.get_pipeline_model_parallel_rank",
+      "75:accessor:parallel_state.get_tensor_model_parallel_group"
+    ],
+    "megatron/core/extensions/transformer_engine.py": [
+      "1645:accessor:get_tensor_model_parallel_group",
+      "1646:accessor:get_context_parallel_group",
+      "1647:accessor:get_hierarchical_context_parallel_groups",
+      "1691:accessor:get_hierarchical_context_parallel_groups",
+      "1977:shim:use_mpu_process_groups",
+      "2529:accessor:get_tensor_model_parallel_world_size",
+      "2532:accessor:get_tensor_model_parallel_group",
+      "2860:accessor:get_tensor_model_parallel_world_size",
+      "289:accessor:get_amax_reduction_group",
+      "2959:accessor:get_tensor_model_parallel_world_size"
+    ],
+    "megatron/core/fp4_utils.py": [
+      "221:accessor:parallel_state.get_amax_reduction_group"
+    ],
+    "megatron/core/fp8_utils.py": [
+      "641:accessor:parallel_state.get_amax_reduction_group"
+    ],
+    "megatron/core/inference/apis/_llm_base.py": [
+      "270:accessor:parallel_state.get_expert_model_parallel_world_size"
+    ],
+    "megatron/core/inference/communication_utils.py": [
+      "125:accessor:parallel_state.get_pipeline_model_parallel_next_rank",
+      "153:accessor:parallel_state.get_model_parallel_src_rank",
+      "162:accessor:parallel_state.get_model_parallel_group",
+      "179:accessor:parallel_state.get_model_parallel_src_rank",
+      "182:accessor:parallel_state.get_model_parallel_src_rank",
+      "56:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "57:accessor:parallel_state.get_pipeline_model_parallel_last_rank",
+      "94:accessor:parallel_state.get_pipeline_model_parallel_prev_rank"
+    ],
+    "megatron/core/inference/contexts/dynamic_context.py": [
+      "1413:accessor:parallel_state.get_tensor_model_parallel_world_size",
+      "1427:accessor:parallel_state.get_tensor_model_parallel_world_size",
+      "322:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "328:accessor:parallel_state.get_expert_model_parallel_world_size",
+      "329:accessor:parallel_state.get_expert_model_parallel_group"
+    ],
+    "megatron/core/inference/engines/dynamic_engine.py": [
+      "232:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py": [
+      "59:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/inference/shards.py": [
+      "59:accessor:mpu.get_tensor_model_parallel_world_size",
+      "61:accessor:mpu.get_context_parallel_world_size",
+      "63:accessor:mpu.get_pipeline_model_parallel_world_size",
+      "65:accessor:mpu.get_expert_model_parallel_world_size",
+      "67:accessor:mpu.get_expert_tensor_parallel_world_size"
+    ],
+    "megatron/core/inference/text_generation_controllers/text_generation_controller.py": [
+      "95:accessor:parallel_state.get_pipeline_model_parallel_group"
+    ],
+    "megatron/core/inference/text_generation_server/dynamic_text_gen_server/tokenization.py": [
+      "29:accessor:parallel_state.get_data_parallel_src_rank"
+    ],
+    "megatron/core/inference/text_generation_server/tokenization.py": [
+      "29:accessor:parallel_state.get_data_parallel_src_rank"
+    ],
+    "megatron/core/models/T5/t5_model.py": [
+      "179:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/models/common/embeddings/rope_utils.py": [
+      "288:accessor:parallel_state.get_context_parallel_group"
+    ],
+    "megatron/core/models/common/embeddings/rotary_pos_embedding.py": [
+      "312:accessor:parallel_state.get_context_parallel_group",
+      "89:accessor:parallel_state.get_context_parallel_group"
+    ],
+    "megatron/core/models/common/language_module/language_module.py": [
+      "495:accessor:parallel_state.get_data_parallel_rank",
+      "51:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/models/mimo/partition/utils.py": [
+      "70:accessor:get_context_parallel_group",
+      "73:accessor:get_tensor_model_parallel_group"
+    ],
+    "megatron/core/models/multimodal/context_parallel.py": [
+      "132:accessor:get_context_parallel_world_size",
+      "133:accessor:get_context_parallel_rank",
+      "150:accessor:get_context_parallel_group",
+      "151:accessor:get_context_parallel_world_size",
+      "164:accessor:get_context_parallel_world_size",
+      "184:accessor:get_context_parallel_group",
+      "217:accessor:get_context_parallel_world_size",
+      "221:accessor:get_context_parallel_group",
+      "225:accessor:get_context_parallel_group",
+      "349:accessor:get_context_parallel_world_size",
+      "350:accessor:get_context_parallel_rank"
+    ],
+    "megatron/core/models/multimodal/llava_model.py": [
+      "182:shim:use_mpu_process_groups",
+      "862:accessor:get_context_parallel_group"
+    ],
+    "megatron/core/optimizer/__init__.py": [
+      "689:accessor:parallel_state.get_tensor_model_parallel_group",
+      "773:shim:use_mpu_process_groups",
+      "888:accessor:parallel_state.get_tensor_model_parallel_group"
+    ],
+    "megatron/core/optimizer/optimizer.py": [
+      "278:accessor:parallel_state.get_model_parallel_group"
+    ],
+    "megatron/core/optimizer/qk_clip.py": [
+      "33:accessor:parallel_state.get_data_parallel_group"
+    ],
+    "megatron/core/pipeline_parallel/hybrid_cp_schedule.py": [
+      "516:accessor:parallel_state.get_tensor_model_parallel_src_rank",
+      "517:accessor:parallel_state.get_tensor_model_parallel_group",
+      "554:accessor:parallel_state.get_data_parallel_rank",
+      "555:accessor:parallel_state.get_tensor_model_parallel_rank",
+      "610:accessor:parallel_state.get_data_parallel_group"
+    ],
+    "megatron/core/pipeline_parallel/schedules.py": [
+      "1007:accessor:parallel_state.get_data_parallel_group",
+      "1010:accessor:parallel_state.get_tensor_and_data_parallel_group",
+      "153:accessor:parallel_state.get_pipeline_model_parallel_world_size",
+      "2151:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "2153:accessor:parallel_state.get_tensor_model_parallel_group",
+      "2154:accessor:parallel_state.get_context_parallel_group",
+      "2156:accessor:parallel_state.get_embedding_group",
+      "2157:accessor:parallel_state.get_position_embedding_group",
+      "2158:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "2166:accessor:parallel_state.get_data_parallel_group",
+      "2169:accessor:parallel_state.get_tensor_and_data_parallel_group",
+      "287:accessor:parallel_state.get_context_parallel_world_size",
+      "666:accessor:parallel_state.get_tensor_model_parallel_group",
+      "667:accessor:parallel_state.get_context_parallel_group",
+      "668:accessor:parallel_state.get_embedding_group",
+      "669:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "670:accessor:parallel_state.get_position_embedding_group",
+      "677:accessor:parallel_state.get_data_parallel_group",
+      "680:accessor:parallel_state.get_tensor_and_data_parallel_group",
+      "882:accessor:parallel_state.get_pipeline_model_parallel_world_size",
+      "883:accessor:parallel_state.get_pipeline_model_parallel_rank",
+      "992:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "994:accessor:parallel_state.get_tensor_model_parallel_group",
+      "995:accessor:parallel_state.get_context_parallel_group",
+      "997:accessor:parallel_state.get_embedding_group",
+      "998:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "999:accessor:parallel_state.get_position_embedding_group"
+    ],
+    "megatron/core/resharding/refit.py": [
+      "186:accessor:parallel_state.get_data_parallel_group"
+    ],
+    "megatron/core/ssm/mamba_mixer.py": [
+      "110:accessor:parallel_state.get_tensor_model_parallel_group"
+    ],
+    "megatron/core/tensor_parallel/cross_entropy.py": [
+      "125:accessor:get_tensor_model_parallel_group"
+    ],
+    "megatron/core/tensor_parallel/layers.py": [
+      "101:accessor:get_tensor_model_parallel_rank",
+      "185:accessor:get_tensor_model_parallel_rank",
+      "186:accessor:get_tensor_model_parallel_world_size"
+    ],
+    "megatron/core/tensor_parallel/random.py": [
+      "461:accessor:get_tensor_model_parallel_rank",
+      "463:accessor:get_expert_model_parallel_rank",
+      "465:accessor:get_expert_tensor_parallel_rank"
+    ],
+    "megatron/core/transformer/attention.py": [
+      "1486:accessor:get_data_parallel_rank",
+      "1495:accessor:get_data_parallel_world_size",
+      "1497:accessor:get_data_parallel_group",
+      "1521:accessor:get_tensor_model_parallel_rank",
+      "1522:accessor:get_tensor_model_parallel_world_size",
+      "1524:accessor:get_tensor_model_parallel_group",
+      "1661:accessor:get_tensor_model_parallel_rank",
+      "318:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/transformer/cuda_graphs.py": [
+      "1467:shim:use_mpu_process_groups",
+      "1790:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/transformer/dot_product_attention.py": [
+      "69:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/transformer/experimental_attention_variant/absorbed_mla.py": [
+      "151:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/transformer/experimental_attention_variant/dsa.py": [
+      "100:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "111:accessor:parallel_state.get_data_parallel_group",
+      "705:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/transformer/fsdp_dtensor_checkpoint.py": [
+      "62:accessor:parallel_state.get_expert_model_parallel_world_size",
+      "63:accessor:parallel_state.get_expert_model_parallel_rank"
+    ],
+    "megatron/core/transformer/heterogeneous/linear_replacements.py": [
+      "26:accessor:get_tensor_model_parallel_world_size",
+      "32:accessor:get_tensor_model_parallel_world_size",
+      "34:accessor:get_tensor_model_parallel_rank"
+    ],
+    "megatron/core/transformer/module.py": [
+      "484:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "84:accessor:parallel_state.get_tensor_model_parallel_group"
+    ],
+    "megatron/core/transformer/moe/moe_logging.py": [
+      "257:accessor:parallel_state.get_pipeline_model_parallel_group",
+      "258:accessor:parallel_state.get_data_parallel_group"
+    ],
+    "megatron/core/transformer/moe/moe_utils.py": [
+      "1100:accessor:parallel_state.get_tensor_and_data_parallel_group",
+      "1385:accessor:parallel_state.get_expert_model_parallel_group",
+      "1386:accessor:parallel_state.get_tensor_model_parallel_group",
+      "1387:accessor:parallel_state.get_context_parallel_group",
+      "1388:accessor:parallel_state.get_expert_tensor_parallel_group",
+      "1389:accessor:parallel_state.get_expert_data_parallel_group",
+      "1390:accessor:parallel_state.get_expert_tensor_and_model_parallel_group",
+      "1391:accessor:parallel_state.get_tensor_and_context_parallel_group",
+      "1392:accessor:parallel_state.get_tensor_and_data_parallel_group"
+    ],
+    "megatron/core/transformer/multi_latent_attention.py": [
+      "1236:shim:use_mpu_process_groups",
+      "490:shim:use_mpu_process_groups"
+    ],
+    "megatron/core/transformer/multi_token_prediction.py": [
+      "1374:accessor:parallel_state.get_tensor_model_parallel_group",
+      "1675:shim:use_mpu_process_groups",
+      "531:accessor:parallel_state.get_tensor_model_parallel_world_size",
+      "635:accessor:parallel_state.get_pipeline_model_parallel_rank",
+      "873:accessor:parallel_state.get_data_parallel_group"
+    ],
+    "megatron/core/transformer/pipeline_parallel_layer_layout.py": [
+      "160:accessor:parallel_state.get_pipeline_model_parallel_rank",
+      "178:accessor:parallel_state.get_pipeline_model_parallel_rank"
+    ],
+    "megatron/core/transformer/transformer_block.py": [
+      "276:shim:use_mpu_process_groups",
+      "91:accessor:parallel_state.get_pipeline_model_parallel_rank"
+    ],
+    "megatron/core/transformer/transformer_layer.py": [
+      "1585:accessor:parallel_state.get_tensor_model_parallel_group",
+      "319:shim:use_mpu_process_groups",
+      "51:accessor:parallel_state.get_pipeline_model_parallel_rank"
+    ],
+    "megatron/core/transformer/utils.py": [
+      "133:accessor:parallel_state.get_data_parallel_group",
+      "191:accessor:parallel_state.get_tensor_model_parallel_rank",
+      "192:accessor:parallel_state.get_data_parallel_rank",
+      "222:accessor:parallel_state.get_data_parallel_group",
+      "225:accessor:parallel_state.get_data_parallel_group"
+    ],
+    "megatron/core/utils.py": [
+      "1004:accessor:parallel_state.get_tensor_model_parallel_group",
+      "1005:accessor:parallel_state.get_data_parallel_group",
+      "532:accessor:parallel_state.get_expert_tensor_parallel_group",
+      "536:accessor:parallel_state.get_tensor_model_parallel_group",
+      "819:accessor:parallel_state.get_tensor_model_parallel_rank",
+      "820:accessor:parallel_state.get_data_parallel_rank",
+      "877:accessor:parallel_state.get_data_parallel_group",
+      "877:accessor:parallel_state.get_expert_data_parallel_group",
+      "939:accessor:parallel_state.get_tensor_model_parallel_group",
+      "940:accessor:parallel_state.get_data_parallel_group"
+    ]
+  },
+  "total": 198
+}
