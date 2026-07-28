@@ -247,14 +247,14 @@ def classify_gtp_chains(model) -> None:
         if "embedding" in name:
             param._need_weight_prefetch_bwd = False
 
-        # Output-layer fwd->bwd weight reuse: its bwd dgrad re-gathers the same full
-        # weight the forward AG just produced, so retain+reuse it and drop the redundant
-        # synchronous bwd all-gather. Name-based opt-in mirrors the embedding opt-out
-        # above; the BF16 (not native-FP8) guard in all_gather_and_prefetch auto-disables
-        # it when fwd/bwd gather different data (rowwise vs columnwise scaling). Tied
+        # Retain the fwd-gathered weight for the bwd dgrad instead of re-gathering it. Only
+        # safe where no same-key gather falls between the two: the output layer is last in
+        # fwd and first in bwd, so its window is empty. A mid-chain param would also need
+        # _need_weight_prefetch_bwd = False, or its successor still prefetches it. Excluded
+        # under native FP8 (fwd gathers rowwise-, bwd columnwise-scaled data). Tied
         # embeddings are an "embedding..."-named param, so this stays False there.
-        if "output_layer" in name:
-            param._reuse_fwd_weight_in_bwd = True
+        if "output_layer" in name and not getattr(param, "_gtp_native_fp8", False):
+            param._retain_for_bwd = True
     if conflicts:
         raise RuntimeError(
             "classify_gtp_chains: the following params were already chain-initialized "
@@ -793,11 +793,10 @@ def _init_gtp_runtime_attrs(obj):
     # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
     # sets this False for embedding.word_embeddings.weight.
     obj._need_weight_prefetch_bwd = True
-    # Output-layer fwd->bwd weight reuse (flag set for output_layer.weight by
-    # classify_gtp_chains): retain the forward-gathered weight and reuse it in the
-    # backward dgrad instead of re-gathering. See all_gather_and_prefetch.
-    obj._reuse_fwd_weight_in_bwd = False
-    obj._retained_fwd_weight = None
+    # Reuse the fwd-gathered weight in the bwd dgrad rather than re-gathering (set for
+    # output_layer.weight by classify_gtp_chains). Drives the fwd buffer's pin in
+    # GTPWeightCache.reserve and the reuse short-circuit in _all_gather_weight.
+    obj._retain_for_bwd = False
     obj.ag_event = torch.cuda.Event(external=True)
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
@@ -1471,12 +1470,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # pinned (fixed-address, never-pooled) buffer on every replay, ordered before
         # the dgrad read via the output layer's own fwd GEMM on the main stream; the
         # Python retain/consume handshake runs only at capture and mirrors eager.
-        if (
-            fwd
-            and not in_recompute
-            and self._reuse_fwd_weight_in_bwd
-            and not getattr(self, "_gtp_native_fp8", False)
-        ):
+        if fwd and not in_recompute and self._retain_for_bwd:
             self._retained_fwd_weight = result
 
         return result
@@ -1766,7 +1760,12 @@ class _TicketSlot:
     fwd: bool
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
-    pin: bool = False  # if True, release() never pools this buffer (output-layer fwd reuse)
+    # Buffer is held from its fwd gather until the bwd dgrad consumes it, so it must never be
+    # pooled again once bound (see GTPWeightCache._pinned_bufs). Slots that adopted it BEFORE
+    # the pin may still reference it; safe only while no co-owner gathers inside that window.
+    # Tickets are minted in fwd order and a pinned slot pops once at birth, so every co-owner
+    # is earlier in fwd, hence later in bwd. Read only by get().
+    pin_for_fwd: bool = False
 
 
 # CUDA-graph memory pool: routes GRAPHED-chain allocations (AG/RS buffers, quantized weight
@@ -1895,14 +1894,9 @@ class GTPWeightCache:
             reduce_scatter=reduce_scatter,
             fwd=fwd,
             chain_id=getattr(param, "chain_id", GTPChain.UNGRAPHED.value),
-            # Pin the output-layer fwd buffer (retained for bwd dgrad reuse) so it's never
-            # pooled. Mirror the retain guard: exclude native-FP8 (never retained), else the
-            # pin would strand an unused buffer.
-            pin=bool(
-                fwd
-                and getattr(param, "_reuse_fwd_weight_in_bwd", False)
-                and not getattr(param, "_gtp_native_fp8", False)
-            ),
+            # Derived here rather than passed in so the two fwd-ticket reserve sites cannot
+            # disagree. _retain_for_bwd already folds the native-FP8 exclusion.
+            pin_for_fwd=fwd and getattr(param, "_retain_for_bwd", False),
         )
         return ticket
 
@@ -1934,7 +1928,7 @@ class GTPWeightCache:
         buffers keep their fixed address across replays.
         """
         slot = self._slots[ticket]
-        if slot.buf is None or slot.pin:
+        if slot.buf is None or slot.pin_for_fwd:
             # Pinned buffers (output-layer fwd reuse) must never enter the pool, so
             # no other same-shape gather can pop and overwrite the retained weight.
             return
