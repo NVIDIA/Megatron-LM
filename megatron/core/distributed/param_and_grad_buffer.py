@@ -887,8 +887,9 @@ def group_params_for_buffers(
     Each distinct buffer is identified by a BufferKey with three dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
-    - is_expert_parallel: whether the parameter is expert-parallel (param.allreduce == False),
-      which requires a separate buffer with a different data-parallel group.
+    - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
+      which requires a separate buffer for the expert data-parallel group.  This is true for experts
+      when expert-parallelism > 1 or expert-tensor-parallelism != tensor-parallelism.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -1070,6 +1071,7 @@ class _ParamAndGradBuffer:
             param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
         self.param_index_map = param_layout.param_index_map
         self.bucket_indices = param_layout.bucket_indices
+        self.num_optimizer_shards = param_layout.num_optimizer_shards
         per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
 
         # Check if this buffer contains NVFP4 params.

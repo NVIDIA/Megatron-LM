@@ -108,6 +108,36 @@ class GTPChain(str, Enum):
     UNGRAPHED = "GTP_ungraphed"
 
 
+# One-block-ahead prefetch for routed grouped experts (see docs §3.4 "Grouped-expert chains"):
+#   - own chain per weight role -> next_w links the SAME role of CONSECUTIVE MoE blocks,
+#     so each all-gather gets a whole block of runway instead of one GEMM;
+#   - fc1/fc2 stay SEPARATE (merging leaves fc2 a GEMM behind) but share ONE stream via
+#     _stream_key, so their gathers serialize instead of splitting bandwidth;
+#   - the "_graphed"/"_ungraphed" suffix keeps captured and eager ops off the same stream.
+_GTP_REMAT_GROUPED_PREFIX = "GTP_remat_grouped_"
+_GTP_REMAT_GROUPED_FC1 = f"{_GTP_REMAT_GROUPED_PREFIX}fc1"
+_GTP_REMAT_GROUPED_FC2 = f"{_GTP_REMAT_GROUPED_PREFIX}fc2"
+
+
+def _graphness_suffix(graphed: bool) -> str:
+    """Chain-id suffix encoding the CUDA-graph capture axis."""
+    return "graphed" if graphed else "ungraphed"
+
+
+def _chain_is_grouped(chain_id: str) -> bool:
+    """True for the per-role grouped-expert chains (``_GTP_REMAT_GROUPED_FC1`` / ``_FC2``)."""
+    return chain_id.startswith(_GTP_REMAT_GROUPED_PREFIX)
+
+
+def _chain_is_graphed(chain_id: str) -> bool:
+    """True for any CUDA-graph-captured chain, including grouped fc1/fc2 chains.
+
+    Every chain id ends in "graphed" or "ungraphed" (see ``_classify_param_chain``), so testing
+    the eager suffix is exact; a new chain id must keep that convention.
+    """
+    return not chain_id.endswith("ungraphed")
+
+
 # Active cuda_graph config, set by the integrator via set_cuda_graph_modules() before
 # classify_gtp_chains(); consumed by _classify_param_chain.
 _CUDA_GRAPH_MODULES: Optional[set] = None  # scope tags, e.g. {"mamba","attn","moe_router"}
@@ -139,41 +169,60 @@ def set_cuda_graph_modules(
         _CUDA_GRAPH_MODULES = set(scope) if scope else None
 
 
-def _classify_param_chain(param_name: str) -> "GTPChain":
-    """Map a GTPShardedParam name + active cuda_graph config to its chain.
+def _classify_param_chain(param_name: str) -> str:
+    """Map a GTPShardedParam name + active cuda_graph config to its chain id (a string).
 
     Full-iteration -> GRAPHED. Otherwise embedding/output_layer are UNGRAPHED, and
-    each layer kind (mixer, attention, shared/routed experts) is GRAPHED iff its
-    scope tag is in cuda_graph_modules.
+    each layer kind (mixer, attention, shared experts) is GRAPHED iff its scope tag is in
+    cuda_graph_modules. Routed grouped experts (``.mlp.experts.``) are special-cased FIRST:
+    fc1/fc2 each go to their own homogeneous grouped chain (see ``_GTP_REMAT_GROUPED_FC1``), with
+    graphness following the same "moe" scope rule.
     """
     n = param_name
+    G = GTPChain.GRAPHED.value
+    U = GTPChain.UNGRAPHED.value
+
+    # Routed grouped experts: own homogeneous chain per weight-role (fc1/fc2) for one-block-ahead
+    # prefetch. Checked BEFORE the generic rules (".mlp.shared_experts." is a distinct substring, so
+    # shared experts never fall in here).
+    if ".mlp.experts." in n:
+        graphed = _FULL_ITERATION or bool(_CUDA_GRAPH_MODULES and "moe" in _CUDA_GRAPH_MODULES)
+        # The grouped split is an EAGER-only optimization: when MoE is captured, keep grouped
+        # weights in the plain GRAPHED chain so the cross-graph drain — wait_async_comms(
+        # GTPChain.GRAPHED.value) in cuda_graphs.py — still targets them by exact chain id.
+        if graphed:
+            return G
+        eager = _graphness_suffix(False)
+        if ".linear_fc1." in n:
+            return f"{_GTP_REMAT_GROUPED_FC1}_{eager}"
+        if ".linear_fc2." in n:
+            return f"{_GTP_REMAT_GROUPED_FC2}_{eager}"
+        # Unknown grouped role (e.g. single fused weight): keep it in the general chain.
+        return U
 
     if _FULL_ITERATION:
-        return GTPChain.GRAPHED
+        return G
 
     # embedding/output_layer live outside any per-layer CG runner.
     if "embedding" in n or "output_layer" in n:
-        return GTPChain.UNGRAPHED
+        return U
 
     scope = _CUDA_GRAPH_MODULES
     if not scope:  # CG disabled
-        return GTPChain.UNGRAPHED
+        return U
 
     if ".mlp.shared_experts." in n:
         if _MOE_SHARED_EXPERT_OVERLAP:
-            return GTPChain.UNGRAPHED
-        return GTPChain.GRAPHED if ("moe" in scope or "moe_router" in scope) else GTPChain.UNGRAPHED
-
-    if ".mlp.experts." in n:
-        return GTPChain.GRAPHED if "moe" in scope else GTPChain.UNGRAPHED
+            return U
+        return G if ("moe" in scope or "moe_router" in scope) else U
 
     if ".self_attention." in n or ".cross_attention." in n:
-        return GTPChain.GRAPHED if "attn" in scope else GTPChain.UNGRAPHED
+        return G if "attn" in scope else U
 
     if ".mixer." in n:
-        return GTPChain.GRAPHED if "mamba" in scope else GTPChain.UNGRAPHED
+        return G if "mamba" in scope else U
 
-    return GTPChain.UNGRAPHED
+    return U
 
 
 def classify_gtp_chains(model) -> None:
@@ -187,7 +236,7 @@ def classify_gtp_chains(model) -> None:
     for name, param in model.named_parameters():
         if not is_gtp_param(param):
             continue
-        target = _classify_param_chain(name).value
+        target = _classify_param_chain(name)
         if param.prefetch_initialized and param.chain_id != target:
             conflicts.append((name, param.chain_id, target))
             continue
@@ -230,6 +279,18 @@ _RS_STREAMS: Dict[str, torch.cuda.Stream] = {}
 # wgrad bufs need address stability for CG replay and are not pool-recycled.
 _wgrad_buf_pool: Dict[tuple, list] = {}
 
+# Double-buffering for the grouped one-block-ahead chains (docs §3.4):
+#   - the weight cache shares ONE buffer per (shape, dtype, expert_idx) -> safe only while at
+#     most one same-key weight is live;
+#   - one-block-ahead keeps blocks N and N+1 live at once, so without a tiebreak the prefetch
+#     would clobber the weight the running GEMM is still reading;
+#   - fold a chain-position parity (0,1,0,1...) into the cache key -> consecutive blocks
+#     alternate between exactly TWO buffers.
+# Parity is assigned on first cache-key use, which happens in forward (= chain) order, so this
+# per-(shape, expert_idx, chain_id) counter yields the alternating sequence. Cleared by
+# reset_gtp_state so a rebuilt model restarts numbering.
+_GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
+
 
 def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
     """Get a pool buffer or allocate fresh, tagged so _wgrad_pool_put accepts only
@@ -260,7 +321,12 @@ def _stream_key(chain_id: str, group) -> tuple:
 
     Partitioned on two axes: chain_id (captured GRAPHED vs eager UNGRAPHED ops must not
     share a stream) and group (independent NCCL, e.g. GTP_remat vs EGTP_remat, no serialization).
+
+    Grouped fc1/fc2 are separate chains but must share ONE stream, so their gathers serialize
+    instead of splitting bandwidth: drop the role from the key, keep the capture suffix.
     """
+    if _chain_is_grouped(chain_id):
+        chain_id = _GTP_REMAT_GROUPED_PREFIX + _graphness_suffix(_chain_is_graphed(chain_id))
     return (chain_id, id(group) if group is not None else 0)
 
 
@@ -917,15 +983,35 @@ class GTPShardedParam(torch.nn.Parameter):
             return
         self.rs_state = new_state
 
+    def _double_buffer_parity(self) -> int:
+        """Chain-position parity (0/1) that keeps neighbouring blocks on different buffers.
+
+        First use draws from a per-(shape, expert_idx, chain_id) counter; since first use follows
+        chain order, consecutive weights get 0,1,0,1... The value is cached on the param, so the
+        weight's fwd-AG, bwd-AG and RS buffers all share it. See ``_GTP_GROUPED_BUF_PARITY_COUNTER``
+        """
+        p = getattr(self, "_buf_parity", None)
+        if p is None:
+            counter_key = (self._unsharded_shape_padded, self.expert_idx, self.chain_id)
+            n = _GTP_GROUPED_BUF_PARITY_COUNTER.get(counter_key, 0)
+            p = n & 1
+            _GTP_GROUPED_BUF_PARITY_COUNTER[counter_key] = n + 1
+            self._buf_parity = p
+        return p
+
     def _get_cache_key(self, dtype, fwd: bool, reduce_scatter: bool) -> tuple:
         """Build cache key from output shape + dtype.
 
         Weights with matching gathered shape and dtype share a buffer. For experts gathered
         in parallel, self.expert_idx keeps each distinct; same-indexed experts across layers share.
+
+        Grouped one-block-ahead chains additionally fold in a double-buffer parity so a prefetched
+        layer N+1 weight never lands in the buffer that layer N is still consuming (see
+        ``_GTP_GROUPED_BUF_PARITY_COUNTER``).
         """
 
         if not isinstance(dtype, torch.dtype):
-            return (
+            key = (
                 self._unsharded_shape_padded,
                 dtype,
                 fwd,
@@ -933,7 +1019,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 self.expert_idx,
                 reduce_scatter,
             )
-        return (self._unsharded_shape_padded, dtype, self.expert_idx, reduce_scatter)
+        else:
+            key = (self._unsharded_shape_padded, dtype, self.expert_idx, reduce_scatter)
+        if _chain_is_grouped(self.chain_id):
+            # chain_id keeps fc1/fc2 apart (both can be in flight at once, even if same-shaped);
+            # parity alternates consecutive blocks between two buffers.
+            key = key + (self.chain_id, self._double_buffer_parity())
+        return key
 
     def _strip_padding(self, tensor):
         if self.pad_length == 0:
@@ -1415,7 +1507,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # Release stashed wgrad inputs: UNGRAPHED buffers go back to the pool;
         # GRAPHED just drops Python refs (addresses must stay stable for CG).
         if getattr(self, "_wgrad_input_bufs", None) is not None:
-            if self.chain_id == GTPChain.UNGRAPHED.value:
+            if not _chain_is_graphed(self.chain_id):
                 for buf in self._wgrad_input_bufs:
                     _wgrad_pool_put(buf)
             self._wgrad_input_bufs = None
@@ -1513,7 +1605,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
         # cannot, since CUDA graphs require stable buffer addresses across replay.
-        poolable = self.chain_id == GTPChain.UNGRAPHED.value
+        poolable = not _chain_is_graphed(self.chain_id)
 
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
@@ -1651,7 +1743,7 @@ def set_cuda_graph_mempool(device, mempool):
 def _graphed_alloc(chain_id):
     """Route allocations in this block into the registered CG mempool when ``chain_id``
     is GRAPHED and a pool is registered; otherwise a no-op (regular allocator)."""
-    if _CG_MEMPOOL is not None and chain_id == GTPChain.GRAPHED.value:
+    if _CG_MEMPOOL is not None and _chain_is_graphed(chain_id):
         torch._C._cuda_beginAllocateCurrentThreadToPool(_CG_MEMPOOL_DEVICE, _CG_MEMPOOL)
         try:
             yield
@@ -1980,6 +2072,7 @@ def reset_gtp_state():
     """
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
+    _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
 
 
 # ------------------------------------------------------------------------
