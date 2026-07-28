@@ -10,8 +10,7 @@ orphan: true
 > This reference does not repeat it.
 
 Bit-exact determinism means two runs with identical configuration, data, seeds,
-software, and hardware produce identical results. The precise definition and
-the terms used across these pages are in the [glossary](./glossary.md).
+software, and hardware produce identical results.
 
 ## Contents
 
@@ -23,6 +22,4 @@ the terms used across these pages are in the [glossary](./glossary.md).
 - [`glossary.md`](./glossary.md): definitions and abbreviations.
 
 The roadmap is tracked dynamically in
-[issue #5785](https://github.com/NVIDIA/Megatron-LM/issues/5785) rather than in
-these documents, so the docs describe what is merged and the issue tracks what
-is in progress.
+[issue #5785](https://github.com/NVIDIA/Megatron-LM/issues/5785).
