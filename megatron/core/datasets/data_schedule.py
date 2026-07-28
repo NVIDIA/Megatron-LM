@@ -7,12 +7,22 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule_utils import (
     _get_global_seqlens_and_ids,
+    broadcast_scalars,
     broadcast_tensor,
 )
-from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
+
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn't installed or the torch wrapper is missing
+    tex = None
 
 
 def _build_thd_padding_mask(
@@ -413,30 +423,24 @@ def get_batch_on_this_rank_for_sequence_packing(
             # TODO: Revert this workaround once TE fixes the issue.
             cu_seqlens = batch["cu_seqlens_padded"]
             total_tokens = int(cu_seqlens[-1].item())
-            index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            assert (
+                tex is not None
+            ), "Transformer Engine is required to use Context Parallel with THD format data."
+            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             cp_slice_keys = ['padding_mask']
             if is_first_or_last_stage:
                 cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
             for key in cp_slice_keys:
                 batch[key] = batch[key].index_select(0, index)
 
-    # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
-    # cu_seqlens_padded for non TP 0 ranks.
-    if is_tp_rank_0:
-        cu_seqlen_size = torch.tensor(batch['cu_seqlens'].size(0), dtype=torch.int32, device=dev)
-    else:
-        cu_seqlen_size = torch.empty(1, dtype=torch.int32, device=dev)
-    broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
-    cu_seqlen_size = cu_seqlen_size.item()
-
-    # Broadcast total_tokens because padding_mask is prepared on every PP stage.
-    # Tokens/labels/loss_mask/position_ids use the same length on stages that own them.
-    if is_tp_rank_0:
-        total_tokens = torch.tensor(batch['padding_mask'].size(0), dtype=torch.int32, device=dev)
-    else:
-        total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
-    broadcast_tensor(total_tokens, tp_src_rank, tp_group)
-    total_tokens = total_tokens.item()
+    # Broadcast the receive-buffer shapes inside the TP group:
+    # - cu_seqlen_size is needed to allocate cu_seqlens / cu_seqlens_padded on non TP 0 ranks.
+    # - total_tokens is needed because padding_mask is prepared on every PP stage, and
+    #   tokens/labels/loss_mask/position_ids use the same length on stages that own them.
+    shapes = (
+        [batch['cu_seqlens'].size(0), batch['padding_mask'].size(0)] if is_tp_rank_0 else [0, 0]
+    )
+    cu_seqlen_size, total_tokens = broadcast_scalars(shapes, tp_group, dev, dtype=torch.int32)
 
     # Step1: Prepare "tokens", "position_ids" on all ranks.
     if is_first_stage or mtp_on_this_rank:
@@ -522,8 +526,6 @@ def get_batch_on_this_rank_for_sequence_packing(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
-        local_cp_size=None,
-        cp_group=None,
     )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
