@@ -2,6 +2,7 @@
 
 """Transfer planning for parameters sharded with generalized tensor parallelism."""
 
+import math
 from itertools import product
 from typing import NamedTuple
 
@@ -119,17 +120,8 @@ def _global_shape(metadata: ParameterMetadata) -> tuple[int, ...]:
             group = metadata.tensor_parallel_group_ranks
             if not group:
                 raise RuntimeError(f"{metadata.name}: missing tensor-parallel group")
-            if metadata.partition_sizes is not None:
-                if sum(metadata.partition_sizes) != tp_local_size:
-                    raise RuntimeError(
-                        f"{metadata.name}: partition_sizes sum to "
-                        f"{sum(metadata.partition_sizes)}, expected TP-local size {tp_local_size}"
-                    )
-                shape.append(sum(size * len(group) for size in metadata.partition_sizes))
-            else:
-                shape.append(tp_local_size * len(group))
-        else:
-            shape.append(tp_local_size)
+            tp_local_size *= len(group)
+        shape.append(tp_local_size)
     return tuple(shape)
 
 
@@ -193,9 +185,7 @@ def plan_gtp(
     dst_shape = _global_shape(dst_metadata)
     dst_segments = [_local_segments(dst_metadata, dim) for dim in range(len(dst_metadata.shape))]
 
-    expected = 1
-    for segments in dst_segments:
-        expected *= sum(segment.length for segment in segments)
+    expected = math.prod(sum(segment.length for segment in segments) for segments in dst_segments)
 
     transferred = 0
     ops = []
@@ -214,7 +204,7 @@ def plan_gtp(
         for rectangle in product(*overlaps_by_dim):
             src_slice = tuple(slices[0] for slices in rectangle)
             dst_slice = tuple(slices[1] for slices in rectangle)
-            transferred += _slice_numel(dst_slice)
+            transferred += math.prod(part.stop - part.start for part in dst_slice)
             ops.append((src.owner_rank, src_slice, dst_slice))
 
     if transferred != expected:
@@ -224,10 +214,3 @@ def plan_gtp(
         )
 
     return sorted(ops, key=lambda op: tuple(part.start for part in op[2]))
-
-
-def _slice_numel(slices: tuple[slice, ...]) -> int:
-    result = 1
-    for part in slices:
-        result *= part.stop - part.start
-    return result
