@@ -13,8 +13,11 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incr
     HuggingFaceFastIncrementalDetokenizer,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
+    StreamingChatParser,
     openai_stream,
 )
+from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import Qwen3CoderToolParser
+
 
 
 class _Tokenizer:
@@ -54,7 +57,16 @@ def _make_byte_level_fast_tokenizer():
 @pytest.mark.asyncio
 async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     stream = AsyncStream(request_id=1, cancel=lambda: None)
-    stream.put({"partial": {"request_id": 1, "new_tokens": [1, 2], "new_log_probs": [-0.1, -0.2]}})
+    stream.put(
+        {
+            "partial": {
+                "request_id": 1,
+                "new_tokens": [1, 2],
+                "new_log_probs": [-0.1, -0.2],
+                "new_top_n_logprobs": [{"a": -0.01}, {"b": -0.02}],
+            }
+        }
+    )
     # Token 3 models a token completed before the engine's final reply and
     # therefore absent from its last partial frame.
     stream.put(
@@ -63,6 +75,11 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
                 "prompt_tokens": [9, 9],
                 "generated_tokens": [1, 2, 3],
                 "generated_log_probs": [-0.1, -0.2, -0.3],
+                "generated_top_n_logprobs": [
+                    {"a": -0.01},
+                    {"b": -0.02},
+                    {"c": -0.03},
+                ],
                 "num_cached_tokens": 2,
                 "sampling_params": {"num_tokens_to_generate": 3},
             }
@@ -90,8 +107,13 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     assert "generated_text" not in first["choices"][0]
     assert "generated_length" not in first["choices"][0]
     assert first["choices"][0]["logprobs"]["token_logprobs"] == [-0.1, -0.2]
+    assert first["choices"][0]["logprobs"]["top_logprobs"] == [
+        {"a": -0.01},
+        {"b": -0.02},
+    ]
     assert first["choices"][0]["logprobs"]["text_offset"] == [0, 1]
     assert reconciled["choices"][0]["text"] == "c"
+    assert reconciled["choices"][0]["logprobs"]["top_logprobs"] == [{"c": -0.03}]
     assert "generation_token_ids" not in reconciled["choices"][0]
     assert "generation_log_probs" not in reconciled["choices"][0]
     assert "generated_text" not in reconciled["choices"][0]
@@ -124,6 +146,213 @@ def test_huggingface_fast_incremental_detokenizer_requires_optional_dependencies
         HuggingFaceFastIncrementalDetokenizer(_Tokenizer(), [])
 
 
+@pytest.mark.asyncio
+async def test_openai_stream_echoes_completion_prompt_before_generated_text():
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "partial": {
+                "request_id": 1,
+                "new_tokens": [1],
+                "new_log_probs": [-0.1],
+                "new_top_n_logprobs": [{"a": -0.01}],
+                "prompt_log_probs": [-0.4],
+                "prompt_top_n_logprobs": [{"z": -0.04}],
+            }
+        }
+    )
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [26, 26],
+                "generated_tokens": [1],
+                "generated_log_probs": [-0.1],
+                "generated_top_n_logprobs": [{"a": -0.01}],
+                "sampling_params": {"num_tokens_to_generate": 2},
+            }
+        }
+    )
+    stream.finish()
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream],
+            _Tokenizer(),
+            [_IncrementalDetokenizer()],
+            chat=False,
+            return_log_probs=True,
+            echo_prompts=["zz"],
+            prompt_token_ids=[[26, 26]],
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+
+    echoed, generated, finished = payloads
+    assert echoed["choices"][0]["text"] == "zz"
+    assert echoed["choices"][0]["logprobs"] == {
+        "tokens": ["z", "z"],
+        "token_logprobs": [None, -0.4],
+        "top_logprobs": [None, {"z": -0.04}],
+        "text_offset": [0, 1],
+    }
+    assert generated["choices"][0]["text"] == "a"
+    assert generated["choices"][0]["logprobs"]["text_offset"] == [2]
+    assert finished["choices"][0]["finish_reason"] == "stop"
+    assert records[-1] == "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_surfaces_failed_final_without_success_terminator():
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "final": {
+                "status": "FAILED",
+                "events": [
+                    {
+                        "type": "ERROR_NONTRANSIENT",
+                        "payload": "context length exceeded",
+                    }
+                ],
+            }
+        }
+    )
+    stream.finish()
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream],
+            _Tokenizer(),
+            [_IncrementalDetokenizer()],
+            chat=True,
+        )
+    ]
+
+    assert records == [
+        'data: {"error": {"message": "context length exceeded"}}\n\n'
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put(
+        {
+            "partial": {
+                "request_id": 1,
+                "new_tokens": [1],
+                "new_log_probs": [-0.1],
+                "new_top_n_logprobs": [{"a": -0.01}],
+            }
+        }
+    )
+    stream.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1],
+                "generated_log_probs": [-0.1],
+                "generated_top_n_logprobs": [{"a": -0.01}],
+                "sampling_params": {"num_tokens_to_generate": 2},
+            }
+        }
+    )
+    stream.finish()
+    parser = StreamingChatParser(lambda text: (text, {}))
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream],
+            _Tokenizer(),
+            [_IncrementalDetokenizer()],
+            chat=True,
+            return_log_probs=True,
+            chat_parsers=[parser],
+        )
+    ]
+    payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
+
+    role, content, finished = payloads
+    assert role["choices"][0]["delta"] == {
+        "role": "assistant",
+        "content": "",
+    }
+    assert content["choices"][0]["delta"] == {"content": "a"}
+    assert content["choices"][0]["logprobs"]["content"][0]["top_logprobs"] == [
+        {
+            "token": "a",
+            "logprob": -0.01,
+            "bytes": [97],
+        }
+    ]
+    assert finished["choices"][0]["finish_reason"] == "stop"
+    assert records[-1] == "data: [DONE]\n\n"
+
+
+def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    def parse(text):
+        return Qwen3CoderToolParser.parse(text, tools=tools)
+
+    parser = StreamingChatParser(
+        parse,
+        marker_prefixes=Qwen3CoderToolParser.streaming_markers,
+    )
+    model_output = (
+        "Checking. <tool_call><function=get_weather>"
+        "<parameter=city>\nSF\n</parameter></function></tool_call>"
+    )
+    deltas = []
+    for end in range(1, len(model_output) + 1):
+        deltas.extend(parser.parse(model_output[:end]))
+    deltas.extend(parser.parse(model_output, finished=True))
+
+    assert "".join(delta.get("content", "") for delta in deltas) == "Checking. "
+    tool_deltas = [
+        tool_call
+        for delta in deltas
+        for tool_call in delta.get("tool_calls", [])
+    ]
+    name_deltas = [
+        tool_call
+        for tool_call in tool_deltas
+        if tool_call.get("function", {}).get("name") is not None
+    ]
+    assert len(name_deltas) == 1
+    assert name_deltas[0]["index"] == 0
+    assert name_deltas[0]["type"] == "function"
+    assert name_deltas[0]["id"].startswith("call_")
+    assert name_deltas[0]["function"] == {"name": "get_weather"}
+
+    argument_text = "".join(
+        tool_call.get("function", {}).get("arguments", "")
+        for tool_call in tool_deltas
+    )
+    assert json.loads(argument_text) == {"city": "SF"}
+    assert all(tool_call["index"] == 0 for tool_call in tool_deltas)
+    assert parser.finish_reason(
+        {
+            "generated_tokens": [1],
+            "sampling_params": {"num_tokens_to_generate": 2},
+        }
+    ) == "tool_calls"
+
+
 def test_huggingface_fast_incremental_detokenizer_preserves_utf8_boundaries():
     tokenizer = _make_byte_level_fast_tokenizer()
     huggingface_tokenizer = tokenizer._tokenizer.tokenizer
@@ -152,6 +381,19 @@ def test_huggingface_fast_incremental_detokenizer_uses_prompt_context():
 
     assert full_text.startswith(prompt_text)
     assert streamed_text == full_text[len(prompt_text) :]
+
+
+def test_huggingface_fast_incremental_detokenizer_skips_special_tokens():
+    tokenizer = _make_byte_level_fast_tokenizer()
+    huggingface_tokenizer = tokenizer._tokenizer.tokenizer
+    huggingface_tokenizer.add_special_tokens({"additional_special_tokens": ["<special>"]})
+    token_ids = huggingface_tokenizer.encode("a<special>b", add_special_tokens=False)
+    detokenizer = HuggingFaceFastIncrementalDetokenizer(tokenizer, [])
+
+    streamed_text = "".join(detokenizer.update([token_id]) for token_id in token_ids)
+
+    assert streamed_text == huggingface_tokenizer.decode(token_ids, skip_special_tokens=True)
+    assert streamed_text == "ab"
 
 
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
