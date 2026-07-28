@@ -107,7 +107,7 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
 
 
 @pytest.mark.internal
-@pytest.mark.parametrize("cuda_graph_static,expected_max_num_seqs", [(False, None), (True, 32)])
+@pytest.mark.parametrize("cuda_graph_static,expected_max_num_seqs", [(False, 32), (True, 32)])
 def test_pad_to_max_resolves_padding_kwargs(cuda_graph_static, expected_max_num_seqs):
     alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
         pad_packed_seq_alignment="max",
@@ -402,7 +402,7 @@ class TestPadSequenceForThd:
         alignment, pad_target_len, max_num_seqs = get_thd_padding_kwargs(
             pad_packed_seq_alignment="max",
             max_seqlen_per_dp_cp_rank=target_len,
-            thd_max_packed_sequences=32,
+            thd_max_packed_sequences=None,
             cuda_graph_static=False,
         )
 

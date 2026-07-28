@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import math
@@ -1087,6 +1087,13 @@ class MLASelfAttention(MultiLatentAttention):
         """Execute weight gradient computation"""
         self._backward_kv_proj()
         self._backward_q_proj()
+        # For the 'dsa' experimental variant core_attention is DSAttention, whose
+        # indexer linears defer their wgrads under delay_wgrad_compute and need an
+        # explicit flush. For standard MLA the core is TEDotProductAttention, which
+        # owns no linears and defines no backward_dw — hence the guard.
+        core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
+        if core_attention_backward_dw is not None:
+            core_attention_backward_dw()
         self._backward_output_proj()
 
     def _backward_kv_proj(self):
