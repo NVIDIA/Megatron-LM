@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional
 
@@ -57,22 +58,43 @@ class _Writeback:
     recv_bufs: Optional[list[torch.Tensor]] = None
 
 
-def _get_mxfp8_accumulator(
-    pending: dict[int, tuple], dst_param: torch.Tensor
-) -> tuple[torch.Tensor, list]:
-    """Get or lazily allocate the BF16 accumulation buffer for an MXFP8 dest param.
+def _is_quantized_param(param: torch.Tensor) -> bool:
+    """Return whether refit must stage a high-precision full parameter."""
+    is_gtp = getattr(param, "is_gtp_weight_remat", False)
+    return is_mxfp8tensor(param) or (is_gtp and is_float8tensor(param))
+
+
+def _get_quantized_accumulator(pending: dict[int, tuple], dst_param: torch.Tensor) -> torch.Tensor:
+    """Get or lazily allocate the BF16 accumulation buffer for a quantized destination.
 
     All slices for the same dst_param land in this buffer; ``quantize_`` is
-    called once after all slices have been written.  Allocates empty (not
-    dequantized) because every slice will be overwritten.
+    called once after all slices have been written. The buffer is zeroed
+    because a padded GTP destination intentionally has storage-only rows that
+    receive no logical-weight transfer.
     """
     param_id = id(dst_param)
     entry = pending.get(param_id)
     if entry is None:
-        full_bf16 = torch.empty(dst_param.shape, dtype=torch.bfloat16, device=dst_param.device)
-        entry = (dst_param, full_bf16, [])
+        full_bf16 = torch.zeros(dst_param.shape, dtype=torch.bfloat16, device=dst_param.device)
+        entry = (dst_param, full_bf16)
         pending[param_id] = entry
-    return entry[1], entry[2]
+    return entry[1]
+
+
+def _quantized_load_context(module: torch.nn.Module | None, pending: dict[int, tuple]):
+    """Return the special update context required by native quantized GTP params."""
+    if module is None or not any(
+        getattr(param, "is_gtp_weight_remat", False) for param, _buffer in pending.values()
+    ):
+        return nullcontext()
+
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if not HAVE_GTP:
+        return nullcontext()
+    from megatron.core.tensor_parallel.gtp_api import gtp_native_fp8_load_context
+
+    return gtp_native_fp8_load_context(module)
 
 
 def execute_reshard_plan(
@@ -126,18 +148,18 @@ def execute_reshard_plan(
     sendable_cache: dict[str, torch.Tensor] = {}
     sendable_events: dict[str, torch.cuda.Event] = {}
 
-    mxfp8_param_names: set[str] = set()
+    quantized_param_names: set[str] = set()
     for op in plan.send_ops:
         if transform is not None and transform.should_transform(op.param_name):
             continue
         src_param = src_params.get(op.param_name)
-        if src_param is not None and is_mxfp8tensor(src_param):
-            mxfp8_param_names.add(op.param_name)
+        if src_param is not None and _is_quantized_param(src_param):
+            quantized_param_names.add(op.param_name)
 
-    if mxfp8_param_names:
+    if quantized_param_names:
         prefetch_stream = torch.cuda.Stream()
         with torch.cuda.stream(prefetch_stream):
-            for param_name in mxfp8_param_names:
+            for param_name in quantized_param_names:
                 sendable_cache[param_name] = _ensure_sendable(src_params[param_name])
                 ev = torch.cuda.Event()
                 ev.record()
@@ -170,9 +192,9 @@ def execute_reshard_plan(
     sendable_events.clear()
 
     writebacks: list[_Writeback] = []
-    # Maps id(dst_param) -> (dst_param, full_bf16, slices) for MXFP8 dests that
-    # need deferred quantize_() after all slices are written.
-    pending_quantized: dict[int, tuple[torch.nn.Parameter, torch.Tensor, list]] = {}
+    # Quantized destinations are assembled in BF16 and quantized once all
+    # logical slices have arrived.
+    pending_quantized: dict[int, tuple[torch.nn.Parameter, torch.Tensor]] = {}
 
     for op in plan.recv_ops:
         if transform is not None and transform.should_transform(op.param_name):
@@ -198,17 +220,17 @@ def execute_reshard_plan(
         # the slice view is already contiguous AND the parameter is a plain
         # tensor (not quantized — quantized params need deferred accumulation).
         dst_slice_view = dst_param.data[op.my_slice]
-        dst_is_mxfp8 = is_mxfp8tensor(dst_param)
+        dst_is_quantized = _is_quantized_param(dst_param)
 
-        if not dst_is_mxfp8 and dst_slice_view.is_contiguous():
+        if not dst_is_quantized and dst_slice_view.is_contiguous():
             service.submit_recv(dst_slice_view, op.peer_rank, task_id=op.task_id)
             writebacks.append(_Writeback(kind='direct'))
             continue
 
-        if dst_is_mxfp8:
-            # TE MXFP8: recv directly into pre-allocated BF16 accumulation
+        if dst_is_quantized:
+            # Quantized parameter: recv directly into pre-allocated BF16 accumulation
             # buffer to avoid per-slice BF16 allocations.
-            full_bf16, _slices = _get_mxfp8_accumulator(pending_quantized, dst_param)
+            full_bf16 = _get_quantized_accumulator(pending_quantized, dst_param)
             accum_view = full_bf16[op.my_slice]
             if accum_view.is_contiguous():
                 service.submit_recv(accum_view, op.peer_rank, task_id=op.task_id)
@@ -234,10 +256,9 @@ def execute_reshard_plan(
     #
     # For quantized destination params (fp8_param=true on receiver),
     # accumulate ALL BF16 slices per-param before calling quantize_() once.
-    # This avoids corrupting MXFP8 per-block scales from partial-slice updates.
-    # Since refit overwrites every slice of each param, we allocate a fresh
-    # BF16 buffer (torch.empty) instead of dequantizing the existing MXFP8
-    # weights — this avoids a full-model-sized dequantize+clone.
+    # This avoids corrupting block scales through partial updates. A zeroed
+    # buffer also gives padded GTP rows neutral values without dequantizing the
+    # old weight.
     for i in range(len(writebacks)):
         wb = writebacks[i]
         writebacks[i] = None  # Drop reference eagerly so recv buffers can free.
@@ -247,20 +268,20 @@ def execute_reshard_plan(
             if wb.kind == 'transform':
                 transform.finalize_recv(wb.param_name, wb.dst_slice, wb.recv_bufs)
                 continue
-            # 'copy' — direct buffer copy, with deferred MXFP8 accumulation if needed.
-            if is_mxfp8tensor(wb.dst_param):
-                full_bf16, slices = _get_mxfp8_accumulator(pending_quantized, wb.dst_param)
-                slices.append((wb.dst_slice, wb.recv_buffer))
+            # 'copy' — direct buffer copy, with deferred quantization if needed.
+            if _is_quantized_param(wb.dst_param):
+                full_bf16 = _get_quantized_accumulator(pending_quantized, wb.dst_param)
                 full_bf16[wb.dst_slice].copy_(wb.recv_buffer)
             else:
                 wb.dst_param.data[wb.dst_slice].copy_(wb.recv_buffer)
     writebacks.clear()
 
     # Finalize deferred quantized param updates.
-    had_mxfp8_staging = bool(pending_quantized)
-    for _param_id, (dst_param, full_bf16, _slices) in pending_quantized.items():
-        with torch.no_grad():
-            dst_param.quantize_(full_bf16)
+    had_quantized_staging = bool(pending_quantized)
+    with _quantized_load_context(dst_module, pending_quantized):
+        for dst_param, full_bf16 in pending_quantized.values():
+            with torch.no_grad():
+                dst_param.quantize_(full_bf16)
     pending_quantized.clear()
 
     refresh_module_caches(dst_module)
@@ -274,9 +295,9 @@ def execute_reshard_plan(
 
     # Release transient BF16 recv/accumulation buffers back to the CUDA driver.
     # Without this the caching allocator retains the peak allocation, which can
-    # be significant for MXFP8 destinations (full model weight size in BF16).
-    # Skip the (expensive) empty_cache walk when no MXFP8 staging happened.
-    if had_mxfp8_staging:
+    # be significant for quantized destinations (full model weight size in BF16).
+    # Skip the (expensive) empty_cache walk when no staging happened.
+    if had_quantized_staging:
         torch.cuda.empty_cache()
 
     logger.info("Reshard complete")

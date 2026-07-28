@@ -26,10 +26,16 @@ class TestPlanCacheKey:
 
     def test_equality_with_same_inputs(self):
         k1 = _PlanCacheKey(
-            rank=0, src_config=(1, 1, 1, 1, 1), dst_config=(1, 1, 1, 1, 1), num_experts=None
+            rank=0,
+            src_config=(1, 1, 1, 1, 1, 1, 1),
+            dst_config=(1, 1, 1, 1, 1, 1, 1),
+            num_experts=None,
         )
         k2 = _PlanCacheKey(
-            rank=0, src_config=(1, 1, 1, 1, 1), dst_config=(1, 1, 1, 1, 1), num_experts=None
+            rank=0,
+            src_config=(1, 1, 1, 1, 1, 1, 1),
+            dst_config=(1, 1, 1, 1, 1, 1, 1),
+            num_experts=None,
         )
         assert k1 == k2
         assert hash(k1) == hash(k2)
@@ -38,16 +44,16 @@ class TestPlanCacheKey:
         """Same sizes + rank, different src_rank_offset → different cache key."""
         k1 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=(2, 1, 1, 2, 1, 1, 1),
+            dst_config=(2, 1, 1, 2, 1, 1, 1),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         k2 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=(2, 1, 1, 2, 1, 1, 1),
+            dst_config=(2, 1, 1, 2, 1, 1, 1),
             num_experts=None,
             src_rank_offset=8,
             dst_rank_offset=12,
@@ -58,16 +64,16 @@ class TestPlanCacheKey:
     def test_different_dst_rank_offset_distinguishes(self):
         k1 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=(2, 1, 1, 2, 1, 1, 1),
+            dst_config=(2, 1, 1, 2, 1, 1, 1),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         k2 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1),
-            dst_config=(2, 1, 1, 2, 1),
+            src_config=(2, 1, 1, 2, 1, 1, 1),
+            dst_config=(2, 1, 1, 2, 1, 1, 1),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=8,
@@ -77,12 +83,15 @@ class TestPlanCacheKey:
     def test_default_offsets_match_collocated(self):
         """Collocated callers (no offsets specified) reuse the same plan."""
         k1 = _PlanCacheKey(
-            rank=3, src_config=(2, 1, 1, 4, 1), dst_config=(2, 1, 1, 4, 1), num_experts=None
+            rank=3,
+            src_config=(2, 1, 1, 4, 1, 1, 1),
+            dst_config=(2, 1, 1, 4, 1, 1, 1),
+            num_experts=None,
         )
         k2 = _PlanCacheKey(
             rank=3,
-            src_config=(2, 1, 1, 4, 1),
-            dst_config=(2, 1, 1, 4, 1),
+            src_config=(2, 1, 1, 4, 1, 1, 1),
+            dst_config=(2, 1, 1, 4, 1, 1, 1),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=0,
@@ -93,6 +102,47 @@ class TestPlanCacheKey:
         k1 = _PlanCacheKey(rank=0, src_config=None, dst_config=None, num_experts=8)
         k2 = _PlanCacheKey(rank=0, src_config=None, dst_config=None, num_experts=16)
         assert k1 != k2
+
+    def test_gtp_sizes_distinguish(self):
+        plain = _PlanCacheKey(
+            rank=0,
+            src_config=(2, 1, 1, 2, 1, 1, 1),
+            dst_config=(2, 1, 1, 2, 1, 1, 1),
+            num_experts=None,
+        )
+        gtp = _PlanCacheKey(
+            rank=0,
+            src_config=(2, 1, 1, 2, 1, 4, 2),
+            dst_config=(2, 1, 1, 2, 1, 4, 2),
+            num_experts=None,
+        )
+        assert plain != gtp
+
+
+def test_config_tuple_includes_gtp_sizes():
+    class Group:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    class Core:
+        pg_collection = type(
+            "PG",
+            (),
+            {
+                "tp": Group(2),
+                "pp": Group(3),
+                "ep": Group(4),
+                "dp": Group(5),
+                "expt_tp": Group(6),
+                "gtp_remat": Group(7),
+                "expt_gtp_remat": Group(8),
+            },
+        )()
+
+    assert _get_config_tuple(Core()) == (2, 3, 4, 5, 6, 7, 8)
 
 
 class TestPlanCacheKeyNonCollocated:
@@ -105,7 +155,7 @@ class TestPlanCacheKeyNonCollocated:
     def test_source_only_vs_dest_only_distinguish(self):
         """Source-only (dst_config=None) and dest-only (src_config=None) on the
         same global rank must produce different plans."""
-        sizes = (2, 1, 1, 2, 1)
+        sizes = (2, 1, 1, 2, 1, 1, 1)
         src_only = _PlanCacheKey(rank=0, src_config=sizes, dst_config=None, num_experts=None)
         dst_only = _PlanCacheKey(rank=0, src_config=None, dst_config=sizes, num_experts=None)
         assert src_only != dst_only
@@ -114,10 +164,10 @@ class TestPlanCacheKeyNonCollocated:
         """Idle rank (both configs None) is distinct from a rank with either model."""
         idle = _PlanCacheKey(rank=5, src_config=None, dst_config=None, num_experts=None)
         with_src = _PlanCacheKey(
-            rank=5, src_config=(1, 1, 1, 1, 1), dst_config=None, num_experts=None
+            rank=5, src_config=(1, 1, 1, 1, 1, 1, 1), dst_config=None, num_experts=None
         )
         with_dst = _PlanCacheKey(
-            rank=5, src_config=None, dst_config=(1, 1, 1, 1, 1), num_experts=None
+            rank=5, src_config=None, dst_config=(1, 1, 1, 1, 1, 1, 1), num_experts=None
         )
         assert idle != with_src
         assert idle != with_dst
@@ -126,7 +176,7 @@ class TestPlanCacheKeyNonCollocated:
     def test_non_collocated_offset_combinations(self):
         """src_rank_offset and dst_rank_offset together distinguish non-collocated
         layouts that share parallel sizes."""
-        sizes = (2, 1, 1, 2, 1)
+        sizes = (2, 1, 1, 2, 1, 1, 1)
         # Two non-collocated layouts: world=[src 0-3, dst 4-7] vs [src 0-3, dst 8-11].
         layout_a = _PlanCacheKey(
             rank=0,

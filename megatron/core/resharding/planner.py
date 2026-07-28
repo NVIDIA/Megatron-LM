@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from .gtp_planner import plan_gtp
 from .utils import (
     ParameterMetadata,
     ReshardPlan,
@@ -305,11 +306,15 @@ def _finalize_dp_transfers(
 
 def _determine_source_ranks_for_dst_param(
     param_name: str,
+    src_meta_list: list[ParameterMetadata],
     src_metadata: ParameterMetadata,
     dst_metadata: ParameterMetadata,
     my_global_rank: int,
 ) -> list[tuple[int, tuple[slice, ...], tuple[slice, ...]]]:
     """Route to dimension-specific planner based on parameter sharding type."""
+
+    if src_metadata.is_gtp or dst_metadata.is_gtp:
+        return plan_gtp(param_name, src_meta_list, src_metadata, dst_metadata)
 
     # Regular TP/DP planning with EP-resolved metadata.  _plan_tp handles both
     # plain TP and block-interleaved TP (partition_sizes-driven) layouts.
@@ -361,7 +366,7 @@ def _iter_global_transfer_ops(
             # Choose a representative source metadata with DP round-robin balancing.
             src_metadata = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_rank)
             sources = _determine_source_ranks_for_dst_param(
-                resolved_name, src_metadata, dst_metadata, dst_rank
+                resolved_name, src_meta_list, src_metadata, dst_metadata, dst_rank
             )
             for src_rank, src_slice, dst_slice in sources:
                 task_id = next_task_id

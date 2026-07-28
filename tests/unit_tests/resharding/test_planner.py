@@ -8,10 +8,12 @@ isolation without requiring distributed init or GPU.
 """
 
 import math
+from itertools import product
 
 import pytest
 
 import megatron.core.resharding.planner as planner
+from megatron.core.resharding.gtp_planner import plan_gtp
 from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
     _build_tensor_reshard_specs,
@@ -38,6 +40,9 @@ def _meta(
     tp_ranks=None,
     dp_ranks=None,
     ep_ranks=None,
+    is_gtp=False,
+    gtp_ranks=None,
+    gtp_pad_length=0,
     resolved_name=None,
 ):
     """Create a ParameterMetadata for testing."""
@@ -52,6 +57,9 @@ def _meta(
         partition_dim=partition_dim,
         partition_stride=partition_stride,
         partition_sizes=partition_sizes,
+        is_gtp=is_gtp,
+        gtp_remat_group_ranks=gtp_ranks,
+        gtp_pad_length=gtp_pad_length,
         owner_rank=owner_rank,
         tensor_parallel_group_ranks=tp_ranks,
         data_parallel_group_ranks=dp_ranks,
@@ -84,6 +92,17 @@ def _verify_full_coverage(ops, dim, expected_full_len):
         f"Expected coverage [0, {expected_full_len}), got gaps: "
         f"{set(range(expected_full_len)) - covered}"
     )
+
+
+def _verify_nd_coverage(ops, expected_shape):
+    """Verify that N-D destination slices cover each logical local element once."""
+    covered = set()
+    for _, _, dst_slice in ops:
+        ranges = [range(s.start, s.stop) for s in dst_slice]
+        for index in product(*ranges):
+            assert index not in covered, f"Duplicate coverage at destination index {index}"
+            covered.add(index)
+    assert len(covered) == math.prod(expected_shape)
 
 
 # ===========================================================================
@@ -268,6 +287,158 @@ class TestPlanBlockInterleaved:
 
 
 # ===========================================================================
+# _plan_gtp
+# ===========================================================================
+
+
+class TestPlanGtp:
+    """Tests for logical-coordinate planning across TP×GTP layouts."""
+
+    @staticmethod
+    def _tp2_gtp2_metadata(shape, partition_dim, **kwargs):
+        topology = {
+            0: ([0, 1], [0, 2]),
+            1: ([0, 1], [1, 3]),
+            2: ([2, 3], [0, 2]),
+            3: ([2, 3], [1, 3]),
+        }
+        return [
+            _meta(
+                shape=shape,
+                is_tp=True,
+                partition_dim=partition_dim,
+                owner_rank=rank,
+                tp_ranks=tp_ranks,
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=gtp_ranks,
+                **kwargs,
+            )
+            for rank, (tp_ranks, gtp_ranks) in topology.items()
+        ]
+
+    def test_gtp2_to_unsharded(self):
+        """GTP2 → unsharded gathers the two dim-0 source shards."""
+        src = [
+            _meta(
+                shape=(4, 3),
+                owner_rank=rank,
+                tp_ranks=[rank],
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=[0, 1],
+            )
+            for rank in (0, 1)
+        ]
+        dst = _meta(shape=(8, 3), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        ops = plan_gtp("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 1]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_uses_only_selected_source_replica(self):
+        """Planning follows the selected GTP group without mixing DP replicas."""
+        src = []
+        for group in ([0, 1], [2, 3]):
+            src.extend(
+                _meta(
+                    shape=(4, 3),
+                    owner_rank=rank,
+                    tp_ranks=[rank],
+                    dp_ranks=[rank % 2, rank % 2 + 2],
+                    is_gtp=True,
+                    gtp_ranks=group,
+                )
+                for rank in group
+            )
+        dst = _meta(shape=(8, 3), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_gtp("weight", src, src[2], dst)
+
+        assert [rank for rank, _, _ in ops] == [2, 3]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_unsharded_to_padded_gtp2(self):
+        """Only logical rows are copied into a padded destination GTP shard."""
+        src = [_meta(shape=(6, 2), owner_rank=0, tp_ranks=[0], dp_ranks=[0])]
+        dst_rank_1 = _meta(
+            shape=(4, 2),
+            owner_rank=2,
+            tp_ranks=[2],
+            dp_ranks=[2],
+            is_gtp=True,
+            gtp_ranks=[1, 2],
+            gtp_pad_length=2,
+        )
+
+        ops = plan_gtp("weight", src, src[0], dst_rank_1)
+
+        assert len(ops) == 1
+        src_slice, dst_slice = ops[0][1:]
+        assert src_slice == (slice(4, 6), slice(0, 2))
+        assert dst_slice == (slice(0, 2), slice(0, 2))
+        _verify_nd_coverage(ops, (2, 2))
+
+    def test_column_tp2_gtp2_to_unsharded(self):
+        """Column TP and GTP compose on dim 0 in tp-rank-major order."""
+        src = self._tp2_gtp2_metadata(shape=(2, 3), partition_dim=0)
+        dst = _meta(shape=(8, 3), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_gtp("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 2, 1, 3]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_row_tp2_gtp2_to_unsharded(self):
+        """Row TP and GTP form perpendicular dim-1 × dim-0 shard cuts."""
+        src = self._tp2_gtp2_metadata(shape=(4, 4), partition_dim=1)
+        dst = _meta(shape=(8, 8), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_gtp("weight", src, src[0], dst)
+
+        assert len(ops) == 4
+        assert {rank for rank, _, _ in ops} == {0, 1, 2, 3}
+        _verify_nd_coverage(ops, (8, 8))
+
+    def test_strided_tp_gtp_to_unsharded(self):
+        """GTP slices the TP-local strided layout, not the global tensor."""
+        src = self._tp2_gtp2_metadata(shape=(2, 3), partition_dim=0, partition_stride=2)
+        dst = _meta(shape=(8, 3), owner_rank=4, tp_ranks=[4], dp_ranks=[4])
+
+        ops = plan_gtp("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 1, 2, 3]
+        assert [dst_slice[0] for _, _, dst_slice in ops] == [
+            slice(0, 2),
+            slice(2, 4),
+            slice(4, 6),
+            slice(6, 8),
+        ]
+        _verify_nd_coverage(ops, (8, 3))
+
+    def test_packed_tp_gtp_layout_with_padding(self):
+        """GTP slices the packed TP-local layout after its component interleaving."""
+        src = self._tp2_gtp2_metadata(
+            shape=(2, 2), partition_dim=0, partition_sizes=[2, 1], gtp_pad_length=1
+        )
+        dst = _meta(
+            shape=(6, 2),
+            is_tp=True,
+            partition_dim=0,
+            partition_sizes=[4, 2],
+            owner_rank=4,
+            tp_ranks=[4],
+            dp_ranks=[4],
+        )
+
+        ops = plan_gtp("weight", src, src[0], dst)
+
+        assert [rank for rank, _, _ in ops] == [0, 1, 2, 3]
+        _verify_nd_coverage(ops, (6, 2))
+
+
+# ===========================================================================
 # _finalize_dp_transfers
 # ===========================================================================
 
@@ -396,6 +567,27 @@ def _recv_sig(plan):
 
 class TestBuildPlanFromRosters:
     """Local plan building replayed independently per rank."""
+
+    def test_gtp_schedule_matches_across_ranks(self):
+        """The roster planner emits matching sends and receives for GTP shards."""
+        src = [
+            _meta(
+                shape=(4, 3),
+                owner_rank=rank,
+                tp_ranks=[rank],
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=[0, 1],
+            )
+            for rank in (0, 1)
+        ]
+        dst = _meta(shape=(8, 3), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+        plans = _build_all([([src[0]], []), ([src[1]], []), ([], [dst])])
+
+        sends, recvs = _plan_edges(plans)
+        assert sends == recvs
+        assert {(src_rank, dst_rank) for _, src_rank, dst_rank in sends} == {(0, 2), (1, 2)}
+        assert [op.my_slice[0] for op in plans[2].recv_ops] == [slice(0, 4), slice(4, 8)]
 
     def test_task_ids_match_across_ranks(self):
         """Sender and receiver, planned independently, agree on task_id per transfer.

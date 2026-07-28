@@ -110,6 +110,13 @@ def _ensure_sendable(param: torch.Tensor) -> torch.Tensor:
     dequantized to their original precision (usually BF16).  Standard
     parameters are returned via ``.data`` (unwrapped from autograd).
     """
+    if getattr(param, "is_gtp_weight_remat", False) and is_float8tensor(param):
+        # Native-FP8 GTP parameters use a dynamic GTP_<QuantizedTensor>
+        # subclass. TransformerEngine's dequantizer dispatches on the exact
+        # base class, so use GTP's temporary reclassification helper.
+        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8
+
+        return dequantize_gtp_native_fp8(param)
     if is_mxfp8tensor(param):
         return dequantize_fp8_tensor(param)
     return param.data
