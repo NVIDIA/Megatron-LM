@@ -525,7 +525,13 @@ def fully_shard_optimizer(
         optimizer_group_settings.append(
             (group, {key: group[key] for key in ("lr", "weight_decay") if key in group})
         )
-        group["lr"] = 0.0
+        if "lr" in group:
+            # Capturable optimizers may require lr to remain a device tensor.
+            group["lr"] = (
+                torch.zeros_like(group["lr"])
+                if isinstance(group["lr"], torch.Tensor)
+                else 0.0
+            )
         if "weight_decay" in group:
             group["weight_decay"] = 0.0
     # Allocate the state, then restore the caller's optimizer settings.
