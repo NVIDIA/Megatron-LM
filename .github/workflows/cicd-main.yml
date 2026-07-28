@@ -536,7 +536,7 @@ jobs:
         id: compute
         env:
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
-          ENABLE_GB_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
+          ENABLE_GB_TESTING: "true"
           SELECTED_RUNNER: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
           SELECTED_RUNNER_GB_GPU: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
           REGISTRY_AWS: ${{ env.container-registry }}
@@ -767,7 +767,6 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -809,7 +808,6 @@ jobs:
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-parse-unit-tests-gb200.result == 'success'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -1010,7 +1008,6 @@ jobs:
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
     outputs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
@@ -1079,7 +1076,6 @@ jobs:
       && needs.cicd-integration-gate.outputs.should_run == 'true'
       && needs.cicd-parse-integration-tests-gb200.result == 'success'
       && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
-      && vars.ENABLE_GB200_TESTING == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -1137,7 +1133,7 @@ jobs:
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
-          ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
+          ENABLE_GB200_TESTING: "true"
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
           UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
