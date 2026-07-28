@@ -438,7 +438,11 @@ def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
         tool_call.get("function", {}).get("name") == "get_weather"
         for tool_call in tool_deltas
     ) == 1
-    assert len({tool_call["id"] for tool_call in tool_deltas}) == 1
+    tool_call_ids = [
+        tool_call["id"] for tool_call in tool_deltas if "id" in tool_call
+    ]
+    assert len(tool_call_ids) == 1
+    assert tool_call_ids[0].startswith("call_")
     assert all(tool_call["index"] == 0 for tool_call in tool_deltas)
     argument_text = "".join(
         tool_call.get("function", {}).get("arguments", "")
