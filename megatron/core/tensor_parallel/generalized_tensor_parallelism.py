@@ -1823,6 +1823,9 @@ class GTPWeightCache:
         self._slots: Dict[int, _TicketSlot] = {}
         self._next_ticket: int = 0
         self._total_bytes: int = 0  # running total of allocated bytes
+        # Buffers held across the fwd->bwd boundary. release() refuses to pool anything in here,
+        # whichever ticket asks, so nothing created after the pin can ever adopt it.
+        self._pinned_bufs: List[torch.Tensor] = []
         self.key_to_allocate_func = {}
 
     @staticmethod
@@ -1918,6 +1921,8 @@ class GTPWeightCache:
                 slot.reduce_scatter,
                 slot.fwd,
             )
+            if slot.pin_for_fwd:
+                self._pinned_bufs.append(slot.buf)
 
         return slot.buf
 
@@ -1928,9 +1933,11 @@ class GTPWeightCache:
         buffers keep their fixed address across replays.
         """
         slot = self._slots[ticket]
-        if slot.buf is None or slot.pin_for_fwd:
-            # Pinned buffers (output-layer fwd reuse) must never enter the pool, so
-            # no other same-shape gather can pop and overwrite the retained weight.
+        if slot.buf is None:
+            return
+        # Checked on the BUFFER, not the slot: pooling is how buffers are shared, so a slot that
+        # adopted this one before it was pinned would otherwise put it back into circulation.
+        if any(b is slot.buf for b in self._pinned_bufs):
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
@@ -1938,9 +1945,15 @@ class GTPWeightCache:
             self._pool[slot.key].append(slot.buf)
 
     def clear(self):
-        """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""
+        """Drop all buffers; tickets remain valid and lazily re-allocate on next get().
+
+        Pinned buffers are dropped too, so this must not run between a pinned slot's fwd gather
+        and the bwd that consumes it: the next get() would hand back a freshly allocated,
+        never-gathered buffer. Add a generation counter here if clear() ever gains a caller.
+        """
         for slot in self._slots.values():
             slot.buf = None
+        self._pinned_bufs.clear()
         self._pool.clear()
         self._total_bytes = 0
 
