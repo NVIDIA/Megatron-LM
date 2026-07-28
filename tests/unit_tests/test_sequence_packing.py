@@ -329,5 +329,3 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
     finally:
         Utils.destroy_model_parallel()
         unset_global_variables()
-
-
