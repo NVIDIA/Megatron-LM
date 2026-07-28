@@ -2100,9 +2100,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
-                        check_initialized=False
-                    )
+                    # pg_collection.hcp is guaranteed here: the caller-supplied branch above
+                    # asserts hasattr(pg_collection, "hcp") for cp_comm_type == "a2a+p2p", and
+                    # the fallback branch populates it.
+                    extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
