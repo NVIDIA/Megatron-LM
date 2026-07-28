@@ -34,6 +34,7 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
+    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -326,12 +327,37 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_freq: int = 1
+    """Frequency of DSA indexer top-k computation across layers.
+    A value greater than 1 enables cross-layer top-k sharing."""
+
+    dsa_indexer_skip_topk_offset: int = 0
+    """Layer offset for DSA cross-layer top-k sharing."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
+    """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
+
+    dsa_indexer_rope_interleaved: bool = False
+    """Whether DSA indexer RoPE should use MLA-style interleaving."""
+
+    dsa_indexer_rotate_activation: bool = True
+    """Whether DSA indexer should apply Hadamard rotation before scoring."""
+
+    dsa_indexer_scoring_relu: bool = True
+    """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
+
+    dsa_indexer_k_norm_epsilon: Optional[float] = None
+    """Optional epsilon override for the DSA indexer key LayerNorm."""
+
+    dsa_indexer_k_norm_fp32: bool = False
+    """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -350,10 +376,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
 
-    apply_dsa_kernel_fusion: bool = False
-    """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
-    indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``
-    with CuTe-DSL support. When False, falls back to unfused PyTorch implementations."""
+    apply_dsa_kernel_fusion: Optional[bool] = None
+    """Deprecated DSv4 fused-kernel switch. Use ``dsa_kernel_backend`` instead. For
+    ``dsv4_hybrid`` only, True maps to ``cudnn`` and False maps to ``none``."""
 
     ####################
     # linear attention
@@ -1552,6 +1577,36 @@ class TransformerConfig(ModelParallelConfig):
                     "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
                 )
 
+        # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
+        # selectors have been folded into experimental_attention_variant, and immediately
+        # before the centralized attention-variant validation consumes dsa_kernel_backend.
+        if self.apply_dsa_kernel_fusion is not None:
+            if self.experimental_attention_variant != "dsv4_hybrid":
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and ignored outside "
+                    "experimental_attention_variant='dsv4_hybrid'; use dsa_kernel_backend "
+                    "instead.",
+                )
+            else:
+                legacy_backend = "cudnn" if self.apply_dsa_kernel_fusion else "none"
+                if self.dsa_kernel_backend not in ("none", legacy_backend):
+                    raise ValueError(
+                        "Conflicting DSA kernel controls: "
+                        f"apply_dsa_kernel_fusion={self.apply_dsa_kernel_fusion} maps to "
+                        f"dsa_kernel_backend={legacy_backend!r}, but "
+                        f"dsa_kernel_backend={self.dsa_kernel_backend!r} was also selected. "
+                        "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
+                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and will be removed in a future "
+                    f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
+                )
+                self.dsa_kernel_backend = legacy_backend
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1616,7 +1671,36 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
-            pass
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if self.add_bias_linear:
+                raise ValueError(
+                    "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "
+                    "Disable linear bias for DSA configs."
+                )
+            if self.dsa_indexer_topk_freq < 1:
+                raise ValueError(
+                    f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
+                )
+            if self.dsa_indexer_skip_topk_offset < 0:
+                raise ValueError(
+                    "dsa_indexer_skip_topk_offset must be non-negative, got "
+                    f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if self.context_parallel_size > 1:
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                assert all(
+                    cp_comm_type is not None
+                    and cp_comm_type.replace("_", "").lower() == "allgather"
+                    for cp_comm_type in cp_comm_types
+                ), (
+                    "DSAttention context parallelism currently supports "
+                    "cp_comm_type=allgather only."
+                )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -1640,13 +1724,17 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
-            if self.apply_dsa_kernel_fusion:
-                assert (
-                    torch.cuda.is_available()
-                ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
+            if self.dsa_kernel_backend == "tilelang":
+                raise ValueError(
+                    "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
+                    "for fused CSA kernels or 'none' for the PyTorch fallback."
+                )
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+
+            if self.dsa_kernel_backend == "cudnn":
                 sm = torch.cuda.get_device_capability()
                 assert sm[0] >= 9, (
-                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
+                    f"dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
                 uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
@@ -1660,36 +1748,10 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
                         "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
-                        "this path. Use sparse indexer loss or disable DSA kernel fusion."
+                        "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
 
-                _flash_mla_available = True
-                try:
-                    from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-                except ImportError:
-                    _flash_mla_available = False
-
-                _cudnn_dsa_available = True
-                try:
-                    from cudnn import DSA  # noqa: F401
-                except ImportError:
-                    _cudnn_dsa_available = False
-
-                if not _flash_mla_available or not _cudnn_dsa_available:
-                    missing = []
-                    if not _flash_mla_available:
-                        missing.append(
-                            "flash_mla (install from "
-                            "https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
-                        )
-                    if not _cudnn_dsa_available:
-                        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
-                    raise ValueError(
-                        f"apply_dsa_kernel_fusion requires fused DSA kernels, but the "
-                        f"following packages are not available: {', '.join(missing)}. "
-                        f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
-                        f"PyTorch fallback."
-                    )
+                from cudnn import DSA
 
                 if (
                     self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -1713,7 +1775,7 @@ class TransformerConfig(ModelParallelConfig):
                             "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
                             "with q_causal_offsets support; missing from: "
                             f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
-                            "build or disable DSA kernel fusion."
+                            "build or set dsa_kernel_backend='none'."
                         )
 
         if (

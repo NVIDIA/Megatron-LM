@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -268,7 +268,7 @@ def _make_dsv4_cp_config(
     context_parallel_size,
     dsa_indexer_loss_coeff=1.0,
     dsa_indexer_use_sparse_loss=True,
-    apply_dsa_kernel_fusion=True,
+    use_fused_kernels=True,
     apply_rope_fusion=True,
 ):
     """Build the DSv4 flash attention config used by CP tests."""
@@ -298,7 +298,7 @@ def _make_dsv4_cp_config(
         qk_layernorm=True,
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
-        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+        dsa_kernel_backend="cudnn" if use_fused_kernels else "none",
         apply_rope_fusion=apply_rope_fusion,
     )
 
@@ -579,19 +579,19 @@ class TestDSv4HybridAttentionTHDCP:
 
         torch.manual_seed(_SEED + layer_number)
         model_parallel_cuda_manual_seed(_SEED + layer_number)
-        apply_dsa_kernel_fusion = self.fused_kernels_available
+        use_fused_kernels = self.fused_kernels_available
         config_cp = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=sparse_loss,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             apply_rope_fusion=apply_rope_fusion,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=sparse_loss,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             apply_rope_fusion=apply_rope_fusion,
         )
         cp_attn = _build_attention(
@@ -617,7 +617,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_out.detach(),
             ref_out.detach().index_select(0, local_idx),
-            f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:rope={apply_rope_fusion}:output",
+            f"layer={layer_number}:dsa={use_fused_kernels}:rope={apply_rope_fusion}:output",
         )
 
         grad = torch.randn_like(ref_out)
@@ -626,7 +626,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_hidden.grad.detach(),
             ref_hidden.grad.index_select(0, local_idx),
-            f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:rope={apply_rope_fusion}:hidden_grad",
+            f"layer={layer_number}:dsa={use_fused_kernels}:rope={apply_rope_fusion}:hidden_grad",
         )
 
         ref_params = dict(ref_attn.named_parameters())
@@ -639,7 +639,7 @@ class TestDSv4HybridAttentionTHDCP:
             _assert_cp_tensor_match(
                 grad_sum,
                 ref_grad,
-                f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:"
+                f"layer={layer_number}:dsa={use_fused_kernels}:"
                 f"rope={apply_rope_fusion}:param_grad:{name}",
             )
 
@@ -655,7 +655,7 @@ class TestDSv4HybridAttentionTHDCP:
         config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            apply_dsa_kernel_fusion=False,
+            use_fused_kernels=False,
             apply_rope_fusion=False,
         )
         attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
@@ -689,13 +689,13 @@ class TestDSv4HybridAttentionTHDCP:
         eager_config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            apply_dsa_kernel_fusion=False,
+            use_fused_kernels=False,
             apply_rope_fusion=apply_rope_fusion,
         )
         recompute_config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            apply_dsa_kernel_fusion=False,
+            use_fused_kernels=False,
             apply_rope_fusion=apply_rope_fusion,
         )
         recompute_config.recompute_granularity = "selective"
@@ -741,12 +741,12 @@ class TestDSv4HybridAttentionTHDCP:
         model_parallel_cuda_manual_seed(_SEED + 1202)
         config_cp = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
-            apply_dsa_kernel_fusion=self.fused_kernels_available,
+            use_fused_kernels=self.fused_kernels_available,
             apply_rope_fusion=True,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
-            apply_dsa_kernel_fusion=self.fused_kernels_available,
+            use_fused_kernels=self.fused_kernels_available,
             apply_rope_fusion=False,
         )
         cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda().eval()
@@ -811,7 +811,7 @@ class TestDSv4HybridAttentionTHDCP:
                 context_parallel_size=self.cp_size,
                 dsa_indexer_loss_coeff=1.0,
                 dsa_indexer_use_sparse_loss=True,
-                apply_dsa_kernel_fusion=dsa_fused,
+                use_fused_kernels=dsa_fused,
                 apply_rope_fusion=rope_fused,
             )
             graph_attn = _build_attention(
@@ -924,7 +924,7 @@ class TestDSv4HybridAttentionTHDCP:
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
-            apply_dsa_kernel_fusion=True,
+            use_fused_kernels=True,
             apply_rope_fusion=True,
         )
         graph_attn = _build_attention(
