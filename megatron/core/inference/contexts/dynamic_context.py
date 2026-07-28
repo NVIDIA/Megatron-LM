@@ -3359,10 +3359,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _get_paused_request_count_within_block_budget(self) -> int:
         """Count the left-most paused requests whose blocks fit the paused budget."""
-        if self.paused_request_count == 0:
+        block_budget = self.kv_block_allocator.paused_limit
+        if self.paused_request_count == 0 or block_budget == 0:
             return 0
 
-        block_budget = self.kv_block_allocator.paused_limit
         if not self.enable_prefix_caching:
             paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
             cumulative_block_counts = paused_block_counts.cumsum(dim=0)
@@ -3393,35 +3393,39 @@ class DynamicInferenceContext(BaseInferenceContext):
             return releasable_counts
 
         if not self.enable_prefix_caching:
-            releasable_count = 0
-            for suffix_count, request_idx in enumerate(
-                range(request_end_idx - 1, request_start_idx - 1, -1), start=1
-            ):
-                block_ids = self.request_to_kv_block_ids[request_idx]
-                releasable_count += int(torch.count_nonzero(block_ids >= 0).item())
-                releasable_counts[suffix_count] = releasable_count
+            suffix_block_counts = (
+                self.request_kv_block_counts[request_start_idx:request_end_idx]
+                .flip(dims=[0])
+                .cumsum(dim=0)
+            )
+            return [0, *suffix_block_counts.tolist()]
+
+        block_rows = self.request_to_kv_block_ids[request_start_idx:request_end_idx]
+        request_offsets, block_offsets = torch.where(block_rows >= 0)
+        if request_offsets.numel() == 0:
             return releasable_counts
 
-        selected_reference_counts: dict[int, int] = {}
-        releasable_count = 0
-        block_ref_counts = self.kv_block_allocator.block_ref_counts
-        for suffix_count, request_idx in enumerate(
-            range(request_end_idx - 1, request_start_idx - 1, -1), start=1
-        ):
-            block_ids = self.request_to_kv_block_ids[request_idx]
-            for block_id in block_ids[block_ids >= 0].tolist():
-                selected_count = selected_reference_counts.get(block_id, 0) + 1
-                selected_reference_counts[block_id] = selected_count
-                current_ref_count = int(block_ref_counts[block_id].item())
-                assert selected_count <= current_ref_count, (
-                    f"selected {selected_count} references to block {block_id}, "
-                    f"but allocator refcount is {current_ref_count}"
-                )
-                if selected_count == current_ref_count:
-                    releasable_count += 1
-            releasable_counts[suffix_count] = releasable_count
+        block_ids = block_rows[request_offsets, block_offsets].long()
+        unique_block_ids, inverse, selected_reference_counts = torch.unique(
+            block_ids, return_inverse=True, return_counts=True
+        )
+        current_reference_counts = self.kv_block_allocator.block_ref_counts[unique_block_ids]
+        assert torch.all(
+            selected_reference_counts <= current_reference_counts
+        ), "selected more KV block references than the allocator owns"
 
-        return releasable_counts
+        # A fully selected block becomes releasable when the suffix reaches its
+        # left-most reference.
+        suffix_depths = suffix_request_count - request_offsets
+        release_suffix_depths = torch.zeros_like(unique_block_ids)
+        release_suffix_depths.scatter_reduce_(
+            0, inverse, suffix_depths, reduce="amax", include_self=True
+        )
+        fully_selected = selected_reference_counts == current_reference_counts
+        releases_by_suffix = torch.bincount(
+            release_suffix_depths[fully_selected], minlength=suffix_request_count + 1
+        )
+        return releases_by_suffix.cumsum(dim=0).tolist()
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: Optional[torch.Tensor]
@@ -3543,6 +3547,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         releasable_block_counts = self._get_releasable_block_counts(
             retained_paused_request_count, self.paused_request_count
         )
+        new_block_counts_by_survivor_count = overflow_needs_new_block.cumsum(dim=0)
+        new_block_counts_by_survivor_count = torch.cat(
+            (new_block_counts_by_survivor_count.new_zeros(1), new_block_counts_by_survivor_count)
+        )
         block_count_avail = self.kv_block_allocator.get_allocatable_count()
 
         # Preserve current ordering: evict the smallest right-most suffix whose
@@ -3552,7 +3560,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             survivor_count = overflow_paused_request_count - candidate_evict_count
             if survivor_count > allowed_to_resume:
                 continue
-            survivor_new_block_count = int(overflow_needs_new_block[:survivor_count].sum().item())
+            survivor_new_block_count = int(
+                new_block_counts_by_survivor_count[survivor_count].item()
+            )
             candidate_avail = block_count_avail + releasable_block_counts[candidate_evict_count]
             if survivor_new_block_count <= candidate_avail:
                 evict_request_count = candidate_evict_count

@@ -3280,6 +3280,8 @@ class TestDynamicContext:
         ctx.request_last_kv_block_id[:4] = blocks.reshape(4, 2)[:, -1]
         ctx.request_last_kv_block_offset[:4] = ctx.block_size_tokens - 1
 
+        assert ctx._get_releasable_block_counts(1, 4) == [0, 2, 4, 6]
+
         evicted_request_ids = ctx.evict_overflow_paused_requests(
             active_request_count=0, next_tokens=torch.arange(4, dtype=torch.int64, device='cpu')
         )
@@ -3344,6 +3346,42 @@ class TestDynamicContext:
         assert ctx.paused_request_count == 0
         assert ctx.active_token_count == 0
         assert alloc.pool_avail == 1
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_releasable_block_counts_with_staggered_shared_prefixes(self):
+        """Count blocks at the first right-most suffix that releases every reference."""
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            enable_prefix_caching=True,
+            unified_memory_level=0,
+            paused_buffer_size_gb=0.0,
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+        blocks = ctx.kv_block_allocator.allocate_memory_blocks(4)
+        assert blocks is not None
+        block_a, block_b, block_c, block_d = blocks.tolist()
+
+        # A is released by the one-request suffix, B by two requests, and C by
+        # three. D also has a reference outside the selected request range.
+        ctx.request_to_kv_block_ids[0, 0] = block_c
+        ctx.request_to_kv_block_ids[1, 0] = block_b
+        ctx.request_to_kv_block_ids[2, :4] = torch.tensor(
+            [block_a, block_b, block_c, block_d], dtype=torch.int32, device='cpu'
+        )
+        ctx.request_to_kv_block_ids[3, 0] = block_d
+        ctx.kv_block_allocator.block_ref_counts[blocks] = torch.tensor(
+            [1, 2, 2, 2], dtype=torch.int32, device='cpu'
+        )
+
+        assert ctx._get_releasable_block_counts(0, 3) == [0, 1, 2, 3]
 
     @pytest.mark.internal
     @rounder_override(64)
