@@ -1196,15 +1196,10 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
             ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
             # The node must also be RETAINED: a live strong reference across the
             # warmup->capture boundary is what keeps the leaf on the capture stream.
-            node = getattr(w, "_grad_accum_node", None)
-            assert node is not None, (
-                f"{name}.weight must retain its AccumulateGrad node "
-                "(required for full-iteration CUDA-graph capture)"
-            )
-            # Identity, not just non-None: a dropped node would be recreated by expand_as here.
+            # Identity (not just non-None): a dropped node would be recreated by expand_as here.
             assert (
-                node is w.expand_as(w).grad_fn.next_functions[0][0]
-            ), f"{name}.weight retained a stale/foreign AccumulateGrad node"
+                getattr(w, "_grad_accum_node", None) is w.expand_as(w).grad_fn.next_functions[0][0]
+            ), f"{name}.weight must retain its AccumulateGrad node (full-iteration CG capture)"
 
         # bias=False -> all params are GTP_remat -> none took the autograd path.
         assert len(ddp_model.grad_accs) == 0, (
