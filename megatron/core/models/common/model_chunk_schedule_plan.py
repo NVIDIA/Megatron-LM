@@ -268,6 +268,19 @@ class TransformerLayerSchedulePlan:
             # Nodes hold a reference to this same layer_state object, so clear it
             # in place rather than replacing it.
             self.layer_state.__dict__.clear()
+        # Free the MoE token dispatcher's transient forward metadata (probs /
+        # routing map / permutation mappings). The backward-time recompute re-runs
+        # dispatch_preprocess, which repopulates all of it before combine, so this
+        # is correctness-neutral and only frees the across-gap per-layer metadata.
+        self._reset_moe_dispatcher_state()
+
+    def _reset_moe_dispatcher_state(self):
+        """Reset the MoE token dispatcher of this layer's MLP, if any."""
+        inner_layer = getattr(self.layer, 'mtp_model_layer', self.layer)
+        mlp = getattr(inner_layer, 'mlp', None)
+        dispatcher = getattr(mlp, 'token_dispatcher', None)
+        if dispatcher is not None:
+            dispatcher.reset_transient_forward_state()
 
     def get_fp8_context(self):
         """
@@ -717,14 +730,20 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 pre_backward(b_schedule_plan.vp_stage)
                 b_schedule_plan.record_current_stream()
 
+            # Run post_process backward *before* the stage recompute. post_process
+            # keeps its own graph (it is not recomputed) and detaches its input, so
+            # its backward produces b_grad independently of the recompute. Releasing
+            # the post_process graph (output projection / logits / saved tensors)
+            # first avoids co-materializing it with the whole recomputed stage on the
+            # last PP stage, where a large vocab would otherwise spike peak memory.
+            if b_schedule_plan.post_process is not None:
+                b_grad = b_schedule_plan.post_process.backward(b_grad)
+
             # VPP-stage full recompute: rebuild the whole stage's layer forward
             # graphs from the retained stage input before any layer backward runs.
             # The A2A issued here is exposed (not overlapped) by design. No-op unless
             # recompute is on.
             b_schedule_plan.recompute_model_chunk_schedule_plan()
-
-            if b_schedule_plan.post_process is not None:
-                b_grad = b_schedule_plan.post_process.backward(b_grad)
 
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
