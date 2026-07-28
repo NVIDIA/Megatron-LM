@@ -485,9 +485,15 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.GELU
                 elif config.activation_func == F.relu:
                     layer_type = te.pytorch.ops.ReLU
+                elif config.activation_func == F.silu:
+                    if not is_te_min_version("2.8.0"):
+                        raise NotImplementedError(
+                            "SiLU activation requires Transformer Engine 2.8+"
+                        )
+                    layer_type = te.pytorch.ops.SiLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU, SiLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
