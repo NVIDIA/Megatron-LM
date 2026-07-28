@@ -48,7 +48,11 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.checkpointing import (
+    _has_checkpoint_args,
+    load_checkpoint,
+    save_checkpoint,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
@@ -106,6 +110,15 @@ class TestGPTCompatLayerMaps:
             gpt_compatible_layer_maps('M**-')
         with pytest.raises(ValueError, match='equal, nonzero'):
             gpt_compatible_layer_maps('MMMM')
+
+
+@pytest.mark.parametrize('state_dict', [None, {}, {'args': None}])
+def test_checkpoint_without_saved_args_cannot_determine_model_type(state_dict):
+    assert not _has_checkpoint_args(state_dict)
+
+
+def test_checkpoint_with_saved_args_can_determine_model_type():
+    assert _has_checkpoint_args({'args': object()})
 
 
 def _sharded_tensor(key):
