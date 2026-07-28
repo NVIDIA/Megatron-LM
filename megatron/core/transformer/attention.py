@@ -20,11 +20,6 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb_with_cos_sin,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import (
-    get_data_parallel_group,
-    get_data_parallel_rank,
-    get_data_parallel_world_size,
-)
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -331,7 +326,11 @@ class Attention(MegatronModule, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+            # 'dp' is only consumed by run_realtime_tests (config.test_mode), but the legacy
+            # fallback must supply it so that path keeps working without an explicit collection.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            )
         else:
             assert hasattr(
                 pg_collection, 'tp'
@@ -1752,7 +1751,13 @@ class SelfAttention(Attention):
 
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
-        rank = get_data_parallel_rank()
+        # Only this consistency check needs the DP group, so it is required here rather than in
+        # __init__, which asks use_mpu_process_groups for tp/cp only.
+        assert hasattr(
+            self.pg_collection, 'dp'
+        ), "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
+        dp_group = self.pg_collection.dp
+        rank = dp_group.rank()
         inputs = torch.stack(
             [
                 self.q_layernorm.weight.data,
@@ -1761,9 +1766,9 @@ class SelfAttention(Attention):
                 self.k_layernorm.bias.data,
             ]
         )
-        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+        dp_list = [torch.empty_like(inputs) for _ in range(dp_group.size())]
         dp_list[rank] = inputs
-        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+        torch.distributed.all_gather(dp_list, inputs, group=dp_group)
 
         def _compare(srcs, tgts, names, parallelism):
             assert len(srcs) == len(tgts) == len(names)
