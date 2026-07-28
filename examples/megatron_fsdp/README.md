@@ -1,8 +1,55 @@
 # Megatron-FSDP Examples
 
-Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 671B models, as well as checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
+Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 671B models, experimental `fully_shard` integration with QwenImage, and checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
 
 ## Scripts
+
+### `train_qwen_image_experimental.py`
+
+A minimal training example for the official
+[Diffusers QwenImageTransformer2DModel](https://huggingface.co/docs/diffusers/api/models/qwenimage_transformer2d)
+using the experimental Megatron-FSDP `fully_shard` API. It applies FSDP
+bottom-up to every QwenImage transformer block and then to the transformer
+root, enabling per-block all-gather prefetch and reduce-scatter overlap.
+
+The example trains only the diffusion transformer. It creates synthetic packed
+latents and text embeddings that follow QwenImage's flow-matching forward
+contract, making it useful for distributed bring-up and profiling without
+loading the VAE, text encoder, or a dataset. Replace
+`_synthetic_qwen_image_batch()` with precomputed VAE latents and prompt
+embeddings for real fine-tuning.
+
+Diffusers is an example-only dependency and is intentionally not added to
+Megatron-LM's package dependencies. Run inside the Megatron-LM development
+container and provide a current Diffusers build:
+
+```bash
+HF_ENABLE_PARALLEL_LOADING=yes \
+uv run --with 'diffusers @ git+https://github.com/huggingface/diffusers.git' \
+  python -m torch.distributed.run \
+  --nproc-per-node 8 \
+  examples/megatron_fsdp/train_qwen_image_experimental.py \
+  --model-id Qwen/Qwen-Image \
+  --steps 3 \
+  --gradient-accumulation-steps 2
+```
+
+To use an existing Hugging Face cache without network access:
+
+```bash
+HF_ENABLE_PARALLEL_LOADING=yes \
+uv run --with 'diffusers @ git+https://github.com/huggingface/diffusers.git' \
+  python -m torch.distributed.run \
+  --nproc-per-node 8 \
+  examples/megatron_fsdp/train_qwen_image_experimental.py \
+  --model-id /path/to/Qwen-Image \
+  --local-files-only
+```
+
+The script loads checkpoint shards one local rank per node at a time to reduce
+filesystem contention, uses BF16 compute and gradients with FP32 optimizer
+weights, adapts AdamW through `fully_shard_optimizer`, and supports the
+experimental symmetric memory path with `--use-symm-mem`.
 
 ### `train_llama3_8b_fsdp_h100_fp8.sh`
 
