@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -31,7 +31,7 @@ version = "1.0.0+9edee0c"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.17.0+2e559f06"
+version = "2.18.0+e7c550c5"
 requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect"]
 
 [[package]]
@@ -2223,6 +2223,7 @@ training = [
 build = [
     { name = "cython" },
     { name = "hatchling" },
+    { name = "nvidia-cudnn-frontend" },
     { name = "nvidia-mathdx" },
     { name = "packaging" },
     { name = "pybind11" },
@@ -2308,7 +2309,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'training'" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=2e559f062497bef768dfbe9d7e45548fadeca80a" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=e7c550c5f80636cf841a8204b1d6f85a5f3f28b7" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -2322,6 +2323,7 @@ provides-extras = ["training", "mlm", "dev", "lts", "te", "ssm"]
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
+    { name = "nvidia-cudnn-frontend", specifier = ">=1.25.0" },
     { name = "nvidia-mathdx" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pybind11" },
@@ -2355,7 +2357,7 @@ no-pypi-wheels = [
 test = [
     { name = "coverage" },
     { name = "mock" },
-    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=17ae86b64d7f75653351664f5d8c9e466faede00" },
+    { name = "nemo-run", git = "https://github.com/NVIDIA-NeMo/Run.git?rev=ddd40a8f24847f5c919f911d0240bd622653612f" },
     { name = "nltk" },
     { name = "pydantic" },
     { name = "pygithub" },
@@ -2707,8 +2709,8 @@ wheels = [
 
 [[package]]
 name = "nemo-run"
-version = "0.9.0rc0.dev0"
-source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=17ae86b64d7f75653351664f5d8c9e466faede00#17ae86b64d7f75653351664f5d8c9e466faede00" }
+version = "0.11.0+ddd40a8"
+source = { git = "https://github.com/NVIDIA-NeMo/Run.git?rev=ddd40a8f24847f5c919f911d0240bd622653612f#ddd40a8f24847f5c919f911d0240bd622653612f" }
 dependencies = [
     { name = "catalogue" },
     { name = "fabric" },
@@ -2718,7 +2720,6 @@ dependencies = [
     { name = "leptonai" },
     { name = "networkx" },
     { name = "omegaconf" },
-    { name = "packaging" },
     { name = "rich" },
     { name = "toml" },
     { name = "torchx" },
@@ -5098,14 +5099,14 @@ name = "torch"
 version = "2.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-bindings", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
+    { name = "cuda-bindings", marker = "python_version < '0'" },
     { name = "filelock" },
     { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx" },
     { name = "setuptools" },
     { name = "sympy" },
-    { name = "triton", marker = "sys_platform == 'never'" },
+    { name = "triton" },
     { name = "typing-extensions" },
 ]
 
@@ -5166,8 +5167,8 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.17.0+2e559f06"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=2e559f062497bef768dfbe9d7e45548fadeca80a#2e559f062497bef768dfbe9d7e45548fadeca80a" }
+version = "2.18.0+e7c550c5"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=e7c550c5f80636cf841a8204b1d6f85a5f3f28b7#e7c550c5f80636cf841a8204b1d6f85a5f3f28b7" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
