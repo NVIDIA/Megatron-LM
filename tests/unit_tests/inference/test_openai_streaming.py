@@ -9,6 +9,9 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+    _sanitize_messages_for_template,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
 )
@@ -345,6 +348,103 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     )
     assert json.loads(argument_text) == {"city": "SF"}
     assert all(tool_call["index"] == 0 for tool_call in tool_deltas)
+    assert parser.finish_reason(
+        {
+            "generated_tokens": [1],
+            "sampling_params": {"num_tokens_to_generate": 2},
+        }
+    ) == "tool_calls"
+
+
+def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    request_payload = {
+        "stream": True,
+        "tools": tools,
+        "messages": [
+            {"role": "user", "content": "What is the weather in SF?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_previous",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "SF"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_previous",
+                "content": "62 F",
+            },
+            {"role": "user", "content": "What about NYC?"},
+        ],
+    }
+
+    sanitized_messages = _sanitize_messages_for_template(request_payload["messages"])
+
+    assert sanitized_messages[1]["tool_calls"][0]["function"]["arguments"] == {
+        "city": "SF"
+    }
+    assert sanitized_messages[2] == {
+        "role": "tool",
+        "tool_call_id": "call_previous",
+        "content": "62 F",
+    }
+    assert sanitized_messages[3] == {
+        "role": "user",
+        "content": "What about NYC?",
+    }
+    assert (
+        request_payload["messages"][1]["tool_calls"][0]["function"]["arguments"]
+        == '{"city": "SF"}'
+    )
+
+    parser = StreamingChatParser(
+        lambda text: Qwen3CoderToolParser.parse(text, tools=tools),
+        marker_prefixes=Qwen3CoderToolParser.streaming_markers,
+    )
+    model_output = (
+        "<tool_call><function=get_weather>"
+        "<parameter=city>\nNYC\n</parameter></function></tool_call>"
+    )
+    deltas = []
+    for end in range(1, len(model_output) + 1):
+        deltas.extend(parser.parse(model_output[:end]))
+    deltas.extend(parser.parse(model_output, finished=True))
+
+    tool_deltas = [
+        tool_call
+        for delta in deltas
+        for tool_call in delta.get("tool_calls", [])
+    ]
+    assert sum(
+        tool_call.get("function", {}).get("name") == "get_weather"
+        for tool_call in tool_deltas
+    ) == 1
+    assert len({tool_call["id"] for tool_call in tool_deltas}) == 1
+    assert all(tool_call["index"] == 0 for tool_call in tool_deltas)
+    argument_text = "".join(
+        tool_call.get("function", {}).get("arguments", "")
+        for tool_call in tool_deltas
+    )
+    assert json.loads(argument_text) == {"city": "NYC"}
     assert parser.finish_reason(
         {
             "generated_tokens": [1],
