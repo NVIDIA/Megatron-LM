@@ -3810,10 +3810,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[
                 survivor_idxs
             ]
+            if self.is_hybrid_model:
+                self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
+                    self.mamba_metadata.request_to_mamba_state_idx[survivor_idxs]
+                )
             for metadata_tensor in self.request_metadata.values():
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
+        if self.is_hybrid_model:
+            self.mamba_metadata.request_to_mamba_state_idx[stale_slice] = -1
         self.total_request_count = active_request_count
         return finished_request_ids, survivor_idxs
 
@@ -4280,25 +4286,83 @@ class DynamicInferenceContext(BaseInferenceContext):
         n_active: int,
         active_query_lengths: Optional[Tensor],
         sampling: Optional[Sampling],
+        row_to_request: Optional[Tensor] = None,
     ) -> Tensor:
-        """Sample the logprobs if desired."""
+        """Calculate raw or sampling-processed per-row log probabilities.
+
+        Args:
+            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
+            n_active (int): Number of active requests represented by the rows.
+            active_query_lengths (Optional[Tensor]): CPU token counts used to
+                map prefill rows to active requests, or `None` for decode.
+            sampling (Optional[Sampling]): Backend providing processed logprobs.
+            row_to_request (Optional[Tensor]): Explicit CPU mapping from each
+                logit row to an active request.
+
+        Returns:
+            Tensor: Per-row log probabilities over the vocabulary.
+        """
         if self.config.logprobs_mode == "raw_logprobs":
             return F.log_softmax(logits, dim=-1)
 
         assert sampling is not None, "processed_logprobs requires a sampling backend"
 
         # Map each logits row to its active request.
-        request_idx = torch.arange(n_active, device=logits.device)
-        row_to_request = (
-            request_idx
-            if active_query_lengths is None
-            else request_idx.repeat_interleave(active_query_lengths)
+        if row_to_request is None and active_query_lengths is not None:
+            row_to_request = torch.arange(n_active).repeat_interleave(active_query_lengths)
+        return sampling.log_probs_kernel(logits, self, token_to_request_index=row_to_request)
+
+    def calculate_log_probs_tensors(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: Optional[bool] = False,
+        sampling: Optional[Sampling] = None,
+        row_to_request: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Calculate selected-token and full-distribution log probabilities.
+
+        Args:
+            logits (Tensor): Raw model output logits with shape
+                `[1, sequence_length, vocab_size]`.
+            new_tokens (Tensor): Newly sampled tokens for active requests.
+            only_last_token_logits (Optional[bool]): Whether logits contain only
+                each request's final token row.
+            sampling (Optional[Sampling]): Sampling backend used for processed
+                log probabilities.
+            row_to_request (Optional[Tensor]): Explicit CPU mapping from each
+                logit row to an active request.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Selected-token log probabilities flattened in
+                active-token order and the full per-row log-probability tensor.
+        """
+        logits_squeezed = logits.squeeze(0)
+        n_active = self.total_request_count - self.paused_request_count
+
+        if only_last_token_logits or self.is_decode_only():
+            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
+            active_logits = logits_squeezed[: len(new_tokens)].float()
+            log_probs = self._processed_log_probs(
+                active_logits, n_active, None, sampling, row_to_request
+            )
+            return log_probs[seq_idx, new_tokens], log_probs
+
+        logits_squeezed = logits_squeezed.float()
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_query_lengths_cpu = self.request_query_lengths[active_slice]
+        active_query_lengths_gpu = self.gpu_view.request_query_lengths[:n_active]
+
+        # Shift away each request's first prompt token, then insert its sampled token.
+        active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
+        new_token_idx = active_query_lengths_gpu.cumsum(0) - 1
+        active_token_ids[new_token_idx] = new_tokens
+
+        log_probs = self._processed_log_probs(
+            logits_squeezed, n_active, active_query_lengths_cpu, sampling
         )
-        md = self.active_request_metadata
-        temperature = md["temperature"][:n_active].to(logits.device, torch.float32)[row_to_request]
-        top_k = md["top_k"][:n_active].to(logits.device, torch.long)[row_to_request]
-        top_p = md["top_p"][:n_active].to(logits.device, torch.float32)[row_to_request]
-        return sampling.log_probs_kernel(logits, temperature, top_k, top_p)
+        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
+        return log_probs[seq_idx, active_token_ids], log_probs
 
     def calculate_log_probs(
         self,
@@ -4323,58 +4387,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             log_probs (Tensor): Used to compute top n logprobs later if required.
         """
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
-        n_active = self.total_request_count - self.paused_request_count
-
-        if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = self._processed_log_probs(
-                logits_squeezed[seq_idx], n_active, None, sampling
-            )
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
-
-        # Get the selected token ids for all tokens.
-        # We shift the active token window left by one to remove the first prompt token for
-        # prefill requests and then set the token ids explicitly for the newly generated tokens.
-        # This is necessary because we calculate the log probs *before* updating the request metadata.
-        #
-        # Example (decode & prefill mix):
-        #
-        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
-        #
-        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
-        #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
-        #
-        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
-        #
-        #   active_token_ids before left shift:
-        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
-        #
-        #   active_token_ids after shift:
-        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
-        #
-        #   active_token_ids[new_token_idx] = new_tokens
-        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
-        active_query_lengths = self.gpu_view.request_query_lengths[:n_active]
-
-        new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
-
-        # Compute (possibly processed) log-probs over all active-token rows.
-        log_probs = self._processed_log_probs(
-            logits_squeezed, n_active, active_query_lengths, sampling
+        selected_log_probs, log_probs = self.calculate_log_probs_tensors(
+            logits, new_tokens, only_last_token_logits=only_last_token_logits, sampling=sampling
         )
 
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        if only_last_token_logits or self.is_decode_only():
+            return [[lp] for lp in selected_log_probs.tolist()], log_probs
 
-        # Split the log probs across request boundaries
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_query_lengths = self.request_query_lengths[active_slice]
         selected_log_probs_list = selected_log_probs.cpu().split(
             active_query_lengths.tolist(), dim=0
         )

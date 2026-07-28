@@ -112,6 +112,7 @@ class _AsyncScheduleSampleResult:
     sampled_mtp_tokens_gpu: Optional[Tensor]
     sampled_mtp_tokens_cpu_view: Optional[Tensor]
     accepted_tokens_cpu_view: Optional[Tensor]
+    accepted_counts_gpu: Optional[Tensor]
     accepted_counts_cpu_view: Optional[Tensor]
     accepted_counts_cpu_ready_event: Optional[torch.cuda.Event]
     sample_cpu_ready_event: Optional[torch.cuda.Event]
@@ -176,6 +177,35 @@ class _AsyncScheduleRequestResult:
     evict_request_ids: Optional[Tensor] = None
 
 
+@dataclass
+class _AsyncScheduleLogProbsGPUResult:
+    """GPU logprob outputs awaiting transfer to CPU."""
+
+    selected_log_probs: Tensor
+    top_n_log_probs: Optional[Tensor]
+    top_n_token_ids: Optional[Tensor]
+    row_counts: List[int]
+    top_n_counts: List[int]
+    skip_prompt_log_probs: List[bool]
+    num_decode_requests: int
+    gpu_ready_event: Optional[torch.cuda.Event]
+
+
+@dataclass
+class _AsyncScheduleLogProbsTransfer:
+    """Transient CPU views retaining their GPU sources until D2H completes."""
+
+    selected_log_probs_cpu_view: Tensor
+    top_n_log_probs_cpu_view: Optional[Tensor]
+    top_n_token_ids_cpu_view: Optional[Tensor]
+    row_counts: List[int]
+    top_n_counts: List[int]
+    skip_prompt_log_probs: List[bool]
+    num_decode_requests: int
+    cpu_ready_event: Optional[torch.cuda.Event]
+    gpu_result: _AsyncScheduleLogProbsGPUResult
+
+
 # pylint: disable=line-too-long
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
@@ -198,8 +228,10 @@ class TextGenerationController:
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
             self.pp_group = pg_collection.pp
+            self.dp_group = pg_collection.dp
         else:
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
+            self.dp_group = parallel_state.get_data_parallel_group()
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
@@ -211,8 +243,20 @@ class TextGenerationController:
         else:
             self.vocab_size = unwrapped_model.vocab_size
 
+        # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
+        # unique generation seed (avoids identical samples when the same prompt is
+        # assigned to multiple DP ranks, which can corrupt RL training). Controlled by
+        # InferenceConfig.offset_sampling_seed_by_dp_rank, but deactivated when enabling
+        # --deterministic-mode (model_config.deterministic_mode).
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
+        seed = self.model_config.inference_sampling_seed
+        offset_by_dp = (
+            inference_config.offset_sampling_seed_by_dp_rank
+            and not self.model_config.deterministic_mode
+        )
+        if offset_by_dp:
+            seed += torch.distributed.get_rank(group=self.dp_group)
+        self.sampling_rng.manual_seed(seed)
 
         if not self.num_speculative_tokens:
             self.num_mtp_depths = 0
@@ -281,14 +325,19 @@ class TextGenerationController:
         # This buffer has a stable address across legacy, no-overlap, overlap,
         # and MTP routing. Sampling producers must copy into it rather than rebind it.
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
-        self._async_sched_sample_values_cuda = torch.empty(
-            max_requests, dtype=logits_dtype, device=device
-        )
         self._async_sched_sampled_tokens_cpu_buffer = torch.empty(
             max_requests, dtype=torch.int64, device="cpu", pin_memory=True
         )
+        self._async_sched_selected_log_probs_cpu_buffer = torch.empty(
+            context.max_tokens, dtype=torch.float32, device="cpu", pin_memory=True
+        )
+        self._async_sched_top_n_log_probs_cpu_buffer = None
+        self._async_sched_top_n_token_ids_cpu_buffer = None
+        self._async_sched_top_n_capacity = 0
         self._async_sched_sample_gpu_ready_event = torch.cuda.Event()
         self._async_sched_sample_cpu_ready_event = torch.cuda.Event()
+        self._async_sched_log_probs_gpu_ready_event = torch.cuda.Event()
+        self._async_sched_log_probs_cpu_ready_event = torch.cuda.Event()
         self._async_sched_copy_stream = torch.cuda.Stream(device=device)
 
         # Sampling backend: provides the sampling kernel.
@@ -890,10 +939,13 @@ class TextGenerationController:
         Returns:
             Tensor: Sampled tokens of shape [num_requests].
         """
+        no_top_k, no_top_p = self._active_requests_sampling_filter_flags()
         return self._sampling.sample_kernel(
             logits_2d,
             logits_2d.shape[0],
             self.inference_wrapped_model.inference_context,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
             eager=True,
         )
 
@@ -1081,24 +1133,17 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Sampling-side request counts: padded when running a captured graph.
-        # Verify uses the actual counts so the Triton kernels operate on the real workload.
-        use_graph_for_sampling = (
-            self._sampling_backend == "flashinfer"
-            and self._enable_cuda_graph
-            and context.using_cuda_graph_this_step()
-        )
-        if use_graph_for_sampling:
-            sample_num_decode = context.padded_batch_dimensions.decode_req_count
-            sample_num_prefill = context.padded_batch_dimensions.prefill_req_count
-        else:
-            sample_num_decode = context.num_decode_requests
-            sample_num_prefill = context.num_prefill_requests
+        # The FlashInfer sampler runs eagerly (never CUDA-graphed), so verify with the
+        # actual request counts. When the forward pass is graphed `required_logits` is
+        # padded to a static shape, but sampling only the actual token prefix (below)
+        # leaves the trailing padded rows unsampled.
+        sample_num_decode = context.num_decode_requests
+        sample_num_prefill = context.num_prefill_requests
 
         # Logit indices for tokens that need sampling.
-        # Padded under graph capture so the captured `gather_indices` input has a stable shape.
-        # Padded slots resolve to row 0; verify and prepare-next read only the actual prefix,
-        # so the padded-row samples produced by the captured kernel are discarded.
+        # `speculative_required_logit_indices()` pads to a static shape when the forward
+        # pass is graphed (trailing slots resolve to row 0); sampling uses the actual
+        # counts, so those padded slots are never sampled.
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
@@ -1128,12 +1173,6 @@ class TextGenerationController:
             self.num_speculative_tokens,
             context,
             gather_indices=sample_gather_indices,
-            eager=not use_graph_for_sampling,
-            cache_key=(
-                ("sample_speculative", sample_num_decode, sample_num_prefill)
-                if use_graph_for_sampling
-                else None
-            ),
         )
         nvtx_range_pop("mtp-spec-decoding/verify/sample")
 
@@ -1212,13 +1251,9 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        use_graph = (
-            self._sampling_backend == "flashinfer"
-            and self._enable_cuda_graph
-            and context.using_cuda_graph_this_step()
-        )
-        # Padded count when running a captured graph (cache key buckets); actual otherwise.
-        n = context.padded_active_request_count if use_graph else active_request_count
+        # The FlashInfer sampler runs eagerly (never CUDA-graphed), so sample the
+        # actual active rows -- there is no captured static shape to pad up to.
+        n = active_request_count
         # When `materialize_only_last_token_logits` is true the forward pass already
         # selected the right rows. Otherwise we point the kernel at the per-request
         # last-token positions via `gather_indices`; padded slots safely fan in to row 0.
@@ -1227,30 +1262,57 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.gpu_view.active_request_last_token_idxs
         )
-        sampled_tokens_cuda = self._sampling.sample_kernel(
+        no_top_k, no_top_p = self._active_requests_sampling_filter_flags(active_request_count)
+        self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
             gather_indices=gather_indices,
-            eager=not use_graph,
-            cache_key=("sample", n) if use_graph else None,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
+            output=self._sampled_tokens_cuda[:n],
         )
-        self._sampled_tokens_cuda[:active_request_count].copy_(
-            sampled_tokens_cuda[:active_request_count]
+
+    def _active_requests_sampling_filter_flags(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """Return ``(no_top_k, no_top_p)`` batch-level escape hatches for the active batch.
+
+        These drive the FlashInfer sampler's dispatch (top-p-only / top-k-only /
+        joint) and are read from the pinned CPU sampling metadata, so they incur no
+        GPU sync. A filter is "absent" only when NO active request uses it. Padded
+        rows carry a neutral 0 and never flip a flag.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
         )
+        if active_request_count <= 0:
+            return True, True
+
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        no_top_k = bool((active_metadata["top_k"][active_slice] == 0).all())
+        no_top_p = bool((active_metadata["top_p"][active_slice] == 0.0).all())
+        return no_top_k, no_top_p
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
 
         Returns:
             return_log_probs (bool): Whether to return the sampled log_probs.
+            return_top_n_logprobs (bool): Whether to return top-n log_probs.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
         return (
-            (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
-            (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+            bool(context.active_request_metadata["return_log_probs"][:active_request_count].any()),
+            bool(
+                (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any()
+            ),
         )
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
@@ -1805,6 +1867,27 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
+    def _apply_stop_word_finished_ids(
+        self, active_request_ids: Tensor, active_request_mask: Tensor
+    ) -> None:
+        """Mark requests whose generated output matched a stop word as finished.
+
+        Args:
+            active_request_ids (Tensor): IDs for requests active during the current step.
+            active_request_mask (Tensor): Mask updated in place for requests that remain active.
+        """
+        if self._get_stop_word_finished_ids_callback is None:
+            return
+
+        request_ids = active_request_ids.tolist()
+        stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids)
+        if not stop_word_finished_ids:
+            return
+
+        for idx, request_id in enumerate(request_ids):
+            if request_id in stop_word_finished_ids:
+                active_request_mask[idx] = 0
+
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -1851,15 +1934,8 @@ class TextGenerationController:
             != context.active_request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
-        # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
-        if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
+        # Apply stop words detected during the previous engine bookkeeping step.
+        self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
 
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
@@ -1919,11 +1995,9 @@ class TextGenerationController:
 
         if run_async_overlap and context.paused_request_count != 0:
             raise RuntimeError("Async scheduling overlap does not support paused requests.")
-        if context.chunked_prefill_request_id != -1:
-            raise RuntimeError("Async scheduling does not support chunked prefill.")
 
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
-        """Compact cached logits from old active-row order into survivor order.
+        """Compact pending logits and sampling metadata into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
@@ -1965,34 +2039,24 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = compacted_logits
 
+        context = self.inference_wrapped_model.inference_context
+        gpu_view = context.gpu_view
+        survivor_count = survivor_idxs.numel()
+        survivor_idxs_cpu = survivor_idxs.to("cpu")
+        survivor_idxs_cuda = survivor_idxs.to(gpu_view.temperature.device)
+        for label in ("temperature", "top_k", "top_p"):
+            compacted_metadata = context.active_request_metadata[label][survivor_idxs_cpu]
+            context.active_request_metadata[label][:survivor_count].copy_(compacted_metadata)
+        compacted_temperature = gpu_view.temperature[survivor_idxs_cuda].contiguous()
+        compacted_top_k = gpu_view.top_k[survivor_idxs_cuda].contiguous()
+        compacted_top_p = gpu_view.top_p[survivor_idxs_cuda].contiguous()
+        gpu_view.temperature[:survivor_count].copy_(compacted_temperature)
+        gpu_view.top_k[:survivor_count].copy_(compacted_top_k)
+        gpu_view.top_p[:survivor_count].copy_(compacted_top_p)
+
         self._async_sched_logits.set_pending(
             self._async_sched_logits.cuda_graph_request_count, survivor_token_row_indices
         )
-
-    def _record_fresh_async_sched_event(
-        self, reference_tensor: Optional[Tensor] = None
-    ) -> Optional[torch.cuda.Event]:
-        """Record a fresh event on the current CUDA stream when CUDA work is active.
-
-        Forward completion events can remain in flight while resolution runs,
-        so each overlapping forward owns a fresh event. Transfer events are
-        reused separately because they are synchronized within each step.
-
-        Args:
-            reference_tensor (Optional[Tensor]): Tensor used to determine whether
-                CUDA work is active.
-
-        Returns:
-            Optional[torch.cuda.Event]: Recorded CUDA event, or `None` when no
-            CUDA work is active.
-        """
-        if reference_tensor is not None and not reference_tensor.is_cuda:
-            return None
-        if not torch.cuda.is_available():
-            return None
-        event = torch.cuda.Event()
-        event.record()
-        return event
 
     @staticmethod
     def _synchronize_async_sched_event(event: Optional[torch.cuda.Event]) -> None:
@@ -2108,6 +2172,17 @@ class TextGenerationController:
             sampled_tokens_cpu != context.request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(resolved_sequence_lengths, max_sequence_lengths).byte()
 
+        self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
+
+        if context.chunked_prefill_request_id != -1:
+            chunked_prefill_rows = torch.nonzero(
+                active_request_ids == context.chunked_prefill_request_id, as_tuple=True
+            )[0]
+            assert (
+                chunked_prefill_rows.numel() == 1
+            ), "The active chunked-prefill request must have exactly one row."
+            active_request_mask[chunked_prefill_rows[0]] = 1
+
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -2126,23 +2201,8 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         range_push("sampling")
+        self._dynamic_step_sample_logits()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
-        logits = self._all_logits_cuda.squeeze(0)[:active_request_count]
-        # ``torch.max`` requires the values ``out`` tensor to share the input's
-        # dtype. ``_all_logits_cuda`` is ``params_dtype`` under CUDA graphs (where
-        # logits are copied into the preallocated buffer) but the model's raw
-        # output dtype (commonly fp32) in eager mode, so the preallocated
-        # ``params_dtype`` scratch would mismatch. The values are discarded here
-        # (only the argmax token ids are used), so size the scratch to match the
-        # logits dtype instead of relying on the preallocated buffer's dtype.
-        sample_values_gpu = self._async_sched_sample_values_cuda[:active_request_count]
-        if sample_values_gpu.dtype != logits.dtype:
-            sample_values_gpu = logits.new_empty(active_request_count)
-        torch.max(
-            logits,
-            dim=-1,
-            out=(sample_values_gpu, sampled_tokens_gpu),
-        )
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
                 torch.cuda.current_stream(sampled_tokens_gpu.device)
@@ -2158,6 +2218,7 @@ class TextGenerationController:
             sampled_mtp_tokens_gpu=None,
             sampled_mtp_tokens_cpu_view=None,
             accepted_tokens_cpu_view=None,
+            accepted_counts_gpu=None,
             accepted_counts_cpu_view=None,
             accepted_counts_cpu_ready_event=None,
             sample_cpu_ready_event=sample_cpu_ready_event,
@@ -2217,6 +2278,7 @@ class TextGenerationController:
             sampled_mtp_tokens_gpu=sampled_mtp_tokens_gpu,
             sampled_mtp_tokens_cpu_view=sampled_mtp_tokens_cpu,
             accepted_tokens_cpu_view=accepted_tokens_cpu,
+            accepted_counts_gpu=accepted_counts_gpu,
             accepted_counts_cpu_view=accepted_counts_cpu,
             accepted_counts_cpu_ready_event=accepted_counts_cpu_ready_event,
             sample_cpu_ready_event=sample_cpu_ready_event,
@@ -2237,6 +2299,263 @@ class TextGenerationController:
         blocks_to_release, remove_mask = self._rewind_kv_cache(accepted_counts_cpu)
         context = self.inference_wrapped_model.inference_context
         context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+
+    def _run_async_sched_log_probs(
+        self, sample_result: _AsyncScheduleSampleResult
+    ) -> Optional[_AsyncScheduleLogProbsGPUResult]:
+        """Calculate selected and top-n log probabilities on the GPU.
+
+        Args:
+            sample_result (_AsyncScheduleSampleResult): Sampled and accepted
+                tokens for active requests.
+
+        Returns:
+            Optional[_AsyncScheduleLogProbsGPUResult]: GPU logprob outputs and
+                their completion event, or `None` when no request needs logprobs.
+        """
+        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        if not return_log_probs and not return_top_n_logprobs:
+            return None
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        num_decode_requests = context.num_decode_requests
+        num_prefill_requests = active_request_count - num_decode_requests
+        tokens_per_request = self.num_speculative_tokens + 1
+        sampled_tokens_gpu = sample_result.sampled_tokens_gpu
+
+        if context.config.materialize_only_last_token_logits:
+            prefill_row_counts = [1] * num_prefill_requests
+        else:
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            prefill_row_counts = context.request_query_lengths[
+                active_slice.start + num_decode_requests : active_slice.stop
+            ].tolist()
+        row_counts = [tokens_per_request] * num_decode_requests + prefill_row_counts
+
+        if self.num_speculative_tokens == 0:
+            selected_log_probs, log_probs = context.calculate_log_probs_tensors(
+                self._all_logits_cuda,
+                sampled_tokens_gpu,
+                only_last_token_logits=context.config.materialize_only_last_token_logits,
+                sampling=self._sampling,
+            )
+        else:
+            accepted_counts_gpu = sample_result.accepted_counts_gpu
+            if accepted_counts_gpu is None or self._accepted_tokens_per_request is None:
+                raise RuntimeError("Async MTP sampling did not produce accepted-token state.")
+
+            decode_samples = sampled_tokens_gpu[:num_decode_requests]
+            decode_tokens = torch.cat(
+                (
+                    self._accepted_tokens_per_request[:num_decode_requests].clamp(min=0),
+                    decode_samples.unsqueeze(1),
+                ),
+                dim=1,
+            )
+            decode_tokens.scatter_(
+                1,
+                accepted_counts_gpu[:num_decode_requests].unsqueeze(1),
+                decode_samples.unsqueeze(1),
+            )
+
+            if context.config.materialize_only_last_token_logits:
+                prefill_tokens = sampled_tokens_gpu[num_decode_requests:]
+            else:
+                decode_token_count = num_decode_requests * tokens_per_request
+                prefill_tokens = context.gpu_view.token_to_input_ids[
+                    decode_token_count : context.active_token_count
+                ].roll(-1, 0)
+                prefill_lengths_gpu = context.gpu_view.request_query_lengths[
+                    num_decode_requests:active_request_count
+                ]
+                prefill_last_token_idxs = prefill_lengths_gpu.cumsum(0) - 1
+                prefill_tokens[prefill_last_token_idxs] = sampled_tokens_gpu[num_decode_requests:]
+
+            selected_tokens = torch.cat((decode_tokens.flatten(), prefill_tokens))
+            logit_count = sum(row_counts)
+            logits = self._all_logits_cuda[:, :logit_count, :]
+            row_to_request = torch.arange(active_request_count).repeat_interleave(
+                torch.tensor(row_counts)
+            )
+            selected_log_probs, log_probs = context.calculate_log_probs_tensors(
+                logits,
+                selected_tokens,
+                only_last_token_logits=True,
+                sampling=self._sampling,
+                row_to_request=row_to_request,
+            )
+
+        top_n_counts = (
+            context.active_request_metadata["top_n_logprobs"][:active_request_count].tolist()
+            if return_top_n_logprobs
+            else [0] * active_request_count
+        )
+        skip_prompt_log_probs = context.active_request_metadata["skip_prompt_log_probs"][
+            :active_request_count
+        ].tolist()
+        max_top_n = max(top_n_counts, default=0)
+        if max_top_n > 0:
+            top_n_result = torch.topk(log_probs[: sum(row_counts)], k=max_top_n, dim=-1)
+            top_n_log_probs = top_n_result.values
+            top_n_token_ids = top_n_result.indices
+        else:
+            top_n_log_probs = None
+            top_n_token_ids = None
+
+        gpu_ready_event = None
+        if selected_log_probs.is_cuda:
+            current_stream = torch.cuda.current_stream(selected_log_probs.device)
+            self._async_sched_log_probs_gpu_ready_event.record(current_stream)
+            gpu_ready_event = self._async_sched_log_probs_gpu_ready_event
+
+        return _AsyncScheduleLogProbsGPUResult(
+            selected_log_probs=selected_log_probs,
+            top_n_log_probs=top_n_log_probs,
+            top_n_token_ids=top_n_token_ids,
+            row_counts=row_counts,
+            top_n_counts=top_n_counts,
+            skip_prompt_log_probs=skip_prompt_log_probs,
+            num_decode_requests=num_decode_requests,
+            gpu_ready_event=gpu_ready_event,
+        )
+
+    def _copy_async_sched_log_probs_to_cpu(
+        self, gpu_result: Optional[_AsyncScheduleLogProbsGPUResult]
+    ) -> Optional[_AsyncScheduleLogProbsTransfer]:
+        """Start selected and top-n logprob transfers to reusable CPU buffers.
+
+        Args:
+            gpu_result (Optional[_AsyncScheduleLogProbsGPUResult]): GPU outputs
+                produced by the current sampling step.
+
+        Returns:
+            Optional[_AsyncScheduleLogProbsTransfer]: Transient CPU views,
+                transfer-completion event, and retained GPU sources, or `None`.
+        """
+        if gpu_result is None:
+            return None
+
+        selected_log_probs = gpu_result.selected_log_probs
+        selected_shape = selected_log_probs.shape
+        selected_size = selected_log_probs.numel()
+        max_top_n = max(gpu_result.top_n_counts, default=0)
+        if max_top_n > self._async_sched_top_n_capacity:
+            context = self.inference_wrapped_model.inference_context
+            buffer_size = context.max_tokens * max_top_n
+            self._async_sched_top_n_log_probs_cpu_buffer = torch.empty(
+                buffer_size, dtype=torch.float32, device="cpu", pin_memory=True
+            )
+            self._async_sched_top_n_token_ids_cpu_buffer = torch.empty(
+                buffer_size, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._async_sched_top_n_capacity = max_top_n
+
+        selected_log_probs_cpu_view = self._async_sched_selected_log_probs_cpu_buffer[
+            :selected_size
+        ].view(selected_shape)
+        if max_top_n > 0:
+            top_n_size = selected_size * max_top_n
+            top_n_log_probs_cpu_view = self._async_sched_top_n_log_probs_cpu_buffer[
+                :top_n_size
+            ].view(*selected_shape, max_top_n)
+            top_n_token_ids_cpu_view = self._async_sched_top_n_token_ids_cpu_buffer[
+                :top_n_size
+            ].view(*selected_shape, max_top_n)
+        else:
+            top_n_log_probs_cpu_view = None
+            top_n_token_ids_cpu_view = None
+
+        cpu_ready_event = None
+        if selected_log_probs.is_cuda:
+            assert gpu_result.gpu_ready_event is not None
+            with torch.cuda.stream(self._async_sched_copy_stream):
+                self._async_sched_copy_stream.wait_event(gpu_result.gpu_ready_event)
+                selected_log_probs_cpu_view.copy_(selected_log_probs, non_blocking=True)
+                if max_top_n > 0:
+                    assert gpu_result.top_n_log_probs is not None
+                    assert gpu_result.top_n_token_ids is not None
+                    assert top_n_log_probs_cpu_view is not None
+                    assert top_n_token_ids_cpu_view is not None
+                    top_n_log_probs_cpu_view.copy_(gpu_result.top_n_log_probs, non_blocking=True)
+                    top_n_token_ids_cpu_view.copy_(gpu_result.top_n_token_ids, non_blocking=True)
+                self._async_sched_log_probs_cpu_ready_event.record(self._async_sched_copy_stream)
+            cpu_ready_event = self._async_sched_log_probs_cpu_ready_event
+        else:
+            selected_log_probs_cpu_view.copy_(selected_log_probs)
+            if max_top_n > 0:
+                assert gpu_result.top_n_log_probs is not None
+                assert gpu_result.top_n_token_ids is not None
+                assert top_n_log_probs_cpu_view is not None
+                assert top_n_token_ids_cpu_view is not None
+                top_n_log_probs_cpu_view.copy_(gpu_result.top_n_log_probs)
+                top_n_token_ids_cpu_view.copy_(gpu_result.top_n_token_ids)
+
+        return _AsyncScheduleLogProbsTransfer(
+            selected_log_probs_cpu_view=selected_log_probs_cpu_view,
+            top_n_log_probs_cpu_view=top_n_log_probs_cpu_view,
+            top_n_token_ids_cpu_view=top_n_token_ids_cpu_view,
+            row_counts=gpu_result.row_counts,
+            top_n_counts=gpu_result.top_n_counts,
+            skip_prompt_log_probs=gpu_result.skip_prompt_log_probs,
+            num_decode_requests=gpu_result.num_decode_requests,
+            cpu_ready_event=cpu_ready_event,
+            gpu_result=gpu_result,
+        )
+
+    @staticmethod
+    def _materialize_async_sched_log_probs(
+        transfer: Optional[_AsyncScheduleLogProbsTransfer],
+        accepted_counts_cpu: Optional[Tensor] = None,
+    ) -> Tuple[Optional[List[List[float]]], Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]]:
+        """Convert completed CPU transfer views to the legacy result format.
+
+        Args:
+            transfer (Optional[_AsyncScheduleLogProbsTransfer]): Completed
+                logprob transfer for the current step.
+            accepted_counts_cpu (Optional[Tensor]): Accepted MTP draft count per
+                active request, or `None` for one-token decoding.
+
+        Returns:
+            Tuple containing selected logprobs per request and optional top-n
+            values/token IDs per request.
+        """
+        if transfer is None:
+            return None, None
+
+        accepted_counts = accepted_counts_cpu.tolist() if accepted_counts_cpu is not None else None
+        row_offset = 0
+        log_probs = []
+        top_n_logprobs = {}
+        for request_idx, (row_count, top_n, skip_prompt) in enumerate(
+            zip(transfer.row_counts, transfer.top_n_counts, transfer.skip_prompt_log_probs)
+        ):
+            is_decode = request_idx < transfer.num_decode_requests
+            emitted_count = (
+                accepted_counts[request_idx] + 1
+                if is_decode and accepted_counts is not None
+                else row_count
+            )
+            emitted_slice = slice(row_offset, row_offset + emitted_count)
+            log_probs.append(transfer.selected_log_probs_cpu_view[emitted_slice].tolist())
+
+            if top_n > 0:
+                assert transfer.top_n_log_probs_cpu_view is not None
+                assert transfer.top_n_token_ids_cpu_view is not None
+                if not is_decode and skip_prompt:
+                    top_n_row_idxs = [row_offset + row_count - 1]
+                else:
+                    top_n_row_idxs = range(row_offset, row_offset + emitted_count)
+                top_n_logprobs[request_idx] = [
+                    (
+                        transfer.top_n_log_probs_cpu_view[token_idx, :top_n].clone(),
+                        transfer.top_n_token_ids_cpu_view[token_idx, :top_n].clone(),
+                    )
+                    for token_idx in top_n_row_idxs
+                ]
+            row_offset += row_count
+
+        return log_probs, top_n_logprobs or None
 
     def _run_async_sched_prepare(self) -> Tuple[Tensor, Tensor]:
         """Prepare decode requests and return live GPU forward-input views.
@@ -2267,6 +2586,12 @@ class TextGenerationController:
             skip_token_input_ids=True, record_done_event=True
         )
 
+    def _commit_mamba_intermediate_states(self) -> None:
+        """Commit prefix-cacheable Mamba states produced by the current forward."""
+        context = self.inference_wrapped_model.inference_context
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
     def _run_async_sched_forward(
         self, input_ids_gpu_view: Tensor, position_ids_gpu_view: Tensor
     ) -> None:
@@ -2284,6 +2609,7 @@ class TextGenerationController:
         # Forward.
         range_push("forward_pass")
         self._dynamic_step_forward_logits(input_ids_gpu_view, position_ids_gpu_view)
+        self._commit_mamba_intermediate_states()
         range_pop()
 
         # Record the logits and identity mapping for this forward's input rows.
@@ -2324,10 +2650,7 @@ class TextGenerationController:
         return True, bookkeeping_done_event
 
     def _run_async_sched_resolve(
-        self,
-        sample_result: _AsyncScheduleSampleResult,
-        resolved_sequence_lengths: Tensor,
-        next_forward_done_event: Optional[torch.cuda.Event],
+        self, sample_result: _AsyncScheduleSampleResult, resolved_sequence_lengths: Tensor
     ) -> _AsyncScheduleRequestResult:
         """Resolve request state and compact speculative forward logits.
 
@@ -2335,8 +2658,6 @@ class TextGenerationController:
             sample_result (_AsyncScheduleSampleResult): Sampling outputs in reusable CPU views.
             resolved_sequence_lengths (Tensor): Sequence lengths after accepting
                 current output and before preparing unverified successor tokens.
-            next_forward_done_event (Optional[torch.cuda.Event]): Event marking
-                successor forward completion, or `None` when no successor exists.
 
         Returns:
             _AsyncScheduleRequestResult: Sampled tokens, resolved request row
@@ -2357,10 +2678,6 @@ class TextGenerationController:
         )
         range_pop()
 
-        # Finish the successor forward before releasing resources that it still uses.
-        if next_forward_done_event is not None and finished_request_ids.numel() > 0:
-            self._synchronize_async_sched_event(next_forward_done_event)
-
         # Resolve CPU request lifecycle state.
         range_push("resolve_requests")
         resolved_finished_request_ids, survivor_idxs = context.resolve_requests(active_request_mask)
@@ -2368,9 +2685,8 @@ class TextGenerationController:
 
         assert torch.equal(finished_request_ids, resolved_finished_request_ids)
 
-        # Compact pending successor logits only while the async chain continues.
-        if next_forward_done_event is not None:
-            self._compact_async_sched_logits(survivor_idxs)
+        # Enqueue compaction behind the successor forward on the current CUDA stream.
+        self._compact_async_sched_logits(survivor_idxs)
 
         # Return the resolution result.
         return _AsyncScheduleRequestResult(
@@ -2434,6 +2750,8 @@ class TextGenerationController:
         request_result: _AsyncScheduleRequestResult,
         cuda_graph_request_count: Optional[int],
         decode_only: DecodeOnly,
+        log_probs: Optional[List[List[float]]],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
         *,
         count_compaction: bool,
     ) -> DynamicBatchControllerStepResult:
@@ -2445,6 +2763,10 @@ class TextGenerationController:
                 by the consumed forward.
             decode_only (DecodeOnly): Decode-only state for the consumed and
                 launched forwards.
+            log_probs (Optional[List[List[float]]]): Selected-token log probabilities
+                grouped by active request.
+            top_n_logprobs (Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]): Top-n
+                log probabilities and token IDs grouped by active request.
             count_compaction (bool): Whether finished requests discarded successor rows.
 
         Returns:
@@ -2465,8 +2787,8 @@ class TextGenerationController:
                 "newly_paused_request_ids": request_result.newly_paused_request_ids,
                 "evict_request_ids": request_result.evict_request_ids,
                 "accepted_tokens": request_result.accepted_tokens_cpu,
-                "log_probs": None,
-                "top_n_logprobs": None,
+                "log_probs": log_probs,
+                "top_n_logprobs": top_n_logprobs,
                 "cuda_graph_request_count": cuda_graph_request_count,
             },
         )
@@ -2492,6 +2814,7 @@ class TextGenerationController:
         launched_decode_only = None
         request_result = None
         cuda_graph_request_count = None
+        log_probs_transfer = None
 
         with torch.inference_mode():
             if had_pending_forward:
@@ -2505,6 +2828,9 @@ class TextGenerationController:
                     self._run_async_sched_mtp_rewind(sample_result)
                 else:
                     sample_result = self._run_async_sched_sample()
+
+                log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
+                log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
 
@@ -2547,8 +2873,19 @@ class TextGenerationController:
             assert active_request_count > 0, "Async no-overlap admission did not add a request."
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
+        if log_probs_transfer is not None:
+            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
+            log_probs_transfer,
+            sample_result.accepted_counts_cpu_view if self.num_speculative_tokens > 0 else None,
+        )
         result = self._build_async_sched_step_result(
-            request_result, cuda_graph_request_count, decode_only, count_compaction=False
+            request_result,
+            cuda_graph_request_count,
+            decode_only,
+            log_probs,
+            top_n_logprobs,
+            count_compaction=False,
         )
         await asyncio.sleep(0)
         return result
@@ -2590,6 +2927,9 @@ class TextGenerationController:
             # Populate the next forward's input-ID view directly from GPU samples.
             context.copy_async_sched_sample_to_forward(sample_result.sampled_tokens_gpu)
 
+            log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
+            log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
+
             # -------------------------------------------------------------------------
             # Forward
             # -------------------------------------------------------------------------
@@ -2600,7 +2940,6 @@ class TextGenerationController:
 
             range_push("async_sched_forward_pass")
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
-            next_forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
             range_pop()
 
             # -------------------------------------------------------------------------
@@ -2610,18 +2949,24 @@ class TextGenerationController:
             self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
             self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            # Resolve N while forward N+1 continues unless finished resources are needed.
-            resolve_result = self._run_async_sched_resolve(
-                sample_result, resolved_sequence_lengths, next_forward_done_event
-            )
+            # Resolve N while forward N+1 continues.
+            resolve_result = self._run_async_sched_resolve(sample_result, resolved_sequence_lengths)
 
             # Commit CPU input IDs in the resolved survivor order.
             context.commit_sampled_tokens(
                 resolve_result.sampled_tokens_cpu[resolve_result.survivor_idxs]
             )
 
+        if log_probs_transfer is not None:
+            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(log_probs_transfer)
         result = self._build_async_sched_step_result(
-            resolve_result, cuda_graph_request_count, decode_only, count_compaction=True
+            resolve_result,
+            cuda_graph_request_count,
+            decode_only,
+            log_probs,
+            top_n_logprobs,
+            count_compaction=True,
         )
 
         # Yield only after resolution is complete and forward N+1 is already submitted.
@@ -2648,6 +2993,8 @@ class TextGenerationController:
             sample_result = self._run_async_sched_sample_mtp()
             self._run_async_sched_mtp_rewind(sample_result)
             resolved_sequence_lengths = context.get_active_sequence_lengths() + 1
+            log_probs_gpu_result = self._run_async_sched_log_probs(sample_result)
+            log_probs_transfer = self._copy_async_sched_log_probs_to_cpu(log_probs_gpu_result)
 
             # -------------------------------------------------------------------------
             # Prepare
@@ -2677,7 +3024,6 @@ class TextGenerationController:
 
             range_push("async_sched_forward_pass")
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
-            next_forward_done_event = self._record_fresh_async_sched_event(self._all_logits_cuda)
             range_pop()
 
             # -------------------------------------------------------------------------
@@ -2687,9 +3033,7 @@ class TextGenerationController:
             self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
             self._synchronize_async_sched_event(bookkeeping_done_event)
 
-            resolve_result = self._run_async_sched_resolve(
-                sample_result, resolved_sequence_lengths, next_forward_done_event
-            )
+            resolve_result = self._run_async_sched_resolve(sample_result, resolved_sequence_lengths)
 
             # Commit CPU input IDs in the resolved survivor order.
             survivor_idxs = resolve_result.survivor_idxs
@@ -2702,8 +3046,18 @@ class TextGenerationController:
                 resolve_result.sampled_tokens_cpu[survivor_idxs], sampled_mtp_tokens_cpu
             )
 
+        if log_probs_transfer is not None:
+            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
+            log_probs_transfer, sample_result.accepted_counts_cpu_view
+        )
         result = self._build_async_sched_step_result(
-            resolve_result, cuda_graph_request_count, decode_only, count_compaction=True
+            resolve_result,
+            cuda_graph_request_count,
+            decode_only,
+            log_probs,
+            top_n_logprobs,
+            count_compaction=True,
         )
         await asyncio.sleep(0)
         return result
@@ -2758,8 +3112,7 @@ class TextGenerationController:
             # may swap request indices. The Python lists tracking EOS block IDs
             # and intermediate offsets are not swapped along with tensors, so
             # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
+            self._commit_mamba_intermediate_states()
 
             # Collect flat routing indices and scatter them into per-block storage.
             # Must be done before update_requests while token-to-block mappings are valid.
@@ -3430,11 +3783,11 @@ class TextGenerationController:
 
             request.status = Status.COMPLETED
 
+            # Detokenize up to input_prompt_length + required_sequence_length for this idx.
+            sequence_length = input_prompt_length + required_sequence_length
             text, segments = self.detokenize_generations(
-                batch_prompt_tokens_with_generations[
-                    idx, : (input_prompt_length + required_sequence_length)
-                ],
-                input_prompt_length + generated_sequence_lengths,
+                batch_prompt_tokens_with_generations[idx, :sequence_length],
+                torch.tensor([sequence_length], device=batch_prompt_tokens_with_generations.device),
                 sampling_params.return_segments,
             )
             request.text = text  # Inference server returns prompts & generations together

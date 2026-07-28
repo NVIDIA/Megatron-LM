@@ -1042,48 +1042,24 @@ class DynamicInferenceEngine(AbstractEngine):
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
         model_config = self.controller.inference_wrapped_model.model.config
-        if self.enable_chunked_prefill:
-            raise ValueError("Async scheduling does not support chunked prefill.")
         if self.num_speculative_tokens > self.controller.num_mtp_depths:
             raise ValueError("Async scheduling requires one MTP depth per speculative token.")
-        if self.context.is_hybrid_model:
-            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
-        if self.context.enable_prefix_caching:
-            raise ValueError("Async scheduling does not support prefix caching.")
-        if not self.materialize_only_last_token_logits:
-            raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
         if model_config.moe_enable_routing_replay:
             raise ValueError("Async scheduling does not support routing replay.")
-
-    def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
-        """Validate request-level restrictions for async scheduling.
-
-        Args:
-            request (DynamicInferenceRequest): Request being added to the engine.
-        """
-        mode = self.context.config.async_sched_mode
-        if mode == AsyncScheduleMode.LEGACY:
-            return
-        if mode != AsyncScheduleMode.ASYNC:
-            raise AssertionError(f"Unexpected async scheduling mode: {mode}")
-
-        sampling_params = request.sampling_params
-        if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
-            raise ValueError(
-                "Async scheduling only supports greedy sampling "
-                "(SamplingParams.top_k == 1 and top_p == 0.0)."
-            )
-        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
-            raise ValueError("Async scheduling does not support log probabilities.")
-        if sampling_params.stop_words:
-            raise ValueError("Async scheduling does not support stop words.")
 
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
+        """Add a request to the engine.
+
+        Args:
+            request (DynamicInferenceRequest): Request to add.
+
+        Returns:
+            asyncio.Future[DynamicInferenceRequest]: Future completed when the request finishes.
+        """
 
         request_id = request.request_id
-        self._validate_async_sched_support_for_request(request)
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
@@ -1255,6 +1231,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sample: torch.Tensor,
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
+        consumed_chunked_prefill_request_id: int,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
@@ -1271,8 +1248,13 @@ class DynamicInferenceEngine(AbstractEngine):
             sample: Tensor: The newly generated token for each request
             accepted_tokens: Tensor: The additional accepted tokens for each request
             log_probs: (List): Log probs for each request
+            consumed_chunked_prefill_request_id (int): Chunked-prefill request ID
+                associated with the consumed forward, or -1 if it had no partial chunk.
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
+            pre_fwd_active_token_count (Optional[int]): Active token count for the
+                consumed forward.
+            pre_fwd_step_count (Optional[int]): Step count for the consumed forward.
             finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
                 finished requests, saved before update_requests released them.
                 Used for per-block routing reconstruction.
@@ -1329,7 +1311,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             num_stop_word_trim = 0
             is_prefill = len(request.generated_tokens) == 0
-            if request_id != self.context.chunked_prefill_request_id:
+            if request_id != consumed_chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
@@ -1483,7 +1465,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
+                is_chunked_prefill = request_id == consumed_chunked_prefill_request_id
                 is_prefill = len(request.generated_log_probs) == 0
 
                 if request.sampling_params.skip_prompt_log_probs:
@@ -1692,6 +1674,24 @@ class DynamicInferenceEngine(AbstractEngine):
             return self._cg_admission_check(req, candidate)
         return self._matches_cg_admission(candidate)
 
+    def _can_schedule_chunked_prefill(self, req) -> bool:
+        """Return whether the queue-head request can admit at least one prompt token.
+
+        Args:
+            req: Queue-head inference request.
+
+        Returns:
+            bool: Whether request, token, and KV-cache capacity permit a chunk.
+        """
+        request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
+        is_continuing_chunk = self.context.chunked_prefill_request_id == req.request_id
+        token_capacity_available = self.context.active_token_count < self.context.max_tokens
+        return (
+            (is_continuing_chunk or request_can_be_added)
+            and kv_cache_available
+            and token_capacity_available
+        )
+
     def _should_run_async_sched_overlap(self) -> bool:
         """Return whether this step should use overlap ordering.
 
@@ -1708,6 +1708,8 @@ class DynamicInferenceEngine(AbstractEngine):
             return True
 
         req = self.get_request(self.waiting_request_ids[0])
+        if self.enable_chunked_prefill:
+            return not self._can_schedule_chunked_prefill(req)
         return not self._can_schedule_non_chunked_prefill(req, record_cg_wait=False)
 
     def schedule_non_chunked_prefill(self) -> None:
@@ -1898,11 +1900,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
-            token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
-            request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
-            request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
-            if request_can_be_added and kv_cache_available and token_partially_can_be_added:
+            if self._can_schedule_chunked_prefill(req):
                 # How many tokens we can admit this step.
                 token_budget = self.context.max_tokens - self.context.active_token_count
 
@@ -1936,6 +1935,35 @@ class DynamicInferenceEngine(AbstractEngine):
                     computed_chunk = computed_budget
 
                 prefill_chunk_length = prefix_skip + computed_chunk
+
+                # Mamba prefix caching: keep chunk boundaries block-aligned.
+                # compute_and_store_offsets() records a recurrent-state snapshot at a
+                # KV-block boundary only when that boundary lands on a multiple of the
+                # SSM chunk size measured FROM the start of the current prefill chunk
+                # (it filters on `offset % mamba_chunk_size == 0`, where the chunk start
+                # equals `finished_chunk_token_count` on continuation chunks). Block
+                # boundaries are multiples of `block_size_tokens` (itself a multiple of
+                # the SSM chunk size), so the filter only passes when
+                # `finished_chunk_token_count` is block-aligned. If a chunk ends at an
+                # arbitrary token offset, every candidate boundary in the following
+                # chunks becomes unrecordable and the last-block snapshot that lets a
+                # future request skip prefill is silently dropped. Stop a partial
+                # (non-final) chunk short at the nearest lower block boundary so the
+                # running `finished_chunk_token_count` stays block-aligned.
+                if (
+                    self.context.is_hybrid_model
+                    and self.context.mamba_slot_allocator is not None
+                    and prefill_chunk_length < remaining_len
+                ):
+                    block_size = self.context.block_size_tokens
+                    chunk_end = req.finished_chunk_token_count + prefill_chunk_length
+                    aligned_end = (chunk_end // block_size) * block_size
+                    aligned_chunk_length = aligned_end - req.finished_chunk_token_count
+                    # Only snap down when the aligned chunk still computes at least one
+                    # token beyond the skipped prefix (a chunk whose budget is smaller
+                    # than a block cannot be block-aligned; leave it unchanged).
+                    if aligned_chunk_length > prefix_skip:
+                        prefill_chunk_length = aligned_chunk_length
 
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
                 # final chunk, reduce by 1 (or defer if we only have 1 computed token).
@@ -2060,6 +2088,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 "active_token_count": self.context.active_token_count,
                 "step_count": self.context.step_count,
             }
+        pre_step_context_state["chunked_prefill_request_id"] = (
+            self.context.chunked_prefill_request_id
+        )
 
         # Generate tokens.
         nvtx_range_push(step_nvtx_range)
@@ -2155,7 +2186,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 sample,
                 accepted_tokens,
                 log_probs,
-                top_n_logprobs,
+                consumed_chunked_prefill_request_id=context_state["chunked_prefill_request_id"],
+                top_n_logprobs=top_n_logprobs,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,

@@ -148,12 +148,8 @@ def test_inference_pipeline(
         # TODO: Compare liftime_prefill_token_count to groundtruth
         pass
 
-    for request_id, groundtruth_results in output_groundtruth.items():
-        # Skip any remaining system-level metrics (e.g. async scheduling step
-        # counters) that are not per-request result dicts.
-        if request_id in _NON_REQUEST_TOP_LEVEL_KEYS:
-            continue
-
+    for request_id in groundtruth_request_ids:
+        groundtruth_results = output_groundtruth[request_id]
         current_results = output_current[request_id]
 
         at_least_one_test_loop = False

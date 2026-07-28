@@ -25,6 +25,9 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
         enable_prefix_caching=False,
         num_prefill_requests=0,
         can_prepare_requests=mock.Mock(return_value=True),
+        active_token_count=0,
+        max_tokens=8,
+        chunked_prefill_request_id=-1,
     )
     model_config = SimpleNamespace(
         expert_model_parallel_size=1, num_moe_experts=None, moe_enable_routing_replay=False
@@ -55,12 +58,30 @@ def _make_engine(async_sched_mode=AsyncScheduleMode.ASYNC, **overrides):
     [
         ({"async_sched_mode": AsyncScheduleMode.LEGACY, "num_speculative_tokens": 1}, False),
         ({}, False),
-        ({"enable_chunked_prefill": True}, True),
+        ({"enable_chunked_prefill": True}, False),
         ({"num_speculative_tokens": 1}, True),
         ({"num_speculative_tokens": 1, "controller_num_mtp_depths": 1}, False),
-        ({"context_is_hybrid_model": True}, True),
-        ({"context_enable_prefix_caching": True}, True),
-        ({"materialize_only_last_token_logits": False}, True),
+        ({"context_is_hybrid_model": True}, False),
+        (
+            {
+                "context_is_hybrid_model": True,
+                "num_speculative_tokens": 1,
+                "controller_num_mtp_depths": 1,
+                "model_config_expert_model_parallel_size": 2,
+                "model_config_num_moe_experts": 4,
+            },
+            False,
+        ),
+        ({"context_enable_prefix_caching": True}, False),
+        (
+            {
+                "enable_chunked_prefill": True,
+                "context_enable_prefix_caching": True,
+                "context_is_hybrid_model": True,
+            },
+            False,
+        ),
+        ({"materialize_only_last_token_logits": False}, False),
         ({"model_config_expert_model_parallel_size": 2}, False),
         ({"model_config_num_moe_experts": 4}, False),
         ({"model_config_moe_enable_routing_replay": True}, True),
@@ -75,44 +96,6 @@ def test_validate_async_sched_support_for_config(overrides, should_raise):
             engine._validate_async_sched_support_for_config()
     else:
         engine._validate_async_sched_support_for_config()
-
-
-@pytest.mark.parametrize(
-    "async_sched_mode, sampling_params, should_raise",
-    [
-        (AsyncScheduleMode.LEGACY, SamplingParams(top_k=0, top_p=0.5), False),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0), False),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=0, top_p=0.0), True),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.5), True),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, return_log_probs=True), True),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, top_n_logprobs=1), True),
-        (AsyncScheduleMode.ASYNC, SamplingParams(top_k=1, top_p=0.0, stop_words=["END"]), True),
-    ],
-)
-def test_validate_async_sched_support_for_request(async_sched_mode, sampling_params, should_raise):
-    """Ensure engine request validation accepts only supported async scheduling requests."""
-    engine = _make_engine(async_sched_mode=async_sched_mode)
-    request = SimpleNamespace(sampling_params=sampling_params)
-
-    if should_raise:
-        with pytest.raises(ValueError, match="Async scheduling"):
-            engine._validate_async_sched_support_for_request(request)
-    else:
-        engine._validate_async_sched_support_for_request(request)
-
-
-def test_add_request_runs_async_sched_request_validation():
-    """Ensure request validation is called before mutating engine request state."""
-    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine._validate_async_sched_support_for_request = mock.Mock(
-        side_effect=RuntimeError("validated")
-    )
-    request = SimpleNamespace(request_id=10)
-
-    with pytest.raises(RuntimeError, match="validated"):
-        engine._add_request(request)
-
-    engine._validate_async_sched_support_for_request.assert_called_once_with(request)
 
 
 @pytest.mark.parametrize(
@@ -156,6 +139,39 @@ def test_async_sched_overlap_probe_uses_non_mutating_cuda_graph_match():
     engine._matches_cg_admission.assert_called_once()
     engine._cg_admission_check.assert_not_called()
     assert request.cg_wait_iters == 7
+
+
+@pytest.mark.parametrize(
+    "availability, active_token_count, chunked_prefill_request_id, expected",
+    [
+        ((True, False, True), 7, -1, True),
+        ((False, False, True), 7, 10, True),
+        ((True, True, False), 7, -1, False),
+        ((True, True, True), 8, -1, False),
+    ],
+)
+def test_can_schedule_chunked_prefill(
+    availability, active_token_count, chunked_prefill_request_id, expected
+):
+    """The chunk probe requires request, KV-cache, and partial-token capacity."""
+    engine = _make_engine(enable_chunked_prefill=True)
+    engine.context.active_token_count = active_token_count
+    engine.context.chunked_prefill_request_id = chunked_prefill_request_id
+    engine.context.check_availability = mock.Mock(return_value=availability)
+    request = SimpleNamespace(request_id=10)
+
+    assert engine._can_schedule_chunked_prefill(request) is expected
+
+
+def test_async_sched_overlap_probe_routes_schedulable_chunk_to_no_overlap():
+    """A schedulable chunk is admitted only after no-overlap lifecycle bookkeeping."""
+    engine = _make_engine(enable_chunked_prefill=True)
+    engine.context.active_token_count = 2
+    engine.context.check_availability = mock.Mock(return_value=(True, False, True))
+    engine.waiting_request_ids = deque([10])
+    engine.get_request = mock.Mock(return_value=SimpleNamespace(request_id=10))
+
+    assert not engine._should_run_async_sched_overlap()
 
 
 @pytest.mark.parametrize(
@@ -228,6 +244,7 @@ def test_async_forward_routes_one_controller_iteration(
         prefix_cache_lru_clock=7,
         active_token_count=2,
         num_prefill_requests=1 if expected_nvtx_range == "Prefill" else 0,
+        chunked_prefill_request_id=17,
         is_decode_only=mock.Mock(return_value=decode_only.launched),
     )
     output = None if primer_only else {"sample": "tokens"}
@@ -251,6 +268,7 @@ def test_async_forward_routes_one_controller_iteration(
 
     assert result is output
     assert context_state["decode_only"] == decode_only
+    assert context_state["chunked_prefill_request_id"] == 17
     assert engine.decode_only == decode_only
     assert not hasattr(engine, "is_decode_only")
     assert engine.context.step_count == 5
@@ -270,6 +288,43 @@ def test_async_forward_routes_one_controller_iteration(
             ),
         )
     engine.context.is_decode_only.assert_not_called()
+
+
+def test_async_bookkeep_uses_consumed_chunked_prefill_request_id():
+    """Post-processing classifies output using the chunk ID from its consumed forward."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.track_paused_request_events = False
+    engine.post_process_requests = mock.Mock(return_value=([10], []))
+    engine.failed_request_ids = set()
+    engine.requests = {}
+    engine.use_coordinator = False
+    engine.context = SimpleNamespace(enable_prefix_caching=False, step_count=1)
+    engine.logging_step_interval = 0
+    engine.num_speculative_tokens = 0
+    step_result = {
+        "active_request_ids": [10],
+        "finished_request_ids": [],
+        "sample": [20],
+        "accepted_tokens": None,
+        "log_probs": None,
+        "cuda_graph_request_count": None,
+    }
+    context_state = {
+        "active_token_count": 4,
+        "step_count": 0,
+        "chunked_prefill_request_id": 10,
+        "kv_stats": None,
+    }
+
+    with (
+        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_push"),
+        mock.patch("megatron.core.inference.engines.dynamic_engine.nvtx_range_pop"),
+    ):
+        asyncio.run(engine.async_bookkeep(step_result, context_state, 0.0))
+
+    assert (
+        engine.post_process_requests.call_args.kwargs["consumed_chunked_prefill_request_id"] == 10
+    )
 
 
 @pytest.mark.parametrize(
