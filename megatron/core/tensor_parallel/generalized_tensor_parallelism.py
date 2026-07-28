@@ -349,8 +349,9 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
-    Drains the eager AG/RS side streams, then waits on each CG runner's replay stream
-    (its tail = captured Phase 2 main_grad.add_). No-op when GTP is inactive.
+    Drains the eager AG/RS side streams, then — outside CUDA-graph capture — waits on each CG
+    runner's replay stream (its tail = captured Phase 2 main_grad.add_). Under whole-step capture
+    there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
@@ -800,6 +801,9 @@ def _init_gtp_runtime_attrs(obj):
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
     obj._grad_accum_hook = None
+    # The weight's AccumulateGrad node (set by register_grad_accum_hook). Retained so the leaf
+    # lands on the capture stream for full-iteration CUDA-graph capture; None until DDP registers.
+    obj._grad_accum_node = None
     # Quantization. For native-FP8 GTP the reclass path overwrites _quantizer with the tensor's
     # own MXFP8 quantizer and points quantized at self; BF16 GTP leaves both unset.
     obj._quantizer = None
