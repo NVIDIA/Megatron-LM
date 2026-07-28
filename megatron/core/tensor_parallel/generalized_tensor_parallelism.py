@@ -1094,7 +1094,20 @@ class GTPShardedParam(torch.nn.Parameter):
         return tensor[: -self.pad_length]
 
     def _all_gather_weight(self, async_op, fwd, nvtx_label=None):
-        """Quantize (if needed) and all-gather weight. Returns (weight_total, handle)."""
+        """Quantize (if needed) and all-gather weight. Returns (weight_total, handle).
+
+        For a _retain_for_bwd weight the backward gather is served from the forward buffer
+        instead of running a collective; callers cannot tell the two apart.
+        """
+        if not fwd and self._retain_for_bwd:
+            # The fwd gather's buffer is pinned, so nothing has overwritten it since. Hand it
+            # back rather than re-gathering; _ag_ticket_bwd is therefore never reserved.
+            nvtx_range_push(f"{self._debug_name}.bwd.reuse_fwd_weight")
+            cache = get_global_GTP_cache()
+            bufs = [cache.get(w._ag_ticket_fwd) for w in self._weights]
+            nvtx_range_pop()
+            return (bufs if self.is_routed_expert else bufs[0]), None
+
         if nvtx_label is None:
             nvtx_label = (
                 self._debug_name + (".fwd" if fwd else ".bwd") + (".async" if async_op else ".sync")
@@ -1322,12 +1335,7 @@ class GTPShardedParam(torch.nn.Parameter):
             weight_total
         """
 
-        if self._retained_fwd_weight is not None:
-            # Reuse the weight the forward pass already gathered (BF16 output
-            # layer) instead of re-gathering it synchronously. Release the pin.
-            result = self._retained_fwd_weight
-            self._retained_fwd_weight = None
-        elif GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
@@ -1460,18 +1468,6 @@ class GTPShardedParam(torch.nn.Parameter):
             # Second forward pass: flush the complete table atomically to avoid interleaving
             chain["link_table_flushed"] = True
             log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
-
-        # Retain the forward-gathered output-layer weight for the immediately-following
-        # backward dgrad to reuse (skips the redundant sync re-gather). Its buffer is
-        # pinned (reserve() sets slot.pin) so no other same-shape gather can overwrite it.
-        # Guards: forward (not recompute), output layer, BF16 (native-FP8 gathers
-        # rowwise fwd vs columnwise bwd — different data). Full-iteration CG is safe:
-        # the whole step is one capture session, so the recorded fwd AG rewrites the
-        # pinned (fixed-address, never-pooled) buffer on every replay, ordered before
-        # the dgrad read via the output layer's own fwd GEMM on the main stream; the
-        # Python retain/consume handshake runs only at capture and mirrors eager.
-        if fwd and not in_recompute and self._retain_for_bwd:
-            self._retained_fwd_weight = result
 
         return result
 

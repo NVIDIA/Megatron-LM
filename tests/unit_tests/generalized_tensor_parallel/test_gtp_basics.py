@@ -187,10 +187,12 @@ def _worker_output_layer_weight_gathered_once(rank, world_size, port):
       bwd-prefetch opt-out. A tied output weight is registered under an "embedding..."
       name and must not opt in, because its backward is a scatter-add with no gather
       to reuse; ordinary weights must not opt in either.
-    * That the reuse actually happens. The retained weight must be populated after
-      forward and cleared after backward, which is what distinguishes the reuse branch
-      from a silent fallback re-gather, and the input gradient must still match a
-      reference built from an explicit all-gather.
+    * That the reuse actually happens. No backward gather ticket may be reserved -- that
+      is what distinguishes the reuse from a silent fallback re-gather -- and the input
+      gradient must still match a reference built from an explicit all-gather.
+    * That the forward buffer stays pinned. It may be shared with slots created before
+      the pin, but must never sit in a pool afterwards, including when one of those
+      earlier co-owners releases its own ticket.
     """
     torch.manual_seed(0)
     batch, in_f, out_f = 16, 64, 128  # out_f % (16*world_size)==0 -> no padding
@@ -211,9 +213,9 @@ def _worker_output_layer_weight_gathered_once(rank, world_size, port):
     emb_w = model.embedding.weight
     fc1_w = model.decoder_fc1.weight
 
-    assert out_w._reuse_fwd_weight_in_bwd is True, "output_layer must reuse its forward weight"
-    assert emb_w._reuse_fwd_weight_in_bwd is False, "a tied/embedding weight must not reuse"
-    assert fc1_w._reuse_fwd_weight_in_bwd is False, "ordinary weights must not reuse"
+    assert out_w._retain_for_bwd is True, "output_layer must reuse its forward weight"
+    assert emb_w._retain_for_bwd is False, "a tied/embedding weight must not reuse"
+    assert fc1_w._retain_for_bwd is False, "ordinary weights must not reuse"
 
     # The sibling embedding opt-out must be unaffected.
     assert emb_w._need_weight_prefetch_bwd is False, "embedding still skips its bwd AG"
@@ -230,8 +232,10 @@ def _worker_output_layer_weight_gathered_once(rank, world_size, port):
     inp_gtp = inp.clone().requires_grad_(True)
     inp_ref = inp.clone().requires_grad_(True)
 
+    # Run the embedding first so it allocates and publishes a same-shape buffer: the output
+    # layer then adopts it, reproducing the shared-buffer case the pin has to survive.
+    model.embedding(inp.clone(), is_first_microbatch=True)
     out_gtp = model.output_layer(inp_gtp, is_first_microbatch=True)
-    assert out_w._retained_fwd_weight is not None, "forward must retain the gathered weight"
 
     out_ref = (inp_ref.float() @ full_weight.T).to(dtype)
 
@@ -242,11 +246,29 @@ def _worker_output_layer_weight_gathered_once(rank, world_size, port):
     out_gtp.backward(grad_out)
     out_ref.backward(grad_out.float())
 
-    assert out_w._retained_fwd_weight is None, "backward must consume the retained weight"
+    # A bwd ticket is only ever reserved by a real bwd gather, so its absence proves the
+    # dgrad took the reuse path rather than silently re-gathering.
+    assert out_w._ag_ticket_bwd is None, "backward must reuse the fwd buffer, not re-gather"
     assert inp_gtp.grad is not None
     assert torch.allclose(
         inp_gtp.grad.float(), inp_ref.grad.float(), atol=1e-5, rtol=1e-5
     ), f"dX mismatch max_diff={(inp_gtp.grad.float()-inp_ref.grad.float()).abs().max():.4f}"
+
+    # The pinned buffer must be registered and absent from every pool -- and must stay absent
+    # when an earlier co-owner releases its own ticket, which is the case that would otherwise
+    # hand the retained weight to the next same-shape gather.
+    cache = gtp_module.get_global_GTP_cache()
+    pinned = cache.get(out_w._ag_ticket_fwd)
+    assert any(b is pinned for b in cache._pinned_bufs), "fwd buffer must be registered as pinned"
+
+    def _pooled():
+        return any(b is pinned for bufs in cache._pool.values() for b in bufs)
+
+    assert not _pooled(), "pinned buffer must not sit in any pool"
+    for w in (emb_w, fc1_w):
+        if w._ag_ticket_fwd is not None:
+            cache.release(w._ag_ticket_fwd)
+    assert not _pooled(), "a co-owner's release must not return the pinned buffer to a pool"
 
 
 class TestOutputLayerWeightGatheredOnce:
