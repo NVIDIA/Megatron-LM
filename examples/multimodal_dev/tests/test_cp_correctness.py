@@ -8,6 +8,11 @@ deterministic data and comparing the per-rank reduced losses.
 
 Launch with torchrun (N must be >= 2*max_cp_size for zigzag splitting):
 
+    # As a pytest module (this is what CI runs; CP sizes that do not
+    # divide the world size are skipped):
+    torchrun --nproc_per_node=8 -m pytest -q \\
+        examples/multimodal_dev/tests/test_cp_correctness.py
+
     # Test CP=2 on 2 GPUs:
     torchrun --nproc_per_node=2 examples/multimodal_dev/tests/test_cp_correctness.py --cp-size 2
 
@@ -29,6 +34,7 @@ import argparse
 import os
 import sys
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -36,6 +42,11 @@ import torch.distributed as dist
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+# Tolerances on the CP>1 vs CP=1 loss comparison, shared by the pytest tests
+# and the CLI defaults so the two entry points cannot drift.
+DEFAULT_ATOL = 1e-4
+DEFAULT_RTOL = 5e-2
 
 
 def _parse_args():
@@ -49,11 +60,11 @@ def _parse_args():
         help="Sequence length (must be divisible by 2*max(cp_size, tp_size*cp_size))",
     )
     parser.add_argument(
-        "--atol", type=float, default=1e-4,
+        "--atol", type=float, default=DEFAULT_ATOL,
         help="Absolute tolerance for loss comparison",
     )
     parser.add_argument(
-        "--rtol", type=float, default=5e-2,
+        "--rtol", type=float, default=DEFAULT_RTOL,
         help="Relative tolerance for loss comparison (default 5%%)",
     )
     parser.add_argument(
@@ -199,36 +210,29 @@ def _forward_with_cp(model, batch, cp_size):
     return avg_loss.item()
 
 
-def main():
-    args = _parse_args()
+def cp_skip_reason(cp_size):
+    """Why this world size cannot run the given CP size, or ``None``."""
+    world_size = dist.get_world_size()
+    if world_size < cp_size:
+        return f"world_size={world_size} < cp_size={cp_size}; need at least {cp_size} GPUs"
+    if world_size % cp_size != 0:
+        return f"world_size={world_size} is not divisible by cp_size={cp_size}"
+    return None
+
+
+def run_cp_comparison(target_cp, seq_len=128, seed=42, vocab_size=1024):
+    """Run the CP=1 baseline and the CP=``target_cp`` trial on the same weights.
+
+    Returns ``(loss_cp1, loss_cpN)``.  Leaves ``torch.distributed``
+    initialised (the caller owns the process group) but re-initialises the
+    Megatron model-parallel groups twice, once per phase.
+    """
     local_rank = _init_distributed()
     device = torch.device(f"cuda:{local_rank}")
     world_size = dist.get_world_size()
     rank = dist.get_rank()
 
-    target_cp = args.cp_size
-    if world_size < target_cp:
-        if rank == 0:
-            print(
-                f"SKIP: world_size={world_size} < cp_size={target_cp}. "
-                f"Need at least {target_cp} GPUs.",
-                flush=True,
-            )
-        dist.destroy_process_group()
-        sys.exit(0)
-    if world_size % target_cp != 0:
-        if rank == 0:
-            print(
-                f"SKIP: world_size={world_size} is not divisible by cp_size={target_cp}.",
-                flush=True,
-            )
-        dist.destroy_process_group()
-        sys.exit(0)
-
-    vocab_size = 1024
-
     # Ensure seq_len is divisible by 2 * target_cp
-    seq_len = args.seq_len
     align = 2 * target_cp
     if seq_len % align != 0:
         seq_len = ((seq_len + align - 1) // align) * align
@@ -242,12 +246,12 @@ def main():
     _init_megatron_parallel(cp_size=1)
 
     # Set deterministic seed for model init
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     model_cp1, _ = _build_tiny_model(cp_size=1, device=device)
 
     batch = _make_deterministic_batch(
-        seed=args.seed + 1, batch_size=1, seq_len=seq_len,
+        seed=seed + 1, batch_size=1, seq_len=seq_len,
         vocab_size=vocab_size, device=device,
     )
 
@@ -267,8 +271,8 @@ def main():
 
     _init_megatron_parallel(cp_size=target_cp)
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     model_cpN, _ = _build_tiny_model(cp_size=target_cp, device=device)
 
     # Load the same weights to ensure identical model
@@ -282,6 +286,56 @@ def main():
 
     del model_cpN
     torch.cuda.empty_cache()
+
+    return loss_cp1, loss_cpN
+
+
+# ===================================================================
+# pytest entry points
+# ===================================================================
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_model_parallel():
+    """Leave the model-parallel groups torn down for the next test module."""
+    yield
+    from megatron.core import parallel_state as ps
+
+    ps.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_cp_matches_cp1_baseline(cp_size):
+    """CP>1 must reproduce the CP=1 loss on identical weights and data."""
+    _init_distributed()
+    reason = cp_skip_reason(cp_size)
+    if reason is not None:
+        pytest.skip(reason)
+
+    loss_cp1, loss_cpN = run_cp_comparison(cp_size)
+
+    atol, rtol = DEFAULT_ATOL, DEFAULT_RTOL
+    diff = abs(loss_cpN - loss_cp1)
+    assert diff <= atol + rtol * abs(loss_cp1), (
+        f"CP={cp_size} loss {loss_cpN:.6f} differs from CP=1 loss {loss_cp1:.6f} "
+        f"(abs diff {diff:.3e}, atol={atol}, rtol={rtol})"
+    )
+
+
+def main():
+    args = _parse_args()
+    _init_distributed()
+    rank = dist.get_rank()
+
+    target_cp = args.cp_size
+    reason = cp_skip_reason(target_cp)
+    if reason is not None:
+        if rank == 0:
+            print(f"SKIP: {reason}.", flush=True)
+        dist.destroy_process_group()
+        sys.exit(0)
+
+    loss_cp1, loss_cpN = run_cp_comparison(target_cp, seq_len=args.seq_len, seed=args.seed)
 
     # --- Step 3: Compare ---
     if rank == 0:
