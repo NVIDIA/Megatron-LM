@@ -14,7 +14,7 @@ from typing import Any, Optional
 import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
-from megatron.core.inference.disaggregation.mamba_reshard import MambaShardLayout
+from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout
 
 KVTransportBackend = Any
 
@@ -40,7 +40,7 @@ class BufferGeometry:
 
     Each (outer, block) pair is one contiguous slice; the outer stride skips
     over the full block pool for that outer index. ``layout`` is the canonical
-    KV shard layout when the buffer is a KV cache; Mamba pools carry their
+    KV shard layout when the buffer is a KV cache; SSM pools carry their
     typed layout separately.
     """
 
@@ -75,8 +75,8 @@ def compute_buffer_geometry(
     num_layers_global: Optional[int] = None,
     layer_start: Optional[int] = None,
     layer_end: Optional[int] = None,
-    mamba_layout: Optional[MambaShardLayout] = None,
-    mamba_state_kind: Optional[str] = None,
+    ssm_layout: Optional[SSMShardLayout] = None,
+    ssm_state_kind: Optional[str] = None,
 ) -> BufferGeometry:
     """Locate the blocks axis, derive the slice strides, and validate the
     canonical KV layout when the full geometry is provided.
@@ -84,10 +84,10 @@ def compute_buffer_geometry(
     Shared by every transfer backend so they agree on addressing and on the
     exported metadata schema. The inference KV layout is [2, L, B, T, H, d].
     """
-    if (mamba_layout is None) != (mamba_state_kind is None):
-        raise ValueError("mamba_layout and mamba_state_kind must be provided together")
-    if mamba_state_kind not in (None, "conv", "ssm"):
-        raise ValueError("mamba_state_kind must be 'conv' or 'ssm'")
+    if (ssm_layout is None) != (ssm_state_kind is None):
+        raise ValueError("ssm_layout and ssm_state_kind must be provided together")
+    if ssm_state_kind not in (None, "conv", "recurrent"):
+        raise ValueError("ssm_state_kind must be 'conv' or 'recurrent'")
 
     layout_capable = (
         None
@@ -158,8 +158,8 @@ def compute_buffer_geometry(
                 f"num_outer={num_outer} is not divisible by local layers="
                 f"{layout.local_num_layers()}"
             )
-    if layout is not None and mamba_layout is not None:
-        raise ValueError("a transfer backend cannot have both KV and Mamba layouts")
+    if layout is not None and ssm_layout is not None:
+        raise ValueError("a transfer backend cannot have both KV and SSM layouts")
 
     return BufferGeometry(
         buf_ptr=memory_buffer.data_ptr(),
@@ -177,7 +177,7 @@ def compute_buffer_geometry(
     )
 
 
-def export_geometry_meta(geometry: BufferGeometry, mamba_layout=None) -> dict:
+def export_geometry_meta(geometry: BufferGeometry, ssm_layout=None) -> dict:
     """The wire schema shared by every backend's export_meta."""
     meta = {
         "base_addr": geometry.buf_ptr,
@@ -207,6 +207,6 @@ def export_geometry_meta(geometry: BufferGeometry, mamba_layout=None) -> dict:
                 "layer_end": layer_end,
             }
         )
-    if mamba_layout is not None:
-        meta["mamba_layout"] = asdict(mamba_layout)
+    if ssm_layout is not None:
+        meta["ssm_layout"] = asdict(ssm_layout)
     return meta

@@ -22,10 +22,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
-from megatron.core.inference.disaggregation.mamba_reshard import (
-    MambaShardLayout,
-    plan_mamba_reshard,
-)
+from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, plan_ssm_reshard
 from megatron.core.inference.disaggregation.transfer_backends.base import compute_buffer_geometry
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
@@ -93,7 +90,7 @@ class NixlPullHandle:
 
     def wait(self) -> None:
         """Block until the transfer completes; NIXL has no blocking wait, so
-        this polls."""
+        poll with a short sleep to avoid monopolizing a CPU core."""
         while not self.poll():
             time.sleep(_POLL_INTERVAL_S)
 
@@ -125,8 +122,8 @@ class NixlTransferBackend:
         num_layers_global: Optional[int] = None,
         layer_start: Optional[int] = None,
         layer_end: Optional[int] = None,
-        mamba_layout: Optional[MambaShardLayout] = None,
-        mamba_state_kind: Optional[str] = None,
+        ssm_layout: Optional[SSMShardLayout] = None,
+        ssm_state_kind: Optional[str] = None,
     ):
         if not _HAVE_NIXL:
             raise RuntimeError(
@@ -154,8 +151,8 @@ class NixlTransferBackend:
             num_layers_global=num_layers_global,
             layer_start=layer_start,
             layer_end=layer_end,
-            mamba_layout=mamba_layout,
-            mamba_state_kind=mamba_state_kind,
+            ssm_layout=ssm_layout,
+            ssm_state_kind=ssm_state_kind,
         )
         self._geometry = geometry
         shape = list(memory_buffer.shape)
@@ -171,8 +168,8 @@ class NixlTransferBackend:
         self._head_dim = geometry.head_dim
         self._tokens_per_block = geometry.tokens_per_block
         self._layout = geometry.layout
-        self._mamba_layout = mamba_layout
-        self._mamba_state_kind = mamba_state_kind
+        self._ssm_layout = ssm_layout
+        self._ssm_state_kind = ssm_state_kind
 
         # Configure UCX before agent construction. Avoid TCP for VRAM addresses;
         # operators may override this by setting UCX_TLS before launch.
@@ -240,8 +237,8 @@ class NixlTransferBackend:
                     "layer_end": layer_end,
                 }
             )
-        if self._mamba_layout is not None:
-            meta["mamba_layout"] = asdict(self._mamba_layout)
+        if self._ssm_layout is not None:
+            meta["ssm_layout"] = asdict(self._ssm_layout)
         return meta
 
     def _ensure_peer_registered(self, peer_meta: Dict[str, Any]) -> str:
@@ -354,28 +351,28 @@ class NixlTransferBackend:
         contexts: List[str] = []
         submitted_at = time.perf_counter()
         try:
-            if self._mamba_layout is not None:
-                state_kind = self._mamba_state_kind
+            if self._ssm_layout is not None:
+                state_kind = self._ssm_state_kind
                 assert state_kind is not None
                 width = (
-                    self._mamba_layout.conv_dim_local
+                    self._ssm_layout.conv_dim_local
                     if state_kind == "conv"
-                    else self._mamba_layout.nheads_local
+                    else self._ssm_layout.nheads_local
                 )
                 if (
                     self._heads_per_partition != width
-                    or self._num_outer != self._mamba_layout.num_layers
+                    or self._num_outer != self._ssm_layout.num_layers
                     or self._blocks_axis != 1
                 ):
-                    raise ValueError(f"local {state_kind} geometry does not match its Mamba layout")
+                    raise ValueError(f"local {state_kind} geometry does not match its SSM layout")
 
                 sources = []
                 peers_by_rank = {}
                 for meta, blocks in transfer_peer_records(peer_meta, src_block_ids):
-                    raw_layout = meta.get("mamba_layout")
+                    raw_layout = meta.get("ssm_layout")
                     if not isinstance(raw_layout, dict):
-                        raise ValueError("peer metadata is missing mamba_layout")
-                    layout = MambaShardLayout(**raw_layout)
+                        raise ValueError("peer metadata is missing ssm_layout")
+                    layout = SSMShardLayout(**raw_layout)
                     self._validate_peer(meta, blocks, dst_block_ids)
                     peer_width = (
                         layout.conv_dim_local if state_kind == "conv" else layout.nheads_local
@@ -386,36 +383,33 @@ class NixlTransferBackend:
                         or int(meta["blocks_axis"]) != 1
                     ):
                         raise ValueError(
-                            f"peer {state_kind} geometry does not match its Mamba layout"
+                            f"peer {state_kind} geometry does not match its SSM layout"
                         )
                     if layout.global_rank in peers_by_rank:
                         raise ValueError(
-                            f"duplicate source global_rank={layout.global_rank} "
-                            "in Mamba metadata"
+                            f"duplicate source global_rank={layout.global_rank} " "in SSM metadata"
                         )
                     sources.append(layout)
                     peers_by_rank[layout.global_rank] = (meta, blocks)
                 if not sources:
-                    raise ValueError("Mamba handoff contains no source peer metadata")
+                    raise ValueError("SSM handoff contains no source peer metadata")
 
                 transfers = [
                     transfer
-                    for transfer in plan_mamba_reshard(sources, [self._mamba_layout])
+                    for transfer in plan_ssm_reshard(sources, [self._ssm_layout])
                     if transfer.is_conv == (state_kind == "conv")
                 ]
-                for layer in range(self._mamba_layout.num_layers):
+                for layer in range(self._ssm_layout.num_layers):
                     intervals = sorted(
                         (transfer.dst_lo, transfer.dst_hi)
                         for transfer in transfers
                         if transfer.dst_layer == layer
                     )
                     if not intervals or intervals[0][0] != 0 or intervals[-1][1] != width:
-                        raise ValueError(
-                            f"incomplete Mamba {state_kind} coverage for layer {layer}"
-                        )
+                        raise ValueError(f"incomplete SSM {state_kind} coverage for layer {layer}")
                     if any(a[1] != b[0] for a, b in zip(intervals, intervals[1:])):
                         raise ValueError(
-                            f"non-contiguous Mamba {state_kind} coverage for layer {layer}"
+                            f"non-contiguous SSM {state_kind} coverage for layer {layer}"
                         )
 
                 for transfer in transfers:

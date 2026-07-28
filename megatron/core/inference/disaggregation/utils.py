@@ -14,7 +14,7 @@ def intersect(a: Tuple[int, int], b: Tuple[int, int]) -> Optional[Tuple[int, int
 
 
 def transfers_for_src(plan, src_rank):
-    """Transfers in ``plan`` originating from ``src_rank`` (any KV/Mamba
+    """Transfers in ``plan`` originating from ``src_rank`` (any KV/SSM
     reshard transfer -- both expose a ``src_rank`` field)."""
     return [t for t in plan if t.src_rank == src_rank]
 

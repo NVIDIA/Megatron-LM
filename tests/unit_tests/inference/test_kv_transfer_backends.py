@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import pytest
 import torch
 
+from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, SSMStateDims
 from megatron.core.inference.disaggregation.transfer_backends import base
 
 
@@ -14,6 +16,40 @@ def test_backend_registry_selects_by_explicit_name():
         assert "expected 'nixl'" in str(exc)
     else:
         raise AssertionError("unsupported backend should raise")
+
+
+def test_ssm_geometry_uses_conv_and_recurrent_state_names():
+    layout = SSMShardLayout(
+        global_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        layer_start=0,
+        num_layers=1,
+        dims=SSMStateDims(nheads=2, headdim=4, d_state=5, ngroups=1, d_conv=3),
+    )
+    memory_buffer = torch.zeros(1, 3, 2, 4, 5)
+    geometry = base.compute_buffer_geometry(
+        memory_buffer,
+        expected_num_blocks=3,
+        backend_name="test",
+        heads_per_partition=2,
+        ssm_layout=layout,
+        ssm_state_kind="recurrent",
+    )
+
+    metadata = base.export_geometry_meta(geometry, layout)
+    assert metadata["ssm_layout"]["dims"]["nheads"] == 2
+    assert "mamba_layout" not in metadata
+
+    with pytest.raises(ValueError, match="'conv' or 'recurrent'"):
+        base.compute_buffer_geometry(
+            memory_buffer,
+            expected_num_blocks=3,
+            backend_name="test",
+            heads_per_partition=2,
+            ssm_layout=layout,
+            ssm_state_kind="ssm",
+        )
 
 
 def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):

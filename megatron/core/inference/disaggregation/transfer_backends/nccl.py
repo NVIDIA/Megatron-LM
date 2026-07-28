@@ -20,10 +20,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
-from megatron.core.inference.disaggregation.mamba_reshard import (
-    MambaShardLayout,
-    plan_mamba_reshard,
-)
+from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, plan_ssm_reshard
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     compute_buffer_geometry,
     export_geometry_meta,
@@ -124,8 +121,8 @@ class NcclTransferBackend:
         num_layers_global: Optional[int] = None,
         layer_start: Optional[int] = None,
         layer_end: Optional[int] = None,
-        mamba_layout: Optional[MambaShardLayout] = None,
-        mamba_state_kind: Optional[str] = None,
+        ssm_layout: Optional[SSMShardLayout] = None,
+        ssm_state_kind: Optional[str] = None,
     ):
         if not (dist.is_available() and dist.is_initialized()):
             raise RuntimeError(
@@ -150,13 +147,13 @@ class NcclTransferBackend:
             num_layers_global=num_layers_global,
             layer_start=layer_start,
             layer_end=layer_end,
-            mamba_layout=mamba_layout,
-            mamba_state_kind=mamba_state_kind,
+            ssm_layout=ssm_layout,
+            ssm_state_kind=ssm_state_kind,
         )
         self._geometry = geometry
         self._layout = geometry.layout
-        self._mamba_layout = mamba_layout
-        self._mamba_state_kind = mamba_state_kind
+        self._ssm_layout = ssm_layout
+        self._ssm_state_kind = ssm_state_kind
         logger.info(
             "NcclTransferBackend[%s] over %d-block buffer (rank=%d, shape=%s)",
             agent_name,
@@ -167,7 +164,7 @@ class NcclTransferBackend:
 
     def export_meta(self) -> Dict[str, Any]:
         """The shared geometry schema plus this rank's NCCL address."""
-        meta = export_geometry_meta(self._geometry, self._mamba_layout)
+        meta = export_geometry_meta(self._geometry, self._ssm_layout)
         meta["transport"] = "nccl"
         meta["nccl_rank"] = dist.get_rank()
         return meta
@@ -199,20 +196,20 @@ class NcclTransferBackend:
                 heads = transfer.dst_head_slice(self._layout)
             yield meta, layers, heads
 
-    def _mamba_transfers(self, peer_records, mine_is_src: bool):
-        """Yield (peer_meta, lo, hi) band slices of this rank's Mamba state,
+    def _ssm_transfers(self, peer_records, mine_is_src: bool):
+        """Yield (peer_meta, lo, hi) band slices of this rank's SSM state,
         in deterministic plan order."""
         for meta, _ in peer_records:
-            raw_layout = meta.get("mamba_layout")
+            raw_layout = meta.get("ssm_layout")
             if not isinstance(raw_layout, dict):
-                raise ValueError("peer metadata is missing mamba_layout")
-            peer_layout = MambaShardLayout(**raw_layout)
+                raise ValueError("peer metadata is missing ssm_layout")
+            peer_layout = SSMShardLayout(**raw_layout)
             if mine_is_src:
-                plan = plan_mamba_reshard([self._mamba_layout], [peer_layout])
+                plan = plan_ssm_reshard([self._ssm_layout], [peer_layout])
             else:
-                plan = plan_mamba_reshard([peer_layout], [self._mamba_layout])
+                plan = plan_ssm_reshard([peer_layout], [self._ssm_layout])
             for t in plan:
-                if t.is_conv != (self._mamba_state_kind == "conv"):
+                if t.is_conv != (self._ssm_state_kind == "conv"):
                     continue
                 if mine_is_src:
                     yield meta, t.src_layer, t.src_lo, t.src_hi
@@ -229,7 +226,7 @@ class NcclTransferBackend:
         self, peer_meta: Any, src_block_ids: List[int], dst_block_ids: List[int]
     ) -> NcclTransferHandle:
         """Post the receives matching the prefill's sends; the handle scatters
-        into the destination blocks (or Mamba slots) on completion."""
+        into the destination blocks (or SSM slots) on completion."""
         if not dst_block_ids:
             return NcclTransferHandle([], [], [])
         records = transfer_peer_records(peer_meta, src_block_ids)
@@ -240,8 +237,8 @@ class NcclTransferBackend:
         device = self._memory_buffer.device
         dtype = self._memory_buffer.dtype
 
-        if self._mamba_layout is not None:
-            for meta, layer, lo, hi in self._mamba_transfers(records, mine_is_src=False):
+        if self._ssm_layout is not None:
+            for meta, layer, lo, hi in self._ssm_transfers(records, mine_is_src=False):
                 for slot in dst_block_ids:
                     view = self._memory_buffer[layer, int(slot), lo:hi]
                     buf = torch.empty(view.shape, dtype=dtype, device=device)
@@ -269,7 +266,7 @@ class NcclTransferBackend:
     # --- prefill side ----------------------------------------------------------
     def begin_push_blocks(self, peer_meta: Any, src_block_ids: List[int]) -> NcclTransferHandle:
         """Post the sends matching the decode's receives, straight out of the
-        pinned source blocks (or Mamba slots). `peer_meta` is the decode
+        pinned source blocks (or SSM slots). `peer_meta` is the decode
         instance's per-rank metadata in the same nested shape as a hand-off's
         kv_meta."""
         if not src_block_ids:
@@ -279,8 +276,8 @@ class NcclTransferBackend:
         ops: List[Any] = []
         keep: List[torch.Tensor] = []
 
-        if self._mamba_layout is not None:
-            for meta, layer, lo, hi in self._mamba_transfers(records, mine_is_src=True):
+        if self._ssm_layout is not None:
+            for meta, layer, lo, hi in self._ssm_transfers(records, mine_is_src=True):
                 for slot in src_block_ids:
                     sub = self._memory_buffer[layer, int(slot), lo:hi].contiguous()
                     keep.append(sub)
