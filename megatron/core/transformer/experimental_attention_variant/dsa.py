@@ -1686,6 +1686,7 @@ class DSAttention(MegatronModule):
     requires_dsa_inputs = True
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
     _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
+    _LAYOUT_HOLDER_ATTR = "_dsa_packed_cp_layout_holder"
 
     def __init__(
         self,
@@ -1770,6 +1771,45 @@ class DSAttention(MegatronModule):
             holder = {}
             setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
         return holder
+
+    def _get_packed_cp_layout_cache(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ) -> Optional[dict]:
+        """Return the per-microbatch memo for packed-CP layout metadata, or None.
+
+        The CP query positions and key reorder indices depend only on
+        ``cu_seqlens_q``/``cu_seqlens_kv``, ``cp_size``, ``cp_rank`` and the
+        requested output sizes. All of those are identical for every layer in a
+        microbatch, yet each layer rebuilds them, and each rebuild loops
+        ``cp_size`` times over :func:`build_packed_allgather_cp_local_positions`,
+        whose boolean-mask indexing has data-dependent output shapes and so
+        forces a device-to-host size readback.
+
+        ``PackedSeqParams`` is the only carrier used here. It is constructed per
+        microbatch, so a memo hung on it cannot outlive the layout it describes
+        -- which matters under dynamic CP, where the layout changes between
+        microbatches. The index-share top-k holders fall back to
+        ``attention_mask``/``self.config``, but that is only safe because every
+        computing layer overwrites its slot before any sharing layer reads it. A
+        layout memo has no such write-before-read ordering and ``self.config``
+        outlives the microbatch, so caching there could serve a stale layout.
+        """
+        if packed_seq_params is None:
+            return None
+        cache = getattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, None)
+        if cache is None:
+            cache = {}
+            setattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, cache)
+        return cache
+
+    @staticmethod
+    def _memoized(cache: Optional[dict], key: tuple, build):
+        """Return ``cache[key]``, building it on first use. No-op when cache is None."""
+        if cache is None:
+            return build()
+        if key not in cache:
+            cache[key] = build()
+        return cache[key]
 
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
@@ -1871,6 +1911,9 @@ class DSAttention(MegatronModule):
         nonpacked_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
+        # Layout metadata is identical for every layer in a microbatch; memoize it on
+        # the per-microbatch PackedSeqParams so only the first DSA layer pays for it.
+        layout_cache = self._get_packed_cp_layout_cache(packed_seq_params)
         if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
             # Whether the pack holds one sequence is a fact about the pack, not about
@@ -1887,12 +1930,16 @@ class DSAttention(MegatronModule):
                     row_start, row_start + sq, dtype=torch.int64, device=query.device
                 )
             elif sequence_parallel_tp and cp_size > 1:
-                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                    cu_seqlens_q,
-                    cp_size,
-                    cp_rank,
-                    query.device,
-                    output_size=packed_query_output_size,
+                packed_query_positions_full = self._memoized(
+                    layout_cache,
+                    ("local_positions", cp_size, cp_rank, packed_query_output_size),
+                    lambda: dsa_layout.build_packed_allgather_cp_local_positions(
+                        cu_seqlens_q,
+                        cp_size,
+                        cp_rank,
+                        query.device,
+                        output_size=packed_query_output_size,
+                    ),
                 )
                 if sequence_parallel_query_is_local:
                     row_start = sequence_parallel_tp_row_start
@@ -1912,8 +1959,19 @@ class DSAttention(MegatronModule):
                     and isinstance(packed_seq_params.max_seqlen_kv, int)
                     and packed_seq_params.max_seqlen_kv == packed_global_output_size
                 )
-                packed_query_positions, kv_reorder_idx = (
-                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                packed_query_positions, kv_reorder_idx = self._memoized(
+                    layout_cache,
+                    (
+                        "positions_and_reorder",
+                        cp_size,
+                        cp_rank,
+                        packed_query_output_size,
+                        packed_query_output_size,
+                        packed_global_output_size,
+                        query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output,
+                    ),
+                    lambda: dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_kv=cu_seqlens_kv,
                         cp_size=cp_size,
@@ -1924,7 +1982,7 @@ class DSAttention(MegatronModule):
                         global_output_size=packed_global_output_size,
                         query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
                         key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-                    )
+                    ),
                 )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
@@ -1967,15 +2025,32 @@ class DSAttention(MegatronModule):
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
                 if packed_thd:
-                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=local_len,
-                        key_local_output_size=local_len,
-                        global_output_size=local_len * cp_size,
+                    # Same memo key shape as the branch above, so when the output sizes
+                    # coincide this reuses that result instead of rerunning the cp_size loop.
+                    _, idx = self._memoized(
+                        layout_cache,
+                        (
+                            "positions_and_reorder",
+                            cp_size,
+                            cp_rank,
+                            local_len,
+                            local_len,
+                            local_len * cp_size,
+                            False,
+                            False,
+                        ),
+                        lambda: (
+                            dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_kv=cu_seqlens_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                            )
+                        ),
                     )
                     return idx
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
