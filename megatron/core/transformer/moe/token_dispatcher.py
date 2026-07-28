@@ -1000,15 +1000,38 @@ class _DispatchManager(ABC):
     can be the number of local experts, or the size of sub_group.
     """
 
-    def reset_transient_forward_state(self) -> None:
-        """Release the transient per-forward routing metadata (token probs/indices).
+    # Per-forward routing metadata cached on the manager that is (a) reassigned
+    # unconditionally by setup_metadata / dispatch / get_permuted_hidden_states_by_experts
+    # on the next forward, and (b) not needed by the backward autograd graph (the
+    # combine kernels save what they need via save_for_backward, which is why
+    # ``combine`` already nulls handle / dispatched_* itself). Names cover all flex
+    # backends; getattr-guarded so each manager only clears what it actually holds:
+    #   - all backends: token_probs, token_indices, tokens_per_expert
+    #   - HybridEP:     routing_map, dispatched_probs
+    #   - DeepEP / v2:  dispatched_indices, dispatched_probs, dispatched_routing_map,
+    #                   reversed_mapping_for_combine, pad_offsets
+    _TRANSIENT_FORWARD_ATTRS = (
+        "token_probs",
+        "token_indices",
+        "tokens_per_expert",
+        "routing_map",
+        "dispatched_probs",
+        "dispatched_indices",
+        "dispatched_routing_map",
+        "reversed_mapping_for_combine",
+        "pad_offsets",
+    )
 
-        ``setup_metadata`` reassigns these unconditionally, so the backward-time
-        recompute (which re-runs setup_metadata + dispatch) repopulates them before
-        combine; clearing them after the initial forward is correctness-neutral and
-        only frees the across-gap metadata. Larger dispatch buffers/handles are
-        already nulled inside ``combine``."""
-        for attr in ("token_probs", "token_indices"):
+    def reset_transient_forward_state(self) -> None:
+        """Release the transient per-forward routing metadata cached on the manager.
+
+        Used by the EP A2A overlap VPP-stage full recompute path: the backward-time
+        recompute re-runs setup_metadata / dispatch / get_permuted, which repopulate
+        all of this before combine, and the backward reads autograd-saved tensors
+        rather than these attributes. Clearing them after the initial forward is
+        therefore correctness-neutral and only frees the metadata retained across the
+        forward->backward gap (persistent comm buffers / bootstrap state are kept)."""
+        for attr in self._TRANSIENT_FORWARD_ATTRS:
             if getattr(self, attr, None) is not None:
                 setattr(self, attr, None)
 
