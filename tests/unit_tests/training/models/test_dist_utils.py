@@ -500,6 +500,54 @@ class TestDdpWrap:
         assert isinstance(result, list)
         assert len(result) == 2
 
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
+    def test_uses_full_iteration_capture_stream_for_ddp_initialization(
+        self, mock_shared_stream, mock_current_stream, mock_stream_context, mock_config, mock_ddp
+    ):
+        mock_stream_context.return_value.__enter__ = Mock(return_value=None)
+        mock_stream_context.return_value.__exit__ = Mock(return_value=False)
+        shared_stream = mock_shared_stream.return_value
+        mock_config.return_value.cuda_graph_impl = "full_iteration"
+
+        _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
+
+        shared_stream.wait_stream.assert_called_once_with(mock_current_stream.return_value)
+        mock_stream_context.assert_called_once_with(shared_stream)
+        mock_current_stream.return_value.wait_stream.assert_called_once_with(shared_stream)
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["none", "local", "transformer_engine"])
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
+    def test_uses_dedicated_stream_for_other_cuda_graph_implementations(
+        self,
+        mock_shared_stream,
+        mock_stream,
+        mock_current_stream,
+        mock_stream_context,
+        mock_config,
+        mock_ddp,
+        cuda_graph_impl,
+    ):
+        mock_stream_context.return_value.__enter__ = Mock(return_value=None)
+        mock_stream_context.return_value.__exit__ = Mock(return_value=False)
+        mock_config.return_value.cuda_graph_impl = cuda_graph_impl
+        dedicated_stream = mock_stream.return_value
+
+        _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
+
+        mock_shared_stream.assert_not_called()
+        dedicated_stream.wait_stream.assert_called_once_with(mock_current_stream.return_value)
+        mock_stream_context.assert_called_once_with(dedicated_stream)
+        mock_current_stream.return_value.wait_stream.assert_called_once_with(dedicated_stream)
+
     @patch("megatron.training.models.dist_utils.TorchFullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.HAVE_FSDP2", False)
     @patch("megatron.training.models.dist_utils.get_model_config")
