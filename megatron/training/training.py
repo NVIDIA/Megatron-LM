@@ -2057,8 +2057,22 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
-            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
+            # The distributed optimizer shards each bucket over the intra-instance group, which
+            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
+            # same group, otherwise the layout reports more shards than the reduce-scatter uses
+            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
+            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
+            # when there are several instances.
+            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
+            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
+            data_parallel_world_size = get_pg_size(
+                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
+            )
+            expert_data_parallel_world_size = get_pg_size(
+                intra_expt_dp_group
+                if intra_expt_dp_group is not None
+                else getattr(layout_pgs, "expt_dp", None)
+            )
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
