@@ -1184,8 +1184,8 @@ class TestMegatronFSDPE2E:
             model_cfg = gpt_config_from_args(args)
             cfg = pretrain_cfg_container_from_args(args, model_cfg)
 
-            from gpt_builders import gpt_builder
-            from model_provider import model_provider
+            from megatron.training.models.gpt_builders import gpt_builder
+            from megatron.training.models.model_provider import model_provider
 
             pretrain(
                 cfg,

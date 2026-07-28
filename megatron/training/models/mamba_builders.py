@@ -11,5 +11,5 @@ warnings.warn(
     stacklevel=2,
 )
 
-from hybrid_builders import *  # noqa: F401,F403
-from hybrid_builders import hybrid_builder as mamba_builder  # noqa: F401
+from megatron.training.models.hybrid_builders import *  # noqa: F401,F403
+from megatron.training.models.hybrid_builders import hybrid_builder as mamba_builder  # noqa: F401
