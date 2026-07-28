@@ -1200,7 +1200,30 @@ class MambaMixer(MegatronModule):
         )
 
         # Conv step
-        if causal_conv1d_update_triton is None:
+        if self.config.batch_invariant_mode:
+            # Match the causal-conv1d arithmetic used by the training forward.
+            assert (
+                causal_conv1d_update_cuda is not None
+            ), "Batch-invariant Mamba decode requires causal-conv1d"
+            assert seq_len == 1, "Batch-invariant Mamba decode supports one token per request"
+            assert (
+                intermediate_conv_state is None
+            ), "Batch-invariant Mamba decode does not support speculative decoding"
+            assert (
+                batch_indices is not None and batch_indices.dtype == torch.int32
+            ), "Batch-invariant Mamba decode requires int32 dynamic-batching indices"
+
+            xBC_dtype = xBC.dtype
+            xBC = causal_conv1d_update_cuda(
+                xBC.to(conv_state.dtype).squeeze(1),
+                conv_state,
+                rearrange(self.conv1d_weight, "d 1 w -> d w").to(conv_state.dtype),
+                self.conv1d_bias.to(conv_state.dtype),
+                self.activation,
+                conv_state_indices=batch_indices,
+            ).unsqueeze(1)
+            xBC = xBC.to(xBC_dtype)
+        elif causal_conv1d_update_triton is None:
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
             xBC_squeeze = xBC.squeeze(1)
@@ -1216,40 +1239,15 @@ class MambaMixer(MegatronModule):
             # tensors to the conv state dtype for causal_conv1d_update and then cast xBC
             # back to the original dtype
             xBC_dtype = xBC.dtype
-            xBC = xBC.to(conv_state.dtype)
-            weight = rearrange(self.conv1d_weight, "d 1 w -> d w").to(conv_state.dtype)
-            bias = self.conv1d_bias.to(conv_state.dtype)
-            if self.config.batch_invariant_mode:
-                # Match the causal-conv1d arithmetic used by the training forward.
-                assert (
-                    causal_conv1d_update_cuda is not None
-                ), "Batch-invariant Mamba decode requires causal-conv1d"
-                assert seq_len == 1, "Batch-invariant Mamba decode supports one token per request"
-                assert (
-                    intermediate_conv_state is None
-                ), "Batch-invariant Mamba decode does not support speculative decoding"
-                assert (
-                    batch_indices is not None and batch_indices.dtype == torch.int32
-                ), "Batch-invariant Mamba decode requires int32 dynamic-batching indices"
-                xBC = causal_conv1d_update_cuda(
-                    xBC.squeeze(1),
-                    conv_state,
-                    weight,
-                    bias,
-                    self.activation,
-                    conv_state_indices=batch_indices,
-                ).unsqueeze(1)
-            else:
-                xBC = causal_conv1d_update_triton(
-                    xBC,
-                    conv_state,
-                    weight,
-                    bias,
-                    self.activation,
-                    conv_state_indices=batch_indices,
-                    intermediate_conv_states=intermediate_conv_state,
-                )
-            xBC = xBC.to(xBC_dtype)
+            xBC = causal_conv1d_update_triton(
+                xBC.to(conv_state.dtype),
+                conv_state,
+                rearrange(self.conv1d_weight, "d 1 w -> d w").to(conv_state.dtype),
+                self.conv1d_bias.to(conv_state.dtype),
+                self.activation,
+                conv_state_indices=batch_indices,
+                intermediate_conv_states=intermediate_conv_state,
+            ).to(xBC_dtype)
 
         x, B, C = torch.split(
             xBC,

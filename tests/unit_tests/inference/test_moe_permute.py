@@ -53,6 +53,7 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     """Match training's probability placement and BF16 rounding before FC2."""
     from megatron.core.activations import squared_relu
     from megatron.core.inference.moe.activations import padded_squared_relu
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
 
     torch.manual_seed(17)
     rows, hidden, output_size = 37, 1856, 512
@@ -62,7 +63,7 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
 
     unweighted = padded_squared_relu(x, permutation_map, _vt(rows))
-    actual = padded_squared_relu(x, permutation_map, _vt(rows), probs=probs)
+    actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs)
     expected_unweighted = squared_relu(x)
     expected = (squared_relu(x) * probs.unsqueeze(1)).to(torch.bfloat16)
 

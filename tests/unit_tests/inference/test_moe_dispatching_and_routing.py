@@ -464,10 +464,10 @@ class TestNVLSAllGatherVDispatcher:
         The graph path still writes local partials into the symmetric RSV buffer,
         but the combine must not use multimem.ld_reduce in batch-invariant mode.
         """
+        from megatron.core.inference.moe import batch_invariant
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             set_batch_invariant_mode,
         )
-        from megatron.core.transformer.moe import token_dispatcher_inference
 
         if Utils.world_size < 2:
             pytest.skip("Ordered RSV combine requires expert-parallel world_size > 1.")
@@ -503,16 +503,14 @@ class TestNVLSAllGatherVDispatcher:
         static_routing_map = global_routing_map[start:end].contiguous()
 
         ordered_calls = {"value": 0}
-        orig_ordered_reduce_scatter_v = token_dispatcher_inference.ordered_reduce_scatter_v
+        orig_ordered_reduce_scatter_v = batch_invariant.ordered_reduce_scatter_v
 
         def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
             ordered_calls["value"] += 1
             return orig_ordered_reduce_scatter_v(*args, **kwargs)
 
         monkeypatch.setattr(
-            token_dispatcher_inference,
-            "ordered_reduce_scatter_v",
-            _tracked_ordered_reduce_scatter_v,
+            batch_invariant, "ordered_reduce_scatter_v", _tracked_ordered_reduce_scatter_v
         )
 
         with torch.no_grad(), set_batch_invariant_mode(True):
@@ -548,13 +546,13 @@ class TestNVLSAllGatherVDispatcher:
         writes deterministic local partials into the symmetric RSV buffer, then
         token_combine uses explicit rank-order fp32 loads.
         """
+        from megatron.core.inference.moe import batch_invariant
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             HAVE_DEEPGEMM_BF16,
             set_batch_invariant_mode,
         )
-        from megatron.core.transformer.moe import token_dispatcher_inference
         from megatron.core.transformer.moe.token_dispatcher_inference import (
             NVLSAllGatherVDispatcher,
         )
@@ -605,16 +603,14 @@ class TestNVLSAllGatherVDispatcher:
             NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(_tracked_get_rsv_tensor)
         )
         ordered_calls = {"value": 0}
-        orig_ordered_reduce_scatter_v = token_dispatcher_inference.ordered_reduce_scatter_v
+        orig_ordered_reduce_scatter_v = batch_invariant.ordered_reduce_scatter_v
 
         def _tracked_ordered_reduce_scatter_v(*args, **kwargs):
             ordered_calls["value"] += 1
             return orig_ordered_reduce_scatter_v(*args, **kwargs)
 
         monkeypatch.setattr(
-            token_dispatcher_inference,
-            "ordered_reduce_scatter_v",
-            _tracked_ordered_reduce_scatter_v,
+            batch_invariant, "ordered_reduce_scatter_v", _tracked_ordered_reduce_scatter_v
         )
 
         local_tokens = 16

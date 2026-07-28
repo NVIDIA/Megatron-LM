@@ -31,18 +31,14 @@ import torch.distributed as dist
 from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
-    ordered_reduce_scatter_v,
 )
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
-)
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -646,8 +642,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             device=hidden_states.device,
         )
         reduce_scatter_v = (
-            ordered_reduce_scatter_v
-            if is_batch_invariant_mode_enabled()
+            batch_invariant.ordered_reduce_scatter_v
+            if batch_invariant.enabled()
             else multimem_reduce_scatter_v
         )
         reduce_scatter_v(
