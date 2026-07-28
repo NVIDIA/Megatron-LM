@@ -986,8 +986,6 @@ class MambaMixer(MegatronModule):
 
             # Batch-invariant decode replays the partial prefill tail, so keep
             # the cached SSM state at the last complete chunk boundary.
-            boundary_chunk_indices = None
-            has_boundary = None
             if self.config.batch_invariant_mode:
                 prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
                 tail_lens = prefill_lens % self.chunk_size
@@ -1263,7 +1261,12 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
         # SSM step
-        if selective_state_update is None:
+        if self.config.batch_invariant_mode:
+            assert (
+                batch_indices is not None
+            ), "batch_invariant_mode for Mamba decode requires batch_indices from dynamic batching."
+            y = self._get_batch_invariant_decoder().step(x, z, dt, B, C, batch_indices, ssm_state)
+        elif selective_state_update is None:
             # Fallback uses 1D A; the decode cache is pre-expanded for Triton.
             A = -torch.exp(self.A_log.float())
             # TODO(ksanthanam): Consider deprecating this path
@@ -1320,13 +1323,7 @@ class MambaMixer(MegatronModule):
                 y = rearrange(y, "b h p -> b (h p)")
                 if not self.rmsnorm:
                     y = y * self.act(z)  # (B D)
-
             y = y.unsqueeze(1)  # Restore seq dimension
-        elif self.config.batch_invariant_mode:
-            assert (
-                batch_indices is not None
-            ), "batch_invariant_mode for Mamba decode requires batch_indices from dynamic batching."
-            y = self._get_batch_invariant_decoder().step(x, z, dt, B, C, batch_indices, ssm_state)
         else:
             A = self._get_decode_A_neg_exp()
 

@@ -57,7 +57,6 @@ def _chunk_cumsum_fwd_kernel(
     seqlen,
     nheads: tl.constexpr,
     chunk_size: tl.constexpr,
-    HAS_CHUNK_STARTS: tl.constexpr,
     HAS_TARGET_ROWS: tl.constexpr,
     dt_min: tl.constexpr,
     dt_max: tl.constexpr,
@@ -87,7 +86,7 @@ def _chunk_cumsum_fwd_kernel(
             return
 
     chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
-    if HAS_CHUNK_STARTS:
+    if HAS_TARGET_ROWS:
         # Fixed windows need only a start offset.
         chunk_seqlen_end = chunk_seqlen_start + chunk_size
     else:
@@ -341,7 +340,6 @@ def _chunk_cumsum_fwd(
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
-            HAS_CHUNK_STARTS=chunk_starts is not None,
             HAS_TARGET_ROWS=has_target_rows,
             DT_SOFTPLUS=dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,

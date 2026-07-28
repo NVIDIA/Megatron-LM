@@ -1094,7 +1094,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mha_cu_kv_seq_lengths_bytes
             + _mha_block_table_bytes
         )
-        # Mamba section (hybrid models only). Must match MambaMetadata and ContextGPUView.
+        # Mamba section (hybrid models only). Must match the MambaMetadata
+        # shapes (mirrors the layout documented in ContextGPUView).
+        # batch_indices_decode is int32 in batch-invariant mode and int64 otherwise;
+        # all other fields are int32.
         if self.is_hybrid_model:
             self._mamba_decode_indices_dtype = (
                 torch.int32 if self.batch_invariant_mode else torch.int64
@@ -2844,6 +2847,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_map = self.mamba_slot_allocator.hash_to_block_id
         hashes = req.precomputed_block_hashes[start_block:end_block]
         for i in range(len(hashes) - 1, -1, -1):
+            block_count = start_block + i + 1
+            if (
+                self.batch_invariant_mode
+                and (block_count * self.block_size_tokens) % self.mamba_chunk_size
+            ):
+                # Restarting between Mamba chunk boundaries changes the
+                # subsequent reduction grouping. Recompute from the latest
+                # aligned cached state instead.
+                continue
             if hashes[i] in mamba_map:
                 return i + 1
         return 0
@@ -4248,10 +4260,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             log_probs (Tensor): Used to compute top n logprobs later if required.
         """
 
-        # Keep the same log-softmax input dtype as training in batch-invariant mode.
-        logits_squeezed = logits.squeeze(0)
-        if not self.batch_invariant_mode:
-            logits_squeezed = logits_squeezed.float()
+        # Calculate log_probs (sequence_length x vocab_size)
+        logits_squeezed = logits.squeeze(0).float()
         n_active = self.total_request_count - self.paused_request_count
 
         if only_last_token_logits or self.is_decode_only():

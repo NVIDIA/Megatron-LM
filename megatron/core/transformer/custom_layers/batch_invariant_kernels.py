@@ -6,7 +6,6 @@
 import contextlib
 import importlib
 import importlib.util
-import inspect
 import logging
 from collections import namedtuple
 from collections.abc import Callable
@@ -713,8 +712,12 @@ def _te_patch_for_batch_invariant():
     # TEGroupedMLP (forward + dgrad + wgrad) goes through DeepGEMM in bf16.
     _te_patch_general_grouped_gemm()
 
-    # Fused LayerNormLinear and LayerNormMLP call apply_normalization
-    # instead of RMSNorm.forward.
+    # Patch the fused-module normalization entry (`apply_normalization`). TE's
+    # fused LayerNormLinear / LayerNormMLP call this instead of RMSNorm.forward,
+    # so without this patch their internal RMSNorm runs TE's tex kernel, whose
+    # within-row reduction strategy depends on the total row count — i.e. it is
+    # NOT batch-invariant (observed: same rows, different output at 928 vs 2274
+    # rows on GB200, 1 bf16 ulp per layer, amplifying across depth).
     import transformer_engine.pytorch.module._common as te_common
 
     for mod_name, mod in (
@@ -796,68 +799,13 @@ def _te_unpatch_general_grouped_gemm() -> None:
         _TE_GROUPED_GEMM_FUNC_ORIGS.pop(key, None)
 
 
-def _get_original_te_grouped_gemm():
-    for key in (
-        "module.grouped_linear.general_grouped_gemm",
-        "cpp_extensions.general_grouped_gemm",
-        "cpp_extensions.gemm.general_grouped_gemm",
-    ):
-        orig = _TE_GROUPED_GEMM_FUNC_ORIGS.get(key)
-        if orig is not None:
-            return orig
-    return None
-
-
-def _original_te_grouped_gemm_has_quantization_params(orig) -> bool:
-    try:
-        return "quantization_params" in inspect.signature(orig).parameters
-    except (TypeError, ValueError):
-        return False
-
-
-def _call_original_te_grouped_gemm(
-    orig,
-    A,
-    B,
-    out,
-    quantization_params,
-    out_dtype,
-    *,
-    layout,
-    m_splits,
-    gelu,
-    grad,
-    accumulate,
-    bias,
-    use_bias,
-    use_split_accumulator,
-    D_dtype,
-    single_output,
-):
-    kwargs = dict(
-        layout=layout,
-        m_splits=m_splits,
-        gelu=gelu,
-        grad=grad,
-        accumulate=accumulate,
-        bias=bias,
-        use_bias=use_bias,
-        use_split_accumulator=use_split_accumulator,
-        D_dtype=D_dtype,
-        single_output=single_output,
-    )
-    if _original_te_grouped_gemm_has_quantization_params(orig):
-        return orig(A, B, out, quantization_params, out_dtype, **kwargs)
-    return orig(A, B, out, out_dtype, **kwargs)
-
-
 def _is_bf16_grouped_path(A, B, quantization_params, gelu: bool) -> bool:
     """Decide if TE's general_grouped_gemm call can be served by DeepGEMM bf16."""
     if gelu:
         return False
     if not HAVE_DEEPGEMM_BF16:
         return False
-    if not (isinstance(A, list) and isinstance(B, list)):
+    if not isinstance(A, (list, tuple)) or not isinstance(B, (list, tuple)):
         return False
     if len(A) != len(B) or len(A) == 0:
         return False
@@ -891,9 +839,8 @@ def _te_general_grouped_gemm_patched(
     """Batch-invariant replacement for TE general_grouped_gemm.
 
     Dispatches by (layout, single_output, grad) to forward / dgrad / wgrad
-    implementations backed by DeepGEMM. Falls back to TE's original for any
-    case we cannot guarantee batch-invariant: quantized inputs, gelu fusion,
-    non-bf16 dtypes, or unsupported (layout, mode) combinations.
+    implementations backed by DeepGEMM. Unsupported calls fail rather than
+    silently using a kernel that is not guaranteed batch invariant.
     """
     # TE versions differ here:
     #   old: general_grouped_gemm(A, B, out, out_dtype, ...)
@@ -903,29 +850,9 @@ def _te_general_grouped_gemm_patched(
         quantization_params = None
 
     if not _is_bf16_grouped_path(A, B, quantization_params, gelu):
-        orig = _get_original_te_grouped_gemm()
-        if orig is None:
-            raise RuntimeError(
-                "Batch-invariant grouped GEMM patch was invoked but no original "
-                "TE general_grouped_gemm was captured; patching order issue."
-            )
-        return _call_original_te_grouped_gemm(
-            orig,
-            A,
-            B,
-            out,
-            quantization_params,
-            out_dtype,
-            layout=layout,
-            m_splits=m_splits,
-            gelu=gelu,
-            grad=grad,
-            accumulate=accumulate,
-            bias=bias,
-            use_bias=use_bias,
-            use_split_accumulator=use_split_accumulator,
-            D_dtype=D_dtype,
-            single_output=single_output,
+        raise RuntimeError(
+            "Batch-invariant grouped GEMM requires unquantized BF16 tensor sequences "
+            "with GELU fusion disabled."
         )
 
     # Dispatch by TE's call convention.
@@ -939,30 +866,9 @@ def _te_general_grouped_gemm_patched(
         return _batch_invariant_te_grouped_dgrad(A, B, out, m_splits, accumulate)
     if (not single_output) and layout == "NT" and grad:
         return _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
-    # Unknown TE call shape — defer to the original.
-    orig = _get_original_te_grouped_gemm()
-    if orig is None:
-        raise RuntimeError(
-            "Batch-invariant grouped GEMM patch was invoked but no original "
-            "TE general_grouped_gemm was captured; patching order issue."
-        )
-    return _call_original_te_grouped_gemm(
-        orig,
-        A,
-        B,
-        out,
-        quantization_params,
-        out_dtype,
-        layout=layout,
-        m_splits=m_splits,
-        gelu=gelu,
-        grad=grad,
-        accumulate=accumulate,
-        bias=bias,
-        use_bias=use_bias,
-        use_split_accumulator=use_split_accumulator,
-        D_dtype=D_dtype,
-        single_output=single_output,
+    raise RuntimeError(
+        "Unsupported batch-invariant grouped GEMM call: "
+        f"layout={layout!r}, single_output={single_output}, grad={grad}."
     )
 
 

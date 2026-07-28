@@ -4,11 +4,53 @@
 from dataclasses import dataclass
 
 import torch
+import triton
+import triton.language as tl
 
-from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
-    tensor_masked_update,
-)
 from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_decode_rows
+
+
+@triton.jit
+def _masked_update_rows_kernel(
+    states_ptr,
+    indices_ptr,
+    values_ptr,
+    state_row_stride,
+    value_row_stride,
+    ROW_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy contiguous rows, skipping entries whose destination index is -1."""
+    src_row = tl.program_id(0)
+    dst_row = tl.load(indices_ptr + src_row)
+    if dst_row < 0:
+        return
+
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < ROW_SIZE
+    values = tl.load(values_ptr + src_row * value_row_stride + offsets, mask=mask)
+    tl.store(states_ptr + dst_row * state_row_stride + offsets, values, mask=mask)
+
+
+def _masked_update_rows(states: torch.Tensor, indices: torch.Tensor, values: torch.Tensor) -> None:
+    """Copy rows into persistent BIK buffers without touching inactive graph lanes."""
+    assert states.ndim == values.ndim == 2
+    assert states.stride(1) == values.stride(1) == 1
+    assert indices.dtype == torch.int32 and indices.numel() == values.shape[0]
+    row_size = states.shape[1]
+    assert values.shape[1] == row_size
+
+    block_size = min(triton.next_power_of_2(row_size), 1024)
+    grid = (values.shape[0], triton.cdiv(row_size, block_size))
+    _masked_update_rows_kernel[grid](
+        states,
+        indices,
+        values,
+        states.stride(0),
+        values.stride(0),
+        ROW_SIZE=row_size,
+        BLOCK_SIZE=block_size,
+    )
 
 
 @dataclass
@@ -88,12 +130,12 @@ class BatchInvariantDecodeBuffers:
         )
 
         slots = batch_indices[:num_seqs]
-        tensor_masked_update(self.x.flatten(1), slots, x[tail_token_idx].flatten(1))
-        tensor_masked_update(self.z.flatten(1), slots, z[tail_token_idx].flatten(1))
-        tensor_masked_update(self.dt.flatten(1), slots, dt[tail_token_idx].flatten(1))
-        tensor_masked_update(self.B.flatten(1), slots, B[tail_token_idx].flatten(1))
-        tensor_masked_update(self.C.flatten(1), slots, C[tail_token_idx].flatten(1))
-        tensor_masked_update(
+        _masked_update_rows(self.x.flatten(1), slots, x[tail_token_idx].flatten(1))
+        _masked_update_rows(self.z.flatten(1), slots, z[tail_token_idx].flatten(1))
+        _masked_update_rows(self.dt.flatten(1), slots, dt[tail_token_idx].flatten(1))
+        _masked_update_rows(self.B.flatten(1), slots, B[tail_token_idx].flatten(1))
+        _masked_update_rows(self.C.flatten(1), slots, C[tail_token_idx].flatten(1))
+        _masked_update_rows(
             self.num_buffered.unsqueeze(1), slots, tail_lens.to(torch.int32).unsqueeze(1)
         )
 
@@ -139,13 +181,17 @@ def batch_invariant_decode_buffered_scan(
     active = batch_indices >= 0
     safe_slots = batch_indices.clamp_min(0)
     write_pos = buffers.num_buffered[safe_slots].to(torch.long)
-    buffer_rows = torch.where(active, safe_slots * chunk_size + write_pos, -1)
+    buffer_rows = torch.where(active, safe_slots * chunk_size + write_pos, -1).to(torch.int32)
 
-    tensor_masked_update(buffers.x.view(-1, nheads, headdim), buffer_rows, x[:, 0])
-    tensor_masked_update(buffers.z.view(-1, nheads, headdim), buffer_rows, z[:, 0])
-    tensor_masked_update(buffers.dt.view(-1, nheads), buffer_rows, dt[:, 0])
-    tensor_masked_update(buffers.B.view(-1, buffers.B.shape[-2], dstate), buffer_rows, B[:, 0])
-    tensor_masked_update(buffers.C.view(-1, buffers.C.shape[-2], dstate), buffer_rows, C[:, 0])
+    _masked_update_rows(buffers.x.view(-1, nheads * headdim), buffer_rows, x[:, 0].flatten(1))
+    _masked_update_rows(buffers.z.view(-1, nheads * headdim), buffer_rows, z[:, 0].flatten(1))
+    _masked_update_rows(buffers.dt.view(-1, nheads), buffer_rows, dt[:, 0])
+    _masked_update_rows(
+        buffers.B.view(-1, buffers.B.shape[-2] * dstate), buffer_rows, B[:, 0].flatten(1)
+    )
+    _masked_update_rows(
+        buffers.C.view(-1, buffers.C.shape[-2] * dstate), buffer_rows, C[:, 0].flatten(1)
+    )
 
     crossed = active & (write_pos + 1 == chunk_size)
     target_rows.copy_(torch.where(active, write_pos, -1).to(torch.int32))
@@ -175,7 +221,7 @@ def batch_invariant_decode_buffered_scan(
     )
 
     next_write_pos = torch.where(crossed, 0, write_pos + 1).to(torch.int32)
-    tensor_masked_update(
+    _masked_update_rows(
         buffers.num_buffered.unsqueeze(1), batch_indices, next_write_pos.unsqueeze(1)
     )
 

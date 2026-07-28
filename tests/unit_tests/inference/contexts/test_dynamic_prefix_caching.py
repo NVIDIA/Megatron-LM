@@ -70,7 +70,7 @@ class PrefixCachingTestBase:
         DynamicInferenceContext.REQUEST_ROUNDER = rounder
 
         transformer_config = TransformerConfig(
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16 if batch_invariant_mode else torch.float32,
             num_layers=4,
             kv_channels=8,
             num_attention_heads=2,
@@ -83,6 +83,9 @@ class PrefixCachingTestBase:
             flash_attention_version=4 if batch_invariant_mode else None,
             attention_dropout=0.0 if batch_invariant_mode else 0.1,
         )
+        if batch_invariant_mode:
+            max_tokens = 512 if max_tokens is None else max_tokens
+            max_requests = 64 if max_requests is None else max_requests
         inference_config = InferenceConfig(
             max_sequence_length=max_sequence_length,
             buffer_size_gb=buffer_size_gb,
@@ -809,6 +812,20 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx6, self._block_ids(ctx6, 0, 4)[:2])
         req6 = self._req(ctx6, p6.clone(), request_id=2)
         assert ctx6._find_mamba_match_count(req6, 0, len(req6.precomputed_block_hashes)) == 2
+
+        # BIK restores only at Mamba chunk boundaries. A later unaligned
+        # cached state would change the reduction grouping after the restore.
+        ctx_bik = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
+        p_bik = self._prompt(32 * 8)
+        ctx_bik.add_request(self._req(ctx_bik, p_bik.clone()))
+        self._mamba_allocate_and_register(ctx_bik, self._block_ids(ctx_bik, 0, 8)[:5])
+        req_bik = self._req(ctx_bik, p_bik.clone(), request_id=2)
+        assert (
+            ctx_bik._find_mamba_match_count(req_bik, 0, len(req_bik.precomputed_block_hashes)) == 4
+        )
+        *_, prefix_skip, effective_prefill = ctx_bik._compute_prefix_match(req_bik, len(p_bik))
+        assert prefix_skip == 128 and effective_prefill == 128
+
         # no match when no mamba hashes registered
         ctx7 = self._mctx()
         ctx7.add_request(self._req(ctx7, self._prompt(bs * 3)))
@@ -1019,6 +1036,17 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx3.initialize_attention_state()
         ctx3.transfer_bookkeeping_to_gpu()
         assert ctx3.mamba_slot_allocator._eos_cache_block_id_cpu[1].item() >= 0
+
+        # BIK does not spend durable slots on block boundaries that cannot be
+        # restored without changing Mamba's chunk reduction grouping.
+        ctx_bik_unaligned = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
+        ctx_bik_unaligned.add_request(self._req(ctx_bik_unaligned, self._prompt(160).clone()))
+        assert ctx_bik_unaligned.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() < 0
+        assert ctx_bik_unaligned.mamba_slot_allocator._intermediate_offsets_cpu[0, 0].item() == 128
+
+        ctx_bik_aligned = self._mctx(block_size_tokens=32, batch_invariant_mode=True)
+        ctx_bik_aligned.add_request(self._req(ctx_bik_aligned, self._prompt(128).clone()))
+        assert ctx_bik_aligned.mamba_slot_allocator._eos_cache_block_id_cpu[0].item() >= 0
 
         # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()

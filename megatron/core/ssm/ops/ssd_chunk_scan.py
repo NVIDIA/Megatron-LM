@@ -174,7 +174,6 @@ def _chunk_scan_fwd_kernel(
     seq_idx = tl.load(seq_idx_ptr)
     if HAS_TARGET_ROWS:
         # Each fixed window starts from its indexed cached state.
-        seq_idx_prev = -1
         prev_states_ptr = (
             initstates_ptr + seq_idx * stride_init_states_batch + pid_h * stride_init_states_head
         )

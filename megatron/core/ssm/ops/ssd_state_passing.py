@@ -154,10 +154,8 @@ def _state_passing_fwd(
     if not has_dst:
         out_dtype = states.dtype if out_dtype is None else out_dtype
         out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
-        out_strides = out.stride()
     else:
         out = states
-        out_strides = (0, 0, 0)
 
     initial_states_strides = (
         (initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
@@ -189,9 +187,9 @@ def _state_passing_fwd(
             stride_states_chunk=states.stride(0),
             stride_states_head=states.stride(1),
             stride_states_dim=states.stride(2),
-            stride_out_chunk=out_strides[0],
-            stride_out_head=out_strides[1],
-            stride_out_dim=out_strides[2],
+            stride_out_chunk=out.stride(0),
+            stride_out_head=out.stride(1),
+            stride_out_dim=out.stride(2),
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),

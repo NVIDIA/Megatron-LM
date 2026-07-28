@@ -14,7 +14,7 @@ def test_selective_log_softmax_batch_invariant():
 
     B, S, V = 4, 7, 16
     device = torch.device("cuda")
-    logits = torch.randn(B, S, V, dtype=torch.float32, device=device)
+    logits = torch.randn(B, S, V, dtype=torch.bfloat16, device=device)
     labels = torch.randint(low=0, high=V, size=(B, S), device=device)
 
     # Randomly permute the batch dimension; a batch-invariant implementation should
@@ -30,6 +30,7 @@ def test_selective_log_softmax_batch_invariant():
     # Undo the permutation on the permuted outputs and compare elementwise.
     # If the kernel is batch invariant, each example's output should not depend
     # on its position in the batch.
+    assert bik_logps.dtype == torch.float32
     assert torch.equal(bik_logps, bik_logps_perm[perm.argsort()])
 
 
