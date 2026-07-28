@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
@@ -369,7 +370,17 @@ class InferenceConfig:
     """
 
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
-    """Which sampling kernels to use during inference."""
+    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
+    "flashinfer" is requested but the package is not installed."""
+
+    offset_sampling_seed_by_dp_rank: bool = True
+    """
+    If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
+    sampling RNG. This gives each DP rank a unique generation seed so that the same prompt
+    routed to different ranks produces different samples (important for RL training).
+    If False (or `ModelParallelConfig.deterministic_mode` / `--deterministic-mode` is
+    enabled), then all DP ranks share the same sampling / generation seed.
+    """
 
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     """Mode used to schedule dynamic batching inference work."""
@@ -437,8 +448,9 @@ class InferenceConfig:
         if self.sampling_backend == 'flashinfer':
             try:
                 import flashinfer  # noqa: F401
-            except ImportError as e:
-                raise ImportError(
-                    "sampling_backend='flashinfer' requires the flashinfer package; "
-                    "install it or set sampling_backend='torch'."
-                ) from e
+            except ImportError:
+                warnings.warn(
+                    "sampling_backend='flashinfer' was requested but the flashinfer "
+                    "package is not installed; falling back to sampling_backend='torch'."
+                )
+                self.sampling_backend = 'torch'

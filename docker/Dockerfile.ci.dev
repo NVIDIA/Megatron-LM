@@ -7,8 +7,8 @@ ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
-# NCCL 2.30.4 supports CUDA 13.x; NVIDIA publishes its CUDA 13 package as cuda13.2.
-ARG NCCL_VERSION=2.30.4-1+cuda13.2
+# TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
+ARG NCCL_VERSION=2.30.7-1+cuda13.3
 ENV PATH="/root/.local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
@@ -56,7 +56,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
+    # Limit per-package compiler concurrency on ARM.
+    if [ "$(uname -m)" = "aarch64" ]; then
+        export MAX_JOBS=8
+    fi
+    uv sync -v \
+        --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
