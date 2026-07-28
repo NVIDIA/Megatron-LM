@@ -527,12 +527,15 @@ class TestAccumulatorVirtualPipeline:
 
 
 class TestAccumulatorDistributed:
-    """All-reduce + ``TP*CP*PP`` deduplication.
+    """SUM all-reduce scoped to the pure data-parallel group (CP excluded).
 
     Each rank in a DP group sees identical ``cu_seqlens`` (broadcast across model
-    parallelism). The world all-reduce therefore overcounts by ``TP * CP * PP``,
-    which the consume helper divides back out. Run with at least 2 ranks via
-    ``torchrun --nproc_per_node=2``.
+    parallelism), so a sum over the pure-DP group -- ``TP``/``CP``/``PP`` peers
+    excluded -- visits each distinct micro-batch exactly once and yields the
+    global-batch total with no divisor. CP is excluded because CP ranks share the
+    same ``cu_seqlens`` and would double-count. When the DP group holds a single
+    rank the collective is skipped entirely. Run with at least 2 ranks via
+    ``torchrun --nproc_per_node=2``; the mixed TP x DP case needs >= 4.
     """
 
     def setup_method(self):
@@ -549,7 +552,8 @@ class TestAccumulatorDistributed:
 
         if Utils.world_size < 2:
             pytest.skip("requires >= 2 ranks")
-        # Pure DP: TP=CP=PP=1, world = DP. No deduplication, every rank's contribution sums.
+        # Pure DP: TP=CP=PP=1, so the DP group spans the world and every rank's
+        # contribution sums.
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
@@ -564,24 +568,49 @@ class TestAccumulatorDistributed:
         assert total_real_tokens == per_rank_sum * Utils.world_size
         assert seqlen_squared_sum == per_rank_sum_sq * Utils.world_size
 
-    def test_pure_tp_deduplicates(self):
-        """All TP ranks have the same cu_seqlens; deduplication divides the world sum."""
+    def test_mixed_tp_dp_reduces_over_the_dp_group(self):
+        """TP x DP: the sum spans the DP dim only, so TP replicas cannot inflate it.
+
+        Also pins the *scope*: exactly one all-reduce, issued on the pure-DP
+        group. A regression to a world reduce (even with a compensating divisor)
+        or to the CP-inclusive group changes the group identity and fails here.
+        """
+        from megatron.core import mpu
         from tests.unit_tests.test_utilities import Utils
 
-        if Utils.world_size < 2:
-            pytest.skip("requires >= 2 ranks")
+        if Utils.world_size < 4 or Utils.world_size % 2 != 0:
+            pytest.skip("requires an even world size >= 4")
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=Utils.world_size, pipeline_model_parallel_size=1
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
         )
 
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        dp_size = Utils.world_size // 2
+        assert dp_size == dp_group.size()
+
+        # Every rank contributes the same micro-batch; the two TP peers of each
+        # DP rank are duplicates and must be counted once, not twice.
         cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
         update_seqlen_stats_from_cu_seqlens(cu)
 
-        # All TP ranks updated the same value; after world all_reduce we get
-        # TP * (per_rank) and divide by TP -> per_rank.
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
-        assert total_real_tokens == 100 + 200
-        assert seqlen_squared_sum == 100**2 + 200**2
+        original_all_reduce = torch.distributed.all_reduce
+        groups = []
+
+        def spy(tensor, *args, **kwargs):
+            groups.append(kwargs.get('group', args[1] if len(args) > 1 else None))
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        torch.distributed.all_reduce = spy
+        try:
+            total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        finally:
+            torch.distributed.all_reduce = original_all_reduce
+
+        per_rank_sum = 100 + 200
+        per_rank_sum_sq = 100**2 + 200**2
+        assert groups == [dp_group], "consume must reduce exactly once, over the pure-DP group"
+        assert total_real_tokens == per_rank_sum * dp_size
+        assert seqlen_squared_sum == per_rank_sum_sq * dp_size
 
     def test_bshd_path_skips_collective(self):
         """If no rank ever calls ``update_*``, ``consume_*`` must return
@@ -613,14 +642,50 @@ class TestAccumulatorDistributed:
         assert result == (None, None)
         assert calls == [], "consume must not issue all_reduce when no update happened"
 
+    def test_single_rank_dp_group_skips_collective(self):
+        """With a 1-rank DP group the local value is already the global-batch
+        total, so ``consume_*`` must return it *without* any collective. The
+        skip predicate is a global topology property, so every rank agrees and
+        nobody is stranded waiting on a peer's all-reduce."""
+        from megatron.core import mpu
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 2:
+            pytest.skip("requires >= 2 ranks")
+        # TP spans the world -> the pure-DP group has exactly one member.
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=Utils.world_size, pipeline_model_parallel_size=1
+        )
+        assert mpu.get_data_parallel_world_size(with_context_parallel=False) == 1
+
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
+        update_seqlen_stats_from_cu_seqlens(cu)
+
+        original_all_reduce = torch.distributed.all_reduce
+        calls = []
+
+        def spy(tensor, *args, **kwargs):
+            calls.append(tensor)
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        torch.distributed.all_reduce = spy
+        try:
+            total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        finally:
+            torch.distributed.all_reduce = original_all_reduce
+
+        assert calls == [], "consume must not issue all_reduce for a 1-rank DP group"
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
 
 # 8-GPU topology matrix. Each tuple is ``(tp, cp, pp)`` with ``dp = 8 / (tp*cp*pp)``.
 # The matrix covers every model-parallel dim in isolation and the pairwise /
 # three-way combinations that fit in 8 GPUs. This pins the contract that:
 #   - ``cu_seqlens`` is broadcast-replicated across the TP/CP/PP dims (every
 #     rank within one DP group accumulates the same value), and
-#   - ``consume_*`` recovers the global DP-summed value by all-reducing across
-#     the world and dividing by ``TP * CP * PP``.
+#   - ``consume_*`` recovers the global DP-summed value by summing over the
+#     pure-DP group, which visits each distinct micro-batch exactly once.
 _TOPOLOGY_8GPU_PARAMS = [
     # (tp, cp, pp)
     pytest.param(1, 1, 1, id="dp8"),
@@ -641,9 +706,9 @@ class TestAccumulatorTopology:
     see the SAME ``cu_seqlens`` because it is broadcast across the
     model-parallel dimensions; across DP groups the data differs. The test
     simulates that by making every rank's contribution depend ONLY on its DP
-    rank, and asserts the deduplicated global sum matches the closed-form
-    expectation. Catches regressions where any of TP/CP/PP is dropped from the
-    dedup factor.
+    rank, and asserts the global sum matches the closed-form expectation.
+    Catches regressions where the reduction group picks up a replicated dim --
+    folding CP in, for instance, doubles every ``cp2`` row.
 
     Skipped unless launched with ``torchrun --nproc_per_node 8``.
     """
@@ -658,7 +723,7 @@ class TestAccumulatorTopology:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("tp,cp,pp", _TOPOLOGY_8GPU_PARAMS)
-    def test_dedup_across_topology(self, tp, cp, pp):
+    def test_dp_sum_across_topology(self, tp, cp, pp):
         from megatron.core import mpu
         from tests.unit_tests.test_utilities import Utils
 
@@ -678,7 +743,7 @@ class TestAccumulatorTopology:
         # Per-DP-group ``cu_seqlens``: a 2-chunk packed sequence whose lengths
         # depend on ``dp_rank`` so that every DP group contributes a DIFFERENT
         # ``sum(L)`` AND ``sum(L^2)``. Every rank in the same DP group must
-        # produce the same value -- that's what the consume() dedup unwinds.
+        # produce the same value -- the replication consume() must not sum.
         len_a = 100 * (dp_rank + 1)
         len_b = 200 * (dp_rank + 1)
         cu = torch.tensor([0, len_a, len_a + len_b], dtype=torch.int32, device='cuda')

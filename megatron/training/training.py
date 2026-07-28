@@ -365,12 +365,22 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         fuse onto one device tensor and consume issues a single 2-element
         all-reduce.
 
-    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
-    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
+    Sync cost: at most ONE all-reduce of a 2-element ``float64`` tensor and ONE
+    host sync (``tolist()``). Skipped entirely when the flag is ``False`` -- the
+    BSHD path costs zero -- and the collective is skipped when the reduction
+    group holds a single rank.
 
-    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
-    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
-    factor of ``TP * CP * PP``, which we divide out.
+    Reduction scope: the SUM runs over the PURE data-parallel group, context
+    parallelism EXCLUDED (``get_data_parallel_group(with_context_parallel=False)``).
+    Every rank inside one DP group accumulated identical values (``cu_seqlens``
+    is replicated across TP/CP/PP), so a pure-DP sum visits each distinct
+    micro-batch exactly once and is the global-batch total directly -- no
+    divisor. CP must stay excluded: CP ranks split one sequence and share the
+    same ``cu_seqlens``, so folding them in would double-count. GTP-remat peers
+    stay INCLUDED (the getter's default) because they hold distinct
+    micro-batches, matching how ``_dp_world_size`` sizes the BSHD batch this sum
+    replaces. Megatron-Bridge's ``resolve_global_flops_seqlen_stats`` documents
+    the same pure-DP contract.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active
     if not _seqlen_stats_active:
@@ -378,23 +388,22 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
+    # Without distributed / model-parallel state there is a single rank and
+    # nothing to reduce. That is the standalone unit-test path; production
+    # always initializes mpu.
     if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
-        torch.distributed.all_reduce(t)
-        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
-        cp_size = max(mpu.get_context_parallel_world_size(), 1)
-        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
-        dedup = tp_size * cp_size * pp_size
-    else:
-        # No model-parallel state -> treat as a single rank, no reduction.
-        # This is the standalone unit-test path; production always initializes mpu.
-        dedup = 1
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        # The group size is a global topology property, so every rank takes the
+        # same branch -- the skip can never leave a peer waiting in a collective.
+        if dp_group.size() > 1:
+            torch.distributed.all_reduce(t, group=dp_group)
     # Single host sync drains both stats at once.
     total_real_tokens, seqlen_squared_sum = t.tolist()
     # Reset for the next iteration. Keep the tensor allocated so subsequent
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
-    return total_real_tokens / dedup, seqlen_squared_sum / dedup
+    return total_real_tokens, seqlen_squared_sum
 
 
 def num_floating_point_operations(
