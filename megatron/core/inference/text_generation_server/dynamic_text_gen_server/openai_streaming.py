@@ -98,6 +98,28 @@ def _common_prefix(left, right):
     return left[:end]
 
 
+def _safe_argument_prefix(arguments):
+    """Exclude incomplete empty values inserted by tool parsers."""
+    try:
+        parsed_arguments = json.loads(arguments)
+    except (TypeError, ValueError):
+        return arguments
+    if not isinstance(parsed_arguments, dict):
+        return arguments
+
+    prefix_parts = ["{"]
+    for index, (name, value) in enumerate(parsed_arguments.items()):
+        if index:
+            prefix_parts.append(", ")
+        prefix_parts.extend((json.dumps(name, ensure_ascii=False), ": "))
+        if value == "":
+            return "".join(prefix_parts)
+        prefix_parts.append(json.dumps(value, ensure_ascii=False))
+
+    # An empty object may still acquire parameters on a later parse step.
+    return arguments if parsed_arguments else "{"
+
+
 def _safe_content_prefix(content, markers):
     """Hold text that may still become a parser control marker."""
     safe_end = len(content)
@@ -197,34 +219,29 @@ class StreamingChatParser:
             if self._tool_names_sent[index]:
                 previous_arguments = self._previous_arguments[index]
                 call_is_complete = finished or index + 1 < len(tool_calls)
-                # The Qwen parser reports ``{}`` as soon as the function name is
-                # complete, before any <parameter> block has arrived. Treat that
-                # as a placeholder until the call completes; otherwise ``{}``
-                # advances the high-water mark and blocks the real arguments.
-                arguments_are_placeholder = (
-                    not call_is_complete and current_arguments.strip() == "{}"
+                stable_arguments = (
+                    current_arguments
+                    if call_is_complete
+                    else _common_prefix(previous_arguments, current_arguments)
                 )
-                if not arguments_are_placeholder:
-                    stable_arguments = (
-                        current_arguments
-                        if call_is_complete
-                        else _common_prefix(previous_arguments, current_arguments)
-                    )
-                    already_sent = self._streamed_arguments[index]
-                    if stable_arguments.startswith(already_sent):
-                        argument_delta = stable_arguments[len(already_sent) :]
-                        if argument_delta:
-                            deltas.append(
-                                {
-                                    "tool_calls": [
-                                        {
-                                            "index": index,
-                                            "function": {"arguments": argument_delta},
-                                        }
-                                    ]
-                                }
-                            )
-                            self._streamed_arguments[index] += argument_delta
+                if not call_is_complete:
+                    safe_arguments = _safe_argument_prefix(current_arguments)
+                    stable_arguments = stable_arguments[: len(safe_arguments)]
+                already_sent = self._streamed_arguments[index]
+                if stable_arguments.startswith(already_sent):
+                    argument_delta = stable_arguments[len(already_sent) :]
+                    if argument_delta:
+                        deltas.append(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "function": {"arguments": argument_delta},
+                                    }
+                                ]
+                            }
+                        )
+                        self._streamed_arguments[index] += argument_delta
 
             self._previous_arguments[index] = current_arguments
 
