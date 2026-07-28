@@ -5,6 +5,7 @@ import logging
 import os
 import pathlib
 import sys
+import time
 from typing import Optional
 
 import click
@@ -15,11 +16,37 @@ from tests.test_utils.python_scripts import recipe_parser
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_MAX_ATTEMPTS = 3
+_NETWORK_RETRY_BASE_DELAY_SECONDS = 10
+_NETWORK_INTERRUPTION_PATTERNS = (
+    "Connection reset by peer",
+    "Connection aborted.",
+    "Connection refused",
+    "Network is unreachable",
+    "No route to host",
+    "NameResolutionError",
+    "We couldn't connect to 'https://huggingface.co'",
+    "The read operation timed out",
+    "Read timed out",
+    "Connection broken",
+    "Temporary failure in name resolution",
+    "Temporary failure resolving",
+    "Could not resolve host",
+    "TLS handshake timeout",
+    "Client.Timeout exceeded while awaiting headers",
+)
+
+
+def is_network_interruption(logs: str) -> bool:
+    """Return whether logs contain a known transient network failure."""
+
+    return any(pattern in logs for pattern in _NETWORK_INTERRUPTION_PATTERNS)
+
 
 def is_flaky_failure(concat_allranks_logs: str) -> bool:
-    """Assumes that certain keywords hint towards intermittent failures"""
+    """Return whether logs contain a known intermittent failure."""
 
-    return (
+    return is_network_interruption(concat_allranks_logs) or (
         "The server socket has failed to listen on any local network address."
         in concat_allranks_logs
         or "Some NCCL operations have failed or timed out." in concat_allranks_logs
@@ -32,17 +59,10 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
         or "double free or corruption" in concat_allranks_logs
         or "Call to CUDA function failed." in concat_allranks_logs
-        or "Connection reset by peer" in concat_allranks_logs
         or "invalid pointer" in concat_allranks_logs
         or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
         or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
-        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
         or "Unpack failed: incomplete input" in concat_allranks_logs
-        or "The read operation timed out" in concat_allranks_logs
-        or "Read timed out" in concat_allranks_logs
-        or "TimeoutError" in concat_allranks_logs
-        or "Connection broken" in concat_allranks_logs
-        or "Temporary failure in name resolution" in concat_allranks_logs
         or "unspecified launch failure" in concat_allranks_logs
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
@@ -51,6 +71,14 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "is already in progress" in concat_allranks_logs
         or "Error deleting container" in concat_allranks_logs
     )
+
+
+def network_retry_delay_seconds(failed_attempt: int, logs: str) -> int:
+    """Return exponential backoff after a failed network attempt."""
+
+    if failed_attempt >= _MAX_ATTEMPTS or not is_network_interruption(logs):
+        return 0
+    return _NETWORK_RETRY_BASE_DELAY_SECONDS * (2 ** (failed_attempt - 1))
 
 
 def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
@@ -192,7 +220,7 @@ def main(
     )
 
     n_attempts = 0
-    while n_attempts < 3:
+    while n_attempts < _MAX_ATTEMPTS:
         tee_buffer = io.StringIO()
         original_stdout = sys.stdout
         original_stderr = sys.stderr
@@ -238,9 +266,24 @@ def main(
         all_ranks_all_logs.extend(_collect_failure_logs(pathlib.Path(os.getcwd())))
         all_ranks_all_logs_string = "\n".join(all_ranks_all_logs)
         if is_flaky_failure(all_ranks_all_logs_string):
-            logger.warning("Detected flaky failure, attempt restart.")
             n_attempts += 1
-            continue
+            if n_attempts < _MAX_ATTEMPTS:
+                retry_delay = network_retry_delay_seconds(n_attempts, all_ranks_all_logs_string)
+                if retry_delay:
+                    logger.warning(
+                        "Detected network interruption, restarting after %s seconds (attempt %s/%s).",
+                        retry_delay,
+                        n_attempts + 1,
+                        _MAX_ATTEMPTS,
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    logger.warning(
+                        "Detected flaky failure, restarting (attempt %s/%s).",
+                        n_attempts + 1,
+                        _MAX_ATTEMPTS,
+                    )
+                continue
 
         sys.exit(1)
 
