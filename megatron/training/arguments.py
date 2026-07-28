@@ -1080,6 +1080,23 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    # Streaming dequantize is unsafe with tensorwise (current) FP8 scaling.
+    # The streaming planner does a BF16->FP8 ``copy_`` per slice; tensorwise
+    # recomputes the per-tensor scale from each slice's amax, so multi-shard
+    # destinations (e.g. resharded loads) end up with inconsistent scales
+    # across slices and the loaded weights are corrupted. Block-scaled
+    # recipes (mxfp8, blockwise, nvfp4) carry per-block scales and are
+    # unaffected. Force the upfront ``force_all_tensors_to_non_fp8`` path
+    # for tensorwise.
+    if args.fp8 and args.fp8_recipe == "tensorwise" and args.stream_ckpt_dequant:
+        warn_rank_0(
+            "--fp8-recipe=tensorwise is incompatible with the streaming "
+            "checkpoint dequantize path; falling back to the upfront "
+            "dequantize pass. Pass --no-stream-ckpt-dequant to silence "
+            "this warning."
+        )
+        args.stream_ckpt_dequant = False
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -2130,13 +2147,11 @@ def _add_inference_args(parser):
                             '--deterministic-mode also uses the same seed on every DP rank.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='legacy',
-                       choices=['legacy', 'serial', 'overlap'],
+                       choices=['legacy', 'async'],
                        help='Async scheduling mode for dynamic batching. '
                             '"legacy" (default) preserves the existing resolve-before-prepare '
-                            'path. "serial" speculatively prepares and forwards decode-only '
-                            'steps before resolving finished requests. "overlap" uses the same '
-                            'async scheduling path while overlapping prepare/sample and '
-                            'forward/resolve phases.')
+                            'path. "async" overlaps asynchronous scheduling phases by reordering '
+                            'them to prepare-before-resolve.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],

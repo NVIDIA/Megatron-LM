@@ -126,6 +126,7 @@ class DynamicEngineTestConfig:
     fp8: bool = False
     model_provider: str = "gpt"
     return_log_probs: bool = False
+    logprobs_mode: str = "raw_logprobs"
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
@@ -149,6 +150,9 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 0.0
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
@@ -248,6 +252,9 @@ class DynamicInferenceEngineTestBase:
                 ),
                 return_log_probs=test_config.return_log_probs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
+                temperature=test_config.temperature,
+                top_k=test_config.top_k,
+                top_p=test_config.top_p,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
                 # Remove this if statement branch in megatron-core 0.16
@@ -310,6 +317,7 @@ class DynamicInferenceEngineTestBase:
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
                 async_sched_mode=test_config.async_sched_mode,
+                logprobs_mode=test_config.logprobs_mode,
             ),
         )
 
@@ -1104,15 +1112,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    async def test_async_sched_run_engine_accepts_request_during_decode(self):
-        """Verify async decode yields so a new request can enter a running engine."""
+    async def test_async_sched_run_engine_accepts_request_during_overlap(self):
+        """Verify async overlap yields so a new request can enter a running engine."""
         with torch.inference_mode():
             test_config = DynamicEngineTestConfig(
                 num_requests=2,
                 min_prompt_length=4,
                 max_prompt_length=4,
                 num_tokens_to_generate=16,
-                async_sched_mode=AsyncScheduleMode.OVERLAP,
+                async_sched_mode=AsyncScheduleMode.ASYNC,
             )
             env = self._build_test_env(test_config)
             long_request, short_request = env.requests
@@ -1138,6 +1146,330 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             finally:
                 engine_task.cancel()
                 await engine_task
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        ("enable_chunked_prefill", "enable_prefix_caching"),
+        [(True, False), (False, True), (True, True)],
+    )
+    @torch.inference_mode()
+    def test_async_sched_prefix_caching_and_chunked_prefill_e2e(
+        self, enable_chunked_prefill, enable_prefix_caching
+    ):
+        """Async output matches legacy for chunking, KV caching, and their combination."""
+
+        def run(mode):
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,
+                num_tokens_to_generate=4,
+                max_sequence_length=768,
+                context_block_size_tokens=256,
+                context_max_tokens=384 if enable_chunked_prefill else 1024,
+                context_max_requests=4,
+                enable_chunked_prefill=enable_chunked_prefill,
+                enable_prefix_caching=enable_prefix_caching,
+                async_sched_mode=mode,
+            )
+            env = self._build_test_env(test_config)
+            prompt = torch.arange(512, dtype=torch.int64, device="cuda") % (
+                test_config.vocab_size - 1
+            )
+            outputs = {}
+
+            def add_request(request_id):
+                env.engine.add_request(
+                    request_id=request_id,
+                    prompt=prompt.clone(),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=4, termination_id=-1, top_k=1, top_p=0.0
+                    ),
+                )
+
+            add_request(0)
+            env.engine.step_modern()
+            add_request(1)
+            while env.engine.has_unfinished_requests():
+                result = env.engine.step_modern()
+                for record in result["finished_request_records"]:
+                    request = record.merge()
+                    outputs[request.request_id] = list(request.generated_tokens)
+            return env.engine, outputs
+
+        _, legacy_outputs = run(AsyncScheduleMode.LEGACY)
+        async_engine, async_outputs = run(AsyncScheduleMode.ASYNC)
+
+        assert async_outputs == legacy_outputs
+        assert all(len(tokens) == 4 for tokens in async_outputs.values())
+        assert async_engine.context.async_sched_step_count > 0
+        if enable_prefix_caching:
+            assert async_engine._prefill_tokens_skipped > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "feature_config, sampling_backend, temperature, top_k, top_p, num_cuda_graphs",
+        [
+            pytest.param({}, "torch", 0.8, 10, 0.0, None, id="torch-eager-top-k"),
+            pytest.param({}, "torch", 1.0, 0, 0.9, 2, id="torch-graphed-forward-top-p"),
+            pytest.param({}, "flashinfer", 1.2, 0, 0.0, None, id="flashinfer-eager-unfiltered"),
+            pytest.param({}, "flashinfer", 0.8, 10, 0.9, 2, id="flashinfer-graphed-forward"),
+            pytest.param(
+                {
+                    "model_provider": "hybrid",
+                    "num_speculative_tokens": 1,
+                    "num_requests": 2,
+                    "num_tokens_to_generate": 4,
+                },
+                "torch",
+                0.8,
+                8,
+                0.0,
+                None,
+                id="mamba-mtp-top-k",
+            ),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_sched_sampling_matches_legacy(
+        self, feature_config, sampling_backend, temperature, top_k, top_p, num_cuda_graphs
+    ):
+        """Require seeded sampling parity across scheduling modes.
+
+        Args:
+            feature_config (dict): Additional cumulative feature configuration.
+            sampling_backend (str): Sampling implementation under test.
+            temperature (float): Sampling temperature used by every request.
+            top_k (int): Top-k filter used by every request.
+            top_p (float): Top-p filter used by every request.
+            num_cuda_graphs (Optional[int]): Number of CUDA graph buckets, or
+                `None` for eager execution.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        if feature_config.get("model_provider") == "hybrid":
+            skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        common_config = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            use_fixed_output_lengths=True,
+            sampling_backend=sampling_backend,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            context_max_requests=8,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        common_config.update(feature_config)
+        generated_tokens = {}
+        final_env = None
+        for mode in (AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC):
+            final_env = self._run_test(async_sched_mode=mode, **common_config)
+            assert all(request.status == Status.COMPLETED for request in final_env.requests)
+            generated_tokens[mode] = [request.generated_tokens for request in final_env.requests]
+
+        assert (
+            generated_tokens[AsyncScheduleMode.ASYNC] == generated_tokens[AsyncScheduleMode.LEGACY]
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "feature_config, sampling_backend, logprobs_mode, skip_prompt_log_probs, num_cuda_graphs",
+        [
+            pytest.param({}, "torch", "raw_logprobs", False, None, id="torch-raw-prompt"),
+            pytest.param({}, "torch", "processed_logprobs", True, 2, id="torch-processed-graph"),
+            pytest.param({}, "flashinfer", "raw_logprobs", False, None, id="flashinfer-raw-prompt"),
+            pytest.param(
+                {}, "flashinfer", "processed_logprobs", True, 2, id="flashinfer-processed-graph"
+            ),
+            pytest.param(
+                {
+                    "model_provider": "hybrid",
+                    "num_speculative_tokens": 1,
+                    "num_requests": 2,
+                    "num_tokens_to_generate": 4,
+                },
+                "torch",
+                "raw_logprobs",
+                True,
+                None,
+                id="mamba-mtp-raw",
+            ),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_sched_log_probs_match_legacy(
+        self,
+        feature_config,
+        sampling_backend,
+        logprobs_mode,
+        skip_prompt_log_probs,
+        num_cuda_graphs,
+    ):
+        """Require prompt and generated logprob parity across scheduling modes.
+
+        Args:
+            feature_config (dict): Additional cumulative feature configuration.
+            sampling_backend (str): Sampling implementation under test.
+            logprobs_mode (str): Raw or sampling-processed logprob mode.
+            skip_prompt_log_probs (bool): Whether to omit prompt logprobs.
+            num_cuda_graphs (Optional[int]): Number of CUDA graph buckets.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        if feature_config.get("model_provider") == "hybrid":
+            skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        common_config = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            use_fixed_output_lengths=True,
+            model_provider="gpt",
+            sampling_backend=sampling_backend,
+            temperature=0.8,
+            top_k=8,
+            return_log_probs=True,
+            logprobs_mode=logprobs_mode,
+            materialize_only_last_token_logits=skip_prompt_log_probs,
+            skip_prompt_log_probs=skip_prompt_log_probs,
+            context_max_requests=8,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        common_config.update(feature_config)
+        outputs = {}
+        for mode in AsyncScheduleMode:
+            env = self._run_test(async_sched_mode=mode, **common_config)
+            outputs[mode] = [
+                (request.generated_tokens, request.prompt_log_probs, request.generated_log_probs)
+                for request in env.requests
+            ]
+
+        legacy_outputs = outputs[AsyncScheduleMode.LEGACY]
+        for legacy, actual in zip(legacy_outputs, outputs[AsyncScheduleMode.ASYNC]):
+            assert actual[0] == legacy[0]
+            assert (actual[1] or []) == pytest.approx(legacy[1] or [])
+            assert actual[2] == pytest.approx(legacy[2])
+
+    def _run_stop_word_schedule(
+        self,
+        test_config: DynamicEngineTestConfig,
+        stop_word: Optional[str] = None,
+        detokenize_stop_sequence: bool = False,
+    ) -> DynamicEngineTestEnv:
+        """Run a schedule where only the first request has a string stop word.
+
+        Args:
+            test_config (DynamicEngineTestConfig): Engine configuration for the run.
+            stop_word (Optional[str]): Whitespace-delimited token IDs used as the stop word.
+            detokenize_stop_sequence (bool): Whether the completed output retains the stop word.
+
+        Returns:
+            DynamicEngineTestEnv: Completed test environment.
+        """
+        env = self._build_test_env(test_config)
+        env.engine.controller.tokenizer.bos = None
+        env.engine.controller.tokenizer.tokenize = lambda text: [
+            int(token_id) for token_id in text.split()
+        ]
+
+        for request_idx, request in enumerate(env.requests):
+            request.sampling_params.termination_id = -1
+            request.sampling_params.detokenize_stop_sequence = detokenize_stop_sequence
+            if request_idx == 0 and stop_word is not None:
+                request.sampling_params.stop_words = [stop_word]
+            env.engine._add_request(request)
+
+        while env.engine.has_unfinished_requests():
+            env.engine.step_modern()
+
+        return env
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "sampling_backend,num_cuda_graphs,detokenize_stop_sequence",
+        [
+            pytest.param("torch", None, True, id="torch-eager-keep"),
+            pytest.param("torch", 2, False, id="torch-graph-strip"),
+            pytest.param("flashinfer", None, False, id="flashinfer-eager-strip"),
+            pytest.param("flashinfer", 2, True, id="flashinfer-graph-keep"),
+        ],
+    )
+    @torch.inference_mode()
+    def test_async_sched_stop_words_match_legacy(
+        self, sampling_backend, num_cuda_graphs, detokenize_stop_sequence
+    ):
+        """Require string stop-word parity while survivor requests keep decoding.
+
+        Args:
+            sampling_backend (str): Sampling backend under test.
+            num_cuda_graphs (Optional[int]): CUDA graph bucket count, or ``None`` for eager mode.
+            detokenize_stop_sequence (bool): Whether completed output retains the stop word.
+        """
+        if sampling_backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+
+        common_config = dict(
+            num_requests=4,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            model_provider="gpt",
+            sampling_backend=sampling_backend,
+            temperature=1.0,
+            top_k=1,
+            context_max_requests=8,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        probe_env = self._run_stop_word_schedule(
+            DynamicEngineTestConfig(async_sched_mode=AsyncScheduleMode.LEGACY, **common_config)
+        )
+        stop_word_ids = probe_env.requests[0].generated_tokens[2:4]
+        stop_word = " ".join(str(token_id) for token_id in stop_word_ids)
+
+        legacy_env = self._run_stop_word_schedule(
+            DynamicEngineTestConfig(async_sched_mode=AsyncScheduleMode.LEGACY, **common_config),
+            stop_word,
+            detokenize_stop_sequence,
+        )
+        async_env = self._run_stop_word_schedule(
+            DynamicEngineTestConfig(async_sched_mode=AsyncScheduleMode.ASYNC, **common_config),
+            stop_word,
+            detokenize_stop_sequence,
+        )
+
+        legacy_tokens = [request.generated_tokens for request in legacy_env.requests]
+        async_tokens = [request.generated_tokens for request in async_env.requests]
+        assert async_tokens == legacy_tokens
+        assert len(async_tokens[0]) < common_config["num_tokens_to_generate"]
+        if detokenize_stop_sequence:
+            assert async_tokens[0][-len(stop_word_ids) :] == stop_word_ids
+        assert async_env.engine.context.async_sched_step_count > 0
+        assert async_env.engine.context.async_sched_compaction_step_count > 0
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1274,8 +1606,11 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
     @torch.inference_mode()
-    def test_return_prompt_log_probs_with_zero_tokens_to_generate(self):
+    def test_return_prompt_log_probs_with_zero_tokens_to_generate(
+        self, async_sched_mode: AsyncScheduleMode
+    ):
         """Prompt log probs must be returned when scoring only (num_tokens_to_generate=0).
 
         Regression test for a prefill-step trimming bug: when a request generates
@@ -1285,12 +1620,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         sampled-token log prob at the tail). The fix trims the excess *trailing*
         log probs instead. This is the path exercised by loglikelihood / echo
         evaluations (e.g. lm-eval-harness sends ``max_tokens=0``).
+
+        Args:
+            async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
         """
         env = self._run_test(
             return_log_probs=True,
             materialize_only_last_token_logits=False,
             skip_prompt_log_probs=False,
             num_tokens_to_generate=0,
+            async_sched_mode=async_sched_mode,
         )
 
         validated_any = False
@@ -2287,15 +2626,22 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
     @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
     @torch.inference_mode()
-    def test_top_n_logprobs_dynamic(self, skip_prompt_log_probs: bool):
-        """
-        Test that top_n_logprobs are computed correctly in dynamic batching mode.
+    def test_top_n_logprobs_dynamic(
+        self, skip_prompt_log_probs: bool, async_sched_mode: AsyncScheduleMode
+    ):
+        """Test that top_n_logprobs are computed correctly in dynamic batching mode.
+
         Verifies:
         1. top_n_logprobs are returned for generated tokens
         2. skip_prompt_log_probs controls whether prompt top-n logprobs are skipped
         3. The top-n values are consistent with the selected token's log prob
+
+        Args:
+            skip_prompt_log_probs (bool): Whether to omit prompt top-n logprobs.
+            async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
         """
         # Build test environment with multiple requests of varying lengths
         test_config = DynamicEngineTestConfig(
@@ -2304,6 +2650,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=12,
             num_tokens_to_generate=4,
             materialize_only_last_token_logits=False,
+            async_sched_mode=async_sched_mode,
         )
         env = self._build_test_env(test_config)
 
@@ -4406,7 +4753,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_speculative_decoding_logprobs_with_stop_word_trim(self):
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
+    def test_speculative_decoding_logprobs_with_stop_word_trim(self, async_sched_mode):
         """Test that log probs are correctly trimmed when a stop word lands
         in the middle of a speculative batch.
 
@@ -4415,6 +4763,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         generates [5, 6, 7] in one step, token 7 is truncated. The
         corresponding log prob for token 7 must also be removed so that
         len(generated_log_probs) == len(generated_tokens).
+
+        Args:
+            async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
         """
         test_config = DynamicEngineTestConfig(
             num_requests=0,
@@ -4424,6 +4775,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2,
             materialize_only_last_token_logits=False,
             model_provider="gpt",
+            async_sched_mode=async_sched_mode,
         )
         env = self._build_test_env(test_config)
 
@@ -4466,6 +4818,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 detokenize_stop_sequence=True,
                 return_log_probs=True,
                 top_k=1,
+                top_n_logprobs=2,
             ),
         )
 
@@ -4480,6 +4833,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_req = finished_records[0].merge()
 
         assert finished_req.status == Status.COMPLETED
+        assert finished_req.generated_tokens == [5, 6]
         assert finished_req.generated_tokens[-1] == 6, (
             f"Expected last token to be stop word 6, "
             f"got {finished_req.generated_tokens[-1]}. "
@@ -4498,6 +4852,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         for j, lp in enumerate(finished_req.generated_log_probs):
             assert isinstance(lp, float)
             assert lp <= 0.0, f"Token {j}: log prob {lp} > 0"
+
+        assert finished_req.generated_top_n_logprobs is not None
+        assert len(finished_req.generated_top_n_logprobs) == len(finished_req.generated_tokens)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -5044,6 +5401,49 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             expert_tensor_parallel_size=1,
         )
         return super()._build_test_env(test_config)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "async_sched_mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC]
+    )
+    @torch.inference_mode()
+    def test_non_greedy_sampling_with_mamba_mtp_ep(self, async_sched_mode):
+        """Run cumulative Mamba, MTP, and EP sampling support to completion.
+
+        Args:
+            async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
+        """
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            num_requests=2,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=4,
+            num_gap_steps=0,
+            use_fixed_output_lengths=True,
+            model_provider="hybrid",
+            expert_model_parallel_size=2,
+            num_speculative_tokens=1,
+            sampling_backend="torch",
+            temperature=0.8,
+            top_k=8,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            context_max_requests=8,
+            async_sched_mode=async_sched_mode,
+        )
+
+        assert all(request.status == Status.COMPLETED for request in env.requests)
+        assert all(
+            len(request.generated_log_probs) == len(request.generated_tokens)
+            for request in env.requests
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
