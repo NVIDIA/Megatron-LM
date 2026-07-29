@@ -61,8 +61,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Validate the MFSDP v2 optimizer support contract."""
         if len(model_chunks) != 1:
             raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
-        if not config.use_distributed_optimizer:
-            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=True.")
+        if config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
         if config.loss_scale is not None:
             raise ValueError("MFSDP v2 does not currently support loss scaling.")
         if config.fp16:

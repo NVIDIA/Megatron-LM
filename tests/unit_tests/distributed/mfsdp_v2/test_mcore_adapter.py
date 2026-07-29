@@ -69,7 +69,7 @@ class TestMcoreAdapter:
             ddp_config=DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
                 megatron_fsdp_version=2,
-                use_distributed_optimizer=True,
+                use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
                 megatron_fsdp_main_grads_dtype=torch.float32,
@@ -118,7 +118,7 @@ class TestMcoreAdapter:
             ddp_config=DistributedDataParallelConfig(
                 use_megatron_fsdp=True,
                 megatron_fsdp_version=2,
-                use_distributed_optimizer=True,
+                use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
                 megatron_fsdp_main_grads_dtype=torch.bfloat16,
@@ -137,10 +137,18 @@ class TestMcoreAdapter:
             use_distributed_optimizer=False,
             clip_grad=0.0,
         )
-        optimizer_config = replace(reference_optimizer_config, use_distributed_optimizer=True)
         reference_optimizer = get_megatron_optimizer(
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
+        optimizer_config = replace(reference_optimizer_config)
+        with pytest.raises(
+            ValueError, match="MFSDP v2 currently requires use_distributed_optimizer=False"
+        ):
+            get_megatron_optimizer(
+                replace(reference_optimizer_config, use_distributed_optimizer=True),
+                [model],
+                use_gloo_process_groups=False,
+            )
         optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()

@@ -634,59 +634,54 @@ def _get_megatron_optimizer_based_on_param_groups(
     if skip_megatron_wrapping:
         return optimizer, init_state_fn
 
-    # Mixed precision optimizer.
-    # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
-    #   from the MixedPrecisionOptimizer, which manages any optimizer where
-    #   the model params and main params are distinct.
+    # Grad scaler:
+    #    if loss-scale is provided, instantiate the constant scaler.
+    #    if we are using fp16 and loss-scale is not present, use a
+    #       dynamic scaler.
+    #    otherwise we are running in bf16 with no loss-scale so
+    #       leave it as None.
+    grad_scaler = None
     if config.fp16 or config.bf16 or config.use_distributed_optimizer:
-
-        # Grad scaler:
-        #    if loss-scale is provided, instantiate the constant scaler.
-        #    if we are using fp16 and loss-scale is not present, use a
-        #       dynamic scaler.
-        #    otherwise we are running in bf16 with no loss-scale so
-        #       leave it as None.
-        grad_scaler = None
-
-        # Constant loss scale.
         if config.loss_scale:
             grad_scaler = ConstantGradScaler(config.loss_scale)
+        elif config.fp16:
+            grad_scaler = DynamicGradScaler(
+                initial_scale=config.initial_loss_scale,
+                min_scale=config.min_loss_scale,
+                growth_factor=2.0,
+                backoff_factor=0.5,
+                growth_interval=config.loss_scale_window,
+                hysteresis=config.hysteresis,
+            )
 
-        # Dynamic loss scale.
-        else:
-            if config.fp16:
-                grad_scaler = DynamicGradScaler(
-                    initial_scale=config.initial_loss_scale,
-                    min_scale=config.min_loss_scale,
-                    growth_factor=2.0,
-                    backoff_factor=0.5,
-                    growth_interval=config.loss_scale_window,
-                    hysteresis=config.hysteresis,
-                )
-
-        optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
-        if config.use_distributed_optimizer:
-            if isinstance(model_chunks[0], FullyShardedDataParallelV2):
-                optimizer = FullyShardedOptimizer(*optimizer_args, model_chunks=model_chunks)
-            else:
-                optimizer = DistributedOptimizer(
-                    *optimizer_args,
-                    model_chunks=model_chunks,
-                    per_model_buffers=per_model_buffers,
-                    data_parallel_group=data_parallel_group,
-                    data_parallel_group_gloo=data_parallel_group_gloo,
-                    data_parallel_group_idx=data_parallel_group_idx,
-                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
-                )
-            # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
-            # weight gradients are all-reduced across optimizer instances, so each instance has
-            # the duplicated weight gradients, need to reduce gradient stats inside each instance.
-            setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
-        else:
-            optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
-            setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+    if config.use_distributed_optimizer:
+        optimizer = DistributedOptimizer(
+            optimizer,
+            config,
+            grad_scaler,
+            init_state_fn,
+            model_chunks=model_chunks,
+            per_model_buffers=per_model_buffers,
+            data_parallel_group=data_parallel_group,
+            data_parallel_group_gloo=data_parallel_group_gloo,
+            data_parallel_group_idx=data_parallel_group_idx,
+            distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+        )
+        # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
+        # weight gradients are all-reduced across optimizer instances, so each instance has
+        # the duplicated weight gradients, need to reduce gradient stats inside each instance.
+        setattr(optimizer, 'grad_stats_parallel_group', intra_dist_opt_group)
+    elif isinstance(model_chunks[0], FullyShardedDataParallelV2):
+        optimizer = FullyShardedOptimizer(
+            optimizer, config, grad_scaler, init_state_fn, model_chunks=model_chunks
+        )
+        setattr(optimizer, 'grad_stats_parallel_group', data_parallel_group)
+    elif config.fp16 or config.bf16:
+        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, grad_scaler, init_state_fn)
+        setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
     else:
         # FP32 optimizer.
+        assert grad_scaler is None
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
@@ -1056,8 +1051,8 @@ def get_megatron_optimizer(
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
     if is_mfsdp_v2:
-        if not config.use_distributed_optimizer:
-            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=True.")
+        if config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
