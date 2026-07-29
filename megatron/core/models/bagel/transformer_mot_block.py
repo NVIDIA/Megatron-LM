@@ -910,6 +910,7 @@ class Qwen2RMSNorm(torch.nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        """Apply RMS normalization to the input hidden states."""
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -917,6 +918,7 @@ class Qwen2RMSNorm(torch.nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
     def extra_repr(self):
+        """Return the normalized weight shape and epsilon value."""
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 

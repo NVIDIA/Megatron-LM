@@ -8,6 +8,7 @@ one-shot behavior keeps activation recomputation from duplicating the step-0
 trace.
 """
 
+import logging
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,6 +16,8 @@ from typing import Iterator, Optional
 
 import torch
 from torch import Tensor
+
+logger = logging.getLogger(__name__)
 
 _AUDIT_ENABLED = os.environ.get("BAGEL_LAYER_ALIGNMENT_AUDIT", "0") == "1"
 _AUDIT_DUMP_DIR = os.environ.get("BAGEL_LAYER_ALIGNMENT_DUMP_DIR")
@@ -66,12 +69,11 @@ def audit_branch_tensor(stage: str, branch: str, tensor: Tensor, *, layer_number
         dump_dir.mkdir(parents=True, exist_ok=True)
         filename = f"layer{layer_number - 1}.{stage}.{branch}.pt"
         torch.save(detached.cpu(), dump_dir / filename)
-    print(
+    logger.info(
         "[BAGEL_LAYER_ALIGNMENT_AUDIT] "
         f"layer={layer_number - 1} stage={stage} branch={branch} "
         f"shape={list(detached.shape)} dtype={detached.dtype} "
-        f"fp32_sum={fp32_sum:.9g} first10={first10}",
-        flush=True,
+        f"fp32_sum={fp32_sum:.9g} first10={first10}"
     )
 
 
