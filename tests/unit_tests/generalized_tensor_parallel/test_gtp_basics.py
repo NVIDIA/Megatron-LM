@@ -217,9 +217,11 @@ def _worker_output_layer_weight_gathered_once(rank, world_size, port):
     assert emb_w._retain_for_bwd is False, "a tied/embedding weight must not reuse"
     assert fc1_w._retain_for_bwd is False, "ordinary weights must not reuse"
 
-    # The sibling embedding opt-out must be unaffected.
-    assert emb_w._need_weight_prefetch_bwd is False, "embedding still skips its bwd AG"
-    assert out_w._need_weight_prefetch_bwd is True, "output_layer still prefetches in bwd"
+    # Reuse replaces the bwd gather, so the output layer opts out of the bwd prefetch too --
+    # the same flag the embedding uses, for the same reason: no bwd AG is wanted.
+    assert emb_w._need_weight_prefetch_bwd is False, "embedding skips its bwd AG"
+    assert out_w._need_weight_prefetch_bwd is False, "a retained weight skips its bwd AG"
+    assert fc1_w._need_weight_prefetch_bwd is True, "ordinary weights still prefetch in bwd"
 
     # Reference full weight, reconstructed from the shards.
     shard = out_w.data.clone()

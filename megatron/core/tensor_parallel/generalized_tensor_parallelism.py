@@ -254,6 +254,9 @@ def classify_gtp_chains(model) -> None:
         # and gather twice per fwd, so retention would have to key off the second gather.
         if "output_layer" in name and not getattr(param, "_gtp_native_fp8", False):
             param._retain_for_bwd = True
+            # Reuse replaces the bwd gather, so stop any successor prefetching it (inert while
+            # the output layer is the chain tail and has none; correct if that ever changes).
+            param._need_weight_prefetch_bwd = False
     if conflicts:
         raise RuntimeError(
             "classify_gtp_chains: the following params were already chain-initialized "
@@ -1094,18 +1097,9 @@ class GTPShardedParam(torch.nn.Parameter):
     def _all_gather_weight(self, async_op, fwd, nvtx_label=None):
         """Quantize (if needed) and all-gather weight. Returns (weight_total, handle).
 
-        A _retain_for_bwd weight's bwd gather is served from its pinned fwd buffer instead
-        of a collective; callers cannot tell the two apart.
+        A _retain_for_bwd weight never reaches here for a bwd gather: its consume is served by
+        _reuse_fwd_weight_for_bwd and its prefetch is suppressed by _need_weight_prefetch_bwd.
         """
-        if not fwd and self._retain_for_bwd:
-            # Pinned, so nothing has overwritten it since the fwd gather. _ag_ticket_bwd is
-            # therefore never reserved for this weight.
-            nvtx_range_push(f"{self._debug_name}.bwd.reuse_fwd_weight")
-            cache = get_global_GTP_cache()
-            bufs = [cache.get(w._ag_ticket_fwd) for w in self._weights]
-            nvtx_range_pop()
-            return (bufs if self.is_routed_expert else bufs[0]), None
-
         if nvtx_label is None:
             nvtx_label = (
                 self._debug_name + (".fwd" if fwd else ".bwd") + (".async" if async_op else ".sync")
@@ -1321,6 +1315,20 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
+    def _reuse_fwd_weight_for_bwd(self):
+        """Serve the bwd dgrad from the pinned fwd buffer: no collective, no _ag_ticket_bwd.
+
+        The buffer is pinned, so nothing has overwritten it since the fwd gather, and the
+        issuer's bwd prefetch is suppressed via _need_weight_prefetch_bwd.
+        """
+        nvtx_range_push(f"{self._debug_name}.bwd.reuse_fwd_weight")
+        cache = get_global_GTP_cache()
+        bufs = [cache.get(w._ag_ticket_fwd) for w in self._weights]
+        nvtx_range_pop()
+        bufs = [self._strip_padding(b) for b in bufs]
+        bufs = [b.detach().requires_grad_(w.requires_grad) for b, w in zip(bufs, self._weights)]
+        return bufs if self.is_routed_expert else bufs[0]
+
     def all_gather_and_prefetch_bwd(self, nvtx_label=None):
         """Backward variant: get the current weight (cached if prefetched, else sync gather)
         and async-prefetch prev_w.
@@ -1333,15 +1341,9 @@ class GTPShardedParam(torch.nn.Parameter):
             weight_total
         """
 
-        # The reuse short-circuit lives in _all_gather_weight, which the prefetched branch below
-        # bypasses -- it would read this weight's unreserved bwd ticket and KeyError. Fail here,
-        # where the assumption is first observable.
-        assert not self._retain_for_bwd or self.next_w is None, (
-            f"{self._debug_name}: _retain_for_bwd requires the fwd-chain tail (next_w is None); "
-            "a mid-chain retained weight also needs _need_weight_prefetch_bwd=False"
-        )
-
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        if self._retain_for_bwd:
+            result = self._reuse_fwd_weight_for_bwd()
+        elif GTP_CONFIG.weight_prefetch and self.next_w is not None:
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
