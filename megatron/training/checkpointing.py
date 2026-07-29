@@ -549,10 +549,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
-    # --freeze-all-layers: the model weights are frozen and never change, so there is nothing new
-    # to persist -- skip the weight write and the normal tracker / one_logger / wandb finalizers.
-    # When logits are also being dumped, run progress is instead recorded to the tracker as a
-    # post-logits finalize (see the async block below) so a resubmit can resume the data position.
+    # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
+    # progress is recorded separately via the post-logits finalize (see the async block below).
     skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
 
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
@@ -2106,12 +2104,9 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
-    # --override-ckpt-iteration: rewind the data loader to this iteration, operating directly on
-    # `args` (not the loaded state_dict) so it also works on checkpoints without a saved `args`
-    # blob -- e.g. release or HuggingFace-converted checkpoints, where the state_dict path would
-    # silently no-op. The GBS-match guard applies only when this checkpoint's own args are being
-    # adopted as the run being resumed (`'args' in state_dict and not finetune`); a finetune-style
-    # load (release / HF / a frozen teacher) describes a different run, so the guard is skipped.
+    # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
+    # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
+    # GBS-match check applies only when adopting this checkpoint's own args (not a finetune load).
     if getattr(args, 'override_ckpt_iteration', None) is not None:
         if 'args' in state_dict and not args.finetune:
             ckpt_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)

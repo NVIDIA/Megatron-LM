@@ -2084,7 +2084,6 @@ def setup_model_and_optimizer(
         )
 
     model = _build_model_wrapper(wrap_with_ddp)
-
     unwrapped_model = unwrap_model(model)
 
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
