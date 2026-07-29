@@ -167,8 +167,7 @@ def test_mlp_builders_follow_transformer_layer_protocol():
     config = _make_mcore_config()
     pg_collection = _PGC(tp=None)
     submodules = MoTTransformerLayerSubmodules(
-        mlp=partial(_build_test_mlp, branch="und"),
-        mlp_gen=partial(_build_test_mlp, branch="gen"),
+        mlp=partial(_build_test_mlp, branch="und"), mlp_gen=partial(_build_test_mlp, branch="gen")
     )
 
     layer = MoTTransformerLayer(

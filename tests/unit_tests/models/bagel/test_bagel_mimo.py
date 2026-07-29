@@ -221,9 +221,7 @@ class _TestBagelMimoModel(BagelMimoModel):
         if self.language_model.use_mo and packed_text_indexes is not None:
             if packed_seq_params is None:
                 packed_seq_params = _build_packed_seq_params(
-                    packed_text_indexes,
-                    packed_vit_token_indexes,
-                    packed_vae_token_indexes,
+                    packed_text_indexes, packed_vit_token_indexes, packed_vae_token_indexes
                 )
 
         compact_position_ids = torch.cat(
@@ -247,9 +245,7 @@ class _TestBagelMimoModel(BagelMimoModel):
         lm_output = super().forward(
             input_ids=input_ids,
             position_ids=position_ids,
-            modality_inputs=(
-                {"diffusion": visual_latents} if visual_latents is not None else None
-            ),
+            modality_inputs=({"diffusion": visual_latents} if visual_latents is not None else None),
             sequence_length=sequence_length,
             sample_lens=sample_lens,
             attention_mask=attention_mask,

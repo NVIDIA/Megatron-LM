@@ -252,9 +252,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.is_moe_layer = False
 
     def _build_mlp(
-        self,
-        mlp_spec: Union[ModuleSpec, MlpBuilder, type],
-        pg_collection: ProcessGroupCollection,
+        self, mlp_spec: Union[ModuleSpec, MlpBuilder, type], pg_collection: ProcessGroupCollection
     ):
         """Build an MLP through the TransformerLayer builder protocol."""
         try:
@@ -272,9 +270,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             module = mlp_spec.module
             if module is MLP or (TEFusedMLP is not None and module is TEFusedMLP):
                 builder = functools.partial(
-                    module.as_mlp_submodule,
-                    submodules=mlp_spec.submodules,
-                    **mlp_spec.params,
+                    module.as_mlp_submodule, submodules=mlp_spec.submodules, **mlp_spec.params
                 )
             elif MoELayer is not None and module is MoELayer:
                 builder_kwargs = dict(mlp_spec.params)
@@ -284,11 +280,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             else:
                 return build_module(mlp_spec, config=self.config)
 
-        kwargs = {
-            "config": self.config,
-            "pg_collection": pg_collection,
-            "is_mtp_layer": False,
-        }
+        kwargs = {"config": self.config, "pg_collection": pg_collection, "is_mtp_layer": False}
         try:
             signature = inspect.signature(builder)
         except (TypeError, ValueError):
@@ -391,12 +383,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Fully constructed transformer layers always carry a 1-based layer number.
         alignment_audit = layer_alignment_audit_enabled(getattr(self, 'layer_number', 0))
         if alignment_audit:
-            audit_compact_tensor(
-                "layer_input",
-                hidden_states,
-                Lund,
-                layer_number=self.layer_number,
-            )
+            audit_compact_tensor("layer_input", hidden_states, Lund, layer_number=self.layer_number)
 
         # =====================================================================
         # Input layernorm with MoT (compact slicing)
@@ -404,12 +391,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual = hidden_states
         hidden_states = self._apply_input_layernorm_mot(hidden_states, Lund)
         if alignment_audit:
-            audit_compact_tensor(
-                "input_norm",
-                hidden_states,
-                Lund,
-                layer_number=self.layer_number,
-            )
+            audit_compact_tensor("input_norm", hidden_states, Lund, layer_number=self.layer_number)
 
         # =====================================================================
         # Self attention
@@ -433,10 +415,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 else attention_output_with_bias
             )
             audit_compact_tensor(
-                "attention.o_proj",
-                projected_attention,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.o_proj", projected_attention, Lund, layer_number=self.layer_number
             )
 
         # Detach und attention output so no gradient flows back through und weights
@@ -460,10 +439,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="self_attn_bda")
         if alignment_audit:
             audit_compact_tensor(
-                "attention.residual",
-                hidden_states,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.residual", hidden_states, Lund, layer_number=self.layer_number
             )
 
         # =====================================================================
@@ -492,12 +468,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # =====================================================================
         output = self._forward_mlp_mot(hidden_states, Lund)
         if alignment_audit:
-            audit_compact_tensor(
-                "layer_output",
-                output,
-                Lund,
-                layer_number=self.layer_number,
-            )
+            audit_compact_tensor("layer_output", output, Lund, layer_number=self.layer_number)
 
         return output, context
 
@@ -638,18 +609,9 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 else attach_zero_grad_dependency(und_h, self.pre_mlp_layernorm)
             )
             if alignment_audit:
-                audit_branch_tensor(
-                    "mlp.pre_norm",
-                    "und",
-                    x,
-                    layer_number=self.layer_number,
-                )
+                audit_branch_tensor("mlp.pre_norm", "und", x, layer_number=self.layer_number)
             nvtx_range_push(suffix="mlp_und")
-            with audit_mlp_linears(
-                self.mlp,
-                branch="und",
-                layer_number=audit_layer_number,
-            ):
+            with audit_mlp_linears(self.mlp, branch="und", layer_number=audit_layer_number):
                 y = self.mlp(x)
             nvtx_range_pop(suffix="mlp_und")
             if isinstance(y, tuple):
@@ -667,18 +629,9 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 else attach_zero_grad_dependency(gen_h, pre_mlp_ln_gen)
             )
             if alignment_audit:
-                audit_branch_tensor(
-                    "mlp.pre_norm",
-                    "gen",
-                    x,
-                    layer_number=self.layer_number,
-                )
+                audit_branch_tensor("mlp.pre_norm", "gen", x, layer_number=self.layer_number)
             nvtx_range_push(suffix="mlp_gen")
-            with audit_mlp_linears(
-                mlp_gen,
-                branch="gen",
-                layer_number=audit_layer_number,
-            ):
+            with audit_mlp_linears(mlp_gen, branch="gen", layer_number=audit_layer_number):
                 y = mlp_gen(x)
             nvtx_range_pop(suffix="mlp_gen")
             if isinstance(y, tuple):
@@ -688,9 +641,7 @@ class MoTTransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return y
 
         def _skip_und():
-            output = attach_zero_grad_dependency(
-                und_h, self.pre_mlp_layernorm, self.mlp
-            )
+            output = attach_zero_grad_dependency(und_h, self.pre_mlp_layernorm, self.mlp)
             return output.detach() if self.freeze_und else output
 
         def _skip_gen():

@@ -104,9 +104,7 @@ def _mlp_submodules(layer_spec: ModuleSpec):
 def test_local_spec_uses_local_linears_and_qwen2_rms_norm():
     """The local route must not retain any TE language-layer modules."""
 
-    local_spec = get_mot_layer_spec(
-        num_experts=None, use_te=False, use_flex_attention=True
-    )
+    local_spec = get_mot_layer_spec(num_experts=None, use_te=False, use_flex_attention=True)
     layer_submodules = local_spec.submodules
     attention_submodules = layer_submodules.self_attention.submodules
 
@@ -183,9 +181,7 @@ def test_qwen2_rms_norm_matches_hf_formula_forward_and_backward():
     with torch.no_grad():
         norm.weight.copy_(
             torch.tensor(
-                [0.75, 1.25, -0.5, 2.0, 0.125, -1.5, 0.625, 1.75],
-                dtype=dtype,
-                device="cuda",
+                [0.75, 1.25, -0.5, 2.0, 0.125, -1.5, 0.625, 1.75], dtype=dtype, device="cuda"
             )
         )
 
@@ -201,16 +197,14 @@ def test_qwen2_rms_norm_matches_hf_formula_forward_and_backward():
     actual = norm(actual_input)
     reference_float = reference_input.to(torch.float32)
     variance = reference_float.pow(2).mean(-1, keepdim=True)
-    reference = reference_weight * (
-        reference_float * torch.rsqrt(variance + eps)
-    ).to(reference_input.dtype)
+    reference = reference_weight * (reference_float * torch.rsqrt(variance + eps)).to(
+        reference_input.dtype
+    )
 
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
     output_grad = torch.tensor(
-        [[-0.5, 1.0, 0.25, -2.0, 1.5, -0.75, 0.125, 0.625]],
-        dtype=dtype,
-        device="cuda",
+        [[-0.5, 1.0, 0.25, -2.0, 1.5, -0.75, 0.125, 0.625]], dtype=dtype, device="cuda"
     )
     actual.backward(output_grad)
     reference.backward(output_grad)
@@ -274,21 +268,14 @@ def test_te_alignment_switches_are_independent():
         TENorm,
     )
 
-    qkv_spec = get_mot_layer_spec(
-        num_experts=None, use_te=True, split_qkv_for_alignment=True
-    )
+    qkv_spec = get_mot_layer_spec(num_experts=None, use_te=True, split_qkv_for_alignment=True)
     qkv_layer = qkv_spec.submodules
-    assert (
-        qkv_layer.self_attention.submodules.linear_qkv
-        is BagelAlignmentColumnParallelLinear
-    )
+    assert qkv_layer.self_attention.submodules.linear_qkv is BagelAlignmentColumnParallelLinear
     assert _mlp_submodules(qkv_spec).linear_fc1 is TELayerNormColumnParallelLinear
     assert qkv_layer.input_layernorm is TENorm
     assert qkv_layer.pre_mlp_layernorm is IdentityOp
 
-    mlp_spec = get_mot_layer_spec(
-        num_experts=None, use_te=True, split_mlp_for_alignment=True
-    )
+    mlp_spec = get_mot_layer_spec(num_experts=None, use_te=True, split_mlp_for_alignment=True)
     mlp_layer = mlp_spec.submodules
     assert mlp_layer.self_attention.submodules.linear_qkv is TEColumnParallelLinear
     assert _mlp_submodules(mlp_spec).linear_fc1 is BagelAlignmentColumnParallelLinear
@@ -468,12 +455,8 @@ def test_alignment_split_linears_match_independent_hf_parameters_forward_and_bac
 
     def unpack_qkv(tensor):
         trailing_shape = tuple(tensor.shape[1:])
-        grouped = tensor.reshape(
-            num_query_groups, queries_per_group + 2, head_dim, *trailing_shape
-        )
-        query = grouped[:, :queries_per_group].reshape(
-            num_heads * head_dim, *trailing_shape
-        )
+        grouped = tensor.reshape(num_query_groups, queries_per_group + 2, head_dim, *trailing_shape)
+        query = grouped[:, :queries_per_group].reshape(num_heads * head_dim, *trailing_shape)
         key = grouped[:, queries_per_group : queries_per_group + 1].reshape(
             num_query_groups * head_dim, *trailing_shape
         )
@@ -484,9 +467,7 @@ def test_alignment_split_linears_match_independent_hf_parameters_forward_and_bac
 
     def pack_qkv(query, key, value):
         prefix = query.shape[:-1]
-        query = query.reshape(
-            *prefix, num_query_groups, queries_per_group, head_dim
-        )
+        query = query.reshape(*prefix, num_query_groups, queries_per_group, head_dim)
         key = key.reshape(*prefix, num_query_groups, 1, head_dim)
         value = value.reshape(*prefix, num_query_groups, 1, head_dim)
         return torch.cat((query, key, value), dim=-2).reshape(*prefix, -1)
@@ -597,13 +578,9 @@ def test_alignment_split_linears_match_independent_hf_parameters_forward_and_bac
         torch.testing.assert_close(actual_fc1, reference_fc1, rtol=0, atol=0)
 
         output_grad = torch.randn_like(reference_fc1)
-        actual_grads = torch.autograd.grad(
-            actual_fc1, (actual_input, fc1.weight), output_grad
-        )
+        actual_grads = torch.autograd.grad(actual_fc1, (actual_input, fc1.weight), output_grad)
         reference_grads = torch.autograd.grad(
-            reference_fc1,
-            (reference_input, gate_weight, up_weight),
-            output_grad,
+            reference_fc1, (reference_input, gate_weight, up_weight), output_grad
         )
         torch.testing.assert_close(actual_grads[0], reference_grads[0], rtol=0, atol=0)
         torch.testing.assert_close(

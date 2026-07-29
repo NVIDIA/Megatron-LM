@@ -163,9 +163,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     )
     monkeypatch.setattr(training_module, "num_floating_point_operations", lambda *a, **k: 0.0)
     monkeypatch.setattr(training_module.one_logger_utils, "track_app_tag", lambda *a, **k: None)
-    monkeypatch.setattr(
-        training_module.one_logger_utils, "track_e2e_metrics", lambda *a, **k: None
-    )
+    monkeypatch.setattr(training_module.one_logger_utils, "track_e2e_metrics", lambda *a, **k: None)
     monkeypatch.setattr(training_module, "print_rank_last", log_lines.append)
 
     # training_log creates its accumulator tensors on CUDA. Keep this logging-only

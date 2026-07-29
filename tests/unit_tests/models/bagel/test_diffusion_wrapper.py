@@ -69,10 +69,7 @@ def test_vae_encode_uses_native_autocast_input_and_preserves_output_contract(mon
     wrapper = DiffusionWrapper()
     wrapper.init_vae("unused.safetensors", latent_patch_size=2, dtype=torch.bfloat16)
 
-    packed = wrapper.vae_encode(
-        torch.zeros((1, 3, 32, 48), dtype=torch.float32),
-        [(2, 3)],
-    )
+    packed = wrapper.vae_encode(torch.zeros((1, 3, 32, 48), dtype=torch.float32), [(2, 3)])
 
     assert autocast_calls == [("cuda", True, torch.bfloat16)]
     assert einsum_autocast_states == [True]
@@ -98,9 +95,7 @@ def test_gen_data_casts_timesteps_before_shift_and_noise(monkeypatch):
             return clean.clone()
 
         def add_noise(self, packed_latents_clean, shifted_timesteps):
-            noisy, noise, target = super().add_noise(
-                packed_latents_clean, shifted_timesteps
-            )
+            noisy, noise, target = super().add_noise(packed_latents_clean, shifted_timesteps)
             self.noise = noise.detach().clone()
             return noisy, noise, target
 
@@ -108,12 +103,15 @@ def test_gen_data_casts_timesteps_before_shift_and_noise(monkeypatch):
     wrapper.dtype = torch.bfloat16
     wrapper.timestep_shift = 1.0
     raw_timesteps = torch.tensor(
-        [-0.31815165281295776, 0.1251, float("-inf"), 1.8751],
-        dtype=torch.float32,
+        [-0.31815165281295776, 0.1251, float("-inf"), 1.8751], dtype=torch.float32
     )
     clean = torch.tensor(
-        [[0.5546875, 1.359375], [-0.65234375, -0.1484375],
-         [0.076171875, 0.7578125], [0.44921875, -0.345703125]],
+        [
+            [0.5546875, 1.359375],
+            [-0.65234375, -0.1484375],
+            [0.076171875, 0.7578125],
+            [0.44921875, -0.345703125],
+        ],
         dtype=torch.bfloat16,
     )
     batch = {
@@ -133,10 +131,7 @@ def test_gen_data_casts_timesteps_before_shift_and_noise(monkeypatch):
     native_raw = raw_timesteps.to(torch.bfloat16)
     native_shifted = torch.sigmoid(native_raw)
     native_noise = torch.randn_like(clean)
-    native_noisy = (
-        (1 - native_shifted[:, None]) * clean
-        + native_shifted[:, None] * native_noise
-    )
+    native_noisy = (1 - native_shifted[:, None]) * clean + native_shifted[:, None] * native_noise
     native_target = (native_noise - clean)[native_shifted > 0]
 
     assert torch.equal(wrapper.raw_timesteps, native_raw)
@@ -155,9 +150,7 @@ def test_timestep_embedder_precast_is_bitwise_native_autocast():
     timesteps = torch.randn(513, device="cuda", dtype=torch.float32).sigmoid()
 
     actual = module(timesteps)
-    reference_frequency = module.timestep_embedding(
-        timesteps, module.frequency_embedding_size
-    )
+    reference_frequency = module.timestep_embedding(timesteps, module.frequency_embedding_size)
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         expected = reference_mlp(reference_frequency)
 

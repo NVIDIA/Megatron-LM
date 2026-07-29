@@ -181,11 +181,7 @@ with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() 
         raise AssertionError("Changing a loaded BAGEL registry root must be rejected")
 """
     result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
+        [sys.executable, "-c", script], env=env, check=False, capture_output=True, text=True
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -259,9 +255,9 @@ def _assert_packed_tensors_equal(orig: dict, ene: dict, label: str = "") -> None
 
 def _assert_packed_value_equal(orig: Any, ene: Any, path: str) -> None:
     """Recursively compare types, tensor metadata, and values."""
-    assert type(orig) is type(ene), (
-        f"{path} type: orig={type(orig).__name__}, ene={type(ene).__name__}"
-    )
+    assert type(orig) is type(
+        ene
+    ), f"{path} type: orig={type(orig).__name__}, ene={type(ene).__name__}"
 
     if isinstance(orig, torch.Tensor):
         assert orig.dtype == ene.dtype, f"{path} dtype: orig={orig.dtype}, ene={ene.dtype}"
@@ -270,9 +266,7 @@ def _assert_packed_value_equal(orig: Any, ene: Any, path: str) -> None:
         return
 
     if isinstance(orig, dict):
-        assert orig.keys() == ene.keys(), (
-            f"{path} keys: orig={sorted(orig)}, ene={sorted(ene)}"
-        )
+        assert orig.keys() == ene.keys(), f"{path} keys: orig={sorted(orig)}, ene={sorted(ene)}"
         for key in orig:
             _assert_packed_value_equal(orig[key], ene[key], path=f"{path}[{key!r}]")
         return
@@ -599,10 +593,7 @@ class TestT2IExactParity:
             {**comparator_reference, "split_lens": [2]},
             {**comparator_reference, "attn_modes": ["full"]},
             {**comparator_reference, "sequence_length": 2},
-            {
-                **comparator_reference,
-                "payload": torch.tensor([1], dtype=torch.int64),
-            },
+            {**comparator_reference, "payload": torch.tensor([1], dtype=torch.int64)},
         )
         for mismatched in comparator_regressions:
             with pytest.raises(AssertionError):
@@ -870,9 +861,7 @@ def _orig_vlm_process(image_bytes_list, conversation, vit_transform, tokenizer) 
 
     parser = object.__new__(SftJSONLIterableDataset)
     raw_images = [pil_img2rgb(Image.open(io.BytesIO(value))) for value in image_bytes_list]
-    image_tensor_list = [
-        vit_transform(image, img_num=len(raw_images)) for image in raw_images
-    ]
+    image_tensor_list = [vit_transform(image, img_num=len(raw_images)) for image in raw_images]
     num_tokens = sum(
         tensor.shape[1] * tensor.shape[2] // (vit_transform.stride**2)
         for tensor in image_tensor_list

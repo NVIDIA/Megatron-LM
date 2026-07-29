@@ -16,7 +16,6 @@ from typing import Iterator, Optional
 import torch
 from torch import Tensor
 
-
 _AUDIT_ENABLED = os.environ.get("BAGEL_LAYER_ALIGNMENT_AUDIT", "0") == "1"
 _AUDIT_DUMP_DIR = os.environ.get("BAGEL_LAYER_ALIGNMENT_DUMP_DIR")
 _AUDITED_KEYS: set[tuple[int, str, str]] = set()
@@ -48,13 +47,7 @@ def _first_tensor(value) -> Optional[Tensor]:
     return None
 
 
-def audit_branch_tensor(
-    stage: str,
-    branch: str,
-    tensor: Tensor,
-    *,
-    layer_number: int,
-) -> None:
+def audit_branch_tensor(stage: str, branch: str, tensor: Tensor, *, layer_number: int) -> None:
     """Print one detached FP32 summary without changing the forward tensor."""
 
     if not layer_alignment_audit_enabled(layer_number):
@@ -82,38 +75,17 @@ def audit_branch_tensor(
     )
 
 
-def audit_compact_tensor(
-    stage: str,
-    tensor: Tensor,
-    und_length: int,
-    *,
-    layer_number: int,
-) -> None:
+def audit_compact_tensor(stage: str, tensor: Tensor, und_length: int, *, layer_number: int) -> None:
     """Summarize the understanding and generation slices of a compact tensor."""
 
     if not layer_alignment_audit_enabled(layer_number):
         return
-    audit_branch_tensor(
-        stage,
-        "und",
-        tensor[:und_length],
-        layer_number=layer_number,
-    )
-    audit_branch_tensor(
-        stage,
-        "gen",
-        tensor[und_length:],
-        layer_number=layer_number,
-    )
+    audit_branch_tensor(stage, "und", tensor[:und_length], layer_number=layer_number)
+    audit_branch_tensor(stage, "gen", tensor[und_length:], layer_number=layer_number)
 
 
 @contextmanager
-def audit_mlp_linears(
-    mlp: torch.nn.Module,
-    *,
-    branch: str,
-    layer_number: int,
-) -> Iterator[None]:
+def audit_mlp_linears(mlp: torch.nn.Module, *, branch: str, layer_number: int) -> Iterator[None]:
     """Capture FC1, post-activation, and FC2 tensors through temporary hooks.
 
     MCore's MLP exposes the post-SwiGLU activation as the input to ``linear_fc2``.
@@ -134,12 +106,7 @@ def audit_mlp_linears(
         def _fc1_output_hook(_module, _inputs, output):
             tensor = _first_tensor(output)
             if tensor is not None:
-                audit_branch_tensor(
-                    "mlp.fc1_output",
-                    branch,
-                    tensor,
-                    layer_number=layer_number,
-                )
+                audit_branch_tensor("mlp.fc1_output", branch, tensor, layer_number=layer_number)
 
         handles.append(linear_fc1.register_forward_hook(_fc1_output_hook))
 
@@ -148,22 +115,12 @@ def audit_mlp_linears(
         def _fc2_input_hook(_module, inputs):
             tensor = _first_tensor(inputs)
             if tensor is not None:
-                audit_branch_tensor(
-                    "mlp.fc1_activation",
-                    branch,
-                    tensor,
-                    layer_number=layer_number,
-                )
+                audit_branch_tensor("mlp.fc1_activation", branch, tensor, layer_number=layer_number)
 
         def _fc2_output_hook(_module, _inputs, output):
             tensor = _first_tensor(output)
             if tensor is not None:
-                audit_branch_tensor(
-                    "mlp.fc2_output",
-                    branch,
-                    tensor,
-                    layer_number=layer_number,
-                )
+                audit_branch_tensor("mlp.fc2_output", branch, tensor, layer_number=layer_number)
 
         handles.append(linear_fc2.register_forward_pre_hook(_fc2_input_hook))
         handles.append(linear_fc2.register_forward_hook(_fc2_output_hook))

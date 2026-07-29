@@ -400,24 +400,16 @@ class BagelMCoreModel(GPTModel):
                 )
                 if layer_alignment_audit_enabled(1):
                     audit_branch_tensor(
-                        "rope.position_ids",
-                        "und",
-                        packed_position_ids[:Lund],
-                        layer_number=1,
+                        "rope.position_ids", "und", packed_position_ids[:Lund], layer_number=1
                     )
                     audit_branch_tensor(
-                        "rope.position_ids",
-                        "gen",
-                        packed_position_ids[Lund:],
-                        layer_number=1,
+                        "rope.position_ids", "gen", packed_position_ids[Lund:], layer_number=1
                     )
                 if self.bagel_native_rope_for_alignment:
                     rope_reference = decoder_input
                     if rope_reference is None:
                         rope_reference = torch.empty(
-                            (),
-                            dtype=self.config.params_dtype,
-                            device=packed_position_ids.device,
+                            (), dtype=self.config.params_dtype, device=packed_position_ids.device
                         )
                     rotary_pos_cos, rotary_pos_sin = (
                         self.rotary_pos_emb.forward_qwen_with_position_ids(
@@ -426,10 +418,7 @@ class BagelMCoreModel(GPTModel):
                     )
                     if layer_alignment_audit_enabled(1):
                         audit_branch_tensor(
-                            "rope.inv_freq",
-                            "all",
-                            self.rotary_pos_emb.inv_freq,
-                            layer_number=1,
+                            "rope.inv_freq", "all", self.rotary_pos_emb.inv_freq, layer_number=1
                         )
                         print(
                             "[BAGEL_ROPE_ALIGNMENT_AUDIT] "
@@ -443,12 +432,8 @@ class BagelMCoreModel(GPTModel):
                             ("rope.cos", rotary_pos_cos),
                             ("rope.sin", rotary_pos_sin),
                         ):
-                            audit_branch_tensor(
-                                stage, "und", tensor[:Lund], layer_number=1
-                            )
-                            audit_branch_tensor(
-                                stage, "gen", tensor[Lund:], layer_number=1
-                            )
+                            audit_branch_tensor(stage, "und", tensor[:Lund], layer_number=1)
+                            audit_branch_tensor(stage, "gen", tensor[Lund:], layer_number=1)
                 else:
                     rotary_pos_emb = self.rotary_pos_emb.forward_with_position_ids(
                         packed_position_ids
