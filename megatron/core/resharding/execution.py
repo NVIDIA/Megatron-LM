@@ -93,7 +93,7 @@ def _get_quantized_accumulator(pending: dict[int, tuple], dst_param: torch.Tenso
     return entry[1]
 
 
-def _quantized_load_context(module: torch.nn.Module | None, pending: dict[int, tuple]):
+def _native_gtp_load_context(module: torch.nn.Module | None, pending: dict[int, tuple]):
     """Return the special update context required by native quantized GTP params."""
     if module is None or not any(
         getattr(param, "is_gtp_weight_remat", False) for param, _buffer in pending.values()
@@ -287,7 +287,7 @@ def execute_reshard_plan(
 
     # Finalize deferred quantized param updates.
     had_quantized_staging = bool(pending_quantized)
-    with _quantized_load_context(dst_module, pending_quantized), torch.no_grad():
+    with _native_gtp_load_context(dst_module, pending_quantized), torch.no_grad():
         for dst_param, full_bf16 in pending_quantized.values():
             dst_param.quantize_(full_bf16)
     pending_quantized.clear()

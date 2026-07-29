@@ -53,11 +53,12 @@ class ParameterMetadata:
     # interleaves these blocks rather than doing a simple contiguous concat.
     partition_sizes: list[int] | None = None
 
-    # GTP weight-rematerialization sharding info. GTP always shards dim 0
-    # after any TP-local layout has been formed. ``gtp_pad_length`` is the
-    # number of alignment-only rows at the tail of that TP-local layout.
+    # GTP always shards dim 0 after any TP-local layout has been formed.
     is_gtp: bool = False
+    # Ordered global ranks that own contiguous dim-0 shards. The list position
+    # determines each owner's GTP rank and therefore its shard offset.
     gtp_remat_group_ranks: list[int] | None = None
+    # Alignment-only rows at the tail of the TP-local layout.
     gtp_pad_length: int = 0
 
     # EP sharding info (fused/grouped MoE)

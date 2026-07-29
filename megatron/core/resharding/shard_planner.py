@@ -111,15 +111,15 @@ def _local_segments(metadata: ParameterMetadata, dim: int) -> list[_Segment]:
     shard = _dimension_shard(metadata, dim)
     segments = []
     for tp_segment in _tp_segments(metadata, dim, shard.tp_local_size):
-        tp_stop = tp_segment.local_start + tp_segment.length
-        start = max(shard.tp_local_start, tp_segment.local_start)
-        stop = min(shard.tp_local_stop, tp_stop)
-        if start < stop:
+        tp_segment_stop = tp_segment.local_start + tp_segment.length
+        tp_local_start = max(shard.tp_local_start, tp_segment.local_start)
+        tp_local_stop = min(shard.tp_local_stop, tp_segment_stop)
+        if tp_local_start < tp_local_stop:
             segments.append(
                 _Segment(
-                    start - shard.tp_local_start,
-                    tp_segment.global_start + start - tp_segment.local_start,
-                    stop - start,
+                    tp_local_start - shard.tp_local_start,
+                    tp_segment.global_start + tp_local_start - tp_segment.local_start,
+                    tp_local_stop - tp_local_start,
                 )
             )
     return segments
@@ -142,7 +142,11 @@ def _global_shape(metadata: ParameterMetadata) -> tuple[int, ...]:
 def _source_shards(
     all_src_metadata: list[ParameterMetadata], selected: ParameterMetadata
 ) -> list[ParameterMetadata]:
-    """Find the TP x GTP shard grid containing the selected source replica."""
+    """Find the TP x GTP shard grid containing the selected source replica.
+
+    Walking both groups transitively finds the grid without assuming a
+    particular global rank layout.
+    """
     by_rank = {metadata.owner_rank: metadata for metadata in all_src_metadata}
     pending = [selected.owner_rank]
     ranks = {selected.owner_rank}
@@ -163,7 +167,7 @@ def _source_shards(
     return [by_rank[rank] for rank in sorted(ranks)]
 
 
-def _overlap(
+def _intersect_segments(
     src_segments: list[_Segment], dst_segments: list[_Segment]
 ) -> list[tuple[slice, slice]]:
     """Intersect two segment lists in logical global coordinates."""
@@ -207,9 +211,11 @@ def plan_sharded_transfer(
     dst_shape = _global_shape(dst_metadata)
     dst_segments = [_local_segments(dst_metadata, dim) for dim in range(len(dst_metadata.shape))]
 
-    expected = math.prod(sum(segment.length for segment in segments) for segments in dst_segments)
+    expected_elements = math.prod(
+        sum(segment.length for segment in segments) for segments in dst_segments
+    )
 
-    transferred = 0
+    transferred_elements = 0
     ops = []
     for src in src_shards:
         src_shape = _global_shape(src)
@@ -220,7 +226,7 @@ def plan_sharded_transfer(
             )
 
         overlaps_by_dim = [
-            _overlap(_local_segments(src, dim), dst_segments[dim])
+            _intersect_segments(_local_segments(src, dim), dst_segments[dim])
             for dim in range(len(dst_metadata.shape))
         ]
         for rectangle in product(*overlaps_by_dim):
@@ -228,12 +234,13 @@ def plan_sharded_transfer(
             dst_slice = tuple(slices[1] for slices in rectangle)
             if any(_rectangles_overlap(dst_slice, op[2]) for op in ops):
                 raise RuntimeError(f"{param_name}: overlapping destination coverage")
-            transferred += math.prod(part.stop - part.start for part in dst_slice)
+            transferred_elements += math.prod(part.stop - part.start for part in dst_slice)
             ops.append((src.owner_rank, src_slice, dst_slice))
 
-    if transferred != expected:
+    if transferred_elements != expected_elements:
         raise RuntimeError(
-            f"{param_name}: covered {transferred} of {expected} destination elements "
+            f"{param_name}: covered {transferred_elements} of {expected_elements} "
+            "destination elements "
             f"from source ranks {[metadata.owner_rank for metadata in src_shards]}"
         )
 
