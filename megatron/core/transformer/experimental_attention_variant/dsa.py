@@ -26,7 +26,9 @@ from megatron.core.transformer.experimental_attention_variant import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import dsa_mark_begin, dsa_mark_end, get_pg_size
+
+
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -1795,6 +1797,7 @@ class DSAttention(MegatronModule):
                     "DSA sequence-parallel query row count mismatch: "
                     f"query_rows={sq}, local_rows={local_sequence_rows}, tp_size={tp_size}"
                 )
+        dsa_mark_begin("dsa.pre.cp_metadata")
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         packed_query_positions = None
         nonpacked_query_positions = None
@@ -1860,6 +1863,8 @@ class DSAttention(MegatronModule):
             _validate_nonpacked_cp_uniform_length(
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
+        dsa_mark_end("dsa.pre.cp_metadata")
+        dsa_mark_begin("dsa.pre.cp_gather")
 
         if sequence_parallel_tp:
             if key.size(0) == local_sequence_rows:
@@ -1944,6 +1949,7 @@ class DSAttention(MegatronModule):
                         )
                     value = value.index_select(0, kv_reorder_idx)
 
+        dsa_mark_end("dsa.pre.cp_gather")
         skv = key.size(0)
 
         if not packed_thd and sequence_parallel_query_is_local:
@@ -2059,7 +2065,9 @@ class DSAttention(MegatronModule):
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
+                dsa_mark_begin("dsa.indexer.qk_proj")
                 q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                dsa_mark_end("dsa.indexer.qk_proj")
                 if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                     if kv_reorder_idx is None:
                         kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
@@ -2170,6 +2178,7 @@ class DSAttention(MegatronModule):
         fused_bounds = None
         if use_fused_kernels and computes_topk:
             assert q is not None
+            dsa_mark_begin("dsa.pre.mask_bounds")
             fused_bounds = dsa_masking.build_fused_indexer_varlen_bounds(
                 sq=sq,
                 skv=skv,
@@ -2179,6 +2188,7 @@ class DSAttention(MegatronModule):
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
             )
+            dsa_mark_end("dsa.pre.mask_bounds")
 
         indexer_loss = None
 
@@ -2310,6 +2320,7 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        dsa_mark_begin("dsa.sparse_attn")
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,
@@ -2325,6 +2336,7 @@ class DSAttention(MegatronModule):
             varlen_ends=varlen_ends,
             key_positions=key_positions,
         )
+        dsa_mark_end("dsa.sparse_attn")
 
         if use_indexer_loss:
             if indexer_loss is None:
