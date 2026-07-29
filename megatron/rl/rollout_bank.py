@@ -43,17 +43,15 @@ already trained through the resumed checkpoint step ``T``:
     no marker   -> restore (never consumed, or lost in the kill)
 """
 
-import glob
 import hashlib
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from typing import Iterator, Literal, NamedTuple, NotRequired, Optional, TypedDict
 
 import numpy as np
 
-if TYPE_CHECKING:  # avoid an import cycle: api.py imports nothing from here
-    from megatron.rl.agent.api import RolloutGroup
+from megatron.rl.types import Rollout, RolloutGroup, TokenRollout
 
 logger = logging.getLogger(__name__)
 
@@ -73,17 +71,86 @@ _LOGPROBS_BIN = "logprobs.bin"
 _MASKS_BIN = "masks.bin"
 
 
+class SidecarMeta(TypedDict):
+    """
+    Where one record's packed array lives in its sidecar .bin file.
+
+    Args:
+        offset: The offset of the packed array in the sidecar .bin file.
+        bytes: The number of bytes in the packed array.
+        lengths: The lengths of the packed array. This is a list of lists, where the inner list is the lengths of the turns in the member.
+    """
+
+    offset: int
+    bytes: int
+    lengths: list[list[int]]  # [member][turn] token counts
+
+
+class LedgerRecord(TypedDict):
+    """
+    One self-describing JSONL index record for a completed group.
+
+    Args:
+        uid: The unique identifier of the group.
+        collection_iter: The iteration number of the collection.
+        member_type: The type of the member. This is the type of the rollouts in the group.
+        kind: How the group is stored. "inline" if the group is not token-typed, "token" if the group is token-typed.
+        group: The group of rollouts.
+        tok: The token meta. This is only present if the group is token-typed.
+        lp: The logprob meta. This is only present if the group is token-typed and logprobs are present.
+        mask: The mask meta. This is only present if the group is token-typed and generation_mask is present.
+        checksum: The checksum of the group.
+    """
+
+    uid: str
+    collection_iter: int
+    member_type: Literal["Rollout", "TokenRollout"]
+    kind: Literal["inline", "token"]
+    group: dict
+    tok: NotRequired[SidecarMeta]
+    lp: NotRequired[SidecarMeta]
+    mask: NotRequired[SidecarMeta]
+    checksum: NotRequired[str]
+
+
+class Manifest(TypedDict):
+    """
+    Bank-level index: how far training got and which segments exist.
+
+    Args:
+        trained_through: The iteration number of the last checkpoint.
+        segments: The list of segment names (e.g. ["gen-000000", "gen-000001"]).
+        compacted_at: The iteration number of the last compaction.
+    """
+
+    trained_through: int
+    segments: list[str]
+    compacted_at: int
+
+
+class ConsumedMarker(TypedDict):
+    """Append-only marker: a group uid was pulled by the trainer at ``iter``."""
+
+    uid: str
+    iter: int
+
+
+class EncodedGroup(NamedTuple):
+    """Ledger record and packed sidecar payloads for one rollout group."""
+
+    record: LedgerRecord
+    tok_bytes: bytes
+    lp_bytes: bytes
+    mask_bytes: bytes
+
+
 def _segment_name(iteration: int) -> str:
+    """Generate a segment name for a given iteration."""
     return f"gen-{iteration:06d}"
 
 
 def _checksum(record_wo_checksum: dict, *slices: bytes) -> str:
-    """Digest over the canonical index record plus its raw sidecar slices.
-
-    Covering the sidecar bytes (not just the JSON) means a kill between a sidecar
-    write and the ledger append can never leave a surviving index record pointing
-    at half-written binary: the mismatch is caught and the record dropped.
-    """
+    """Digest over the canonical index record plus its raw sidecar slices."""
     h = hashlib.blake2b(digest_size=16)
     h.update(json.dumps(record_wo_checksum, sort_keys=True, separators=(",", ":")).encode())
     for s in slices:
@@ -120,14 +187,15 @@ class RolloutBank:
     def _manifest_path(self) -> str:
         return os.path.join(self.bank_dir, _MANIFEST)
 
-    def _read_manifest(self) -> dict:
+    def _read_manifest(self) -> Manifest:
         try:
             with open(self._manifest_path) as f:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
+            logger.warning(f"Manifest file not found at {self._manifest_path}; creating new one.")
             return {"trained_through": 0, "segments": [], "compacted_at": 0}
 
-    def _write_manifest_atomic(self, manifest: dict) -> None:
+    def _write_manifest_atomic(self, manifest: Manifest) -> None:
         tmp = self._manifest_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(manifest, f)
@@ -142,14 +210,14 @@ class RolloutBank:
             return
         self._close_handles()
         self._collection_iter = iteration
-        self._seg_dir = os.path.join(self.bank_dir, _segment_name(iteration))
+        seg = _segment_name(iteration)
+        self._seg_dir = os.path.join(self.bank_dir, seg)
         os.makedirs(self._seg_dir, exist_ok=True)
         self._seq = 0
         self._tok_off = self._file_size(_TOKENS_BIN)
         self._lp_off = self._file_size(_LOGPROBS_BIN)
         self._mask_off = self._file_size(_MASKS_BIN)
         manifest = self._read_manifest()
-        seg = _segment_name(iteration)
         if seg not in manifest["segments"]:
             manifest["segments"].append(seg)
             self._write_manifest_atomic(manifest)
@@ -172,7 +240,7 @@ class RolloutBank:
         """Write-through one completed group; return its stable uid.
 
         The uid is assigned here and attached to the group by the caller
-        (``stage_assemble``) so the consume side can mark it consumed.
+        so the consume side can mark it consumed.
         """
         assert self._seg_dir is not None, "set_collection() must be called before append()"
         uid = f"{_segment_name(self._collection_iter)}/{self._seq}"
@@ -205,39 +273,41 @@ class RolloutBank:
         f.flush()
         os.fsync(f.fileno())
 
-    def _append_ledger(self, record: dict) -> None:
+    def _append_ledger(self, record: LedgerRecord) -> None:
         if self._ledger_f is None:
             self._ledger_f = open(os.path.join(self._seg_dir, _LEDGER), "a")
         self._ledger_f.write(json.dumps(record, separators=(",", ":")) + "\n")
         self._ledger_f.flush()
         os.fsync(self._ledger_f.fileno())
 
-    # ---------------------------------------------------------------- encode
-    def _encode(self, group: "RolloutGroup", uid: str):
+    def _encode(self, group: "RolloutGroup", uid: str) -> EncodedGroup:
         """Build the JSONL index record + packed sidecar bytes for one group.
-
-        A group is homogeneous. Token-typed groups move their per-token arrays to
-        sidecars; anything else (text ``Rollout``) is stored inline (it has no
-        large per-token arrays).
         """
+        assert self._collection_iter is not None, "set_collection() must be called before _encode()"
         dumped = group.model_dump()
         dumped.pop("uid", None)  # uid lives at the top level of the record
         members = dumped.get("rollouts", [])
         member_type = type(group.rollouts[0]).__name__ if group.rollouts else "Rollout"
 
-        base = {"uid": uid, "collection_iter": self._collection_iter, "member_type": member_type}
-
+        # if the member type is TokenRollout and all the rollouts are token-typed, then set token_typed to True
         token_typed = member_type == "TokenRollout" and all(
             "trajectory" in m and m["trajectory"] and isinstance(m["trajectory"][0], list)
             for m in members
         )
+
         if not token_typed:
-            base.update(kind="inline", group=dumped)
-            return base, b"", b"", b""
+            record: LedgerRecord = {
+                "uid": uid,
+                "collection_iter": self._collection_iter,
+                "member_type": member_type,
+                "kind": "inline",
+                "group": dumped,
+            }
+            return EncodedGroup(record, b"", b"", b"")
 
         tok_flat, tok_lengths = [], []
-        lp_flat, lp_lengths, lp_present = [], [], True
-        mask_flat, mask_lengths, mask_present = [], [], True
+        lp_flat, lp_lengths = [], []
+        mask_flat, mask_lengths = [], []
         for m in members:
             traj = m.pop("trajectory")
             tok_lengths.append([len(turn) for turn in traj])
@@ -245,61 +315,79 @@ class RolloutBank:
                 tok_flat.extend(turn)
 
             lp = m.pop("logprobs", None)
-            if lp is None:
-                lp_present = False
-            else:
+            if lp is not None:
                 lp_lengths.append([len(turn) for turn in lp])
                 for turn in lp:
                     lp_flat.extend(turn)
 
             mask = m.pop("generation_mask", None)
-            if mask is None:
-                mask_present = False
-            else:
+            if mask is not None:
                 mask_lengths.append([len(turn) for turn in mask])
                 for turn in mask:
                     mask_flat.extend(turn)
 
+        for field, lengths in (("logprobs", lp_lengths), ("generation_mask", mask_lengths)):
+            if lengths and len(lengths) != len(members):
+                raise ValueError(f"{field} must be present for all or no rollouts in a group")
+
         tok_bytes = np.asarray(tok_flat, dtype=_TOKEN_DTYPE).tobytes()
-        base["tok"] = {"offset": self._tok_off, "bytes": len(tok_bytes), "lengths": tok_lengths}
+        record: LedgerRecord = {
+            "uid": uid,
+            "collection_iter": self._collection_iter,
+            "member_type": member_type,
+            "kind": "token",
+            "group": dumped,  # dumped members are now array-stripped
+            "tok": {"offset": self._tok_off, "bytes": len(tok_bytes), "lengths": tok_lengths},
+        }
 
         lp_bytes = b""
-        if lp_present:
+        if lp_lengths:
             lp_bytes = np.asarray(lp_flat, dtype=_LOGPROB_DTYPE).tobytes()
-            base["lp"] = {"offset": self._lp_off, "bytes": len(lp_bytes), "lengths": lp_lengths}
+            record["lp"] = {"offset": self._lp_off, "bytes": len(lp_bytes), "lengths": lp_lengths}
 
         mask_bytes = b""
-        if mask_present:
+        if mask_lengths:
             mask_arr = np.asarray(mask_flat, dtype=bool).astype(_MASK_DTYPE)
             mask_bytes = mask_arr.tobytes()
-            base["mask"] = {"offset": self._mask_off, "bytes": len(mask_bytes), "lengths": mask_lengths}
+            record["mask"] = {"offset": self._mask_off, "bytes": len(mask_bytes), "lengths": mask_lengths}
 
         # Advance running offsets now that this record's slices are placed.
         self._tok_off += len(tok_bytes)
         self._lp_off += len(lp_bytes)
         self._mask_off += len(mask_bytes)
 
-        base.update(kind="token", group=dumped)  # dumped members are now array-stripped
-        return base, tok_bytes, lp_bytes, mask_bytes
+        return EncodedGroup(record, tok_bytes, lp_bytes, mask_bytes)
 
-    # --------------------------------------------------------------- markers
     def mark_consumed(self, uid: str, iteration: int) -> None:
         """Record that ``uid`` was pulled by the trainer at ``iteration``.
 
         Markers are append-only and never deleted (a delete could not be undone;
         a marker can be ignored on restore).
+
+        Args:
+            uid: The unique identifier of the group.
+            iteration: The iteration number of the training.
+
+        Returns:
+            None
+
+        Example:
+            uid = "gen-000000/0"
+            iteration = 100
+            consumed.log:
+                {"uid": "gen-000000/0", "iter": 100}
         """
         if not uid:
             return
         seg = uid.split("/", 1)[0]
         seg_dir = os.path.join(self.bank_dir, seg)
         os.makedirs(seg_dir, exist_ok=True)
+        marker: ConsumedMarker = {"uid": uid, "iter": iteration}
         with open(os.path.join(seg_dir, _CONSUMED), "a") as f:
-            f.write(json.dumps({"uid": uid, "iter": iteration}, separators=(",", ":")) + "\n")
+            f.write(json.dumps(marker, separators=(",", ":")) + "\n")
             f.flush()
             os.fsync(f.fileno())
 
-    # --------------------------------------------------------------- restore
     def restore(self, trained_through: int) -> list["RolloutGroup"]:
         """Replay the ledger and return groups not yet trained through ``T``."""
         self._close_handles()  # flush any active writer before reading
@@ -319,7 +407,29 @@ class RolloutBank:
         return restored
 
     def _read_markers(self, seg_dir: str) -> dict:
-        """uid -> latest (max) consumed iteration for this segment."""
+        """
+        Load consumption markers for a segment.
+        A marker records that the trainer pulled a group (``uid``) at some
+        training iteration (``iter``). Markers live as append-only JSONL in
+        ``consumed.log`` and are never deleted; this method collapses them to
+        ``uid -> latest (max) consumed iteration`` for ``restore``.
+
+        Args:
+            seg_dir: The directory of the segment.
+
+        Returns:
+            A dictionary of {uid: latest (max) consumed iteration for this segment}.
+
+        Example:
+            seg_dir = "gen-000000"
+            consumed.log:
+                {"uid": "gen-000000/0", "iter": 100}
+                {"uid": "gen-000000/1", "iter": 101}
+                {"uid": "gen-000000/0", "iter": 105}
+            return:
+                {"gen-000000/0": 105, "gen-000000/1": 101}
+        """
+
         markers: dict[str, int] = {}
         path = os.path.join(seg_dir, _CONSUMED)
         if not os.path.exists(path):
@@ -332,13 +442,25 @@ class RolloutBank:
                 try:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
-                    continue  # torn final marker
-                uid, it = rec.get("uid"), rec.get("iter")
-                if uid is not None and it is not None:
-                    markers[uid] = max(markers.get(uid, it), it)
+                    logger.debug(f"Invalid JSON in {path}: {line}")
+                    continue
+                uid, iter = rec.get("uid"), rec.get("iter")
+                if uid is not None and iter is not None:
+                    markers[uid] = max(markers.get(uid, iter), iter)
         return markers
 
-    def _read_ledger(self, seg_dir: str):
+    def _read_ledger(self, seg_dir: str) -> Iterator[LedgerRecord]:
+        """
+        Read the ledger for a segment and yield the ledger records.
+        The ledger is a JSONL file that contains the ledger records for the segment.
+        Each line is a JSON object.
+
+        Args:
+            seg_dir: The directory of the segment.
+
+        Returns:
+            An iterator of ledger records.
+        """
         path = os.path.join(seg_dir, _LEDGER)
         if not os.path.exists(path):
             return
@@ -350,22 +472,32 @@ class RolloutBank:
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError:
+                    logger.debug(f"Invalid JSON in {path}: {line}")
                     continue  # torn final record from a mid-append kill
 
-    def _decode(self, record: dict, seg_dir: str) -> Optional["RolloutGroup"]:
-        from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
+    def _decode(self, record: LedgerRecord, seg_dir: str) -> Optional["RolloutGroup"]:
+        """
+        Decode a ledger record into a RolloutGroup.
+        Args:
+            record: The ledger record to decode.
+            seg_dir: The directory of the segment.
 
+        Returns:
+            A RolloutGroup or None if the record is corrupted or truncated.
+        """
         tok_bytes = self._read_slice(seg_dir, _TOKENS_BIN, record.get("tok"))
         lp_bytes = self._read_slice(seg_dir, _LOGPROBS_BIN, record.get("lp"))
         mask_bytes = self._read_slice(seg_dir, _MASKS_BIN, record.get("mask"))
         if tok_bytes is None or lp_bytes is None or mask_bytes is None:
-            return None  # a sidecar slice was short (truncated) — drop this record
+            logger.debug(f"Sidecar slice was short (truncated) — dropping record: {record}")
+            return None
 
         expected = _checksum(
             {k: v for k, v in record.items() if k != "checksum"}, tok_bytes, lp_bytes, mask_bytes
         )
         if expected != record.get("checksum"):
-            return None  # corrupt / torn — drop
+            logger.debug(f"Checksum mismatch — dropping record: {record}")
+            return None
 
         group_dict = record["group"]
         uid = record["uid"]
@@ -408,7 +540,7 @@ class RolloutBank:
         return group
 
     @staticmethod
-    def _read_slice(seg_dir: str, name: str, meta: Optional[dict]) -> Optional[bytes]:
+    def _read_slice(seg_dir: str, name: str, meta: Optional[SidecarMeta]) -> Optional[bytes]:
         """Return the record's sidecar bytes, or None if the slice is truncated."""
         if not meta:
             return b""
@@ -432,7 +564,6 @@ class RolloutBank:
             out.append(turns)
         return out
 
-    # ------------------------------------------------------- compaction / GC
     def checkpoint(self, iteration: int) -> None:
         """Compact survivors into a fresh segment and atomically flip the manifest.
 

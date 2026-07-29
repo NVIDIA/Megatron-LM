@@ -15,11 +15,21 @@ import os
 import numpy as np
 import pytest
 
+from megatron.rl import rollout_bank
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.rollout_bank import _LEDGER, _MANIFEST, _TOKENS_BIN, RolloutBank, _segment_name
+from megatron.rl.types import Rollout as SharedRollout
+from megatron.rl.types import RolloutGroup as SharedRolloutGroup
+from megatron.rl.types import TokenRollout as SharedTokenRollout
 
 # Reuse the pipeline mocks so the integration test drives the real pipeline.
 from tests.unit_tests.rl.test_grouped_rollouts import MockGenerator, MockInferenceInterface
+
+
+def test_agent_api_reexports_shared_rollout_types():
+    assert SharedRollout is Rollout
+    assert SharedRolloutGroup is RolloutGroup
+    assert SharedTokenRollout is TokenRollout
 
 
 def make_token_group(members, *, batch_id=0, index_in_batch=0):
@@ -67,6 +77,19 @@ def text_group():
 
 
 class TestRoundTrip:
+    def test_encode_returns_named_payload(self, tmp_path):
+        assert hasattr(rollout_bank, "EncodedGroup")
+
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(3)
+        encoded = bank._encode(sample_group(), "gen-000003/0")
+
+        assert isinstance(encoded, rollout_bank.EncodedGroup)
+        assert encoded.record["uid"] == "gen-000003/0"
+        assert encoded.tok_bytes
+        assert encoded.lp_bytes
+        assert encoded.mask_bytes
+
     def test_token_group_round_trip(self, tmp_path):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(3)
@@ -110,6 +133,16 @@ class TestRoundTrip:
         g = RolloutBank(str(tmp_path)).restore(0)[0]
         assert g.rollouts[0].trajectory[0] == toks  # int32 exact
         assert np.allclose(g.rollouts[0].logprobs[0], lps, atol=1e-3)
+
+    @pytest.mark.parametrize("field", ["logprobs", "generation_mask"])
+    def test_mixed_optional_field_presence_is_rejected(self, tmp_path, field):
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        group = sample_group()
+        setattr(group.rollouts[1], field, None)
+
+        with pytest.raises(ValueError, match=f"{field} must be present for all or no rollouts"):
+            bank.append(group)
 
 
 class TestDurability:

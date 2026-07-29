@@ -13,6 +13,7 @@ from megatron.rl.agent.api import (
     GroupRolloutParams,
     Rollout,
     RolloutGenerator,
+    RolloutGroup,
     RolloutRequest,
     _SubmissionGate,
 )
@@ -85,6 +86,14 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
             )
 
         return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
+
+
+def test_grouped_rollout_generator_initializes_rollout_bank():
+    assert MockGenerator()._rollout_bank is None
+
+
+def test_rollout_group_defines_optional_uid():
+    assert RolloutGroup.model_fields["uid"].default is None
 
 
 class CountingRewardAgent(RewardOnlyAgent):

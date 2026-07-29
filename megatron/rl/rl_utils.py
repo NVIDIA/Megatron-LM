@@ -344,9 +344,6 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
-        # Durable rollout bank (rank-0 only). Groups restored from disk at restart
-        # wait here and are injected into collections before any fresh generation;
-        # bank_restored guards the one-shot restore per process.
         self.rollout_bank = None
         self.restored_groups = deque()
         self.bank_restored = False
@@ -762,15 +759,18 @@ def maybe_get_rollout_bank(args):
     """
     global _ROLLOUT_BANK
     if not getattr(args, "rl_durable_rollout_bank", False):
+        logger.debug("Durable rollout bank is disabled; proceeding without it.")
         return None
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        logger.warning(
+            "Durable rollout bank cannot be activated on non-zero ranks; proceeding without it."
+        )
         return None
     if _ROLLOUT_BANK is None:
         from megatron.rl.rollout_bank import RolloutBank
 
         bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
         _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
-        get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(
             logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}"
         )
@@ -933,6 +933,7 @@ def get_environment_rollouts(
                             f"RolloutBank restored {len(runtime_state.restored_groups)} completed "
                             f"groups from disk at resume iteration {args.iteration}",
                         )
+                # Inject restored groups into the collection.
                 take = min(len(runtime_state.restored_groups), n_prompts)
                 inject = [runtime_state.restored_groups.popleft() for _ in range(take)]
             n_fresh = n_prompts - len(inject)
@@ -983,7 +984,7 @@ def get_environment_rollouts(
                     # these; once the checkpoint advances past this step they are pruned.
                     if bank is not None:
                         for group in rollouts:
-                            bank.mark_consumed(getattr(group, "uid", None), args.curr_iteration)
+                            bank.mark_consumed(group.uid, args.curr_iteration)
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]

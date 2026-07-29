@@ -3,10 +3,9 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, Generic, NamedTuple, TypeVar
 
 import numpy as np
-from pydantic import BaseModel
 
 from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
@@ -19,17 +18,18 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-from ..inflight_tracker import add_inflight, remove_inflight
-from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
+from ..rollout_bank import RolloutBank
+from ..rollout_granularity import (
+    RELEASE_STATE_BY_SUBMISSION,
+    ConsumptionGranularity,
+    ReleaseState,
+    SubmissionGranularity,
+)
+from ..types import AgentBaseModel, Rollout, RolloutGroup, TokenRollout
 
-if TYPE_CHECKING:
-    from ..rollout_bank import RolloutBank
 
-
-class AgentBaseModel(BaseModel, extra='allow'):
-    pass
-
-
+# TODO: Move these models to ``megatron.rl.types`` after moving ``Request``,
+# ``InferenceInterface``, and their dependencies there to avoid circular imports.
 class RolloutRequest(Request):
     """Request to agent to generate Rollouts."""
 
@@ -49,60 +49,6 @@ class GroupedRolloutRequest(Request):
     streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
-
-
-class Rollout(AgentBaseModel):
-    """Data for language-based Rollout."""
-
-    trajectory: list[str]
-    prompt_length: list[int] | None = None
-    reward: float = None
-    env_id: str = ''
-    problem_id: str | None = None
-    policy_epoch: list[list[tuple[int, int]]]
-    kv_cache_epoch: list[list[tuple[int, int]]]
-    num_evictions: list[int]
-
-
-class TokenRollout(AgentBaseModel):
-    """Tokenized representation of a language-based Rollout."""
-
-    trajectory: list[list[int]]
-    reward: list[float] | float
-    generation_mask: list[list[bool]] | None = None
-    logprobs: list[list[float]] | None = None
-    env_id: str = ''
-    problem_id: str | None = None
-    policy_epoch: list[list[tuple[int, int]]]
-    kv_cache_epoch: list[list[tuple[int, int]]]
-    num_evictions: list[int]
-    # When set, replaces this rollout's group-normalized advantage with a fixed
-    # value (e.g. -5.0 for format violations such as tool-call syntax emitted as
-    # plain text). Applied after group normalization in calculate_grpo_advantages.
-    advantage_override: float | None = None
-
-
-Rollouts = list[TokenRollout | Rollout]
-
-
-class RolloutGroup(AgentBaseModel):
-    """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
-
-    rollouts: Rollouts
-    batch_id: int = 0
-    index_in_batch: int = 0
-
-    def __iter__(self):
-        return iter(self.rollouts)
-
-    def __len__(self):
-        return len(self.rollouts)
-
-    def __getitem__(self, idx):
-        return self.rollouts[idx]
-
-
-GroupedRollouts = list[RolloutGroup]
 
 
 class GroupRolloutParams(NamedTuple):
@@ -305,7 +251,7 @@ class _RolloutPipeline:
         agent: "GroupedRolloutGenerator",
         request: GroupedRolloutRequest,
         parallel_generation_tasks: int,
-        bank: "RolloutBank | None" = None,
+        bank: RolloutBank | None = None,
     ) -> None:
         self.agent = agent
         self.request = request
@@ -472,10 +418,6 @@ class _RolloutPipeline:
                         batch_id=first.item.batch_id,
                         index_in_batch=first.item.index_in_batch,
                     )
-                    # Write-through: the completed group hits durable storage the
-                    # instant it exists, before it is queued for the trainer. The
-                    # returned uid rides on the group so the consume side can mark
-                    # it consumed. Rank-0 single writer (only rank 0 runs the pipeline).
                     if self.bank is not None:
                         group.uid = self.bank.append(group)
                     await self.output_queue.put(group)
@@ -535,6 +477,7 @@ class GroupedRolloutGenerator(Agent, ABC):
 
     def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
         super().__init__(**kwargs)
+        self._rollout_bank = None
         if parallel_generation_tasks is not None:
             self.parallel_generation_tasks = parallel_generation_tasks
 
@@ -561,9 +504,7 @@ class GroupedRolloutGenerator(Agent, ABC):
             agent=self,
             request=request,
             parallel_generation_tasks=self.parallel_generation_tasks,
-            # Set by rl_utils on rank 0 when --rl-durable-rollout-bank is enabled;
-            # absent (None) otherwise, so this is a no-op for existing runs.
-            bank=getattr(self, "_rollout_bank", None),
+            bank=self._rollout_bank,
         )
         # Expose the live pipeline for observability; rl_utils reads its
         # queue sizes, gate state, and timing accumulators during logging.
