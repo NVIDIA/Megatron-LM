@@ -181,7 +181,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
 
         out = torch.zeros_like(x[0, :prefill_len])
         seq_idx = torch.zeros(len(chunk_boundaries) - 1, dtype=torch.int32, device=self.device)
-        chunk_states = mamba_chunk_scan_combined_varlen(
+        _, chunk_states = mamba_chunk_scan_combined_varlen(
             x=x[0, :prefill_len],
             dt=dt[0, :prefill_len],
             A=self.A,
@@ -196,7 +196,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
             z=None,
             dt_bias=self.dt_bias,
             initial_states=initial_states,
-            return_intermediate_states=True,
+            return_raw_states=True,
             dt_softplus=True,
             dt_limit=(0.0, float("inf")),
             state_dtype=torch.float32,
