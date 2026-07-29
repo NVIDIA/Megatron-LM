@@ -18,10 +18,12 @@ from megatron.core.ssm.gated_delta_net.common import (
     torch_chunk_gated_delta_rule,
 )
 from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net.gdn2 import GatedDeltaNet2
 
 __all__ = [
     "HAVE_FLA",
     "GatedDeltaNet",
+    "GatedDeltaNet2",
     "GatedDeltaNetSubmodules",
     "causal_conv1d",
     "chunk_gated_delta_rule",

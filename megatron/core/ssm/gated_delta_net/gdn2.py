@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
-from megatron.core.ssm.gdn.gdn_common import _GDNBase
+from megatron.core.ssm.gated_delta_net.common import BaseInferenceContext, PackedSeqParams, _GDNBase
 
 try:
     # The GDN2 kernel is only available in flash-linear-attention >= 0.5.1.
@@ -125,3 +125,17 @@ class GatedDeltaNet2(_GDNBase):
             b = b.repeat_interleave(repeat_factor, dim=2)
 
         return g, {"b": b.contiguous(), "w": w.contiguous()}
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: BaseInferenceContext | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        sequence_len_offset: int | None = None,
+        *,
+        inference_params: BaseInferenceContext | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward logic for GDN2"""
+        pass
