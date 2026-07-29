@@ -6,6 +6,8 @@ import math
 import os
 import random
 import types
+from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Tuple
@@ -32,7 +34,12 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
-from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
+    Status,
+    compute_block_hashes_batched,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -40,6 +47,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
@@ -618,6 +626,121 @@ class DynamicInferenceEngineTestBase:
         env.mem_usage["end"] = torch.cuda.memory_stats()
 
         return env
+
+
+def _make_prefix_cached_request_for_checkpoint(request_id: int) -> DynamicInferenceRequest:
+    """Build a request whose generated tokens complete one additional cache block."""
+    return DynamicInferenceRequest(
+        request_id=request_id,
+        prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=6, termination_id=-1),
+        generated_tokens=[5, 6],
+        block_size_tokens=2,
+        enable_prefix_caching=True,
+    )
+
+
+def _assert_prefix_cache_checkpoint(
+    original: DynamicInferenceRequest, checkpointed: DynamicInferenceRequest
+) -> None:
+    """Verify a checkpoint retained config and rehashed its expanded prompt."""
+    expected_prompt = torch.cat(
+        (
+            original.prompt_tokens,
+            torch.tensor(
+                original.generated_tokens,
+                dtype=original.prompt_tokens.dtype,
+                device=original.prompt_tokens.device,
+            ),
+        )
+    )
+    expected_hashes = compute_block_hashes_batched(
+        expected_prompt, block_size=original.block_size_tokens
+    )
+
+    assert checkpointed.enable_prefix_caching is True
+    assert checkpointed.block_size_tokens == original.block_size_tokens
+    assert torch.equal(checkpointed.prompt_tokens, expected_prompt)
+    assert torch.equal(checkpointed.remaining_prompt_tokens, expected_prompt)
+    assert checkpointed.precomputed_block_hashes == expected_hashes
+    assert len(checkpointed.precomputed_block_hashes) == len(original.precomputed_block_hashes) + 1
+
+
+def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes():
+    """Eviction must checkpoint and requeue a prefix-enabled request without losing its config."""
+    request = _make_prefix_cached_request_for_checkpoint(request_id=17)
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1, kv_block_allocator=types.SimpleNamespace()
+    )
+    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    engine.waiting_request_ids = deque()
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+
+    active_request_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.empty(0, dtype=torch.int64),
+        finished_request_ids=torch.empty(0, dtype=torch.int64),
+        evict_request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        step_time=0.0,
+        sample=torch.empty(0, dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[],
+    )
+
+    assert active_request_ids == []
+    assert finished_records == []
+    assert list(engine.waiting_request_ids) == [request.request_id]
+    assert len(record.requests) == 2
+    _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
+
+
+def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
+    """RECOMPUTE suspend/resume must re-add the prefix-enabled checkpoint tail."""
+    request = _make_prefix_cached_request_for_checkpoint(request_id=23)
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+    )
+    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    engine.waiting_request_ids = deque()
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine._add_request = mock.Mock()
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+
+    with (
+        mock.patch.object(
+            DynamicInferenceEngine,
+            "suspend_resume_ctx",
+            side_effect=lambda *args, **kwargs: nullcontext(),
+        ),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        engine.suspend()
+        checkpointed = engine.get_request(request.request_id)
+        _assert_prefix_cache_checkpoint(request, checkpointed)
+
+        engine.resume()
+
+    assert engine.context.deallocate_inference_state_buffers.call_count == 1
+    assert engine.context.reinitialize_inference_state_buffers.call_count == 1
+    assert engine.state == EngineState.RUNNING
+    assert engine._add_request.call_count == 1
+    assert engine._add_request.call_args.args[0] is checkpointed
 
 
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
