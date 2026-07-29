@@ -12,7 +12,6 @@ without CUDA graphs) and compared:
   2. context.using_cuda_graph_this_step() returned True at expected steps.
 """
 
-import os
 import random
 import types
 
@@ -44,7 +43,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 BLOCK_SIZE = 256
 VOCAB_SIZE = 10000
@@ -323,6 +322,11 @@ class TestHybridChunkedPrefillIntermediateState:
     @classmethod
     def setup_class(cls):
         Utils.initialize_model_parallel()
+        random.seed(123)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
 
     @classmethod
     def teardown_class(cls):
@@ -450,16 +454,7 @@ class TestHybridChunkedPrefillIntermediateState:
         if not sequence_packing_available:
             pytest.skip(reason)
 
-        # Clear NVTE env vars set by conftest set_env fixture.
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
-
-        random.seed(123)
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
-        )
+        clear_nvte_env_vars()  # conftest's set_env fixture re-sets these per test
 
         model = self._create_hybrid_model()
         mamba_config = MambaInferenceStateConfig.from_model(model)
@@ -541,3 +536,50 @@ class TestHybridChunkedPrefillIntermediateState:
                 f"req {req_id}: baseline {baseline_outputs[req_id]} != "
                 f"test {test_outputs[req_id]}"
             )
+
+    @torch.inference_mode()
+    def test_prefill_shorter_than_conv_window(self):
+        """A prefill captured into a CUDA graph whose token bucket is smaller than the
+        Mamba conv window (d_conv) generates correctly.
+
+        Conv-state extraction gathers d_conv positions per slot, and unused slots use
+        abs_position == d_conv (gather indices up to d_conv-1). The CUDA-graph bucket
+        list always includes a size-1 (tp_size) graph, so a prompt shorter than d_conv
+        is captured at a bucket whose token layout is shorter than the gather window.
+        CUDA graphs (num_cuda_graphs) are required to exercise this capture path.
+        """
+        sequence_packing_available, reason = _check_mamba_sequence_packing_support()
+        if not sequence_packing_available:
+            pytest.skip(reason)
+
+        clear_nvte_env_vars()  # conftest's set_env fixture re-sets these per test
+
+        model = self._create_hybrid_model(num_cuda_graphs=2)
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        device = torch.cuda.current_device()
+
+        d_conv = mamba_config.conv_states_shape[-1]
+        if d_conv < 2:
+            pytest.skip(f"d_conv={d_conv} too small to exercise a sub-window prefill")
+
+        # Prompt shorter than the conv window: its prefill chunk snaps to a CUDA-graph
+        # bucket < d_conv, so the captured graph's token layout is < d_conv.
+        engine = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            num_cuda_graphs=2,
+        )
+        short_prompt = torch.arange(0, d_conv - 1, dtype=torch.int64, device=device)
+
+        engine._add_request(self._make_request(0, short_prompt, enable_pc=True))
+        outputs = {}
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            for record in result["finished_request_records"]:
+                merged = record.merge()
+                outputs[merged.request_id] = list(merged.generated_tokens)
+
+        # Generation completes and produces the requested number of tokens.
+        assert len(outputs[0]) == NUM_TOKENS_TO_GENERATE
