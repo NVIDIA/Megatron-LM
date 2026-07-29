@@ -21,22 +21,24 @@ from megatron.core.resharding.refit import _PlanCacheKey
 from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
 
 
+def _config(tp=1, pp=1, ep=1, dp=1, expert_tp=1, gtp=1, expert_gtp=1):
+    return _ParallelConfig(
+        tp_size=tp,
+        pp_size=pp,
+        ep_size=ep,
+        dp_size=dp,
+        expert_tp_size=expert_tp,
+        gtp_size=gtp,
+        expert_gtp_size=expert_gtp,
+    )
+
+
 class TestPlanCacheKey:
     """Plan cache must distinguish configs that route to different global ranks."""
 
     def test_equality_with_same_inputs(self):
-        k1 = _PlanCacheKey(
-            rank=0,
-            src_config=(1, 1, 1, 1, 1, 1, 1),
-            dst_config=(1, 1, 1, 1, 1, 1, 1),
-            num_experts=None,
-        )
-        k2 = _PlanCacheKey(
-            rank=0,
-            src_config=(1, 1, 1, 1, 1, 1, 1),
-            dst_config=(1, 1, 1, 1, 1, 1, 1),
-            num_experts=None,
-        )
+        k1 = _PlanCacheKey(rank=0, src_config=_config(), dst_config=_config(), num_experts=None)
+        k2 = _PlanCacheKey(rank=0, src_config=_config(), dst_config=_config(), num_experts=None)
         assert k1 == k2
         assert hash(k1) == hash(k2)
 
@@ -44,16 +46,16 @@ class TestPlanCacheKey:
         """Same sizes + rank, different src_rank_offset → different cache key."""
         k1 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1, 1, 1),
-            dst_config=(2, 1, 1, 2, 1, 1, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         k2 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1, 1, 1),
-            dst_config=(2, 1, 1, 2, 1, 1, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=8,
             dst_rank_offset=12,
@@ -64,16 +66,16 @@ class TestPlanCacheKey:
     def test_different_dst_rank_offset_distinguishes(self):
         k1 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1, 1, 1),
-            dst_config=(2, 1, 1, 2, 1, 1, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         k2 = _PlanCacheKey(
             rank=0,
-            src_config=(2, 1, 1, 2, 1, 1, 1),
-            dst_config=(2, 1, 1, 2, 1, 1, 1),
+            src_config=_config(tp=2, dp=2),
+            dst_config=_config(tp=2, dp=2),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=8,
@@ -83,15 +85,12 @@ class TestPlanCacheKey:
     def test_default_offsets_match_collocated(self):
         """Collocated callers (no offsets specified) reuse the same plan."""
         k1 = _PlanCacheKey(
-            rank=3,
-            src_config=(2, 1, 1, 4, 1, 1, 1),
-            dst_config=(2, 1, 1, 4, 1, 1, 1),
-            num_experts=None,
+            rank=3, src_config=_config(tp=2, dp=4), dst_config=_config(tp=2, dp=4), num_experts=None
         )
         k2 = _PlanCacheKey(
             rank=3,
-            src_config=(2, 1, 1, 4, 1, 1, 1),
-            dst_config=(2, 1, 1, 4, 1, 1, 1),
+            src_config=_config(tp=2, dp=4),
+            dst_config=_config(tp=2, dp=4),
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=0,
@@ -104,22 +103,16 @@ class TestPlanCacheKey:
         assert k1 != k2
 
     def test_gtp_sizes_distinguish(self):
-        plain = _PlanCacheKey(
-            rank=0,
-            src_config=(2, 1, 1, 2, 1, 1, 1),
-            dst_config=(2, 1, 1, 2, 1, 1, 1),
-            num_experts=None,
-        )
-        gtp = _PlanCacheKey(
-            rank=0,
-            src_config=(2, 1, 1, 2, 1, 4, 2),
-            dst_config=(2, 1, 1, 2, 1, 4, 2),
-            num_experts=None,
-        )
-        assert plain != gtp
+        base = _config(tp=2, dp=2)
+        plain = _PlanCacheKey(rank=0, src_config=base, dst_config=base, num_experts=None)
+
+        for config in (_config(tp=2, dp=2, gtp=4), _config(tp=2, dp=2, expert_gtp=2)):
+            assert plain != _PlanCacheKey(
+                rank=0, src_config=config, dst_config=config, num_experts=None
+            )
 
 
-def test_config_tuple_includes_gtp_sizes():
+def test_parallel_config_includes_gtp_sizes():
     class Group:
         def __init__(self, size):
             self._size = size
@@ -142,7 +135,9 @@ def test_config_tuple_includes_gtp_sizes():
             },
         )()
 
-    assert _get_config_tuple(Core()) == (2, 3, 4, 5, 6, 7, 8)
+    assert _get_parallel_config(Core()) == _config(
+        tp=2, pp=3, ep=4, dp=5, expert_tp=6, gtp=7, expert_gtp=8
+    )
 
 
 class TestPlanCacheKeyNonCollocated:
@@ -155,20 +150,16 @@ class TestPlanCacheKeyNonCollocated:
     def test_source_only_vs_dest_only_distinguish(self):
         """Source-only (dst_config=None) and dest-only (src_config=None) on the
         same global rank must produce different plans."""
-        sizes = (2, 1, 1, 2, 1, 1, 1)
-        src_only = _PlanCacheKey(rank=0, src_config=sizes, dst_config=None, num_experts=None)
-        dst_only = _PlanCacheKey(rank=0, src_config=None, dst_config=sizes, num_experts=None)
+        config = _config(tp=2, dp=2)
+        src_only = _PlanCacheKey(rank=0, src_config=config, dst_config=None, num_experts=None)
+        dst_only = _PlanCacheKey(rank=0, src_config=None, dst_config=config, num_experts=None)
         assert src_only != dst_only
 
     def test_idle_rank_distinguishes_from_active(self):
         """Idle rank (both configs None) is distinct from a rank with either model."""
         idle = _PlanCacheKey(rank=5, src_config=None, dst_config=None, num_experts=None)
-        with_src = _PlanCacheKey(
-            rank=5, src_config=(1, 1, 1, 1, 1, 1, 1), dst_config=None, num_experts=None
-        )
-        with_dst = _PlanCacheKey(
-            rank=5, src_config=None, dst_config=(1, 1, 1, 1, 1, 1, 1), num_experts=None
-        )
+        with_src = _PlanCacheKey(rank=5, src_config=_config(), dst_config=None, num_experts=None)
+        with_dst = _PlanCacheKey(rank=5, src_config=None, dst_config=_config(), num_experts=None)
         assert idle != with_src
         assert idle != with_dst
         assert with_src != with_dst
@@ -176,20 +167,20 @@ class TestPlanCacheKeyNonCollocated:
     def test_non_collocated_offset_combinations(self):
         """src_rank_offset and dst_rank_offset together distinguish non-collocated
         layouts that share parallel sizes."""
-        sizes = (2, 1, 1, 2, 1, 1, 1)
+        config = _config(tp=2, dp=2)
         # Two non-collocated layouts: world=[src 0-3, dst 4-7] vs [src 0-3, dst 8-11].
         layout_a = _PlanCacheKey(
             rank=0,
-            src_config=sizes,
-            dst_config=sizes,
+            src_config=config,
+            dst_config=config,
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=4,
         )
         layout_b = _PlanCacheKey(
             rank=0,
-            src_config=sizes,
-            dst_config=sizes,
+            src_config=config,
+            dst_config=config,
             num_experts=None,
             src_rank_offset=0,
             dst_rank_offset=8,
