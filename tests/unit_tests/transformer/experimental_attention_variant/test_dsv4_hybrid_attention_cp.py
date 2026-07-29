@@ -342,6 +342,11 @@ def _make_dsv4_cp_config(
         apply_rope_fusion=apply_rope_fusion,
         dsa_indexer_precision=dsa_indexer_precision,
         cuda_graph_impl=cuda_graph_impl,
+        thd_max_packed_sequences=(
+            len(_DSV4_CP_RAGGED_PADDED_SEG_LENS)
+            if cuda_graph_impl != "none" and context_parallel_size > 1
+            else None
+        ),
         max_seqlen_per_dp_cp_rank=(
             sum(_DSV4_CP_RAGGED_PADDED_SEG_LENS) // context_parallel_size
             if cuda_graph_impl != "none" and context_parallel_size > 1
