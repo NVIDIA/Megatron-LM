@@ -122,13 +122,13 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
     ((2, 2, 1), (2, 1, 2), (4, 1, 2), (2, 1, 4)),
     ids=("expert-parallel", "expert-tensor-parallel", "tp-larger-than-etp", "etp-larger-than-tp"),
 )
-def test_moe_grad_norm_and_clipping_count_each_logical_gradient_once(
+def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
     tensor_parallel_size: int,
     expert_parallel_size: int,
     expert_tensor_parallel_size: int,
     use_distributed_optimizer: bool,
 ):
-    """Gradient clipping should use each logical parameter's gradient exactly once."""
+    """Gradient norm, clipping, and zero count should include each logical gradient once."""
     if Utils.world_size < 4 or Utils.world_size % 4 != 0:
         pytest.skip("test requires a world size divisible by four")
 
@@ -168,6 +168,7 @@ def test_moe_grad_norm_and_clipping_count_each_logical_gradient_once(
                 lr=0.0,
                 bf16=True,
                 clip_grad=max_norm,
+                log_num_zeros_in_grad=True,
                 use_distributed_optimizer=use_distributed_optimizer,
             ),
             [model],
@@ -175,11 +176,19 @@ def test_moe_grad_norm_and_clipping_count_each_logical_gradient_once(
 
         for param in model.parameters():
             assert hasattr(param, "main_grad")
+            param.main_grad.zero_()
+
+        found_inf = optimizer.prepare_grads()
+        assert not found_inf
+        assert optimizer.count_zeros() == expected_numel
+
+        for param in model.parameters():
             param.main_grad.fill_(1.0)
 
-        update_successful, actual_norm, _ = optimizer.step()
+        update_successful, actual_norm, actual_num_zeros = optimizer.step()
 
         assert update_successful
+        assert actual_num_zeros == 0
         actual_norm_value = (
             actual_norm.item() if isinstance(actual_norm, torch.Tensor) else actual_norm
         )
