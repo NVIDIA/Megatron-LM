@@ -495,7 +495,9 @@ class TopKRouter(Router):
             aux_loss,
             "seq_load_balancing_loss",
             self.tp_cp_group,
-            valid_token_count=local_num_tokens,
+            # local_num_tokens is per-sequence (bsz folded into the expert dim above);
+            # * bsz recovers the micro-batch total, else per-token-loss scaling keeps a 1/MBS.
+            valid_token_count=local_num_tokens * bsz,
         )
         return probs
 
@@ -693,7 +695,11 @@ class TopKRouter(Router):
                 layer_number = self.layer_number
 
             get_moe_metrics_tracker().record(
-                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
+                "z_loss",
+                z_loss / moe_z_loss_coeff,
+                layer_number,
+                num_layers,
+                avg_group=self.tp_dp_cp_group,
             )
         return logits
 

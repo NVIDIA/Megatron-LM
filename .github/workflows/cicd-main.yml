@@ -54,14 +54,14 @@ jobs:
       DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           token: ${{ env.GITHUB_TOKEN }}
 
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Check NVIDIA SSO membership
         id: check-sso
@@ -133,7 +133,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@6a2f81195fd910ae91d3c001d2e32ceb6d82e975 # v1.0.0
 
   configure:
     runs-on: ubuntu-latest
@@ -154,7 +154,7 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       # Resolve a single SHA used by the build, every test job, and every
       # downstream checkout so that the container image, golden values, and
@@ -341,12 +341,12 @@ jobs:
       )
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: 0.7.2
 
@@ -357,7 +357,27 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+
+      - name: Validate updated golden values
+        if: github.event_name == 'merge_group' || (startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push')
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+        run: |
+          BASE_REF="${BASE_REF#refs/heads/}"
+          git fetch origin "$BASE_REF"
+          mapfile -t GOLDEN_VALUES_FILES < <(
+            git diff --name-only --diff-filter=ACMR \
+              --merge-base "origin/$BASE_REF" -- \
+              ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
+          )
+
+          if (( ${#GOLDEN_VALUES_FILES[@]} == 0 )); then
+            echo "No golden value files were updated; skipping validation."
+            exit 0
+          fi
+
+          python3 tools/check_golden_values.py "${GOLDEN_VALUES_FILES[@]}"
 
       - name: Run linting
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
@@ -406,7 +426,7 @@ jobs:
       mbridge-test-suite: ${{ needs.configure.outputs.mbridge_suite }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: How-To
         run: bash .github/scripts/readme.sh
@@ -441,10 +461,10 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout MBridge and create testing branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: main
           repository: NVIDIA-NeMo/Megatron-Bridge
@@ -461,7 +481,7 @@ jobs:
           git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
 
       - name: Trigger MBridge tests
-        uses: convictional/trigger-workflow-and-wait@v1.6.5
+        uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # v1.6.5
         env:
           MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         with:
@@ -497,7 +517,7 @@ jobs:
       && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
     steps:
       - name: Send Slack alert
-        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@main
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@209ac7913b0419a5ccbac47b02d00fbea4939243 # main
         with:
           webhook: ${{ secrets.SLACK_WH_MLM_MB_ALERTS }}
           message: |
@@ -556,15 +576,15 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
       - name: Setup python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: 3.12
 
@@ -627,10 +647,10 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.0.0
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Build and push
-        uses: docker/build-push-action@v7.1.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           file: ${{ steps.base-image.outputs.dockerfile }}
           push: true
@@ -671,7 +691,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
@@ -717,7 +737,7 @@ jobs:
       PIP_RETRIES: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -757,7 +777,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
@@ -805,7 +825,7 @@ jobs:
       PIP_RETRIES: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -896,7 +916,7 @@ jobs:
       integration-tests-h100: ${{ steps.main.outputs.integration-tests-h100 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -961,7 +981,7 @@ jobs:
       && needs.cicd-parse-integration-tests-h100.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -995,7 +1015,7 @@ jobs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -1062,7 +1082,7 @@ jobs:
       && vars.ENABLE_GB200_TESTING == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -1104,7 +1124,7 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Get workflow result
         id: result
@@ -1214,7 +1234,7 @@ jobs:
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Generate fake coverage report
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |
@@ -1245,13 +1265,13 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
@@ -1272,7 +1292,7 @@ jobs:
           ls -al
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
@@ -1280,7 +1300,7 @@ jobs:
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
@@ -1301,7 +1321,7 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
       - name: Comment on PR with action run URL
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |

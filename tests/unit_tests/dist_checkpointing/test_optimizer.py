@@ -24,7 +24,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, ChainedOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -874,6 +875,99 @@ class TestDistributedOptimizer:
         same_groups = set(g for g in same_groups if g is not None)
         # Check each dst group has at least 1 rank both in src and dest
         assert same_groups == set(range(num_dest_dp_groups))
+
+    @pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package not installed"
+    )
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
+    def test_lion_optimizer_checkpoint_round_trip(self, tmp_path_dist_ckpt, sharding_type):
+        """Test DistributedOptimizer checkpoint save/load with Lion (single-moment optimizer).
+
+        Lion is used as the scalar optimizer for Muon (muon_scalar_optimizer='lion'),
+        which is the natural path where Lion ends up inside a DistributedOptimizer.
+        This exercises the dynamic optimizer_state_keys logic with Lion's single
+        moment ('exp_avg') instead of Adam's two ('exp_avg', 'exp_avg_sq').
+        """
+        Utils.initialize_model_parallel(2, 1, order='tp-pp-dp')
+
+        def _get_lion_distopt(optimizer):
+            """Extract the Lion DistributedOptimizer from a Muon+Lion ChainedOptimizer."""
+            assert isinstance(optimizer, ChainedOptimizer)
+            for child in optimizer.chained_optimizers:
+                if isinstance(child, DistributedOptimizer):
+                    return child
+            raise AssertionError("No DistributedOptimizer found in ChainedOptimizer")
+
+        def _seed_random_optimizer_state(distopt, seed):
+            """Seed non-zero random exp_avg values in the DistOpt's raw optimizer state."""
+            torch.manual_seed(seed)
+            for group in distopt.optimizer.param_groups:
+                for p in group['params']:
+                    state = distopt.optimizer.state[p]
+                    if 'exp_avg' in state:
+                        state['exp_avg'].copy_(torch.randn_like(p.data))
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_lion_optimizer_checkpoint', sync=True
+        ) as ckpt_dir_A:
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=2,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='muon',
+                muon_scalar_optimizer='lion',
+                use_param_layout=True,
+            )
+
+            lion_distopt_A = _get_lion_distopt(optimizer_A)
+            assert lion_distopt_A.optimizer_state_keys == ("exp_avg",)
+            _seed_random_optimizer_state(lion_distopt_A, seed=100)
+
+            metadata = {'distrib_optim_sharding_type': sharding_type}
+
+            model_sharded_sd = model_A[0].sharded_state_dict()
+            optim_sd = optimizer_A.sharded_state_dict(model_sharded_sd, metadata=metadata)
+            save(optim_sd, ckpt_dir_A)
+
+            dp_zero_optim_A = lion_distopt_A.get_parameter_state_dp_zero(use_gloo_comm=False)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=2,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='muon',
+                muon_scalar_optimizer='lion',
+                use_param_layout=True,
+            )
+
+            lion_distopt_B = _get_lion_distopt(optimizer_B)
+            _seed_random_optimizer_state(lion_distopt_B, seed=200)
+
+            # Before loading, state should differ.
+            dp_zero_optim_B = lion_distopt_B.get_parameter_state_dp_zero(use_gloo_comm=False)
+            assert not self.check_equal_dp_zero_state(dp_zero_optim_A, dp_zero_optim_B, True)
+
+            model_sharded_sd = model_B[0].sharded_state_dict()
+            load_sharded_state_dict = optimizer_B.sharded_state_dict(
+                model_sharded_sd, metadata=metadata, is_loading=True
+            )
+            state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+            optimizer_B.load_state_dict(state_dict)
+
+            # After loading, state should match.
+            dp_zero_optim_B = lion_distopt_B.get_parameter_state_dp_zero(use_gloo_comm=False)
+            assert self.check_equal_dp_zero_state(
+                dp_zero_optim_A, dp_zero_optim_B, True, raise_if_different=True
+            )
+
+        Utils.destroy_model_parallel()
 
 
 class TestFP32Optimizer:
