@@ -9,6 +9,7 @@ from typing import Callable, List, Literal, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -866,10 +867,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'moonep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
-    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
+    Options are "deepep", "hybridep", "moonep", and "ncclep". Currently only "hybridep" backend
+    supports the MNNVL case. "moonep" is a single-node NVLink backend using an externally installed
+    MoonEP package. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
     transformer_engine.pytorch.ep API."""
 
     moe_permute_fusion_into_hybridep: bool = False
@@ -925,8 +927,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
-    backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
-    deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
+    backends (deepep, hybridep, moonep, ncclep). None lets each backend use its own default. Unifies
+    the deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
 
     moe_deepep_num_sms: Optional[int] = None
     """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for DeepEP (historical
@@ -1611,6 +1613,80 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
+                )
+
+        if self.moe_flex_dispatcher_backend == "moonep":
+            moonep_errors = []
+            if self.moe_token_dispatcher_type != "flex":
+                moonep_errors.append("moe_token_dispatcher_type='flex'")
+            if not self.bf16 or self.params_dtype != torch.bfloat16:
+                moonep_errors.append("BF16 execution and BF16 parameters")
+            if self.fp8 or self.fp4:
+                moonep_errors.append("FP8 and FP4 disabled")
+            if self.add_bias_linear:
+                moonep_errors.append("add_bias_linear=False")
+            if not self.moe_grouped_gemm:
+                moonep_errors.append("moe_grouped_gemm=True")
+            if not self.moe_single_grouped_weight:
+                moonep_errors.append("moe_single_grouped_weight=True")
+            if self.moe_single_grouped_bias:
+                moonep_errors.append("moe_single_grouped_bias=False")
+            if not self.use_transformer_engine_op_fuser:
+                moonep_errors.append("use_transformer_engine_op_fuser=True")
+            if not self.gradient_accumulation_fusion:
+                moonep_errors.append("gradient_accumulation_fusion=True")
+            if self.moe_router_dtype != "fp32":
+                moonep_errors.append("moe_router_dtype='fp32'")
+            if self.expert_tensor_parallel_size != 1:
+                moonep_errors.append("expert_tensor_parallel_size=1")
+            if self.moe_router_topk > 32:
+                moonep_errors.append("moe_router_topk<=32")
+            supported_glu = self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu)
+            supported_squared_relu = (
+                not self.gated_linear_unit
+                and self.activation_func == squared_relu
+                and self.use_fused_weighted_squared_relu
+            )
+            if not (supported_glu or supported_squared_relu):
+                moonep_errors.append(
+                    "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation"
+                )
+            if self.cuda_graph_impl != "none":
+                moonep_errors.append("cuda_graph_impl='none'")
+            if self.delay_wgrad_compute:
+                moonep_errors.append("delay_wgrad_compute=False")
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                moonep_errors.append("overlap_dispatch_backward_with_experts_wgrad=False")
+            if self.overlap_moe_expert_parallel_comm:
+                moonep_errors.append("overlap_moe_expert_parallel_comm=False")
+            if self.moe_shared_expert_overlap:
+                moonep_errors.append("moe_shared_expert_overlap=False")
+            expert_input_size = self.moe_latent_size or self.hidden_size
+            if expert_input_size % 128 != 0:
+                moonep_errors.append(
+                    "moe_latent_size (or hidden_size when latent MoE is disabled) divisible by 128"
+                )
+            if self.moe_ffn_hidden_size % 128 != 0:
+                moonep_errors.append("moe_ffn_hidden_size divisible by 128")
+            if self.moe_expert_capacity_factor is not None:
+                moonep_errors.append("moe_expert_capacity_factor=None")
+            if self.moe_expert_rank_capacity_factor is not None:
+                moonep_errors.append("moe_expert_rank_capacity_factor=None")
+            if self.moe_pad_expert_input_to_capacity:
+                moonep_errors.append("moe_pad_expert_input_to_capacity=False")
+            if self.moe_router_padding_for_quantization:
+                moonep_errors.append("moe_router_padding_for_quantization=False")
+            if self.moe_token_dropping:
+                moonep_errors.append("moe_token_dropping=False")
+            if self.moe_apply_probs_on_input:
+                moonep_errors.append("moe_apply_probs_on_input=False")
+            if self.enable_cuda_graph or self.external_cuda_graph:
+                moonep_errors.append("deprecated CUDA graph flags disabled")
+            if moonep_errors:
+                raise ValueError(
+                    "MoonEP flex dispatcher configuration is unsupported; require "
+                    + ", ".join(moonep_errors)
+                    + "."
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
