@@ -132,14 +132,19 @@ class InferenceSetupConfig:
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
 
-    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "torch"
-    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
-    "flashinfer" is requested but the package is not installed."""
+    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
+    """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
+    "torch" with a warning if the flashinfer package is not installed."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
+    offset_sampling_seed_by_dp_rank: bool = True
+    """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
+    generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
+    --deterministic-mode is enabled."""
+
+    inference_dynamic_batching_async_sched_mode: Literal["legacy", "async"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
-    existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
-    steps before resolving finished requests."""
+    existing resolve-before-prepare path. "async" overlaps asynchronous scheduling phases by
+    reordering them to prepare-before-resolve."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
@@ -156,6 +161,9 @@ class InferenceSetupConfig:
     """Extend prefill/mixed CUDA graph capture up to `max_tokens`. By default, all graphs are
     limited by the decode limit of `max_requests * (num_speculative_tokens + 1)`."""
 
+    inference_cuda_graph_max_tokens: int = 512
+    """Token ceiling for the largest captured prefill/mixed CUDA graph (default: 512)."""
+
     # ---------------- Chunked prefill / speculation ----------------
 
     enable_chunked_prefill: bool = False
@@ -170,17 +178,22 @@ class InferenceSetupConfig:
     """Enable/disable prefix caching for dynamic batching inference. When disabled, KV cache blocks
     cannot be shared between requests with identical prompt prefixes."""
 
-    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "ref_zero"
+    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = (
+        "ref_zero"
+    )
     """Eviction policy for prefix caching blocks. "ref_zero" (default) immediately returns blocks to
     the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
     space is needed."""
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
-        "longest_prefix", "first_prefix_block", "round_robin"
-    ] = "first_prefix_block"
-    """Coordinator routing policy for prefix caching. "first_prefix_block" (default) routes based on
-    the first block hash only. "longest_prefix" routes to the rank with the longest matching prefix.
-    "round_robin" ignores prefix affinity and cycles through ranks."""
+        "longest_prefix", "first_prefix_block", "load_balanced"
+    ] = "load_balanced"
+    """Coordinator routing policy for prefix caching. "load_balanced" (default) routes to the rank
+    with the fewest in-flight requests, ignoring prefix affinity. "first_prefix_block" routes based
+    on the first block hash only. "longest_prefix" routes to the rank with the longest matching
+    prefix. "first_prefix_block" and "longest_prefix" both combine prefix affinity with load
+    balancing and fall back to load-balanced routing when prefix caching is disabled or no prefix
+    match exists."""
 
     inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
     """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
@@ -337,6 +350,7 @@ class InferenceSetupConfig:
             ),
             use_cuda_graphs_for_non_decode_steps=not self.decode_only_cuda_graphs,
             cuda_graph_all_prefills=self.inference_cuda_graph_all_prefills,
+            cuda_graph_max_tokens=self.inference_cuda_graph_max_tokens,
             static_kv_memory_pointers=static_kv_memory_pointers,
             max_sequence_length=max_sequence_length,
             mamba_inference_state_config=mamba_inference_state_config,
@@ -365,8 +379,7 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
-            async_sched_mode=AsyncScheduleMode(
-                self.inference_dynamic_batching_async_sched_mode
-            ),
+            offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
+            async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
         )

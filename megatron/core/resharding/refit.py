@@ -21,16 +21,17 @@ from megatron.core.inference.quantization.utils import (
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.utils import unwrap_model
 
-from . import build_centralized_reshard_plan, execute_reshard_plan
+from . import build_local_reshard_plan, execute_reshard_plan
 from .copy_services.base import CopyService
 from .copy_services.gloo_copy_service import GlooCopyService
 from .copy_services.nccl_copy_service import NCCLCopyService
+from .copy_services.nixl_copy_service import NixlCopyService
 from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
-RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
+RefitBackendName = Literal["nccl", "gloo", "nvshmem", "nixl"]
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,9 @@ class _PlanCacheKey:
     src_config: Optional[Tuple[int, int, int, int, int]]
     dst_config: Optional[Tuple[int, int, int, int, int]]
     num_experts: Optional[int]
+    # Adding inference nodes leaves the configs and offsets unchanged, so without
+    # world_size the stale pre-growth plan would be reused.
+    world_size: int = 0
     # Rank offsets distinguish non-collocated configurations that would otherwise
     # share the same (rank, sizes, num_experts) tuple but route to different
     # global ranks.
@@ -85,13 +89,16 @@ def _build_plan_cache_key(
     dst_rank_offset: int = 0,
 ) -> _PlanCacheKey:
     """Build cache key for reshard plan."""
-    # group.rank() supports cross-cluster ProcessGroups.
+    # group.rank()/size() support cross-cluster ProcessGroups where members
+    # have independent default PGs.
     rank = group.rank() if group is not None else torch.distributed.get_rank()
+    world_size = group.size() if group is not None else torch.distributed.get_world_size()
     return _PlanCacheKey(
         rank=rank,
         src_config=_get_config_tuple(src_core),
         dst_config=_get_config_tuple(tgt_core),
         num_experts=num_experts,
+        world_size=world_size,
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
     )
@@ -109,7 +116,7 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     when swap_model_weights is called multiple times with the same backend.
 
     Args:
-        backend: Backend name ("nccl", "gloo", or "nvshmem").
+        backend: Backend name ("nccl", "gloo", "nvshmem", or "nixl").
         group: Optional process group for NCCL backend.
     """
     if backend in _service_cache:
@@ -121,6 +128,8 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
         service = NVSHMEMCopyService(group=group)
+    elif backend == "nixl":
+        service = NixlCopyService(group=group)
     else:
         raise ValueError(f"Unknown backend '{backend}'")
 
@@ -195,7 +204,8 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
     All participating ranks must call this simultaneously when the plan is not
-    yet cached, because build_centralized_reshard_plan uses collective communication.
+    yet cached, because build_local_reshard_plan uses collective communication
+    (an all_gather of parameter metadata).
     """
     global _plan_cache
     cache_key = _build_plan_cache_key(
@@ -207,7 +217,7 @@ def _build_or_get_plan(src_core, tgt_core, num_experts, group, src_rank_offset, 
         dst_rank_offset=dst_rank_offset,
     )
     if cache_key not in _plan_cache:
-        _plan_cache[cache_key] = build_centralized_reshard_plan(
+        _plan_cache[cache_key] = build_local_reshard_plan(
             src_core,
             tgt_core,
             num_experts=num_experts,
