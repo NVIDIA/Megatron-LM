@@ -13,7 +13,7 @@ def test_megatron_help_formatter_allows_literal_percent_characters():
         help="Prepare 5% training cache shards; default %(default)s; escaped 10%%.",
     )
 
-    help_text = parser.format_help()
+    help_text = " ".join(parser.format_help().split())
 
     assert "Prepare 5% training cache shards" in help_text
     assert "default 1.0" in help_text
