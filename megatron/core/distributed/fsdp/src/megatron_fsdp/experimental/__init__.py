@@ -14,7 +14,7 @@
 
 """Experimental Megatron-FSDP implementation."""
 
-from .checkpoint import load_checkpoint, save_checkpoint, sync_model_weight_from_main_weight
+from .checkpoint import load_checkpoint, save_checkpoint
 from .dbuffer import DBuffer
 from .fully_shard import fully_shard, microbatch
 from .optimizer import fully_shard_optimizer
@@ -32,5 +32,4 @@ __all__ = [
     "load_checkpoint",
     "microbatch",
     "save_checkpoint",
-    "sync_model_weight_from_main_weight",
 ]
