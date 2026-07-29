@@ -260,6 +260,23 @@ class TestLogicalShardPlanner:
         with pytest.raises(RuntimeError, match="logical shape mismatch"):
             plan_sharded_transfer("weight", src, src[0], dst)
 
+    def test_overlapping_source_metadata_raises(self):
+        src = [
+            _meta(
+                shape=(4, 3),
+                owner_rank=rank,
+                tp_ranks=[rank],
+                dp_ranks=[rank],
+                is_gtp=True,
+                gtp_ranks=group,
+            )
+            for rank, group in ((0, [0, 1]), (1, [1, 0]))
+        ]
+        dst = _meta(shape=(8, 3), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
+
+        with pytest.raises(RuntimeError, match="overlapping destination coverage"):
+            plan_sharded_transfer("weight", src, src[0], dst)
+
     def test_missing_tp_group_raises(self):
         src = [_meta(shape=(64, 64), is_tp=True, partition_dim=1, owner_rank=0)]
         dst = _meta(shape=(64, 128), owner_rank=1)
