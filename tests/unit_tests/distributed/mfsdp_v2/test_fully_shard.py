@@ -150,6 +150,19 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
+def _strategy_placements(sharding_strategy: str) -> Placements:
+    placements = {
+        "no_shard": (Replicate(), Replicate(), Replicate()),
+        "zero1": (Replicate(), Replicate(), Flat()),
+        "zero2": (Replicate(), Flat(), Flat()),
+        "zero3": (Flat(), Flat(), Flat()),
+    }
+    parameter, gradient, optimizer = placements[sharding_strategy]
+    return Placements(
+        dp_axes=[0], parameter=[parameter], gradient=[gradient], optimizer=[optimizer]
+    )
+
+
 def _hsdp_placements() -> Placements:
     """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
     DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
@@ -174,9 +187,12 @@ _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
 _GEMM_OP_NAME_SUBSTRING = "aten::mm"
 
 
+@pytest.mark.parametrize("sharding_strategy", ["no_shard", "zero1", "zero2", "zero3"])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatches):
-    """Minimal per-module FSDP training should match single-rank SGD."""
+def test_fully_shard_sgd_losses_match_baseline(
+    distributed_setup, num_microbatches, sharding_strategy
+):
+    """Every supported sharding strategy should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -189,11 +205,13 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
+    placements = _strategy_placements(sharding_strategy)
     with fully_shard_context(device=device):
-        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc1, mesh=mesh, placements=placements)
+        fully_shard(model.fc2, mesh=mesh, placements=placements)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
 
     micro_batch_size = 2
     x = torch.randn(num_microbatches, micro_batch_size, 8, device=device)
@@ -205,19 +223,19 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
         for step in range(5):
             optimizer.zero_grad()
 
-            for microbatch, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                losses.append(loss.detach())
-                logger.debug(
-                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
-                    log_prefix,
-                    rank,
-                    step,
-                    microbatch,
-                    loss,
-                )
-
-                (loss / num_microbatches).backward()
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                with microbatch(model, is_last=microbatch_index == num_microbatches - 1):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    losses.append(loss.detach())
+                    logger.debug(
+                        "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
+                        log_prefix,
+                        rank,
+                        step,
+                        microbatch_index,
+                        loss,
+                    )
+                    (loss / num_microbatches).backward()
 
             optimizer.step()
         return losses

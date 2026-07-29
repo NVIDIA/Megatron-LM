@@ -26,7 +26,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .placement import Flat, Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -177,6 +177,7 @@ class FsdpParameterGroup:
                     dtype=grad_dtype,
                     device=self.main_weight.device,
                 )
+                self.main_grad.local_buffer.zero_()
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
@@ -269,12 +270,10 @@ class FsdpParameterGroup:
         gather_axis = changed_mesh_axis(
             self.model_weight.placements, self._unsharded_model_weight.placements
         )
-        if gather_axis is None:
-            raise RuntimeError("FSDP parameter unshard requires a changed placement axis.")
         with torch.autograd._unsafe_preserve_version_counter(
             self._unsharded_model_weight.local_buffer
         ):
-            if self._symm_mem_pool is not None:
+            if self._symm_mem_pool is not None and gather_axis is not None:
                 self._unsharded_model_weight.rendezvous(gather_axis)
             self.model_weight.redistribute(
                 self._unsharded_model_weight.placements, out=self._unsharded_model_weight
@@ -296,6 +295,14 @@ class FsdpParameterGroup:
         # post-backward reshard behavior would make the caller code less clean,
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
+
+    def _install_sharded_grads(self, grad_buffer: DBuffer | None = None) -> None:
+        """Point each sharded parameter's grad at main_grad's current DTensor view."""
+        if grad_buffer is None:
+            grad_buffer = self.main_grad
+        assert grad_buffer is not None
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.sharded.grad = grad_buffer.get_dtensor(index)
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
@@ -348,6 +355,28 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
 
+        optimizer_axis = changed_mesh_axis(
+            self.main_grad.placements, self.main_weight.placements
+        )
+        if (
+            optimizer_axis is not None
+            and isinstance(self.main_grad.placements[optimizer_axis], Replicate)
+            and isinstance(self.main_weight.placements[optimizer_axis], Flat)
+        ):
+            with self._symmetric_memory_context():
+                partial_grad = partial_grad.cast(self.main_grad.dtype)
+            if not is_last_microbatch:
+                self.main_grad.local_buffer.add_(partial_grad.local_buffer)
+                return
+            partial_grad.local_buffer.add_(self.main_grad.local_buffer)
+            if self._symm_mem_pool is not None:
+                partial_grad.rendezvous(optimizer_axis)
+            optimizer_grad = partial_grad.redistribute(self.main_weight.placements)
+            if partial_grad.placements[optimizer_axis].reduce_op == dist.ReduceOp.SUM:
+                optimizer_grad.local_buffer.div_(self.mesh.size(optimizer_axis))
+            self._install_sharded_grads(optimizer_grad)
+            self.main_grad.local_buffer.zero_()
+            return
         # zero_grad(set_to_none=True) clears sharded parameter grads, so this
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
