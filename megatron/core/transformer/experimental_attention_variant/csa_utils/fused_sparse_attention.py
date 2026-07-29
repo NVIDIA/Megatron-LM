@@ -36,9 +36,11 @@ from megatron.core.quantization.indexer_quantization import (
     IndexerMXFP8QuantizationBuffers,
     create_indexer_mxfp8_quantization_buffers,
     indexer_mxfp8_scale_shape,
+    indexer_mxfp8_thd_scale_capacity,
     indexer_mxfp8_thd_scale_shape,
     make_indexer_mxfp8_scale_cu_seqlens,
     quantize_indexer_mxfp8,
+    refresh_indexer_mxfp8_scale_cu_seqlens,
 )
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -332,6 +334,14 @@ class THDCompactIndexerWorkspace:
         mxfp8_valid = self.mxfp8 is None
         if precision == "mxfp8":
             mxfp8 = self.mxfp8
+            q_scale_shape = indexer_mxfp8_thd_scale_shape(
+                indexer_mxfp8_thd_scale_capacity(q.shape[0], batch_size, q.shape[1]),
+                q.shape[1],
+                q.shape[2],
+            )
+            k_scale_shape = indexer_mxfp8_thd_scale_shape(
+                indexer_mxfp8_thd_scale_capacity(k.shape[0], batch_size, 1), 1, k.shape[1]
+            )
             scale_prefixes_valid = mxfp8 is not None and all(
                 prefix is not None
                 and prefix.device == q.device
@@ -348,17 +358,11 @@ class THDCompactIndexerWorkspace:
                     (
                         mxfp8.q_scale.device == q.device,
                         mxfp8.q_scale.dtype == torch.float8_e8m0fnu,
-                        mxfp8.q_scale.ndim == 3,
-                        mxfp8.q_scale.shape[0] == 1,
-                        mxfp8.q_scale.shape[1] % 128 == 0,
-                        mxfp8.q_scale.shape[2] == ((q.shape[2] // 32 + 3) // 4) * 4,
+                        tuple(mxfp8.q_scale.shape) == q_scale_shape,
                         mxfp8.q_scale.is_contiguous(),
                         mxfp8.k_scale.device == q.device,
                         mxfp8.k_scale.dtype == torch.float8_e8m0fnu,
-                        mxfp8.k_scale.ndim == 3,
-                        mxfp8.k_scale.shape[0] == 1,
-                        mxfp8.k_scale.shape[1] % 128 == 0,
-                        mxfp8.k_scale.shape[2] == ((k.shape[1] // 32 + 3) // 4) * 4,
+                        tuple(mxfp8.k_scale.shape) == k_scale_shape,
                         mxfp8.k_scale.is_contiguous(),
                         mxfp8.q_buffers.matches(q),
                         mxfp8.k_buffers.matches(k),
@@ -601,20 +605,19 @@ def prepare_thd_compact_indexer_workspace(
         k_buffers = create_indexer_mxfp8_quantization_buffers(k)
         cu_seqlens_q_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_q, q.shape[1])
         cu_seqlens_k_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_k, 1)
+        batch_size = cu_seqlens_q.numel() - 1
+        q_scale_capacity = indexer_mxfp8_thd_scale_capacity(q.shape[0], batch_size, q.shape[1])
+        k_scale_capacity = indexer_mxfp8_thd_scale_capacity(k.shape[0], batch_size, 1)
         mxfp8_workspace = MXFP8IndexerWorkspace(
             q_buffers=q_buffers,
             k_buffers=k_buffers,
             q_scale=torch.empty(
-                indexer_mxfp8_thd_scale_shape(
-                    int(cu_seqlens_q_scale_padded[-1].item()), q.shape[1], q.shape[2]
-                ),
+                indexer_mxfp8_thd_scale_shape(q_scale_capacity, q.shape[1], q.shape[2]),
                 dtype=torch.float8_e8m0fnu,
                 device=device,
             ),
             k_scale=torch.empty(
-                indexer_mxfp8_thd_scale_shape(
-                    int(cu_seqlens_k_scale_padded[-1].item()), 1, k.shape[1]
-                ),
+                indexer_mxfp8_thd_scale_shape(k_scale_capacity, 1, k.shape[1]),
                 dtype=torch.float8_e8m0fnu,
                 device=device,
             ),
@@ -1650,6 +1653,12 @@ def _indexer_topk_core(
                     cu_seqlens_k_scale_padded = mxfp8_workspace.cu_seqlens_k_scale_padded
                     assert cu_seqlens_q_scale_padded is not None
                     assert cu_seqlens_k_scale_padded is not None
+                    refresh_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_q_scale_padded, cu_seqlens_q, q.shape[1]
+                    )
+                    refresh_indexer_mxfp8_scale_cu_seqlens(
+                        cu_seqlens_k_scale_padded, cu_seqlens_kv, 1
+                    )
                 else:
                     cu_seqlens_q_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(
                         cu_seqlens_q, q.shape[1]

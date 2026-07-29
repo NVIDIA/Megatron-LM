@@ -1908,9 +1908,7 @@ class TransformerConfig(ModelParallelConfig):
             indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
             uses_mxfp8_indexer = uses_ratio4_indexer and self.dsa_indexer_precision == "mxfp8"
             if uses_mxfp8_indexer and self.dsa_kernel_backend != "cudnn":
-                raise ValueError(
-                    "MXFP8 DSA indexer precision requires dsa_kernel_backend='cudnn'"
-                )
+                raise ValueError("MXFP8 DSA indexer precision requires dsa_kernel_backend='cudnn'")
 
             if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(

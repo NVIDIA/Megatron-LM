@@ -10,9 +10,11 @@ from megatron.core.quantization.indexer_quantization import (
     HAVE_TRITON,
     create_indexer_mxfp8_quantization_buffers,
     indexer_mxfp8_scale_shape,
+    indexer_mxfp8_thd_scale_capacity,
     indexer_mxfp8_thd_scale_shape,
     make_indexer_mxfp8_scale_cu_seqlens,
     quantize_indexer_mxfp8,
+    refresh_indexer_mxfp8_scale_cu_seqlens,
 )
 
 pytestmark = [
@@ -108,21 +110,25 @@ def test_thd_quantization_uses_concatenated_padded_scale_spans():
 @pytest.mark.parametrize("num_heads", [1, 64])
 def test_thd_preallocated_quantization_cuda_graph_replay(num_heads):
     torch.manual_seed(789)
-    q_lens = [2, 3]
+    capture_lens = [128, 128]
+    replay_lens = [1, 255]
     head_dim = 128
-    total_tokens = sum(q_lens)
-    cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32, device="cuda")
+    total_tokens = sum(capture_lens)
+    cu_seqlens = torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda")
     cu_seqlens_scale_padded = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens, num_heads)
     shape = (total_tokens, num_heads, head_dim) if num_heads > 1 else (total_tokens, head_dim)
     x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
     buffers = create_indexer_mxfp8_quantization_buffers(x)
+    scale_capacity = indexer_mxfp8_thd_scale_capacity(total_tokens, len(capture_lens), num_heads)
+    assert int(cu_seqlens_scale_padded[-1].item()) < scale_capacity
     out_scale = torch.zeros(
-        indexer_mxfp8_thd_scale_shape(int(cu_seqlens_scale_padded[-1].item()), num_heads, head_dim),
+        indexer_mxfp8_thd_scale_shape(scale_capacity, num_heads, head_dim),
         dtype=torch.float8_e8m0fnu,
         device="cuda",
     )
 
     def run():
+        refresh_indexer_mxfp8_scale_cu_seqlens(cu_seqlens_scale_padded, cu_seqlens, num_heads)
         return quantize_indexer_mxfp8(
             x,
             cu_seqlens=cu_seqlens,
@@ -142,11 +148,17 @@ def test_thd_preallocated_quantization_cuda_graph_replay(num_heads):
     first_data = captured_data.float().clone()
 
     x.copy_(torch.randn_like(x))
+    cu_seqlens.copy_(
+        torch.tensor([0, replay_lens[0], sum(replay_lens)], dtype=torch.int32, device="cuda")
+    )
     graph.replay()
     torch.cuda.synchronize()
+    expected_scale_prefix = make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens, num_heads)
     expected_data, expected_scale = quantize_indexer_mxfp8(
-        x, cu_seqlens=cu_seqlens, cu_seqlens_scale_padded=cu_seqlens_scale_padded
+        x, cu_seqlens=cu_seqlens, cu_seqlens_scale_padded=expected_scale_prefix
     )
+    assert int(expected_scale_prefix[-1].item()) == scale_capacity
+    assert torch.equal(cu_seqlens_scale_padded, expected_scale_prefix)
     assert not torch.equal(captured_data.float(), first_data)
     assert torch.equal(captured_data.float(), expected_data.float())
     assert torch.equal(captured_scale.view(torch.uint8), expected_scale.view(torch.uint8))
