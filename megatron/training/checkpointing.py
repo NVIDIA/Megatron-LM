@@ -1983,12 +1983,13 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     return args, checkpoint_args
 
 
-def _has_checkpoint_args(state_dict):
-    """Return whether a loaded checkpoint contains usable saved arguments."""
-    return state_dict is not None and state_dict.get('args') is not None
-
-
-def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
+def _maybe_setup_gpt_to_hybrid_load(
+    args,
+    ckpt_args,
+    model,
+    checkpoint_name=None,
+    ckpt_format=None,
+):
     """Detect a GPT (pure transformer) checkpoint being loaded into a HybridModel run.
 
     Returns ``(layer_maps, load_optim)`` where ``layer_maps`` is used to retarget
@@ -2015,7 +2016,20 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
     )
-    if runtime_is_hybrid == bool(ckpt_pattern):
+    checkpoint_is_hybrid = bool(ckpt_pattern)
+    if runtime_is_hybrid and ckpt_args is None:
+        if ckpt_format == 'torch_dist':
+            checkpoint_keys = dist_checkpointing.load_tensors_metadata(checkpoint_name)
+        else:
+            checkpoint_keys = FileSystemReader(checkpoint_name).read_metadata().state_dict_metadata
+        has_gpt_layout = any('decoder.final_layernorm.' in key for key in checkpoint_keys)
+        checkpoint_is_hybrid = any('decoder.final_norm.' in key for key in checkpoint_keys)
+        if has_gpt_layout == checkpoint_is_hybrid:
+            raise RuntimeError(
+                'Checkpoint tensor metadata does not uniquely identify a GPTModel or '
+                'HybridModel layout.'
+            )
+    if runtime_is_hybrid == checkpoint_is_hybrid:
         return None, False
     if not runtime_is_hybrid:
         raise RuntimeError(
@@ -2135,25 +2149,21 @@ def load_checkpoint(
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
-    checkpoint_args_available = _has_checkpoint_args(state_dict)
     ckpt_args = types.SimpleNamespace()
-    if ckpt_format in ('torch_dist', 'fsdp_dtensor') and checkpoint_args_available:
-        ckpt_args = state_dict['args']
-    elif ckpt_format in ('torch_dist', 'fsdp_dtensor') and state_dict is not None:
-        print_rank_0(
-            '> checkpoint has no saved arguments; skipping GPT-to-Hybrid detection '
-            'and loading with the native runtime model layout.'
-        )
+    if ckpt_format in ('torch_dist', 'fsdp_dtensor') and state_dict is not None:
+        ckpt_args = state_dict.get('args')
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
     gpt_compat_layer_maps, gpt_compat_load_optim = (
-        _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model)
-        if (
-            ckpt_format in ('torch_dist', 'fsdp_dtensor')
-            and state_dict is not None
-            and checkpoint_args_available
+        _maybe_setup_gpt_to_hybrid_load(
+            args,
+            ckpt_args,
+            model,
+            checkpoint_name=checkpoint_name,
+            ckpt_format=ckpt_format,
         )
+        if ckpt_format in ('torch_dist', 'fsdp_dtensor') and state_dict is not None
         else (None, False)
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release
@@ -2452,7 +2462,7 @@ def load_checkpoint(
     if getattr(args, 'override_ckpt_iteration', None) is not None:
         target_iter = args.override_ckpt_iteration
         state_dict['iteration'] = target_iter
-        if _has_checkpoint_args(state_dict):
+        if state_dict.get('args') is not None:
             checkpoint_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
             if (
                 checkpoint_global_batch_size is not None
@@ -2499,7 +2509,7 @@ def load_checkpoint(
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if _has_checkpoint_args(state_dict) and not args.finetune:
+    if state_dict.get('args') is not None and not args.finetune:
         checkpoint_args = state_dict['args']
         # A GPT block is split into separate attention and MLP positions in
         # HybridModel, so num_layers intentionally differs even for an
