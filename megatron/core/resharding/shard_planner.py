@@ -174,6 +174,14 @@ def _overlap(
     return overlaps
 
 
+def _rectangles_overlap(left: tuple[slice, ...], right: tuple[slice, ...]) -> bool:
+    """Return whether two slice rectangles cover any common element."""
+    return all(
+        max(left_part.start, right_part.start) < min(left_part.stop, right_part.stop)
+        for left_part, right_part in zip(left, right)
+    )
+
+
 def plan_sharded_transfer(
     param_name: str,
     all_src_metadata: list[ParameterMetadata],
@@ -204,6 +212,8 @@ def plan_sharded_transfer(
         for rectangle in product(*overlaps_by_dim):
             src_slice = tuple(slices[0] for slices in rectangle)
             dst_slice = tuple(slices[1] for slices in rectangle)
+            if any(_rectangles_overlap(dst_slice, op[2]) for op in ops):
+                raise RuntimeError(f"{param_name}: overlapping destination coverage")
             transferred += math.prod(part.stop - part.start for part in dst_slice)
             ops.append((src.owner_rank, src_slice, dst_slice))
 
