@@ -19,6 +19,10 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from megatron.core.inference.batch_dimensions_utils import (
+    CUDAGraphBatchDimensionBuilder,
+    InferenceBatchDimensions,
+)
 from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
@@ -283,6 +287,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        self.cuda_graph_all_prefills = inference_config.cuda_graph_all_prefills
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level

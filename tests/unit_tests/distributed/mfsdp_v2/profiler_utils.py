@@ -2,6 +2,7 @@
 
 """Helpers for parsing ``torch.profiler`` events in the mfsdp_v2 tests."""
 
+import pytest
 from torch.autograd import DeviceType
 from torch.autograd.profiler_util import FunctionEvent
 from torch.profiler import profile as TorchProfiler
@@ -31,6 +32,14 @@ def collect_linked_kernels(
     # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
     # is the "no device correlation" sentinel and is skipped.
     events = prof.events()
+    # FunctionEvent.linked_correlation_id was added in a newer torch than some CI base
+    # images ship. Skip (rather than error) when the running torch predates it, so the
+    # profiler-overlap tests degrade gracefully instead of failing with AttributeError.
+    if events and not hasattr(events[0], "linked_correlation_id"):
+        pytest.skip(
+            "torch.autograd profiler FunctionEvent lacks 'linked_correlation_id' "
+            "(requires a newer torch); skipping kernel-linking profiler assertions."
+        )
     matching_correlations: set[int] = set()
     for event in events:
         if event.device_type != DeviceType.CPU or not event.linked_correlation_id:

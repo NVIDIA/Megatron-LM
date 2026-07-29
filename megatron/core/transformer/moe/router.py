@@ -559,7 +559,13 @@ class TopKRouter(Router):
             valid_token_count=local_num_tokens,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
-            aux_loss_scale_num_tokens=total_num_tokens,
+            # bsz was folded into the expert dim (routing_map reshaped to seq_length rows), so
+            # total_num_tokens counts per-sequence tokens and omits the batch factor. Multiply
+            # by bsz to recover the micro-batch token total. This is the ACTIVE per-token-loss
+            # scale (activation is scaled by aux_loss * aux_loss_scale_num_tokens) and equals
+            # main's valid_token_count(=local_num_tokens * bsz) * tp_cp_group.size(). Without
+            # the * bsz the MBS=N gradient is 1/bsz of the accumulated MBS=1 gradient.
+            aux_loss_scale_num_tokens=total_num_tokens * bsz,
         )
         return probs
 

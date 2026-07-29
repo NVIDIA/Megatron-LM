@@ -560,7 +560,7 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
 def gpt_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
-    model_config_cls: type = GPTModelConfig,
+    model_config_cls: type | None = None,
 ) -> Any:
     """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
 
@@ -568,7 +568,14 @@ def gpt_config_from_args(
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptModelConfig`.
     """
-    assert issubclass(model_config_cls, GPTModelConfig)
+    # Resolve the default at call time (not as a def-time default) so the
+    # module-level ``GPTModelConfig`` name can be monkeypatched in tests. Only
+    # validate an explicitly supplied class; the resolved default is correct by
+    # construction (and may itself be a test double).
+    if model_config_cls is None:
+        model_config_cls = GPTModelConfig
+    else:
+        assert issubclass(model_config_cls, GPTModelConfig)
 
     kwargs = {}
     if config is None:
@@ -615,7 +622,7 @@ def gpt_config_from_args(
 def hybrid_config_from_args(
     args: Namespace,
     config: TransformerConfig | None = None,
-    model_config_cls: type = HybridModelConfig,
+    model_config_cls: type | None = None,
 ) -> Any:
     """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
 
@@ -623,7 +630,14 @@ def hybrid_config_from_args(
     subclasses that only override metadata (e.g. `builder`) and add no new fields,
     such as `ModelOptHybridModelConfig`.
     """
-    assert issubclass(model_config_cls, HybridModelConfig)
+    # Resolve the default at call time (not as a def-time default) so the
+    # module-level ``HybridModelConfig`` name can be monkeypatched in tests. Only
+    # validate an explicitly supplied class; the resolved default is correct by
+    # construction (and may itself be a test double).
+    if model_config_cls is None:
+        model_config_cls = HybridModelConfig
+    else:
+        assert issubclass(model_config_cls, HybridModelConfig)
 
     kwargs = {}
     if config is None:

@@ -539,6 +539,12 @@ def test_sparse_mla_delta_pads_partial_sequence_tile(monkeypatch):
 
 
 def test_lighting_indexer_indices_preserves_single_head_weight_axis(monkeypatch):
+    # lighting_indexer_indices is set to None at import when the TileLang indexer kernels
+    # are unavailable (see ops/indexer.py), so calling it would raise a TypeError. Skip --
+    # like the other real-kernel tests below -- when the backend is absent; the monkeypatched
+    # interface exercises the wrapper's arg handling only when the wrapper itself exists.
+    if indexer.lighting_indexer_indices is None:
+        pytest.skip("TileLang indexer forward/backward kernels are unavailable")
     seen = {}
 
     def fake_indexer_fwd_interface(

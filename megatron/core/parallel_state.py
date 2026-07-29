@@ -1865,7 +1865,15 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 
 def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
     """Get the dynamic context parallel groups the caller rank belongs to."""
-    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+    # group_size values are the plain replicate DP x CP degree (see the
+    # data_parallel_size * context_parallel_size group_sizes built in
+    # initialize_model_parallel), and the matched branch returns the replicate
+    # _DATA_PARALLEL_GROUP_WITH_CP. Query that same replicate group's size:
+    # with_gtp_remat=False. The merge took main's get_data_parallel_world_size
+    # signature, whose with_gtp_remat=True default would instead read the
+    # GTP_remat group -- which is None here (this runs during
+    # initialize_model_parallel, before the GTP_remat groups are set up).
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
