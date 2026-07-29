@@ -438,9 +438,9 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
-    # skip downstream mbridge testing on PR pushes by
-    # default. They still run for merge_group and nightly (schedule /
-    # workflow_dispatch) triggers, and PR authors can opt in by adding the
+    # Skip downstream MBridge testing for docs-only changes and PR pushes by
+    # default. Non-docs merge_group and nightly (schedule / workflow_dispatch)
+    # triggers still run it, and PR authors can opt in by adding the
     # "Run MBridge tests" label — all three cases set
     # configure.outputs.run_mbridge == 'true'.
     if: |
@@ -450,6 +450,7 @@ jobs:
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && vars.ENABLE_CICD_MBRIDGE_TESTING == 'true'
       && needs.configure.outputs.run_mbridge == 'true'
+      && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
