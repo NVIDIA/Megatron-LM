@@ -65,12 +65,10 @@ def _requires_bf16_staging(param: torch.Tensor) -> bool:
     destination, updating quantized storage slice-by-slice is unsafe because
     scale blocks can cross slice boundaries, so refit assembles the complete
     local BF16 weight and quantizes it once after all receives finish.
-
-    The first condition preserves existing non-GTP MXFP8 support. The second
-    adds native quantized GTP parameters, including NVFP4 (``is_float8tensor``
-    recognizes TransformerEngine's generic QuantizedTensor base in TE 2.x).
     """
     is_gtp = getattr(param, "is_gtp_weight_remat", False)
+    # MXFP8 staging predates GTP. Broaden it to TE's generic quantized tensor
+    # class only for GTP, adding NVFP4 without changing non-GTP behavior.
     return is_mxfp8tensor(param) or (is_gtp and is_float8tensor(param))
 
 
@@ -78,10 +76,7 @@ def _get_quantized_accumulator(pending: dict[int, tuple], dst_param: torch.Tenso
     """Get or lazily allocate the BF16 accumulation buffer for a quantized destination.
 
     All slices for the same dst_param land in this buffer; ``quantize_`` is
-    called once after all slices have been written. Preserve the existing
-    uninitialized allocation for ordinary MXFP8 parameters, whose full storage
-    is overwritten. Only padded GTP parameters need zero initialization because
-    their storage-only tail intentionally receives no logical-weight transfer.
+    called once after all slices have been written.
     """
     param_id = id(dst_param)
     entry = pending.get(param_id)
@@ -89,6 +84,8 @@ def _get_quantized_accumulator(pending: dict[int, tuple], dst_param: torch.Tenso
         has_gtp_padding = bool(
             getattr(dst_param, "is_gtp_weight_remat", False) and getattr(dst_param, "pad_length", 0)
         )
+        # GTP padding receives no data. Zero it so uninitialized values cannot
+        # distort a quantization block shared with logical weight values.
         allocate = torch.zeros if has_gtp_padding else torch.empty
         full_bf16 = allocate(dst_param.shape, dtype=torch.bfloat16, device=dst_param.device)
         entry = (dst_param, full_bf16)
