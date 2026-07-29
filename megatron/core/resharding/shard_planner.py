@@ -17,7 +17,7 @@ class _Segment(NamedTuple):
     length: int
 
 
-class _DimensionShard(NamedTuple):
+class _GTPShardLayout(NamedTuple):
     """Location of one stored dimension in its unpadded TP-local layout.
 
     ``tp_local_size`` is the size after GTP shards are joined and padding is
@@ -37,11 +37,11 @@ class _DimensionShard(NamedTuple):
     tp_local_size: int
 
 
-def _dimension_shard(metadata: ParameterMetadata, dim: int) -> _DimensionShard:
-    """Locate this rank's stored dimension in the TP-local weight."""
+def _gtp_shard_layout(metadata: ParameterMetadata, dim: int) -> _GTPShardLayout:
+    """Describe this rank's GTP shard within the TP-local dimension."""
     stored_size = metadata.shape[dim]
     if not metadata.is_gtp or dim != 0:
-        return _DimensionShard(0, stored_size, stored_size)
+        return _GTPShardLayout(0, stored_size, stored_size)
 
     group = metadata.gtp_remat_group_ranks
     if not group:
@@ -57,7 +57,7 @@ def _dimension_shard(metadata: ParameterMetadata, dim: int) -> _DimensionShard:
     gtp_rank = _get_rank_in_group(metadata.owner_rank, group)
     tp_local_start = gtp_rank * stored_size
     tp_local_stop = min(tp_local_start + stored_size, tp_local_size)
-    return _DimensionShard(tp_local_start, tp_local_stop, tp_local_size)
+    return _GTPShardLayout(tp_local_start, tp_local_stop, tp_local_size)
 
 
 def _tp_segments(metadata: ParameterMetadata, dim: int, tp_local_size: int) -> list[_Segment]:
@@ -116,16 +116,16 @@ def _local_segments(metadata: ParameterMetadata, dim: int) -> list[_Segment]:
     that slice with the TP segments naturally handles column, row, strided, and
     packed tensor-parallel layouts.
     """
-    shard = _dimension_shard(metadata, dim)
+    gtp_layout = _gtp_shard_layout(metadata, dim)
     segments = []
-    for tp_segment in _tp_segments(metadata, dim, shard.tp_local_size):
+    for tp_segment in _tp_segments(metadata, dim, gtp_layout.tp_local_size):
         tp_segment_stop = tp_segment.local_start + tp_segment.length
-        tp_local_start = max(shard.tp_local_start, tp_segment.local_start)
-        tp_local_stop = min(shard.tp_local_stop, tp_segment_stop)
+        tp_local_start = max(gtp_layout.tp_local_start, tp_segment.local_start)
+        tp_local_stop = min(gtp_layout.tp_local_stop, tp_segment_stop)
         if tp_local_start < tp_local_stop:
             segments.append(
                 _Segment(
-                    tp_local_start - shard.tp_local_start,
+                    tp_local_start - gtp_layout.tp_local_start,
                     tp_segment.global_start + tp_local_start - tp_segment.local_start,
                     tp_local_stop - tp_local_start,
                 )
@@ -137,7 +137,7 @@ def _global_shape(metadata: ParameterMetadata) -> tuple[int, ...]:
     """Return the unpadded shape after materializing TP and GTP."""
     shape = []
     for dim in range(len(metadata.shape)):
-        tp_local_size = _dimension_shard(metadata, dim).tp_local_size
+        tp_local_size = _gtp_shard_layout(metadata, dim).tp_local_size
         if metadata.is_tp and metadata.partition_dim == dim:
             group = metadata.tensor_parallel_group_ranks
             if not group:
