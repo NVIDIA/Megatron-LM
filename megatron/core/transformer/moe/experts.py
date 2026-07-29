@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.activations import squared_relu
+from megatron.core.activations import squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -996,7 +996,9 @@ class TEGroupedMLP(MegatronModule):
                     bias_parallel is None
                 ), "Bias is not supported with fused weighted squared relu."
                 intermediate_parallel = weighted_squared_relu_impl(
-                    intermediate_parallel, permuted_probs
+                    intermediate_parallel,
+                    permuted_probs,
+                    self.config.activation_func_tanh_clamp_scale,
                 )
             else:
                 if self.config.gated_linear_unit:
@@ -1016,6 +1018,8 @@ class TEGroupedMLP(MegatronModule):
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
+                    if (val := self.config.activation_func_tanh_clamp_scale) is not None:
+                        intermediate_parallel = tanh_soft_clamp(intermediate_parallel, val)
                     intermediate_parallel = self.activation_func(intermediate_parallel)
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * permuted_probs

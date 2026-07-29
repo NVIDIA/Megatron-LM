@@ -239,6 +239,9 @@ class TransformerConfig(ModelParallelConfig):
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu or SwiGLU (MoE only)."""
 
+    activation_func_tanh_clamp_scale: Optional[float] = None
+    """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s` is this value."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
@@ -2621,6 +2624,23 @@ class TransformerConfig(ModelParallelConfig):
                     "TransformerEngine only support gelu, geglu, silu, swiglu, relu, reglu. "
                     "If you don't want to use TransformerEngine activation function, set "
                     "use_te_activation_func to False"
+                )
+
+        if self.activation_func_tanh_clamp_scale is not None:
+            if self.activation_func_tanh_clamp_scale <= 0.0:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale must be positive, got "
+                    f"{self.activation_func_tanh_clamp_scale}."
+                )
+            if self.gated_linear_unit:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale is not supported with gated_linear_unit. "
+                    "Use activation_func_clamp_value to clamp a gated activation instead."
+                )
+            if self.bias_activation_fusion or self.use_te_activation_func:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale is not supported with "
+                    "bias_activation_fusion or use_te_activation_func."
                 )
 
         if self.activation_func_fp8_input_store:

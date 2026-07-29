@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -333,6 +334,8 @@ class MLP(MegatronModule):
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
+                if (val := self.config.activation_func_tanh_clamp_scale) is not None:
+                    intermediate_parallel = tanh_soft_clamp(intermediate_parallel, val)
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
             if per_token_scale is not None:

@@ -12,6 +12,12 @@ def squared_relu(x: torch.Tensor) -> torch.Tensor:
 
 
 @jit_fuser
+def tanh_soft_clamp(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Tanh Soft Clamp to precondition activation inputs."""
+    return (scale * torch.tanh(x.float() / scale)).to(x.dtype)
+
+
+@jit_fuser
 def quick_gelu(x: torch.Tensor) -> torch.Tensor:
     """Quick GELU activation"""
     return x * torch.sigmoid(1.702 * x)
