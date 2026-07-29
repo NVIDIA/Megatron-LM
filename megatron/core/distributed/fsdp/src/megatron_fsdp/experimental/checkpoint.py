@@ -43,10 +43,10 @@ from torch.distributed.checkpoint.state_dict import (
 from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .module import FsdpModule
 
-__all__ = ["save_checkpoint", "load_checkpoint", "sync_model_weight_from_main_weight"]
+__all__ = ["save_checkpoint", "load_checkpoint"]
 
 
-def sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
+def _sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
     """Refresh every FSDP group's compute weights from its (loaded) main weights.
 
     A load writes into the ``main_weight``-backed sharded DTensors. When mixed precision keeps a
@@ -72,6 +72,10 @@ def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
     (main-weight) parameter dtype under mixed precision, and rejects a mismatched gradient. So
     initialize the state here with a ``grad_dtype``-matched zero gradient; the subsequent load
     overwrites it. This is a no-op once the state exists (for example after a training step).
+
+    TODO: this function becomes unnecessary once torch's ``_init_optim_state`` honors a parameter's
+    ``grad_dtype`` when it allocates the placeholder gradient (``torch.zeros_like(param)`` in
+    ``torch/distributed/checkpoint/state_dict.py``); an upstream issue is being filed.
     """
     if optimizer.state:
         return
@@ -81,7 +85,7 @@ def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
                 grad_dtype = getattr(param, "grad_dtype", None) or param.dtype
                 param.grad = torch.zeros_like(param, dtype=grad_dtype)
     optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad()
 
 
 def save_checkpoint(
@@ -135,4 +139,4 @@ def load_checkpoint(
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
     if sync_model_weights:
-        sync_model_weight_from_main_weight(model)
+        _sync_model_weight_from_main_weight(model)
