@@ -82,10 +82,22 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
+# not `flash_attn.__version__` (which reports the 2.x version) or
+# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
+# `is_fa_min_version` here.
+_MIN_FA4_VERSION = "4.0.0b20"
 try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _get_dist_version
 
-    HAVE_FA4 = True
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from packaging.version import Version as _Version
+
+    try:
+        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    except PackageNotFoundError:
+        HAVE_FA4 = False
 except ImportError:
     HAVE_FA4 = False
 
@@ -306,6 +318,7 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+        self.flash_attention_version = config.flash_attention_version
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
         # which is a pure function of the config and is reused on every forward
@@ -983,6 +996,29 @@ class Attention(MegatronModule, ABC):
         )
         return output_total, softmax_lse
 
+    def _resolve_flash_version(self) -> Tuple[bool, bool]:
+        """Resolve which FlashAttention generation this attention should run.
+
+        Honors ``config.flash_attention_version`` when pinned, otherwise falls back
+        to the auto preference order (FA4 > FA3 > FA2). Returns ``(use_fa4, use_fa3)``;
+        when both are False the FA2 kernel is used.
+        """
+        pinned = self.flash_attention_version
+        if pinned == 4:
+            assert (
+                HAVE_FA4
+            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            return True, False
+        if pinned == 3:
+            assert (
+                HAVE_FA3
+            ), "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            return False, True
+        if pinned == 2:
+            return False, False
+        # Auto: prefer the newest available generation.
+        return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -1041,6 +1077,8 @@ class Attention(MegatronModule, ABC):
         # the sink (off-by-one / learnable) softmax correction post-hoc.
         need_lse = softmax_offset is not None
 
+        use_fa4, use_fa3 = self._resolve_flash_version()
+
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
@@ -1048,7 +1086,7 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA4:
+            if use_fa4:
                 output_total, softmax_lse = flash_attn4_varlen_func(
                     q,
                     k,
@@ -1061,9 +1099,9 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=1,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                 )
-            elif HAVE_FA3:
+            elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 fa3_ret = self._flash_attention_3_forward_wrapper(
@@ -1164,7 +1202,7 @@ class Attention(MegatronModule, ABC):
                         output_total, softmax_lse, softmax_offset
                     )
             else:
-                if HAVE_FA4:
+                if use_fa4:
                     if getattr(self, "softmax_scale", None) is not None:
                         softmax_scale = self.softmax_scale
                     else:
@@ -1183,7 +1221,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=1,
+                        num_splits=0 if not self.batch_invariant_mode else 1,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
@@ -1207,12 +1245,12 @@ class Attention(MegatronModule, ABC):
                         "softmax_scale": softmax_scale,
                         "causal": True,
                         "window_size": window_size,
-                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "page_table" if use_fa3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
                     if need_lse:
                         flash_attn_args["return_softmax_lse"] = True
-                    if HAVE_FA3:
+                    if use_fa3:
                         kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
                     else:
                         assert (
