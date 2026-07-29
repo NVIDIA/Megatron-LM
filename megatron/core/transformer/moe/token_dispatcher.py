@@ -1468,11 +1468,15 @@ class _NCCLEPManager(_DispatchManager):
     (1) setup_metadata(): reconstruct topk indices/probs from the routing map (like DeepEP).
     (2) dispatch(): TE ep_dispatch permutes tokens to expert-major layout and performs the
         all-to-all in one step, returning a packed receive buffer + per-expert counts.
-    (3) get_permuted_hidden_states_by_experts(): the receive buffer is already expert-major,
-        so this only narrows it to the valid (sum of per-expert counts) rows for the experts.
-    (4) get_restored_hidden_states_by_experts(): re-expand the expert output back into the
-        static receive-capacity buffer that TE ep_combine writes from.
+    (3) get_permuted_hidden_states_by_experts(): pass-through; the receive buffer is already
+        expert-major and is exactly what the experts consume.
+    (4) get_restored_hidden_states_by_experts(): pass-through; the expert output is already what
+        TE ep_combine reads from.
     (5) combine(): TE ep_combine scatters expert outputs back to the original tokens.
+
+    moe_expert_rank_capacity_factor selects the mode: set for static shapes (fixed receive
+    buffer, CUDA-graph capturable, needs the fused grouped GEMM), unset for eager (TE sizes the
+    receive buffer per step from the actual received-token count).
 
     The TE NCCL EP context (a single EpBuffer) and the process-wide bootstrap are created
     lazily on the first dispatch, when the local token count is known.
@@ -1523,49 +1527,55 @@ class _NCCLEPManager(_DispatchManager):
         # Per-expert packing alignment for the receive buffer (grouped-GEMM tile)
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
-        self.static_shape = config.moe_ncclep_static_shape
+        # An unset capacity factor selects eager mode: TE sizes the receive buffer per step from
+        # the actual received-token count instead of a fixed budget.
+        self.eager = self.rank_capacity_factor is None
         self.zero_copy = config.moe_ncclep_zero_copy
         self._zc_quant = self.zero_copy and bool(config.fp8 or config.fp4)
-        if self.zero_copy and not self.static_shape:
-            raise ValueError(
-                "moe_ncclep_zero_copy requires moe_ncclep_static_shape "
-                "(fixed [recv_capacity, hidden] symm buffers)."
-            )
-        if self.static_shape:
-            # static shape needs a fused grouped GEMM that consumes ragged per-expert counts on
-            # device (no host-side split narrowing): moe_grouped_gemm selects the grouped experts
-            # and use_transformer_engine_op_fuser fuses FC1+act+FC2 over them (fp8/fp4 via the CuTe
-            # DSL fused grouped MLP, bf16 via the op-fuser GroupedLinear grouped-tensor path).
-            if not (config.use_transformer_engine_op_fuser and config.moe_grouped_gemm):
-                raise ValueError(
-                    "moe_ncclep_static_shape=True requires BOTH use_transformer_engine_op_fuser "
-                    "and moe_grouped_gemm (the fused grouped GEMM over device-side "
-                    "per-expert counts)."
-                )
-            if config.fp8 or config.fp4:
-                if torch.cuda.get_device_capability()[0] < 10:
-                    raise ValueError(
-                        "moe_ncclep_static_shape=True with fp8/fp4 requires an sm100+ (Blackwell+) "
-                        "GPU for the CuTe DSL grouped GEMM; leave it False on older GPUs."
-                    )
-                if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-                    raise ValueError(
-                        "moe_ncclep_static_shape=True with fp8/fp4 requires the CuTe DSL grouped "
-                        "GEMM; set NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must "
-                        "consume ragged per-expert counts on device)."
-                    )
 
         if nccl_ep_dispatch is None:
             raise ImportError(
                 "TransformerEngine NCCL EP is unavailable. The 'ncclep' backend requires a "
                 "TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
             )
-        if self.rank_capacity_factor is None:
+        # [TODO] Add support for drop and pad with the 'ncclep' backend.
+        if config.moe_pad_expert_input_to_capacity or config.moe_expert_capacity_factor is not None:
             raise ValueError(
-                "The 'ncclep' backend requires moe_expert_rank_capacity_factor to be set: it "
-                "sizes the per-rank receive buffer. Exceeding the budget hard-traps, so set it "
-                "generously."
+                "drop and pad is not supported yet with the 'ncclep' backend."
             )
+
+        if self.eager:
+            if self.zero_copy:
+                raise ValueError(
+                    "moe_ncclep_zero_copy requires moe_expert_rank_capacity_factor: the symm-mem "
+                    "buffers are a fixed [recv_capacity, hidden] and cannot be resized per step."
+                )
+        else:
+            # Static shapes feed the experts the full receive buffer, so the grouped GEMM must
+            # consume the ragged per-expert counts on device and never read the slack tail:
+            # moe_grouped_gemm selects the grouped experts and use_transformer_engine_op_fuser
+            # fuses FC1+act+FC2 over them (fp8/fp4 via the CuTe DSL fused grouped MLP, bf16 via
+            # the op-fuser GroupedLinear grouped-tensor path).
+            if not (config.use_transformer_engine_op_fuser and config.moe_grouped_gemm):
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor with the 'ncclep' backend requires BOTH "
+                    "use_transformer_engine_op_fuser and moe_grouped_gemm (the fused grouped GEMM "
+                    "over device-side per-expert counts); unset it to use eager mode instead."
+                )
+            if config.fp8 or config.fp4:
+                if torch.cuda.get_device_capability()[0] < 10:
+                    raise ValueError(
+                        "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
+                        "requires an sm100+ (Blackwell+) GPU for the CuTe DSL grouped GEMM; unset "
+                        "it to use eager mode on older GPUs."
+                    )
+                if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
+                    raise ValueError(
+                        "moe_expert_rank_capacity_factor with the 'ncclep' backend and fp8/fp4 "
+                        "requires the CuTe DSL grouped GEMM; set "
+                        "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume "
+                        "ragged per-expert counts on device)."
+                    )
 
         # Fresh EpBuffer per dispatch, held until the matching combine consumes it. dispatch
         # and combine share one buffer: handle_mem is the routing table that dispatch writes
@@ -1591,7 +1601,7 @@ class _NCCLEPManager(_DispatchManager):
         self.num_local_tokens = num_tokens
 
     def _ensure_bootstrap(self):
-        """Bootstrap NCCL EP and size the receive buffer on first use (static shapes)."""
+        """Bootstrap NCCL EP and size the receive buffer on first use."""
         if self._bootstrapped:
             return
         # NCCL EP's HT backend requires max_dispatch_tokens_per_rank to be a multiple of the HT
@@ -1603,10 +1613,13 @@ class _NCCLEPManager(_DispatchManager):
             // _HT_TOKENS_PER_CHUNK
             * _HT_TOKENS_PER_CHUNK
         )
-        budget = int(self._max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
-        if self.alignment != 0:
-            budget += -budget % self.alignment
-        self._recv_capacity = budget
+        if self.eager:
+            self._recv_capacity = None
+        else:
+            budget = int(self._max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
+            if self.alignment != 0:
+                budget += -budget % self.alignment
+            self._recv_capacity = budget
 
         ensure_nccl_ep_bootstrapped(
             self.group,
@@ -1614,6 +1627,7 @@ class _NCCLEPManager(_DispatchManager):
             max_tokens_per_rank=self._max_tokens_per_rank,
             recv_capacity_per_rank=self._recv_capacity,
             hidden_dim=self.hidden_dim,
+            num_topk=self.router_topk,
             num_sms=(
                 self.config.moe_flex_dispatcher_num_sms
                 if self.config.moe_flex_dispatcher_num_sms is not None
@@ -1673,9 +1687,11 @@ class _NCCLEPManager(_DispatchManager):
         # token_indices/token_probs: [num_local_tokens, router_topk]
         topk_idx = self.token_indices
         topk_weights = self.token_probs.float()
-        # hidden_states: [num_local_tokens, H] -> recv_tokens: [recv_capacity_per_rank, H]
+        # hidden_states: [num_local_tokens, H] -> recv_tokens: [recv_rows, H]
         #   tokens_per_expert: [num_local_experts]
-        #   dispatched_probs: [recv_capacity_per_rank]
+        #   dispatched_probs: [recv_rows]
+        # recv_rows is the actual number of received tokens in eager mode, otherwise
+        # recv_capacity_per_rank.
         recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
             self._buffer,
             hidden_states,
@@ -1692,13 +1708,7 @@ class _NCCLEPManager(_DispatchManager):
         return recv_tokens
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.static_shape:
-            return hidden_states, self.dispatched_probs
-        # narrow to the sum(counts) valid (alignment-padded) rows the experts consume.
-        num_valid = int(self.tokens_per_expert.sum().item())  # sum(counts) = Σ
-        permuted_hidden = hidden_states[:num_valid]  # [recv_capacity_per_rank, H] -> [Σ, H]
-        permuted_probs = self.dispatched_probs[:num_valid]  # [recv_capacity_per_rank] -> [Σ]
-        return permuted_hidden, permuted_probs
+        return hidden_states, self.dispatched_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
         '''
@@ -1707,16 +1717,6 @@ class _NCCLEPManager(_DispatchManager):
         return self.tokens_per_expert
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # TE ep_combine reads from the static [recv_capacity, H] buffer. static_shape=False path the
-        # experts ran on the narrowed [Σ, H] slice, so re-expand back to recv_capacity; in
-        # static_shape mode the output is already recv_capacity rows (no-op). Rows beyond the valid
-        # region map to no token and combine ignores them.
-        num_valid = hidden_states.shape[0]
-        pad_rows = self._recv_capacity - num_valid
-        if pad_rows > 0:
-            hidden_states = torch.cat(
-                [hidden_states, hidden_states.new_zeros(pad_rows, hidden_states.shape[-1])], dim=0
-            )
         return hidden_states
 
     def combine(
@@ -1725,7 +1725,7 @@ class _NCCLEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        # hidden_states: [recv_capacity_per_rank, H] -> [num_local_tokens, H]
+        # hidden_states: [recv_rows, H] -> [num_local_tokens, H]
         hidden_states = nccl_ep_combine(
             self._buffer,
             hidden_states,

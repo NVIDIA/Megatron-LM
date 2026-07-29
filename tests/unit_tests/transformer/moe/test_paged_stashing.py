@@ -117,7 +117,6 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
-            moe_ncclep_static_shape=kwargs.get("moe_ncclep_static_shape", False),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
@@ -448,10 +447,11 @@ class TestPagedStashingOverBudget:
 class TestNcclEpPagedStashing:
     """Paged stashing with the NCCL EP flex backend in its static-shape path.
 
-    ncclep's CUDA-graph / paged-stash path requires moe_ncclep_static_shape=True, which feeds the
-    experts the full fixed-size recv buffer and is only valid with fp8/fp4 + the CuTe DSL grouped
-    GEMM (the container always configures mxfp8; NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 must be set in the
-    environment). This mirrors TestPagedStashing: run the paged-stash path twice and assert the two
+    ncclep's CUDA-graph / paged-stash path requires moe_expert_rank_capacity_factor, which feeds
+    the experts the full fixed-size recv buffer and is only valid with fp8/fp4 + the CuTe DSL
+    grouped GEMM (the container always configures mxfp8; NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 must be
+    set in the environment). This mirrors TestPagedStashing: run the paged-stash path twice and
+    assert the two
     passes agree (a determinism guard for the static ncclep path), plus no paged-stash overflow.
     """
 
@@ -489,7 +489,6 @@ class TestNcclEpPagedStashing:
             moe_permute_fusion=True,
             hidden_size=1024,
             moe_flex_dispatcher_backend="ncclep",
-            moe_ncclep_static_shape=True,
             test_dtype=torch.bfloat16,
             moe_grouped_gemm=True,
             moe_use_legacy_grouped_gemm=False,
