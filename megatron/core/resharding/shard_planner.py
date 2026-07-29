@@ -17,25 +17,39 @@ class _Segment(NamedTuple):
     length: int
 
 
-def _storage_interval(metadata: ParameterMetadata, dim: int) -> tuple[int, int, int]:
-    """Return local storage bounds in the unpadded TP-local weight."""
-    local_size = metadata.shape[dim]
+class _DimensionShard(NamedTuple):
+    """Location of one stored dimension in its unpadded TP-local layout.
+
+    ``tp_local_size`` is the size after GTP shards are joined and padding is
+    removed, but before TP shards are joined.
+    """
+
+    tp_local_start: int
+    tp_local_stop: int
+    tp_local_size: int
+
+
+def _dimension_shard(metadata: ParameterMetadata, dim: int) -> _DimensionShard:
+    """Locate this rank's stored dimension in the TP-local weight."""
+    stored_size = metadata.shape[dim]
     if not metadata.is_gtp or dim != 0:
-        return 0, local_size, local_size
+        return _DimensionShard(0, stored_size, stored_size)
 
     group = metadata.gtp_remat_group_ranks
     if not group:
         raise RuntimeError(f"{metadata.name}: missing GTP rematerialization group")
 
-    tp_local_size = local_size * len(group) - metadata.gtp_pad_length
+    tp_local_size = stored_size * len(group) - metadata.gtp_pad_length
     if tp_local_size <= 0:
         raise RuntimeError(
             f"{metadata.name}: invalid GTP padding ({metadata.gtp_pad_length}) "
-            f"for dim 0 size {local_size} and group size {len(group)}"
+            f"for dim 0 size {stored_size} and group size {len(group)}"
         )
 
-    start = _get_rank_in_group(metadata.owner_rank, group) * local_size
-    return start, min(start + local_size, tp_local_size), tp_local_size
+    gtp_rank = _get_rank_in_group(metadata.owner_rank, group)
+    tp_local_start = gtp_rank * stored_size
+    tp_local_stop = min(tp_local_start + stored_size, tp_local_size)
+    return _DimensionShard(tp_local_start, tp_local_stop, tp_local_size)
 
 
 def _tp_segments(metadata: ParameterMetadata, dim: int, tp_local_size: int) -> list[_Segment]:
@@ -94,16 +108,16 @@ def _local_segments(metadata: ParameterMetadata, dim: int) -> list[_Segment]:
     that slice with the TP segments naturally handles column, row, strided, and
     packed tensor-parallel layouts.
     """
-    storage_start, storage_stop, tp_local_size = _storage_interval(metadata, dim)
+    shard = _dimension_shard(metadata, dim)
     segments = []
-    for tp_segment in _tp_segments(metadata, dim, tp_local_size):
+    for tp_segment in _tp_segments(metadata, dim, shard.tp_local_size):
         tp_stop = tp_segment.local_start + tp_segment.length
-        start = max(storage_start, tp_segment.local_start)
-        stop = min(storage_stop, tp_stop)
+        start = max(shard.tp_local_start, tp_segment.local_start)
+        stop = min(shard.tp_local_stop, tp_stop)
         if start < stop:
             segments.append(
                 _Segment(
-                    start - storage_start,
+                    start - shard.tp_local_start,
                     tp_segment.global_start + start - tp_segment.local_start,
                     stop - start,
                 )
@@ -115,7 +129,7 @@ def _global_shape(metadata: ParameterMetadata) -> tuple[int, ...]:
     """Return the unpadded shape after materializing TP and GTP."""
     shape = []
     for dim in range(len(metadata.shape)):
-        _, _, tp_local_size = _storage_interval(metadata, dim)
+        tp_local_size = _dimension_shard(metadata, dim).tp_local_size
         if metadata.is_tp and metadata.partition_dim == dim:
             group = metadata.tensor_parallel_group_ranks
             if not group:
