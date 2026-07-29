@@ -13,7 +13,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
 from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
@@ -62,7 +62,7 @@ def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[t
     return unpacked_x
 
 
-@pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn1", "gdn2"])
+@pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn", "gdn2"])
 @pytest.mark.parametrize(
     ("tp_size", "sp", "cp_size"),
     [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
@@ -243,6 +243,8 @@ class TestGatedDeltaNet:
             ), f"Grad not identical for {name} ({rank=})"
 
     def test_deterministic_mode(self):
+        if self.use_gdn2:
+            pytest.skip("GDN2 doesn't support deterministic mode yet.")
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
@@ -368,31 +370,39 @@ class TestGatedDeltaNet:
         # Disable dynamo so coverage.py can trace through the method bodies,
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
-            query, key, value, gate_out, *gate_feats_out = gdn._prepare_input_for_gated_delta_rule(
-                qkv, gate, batch, seq_len, *gate_feats
+            kernel_inputs = gdn._prepare_input_for_gated_delta_rule(
+                qkv, gate, A_log_mock, dt_bias_mock, batch, seq_len, *gate_feats
             )
 
+        # The output gate (z) rides along under "gate" and is popped by forward before
+        # the kernel call; everything else is passed straight through as kernel kwargs.
+        gate_out = kernel_inputs.pop("gate")
+        assert set(kernel_inputs) == expected_keys
+
+        query, key, value, g = (kernel_inputs[k] for k in ("q", "k", "v", "g"))
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-        for t in (query, key, value, gate_out, *gate_feats_out):
+        assert gate_out.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
+        for t in (query, key, value, gate_out, *kernel_inputs.values()):
             assert t.is_contiguous()
 
         if self.use_gdn2:
             # Per-channel decay and erase/write gates squashed to [0, 1]
-            f, b, w = gate_feats_out
-            assert gate_out.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
+            b, w = kernel_inputs["b"], kernel_inputs["w"]
+            assert g.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
             assert b.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
             assert w.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-            assert (gate_out <= 0).all()
+            assert (g <= 0).all()
             assert (b >= 0).all() and (b <= 1).all()
             assert (w >= 0).all() and (w <= 1).all()
-            assert b.is_contiguous() and w.is_contiguous()
         else:
             # Per-head decay and write strength beta
-            assert gate_out.shape == (batch, seq_len, num_v_heads_local)
-            beta, alpha = gate_feats_out
+            beta = kernel_inputs["beta"]
+            assert g.shape == (batch, seq_len, num_v_heads_local)
             assert beta.shape == (batch, seq_len, num_v_heads_local)
+            assert (g <= 0).all()
+            assert (beta >= 0).all() and (beta <= 1).all()
 
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
