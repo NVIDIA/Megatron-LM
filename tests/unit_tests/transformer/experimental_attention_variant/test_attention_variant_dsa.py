@@ -38,6 +38,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     unfused_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_all_rank_positions,
     build_packed_allgather_cp_local_positions,
     build_packed_allgather_cp_query_positions_and_key_reorder,
     build_zigzag_allgather_cp_key_reorder,
@@ -3908,3 +3909,102 @@ class TestDSAModuleSpecDispatch:
         config = self._make_dsa_config(qk_l2_norm=True)
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(config, backend=None)
+
+
+class TestPackedCPAllRankPositions:
+    """The batched CP position builder must match the per-rank loop exactly."""
+
+    @staticmethod
+    def _cu_seqlens(seq_lens, cp_size):
+        """Pad each sequence to a multiple of 2 * cp_size and return cu_seqlens."""
+        multiple = 2 * cp_size
+        padded = [0 if s == 0 else -(-s // multiple) * multiple for s in seq_lens]
+        offsets = [0]
+        for p in padded:
+            offsets.append(offsets[-1] + p)
+        return torch.tensor(offsets, dtype=torch.int32)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8, 16, 64])
+    @pytest.mark.parametrize(
+        "seq_lens", [[512], [512, 1024], [256, 256, 512], [128, 384, 640, 896], [1024, 0, 2048]]
+    )
+    @pytest.mark.parametrize("cover", [True, False])
+    def test_matches_per_rank_loop(self, cp_size, seq_lens, cover):
+        """Row r of the batched build equals the single-rank build for cp_rank=r."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        output_size = total // cp_size
+
+        expected = torch.stack(
+            [
+                build_packed_allgather_cp_local_positions(
+                    cu_seqlens,
+                    cp_size,
+                    rank,
+                    device,
+                    output_size=output_size,
+                    cu_seqlens_cover_output=cover,
+                )
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
+        actual = build_packed_allgather_cp_all_rank_positions(
+            cu_seqlens, cp_size, device, output_size=output_size, cu_seqlens_cover_output=cover
+        )
+        assert actual.shape == expected.shape
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8])
+    def test_padded_output_size(self, cp_size):
+        """Rows still match when output_size exceeds the packed token count."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens([512, 1024], cp_size)
+        output_size = int(cu_seqlens[-1]) // cp_size + 2 * cp_size
+        expected = torch.stack(
+            [
+                build_packed_allgather_cp_local_positions(
+                    cu_seqlens, cp_size, rank, device, output_size=output_size
+                )
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
+        actual = build_packed_allgather_cp_all_rank_positions(
+            cu_seqlens, cp_size, device, output_size=output_size
+        )
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 16])
+    def test_key_reorder_unchanged(self, cp_size):
+        """The public reorder index is unchanged by the batched build."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens([512, 1024], cp_size)
+        total = int(cu_seqlens[-1])
+        output_size = total // cp_size
+
+        _, key_reorder_idx = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=0,
+            device=device,
+            local_output_size=output_size,
+            key_local_output_size=output_size,
+            global_output_size=total,
+        )
+        reference = torch.argsort(
+            torch.cat(
+                [
+                    build_packed_allgather_cp_local_positions(
+                        cu_seqlens, cp_size, rank, device, output_size=output_size
+                    )
+                    for rank in range(cp_size)
+                ],
+                dim=0,
+            )
+        )
+        assert torch.equal(key_reorder_idx, reference)
