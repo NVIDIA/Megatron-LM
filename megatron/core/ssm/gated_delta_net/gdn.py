@@ -13,15 +13,14 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
-    _build_head_perm_for_split_sections,
-    _build_thd_cp_a2a_perm,
     _GDNBase,
+    a2a_cp_to_hp,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
-    tensor_a2a_cp2hp,
     torch_chunk_gated_delta_rule,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
@@ -60,6 +59,22 @@ class GatedDeltaNet(_GDNBase):
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
+
+    @jit_fuser
+    def _compute_gates(
+        self,
+        A_log_local_cp: torch.Tensor,
+        dt_bias_local_cp: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        *gate_feats: tuple[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Compute the per-head log-decay g and the write strength beta."""
+        # ``gate_feats`` arrives in ``in_proj_split_names`` order: beta, then alpha.
+        beta, alpha = gate_feats
+        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        beta = beta.sigmoid()
+        return g, {"beta": beta.contiguous()}
 
     def forward(
         self,
@@ -131,37 +146,15 @@ class GatedDeltaNet(_GDNBase):
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
-        # CP All to All: CP to HP
-        if self.cp_size > 1:
-            # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
-            head_perm = _build_head_perm_for_split_sections(
-                self.in_proj_split_sections,
-                self.pg_collection.cp.size(),
-                torch.cuda.current_device(),
-            )
-            qkvzba = qkvzba.index_select(-1, head_perm)
-
-        thd_cp_a2a_idx, thd_cp_a2a_inv = None, None
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-                undo_attention_load_balancing=False,
-            )
-            if self.cp_size > 1:
-                # Permute at the seq dim so that a single unsectioned a2a
-                # is equivalent to per-sequence a2a.
-                # This also folds the ``_undo_attention_load_balancing`` step.
-                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
-                    cu_seqlens_q, self.cp_size, seq_len
-                )
-                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
-        else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
+        qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
+            qkvzba,
+            self.in_proj_split_sections,
+            self.cp_size,
+            self.pg_collection.cp,
+            cu_seqlens_q,
+            seq_len,
+            packed_seq_params,
+        )
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -227,24 +220,17 @@ class GatedDeltaNet(_GDNBase):
             self.dt_bias, dim=0, cp_group=self.pg_collection.cp
         )
 
-        # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
+        # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        query, key, value, gate, beta, alpha = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, batch, seq_len, beta, alpha
+        kernel_inputs = self._prepare_input_for_gated_delta_rule(
+            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
         )
+        gate = kernel_inputs.pop("gate")
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
-
-        nvtx_range_push(suffix="g_and_beta")
-        g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
-        nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
+            **kernel_inputs,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,

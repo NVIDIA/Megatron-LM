@@ -296,18 +296,26 @@ class _GDNBase(MegatronModule):
         """
         raise NotImplementedError
 
+    def _reset_dt_bias(self):
+        """Initialize ``dt_bias``. Called from ``reset_parameters`` under the RNG tracker.
+
+        Defaults to ones; variants whose kernel expects a different step-size
+        parametrization override this.
+        """
+        torch.ones(
+            self.dt_bias_dim,
+            dtype=self.config.params_dtype,
+            device=torch.cuda.current_device(),
+            out=self.dt_bias.data,
+        )
+
     def reset_parameters(self):
         """Reset the parameters."""
         if self.config.perform_initialization:
             with get_cuda_rng_tracker().fork():
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
-                torch.ones(
-                    self.dt_bias_dim,
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
-                    out=self.dt_bias.data,
-                )
+                self._reset_dt_bias()
                 A = torch.empty(
                     self.A_log.shape[0],
                     dtype=self.config.params_dtype,
@@ -348,23 +356,9 @@ class _GDNBase(MegatronModule):
         norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
         norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
-        # CP all to all: HP to CP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            if self.cp_size > 1:
-                norm_out_hp = norm_out_hp.index_select(0, thd_cp_a2a_inv)
-            norm_out = tensor_a2a_hp2cp(
-                norm_out_hp,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-                redo_attention_load_balancing=False,
-            )
-        else:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
-
-        return norm_out
+        return a2a_hp_to_cp(
+            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
+        )
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -383,17 +377,23 @@ class _GDNBase(MegatronModule):
         self,
         qkv: torch.Tensor,
         gate: torch.Tensor,
+        A_log_local_cp: torch.Tensor,
+        dt_bias_local_cp: torch.Tensor,
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> dict[str, torch.Tensor]:
         """
-        Prepare the query, key, value, gate, and variant gate-feature tensors for the
-        gated delta rule kernels.
+        Prepare all gated delta rule kernel inputs.
 
-        Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
-        ``gate_feats`` holds the variant-specific in_proj sections, which are returned
-        contiguous for the decay/gating computation in ``forward``.
+        Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
+        contiguous operations. ``gate_feats`` holds the variant-specific in_proj
+        sections, which ``_compute_gates`` turns into the decay and gating tensors.
+
+        Returns:
+            (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
+            ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
+            gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
@@ -415,35 +415,49 @@ class _GDNBase(MegatronModule):
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
-        if self.num_value_heads // self.num_key_heads > 1:
-            repeat_factor = self.num_value_heads // self.num_key_heads
+        repeat_factor = self.num_value_heads // self.num_key_heads
+        if repeat_factor > 1:
             query = query.repeat_interleave(repeat_factor, dim=2)
             key = key.repeat_interleave(repeat_factor, dim=2)
 
-        # Make all tensors contiguous
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        gate = gate.contiguous()
-        gate_feats = tuple(t.contiguous() for t in gate_feats)
+        g, variant_kernel_inputs = self._compute_gates(
+            A_log_local_cp, dt_bias_local_cp, batch, seq_len, *gate_feats
+        )
 
-        return query, key, value, gate, *gate_feats
+        kernel_inputs = {
+            "q": query.contiguous(),
+            "k": key.contiguous(),
+            "v": value.contiguous(),
+            "g": g.contiguous(),
+            "gate": gate.contiguous(),
+            **variant_kernel_inputs,
+        }
+        return kernel_inputs
 
-    @jit_fuser
-    def _compute_g_and_beta(
+    def _compute_gates(
         self,
         A_log_local_cp: torch.Tensor,
         dt_bias_local_cp: torch.Tensor,
-        alpha: torch.Tensor,
-        beta: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch: int,
+        seq_len: int,
+        *gate_feats: tuple[torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        Compute g (decay) and beta (sigmoid) for gated delta rule.
-        Fuses exp, softplus, mul, neg, and sigmoid operations.
+        Compute the log-decay ``g`` and the variant-specific kernel inputs.
+
+        Args:
+            A_log_local_cp: CP-local slice of ``A_log``.
+            dt_bias_local_cp: CP-local slice of ``dt_bias``.
+            batch: Batch size.
+            seq_len: Sequence length.
+            gate_feats: The variant-specific in_proj output sections (everything after
+                the qkv and output-gate sections, in ``feat_dim_split`` order).
+
+        Returns:
+            (tuple[Tensor, dict[str, Tensor]]): The log-decay ``g`` and a dict of the
+            remaining variant-specific kernel inputs keyed by kernel argument name.
         """
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
-        return g, beta
+        raise NotImplementedError
 
     def _resolve_cu_seqlens(
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
@@ -793,6 +807,90 @@ def tensor_a2a_hp2cp(
         tensor = _all_to_all_hp2cp(tensor, cp_group)
 
     return tensor
+
+
+def a2a_cp_to_hp(
+    qkvzba: torch.Tensor,
+    in_proj_split_sections: tuple[int, ...],
+    cp_size: int,
+    cp_group: torch.distributed.ProcessGroup,
+    cu_seqlens_q: torch.Tensor | None,
+    seq_len: int,
+    packed_seq_params: PackedSeqParams | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run GDN context-parallel to hidden-parallel A2A and return its inverse context.
+
+    Args:
+        qkvzba: in_proj output in sbhd format, sharded along the sequence dim over CP.
+        in_proj_split_sections: per-section sizes of the in_proj output, local to this
+            TP rank, used to build the pre-a2a head permutation.
+        cp_size: context-parallel world size.
+        cp_group: context-parallel process group.
+        cu_seqlens_q: cumulative sequence lengths, required for the ``thd`` path.
+        seq_len: global (unsharded) sequence length.
+        packed_seq_params: packed-sequence params; the ``thd`` path is taken when its
+            ``qkv_format`` is ``'thd'``.
+
+    Returns:
+        The hidden-parallel tensor and the sequence-dim inverse permutation to hand to
+        :func:`a2a_hp_to_cp` (``None`` outside the ``thd`` + CP>1 case).
+    """
+    if cp_size > 1:
+        # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
+        head_perm = _build_head_perm_for_split_sections(
+            in_proj_split_sections, cp_size, qkvzba.device
+        )
+        qkvzba = qkvzba.index_select(-1, head_perm)
+
+    thd_cp_a2a_inv = None
+    if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        qkvzba = tensor_a2a_cp2hp(
+            qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group, undo_attention_load_balancing=False
+        )
+        if cp_size > 1:
+            # Permute at the seq dim so that a single unsectioned a2a
+            # is equivalent to per-sequence a2a.
+            # This also folds the ``_undo_attention_load_balancing`` step.
+            thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(cu_seqlens_q, cp_size, seq_len)
+            qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
+    else:
+        qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)
+
+    return qkvzba, thd_cp_a2a_inv
+
+
+def a2a_hp_to_cp(
+    norm_out: torch.Tensor,
+    cp_size: int,
+    cp_group: torch.distributed.ProcessGroup,
+    packed_seq_params: PackedSeqParams | None,
+    thd_cp_a2a_inv: torch.Tensor | None,
+) -> torch.Tensor:
+    """Run GDN hidden-parallel to context-parallel A2A using CP-to-HP context.
+
+    Args:
+        norm_out: gated-norm output in sbhd format, sharded along the head dim over CP.
+        cp_size: context-parallel world size.
+        cp_group: context-parallel process group.
+        packed_seq_params: packed-sequence params; the ``thd`` path is taken when its
+            ``qkv_format`` is ``'thd'``.
+        thd_cp_a2a_inv: sequence-dim inverse permutation returned by
+            :func:`a2a_cp_to_hp`, required on the ``thd`` path when ``cp_size > 1``.
+
+    Returns:
+        The context-parallel tensor, matching the layout of the GDN module input.
+    """
+    if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if cp_size > 1:
+            assert thd_cp_a2a_inv is not None
+            norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
+        norm_out = tensor_a2a_hp2cp(
+            norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group, redo_attention_load_balancing=False
+        )
+    else:
+        norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group)
+
+    return norm_out
 
 
 ####################

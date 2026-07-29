@@ -195,7 +195,7 @@ class HybridStack(MegatronModule):
                     if self.config.experimental_attention_variant == "gdn2":
                         # 'G' layers build the GDN2 variant when the gdn2 experimental
                         # attention variant is selected.
-                        from megatron.core.ssm.gdn import GatedDeltaNet2
+                        from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
 
                         gdn_layer_spec = copy.deepcopy(gdn_layer_spec)
                         gdn_layer_spec.submodules.self_attention.module = GatedDeltaNet2
