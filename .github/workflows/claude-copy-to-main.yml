@@ -66,7 +66,7 @@ jobs:
       COPY_BRANCH: copy-pr-${{ github.event.issue.number }}-to-main
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
@@ -80,7 +80,7 @@ jobs:
           git config user.email "svcnvidia-nemo-ci@nvidia.com"
 
       - name: Run Claude Copy to Main
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
         env:
           ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
           CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
@@ -148,7 +148,7 @@ jobs:
           test -s "$RUNNER_TEMP/copy-pr.patch"
 
       - name: Upload copy patch
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: copy-pr-${{ github.event.issue.number }}-patch
           path: ${{ runner.temp }}/copy-pr.patch
@@ -170,13 +170,13 @@ jobs:
       COPY_BRANCH: copy-pr-${{ github.event.issue.number }}-to-main
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT }}
 
       - name: Download copy patch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: copy-pr-${{ github.event.issue.number }}-patch
           path: ${{ runner.temp }}
