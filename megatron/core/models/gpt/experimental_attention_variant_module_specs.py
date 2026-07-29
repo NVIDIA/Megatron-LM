@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gdn import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
