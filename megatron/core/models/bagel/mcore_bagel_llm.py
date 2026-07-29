@@ -316,7 +316,7 @@ class BagelMCoreModel(GPTModel):
             effective_output_weight = (
                 output_weight if output_weight is not None else self.output_layer.weight
             )
-            print(
+            logger.info(
                 '[BAGEL_LM_HEAD_ALIGNMENT_AUDIT] '
                 f'step={audit_step} ce_tokens={ce.numel()} '
                 f'hidden_sum={logits_hidden_states.float().sum().item():.9g} '
@@ -324,8 +324,7 @@ class BagelMCoreModel(GPTModel):
                 f'weight_dtype={effective_output_weight.dtype} '
                 f'weight_sum={effective_output_weight.float().sum().item():.9g} '
                 f'logits_sum={logits.float().sum().item():.9g} '
-                f'ce_sum={ce.float().sum().item():.9g}',
-                flush=True,
+                f'ce_sum={ce.float().sum().item():.9g}'
             )
 
         return dict(
@@ -420,13 +419,12 @@ class BagelMCoreModel(GPTModel):
                         audit_branch_tensor(
                             "rope.inv_freq", "all", self.rotary_pos_emb.inv_freq, layer_number=1
                         )
-                        print(
+                        logger.info(
                             "[BAGEL_ROPE_ALIGNMENT_AUDIT] "
                             f"native_flag={self.bagel_native_rope_for_alignment} "
                             "inv_freq_initialized_on_cpu="
                             f"{self.rotary_pos_emb.native_qwen_for_alignment} "
-                            f"inv_freq_idx9={self.rotary_pos_emb.inv_freq[9].item():.17g}",
-                            flush=True,
+                            f"inv_freq_idx9={self.rotary_pos_emb.inv_freq[9].item():.17g}"
                         )
                         for stage, tensor in (
                             ("rope.cos", rotary_pos_cos),
