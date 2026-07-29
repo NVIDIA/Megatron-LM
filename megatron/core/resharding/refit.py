@@ -9,7 +9,7 @@ High-level refit/reshard orchestration:
 """
 
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, Literal, NamedTuple, Optional, Union
 
 import torch
 
@@ -32,7 +32,18 @@ from .utils import invalidate_refit_tensor_cache, named_persistent_buffers
 
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem", "nixl"]
-_ParallelConfig = Tuple[int, int, int, int, int, int, int]
+
+
+class _ParallelConfig(NamedTuple):
+    """Parallel group sizes that determine a refit plan."""
+
+    tp_size: int
+    pp_size: int
+    ep_size: int
+    dp_size: int
+    expert_tp_size: int
+    gtp_size: int
+    expert_gtp_size: int
 
 
 @dataclass(frozen=True)
@@ -42,7 +53,6 @@ class _PlanCacheKey:
     """
 
     rank: int
-    # (TP, PP, EP, DP, expert TP, GTP remat, expert GTP remat), or None.
     src_config: Optional[_ParallelConfig]
     dst_config: Optional[_ParallelConfig]
     num_experts: Optional[int]
@@ -59,7 +69,7 @@ class _PlanCacheKey:
     pool_index: int = 0
 
 
-def _get_config_tuple(core) -> Optional[_ParallelConfig]:
+def _get_parallel_config(core) -> Optional[_ParallelConfig]:
     """Extract TP/PP/EP/DP/expert-TP/GTP/expert-GTP sizes, memoized on the core.
 
     Process-group sizes don't change after init, so the result is cached on the
@@ -68,23 +78,23 @@ def _get_config_tuple(core) -> Optional[_ParallelConfig]:
     """
     if core is None:
         return None
-    cached = getattr(core, '_refit_config_tuple', None)
+    cached = getattr(core, '_refit_parallel_config', None)
     if cached is not None:
         return cached
     pg = core.pg_collection
     expt_tp = getattr(pg, 'expt_tp', None)
     gtp_remat = getattr(pg, 'gtp_remat', None)
     expt_gtp_remat = getattr(pg, 'expt_gtp_remat', None)
-    result = (
-        pg.tp.size() if pg.tp else 1,
-        pg.pp.size() if pg.pp else 1,
-        pg.ep.size() if pg.ep else 1,
-        pg.dp.size() if pg.dp else 1,
-        expt_tp.size() if expt_tp else 1,
-        gtp_remat.size() if gtp_remat else 1,
-        expt_gtp_remat.size() if expt_gtp_remat else 1,
+    result = _ParallelConfig(
+        tp_size=pg.tp.size() if pg.tp else 1,
+        pp_size=pg.pp.size() if pg.pp else 1,
+        ep_size=pg.ep.size() if pg.ep else 1,
+        dp_size=pg.dp.size() if pg.dp else 1,
+        expert_tp_size=expt_tp.size() if expt_tp else 1,
+        gtp_size=gtp_remat.size() if gtp_remat else 1,
+        expert_gtp_size=expt_gtp_remat.size() if expt_gtp_remat else 1,
     )
-    core._refit_config_tuple = result
+    core._refit_parallel_config = result
     return result
 
 
@@ -104,8 +114,8 @@ def _build_plan_cache_key(
     world_size = group.size() if group is not None else torch.distributed.get_world_size()
     return _PlanCacheKey(
         rank=rank,
-        src_config=_get_config_tuple(src_core),
-        dst_config=_get_config_tuple(tgt_core),
+        src_config=_get_parallel_config(src_core),
+        dst_config=_get_parallel_config(tgt_core),
         num_experts=num_experts,
         world_size=world_size,
         src_rank_offset=src_rank_offset,
