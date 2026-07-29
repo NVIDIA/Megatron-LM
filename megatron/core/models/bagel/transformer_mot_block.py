@@ -906,9 +906,7 @@ class Qwen2RMSNorm(torch.nn.Module):
 
     def __init__(self, config: TransformerConfig, hidden_size: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.ones(hidden_size, dtype=config.params_dtype)
-        )
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=config.params_dtype))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
@@ -981,9 +979,7 @@ class BagelAlignmentColumnParallelLinear(ColumnParallelLinear):
         if tp_comm_buffer_name in ("qkv", "qkv_gen"):
             projection_kind = "qkv"
             if getattr(config, "attention_output_gate", False):
-                raise ValueError(
-                    "BAGEL split-QKV alignment does not support attention_output_gate"
-                )
+                raise ValueError("BAGEL split-QKV alignment does not support attention_output_gate")
         elif tp_comm_buffer_name == "fc1":
             projection_kind = "swiglu_fc1"
             if stride != 2 or output_size != 2 * config.ffn_hidden_size:
@@ -1035,9 +1031,7 @@ class BagelAlignmentColumnParallelLinear(ColumnParallelLinear):
             )
 
         trailing_shape = tuple(tensor.shape[1:])
-        grouped = tensor.reshape(
-            num_query_groups, queries_per_group + 2, head_dim, *trailing_shape
-        )
+        grouped = tensor.reshape(num_query_groups, queries_per_group + 2, head_dim, *trailing_shape)
         query = grouped[:, :queries_per_group].reshape(
             num_attention_heads * head_dim, *trailing_shape
         )
@@ -1147,6 +1141,7 @@ def get_mot_layer_spec(
             TERowParallelLinear,
         )
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
         linear_qkv = TEColumnParallelLinear
         linear_proj = TERowParallelLinear
         layernorm = TENorm

@@ -26,8 +26,8 @@ def attach_zero_grad_dependency(output: Tensor, *modules: Optional[nn.Module]) -
             if not parameter.requires_grad or parameter_id in seen_parameters:
                 continue
             seen_parameters.add(parameter_id)
-            dependency = parameter.reshape(-1)[:0].sum().to(
-                device=output.device, dtype=output.dtype
+            dependency = (
+                parameter.reshape(-1)[:0].sum().to(device=output.device, dtype=output.dtype)
             )
             zero = dependency if zero is None else zero + dependency
 

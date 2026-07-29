@@ -13,10 +13,7 @@ __all__ = ['BagelRotaryEmbedding', 'apply_qwen2_rotary_pos_emb']
 
 
 def apply_qwen2_rotary_pos_emb(
-    query: Tensor,
-    key: Tensor,
-    cos: Tensor,
-    sin: Tensor,
+    query: Tensor, key: Tensor, cos: Tensor, sin: Tensor
 ) -> tuple[Tensor, Tensor]:
     """Apply RoPE with native Qwen2's exact batch-1 tensor layout and op order."""
 
@@ -117,12 +114,14 @@ class BagelRotaryEmbedding(RotaryEmbedding):
             # uses FP32 values expanded from BF16-rounded frequencies.
             self.inv_freq = self.inv_freq.to(device=position_ids.device, dtype=x.dtype)
 
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(
-            position_ids.shape[0], -1, 1
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         )
         position_ids_expanded = position_ids[:, None, :].float()
         device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        device_type = (
+            device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        )
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)

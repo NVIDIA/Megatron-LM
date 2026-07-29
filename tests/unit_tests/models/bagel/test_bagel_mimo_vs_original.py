@@ -626,8 +626,7 @@ def _check_text_and_gen_parity(T: int, G: int, label: str):
 
     # Extend mimo_batch with gen token indexes so packed_seq_params includes them
     psp = _build_packed_seq_params(
-        packed_batch["packed_text_indexes"],
-        vae_indexes=packed_batch["packed_vae_token_indexes"],
+        packed_batch["packed_text_indexes"], vae_indexes=packed_batch["packed_vae_token_indexes"]
     )
 
     def _to_cuda(batch):
@@ -870,8 +869,7 @@ def _check_diffusion_module_parity(T: int, G: int, label: str):
 
     # ── 6. BagelMimoModel with _TestDiffusionSubmodule ────────────────────────
     psp = _build_packed_seq_params(
-        packed_batch["packed_text_indexes"],
-        vae_indexes=packed_batch["packed_vae_token_indexes"],
+        packed_batch["packed_text_indexes"], vae_indexes=packed_batch["packed_vae_token_indexes"]
     )
     _move_psp_to_device(psp, device)
 
@@ -1020,8 +1018,7 @@ def _check_vit_module_parity(T: int, V: int, label: str):
 
     # ── 6. BagelMimoModel with _TestVitSubmodule ──────────────────────────────
     psp = _build_packed_seq_params(
-        packed_batch["packed_text_indexes"],
-        vit_indexes=packed_batch["packed_vit_token_indexes"],
+        packed_batch["packed_text_indexes"], vit_indexes=packed_batch["packed_vit_token_indexes"]
     )
     _move_psp_to_device(psp, device)
 

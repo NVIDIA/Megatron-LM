@@ -24,10 +24,7 @@ logger = logging.getLogger(__name__)
 def _native_bagel_squared_error(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Evaluate BAGEL's elementwise MSE with native autocast semantics."""
 
-    use_autocast = prediction.is_cuda and prediction.dtype in (
-        torch.float16,
-        torch.bfloat16,
-    )
+    use_autocast = prediction.is_cuda and prediction.dtype in (torch.float16, torch.bfloat16)
     autocast_dtype = prediction.dtype if use_autocast else torch.bfloat16
     with torch.amp.autocast("cuda", enabled=use_autocast, dtype=autocast_dtype):
         return (prediction - target) ** 2
@@ -179,18 +176,10 @@ def align_bagel_embeddings(
     if layer_alignment_audit_enabled(1):
         if vision_embeddings is not None:
             audit_branch_tensor(
-                "vision.position_added",
-                "vision",
-                vision_embeddings,
-                layer_number=1,
+                "vision.position_added", "vision", vision_embeddings, layer_number=1
             )
         if visual_latents is not None:
-            audit_branch_tensor(
-                "diffusion.visual_latents",
-                "gen",
-                visual_latents,
-                layer_number=1,
-            )
+            audit_branch_tensor("diffusion.visual_latents", "gen", visual_latents, layer_number=1)
 
     # ── Step 2: scatter into full [S, H] ────────────────────────────────────
     packed_seq = torch.zeros(sequence_length, H, dtype=dtype, device=device)
@@ -552,12 +541,8 @@ class BagelMimoModel(MimoModel):
                     torch.bfloat16,
                 )
                 autocast_dtype = hidden_state.dtype if use_autocast else torch.bfloat16
-                with torch.amp.autocast(
-                    "cuda", enabled=use_autocast, dtype=autocast_dtype
-                ):
-                    noise_pred = self.modality_submodules['diffusion'].llm2vae(
-                        gen_hidden_state
-                    )
+                with torch.amp.autocast("cuda", enabled=use_autocast, dtype=autocast_dtype):
+                    noise_pred = self.modality_submodules['diffusion'].llm2vae(gen_hidden_state)
                 mse = _native_bagel_squared_error(noise_pred, vis_gen_target)
                 mse = mse * gen_loss_mask.unsqueeze(1)
                 lm_output['mse'] = mse

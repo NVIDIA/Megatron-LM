@@ -341,9 +341,9 @@ class SelfAttentionMoT(MegatronModule):
         ), "packed_seq_params must be provided for MoT with packed sequence"
         Lund = getattr(packed_seq_params, 'padded_und_seqlen', 0)
         Lgen = getattr(packed_seq_params, 'padded_gen_seqlen', 0)
-        assert Lund + Lgen == seq_len, (
-            f"MoT branch lengths ({Lund} + {Lgen}) must match sequence length {seq_len}"
-        )
+        assert (
+            Lund + Lgen == seq_len
+        ), f"MoT branch lengths ({Lund} + {Lgen}) must match sequence length {seq_len}"
         # Keep the opt-in audit inert for lightweight helper-only test doubles.
         # Fully constructed attention modules always carry a 1-based layer number.
         alignment_audit = layer_alignment_audit_enabled(getattr(self, 'layer_number', 0))
@@ -389,24 +389,9 @@ class SelfAttentionMoT(MegatronModule):
         # =====================================================================
         query, key, value = self._split_qkv(qkv_output)
         if alignment_audit:
-            audit_compact_tensor(
-                "attention.q_linear",
-                query,
-                Lund,
-                layer_number=self.layer_number,
-            )
-            audit_compact_tensor(
-                "attention.k_linear",
-                key,
-                Lund,
-                layer_number=self.layer_number,
-            )
-            audit_compact_tensor(
-                "attention.v_linear",
-                value,
-                Lund,
-                layer_number=self.layer_number,
-            )
+            audit_compact_tensor("attention.q_linear", query, Lund, layer_number=self.layer_number)
+            audit_compact_tensor("attention.k_linear", key, Lund, layer_number=self.layer_number)
+            audit_compact_tensor("attention.v_linear", value, Lund, layer_number=self.layer_number)
 
         # Apply Q/K layernorms with MoT
         if any(
@@ -421,22 +406,13 @@ class SelfAttentionMoT(MegatronModule):
             query, key = self._apply_qk_layernorm_mot(query, key, Lund, Lgen)
         if alignment_audit:
             audit_compact_tensor(
-                "attention.q_after_qk_norm",
-                query,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.q_after_qk_norm", query, Lund, layer_number=self.layer_number
             )
             audit_compact_tensor(
-                "attention.k_after_qk_norm",
-                key,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.k_after_qk_norm", key, Lund, layer_number=self.layer_number
             )
             audit_compact_tensor(
-                "attention.v_after_qk_norm",
-                value,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.v_after_qk_norm", value, Lund, layer_number=self.layer_number
             )
 
         # =====================================================================
@@ -448,9 +424,7 @@ class SelfAttentionMoT(MegatronModule):
                 raise ValueError(
                     "BAGEL native Qwen RoPE requires both rotary_pos_cos and rotary_pos_sin"
                 )
-            query, key = apply_qwen2_rotary_pos_emb(
-                query, key, rotary_pos_cos, rotary_pos_sin
-            )
+            query, key = apply_qwen2_rotary_pos_emb(query, key, rotary_pos_cos, rotary_pos_sin)
         elif rotary_pos_emb is not None:
 
             if isinstance(rotary_pos_emb, tuple):
@@ -465,22 +439,13 @@ class SelfAttentionMoT(MegatronModule):
                 key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config)
         if alignment_audit:
             audit_compact_tensor(
-                "attention.q_after_rope",
-                query,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.q_after_rope", query, Lund, layer_number=self.layer_number
             )
             audit_compact_tensor(
-                "attention.k_after_rope",
-                key,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.k_after_rope", key, Lund, layer_number=self.layer_number
             )
             audit_compact_tensor(
-                "attention.v_after_rope",
-                value,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.v_after_rope", value, Lund, layer_number=self.layer_number
             )
 
         # # =====================================================================
@@ -508,10 +473,7 @@ class SelfAttentionMoT(MegatronModule):
             )
         if alignment_audit:
             audit_compact_tensor(
-                "attention.kernel_output",
-                core_attn_out,
-                Lund,
-                layer_number=self.layer_number,
+                "attention.kernel_output", core_attn_out, Lund, layer_number=self.layer_number
             )
 
         # =====================================================================
@@ -587,9 +549,7 @@ class SelfAttentionMoT(MegatronModule):
                 raise ValueError(
                     "BAGEL native Qwen RoPE requires both rotary_pos_cos and rotary_pos_sin"
                 )
-            query, key = apply_qwen2_rotary_pos_emb(
-                query, key, rotary_pos_cos, rotary_pos_sin
-            )
+            query, key = apply_qwen2_rotary_pos_emb(query, key, rotary_pos_cos, rotary_pos_sin)
         elif rotary_pos_emb is not None:
             # rotary_pos_emb can be a tuple (q_pos_emb, k_pos_emb) or a single tensor
             if isinstance(rotary_pos_emb, tuple):
@@ -664,9 +624,9 @@ class SelfAttentionMoT(MegatronModule):
         # Flatten for token-level indexing
         query_flat = query.view(-1, num_heads, head_dim)
         key_flat = key.view(-1, key.shape[2], head_dim)
-        assert padded_und_seqlen + padded_gen_seqlen == query_flat.shape[0], (
-            "MoT Q/K branch lengths must match the flattened query length"
-        )
+        assert (
+            padded_und_seqlen + padded_gen_seqlen == query_flat.shape[0]
+        ), "MoT Q/K branch lengths must match the flattened query length"
 
         def apply_norm(branch: Tensor, norm: Optional[torch.nn.Module]) -> Tensor:
             if norm is None:
@@ -702,9 +662,9 @@ class SelfAttentionMoT(MegatronModule):
 
         # Flatten for token-level indexing
         attn_output_flat = attn_output.view(-1, hidden_size)
-        assert padded_und_seqlen + padded_gen_seqlen == attn_output_flat.shape[0], (
-            "MoT projection branch lengths must match the flattened attention output length"
-        )
+        assert (
+            padded_und_seqlen + padded_gen_seqlen == attn_output_flat.shape[0]
+        ), "MoT projection branch lengths must match the flattened attention output length"
         # Process understanding tokens
         und_input = attn_output_flat[:padded_und_seqlen]
         if padded_und_seqlen > 0:

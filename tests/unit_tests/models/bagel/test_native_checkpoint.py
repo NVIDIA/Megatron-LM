@@ -100,8 +100,7 @@ def _make_model(num_layers=2, *, explicit_pre_mlp_norm=False):
         embedding=SimpleNamespace(word_embeddings=torch.nn.Embedding(_VOCAB_SIZE, _HIDDEN_SIZE)),
         decoder=SimpleNamespace(
             layers=[
-                _make_layer(explicit_pre_mlp_norm=explicit_pre_mlp_norm)
-                for _ in range(num_layers)
+                _make_layer(explicit_pre_mlp_norm=explicit_pre_mlp_norm) for _ in range(num_layers)
             ],
             final_layernorm=_WeightOnlyNorm(_HIDDEN_SIZE),
             final_layernorm_gen=_WeightOnlyNorm(_HIDDEN_SIZE),
@@ -385,8 +384,7 @@ def test_full_native_checkpoint_maps_local_explicit_pre_mlp_norms(tmp_path):
     for layer_index, layer in enumerate(model.language_model.decoder.layers):
         prefix = f"language_model.model.layers.{layer_index}"
         assert torch.equal(
-            layer.pre_mlp_layernorm.weight,
-            source[f"{prefix}.post_attention_layernorm.weight"],
+            layer.pre_mlp_layernorm.weight, source[f"{prefix}.post_attention_layernorm.weight"]
         )
         assert torch.equal(
             layer.pre_mlp_layernorm_gen.weight,
