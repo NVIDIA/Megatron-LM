@@ -2071,6 +2071,9 @@ def setup_model_and_optimizer(
             fp8_recipe=getattr(args, 'fp8_recipe', None),
             fp8=getattr(args, 'fp8', None) is not None,
             calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+            gtp_nccl_ub=getattr(args, 'gtp_nccl_ub', False),
+            egtp_nccl_ub=getattr(args, 'egtp_nccl_ub', False),
+            use_distributed_optimizer=getattr(args, 'use_distributed_optimizer', False),
         )
 
     model = _build_model_wrapper(wrap_with_ddp)
@@ -2088,6 +2091,17 @@ def setup_model_and_optimizer(
             moe_shared_expert_overlap=getattr(args, 'moe_shared_expert_overlap', False),
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
+
+        if is_gtp_remat_active(args) and (
+            getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False)
+        ):
+            from megatron.core.tensor_parallel.gtp_api import register_ddp_buffers_on_gtp_groups
+
+            # Register DDP param buffers on GTP comm groups so both ends of the
+            # GTP all-gather are in the NCCL symmetric window (enables NVLS).
+            for model_chunk in model:
+                if isinstance(model_chunk, DDP):
+                    register_ddp_buffers_on_gtp_groups(model_chunk)
 
     if args.logits_save_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
@@ -4137,10 +4151,27 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
+        if is_gtp_remat_active(args) and (
+            getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False)
+        ):
+            from megatron.core.tensor_parallel.gtp_api import (
+                deregister_ddp_buffers_from_gtp_groups,
+                deregister_gtp_pools,
+            )
+
+            for model_module in model:
+                if isinstance(model_module, DDP):
+                    deregister_ddp_buffers_from_gtp_groups(model_module)
+            # Cache/RS pools are process-global (shared across chunks): deregister once, after
+            # the per-chunk buffer loop above.
+            deregister_gtp_pools()
+        # Deregister the DP-group registration only when it exists (--use-nccl-ub). With
+        # --gtp-nccl-ub alone the pool was registered on the GTP group (handled above), never on
+        # DP, so a DP deregister here would abort with "Could not find handle".
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
+                    if getattr(buf, 'nccl_ub', False) and getattr(buf, 'nccl_mem_pool', None) is not None:
                         nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}

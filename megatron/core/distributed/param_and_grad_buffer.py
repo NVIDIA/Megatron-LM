@@ -1126,6 +1126,12 @@ class _ParamAndGradBuffer:
         self.extra_main_grads = []
         self.nccl_mem_pool = None
 
+        # Only the distributed optimizer has a param_data all-gather input to back with
+        # ncclMemAlloc; without it this would just move grad_data into the pool for no benefit.
+        _any_param_needs_nccl_mem = self.ddp_config.use_distributed_optimizer and any(
+            getattr(p, 'param_needs_nccl_mem', False) for p in self.params
+        )
+
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()
@@ -1145,6 +1151,14 @@ class _ParamAndGradBuffer:
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
+        elif _any_param_needs_nccl_mem:
+            # Params requested ncclMemAlloc backing so this buffer can be window-registered
+            # on additional comm groups by the caller. Allocation-only: no DP group
+            # registration or warmup here — the caller handles those for its own group(s).
+            nccl_allocator.init()
+            pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
+            self.nccl_mem_pool = pool
+            mem_alloc_context = functools.partial(torch.cuda.use_mem_pool, pool)
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext

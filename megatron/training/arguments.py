@@ -3014,6 +3014,11 @@ def _add_distributed_args(parser):
     group.add_argument('--disable-symmetric-registration', action='store_true', dest='disable_symmetric_registration',
                        default=False, help='Disable symmetric (window) registration for NCCL userbuffer registration.'
                        'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.')
+    group.add_argument('--gtp-nccl-ub', action='store_true', dest='gtp_nccl_ub',
+                       default=False, help='Register dense GTP param buffers with NCCL symmetric memory on the GTP '
+                       'group, independent of --use-nccl-ub (which covers the DP group).')
+    group.add_argument('--egtp-nccl-ub', action='store_true', dest='egtp_nccl_ub',
+                       default=False, help='Like --gtp-nccl-ub but for routed-expert (EGTP) groups.')
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')

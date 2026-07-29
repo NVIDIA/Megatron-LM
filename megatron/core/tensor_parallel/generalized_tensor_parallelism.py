@@ -36,6 +36,12 @@ from typing import Dict, List, Optional
 import torch
 from packaging.version import Version
 
+from megatron.core.tensor_parallel.gtp_symm import (
+    _gtp_wgrad_pool,
+    gtp_mem_pool_ctx,
+    is_gtp_pool_registered,
+    register_gtp_pool,
+)
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -384,6 +390,14 @@ class GTPRematConfig:
     # DDP's 1/replicate scaling to yield the full (replicate x gtp) mean.
     calculate_per_token_loss: bool = False
 
+    # Symmetric-memory registration: back the GTP / EGTP AG output cache, RS wgrad padded
+    # buffer, and (under --use-distributed-optimizer) the DDP param buffer with ncclMemAlloc
+    # pools registered on the GTP / EGTP group. Independent of --use-nccl-ub (DP group).
+    gtp_nccl_ub: bool = False
+    egtp_nccl_ub: bool = False
+    # Without distopt the slice-path shard keeps its own storage, so it goes to the symm pool.
+    use_distributed_optimizer: bool = False
+
 
 GTP_CONFIG = GTPRematConfig()
 
@@ -407,23 +421,61 @@ def tag_gtp_params_with_names(model):
             param._debug_name = name
 
 
+def _gtp_remat_group_safe(is_expert: bool = False):
+    """Safe read of the active GTP/EGTP weight-remat group; ``None`` when GTP is off.
+
+    parallel_state's getters assert on an uninitialized group by default, and are split
+    dense/expert rather than taking ``is_expert``. This restores the tolerant lookup the
+    (now removed) ``megatron.core.utils.get_gtp_weight_remat_group`` wrapper provided, so
+    callers on the symm path can probe the group before MPU init without tripping the assert.
+    Local parallel_state import: it imports this module, so a module-level import is circular.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    from megatron.core import parallel_state
+
+    if not parallel_state.is_initialized():
+        return None
+    if is_expert:
+        return parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+    return parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+
+
+def _initialize_gtp_symmetric_group(group):
+    """Register a GTP/EGTP group's symmetric pool (idempotent; no-op for absent/trivial groups)."""
+    if group is not None and group.size() > 1:
+        register_gtp_pool(group)
+
+
 def configure_gtp_remat_from_recipe(
-    *, fp4=False, fp8_recipe=None, fp8=False, calculate_per_token_loss=False
+    *, fp4=False, fp8_recipe=None, fp8=False, calculate_per_token_loss=False,
+    gtp_nccl_ub=False, egtp_nccl_ub=False, use_distributed_optimizer=False,
 ):
     """
-    Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
+    Configure GTP weight-remat (padding + loss reduction + symm mem) from the training recipe.
     Must be called once BEFORE model construction.
     """
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
     # param-state debug asserts, so keep them off for GTP runs.
-    update_gtp_config(calculate_per_token_loss=calculate_per_token_loss, check_param_states=False)
+    update_gtp_config(
+        calculate_per_token_loss=calculate_per_token_loss, check_param_states=False,
+        gtp_nccl_ub=gtp_nccl_ub, egtp_nccl_ub=egtp_nccl_ub,
+        use_distributed_optimizer=use_distributed_optimizer,
+    )
     if fp4:
         update_gtp_config(pad_for_alignment=16)
     elif fp8_recipe == "mxfp8":
         update_gtp_config(pad_for_alignment=32)
     elif fp8:
         update_gtp_config(pad_for_alignment=16)
+
+    # Register the dense-GTP and EGTP pools centrally (pre-construction, before any forward),
+    # so all modules -- including TE pre-sharded ones -- share the registered per-group pools.
+    if gtp_nccl_ub:
+        _initialize_gtp_symmetric_group(_gtp_remat_group_safe())
+    if egtp_nccl_ub:
+        _initialize_gtp_symmetric_group(_gtp_remat_group_safe(is_expert=True))
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
@@ -499,7 +551,14 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
 
     shard_size = tensor.shape[0] // gtp_remat_size
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
-    gtp_shard = GTPShardedParam(shard.clone())
+    # No distopt: the shard keeps this storage -> put it in the symm pool for a symmetric AG input.
+    # With distopt it's flattened into param_data (which carries symmetry) -> skip, so we don't pay
+    # an extra window-register collective (expensive at scale) for a buffer that gets freed.
+    if is_gtp_pool_registered(gtp_remat_group) and not GTP_CONFIG.use_distributed_optimizer:
+        with gtp_mem_pool_ctx(gtp_remat_group):
+            gtp_shard = GTPShardedParam(shard.clone())
+    else:
+        gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
     # Preserve the source weight's TP attributes (dropped when wrapping into GTPShardedParam),
     # so param_is_not_tensor_parallel_duplicate still classifies it without GTP-specific code.
@@ -528,6 +587,14 @@ def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_id
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+    # gtp_smr: use per-group ncclMemAlloc pool for AG/RS buffers.
+    # param_needs_nccl_mem: signal DDP to allocate param_data from ncclMemAlloc (AG input).
+    # Expert vs dense by group identity: is_grouped misses non-grouped (SequentialMLP) experts.
+    # Local import: parallel_state imports this module, so a module-level import would be circular.
+    _is_expert_group = gtp_remat_group is _gtp_remat_group_safe(is_expert=True)
+    _is_smr_enabled = GTP_CONFIG.egtp_nccl_ub if _is_expert_group else GTP_CONFIG.gtp_nccl_ub
+    gtp_shard.gtp_smr = _is_smr_enabled
+    gtp_shard.param_needs_nccl_mem = _is_smr_enabled
     global _GTP_PARAMS
     _GTP_PARAMS.append(gtp_shard)
 
@@ -820,6 +887,9 @@ def _init_gtp_runtime_attrs(obj):
     obj._wgrad_rs_handle = None
     obj.rs_event = torch.cuda.Event(external=True)
     obj._rs_ticket = None
+    # Persistent symm RS send buffer (padded shape, window-registered via LIFO pool).
+    # None for non-symm params or before the first RS.
+    obj._wgrad_padded_buf = None
     # Padding
     obj.pad_length = 0
     # Debug
@@ -1443,8 +1513,37 @@ class GTPShardedParam(torch.nn.Parameter):
         return self.all_gather_and_prefetch(**kwargs)
 
     def get_wgrad_tensor(self):
-        """Pool-allocate a wgrad scratch tensor of unsharded shape for the bwd GEMM."""
-        return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
+        """Pool-allocate a wgrad scratch tensor of unsharded shape for the bwd GEMM.
+
+        Symm-RS path: return the [:unsharded] view of a persistent padded send buffer
+        from the LIFO pool. The bwd GEMM writes into the view; the RS sends the full
+        padded buffer directly (already window-registered), skipping F.pad.
+        """
+        if not getattr(self, "gtp_smr", False):
+            return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
+        if self._wgrad_padded_buf is None:
+            self._wgrad_padded_buf = _gtp_wgrad_pool.alloc(
+                self._unsharded_shape_padded, self.main_grad.dtype, self.device, self.group
+            )
+            # The GEMM writes only the [:unsharded] rows but the RS sends the whole buffer;
+            # zero the pad tail so recycled LIFO storage (keyed by numel, not shape) can't
+            # scatter stale rows into the last rank's main_grad.
+            if self.pad_length:
+                self._wgrad_padded_buf[self._unsharded_shape[0] :].zero_()
+        return self._wgrad_padded_buf[: self._unsharded_shape[0]]
+
+    def _release_wgrad_sendbufs(self):
+        """Return this chain's symm RS send buffers to the LIFO after RS completes -- the release
+        counterpart of get_wgrad_tensor. Non-symm chains never allocated one, so skip without
+        touching self._weights. The LIFO holds buffers at stable addresses, so the same set
+        recycles across params (UNGRAPHED and GRAPHED) rather than pinning one per weight.
+        """
+        if not getattr(self, "gtp_smr", False):
+            return
+        for w in self._weights:
+            if w._wgrad_padded_buf is not None:
+                _gtp_wgrad_pool.free(w._wgrad_padded_buf)
+                w._wgrad_padded_buf = None
 
     def register_grad_accum_hook(self, grad_accum_node, hook):
         """Register a DDP backward hook to call after the wgrad RS finalize.
@@ -1511,6 +1610,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 for buf in self._wgrad_input_bufs:
                     _wgrad_pool_put(buf)
             self._wgrad_input_bufs = None
+        self._release_wgrad_sendbufs()
 
     def _prescale_wgrads_for_mean_rs(self, wgrads):
         """Pre-scale wgrad by 1/gtp_remat so the SUM reduce-scatter yields the gtp_remat mean.
@@ -1539,7 +1639,18 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 w._set_rs_state(new_rs_state)
 
-        if self.pad_length > 0:
+        # Symm-RS: if the bwd GEMM wrote into the registered padded send buffer
+        # (confirmed via storage aliasing), send it directly — F.pad would produce
+        # an unregistered copy. Non-symm or aliasing-miss falls back to F.pad.
+        use_persistent_wgrad = self.pad_length > 0 and all(
+            getattr(w, "_wgrad_padded_buf", None) is not None
+            and w._wgrad_padded_buf.untyped_storage().data_ptr()
+            == g.untyped_storage().data_ptr()
+            for w, g in zip(self._weights, wgrads)
+        )
+        if use_persistent_wgrad:
+            wgrads = [w._wgrad_padded_buf for w in self._weights]
+        elif self.pad_length > 0:
             wgrads = [torch.nn.functional.pad(w, (0, 0, 0, self.pad_length)) for w in wgrads]
 
         if async_op:
@@ -1630,6 +1741,7 @@ class GTPShardedParam(torch.nn.Parameter):
             if poolable:
                 for buf in wgrads:
                     _wgrad_pool_put(buf)
+            self._release_wgrad_sendbufs()
             ret = result if batched else result[0]
 
         # Wait for last reduce scatter if it was async
@@ -1802,8 +1914,17 @@ class GTPWeightCache:
         else:
             out_shape = param._unsharded_shape_padded
 
-        # Route GRAPHED-chain buffers into the CG mempool at creation (see _graphed_alloc).
-        with _graphed_alloc(getattr(param, "chain_id", GTPChain.UNGRAPHED.value)):
+        # Only the AG output needs the symmetric window (store-multicast); the RS output is a local
+        # write -> _graphed_alloc. is_gtp_pool_registered gates the symm pool (gtp_smr implies it;
+        # explicit keeps the custom/unregistered-group path correct and mirrors the TE alloc guard).
+        symm = getattr(param, 'gtp_smr', False) and not reduce_scatter
+        group = getattr(param, "group", None)
+        if symm and is_gtp_pool_registered(group):
+            alloc_ctx = gtp_mem_pool_ctx(group)
+        else:
+            alloc_ctx = _graphed_alloc(getattr(param, "chain_id", GTPChain.UNGRAPHED.value))
+
+        with alloc_ctx:
             if not isinstance(dtype, torch.dtype):
                 # Use the gather quantizer copy: mutating the param's own quantizer usage
                 # would corrupt the optimizer's quantize_ update direction (frozen weights).

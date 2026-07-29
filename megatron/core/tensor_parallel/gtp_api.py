@@ -10,6 +10,16 @@ inner module imports cleanly but reports ``HAVE_TE = False``, mirrored here as
 so no core module uses GTP symbols without TE.
 """
 
+from megatron.core.tensor_parallel.gtp_symm import (
+    RegisteredLifoPool,
+    deregister_ddp_buffers_from_gtp_groups,
+    deregister_gtp_pools,
+    gtp_mem_pool_ctx,
+    is_gtp_pool_registered,
+    register_ddp_buffers_on_gtp_groups,
+    register_gtp_pool,
+)
+
 try:
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
         HAVE_TE,
@@ -40,6 +50,13 @@ except ImportError:
 
 __all__ = [
     "HAVE_GTP",
+    "RegisteredLifoPool",
+    "deregister_ddp_buffers_from_gtp_groups",
+    "deregister_gtp_pools",
+    "gtp_mem_pool_ctx",
+    "is_gtp_pool_registered",
+    "register_ddp_buffers_on_gtp_groups",
+    "register_gtp_pool",
     "GTPChain",
     "GTPEmbeddingWeight",
     "attach_gtp_to_presharded_module",
