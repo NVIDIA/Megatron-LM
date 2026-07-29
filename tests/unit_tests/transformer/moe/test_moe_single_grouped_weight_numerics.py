@@ -54,8 +54,12 @@ try:
     _TE_GROUPED_LINEAR_SUPPORTS_SINGLE_PARAM = (
         "single_grouped_weight" in inspect.signature(TEGroupedLinear.__init__).parameters
     )
+    _TE_GROUPED_LINEAR_SUPPORTS_USE_GROUPED_TENSOR = (
+        "use_grouped_tensor" in inspect.signature(TEGroupedLinear.__init__).parameters
+    )
 except (ImportError, AttributeError):
     _TE_GROUPED_LINEAR_SUPPORTS_SINGLE_PARAM = False
+    _TE_GROUPED_LINEAR_SUPPORTS_USE_GROUPED_TENSOR = False
 
 pytestmark = [
     pytest.mark.internal,
@@ -67,6 +71,10 @@ pytestmark = [
     pytest.mark.skipif(
         not _TE_GROUPED_LINEAR_SUPPORTS_SINGLE_PARAM,
         reason="Installed TE GroupedLinear does not expose single_grouped_weight",
+    ),
+    pytest.mark.skipif(
+        not _TE_GROUPED_LINEAR_SUPPORTS_USE_GROUPED_TENSOR,
+        reason="Installed TE GroupedLinear does not expose use_grouped_tensor",
     ),
 ]
 
@@ -194,6 +202,7 @@ class TestMoESingleGroupedWeightNumerics:
         args.num_experts = 2
         args.moe_layer_freq = 1
         args.moe_grouped_gemm = True
+        args.moe_use_grouped_tensor = True
         args.moe_single_grouped_weight = single_weight
         args.moe_token_dispatcher_type = "alltoall"
         args.moe_router_topk = 1
@@ -726,17 +735,18 @@ class TestMoESingleGroupedWeightNumerics:
             use_transformer_engine_op_fuser=True,
         )
 
-    def test_single_grouped_weight_parity_module_grouped_linear(self):
-        """Single grouped weights require the TE op-fuser execution path."""
-        args = self.create_test_args(
-            precision="bf16",
-            primary_param_gather=False,
-            single_weight=True,
-            gradient_accumulation_fusion=False,
+    @pytest.mark.parametrize(
+        "precision,primary_param_gather", [("bf16", False), ("mxfp8", False), ("mxfp8", True)]
+    )
+    @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
+    def test_single_grouped_weight_parity_module_grouped_linear(
+        self, precision, primary_param_gather, gradient_accumulation_fusion
+    ):
+        """Compare native TE GroupedLinear single and discrete parameter layouts."""
+        _skip_if_unsupported(precision)
+        self.run_parity_case(
+            precision=precision,
+            primary_param_gather=primary_param_gather,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
             use_transformer_engine_op_fuser=False,
         )
-        with pytest.raises(
-            ValueError,
-            match="moe_single_grouped_weight requires use_transformer_engine_op_fuser=True",
-        ):
-            core_transformer_config_from_args(args)
