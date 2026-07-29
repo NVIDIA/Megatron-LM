@@ -2395,6 +2395,7 @@ class TestRealKernelIndexerTopk:
 
         ratio, topk, idx_nh, idx_hd = 4, 16, 64, 128
         q_lens, k_lens = [64, 96], [16, 24]
+        max_seqlen_q, max_seqlen_k = 96, 24
         cu_q = _make_cu_seqlens(q_lens, device='cuda')
         cu_k = _make_cu_seqlens(k_lens, device='cuda')
         total_q, total_k = sum(q_lens), sum(k_lens)
@@ -2412,8 +2413,8 @@ class TestRealKernelIndexerTopk:
             ratio=ratio,
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
-            max_seqlen_q=max(q_lens),
-            max_seqlen_k=max(k_lens),
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             return_softmax=True,
             precision=precision,
         )
@@ -2430,7 +2431,7 @@ class TestRealKernelIndexerTopk:
                 workspace.mxfp8.cu_seqlens_k_scale_padded,
                 torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda"),
             )
-            assert workspace.mxfp8.q_scale.shape == (1, 160 * idx_nh, 4)
+            assert workspace.mxfp8.q_scale.shape == (1, 162 * idx_nh, 4)
             assert workspace.mxfp8.k_scale.shape == (1, 256, 4)
 
         def run():
@@ -2442,8 +2443,8 @@ class TestRealKernelIndexerTopk:
                 ratio=ratio,
                 cu_seqlens_q=cu_q,
                 cu_seqlens_kv=cu_k,
-                max_seqlen_q=max(q_lens),
-                max_seqlen_kv=max(k_lens),
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_k,
                 use_compact=True,
                 return_softmax=True,
                 compact_workspace=workspace,
@@ -2477,13 +2478,23 @@ class TestRealKernelIndexerTopk:
         captured_lengths.fill_(-123)
         workspace.out_logits.fill_(float('nan'))
         captured_softmax.fill_(float('nan'))
+        if precision == "mxfp8":
+            q_lens = [65, 95]
+            cu_q.copy_(_make_cu_seqlens(q_lens, device='cuda'))
         graph.replay()
         torch.cuda.synchronize()
 
-        assert torch.equal(captured_indices, eager_indices)
-        assert torch.equal(captured_lengths, eager_lengths)
-        torch.testing.assert_close(workspace.out_logits, eager_logits)
-        torch.testing.assert_close(captured_softmax, eager_softmax)
+        if precision == "mxfp8":
+            assert workspace.mxfp8 is not None
+            assert torch.equal(
+                workspace.mxfp8.cu_seqlens_q_scale_padded,
+                torch.tensor([0, 66, 162], dtype=torch.int32, device="cuda"),
+            )
+        else:
+            assert torch.equal(captured_indices, eager_indices)
+            assert torch.equal(captured_lengths, eager_lengths)
+            torch.testing.assert_close(workspace.out_logits, eager_logits)
+            torch.testing.assert_close(captured_softmax, eager_softmax)
 
         # Validate the replayed local-id Top-K sets and aligned logits against
         # the matching dense packed-segment reference. For MXFP8 this must use

@@ -94,6 +94,60 @@ def make_indexer_mxfp8_scale_cu_seqlens(cu_seqlens: Tensor, num_heads: int) -> T
     return out
 
 
+def indexer_mxfp8_thd_scale_capacity(total_tokens: int, num_sequences: int, num_heads: int) -> int:
+    """Return the maximum padded-token scale capacity for static THD geometry."""
+    if min(total_tokens, num_sequences, num_heads) <= 0:
+        raise ValueError("THD MXFP8 scale capacity dimensions must all be positive")
+
+    token_alignment = 128 // math.gcd(128, num_heads)
+    positive_sequences = min(total_tokens, num_sequences)
+    return (
+        (total_tokens + positive_sequences * (token_alignment - 1)) // token_alignment
+    ) * token_alignment
+
+
+@torch.compile
+def _refresh_indexer_mxfp8_scale_cu_seqlens(
+    destination: Tensor, cu_seqlens: Tensor, token_alignment: int
+) -> None:
+    """Write padded THD scale prefixes into caller-owned storage."""
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    padded_lengths = (
+        torch.div(lengths + token_alignment - 1, token_alignment, rounding_mode="floor")
+        * token_alignment
+    )
+    destination.zero_()
+    torch.cumsum(padded_lengths, dim=0, out=destination[1:])
+
+
+def refresh_indexer_mxfp8_scale_cu_seqlens(
+    destination: Tensor, cu_seqlens: Tensor, num_heads: int
+) -> None:
+    """Refresh caller-owned compact THD scale prefixes from live sequence boundaries."""
+    if (
+        cu_seqlens.dtype != torch.int32
+        or cu_seqlens.ndim != 1
+        or cu_seqlens.numel() < 2
+        or not cu_seqlens.is_contiguous()
+    ):
+        raise ValueError("cu_seqlens must be a contiguous int32 tensor with at least two elements")
+    if (
+        destination.device != cu_seqlens.device
+        or destination.dtype != torch.int32
+        or destination.ndim != 1
+        or destination.numel() != cu_seqlens.numel()
+        or not destination.is_contiguous()
+    ):
+        raise ValueError(
+            "destination must be contiguous int32 storage matching cu_seqlens shape and device"
+        )
+    if num_heads <= 0:
+        raise ValueError("num_heads must be positive")
+
+    token_alignment = 128 // math.gcd(128, num_heads)
+    _refresh_indexer_mxfp8_scale_cu_seqlens(destination, cu_seqlens, token_alignment)
+
+
 def indexer_mxfp8_thd_scale_shape(
     padded_tokens: int, num_heads: int, head_dim: int, sf_vec_size: int = 32
 ) -> tuple[int, int, int]:
@@ -496,8 +550,10 @@ __all__ = [
     "IndexerMXFP8QuantizationBuffers",
     "create_indexer_mxfp8_quantization_buffers",
     "indexer_mxfp8_scale_shape",
+    "indexer_mxfp8_thd_scale_capacity",
     "indexer_mxfp8_thd_scale_shape",
     "make_indexer_mxfp8_scale_cu_seqlens",
     "pack_indexer_mxfp8_scale",
     "quantize_indexer_mxfp8",
+    "refresh_indexer_mxfp8_scale_cu_seqlens",
 ]
