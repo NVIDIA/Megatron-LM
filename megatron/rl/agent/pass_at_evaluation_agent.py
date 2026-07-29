@@ -25,7 +25,7 @@ def pass_at_k(n_samples: int, n_correct: int, k: int) -> float:
 
 class PassAtEvaluationResult(RewardEvaluationResult):
     pass_at: dict[int, float]
-    response: list[str] | list[LLMChatMessage]
+    response: list[str | LLMChatMessage]
     reward: list[float]
     greedy_response: str | LLMChatMessage
     greedy_reward: float

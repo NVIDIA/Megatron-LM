@@ -4,6 +4,7 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 
 def _mock_math_verify():
@@ -19,6 +20,8 @@ sys.modules.setdefault("math_verify", _mock_math_verify())
 
 from examples.rl.environments.countdown.countdown import compute_score as countdown_compute_score
 from examples.rl.environments.math.math_agent import MathAgent
+from megatron.rl.agent.pass_at_evaluation_agent import PassAtEvaluationResult
+from megatron.rl.inference import LLMChatMessage
 
 
 def _make_math_agent(
@@ -105,3 +108,33 @@ class TestRLAgentRewards:
     def test_countdown_compute_score(self, response, ground_truth, expected_reward):
         score = countdown_compute_score(response, ground_truth)
         assert score == pytest.approx(expected_reward)
+
+
+def test_pass_at_result_accepts_mixed_responses():
+    """Aggregated pass@k responses mix assistant messages with '' placeholders
+    for dropped/over-context rollouts; the result type validates element-wise."""
+    msg = LLMChatMessage(role='assistant', content='the answer is 4')
+    result = PassAtEvaluationResult(
+        prompt='2+2?',
+        response=[msg, '', 'plain-string response'],
+        reward=[1.0, 0.0, 0.5],
+        pass_at={1: 0.5},
+        greedy_response=msg,
+        greedy_reward=1.0,
+    )
+    # Assert that the plain-string responses are not type-cast.
+    assert isinstance(result.response[0], LLMChatMessage)
+    assert result.response[0].content == 'the answer is 4'
+    assert result.response[1] == ''
+    assert result.response[2] == 'plain-string response'
+
+    # Element-wise validation: invalid elements still fail.
+    with pytest.raises(ValidationError):
+        PassAtEvaluationResult(
+            prompt='x',
+            response=[{'not': 'valid'}],
+            reward=[0.0],
+            pass_at={1: 0.0},
+            greedy_response='y',
+            greedy_reward=0.0,
+        )

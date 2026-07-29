@@ -389,7 +389,7 @@ def test_compute_packed_inference_logprobs_stats_with_mismatch():
 
 
 def test_compute_packed_inference_logprobs_stats_shape_mismatch():
-    """Test that function handles shape mismatch gracefully."""
+    """Test that a shape mismatch raises instead of silently skipping the stats."""
     # Mismatched shapes
     old_logprobs = torch.tensor([[-0.5, -0.3, -0.2]])  # 3 elements
     packed_inference_logprobs = torch.tensor([[-0.5, -0.3, -0.2]])
@@ -397,16 +397,13 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
 
     group_stats = MockGroupStats()
 
-    # Should not raise, but stats should remain None due to shape mismatch
-    sequence_packing_utils.compute_packed_inference_logprobs_stats(
-        old_logprobs=old_logprobs,
-        packed_inference_logprobs=packed_inference_logprobs,
-        packed_loss_mask=packed_loss_mask,
-        group_stats=group_stats,
-    )
-
-    # Stats should remain None due to shape mismatch
-    assert group_stats.mean_piold_to_inf_prob is None
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        sequence_packing_utils.compute_packed_inference_logprobs_stats(
+            old_logprobs=old_logprobs,
+            packed_inference_logprobs=packed_inference_logprobs,
+            packed_loss_mask=packed_loss_mask,
+            group_stats=group_stats,
+        )
 
 
 def test_packing_observability_metrics():
