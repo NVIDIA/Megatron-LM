@@ -1333,6 +1333,14 @@ class GTPShardedParam(torch.nn.Parameter):
             weight_total
         """
 
+        # The reuse short-circuit lives in _all_gather_weight, which the prefetched branch below
+        # bypasses -- it would read this weight's unreserved bwd ticket and KeyError. Fail here,
+        # where the assumption is first observable.
+        assert not self._retain_for_bwd or self.next_w is None, (
+            f"{self._debug_name}: _retain_for_bwd requires the fwd-chain tail (next_w is None); "
+            "a mid-chain retained weight also needs _need_weight_prefetch_bwd=False"
+        )
+
         if GTP_CONFIG.weight_prefetch and self.next_w is not None:
             result = self._get_prefetched_weight(False)
         else:
