@@ -901,36 +901,47 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_generation_within_tight_kv_pool(self) -> None:
-        """Admission is bounded by what the active pool can ever grant a running
-        request: paused-pool blocks are not grantable (a request admitted against
-        them pauses forever), speculative decoding pre-allocates blocks early, and
-        an exact-fit request runs to completion."""
+    @pytest.mark.parametrize("num_speculative_tokens,exact_fit_tokens", [(0, 249), (2, 247)])
+    def test_generation_within_tight_kv_pool(
+        self, num_speculative_tokens: int, exact_fit_tokens: int
+    ) -> None:
+        """Admission is bounded by what the active pool can ever grant a running request:
+        paused-pool blocks are not grantable (a request admitted against them pauses forever)
+        and only stored tokens need slots;
+        the final sampled token is never stored, the last decode step stores its speculative drafts.
+        Exact fit: 8 prompt + (exact_fit_tokens - 1) outputs + drafts = 256."""
         env = self._build_test_env(DynamicEngineTestConfig())
         block_size_bytes = env.engine.context.block_size_bytes
 
-        # 3-block pool: 1 active + 1 paused + 1 dummy. The default budget
-        # (512 - 8 -> 2 blocks) fits the old total-blocks bound (2) but only
-        # 1 block is ever grantable to a running request.
+        # 3-block pool: 1 active + 1 paused + 1 dummy.
         test_config = DynamicEngineTestConfig(
-            num_requests=2,
+            num_requests=3,
             min_prompt_length=8,
             max_prompt_length=8,
             num_tokens_to_generate=None,
             max_sequence_length=512,
+            num_speculative_tokens=num_speculative_tokens,
             context_buffer_size_gb=3 * block_size_bytes / 1024**3,
             context_paused_buffer_size_gb=block_size_bytes / 1024**3,
             context_max_requests=4,
         )
         env = self._build_test_env(test_config)
 
+        # The msl-derived default budget (8 + 504) fits the old total-blocks
+        # bound but needs more than the 1 grantable block; fails at admission.
         doomed_request = env.requests[0]
         env.engine._add_request(doomed_request)
         assert doomed_request.status == Status.FAILED
 
-        # An exact-fit request (8 + 248 = 256 tokens = the one active block) completes.
+        # One more stored token than the active block holds; fails at admission.
+        overflow_request = env.requests[2]
+        overflow_request.sampling_params.num_tokens_to_generate = exact_fit_tokens + 1
+        env.engine._add_request(overflow_request)
+        assert overflow_request.status == Status.FAILED
+
+        # An exact-fit request runs to completion.
         request = env.requests[1]
-        request.sampling_params.num_tokens_to_generate = 248
+        request.sampling_params.num_tokens_to_generate = exact_fit_tokens
         request.sampling_params.termination_id = -1  # never terminate early
         env.engine._add_request(request)
         assert request.status != Status.FAILED
@@ -942,39 +953,35 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 break
         assert not env.engine.has_unfinished_requests()
         assert request.status == Status.COMPLETED
-        assert len(request.output) == 248
+        assert len(request.output) == exact_fit_tokens
 
-        # Speculative decoding pre-allocates the next block within
-        # num_speculative_tokens of a block boundary, so admission reserves that
-        # headroom: prompt + generation + num_speculative_tokens (8 + 246 + 2)
-        # fits a 1-active-block pool exactly...
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_cuda_graph_padding_uses_dummy_block(self) -> None:
+        """One real request in a four-request graph bucket: the padded block-table
+        rows must hold the dummy block index, not the old -1 sentinel (OOB reads)."""
         test_config = DynamicEngineTestConfig(
             num_requests=1,
             min_prompt_length=8,
             max_prompt_length=8,
-            num_tokens_to_generate=4,
-            num_speculative_tokens=2,
-            max_sequence_length=8 + 4 + 256,
-            context_buffer_size_gb=2 * block_size_bytes / 1024**3,
-            context_paused_buffer_size_gb=0.0,
+            num_cuda_graphs=1,
             context_max_requests=4,
         )
         env = self._build_test_env(test_config)
-        request = env.requests[0]
-        request.sampling_params.num_tokens_to_generate = 246
-        env.engine._add_request(request)
-        assert request.status != Status.FAILED
+        context = env.engine.context
 
-        # ...and one more generated token could never be granted; fails at admission.
-        boundary_request = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=torch.randint(
-                0, test_config.vocab_size - 1, (8,), dtype=torch.int64, device='cuda'
-            ),
-            sampling_params=SamplingParams(num_tokens_to_generate=247),
-        )
-        env.engine._add_request(boundary_request)
-        assert boundary_request.status == Status.FAILED
+        env.engine._add_request(env.requests[0])
+        self._run_step(env)  # prefill
+        self._run_step(env)  # decode: 1 real request in the 4-request graph bucket
+
+        assert context.using_cuda_graph_this_step()
+        assert context.padded_batch_dimensions.req_count == 4
+        padded_rows = context._cpu_mha_block_table[1:4]
+        assert (padded_rows != -1).all()
+        assert (padded_rows == context.kv_block_allocator.dummy_block_idx).all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
