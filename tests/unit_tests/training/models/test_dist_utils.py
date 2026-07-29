@@ -522,14 +522,38 @@ class TestDdpWrap:
         mock_stream_context.assert_called_once_with(shared_stream)
         mock_current_stream.return_value.wait_stream.assert_called_once_with(shared_stream)
 
-    @pytest.mark.parametrize("cuda_graph_impl", ["none", "local", "transformer_engine"])
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
     @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
-    def test_uses_dedicated_stream_for_other_cuda_graph_implementations(
+    def test_uses_current_stream_when_cuda_graphs_are_disabled(
+        self,
+        mock_shared_stream,
+        mock_stream,
+        mock_current_stream,
+        mock_stream_context,
+        mock_config,
+        mock_ddp,
+    ):
+        mock_config.return_value.cuda_graph_impl = "none"
+
+        _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
+
+        mock_shared_stream.assert_not_called()
+        mock_stream.assert_not_called()
+        mock_current_stream.assert_not_called()
+        mock_stream_context.assert_not_called()
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
+    def test_uses_dedicated_stream_for_graph_enabled_implementations(
         self,
         mock_shared_stream,
         mock_stream,
