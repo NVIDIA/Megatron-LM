@@ -21,9 +21,15 @@ class _DimensionShard(NamedTuple):
     """Location of one stored dimension in its unpadded TP-local layout.
 
     ``tp_local_size`` is the size after GTP shards are joined and padding is
-    removed, but before TP shards are joined. For example, with TP=2, GTP=2,
-    stored dim-0 size 3, and two padding rows, each TP shard reconstructs to
-    ``3 * 2 - 2 = 4`` rows; joining TP then produces 8 global rows.
+    removed, but before TP shards are joined. For TP=2, GTP=2, stored dim-0
+    size 3, and two padding rows (P):
+
+        GTP: TP 0 [a b c] + [d P P] -> [a b c d]
+             TP 1 [e f g] + [h P P] -> [e f g h]
+        TP:       [a b c d] + [e f g h] -> [a b c d e f g h]
+
+    Each stored shard has size 3. Joining GTP gives ``tp_local_size =
+    3 * 2 - 2 = 4``; joining TP then gives 8 global rows.
     """
 
     tp_local_start: int
