@@ -86,11 +86,6 @@ class FsdpParameterGroup:
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
         for name, parameter in parameters.items():
-            if parameter.is_meta:
-                raise ValueError(
-                    f"Expected parameter {name!r} to be materialized before "
-                    "ParameterGroup construction."
-                )
             if parameter.dtype != self.dtype:
                 raise ValueError(
                     f"Expected parameter {name!r} to have dtype {self.dtype}, "
@@ -162,8 +157,19 @@ class FsdpParameterGroup:
         unsharded_parameters: list[nn.Parameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, parameter in enumerate(parameters.values()):
-            parameter.data = self._unsharded_model_weight.get_local_tensor(index)
-            parameter.grad = None
+            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            if parameter.is_meta:
+                # A meta Parameter cannot set .data to a real tensor because their
+                # TensorImpl types are incompatible, so swap in a materialized Parameter.
+                # This may be problematic if attributes from the original Parameter need
+                # to be copied to the unsharded Parameter.
+                materialized_parameter = nn.Parameter(
+                    unsharded_tensor, requires_grad=parameter.requires_grad
+                )
+                torch.utils.swap_tensors(parameter, materialized_parameter)
+            else:
+                parameter.data = unsharded_tensor
+                parameter.grad = None
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
             unsharded_parameters.append(parameter)
 
@@ -177,8 +183,6 @@ class FsdpParameterGroup:
         self.sharded_parameters = tuple(sharded_parameters)
         self.unsharded_parameters = tuple(unsharded_parameters)
 
-        # Compute weights must be initialized before the first forward; subsequent
-        # refreshes happen from the FSDP optimizer's post-step hook.
         self.sync_model_weight_from_main_weight()
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
