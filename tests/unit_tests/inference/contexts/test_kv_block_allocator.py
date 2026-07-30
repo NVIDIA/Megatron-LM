@@ -266,6 +266,61 @@ def test_block_usage_counts_with_prefix_caching(
     assert a.get_paused_used() == expected_paused
 
 
+def test_release_shared_block_decrements_once_per_owner():
+    """A shared prefix block appears once per finishing owner in a batched
+    release: each occurrence must decrement (scatter-accumulate), and a block
+    reaching ref 0 with a duplicated ID is freed/deregistered exactly once."""
+    # REF_ZERO: three owners of a shared block finish in stages, with a private
+    # block mixed into the final batch.
+    a = KVBlockAllocator(
+        _make_context(),
+        total_count=8,
+        paused_count=2,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+    )
+    ids = a.allocate_memory_blocks(2)  # ref_count == 1 each
+    shared, private = int(ids[0]), int(ids[1])
+    a.register_kv_block_hashes(block_ids=[shared], block_hashes=[111])
+    a.block_ref_counts[shared] += 2  # two more owners pin the shared block -> ref 3
+    avail0 = a.total_avail
+
+    # One owner finishes alone: ref 3 -> 2, nothing freed yet.
+    a.release_memory_blocks(torch.tensor([shared], dtype=torch.int32))
+    assert a.block_ref_counts[shared].item() == 2
+    assert a.total_avail == avail0
+    assert 111 in a.kv_hash_to_block_id
+
+    # The final two owners and the private request finish in one batch: the
+    # shared block appears twice and both decrements must land (ref 2 -> 0).
+    a.release_memory_blocks(torch.tensor([shared, private, shared], dtype=torch.int32))
+    assert a.block_ref_counts[shared].item() == 0
+    assert a.block_ref_counts[private].item() == 0
+    # Two distinct blocks return to the pool; the shared one only once (not twice).
+    assert a.total_avail == avail0 + 2
+    assert 111 not in a.kv_hash_to_block_id  # deregistered exactly once
+    free_region = a.block_bag[: a.total_avail].tolist()
+    assert len(set(free_region)) == len(free_region)  # no double-returned id
+
+    # LRU: a hashed shared block released by both owners in one batch must hit
+    # ref 0 (becoming evictable), not stall at 1 with a leaked reference. A hashed
+    # block stays cached for reuse rather than returning to the pool.
+    lru = KVBlockAllocator(
+        _make_context(),
+        total_count=8,
+        paused_count=2,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+    )
+    lshared = int(lru.allocate_memory_blocks(1)[0])
+    lru.register_kv_block_hashes(block_ids=[lshared], block_hashes=[333], parent_hashes=[0])
+    lru.block_ref_counts[lshared] += 1  # second owner -> ref 2
+    lru.release_memory_blocks(torch.tensor([lshared, lshared], dtype=torch.int32))
+    assert lru.block_ref_counts[lshared].item() == 0
+    assert int(lru.get_evictable_block_count()) == 1
+    assert lru.block_hashes[lshared].item() == 333  # kept cached, not pool-returned
+
+
 # ---------------------------------------------------------------------------
 # LRU eviction: parent-chain safety
 # ---------------------------------------------------------------------------
