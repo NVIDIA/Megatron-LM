@@ -2151,20 +2151,19 @@ class MultiTokenPredictionBlock(MegatronModule):
         # Initialize Context Parallelism (CP) support for MTP
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
-        if pg_collection is None:
-            # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp'] if self.config.mtp_hsm else [])
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
-        else:
-            # Ensure the provided process groups include TP, CP, and PP.
-            for group_name in ('tp', 'cp', 'pp'):
-                assert (
-                    getattr(pg_collection, group_name, None) is not None
-                ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
-            if self.config.mtp_hsm:
-                assert hasattr(
-                    pg_collection, 'dp'
-                ), "MultiTokenPredictionBlock with HSM requires a dp process group"
+        assert pg_collection is not None, (
+            "MultiTokenPredictionBlock requires an explicit pg_collection with tp/cp/pp; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
+        # Ensure the provided process groups include TP, CP, and PP.
+        for group_name in ('tp', 'cp', 'pp'):
+            assert (
+                getattr(pg_collection, group_name, None) is not None
+            ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
+        if self.config.mtp_hsm:
+            assert hasattr(
+                pg_collection, 'dp'
+            ), "MultiTokenPredictionBlock with HSM requires a dp process group"
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
