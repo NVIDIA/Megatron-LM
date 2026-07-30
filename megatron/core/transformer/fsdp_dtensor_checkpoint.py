@@ -276,8 +276,8 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
 
         Args:
-            data: The tensor to split. May be a DTensor (model state dict) or a
-                plain Tensor (optimizer states from FusedAdam).
+            data: The tensor to split. May be a DTensor from model state, a
+                flat optimizer DTensor, or a plain optimizer Tensor.
             dist_param: The corresponding model parameter (always a DTensor).
                 Used for global shape, numel, FSDP slice, and dist index metadata.
             swiglu_shard_axis: Axis along which to split W and V gates.
@@ -304,11 +304,14 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         view_shape = list(global_shape)
         view_shape[swiglu_shard_axis] = -1
         if isinstance(data, DTensor):
-            assert data.shape == global_shape, (
-                f"DTensor shape mismatch: data.shape={data.shape} vs "
-                f"dist_param.shape={global_shape}"
-            )
-            local_tensor = data.to_local()
+            if data.shape == global_shape:
+                local_tensor = data.to_local()
+            else:
+                assert data.numel() == dist_param.numel(), (
+                    f"DTensor shape mismatch: data.shape={data.shape} vs "
+                    f"dist_param.shape={global_shape}"
+                )
+                local_tensor = data.to_local().view(-1)
         else:
             # Plain Tensor must already be the FSDP-local shard; other layouts
             # (TP-local / global) would silently misalign in the slice below.
@@ -491,8 +494,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """Split a fused GDN projection DTensor into per-component DTensors.
 
         Args:
-            data: The tensor to split. May be a DTensor (model state dict) or a
-                plain Tensor (optimizer states from FusedAdam).
+            data: The tensor to split. May be a DTensor from model state, a
+                flat optimizer DTensor, or a plain optimizer Tensor.
             dist_param: The corresponding model parameter (always a DTensor).
                 Used for global shape, numel, FSDP slice, and dist index metadata.
             split_sizes: List of sizes for each component along split_dim.
@@ -519,11 +522,14 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         elems_per_unit = data_size // total_split
 
         if isinstance(data, DTensor):
-            assert data.shape == global_shape, (
-                f"DTensor shape mismatch: data.shape={data.shape} vs "
-                f"dist_param.shape={global_shape}"
-            )
-            local_tensor = data.to_local()
+            if data.shape == global_shape:
+                local_tensor = data.to_local()
+            else:
+                assert data.numel() == dist_param.numel(), (
+                    f"DTensor shape mismatch: data.shape={data.shape} vs "
+                    f"dist_param.shape={global_shape}"
+                )
+                local_tensor = data.to_local().view(-1)
         else:
             # Plain Tensor must already be the FSDP-local shard; other layouts
             # (TP-local / global) would silently misalign in the slice below.
