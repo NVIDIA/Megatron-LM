@@ -155,8 +155,11 @@ class LLaVAModel(MegatronModule):
             "LLaVA is work in progress. Features are missing and methods can change.",
         )
 
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert pg_collection is not None, (
+            "LLaVAModel requires an explicit pg_collection. A vision encoder and an LLM may run "
+            "on independent parallel grids, so the global grid is not a safe default; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
         language_model_type = getattr(language_transformer_config, "language_model_type", "")
 
         # Constructor configuration and initial module state.
