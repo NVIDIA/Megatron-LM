@@ -4,6 +4,7 @@ import logging
 import math
 import operator
 import os
+import sys
 import time
 import warnings
 from contextlib import nullcontext
@@ -98,6 +99,24 @@ _VEC_UPDATE_REQS = os.environ.get("MCORE_INFER_VEC_UPDATE_REQS", "0") == "1"
 # Debug mode: run the reduced-op path, snapshot every buffer it wrote, restore
 # the inputs, run the reference path, and assert the two agree exactly.
 _VEC_UPDATE_REQS_VERIFY = os.environ.get("MCORE_INFER_VEC_UPDATE_REQS_VERIFY", "0") == "1"
+
+# Diagnostic: tally why the incremental fast path declines, so a single run answers
+# "which guard is rejecting every step" instead of requiring a guess per experiment.
+_INCR_DIAG = os.environ.get("MCORE_INFER_INCR_DIAG", "0") == "1"
+_incr_diag_counts: Dict[str, int] = {}
+
+
+def _incr_diag(reason: str) -> None:
+    """Count one fast-path outcome and periodically dump the tally to stderr."""
+    _incr_diag_counts[reason] = _incr_diag_counts.get(reason, 0) + 1
+    total = sum(_incr_diag_counts.values())
+    if total % 500 == 0:
+        parts = ", ".join(
+            f"{k}={v} ({100*v/total:.1f}%)"
+            for k, v in sorted(_incr_diag_counts.items(), key=lambda x: -x[1])
+        )
+        print(f"[INCR_DIAG] {total} calls: {parts}", file=sys.stderr, flush=True)
+
 
 _ATTN_PROF_ENABLED = os.environ.get("MCORE_INFER_ATTN_PROF", "0") == "1"
 _ATTN_PROF_EVERY = int(os.environ.get("MCORE_INFER_ATTN_PROF_EVERY", "100"))
@@ -2296,16 +2315,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         _t_start = _t
 
         _verify_snapshot = None
-        if (
-            _INCR_ATTN_STATE
-            and not is_expert_parallel_dummy_cuda_graph_step
-            # The fast path publishes the bookkeeping itself and records no event,
-            # so it cannot serve callers that defer the publish (async scheduling)
-            # or that need the H2D completion event.
-            and transfer_bookkeeping_to_gpu
-            and not record_bookkeeping_done_event
-        ):
-            if self._incremental_attention_state_update(construct_graph_dimensions):
+        if _INCR_ATTN_STATE and not is_expert_parallel_dummy_cuda_graph_step:
+            advanced, fast_bookkeeping_done_event = self._incremental_attention_state_update(
+                construct_graph_dimensions,
+                transfer_bookkeeping_to_gpu=transfer_bookkeeping_to_gpu,
+                record_bookkeeping_done_event=record_bookkeeping_done_event,
+            )
+            if advanced:
                 if not _INCR_ATTN_STATE_VERIFY:
                     if _prof:
                         _t = _attn_prof_mark(8, _t)
@@ -2313,7 +2329,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         _attn_prof_calls[0] += 1
                         if _attn_prof_calls[0] >= _ATTN_PROF_EVERY:
                             _attn_prof_report()
-                    return
+                    return fast_bookkeeping_done_event
                 # Verify mode: keep what the fast path produced, redo everything
                 # from scratch below, then assert the two agree exactly.
                 _verify_snapshot = self._incr_attn_state_snapshot()
@@ -2658,8 +2674,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._incr_attn_state_key = self._incr_attn_state_cache_key()
 
     def _incremental_attention_state_update(
-        self, construct_graph_dimensions: Optional[InferenceBatchDimensions]
-    ) -> bool:
+        self,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions],
+        *,
+        transfer_bookkeeping_to_gpu: bool = True,
+        record_bookkeeping_done_event: bool = False,
+    ) -> Tuple[bool, Optional[torch.cuda.Event]]:
         """Advance the cached attention state by one decode step.
 
         In steady-state decode the request set, sampling metadata, KV block
@@ -2668,16 +2688,54 @@ class DynamicInferenceContext(BaseInferenceContext):
         the KV sequence lengths advance by `num_speculative_tokens + 1` per
         request. Recompute exactly those and reuse the rest.
 
+        The publish arguments mirror :meth:`initialize_attention_state`, so this path
+        serves deferred-publish callers (async scheduling) too. Without them the fast
+        path had to decline those callers, which meant it never ran at all under async
+        scheduling -- and async is the default in the tuned config, so the whole
+        optimization was silently inactive there.
+
         Returns:
-            True if the state was advanced and the caller may return; False if
-            the caller must run the full path.
+            Tuple[bool, Optional[torch.cuda.Event]]: whether the state was advanced
+                (False means the caller must run the full path), and the bookkeeping
+                H2D completion event when one was both requested and recorded.
         """
         if construct_graph_dimensions is not None:
             self._incr_attn_state_key = None
-            return False
+            if _INCR_DIAG:
+                _incr_diag("decline:graph_capture")
+            return False, None
         key = self._incr_attn_state_cache_key()
         if key is None or key != self._incr_attn_state_key:
-            return False
+            if _INCR_DIAG:
+                if key is None:
+                    # Uncacheable batch: hybrid model or a prefill request present.
+                    _incr_diag("decline:key_none")
+                elif self._incr_attn_state_key is None:
+                    # Previous step declined to store, so there is nothing to advance.
+                    _incr_diag("decline:no_stored_key")
+                else:
+                    # Both keys exist but differ: name the first differing field, which
+                    # is what distinguishes "layout really changed" from "one sentinel
+                    # (e.g. KV block availability) churns every step".
+                    fields = (
+                        "layout_version",
+                        "total_reqs",
+                        "paused_reqs",
+                        "active_tokens",
+                        "kv_blocks_avail",
+                        "chunked_prefill_id",
+                        "spec_tokens",
+                    )
+                    diff = next(
+                        (
+                            f
+                            for f, a, b in zip(fields, key, self._incr_attn_state_key)
+                            if a != b
+                        ),
+                        "unknown",
+                    )
+                    _incr_diag(f"decline:key_differs:{diff}")
+            return False, None
 
         real_bs = self._incr_attn_state_real_bs
         padded_bs = self._incr_attn_state_padded_bs
@@ -2738,8 +2796,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # produces real output; clear the flag the publish step reads, which may
         # still be set from an earlier capture step.
         self._bookkeeping_no_real_work = False
-        self.transfer_bookkeeping_to_gpu()
-        return True
+        if _INCR_DIAG:
+            _incr_diag("advanced")
+        # Same conditional publish as the tail of the full path: deferred-publish
+        # callers bind the GPU views here and push the values later.
+        bookkeeping_done_event = None
+        if transfer_bookkeeping_to_gpu:
+            bookkeeping_done_event = self.transfer_bookkeeping_to_gpu(
+                record_done_event=record_bookkeeping_done_event
+            )
+        return True, bookkeeping_done_event
 
     def _incr_attn_state_snapshot(self) -> Dict:
         """Clone everything the incremental path produced (debug verify only)."""
@@ -4113,8 +4179,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             Tuple[Tensor, Tensor]: Request IDs that finished and source row indices
                 for surviving requests in their resolved destination order.
         """
-        self._bump_request_layout_version()
-
+        # The layout-version bump is deferred until a request is known to have
+        # finished (below). When the mask is all ones -- the steady-state decode
+        # case -- nothing here touches the layout: no rows move (``survivor_idxs``
+        # equals ``dst_idxs``), no KV blocks are released, the stale slice is empty
+        # and ``total_request_count`` is unchanged. Bumping unconditionally
+        # invalidated the incremental attention-state cache on *every* step, which
+        # made that whole optimization inert under async scheduling (measured: the
+        # fast path advanced on 0.1% of calls, 97.5% declining on this version).
         if active_requests_mask.is_cuda:
             active_requests_mask = active_requests_mask.cpu()
 
@@ -4149,6 +4221,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_attention_state()
 
         if finished_idxs.numel() > 0:
+            # Every layout change in this method is downstream of a finished request:
+            # the row compaction below, the KV block release, and the request-count
+            # change all require at least one zero in the mask.
+            self._bump_request_layout_version()
             self.release_memory_blocks_from_request_indexes(finished_idxs)
 
         if active_request_count == 0:
