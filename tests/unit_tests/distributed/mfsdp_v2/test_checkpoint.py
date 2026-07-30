@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 from torch import nn
+from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 
@@ -69,19 +70,37 @@ def _train_one_step(
     optimizer.step()
 
 
-def _to_local(value: torch.Tensor) -> torch.Tensor:
-    return value.to_local() if isinstance(value, DTensor) else value
+def _assert_tensors_identical(expected: torch.Tensor, actual: torch.Tensor, what: str) -> None:
+    """Assert two tensors are bit-identical, checking DTensor global metadata when applicable.
+
+    A checkpoint roundtrip must reproduce the values exactly, so tolerances are zero. For DTensors
+    it must also reproduce the *global* view: an entry whose global shape or placement changed would
+    be silently wrong even if this rank's local shard happens to match.
+    """
+    assert type(expected) is type(actual), f"{what}: {type(expected)} became {type(actual)}"
+    if isinstance(expected, DTensor):
+        assert (
+            expected.shape == actual.shape
+        ), f"{what}: global shape {expected.shape} != {actual.shape}"
+        assert expected.placements == actual.placements, f"{what}: placements changed"
+        assert expected.device_mesh == actual.device_mesh, f"{what}: device mesh changed"
+        expected, actual = expected.to_local(), actual.to_local()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, msg=f"{what}: value mismatch")
 
 
-def _snapshot_local_state(
+def _snapshot_state(
     model: nn.Module, optimizer: torch.optim.Optimizer
 ) -> tuple[dict[str, torch.Tensor], dict[int, dict]]:
-    """Clone this rank's local model weights and optimizer state, keyed as their state dicts are."""
-    model_snapshot = {key: _to_local(value).clone() for key, value in model.state_dict().items()}
+    """Clone the model weights and optimizer state, keyed as their state dicts are.
+
+    DTensor entries are cloned as DTensors so the comparison can check the global shape and
+    placements, not just this rank's local shard.
+    """
+    model_snapshot = {key: value.clone() for key, value in model.state_dict().items()}
     optimizer_snapshot: dict[int, dict] = {}
     for index, state in optimizer.state_dict()["state"].items():
         optimizer_snapshot[index] = {
-            key: (_to_local(value).clone() if torch.is_tensor(value) else value)
+            key: (value.clone() if torch.is_tensor(value) else value)
             for key, value in state.items()
         }
     return model_snapshot, optimizer_snapshot
@@ -90,7 +109,7 @@ def _snapshot_local_state(
 def _assert_model_matches_snapshot(
     model: nn.Module, model_snapshot: dict[str, torch.Tensor]
 ) -> bool:
-    """Assert the model's local weights equal the snapshot.
+    """Assert the model's weights equal the snapshot.
 
     Returns:
         bool: whether this rank held at least one non-empty local shard. The caller all-gathers
@@ -104,30 +123,43 @@ def _assert_model_matches_snapshot(
     local_nonempty = False
     for key, expected in model_snapshot.items():
         assert isinstance(current[key], DTensor), f"{key} should rest as a DTensor"
-        actual = _to_local(current[key])
-        assert (
-            expected.shape == actual.shape
-        ), f"model[{key}] shape {expected.shape} != {actual.shape}"
-        assert torch.equal(expected, actual), f"model[{key}] value mismatch after roundtrip"
-        local_nonempty = local_nonempty or expected.numel() > 0
+        _assert_tensors_identical(expected, current[key], f"model[{key}]")
+        local_nonempty = local_nonempty or expected.to_local().numel() > 0
     return local_nonempty
 
 
 def _assert_optimizer_matches_snapshot(
     optimizer: torch.optim.Optimizer, optimizer_snapshot: dict[int, dict]
 ) -> None:
-    """Assert the optimizer's local state equals the snapshot."""
+    """Assert the optimizer's state equals the snapshot."""
     current = optimizer.state_dict()["state"]
     assert optimizer_snapshot.keys() == current.keys()
     for index, expected_state in optimizer_snapshot.items():
         for key, expected in expected_state.items():
             actual = current[index][key]
             if torch.is_tensor(expected):
-                actual = _to_local(actual)
-                assert expected.shape == actual.shape, f"optim[{index}][{key}] shape mismatch"
-                assert torch.equal(expected, actual), f"optim[{index}][{key}] value mismatch"
+                _assert_tensors_identical(expected, actual, f"optim[{index}][{key}]")
             else:
                 assert expected == actual, f"optim[{index}][{key}] scalar mismatch"
+
+
+def _assert_checkpoint_records_global_shapes(checkpoint_dir: Path, model: nn.Module) -> None:
+    """Assert the saved checkpoint describes every parameter by its full global shape.
+
+    A checkpoint of a sharded model must describe the assembled tensor, not this rank's fragment,
+    so a reader that reshards differently sees the right geometry.
+
+    Only the global sizes are checked. The per-chunk offsets deliberately are not: dropping the
+    uneven-DTensor metadata does not make them look wrong -- DCP then records exactly the canonical
+    even-``Shard(0)`` chunks (two 8-row chunks for a 16-row parameter that the ranks really split
+    9/7), which tile the tensor perfectly while the bytes underneath belong to different rows. That
+    self-consistency is why the corruption is silent, and why the value comparison after the load is
+    what actually guards it.
+    """
+    metadata = FileSystemReader(checkpoint_dir).read_metadata()
+    for key, value in model.state_dict().items():
+        entry = metadata.state_dict_metadata[f"model.{key}"]
+        assert tuple(entry.size) == tuple(value.shape), f"model.{key}: saved {entry.size}"
 
 
 @pytest.mark.parametrize("param_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
@@ -149,10 +181,11 @@ def test_checkpoint_roundtrip_flat_dp(
     # Source: train one step so weights and optimizer state are non-trivial, then save.
     model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=False)
     _train_one_step(model, optimizer, device, param_dtype=param_dtype)
-    model_snapshot, optimizer_snapshot = _snapshot_local_state(model, optimizer)
+    model_snapshot, optimizer_snapshot = _snapshot_state(model, optimizer)
 
     with TempNamedDir(tmp_path_dist_ckpt / f"ckpt_{param_dtype}", sync=True) as checkpoint_dir:
         save_checkpoint(model, optimizer, checkpoint_dir)
+        _assert_checkpoint_records_global_shapes(checkpoint_dir, model)
 
         # Destination: zero-initialized, so a correct load is non-trivial.
         model, optimizer = _build_sharded(mesh, device, param_dtype=param_dtype, zero_init=True)
