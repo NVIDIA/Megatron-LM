@@ -43,7 +43,7 @@ from tests.unit_tests.inference.test_moe_dispatching_and_routing import (
     NANOV3_BASE,
     _make_base_config,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 # Request state constants for parametrized tests.
 NONE = "none"  # 0 requests (dummy rank)
@@ -281,6 +281,7 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
         )
 
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        clear_nvte_env_vars()
         config = _make_base_config(
             num_layers=3,
             batch_invariant_mode=True,
