@@ -51,7 +51,7 @@ from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from .utils import append_to_progress_log, is_last_rank, print_rank_0
+from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -397,6 +397,24 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
+def read_frozen_resume_iteration(save_dir):
+    """Resume iteration for a ``--freeze-all-layers`` run.
+
+    Returns the integer recorded in ``save_dir``'s progress tracker
+    (``latest_checkpointed_iteration.txt``), or ``0`` when there is none -- i.e. a
+    fresh run, equivalent to ``--finetune`` on the first launch. Unlike
+    :func:`read_metadata` (which returns ``-1`` / errors on a missing or malformed
+    file), a missing tracker here simply means "start from the beginning".
+    """
+    if save_dir is None:
+        return 0
+    tracker_filename = get_checkpoint_tracker_filename(save_dir)
+    if not maybe_msc.os.path.isfile(tracker_filename):
+        return 0
+    iteration, _release = read_metadata(tracker_filename)
+    return iteration
+
+
 def get_rng_state(
     ckpt_format: str,
     tp_group: torch.distributed.ProcessGroup,
@@ -610,6 +628,10 @@ def save_checkpoint(
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
+    # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
+    # progress is recorded separately via the post-logits finalize (see the async block below).
+    skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
+
     # Handle non_persistent_ckpt flag. Besides overwriting `args.save` and
     # `args.use_dist_ckpt`, non-persistent global ckpt requires no additional logic
     ckpt_type = CheckpointType.GLOBAL if args.use_dist_ckpt else CheckpointType.LEGACY
@@ -736,7 +758,7 @@ def save_checkpoint(
     # exactly one rank. Neither dp_rank==0 nor edp_rank==0 alone covers all shards when
     # the dense and expert parallelism layouts disagree (e.g. TP > EP*ETP); the union
     # does, with at most one rank per (tp_rank, ep_rank) inside any DP group.
-    if (
+    if not skip_weight_ckpt and (
         not torch.distributed.is_initialized()
         or ckpt_type != CheckpointType.LEGACY
         or dp_rank == 0
@@ -958,7 +980,10 @@ def save_checkpoint(
                 torch.distributed.barrier()
 
     # And update the latest iteration
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    if not skip_weight_ckpt and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_rank() == 0
+    ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
         if ckpt_type == CheckpointType.LOCAL:
@@ -1077,7 +1102,9 @@ def save_checkpoint(
             iter_finalize_fn()
 
     # Additional callback for one_logger (last rank)
-    if not torch.distributed.is_initialized() or is_last_rank():
+    if not skip_weight_ckpt and (
+        not torch.distributed.is_initialized() or is_last_rank()
+    ):
 
         def onelogger_finalize_fn():
             on_save_checkpoint_success(productive_metrics, args.async_save)
@@ -1089,7 +1116,9 @@ def save_checkpoint(
             onelogger_finalize_fn()
 
     # Additional callback for wandb (last rank)
-    if not torch.distributed.is_initialized() or is_last_rank():
+    if not skip_weight_ckpt and (
+        not torch.distributed.is_initialized() or is_last_rank()
+    ):
 
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(
@@ -1112,15 +1141,38 @@ def save_checkpoint(
 
         logits_saver = get_logits_saver()
         if logits_saver is not None:
+            # In frozen-dump mode there is no checkpoint request (async_save_request is None); the
+            # logits request then owns its own finalize_fns.
+            if async_save_request is not None:
+                logits_finalize_fns = async_save_request.finalize_fns.copy()
+                async_save_request.finalize_fns.clear()
+            else:
+                logits_finalize_fns = []
+            # Record run progress AFTER the logits tar is confirmed written, so a resumed job
+            # never skips or replays a window. Written by a single rank -- the last rank, which
+            # lives on the last pipeline stage where the logits saver is attached (get_logits_saver
+            # is None on earlier stages, including global rank 0 when PP > 1).
+            if skip_weight_ckpt and (
+                not torch.distributed.is_initialized() or is_last_rank()
+            ):
+
+                def progress_finalize_fn():
+                    tracker_filename = get_checkpoint_tracker_filename(args.save)
+                    with maybe_msc.open(tracker_filename, 'w') as f:
+                        f.write(str(iteration))
+                    print_rank_last(f"  recorded logits-dump progress: iteration "
+                                    f"{iteration} to {tracker_filename}")
+
+                logits_finalize_fns.append(progress_finalize_fn)
             async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
             async_logits_request = async_request_cls(
                 async_fn=logits_saver._write_batched_tar,
                 async_fn_args=logits_saver.take_pending_data(),
-                finalize_fns=async_save_request.finalize_fns.copy(),
+                finalize_fns=logits_finalize_fns,
             )
-            async_save_request.finalize_fns.clear()
 
-        schedule_async_save(async_save_request)
+        if async_save_request is not None:
+            schedule_async_save(async_save_request)
         if logits_saver is not None:
             schedule_async_save(async_logits_request)
         print_rank_0(
@@ -2094,6 +2146,22 @@ def load_checkpoint(
     args = get_args()
     load_dir = getattr(args, load_arg)
 
+    # --freeze-all-layers: nothing trains, so load the model in --load weights-only (finetune-style)
+    # and auto-resume the data position by feeding this run's own progress tracker -- written to
+    # --save on the previous launch -- into the standard --override-ckpt-iteration path. Reading
+    # progress from --save (this job's output) rather than --load lets --load stay pinned to a
+    # fixed checkpoint across resubmits. An explicit --override-ckpt-iteration wins. (The main use
+    # today is offline-KD teacher-logit dumps.)
+    if getattr(args, 'freeze_all_layers', False):
+        # Weights only: don't adopt the loaded checkpoint's optimizer / LR-scheduler / rng, or run
+        # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
+        # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
+        args.finetune = True
+        if args.override_ckpt_iteration is None:
+            progress_iteration = read_frozen_resume_iteration(args.save)
+            if progress_iteration > 0:
+                args.override_ckpt_iteration = progress_iteration
+
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
     if pretrained_dir is not None and not checkpoint_exists(load_dir):
@@ -2439,30 +2507,6 @@ def load_checkpoint(
         # Iteration and num_floating_point_operations_so_far default to 0.
         return 0, 0
 
-    # Override iteration/consumed_samples if requested (e.g. to rewind the data loader).
-    if getattr(args, 'override_ckpt_iteration', None) is not None:
-        target_iter = args.override_ckpt_iteration
-        state_dict['iteration'] = target_iter
-        if 'args' in state_dict:
-            checkpoint_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
-            if (
-                checkpoint_global_batch_size is not None
-                and checkpoint_global_batch_size != args.global_batch_size
-            ):
-                raise RuntimeError(
-                    '--override-ckpt-iteration recomputes consumed_train_samples from the target '
-                    f'iteration and current global_batch_size, but checkpoint global_batch_size '
-                    f'({checkpoint_global_batch_size}) != current global_batch_size '
-                    f'({args.global_batch_size}). This would replay the data loader from the '
-                    'wrong sample offset.'
-                )
-            state_dict['args'].consumed_train_samples = target_iter * args.global_batch_size
-            state_dict['args'].skipped_train_samples = 0
-        print_rank_0(
-            f'Overriding checkpoint iteration to {target_iter} '
-            f'(consumed_train_samples = {target_iter * args.global_batch_size})'
-        )
-
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
@@ -2504,6 +2548,30 @@ def load_checkpoint(
         args.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+
+    # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
+    # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The
+    # GBS-match check applies only when adopting this checkpoint's own args (not a finetune load).
+    if getattr(args, 'override_ckpt_iteration', None) is not None:
+        if 'args' in state_dict and not args.finetune:
+            ckpt_global_batch_size = getattr(state_dict['args'], 'global_batch_size', None)
+            if (
+                ckpt_global_batch_size is not None
+                and ckpt_global_batch_size != args.global_batch_size
+            ):
+                warn_rank_0(
+                    '--override-ckpt-iteration recomputes consumed_train_samples = target_iter * '
+                    f'current global_batch_size ({args.global_batch_size}), but this checkpoint '
+                    f'was saved at global_batch_size {ckpt_global_batch_size}. If the target '
+                    "iteration is in the checkpoint run's units, the data loader resumes from a "
+                    'shifted sample offset.'
+                )
+        iteration = args.override_ckpt_iteration
+        args.consumed_train_samples = iteration * args.global_batch_size
+        args.skipped_train_samples = 0
+        update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
+        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
+                     f'(consumed_train_samples {args.consumed_train_samples})')
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
