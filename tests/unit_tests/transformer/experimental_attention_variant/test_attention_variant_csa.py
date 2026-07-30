@@ -17,8 +17,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexer,
     CSAIndexerSubmodules,
     _apply_rope,
-    _compute_unfused_csa_indexer_loss,
-    _unfused_csa_indexer_topk_and_loss_thd,
+    _compute_unfused_csa_non_compressed_lse,
     build_cu_seqlens_kv_full,
     cat_per_segment,
     get_compress_topk_idxs,
@@ -26,6 +25,11 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     get_window_topk_idxs,
     get_window_topk_idxs_thd,
     unfused_compressed_sparse_attn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    FusedDSAIndexerLoss,
+    compute_dsa_indexer_loss,
+    fused_qk_topk_naive,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -68,192 +72,208 @@ def patch_hadamard_if_needed():
 # ===========================================================================
 
 
+class _SingleRankTP:
+    @staticmethod
+    def size():
+        return 1
+
+
+class _SingleRankPG:
+    tp = _SingleRankTP()
+
+
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+def test_unfused_csa_non_compressed_lse_matches_window_and_sink_oracle(layout):
+    torch.manual_seed(17)
+    num_heads, head_dim = 2, 4
+    sink = torch.randn(num_heads, requires_grad=True)
+
+    if layout == "sbhd":
+        seqlen_q, batch_size, n_kv = 3, 2, 5
+        query = torch.randn(seqlen_q, batch_size, num_heads, head_dim, requires_grad=True)
+        kv_full = torch.randn(n_kv, batch_size, head_dim, requires_grad=True)
+        window_indices = torch.tensor([[[-1, 0], [0, 1], [1, 2]], [[-1, 0], [0, 2], [2, 4]]])
+        expected = torch.empty(batch_size, num_heads, seqlen_q)
+        with torch.no_grad():
+            for batch in range(batch_size):
+                for row in range(seqlen_q):
+                    for head in range(num_heads):
+                        logits = [sink[head]]
+                        for key_index in window_indices[batch, row]:
+                            if key_index >= 0:
+                                logits.append(
+                                    torch.dot(query[row, batch, head], kv_full[key_index, batch])
+                                )
+                        expected[batch, head, row] = torch.logsumexp(torch.stack(logits), dim=0)
+    else:
+        seqlen_q, batch_size, n_kv = 4, 1, 6
+        query = torch.randn(seqlen_q, num_heads, head_dim, requires_grad=True)
+        kv_full = torch.randn(n_kv, head_dim, requires_grad=True)
+        window_indices = torch.tensor([[-1, 0], [0, 1], [2, 3], [4, 5]])
+        expected = torch.empty(batch_size, num_heads, seqlen_q)
+        with torch.no_grad():
+            for row in range(seqlen_q):
+                for head in range(num_heads):
+                    logits = [sink[head]]
+                    for key_index in window_indices[row]:
+                        if key_index >= 0:
+                            logits.append(torch.dot(query[row, head], kv_full[key_index]))
+                    expected[0, head, row] = torch.logsumexp(torch.stack(logits), dim=0)
+
+    actual = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full, sink, window_indices, softmax_scale=1.0
+    )
+
+    assert actual.shape == (batch_size, num_heads, seqlen_q)
+    assert actual.dtype == torch.float32
+    assert not actual.requires_grad
+    torch.testing.assert_close(actual, expected)
+
+    for teacher_tensor in (query, kv_full, sink):
+        assert teacher_tensor.grad is None
+
+
+def _independent_csa_indexer_loss(
+    index_scores,
+    topk_indices,
+    query,
+    compressed_kv,
+    window_kv,
+    window_indices,
+    sink,
+    *,
+    sparse_loss,
+    loss_coeff,
+):
+    batch_size, seqlen_q, n_compressed = index_scores.shape
+    num_heads = query.shape[2]
+    losses = []
+    for batch in range(batch_size):
+        for row in range(seqlen_q):
+            selected = (
+                topk_indices[batch, row].tolist() if sparse_loss else list(range(n_compressed))
+            )
+            target = []
+            for compressed_index in selected:
+                head_mass = 0.0
+                for head in range(num_heads):
+                    non_compressed_logits = [sink[head]]
+                    for window_index in window_indices[batch, row]:
+                        if window_index >= 0:
+                            non_compressed_logits.append(
+                                torch.dot(query[row, batch, head], window_kv[window_index, batch])
+                            )
+                    compressed_logits = [
+                        torch.dot(query[row, batch, head], compressed_kv[key_index, batch])
+                        for key_index in selected
+                    ]
+                    denominator = torch.logsumexp(
+                        torch.stack(non_compressed_logits + compressed_logits), dim=0
+                    )
+                    head_mass = head_mass + torch.exp(
+                        compressed_logits[selected.index(compressed_index)] - denominator
+                    )
+                target.append(head_mass)
+            target = torch.stack(target)
+            target = target / target.sum()
+            predict_log = torch.log_softmax(index_scores[batch, row, selected], dim=-1)
+            losses.append((target * (torch.log(target) - predict_log)).sum())
+    return torch.stack(losses).mean() * loss_coeff
+
+
 @pytest.mark.parametrize("sparse_loss", [False, True], ids=["dense", "sparse"])
-def test_unfused_csa_indexer_loss_uses_full_attention_denominator(sparse_loss):
-    """Window and sink logits must affect the compressed-key teacher across heads."""
-    query = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
-    compressed_kv = torch.tensor([[2.0, 0.0], [0.0, 2.0]])[:, None, :]
-    index_scores = torch.tensor([[[0.2, -0.1]]], requires_grad=True)
-    topk_indices = torch.tensor([[[0, 1]]])
-    causal_mask = torch.zeros((1, 1, 2))
-    window_indices = torch.tensor([[[0]]])
+def test_csa_lse_custom_autograd_matches_full_teacher_and_reference(sparse_loss):
+    torch.manual_seed(29)
+    seqlen_q, batch_size, num_heads, head_dim = 4, 1, 2, 3
+    n_compressed, index_heads, index_dim = 3, 2, 2
+    index_topk, loss_coeff = 2, 0.7
 
-    def compute_loss(window_kv, attn_sink, scores=index_scores):
-        kv_full = torch.cat([window_kv.view(1, 1, 2), compressed_kv])
-        return _compute_unfused_csa_indexer_loss(
-            scores,
-            topk_indices,
+    q = torch.randn(seqlen_q, batch_size, index_heads, index_dim, requires_grad=True)
+    weights = torch.randn(seqlen_q, batch_size, index_heads, requires_grad=True)
+    k = torch.randn(n_compressed, batch_size, index_dim, requires_grad=True)
+    query = torch.randn(seqlen_q, batch_size, num_heads, head_dim, requires_grad=True)
+    window_kv = torch.randn(seqlen_q, batch_size, head_dim, requires_grad=True)
+    compressed_kv = torch.randn(n_compressed, batch_size, head_dim, requires_grad=True)
+    sink = torch.randn(num_heads, requires_grad=True)
+    window_indices = torch.tensor([[[-1, 0], [0, 1], [1, 2], [2, 3]]])
+    kv_full = torch.cat([window_kv, compressed_kv], dim=0)
+    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full, sink, window_indices, softmax_scale=1.0
+    )
+    key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, num_heads, -1)
+    compressed_mask = torch.zeros(seqlen_q, n_compressed)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    weights_ref = weights.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    index_scores_ref, topk_ref = fused_qk_topk_naive(q_ref, k_ref, weights_ref, index_topk)
+    index_scores_oracle = index_scores_ref.detach().clone()
+    loss_ref = compute_dsa_indexer_loss(
+        index_scores_ref,
+        topk_ref,
+        query.detach(),
+        key_for_loss.detach(),
+        1.0,
+        loss_coeff,
+        sparse_loss,
+        _SingleRankPG(),
+        mask=compressed_mask,
+        non_compressed_lse=non_compressed_lse,
+    )
+    loss_ref.backward()
+
+    saved_shapes = []
+
+    def pack_hook(tensor):
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+        topk_actual, loss_actual = FusedDSAIndexerLoss.apply(
+            q,
+            weights,
+            k,
             query,
-            kv_full,
-            attn_sink,
-            window_indices,
-            compressed_kv_offset=1,
-            softmax_scale=1.0,
-            loss_coeff=1.0,
-            sparse_loss=sparse_loss,
-            causal_mask=causal_mask,
-            pg_collection=None,
+            key_for_loss,
+            1.0,
+            index_topk,
+            loss_coeff,
+            compressed_mask,
+            sparse_loss,
+            _SingleRankPG(),
+            None,
+            None,
+            None,
+            None,
+            False,
+            True,
+            non_compressed_lse,
         )
+        loss_actual.backward()
 
-    baseline_loss = compute_loss(torch.tensor([0.0, 0.0]), torch.tensor([0.0, 0.0]))
-    window_perturbed_loss = compute_loss(torch.tensor([6.0, 0.0]), torch.tensor([0.0, 0.0]))
-    sink_perturbed_loss = compute_loss(torch.tensor([0.0, 0.0]), torch.tensor([6.0, 0.0]))
-    balanced_extreme_window_loss = compute_loss(
-        torch.tensor([30.0, 30.0]), torch.tensor([0.0, 0.0])
-    )
-    predictor_tail_loss = compute_loss(
-        torch.tensor([30.0, 30.0]), torch.tensor([0.0, 0.0]), torch.tensor([[[0.0, -40.0]]])
-    )
-
-    torch.testing.assert_close(baseline_loss, torch.tensor(0.0112081543))
-    torch.testing.assert_close(window_perturbed_loss, torch.tensor(0.4118546844))
-    torch.testing.assert_close(sink_perturbed_loss, torch.tensor(0.4118546844))
-    torch.testing.assert_close(balanced_extreme_window_loss, baseline_loss)
-    torch.testing.assert_close(predictor_tail_loss, torch.tensor(19.3068528))
-
-
-def test_unfused_csa_indexer_loss_ignores_rows_without_compressed_keys():
-    """Early rows with no causal compressed key must have finite zero loss and gradient."""
-    index_scores = torch.tensor([[[0.2, -0.1]]], requires_grad=True)
-    loss = _compute_unfused_csa_indexer_loss(
-        index_scores,
-        torch.tensor([[[0, 1]]]),
-        torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]]),
-        torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]])[:, None, :],
-        torch.tensor([0.0, 0.0]),
-        torch.tensor([[[0]]]),
-        compressed_kv_offset=1,
-        softmax_scale=1.0,
-        loss_coeff=1.0,
-        sparse_loss=True,
-        causal_mask=torch.full((1, 1, 2), float("-inf")),
-        pg_collection=None,
-    )
-
-    loss.backward()
-    torch.testing.assert_close(loss, torch.tensor(0.0))
-    torch.testing.assert_close(index_scores.grad, torch.zeros_like(index_scores))
-
-
-def test_unfused_csa_indexer_loss_preserves_sparse_and_dense_support():
-    """Sparse loss uses selected compressed keys; dense loss uses every causal key."""
-    query = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
-    index_scores = torch.tensor([[[0.2, -0.1, -0.3]]])
-    topk_indices = torch.tensor([[[0, 1]]])
-    causal_mask = torch.zeros((1, 1, 3))
-
-    def compute_loss(third_compressed_kv, sparse_loss):
-        kv_full = torch.tensor([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], third_compressed_kv])[
-            :, None, :
-        ]
-        return _compute_unfused_csa_indexer_loss(
-            index_scores,
-            topk_indices,
-            query,
-            kv_full,
-            torch.tensor([0.0, 0.0]),
-            torch.tensor([[[0]]]),
-            compressed_kv_offset=1,
-            softmax_scale=1.0,
-            loss_coeff=1.0,
-            sparse_loss=sparse_loss,
-            causal_mask=causal_mask,
-            pg_collection=None,
-        )
-
-    sparse_baseline = compute_loss([0.0, 0.0], sparse_loss=True)
-    sparse_perturbed = compute_loss([10.0, 0.0], sparse_loss=True)
-    dense_baseline = compute_loss([0.0, 0.0], sparse_loss=False)
-    dense_perturbed = compute_loss([10.0, 0.0], sparse_loss=False)
-
-    torch.testing.assert_close(sparse_perturbed, sparse_baseline)
-    assert torch.abs(dense_perturbed - dense_baseline) > 1e-3
-
-
-def test_unfused_csa_indexer_loss_thd_handles_per_segment_padding():
-    """The THD wrapper must separate physical offsets from each segment's real length."""
-    generator = torch.Generator().manual_seed(7)
-    q_indexer = torch.randn(24, 2, 2, generator=generator, requires_grad=True)
-    k_indexer = torch.randn(6, 2, generator=generator, requires_grad=True)
-    weights = torch.randn(24, 2, generator=generator, requires_grad=True)
-    query = torch.randn(24, 2, 2, generator=generator)
-    kv_full = torch.randn(30, 2, generator=generator)
-    window_indices = torch.stack(
-        [torch.tensor([max(0, position - 1), position]) for position in list(range(12)) * 2]
-    )
-
-    topk_indices, loss = _unfused_csa_indexer_topk_and_loss_thd(
-        q_indexer,
-        k_indexer,
-        weights,
-        query,
-        kv_full,
-        torch.tensor([0.0, 1.0]),
+    independent_loss = _independent_csa_indexer_loss(
+        index_scores_oracle,
+        topk_ref,
+        query.detach(),
+        compressed_kv.detach(),
+        window_kv.detach(),
         window_indices,
-        torch.tensor([0, 12, 24], dtype=torch.int32),
-        torch.tensor([0, 9, 20], dtype=torch.int32),
-        torch.tensor([0, 3, 6], dtype=torch.int32),
-        torch.tensor([0, 12, 24], dtype=torch.int32),
-        torch.tensor([0, 15, 30], dtype=torch.int32),
-        topk=2,
-        softmax_scale=1.0,
-        loss_coeff=0.1,
-        sparse_loss=True,
-        ratio=4,
-        pg_collection=None,
+        sink.detach(),
+        sparse_loss=sparse_loss,
+        loss_coeff=loss_coeff,
     )
 
-    def segment_oracle(q_start, seqlen_q, compressed_start, kv_full_start):
-        n_compressed = seqlen_q // 4
-        causal_mask = torch.where(
-            torch.arange(n_compressed).unsqueeze(0)
-            >= torch.arange(1, seqlen_q + 1).unsqueeze(1) // 4,
-            float("-inf"),
-            0.0,
-        ).unsqueeze(0)
-        segment_scores = torch.einsum(
-            "shd,td->sht",
-            q_indexer[q_start : q_start + seqlen_q].float(),
-            k_indexer[compressed_start : compressed_start + n_compressed].float(),
-        )
-        segment_scores = (
-            torch.relu(segment_scores) * weights[q_start : q_start + seqlen_q].float().unsqueeze(-1)
-        ).sum(dim=1)
-        segment_scores = segment_scores.unsqueeze(0) + causal_mask
-        segment_topk = segment_scores.topk(2, dim=-1).indices
-        return _compute_unfused_csa_indexer_loss(
-            segment_scores,
-            segment_topk,
-            query[q_start : q_start + seqlen_q].unsqueeze(1),
-            kv_full[kv_full_start : kv_full_start + 15].unsqueeze(1),
-            torch.tensor([0.0, 1.0]),
-            window_indices[q_start : q_start + seqlen_q].unsqueeze(0),
-            compressed_kv_offset=12,
-            softmax_scale=1.0,
-            loss_coeff=0.1,
-            sparse_loss=True,
-            causal_mask=causal_mask,
-            pg_collection=None,
-        )
+    torch.testing.assert_close(loss_actual, independent_loss)
+    torch.testing.assert_close(loss_actual, loss_ref)
+    torch.testing.assert_close(topk_actual, topk_ref)
+    torch.testing.assert_close(q.grad, q_ref.grad)
+    torch.testing.assert_close(weights.grad, weights_ref.grad)
+    torch.testing.assert_close(k.grad, k_ref.grad)
+    assert (batch_size, seqlen_q, n_compressed) not in saved_shapes
+    assert tuple(non_compressed_lse.shape) in saved_shapes
 
-    with torch.no_grad():
-        expected_loss = (segment_oracle(0, 9, 0, 0) * 9 + segment_oracle(12, 11, 3, 15) * 11) / 24
-
-    assert topk_indices.shape == (24, 2)
-    torch.testing.assert_close(
-        topk_indices[[9, 10, 11, 23]], torch.full((4, 2), -1, dtype=torch.int32)
-    )
-    assert torch.isfinite(loss)
-    assert loss > 0
-    torch.testing.assert_close(loss, expected_loss)
-    loss.backward()
-    for grad in (q_indexer.grad, k_indexer.grad, weights.grad):
-        assert grad is not None
-        assert torch.isfinite(grad).all()
-        assert torch.count_nonzero(grad) > 0
-    torch.testing.assert_close(q_indexer.grad[[9, 10, 11, 23]], torch.zeros(4, 2, 2))
-    torch.testing.assert_close(weights.grad[[9, 10, 11, 23]], torch.zeros(4, 2))
-    torch.testing.assert_close(k_indexer.grad[[2, 5]], torch.zeros(2, 2))
+    for teacher_tensor in (query, window_kv, compressed_kv, sink):
+        assert teacher_tensor.grad is None
 
 
 class TestGetWindowTopkIdxs:

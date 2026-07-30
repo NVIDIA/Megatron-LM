@@ -467,7 +467,7 @@ def _native_unfused_sparse_indexer_loss(
     row_valid = selected_valid.any(dim=-1, keepdim=True)
     predict_logits = predict_logits.masked_fill(~selected_valid, float("-inf"))
     predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
-    predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32) * row_valid.float()
+    predict_log = F.log_softmax(predict_logits, dim=-1, dtype=torch.float32)
 
     compressed_attention_indices = torch.where(
         selected_valid, safe_compressed + compressed_kv_offset, torch.full_like(safe_compressed, -1)
@@ -496,12 +496,10 @@ def _native_unfused_sparse_indexer_loss(
 
     compressed_width = compressed_attention_indices.shape[-1]
     target = attention_probs[..., -compressed_width:].sum(dim=1)
-    eps = torch.finfo(torch.float32).tiny
+    eps = 1e-10
     target = target / target.sum(dim=-1, keepdim=True).clamp(min=eps)
     target = target * row_valid.float()
-    target = target.clamp(min=eps)
-    predict = predict.clamp(min=eps)
-    kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
+    kl_per_row = (target * (torch.log(target.clamp(min=eps)) - predict_log)).sum(dim=-1)
     kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
     loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
     return loss * loss_coeff
@@ -1481,12 +1479,13 @@ class TestDSv4HybridNativeParity:
             pad_offset += pl
         hidden_padded = hidden_padded.clone().requires_grad_(True)
 
-        # cu_seqlens_q: cumulative unpadded lengths, matching the metadata
-        # produced by data_schedule. Physical boundaries live separately in
-        # cu_seqlens_q_padded.
+        # cu_seqlens_q: unpadded real boundaries (cumsum of real lengths
+        # within the padded physical layout).
         cu_seqlens_q_vals = [0]
-        for real_length in seg_lens:
-            cu_seqlens_q_vals.append(cu_seqlens_q_vals[-1] + real_length)
+        offset = 0
+        for rl, pl in zip(seg_lens, padded_seg_lens):
+            cu_seqlens_q_vals.append(offset + rl)
+            offset += pl
         cu_seqlens_unpadded = torch.tensor(cu_seqlens_q_vals, dtype=torch.int32, device='cuda')
 
         # cu_seqlens_q_padded: padded boundaries (cumsum of padded lengths
