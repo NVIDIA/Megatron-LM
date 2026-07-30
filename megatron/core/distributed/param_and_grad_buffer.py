@@ -28,7 +28,7 @@ from ..fp4_utils import (
     modify_nvfp4_rowwise_storage,
 )
 from ..fp8_utils import (
-    copy_tensor_to_quantized_param,
+    copy_tensors_to_quantized_params,
     is_float8tensor,
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
@@ -308,6 +308,9 @@ class _ParamAndGradBucketGroup:
                     # buffer to copy back from.
                     continue
                 has_non_quantized_weight = False
+                quantized_params = []
+                param_slices = []
+                flat_param_data = bucket.param_data.view(-1)
                 for param in bucket.params:
                     # Non-quantized weights are already mapped to param.data. Skip
                     # mixed buckets because zeroing bucket.param_data would also
@@ -316,8 +319,11 @@ class _ParamAndGradBucketGroup:
                         has_non_quantized_weight = True
                         break
                     param_start, param_end = bucket.param_to_index[param]
-                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    copy_tensor_to_quantized_param(param, param_slice)
+                    quantized_params.append(param)
+                    param_slices.append(flat_param_data[param_start:param_end])
+                # Cast the bucket in one call: these casts are small, so the per-param cost of
+                # issuing them is worth avoiding.
+                copy_tensors_to_quantized_params(quantized_params, param_slices)
                 if has_non_quantized_weight:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
@@ -1071,6 +1077,7 @@ class _ParamAndGradBuffer:
             param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
         self.param_index_map = param_layout.param_index_map
         self.bucket_indices = param_layout.bucket_indices
+        self.num_optimizer_shards = param_layout.num_optimizer_shards
         per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
 
         # Check if this buffer contains NVFP4 params.
