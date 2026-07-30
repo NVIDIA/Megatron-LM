@@ -15,6 +15,7 @@ from megatron.core.models.T5.t5_spec import encoder_model_with_local_spec as t5_
 from megatron.core.models.T5.t5_spec import (
     encoder_model_with_transformer_engine_default_spec as t5_encoder_te_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -64,6 +65,9 @@ def initialize_t5_model(seed, encoder_decoder_spec_fn, num_layers=8, **config_kw
         post_process=post_process,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'pp']
+        ),
     )
 
     with torch.no_grad():
