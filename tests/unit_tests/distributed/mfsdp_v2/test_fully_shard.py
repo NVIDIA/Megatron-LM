@@ -152,8 +152,8 @@ def _flat_placements() -> Placements:
 
 def _strategy_placements(sharding_strategy: str) -> Placements:
     placements = {
-        "no_shard": (Replicate(), Replicate(), Replicate()),
-        "optim": (Replicate(), Replicate(), Flat()),
+        "no_shard": (Replicate(), Partial(dist.ReduceOp.AVG), Replicate()),
+        "optim": (Replicate(), Partial(dist.ReduceOp.AVG), Flat()),
         "optim_grads": (Replicate(), Flat(), Flat()),
         "optim_grads_params": (Flat(), Flat(), Flat()),
     }
