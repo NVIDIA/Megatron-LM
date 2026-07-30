@@ -52,8 +52,14 @@ from ..distributed.param_and_grad_buffer import (
     group_params_for_buffers,
     partition_buckets,
 )
-from ..fp4_utils import is_nvfp4tensor, quantize_nvfp4_param_shard
-from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
+from ..fp4_utils import is_grouped_nvfp4tensor, is_nvfp4tensor, quantize_nvfp4_param_shard
+from ..fp8_utils import (
+    dequantize_fp8_tensor,
+    get_grouped_quantized_members,
+    is_float8tensor,
+    is_grouped_tensor_with_quantized_storage,
+    quantize_param_shard,
+)
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -204,6 +210,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
         data_parallel_world_size = param_and_grad_buffer.data_parallel_group.size()
+
+        # The layout records how many shards it was built for. That count has to match the group
+        # the reduce-scatter and all-gather run over, which is the intra-instance group when
+        # there are several optimizer instances. If the layout was sized by a larger group, the
+        # trailing shards of every bucket belong to no rank: those params are never updated and
+        # drop out of grad-norm, num-zeros and params-norm, which sum over owned shards only.
+        num_optimizer_shards = param_and_grad_buffer.num_optimizer_shards
+        assert num_optimizer_shards is None or num_optimizer_shards == data_parallel_world_size, (
+            f"Parameter layout was built for {num_optimizer_shards} optimizer shards but the "
+            f"buffer's data-parallel group has {data_parallel_world_size} ranks. Size the layout "
+            f"by the group the optimizer shards over."
+        )
 
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
@@ -397,6 +415,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                         copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
@@ -428,6 +447,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
                         copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
@@ -450,6 +470,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
+                    tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                     copy_optimizer_param_metadata(shard_model_param, model_param)
 
                 else:
@@ -563,6 +584,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=data_parallel_world_size,
         )
 
     @staticmethod
@@ -1097,19 +1119,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @staticmethod
     def _is_grouped_quantized_tensor(tensor: torch.Tensor) -> bool:
         """Check if tensor is a TE GroupedTensor using quantized storage."""
-        return (
-            hasattr(tensor, "split_into_quantized_tensors")
-            and callable(tensor.split_into_quantized_tensors)
-            and getattr(tensor, "quantizer", None) is not None
-        )
+        return is_grouped_tensor_with_quantized_storage(tensor)
 
     @classmethod
     def _is_distopt_quantized_param(cls, tensor: torch.Tensor) -> bool:
         """Check if tensor should follow quantized parameter path in dist optimizer."""
         return is_float8tensor(tensor) or cls._is_grouped_quantized_tensor(tensor)
 
+    @classmethod
+    def _get_grouped_quantized_members(cls, tensor: torch.Tensor) -> List[torch.Tensor]:
+        """Return cached member tensors from a grouped quantized parameter."""
+        return get_grouped_quantized_members(tensor, create_if_missing=True)
+
+    @classmethod
+    def _is_grouped_nvfp4_param(cls, tensor: torch.Tensor) -> bool:
+        """Check if a grouped quantized parameter stores NVFP4 member tensors."""
+        return is_grouped_nvfp4tensor(tensor)
+
+    @classmethod
+    def _is_fp8_param_for_param_gather(cls, tensor: torch.Tensor) -> bool:
+        """Check if a quantized param should use the FP8/MXFP8 param-gather cast path."""
+        return cls._is_distopt_quantized_param(tensor) and not cls._is_grouped_nvfp4_param(tensor)
+
+    @classmethod
     def _expand_quantized_param_shard_for_cast(
-        self,
+        cls,
         model_param: torch.Tensor,
         shard_main_param: Optional[torch.Tensor],
         start_offset: Optional[int],
@@ -1120,12 +1154,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         master slice to per-member offset ranges, while preserving deterministic ordering across
         DP ranks.
         """
-        if not self._is_grouped_quantized_tensor(model_param):
+        if not cls._is_grouped_quantized_tensor(model_param):
             return [model_param], [shard_main_param], [start_offset]
 
-        quantized_members = model_param.quantized_tensors
-        if quantized_members is None:
-            quantized_members = model_param.split_into_quantized_tensors()
+        quantized_members = cls._get_grouped_quantized_members(model_param)
 
         shard_start = 0 if start_offset is None else start_offset
         shard_size = 0 if shard_main_param is None else shard_main_param.numel()
@@ -2614,7 +2646,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         idx = 0
         for buffer in buffers:
             for param in buffer.params:
-                if self._is_distopt_quantized_param(param):
+                if self._is_fp8_param_for_param_gather(param):
                     fp8_params.append(param)
                     shard_fp32_from_fp8.append(None)
                     shard_offsets_in_fp8.append(None)
@@ -2629,7 +2661,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             """
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
-                    if self._is_distopt_quantized_param(model_param):
+                    if self._is_fp8_param_for_param_gather(model_param):
                         param_range_map = self._get_model_param_range_map(model_param)
                         param_range = param_range_map["param"]
                         assert param_range.size == shard_main_param.nelement()
@@ -2664,6 +2696,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_offsets_in_nvfp4.append(None)
                     nvfp4_param_to_idx_map[param] = idx
                     idx += 1
+                elif self._is_grouped_nvfp4_param(param):
+                    members = self._get_grouped_quantized_members(param)
+                    nvfp4_params.extend(members)
+                    shard_fp32_from_nvfp4.extend([None] * len(members))
+                    shard_offsets_in_nvfp4.extend([None] * len(members))
+                    nvfp4_param_to_idx_map[param] = list(range(idx, idx + len(members)))
+                    idx += len(members)
 
         def _get_shard_fp32_from_nvfp4(shard_main_groups, model_groups):
             """Populate shard_fp32_from_nvfp4 and shard_offsets_in_nvfp4 for NVFP4 params."""
@@ -2676,6 +2715,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         idx = nvfp4_param_to_idx_map[model_param]
                         shard_fp32_from_nvfp4[idx] = shard_main_param
                         shard_offsets_in_nvfp4[idx] = param_range.start
+                    elif self._is_grouped_nvfp4_param(model_param):
+                        param_range_map = self._get_model_param_range_map(model_param)
+                        param_range = param_range_map["param"]
+                        assert param_range.size == shard_main_param.nelement()
+                        (
+                            expanded_model_params,
+                            expanded_shard_main_params,
+                            expanded_start_offsets,
+                        ) = self._expand_quantized_param_shard_for_cast(
+                            model_param, shard_main_param, param_range.start
+                        )
+                        indices = nvfp4_param_to_idx_map[model_param]
+                        assert len(indices) == len(expanded_model_params)
+                        for idx, member, member_master, member_offset in zip(
+                            indices,
+                            expanded_model_params,
+                            expanded_shard_main_params,
+                            expanded_start_offsets,
+                        ):
+                            assert nvfp4_params[idx] is member
+                            shard_fp32_from_nvfp4[idx] = member_master
+                            shard_offsets_in_nvfp4[idx] = member_offset
 
         _get_shard_fp32_from_nvfp4(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         _get_shard_fp32_from_nvfp4(self.shard_fp32_groups, self.model_fp32_groups)
@@ -2857,6 +2918,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
 
                 shard_param_buffer.copy_(shard_main_param)
+
+        # Staging params into the DDP param buffer invalidates any prior "already
+        # dispatched" state. The next forward pre-hook must run post-sync cleanup,
+        # especially when MXFP8 reuses grad_data as the param AG buffer.
+        for model_chunk in self.model_chunks:
+            model_chunk.reset_param_sync_dispatch_state()
 
     @staticmethod
     def _normalize_state_dict_for_grouped_params(state_dict_flat, model_chunk):
