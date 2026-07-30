@@ -13,13 +13,18 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    GatedDeltaNet2,
+    chunk_gated_delta_rule,
+    torch_chunk_gated_delta_rule,
+    torch_chunk_gdn2,
+)
 from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
-    torch_chunk_gated_delta_rule,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -243,8 +248,6 @@ class TestGatedDeltaNet:
             ), f"Grad not identical for {name} ({rank=})"
 
     def test_deterministic_mode(self):
-        if self.use_gdn2:
-            pytest.skip("GDN2 doesn't support deterministic mode yet.")
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
@@ -252,16 +255,14 @@ class TestGatedDeltaNet:
         det_config = copy.deepcopy(self.transformer_config)
         det_config.deterministic_mode = True
 
-        gdn_submodules = get_experimental_attention_variant_module_spec(
-            config=det_config
-        ).submodules
+        gdn_spec = get_experimental_attention_variant_module_spec(config=det_config)
 
         model_parallel_cuda_manual_seed(42)
         torch.manual_seed(42)
         gdn = (
-            GatedDeltaNet(
+            gdn_spec.module(
                 det_config,
-                submodules=gdn_submodules,
+                submodules=gdn_spec.submodules,
                 layer_number=1,
                 bias=False,
                 conv_bias=False,
@@ -274,8 +275,13 @@ class TestGatedDeltaNet:
             .bfloat16()
         )
 
-        # deterministic_mode must select the torch-native kernel, not FLA.
-        assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
+        # deterministic_mode must select the variant's torch-native kernel, not FLA.
+        if self.use_gdn2:
+            assert isinstance(gdn, GatedDeltaNet2)
+            assert gdn.gated_delta_rule is torch_chunk_gdn2
+        else:
+            assert isinstance(gdn, GatedDeltaNet)
+            assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
 
         micro_batch_size = 2
         seq_length = 64
@@ -286,20 +292,20 @@ class TestGatedDeltaNet:
             dtype=torch.bfloat16,
         )
 
-        def run():
+        def run(module):
             hidden_states = base_input.clone().requires_grad_(True)
-            output, _ = gdn(hidden_states, None)
+            output, _ = module(hidden_states, None)
             output.float().sum().backward()
             grads = {
                 name: param.grad.detach().clone()
-                for name, param in gdn.named_parameters()
+                for name, param in module.named_parameters()
                 if param.grad is not None
             }
-            gdn.zero_grad(set_to_none=True)
+            module.zero_grad(set_to_none=True)
             return output.detach().clone(), grads, hidden_states.grad.detach().clone()
 
-        out1, grads1, input_grad1 = run()
-        out2, grads2, input_grad2 = run()
+        out1, grads1, input_grad1 = run(gdn)
+        out2, grads2, input_grad2 = run(gdn)
 
         rank = torch.distributed.get_rank()
         assert torch.equal(out1, out2), f"Output not reproducible ({rank=})"
@@ -309,6 +315,63 @@ class TestGatedDeltaNet:
             assert torch.equal(
                 grads1[name], grads2[name]
             ), f"Grad not reproducible for {name} ({rank=})"
+
+        # The deterministic (torch-native) and default (FLA) paths implement the same
+        # recurrence with different kernels, so they must agree numerically.
+        nondet_config = copy.deepcopy(self.transformer_config)
+        nondet_config.deterministic_mode = False
+        nondet_spec = get_experimental_attention_variant_module_spec(config=nondet_config)
+        nondet_gdn = (
+            nondet_spec.module(
+                nondet_config,
+                submodules=nondet_spec.submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        # Share weights so the only difference between the two runs is kernel numerics.
+        nondet_gdn.load_state_dict(gdn.state_dict())
+        assert nondet_gdn.gated_delta_rule is (
+            chunk_gdn2 if self.use_gdn2 else chunk_gated_delta_rule
+        )
+
+        nondet_out, nondet_grads, nondet_input_grad = run(nondet_gdn)
+
+        def rel_l2(a, b):
+            b = b.float()
+            return ((a.float() - b).norm() / b.norm().clamp(min=1e-12)).item()
+
+        out_err = rel_l2(out1, nondet_out)
+        input_grad_err = rel_l2(input_grad1, nondet_input_grad)
+        param_grad_err = max(rel_l2(grads1[n], nondet_grads[n]) for n in grads1)
+        if rank == 0:
+            variant = "gdn2" if self.use_gdn2 else "gdn"
+            print(
+                f"[det-vs-fla {variant} tp{self.tp_size} cp{self.cp_size} sp{self.sp_size}] "
+                f"out={out_err:.3e} input_grad={input_grad_err:.3e} "
+                f"param_grad={param_grad_err:.3e}"
+            )
+
+        # Elementwise assert_close is the wrong metric here. Both paths round to bf16,
+        # and the two kernels disagree by ~1 bf16 ulp on ~6% of elements; wherever the
+        # result is near zero that ulp is an unbounded *relative* error. Compare the
+        # tensors in norm instead, which stays sensitive to a genuine algorithmic
+        # divergence (that would show up as O(1)) while ignoring rounding.
+        tol = 2e-2
+        assert out_err < tol, f"deterministic vs FLA output rel-L2 {out_err:.3e} > {tol} ({rank=})"
+        assert (
+            input_grad_err < tol
+        ), f"deterministic vs FLA input-grad rel-L2 {input_grad_err:.3e} > {tol} ({rank=})"
+        assert (
+            param_grad_err < tol
+        ), f"deterministic vs FLA param-grad rel-L2 {param_grad_err:.3e} > {tol} ({rank=})"
 
     def test_module_construction(self):
         gdn = self.gdn
