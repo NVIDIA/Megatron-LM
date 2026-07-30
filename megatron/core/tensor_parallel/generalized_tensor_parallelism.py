@@ -31,7 +31,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from packaging.version import Version
@@ -349,15 +349,21 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
-    Drains the eager AG/RS side streams, then waits on each CG runner's replay stream
-    (its tail = captured Phase 2 main_grad.add_). No-op when GTP is inactive.
+    Drains the eager AG/RS side streams, then — outside CUDA-graph capture — waits on each CG
+    runner's replay stream (its tail = captured Phase 2 main_grad.add_). Under whole-step capture
+    there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
+    # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
     for s in _AG_STREAMS.values():
         cur.wait_stream(s)
     for s in _RS_STREAMS.values():
         cur.wait_stream(s)
+    # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
+    # whole-step capture there are no runners, so stop here while capturing.
+    if torch.cuda.is_current_stream_capturing():
+        return
     # Local import: cuda_graphs imports this module, so a module-level import would be circular.
     from megatron.core.transformer.cuda_graphs import get_gtp_runner_streams
 
@@ -788,6 +794,9 @@ def _init_gtp_runtime_attrs(obj):
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
     obj._grad_accum_hook = None
+    # The weight's AccumulateGrad node (set by register_grad_accum_hook). Retained so the leaf
+    # lands on the capture stream for full-iteration CUDA-graph capture; None until DDP registers.
+    obj._grad_accum_node = None
     # Quantization. For native-FP8 GTP the reclass path overwrites _quantizer with the tensor's
     # own MXFP8 quantizer and points quantized at self; BF16 GTP leaves both unset.
     obj._quantizer = None
@@ -1446,16 +1455,22 @@ class GTPShardedParam(torch.nn.Parameter):
         """Pool-allocate a wgrad scratch tensor of unsharded shape for the bwd GEMM."""
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
-    def register_grad_accum_hook(self, grad_accum_node, hook):
+    def register_grad_accum_hook(
+        self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
+    ) -> None:
         """Register a DDP backward hook to call after the wgrad RS finalize.
 
         For GTP params autograd may receive None (async RS), so the normal grad-accumulator
         hook never fires; the integrator (Graphed.backward for captured chains, or the eager
         chain-tail cascade) calls this hook explicitly after RS wait + accumulation, so DDP's
-        register_grad_ready fires at the right time. grad_accum_node is accepted for API
-        compatibility but not retained — only the hook callable.
+        register_grad_ready fires at the right time. We retain grad_accum_node (the weight's
+        AccumulateGrad) here. Keeping a live strong reference across the warmup->capture
+        boundary is what places the node on the capture stream for full-iteration CG; an
+        un-retained node stays stranded on the default stream and trips capture. The node is
+        not added to DDP's grad_accs (that list is for autograd-hooked nodes) and never gets
+        .register_hook'd, because grad-ready is fired manually via _grad_accum_hook.
         """
-        del grad_accum_node
+        self._grad_accum_node = grad_accum_node
         self._grad_accum_hook = hook
 
     @staticmethod
