@@ -148,8 +148,10 @@ class AbsorbedMLASelfAttention(Attention):
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert pg_collection is not None, (
+            "AbsorbedMLASelfAttention requires an explicit pg_collection; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
 
         super().__init__(
             config=config,
