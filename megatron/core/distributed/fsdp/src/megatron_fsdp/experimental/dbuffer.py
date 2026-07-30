@@ -20,12 +20,11 @@ from collections.abc import Iterable
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-import torch.distributed.tensor as dist_tensor
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, Partial, Placement, Replicate, changed_mesh_axis
+from .placement import Flat, Partial, Placement, Replicate, changed_mesh_axis, to_dtensor_placement
 
 
 @dataclasses.dataclass(frozen=True)
@@ -462,27 +461,14 @@ class DBuffer:
         ).view(local_shape)
 
     def get_dtensor(self, index: int) -> DTensor:
-        """Return logical tensor ``index`` as a DTensor."""
-        torch_placements = []
-        for placement in self.placements:
-            if isinstance(placement, Replicate):
-                torch_placements.append(dist_tensor.Replicate())
-            elif isinstance(placement, Flat):
-                torch_placements.append(dist_tensor.Shard(0))
-            elif isinstance(placement, Partial):
-                # main_grad backs .grad while it rests DP-outer-Partial between
-                # microbatches, so a Partial placement must round-trip to a DTensor.
-                if placement.reduce_op == dist.ReduceOp.AVG:
-                    reduce_op = "avg"
-                elif placement.reduce_op == dist.ReduceOp.SUM:
-                    reduce_op = "sum"
-                else:
-                    raise ValueError(
-                        f"Unsupported Partial reduce op for DTensor: {placement.reduce_op!r}."
-                    )
-                torch_placements.append(dist_tensor.Partial(reduce_op))
-            else:
-                raise TypeError(f"Unsupported placement for DTensor conversion: {placement!r}.")
+        """Return logical tensor ``index`` as a DTensor on this DP-only mesh.
+
+        This constructs a DTensor over the DBuffer's own mesh, which owns only
+        data-parallel axes. Callers that also need tensor-parallel placements
+        should build the full-mesh DTensor at the ``FsdpParameterGroup`` layer,
+        which owns the full user-provided mesh.
+        """
+        dtensor_placements = tuple(to_dtensor_placement(placement) for placement in self.placements)
 
         local_tensor = self.get_local_tensor(index)
         tensor_shape = self.layout.tensor_shapes[index]
@@ -491,7 +477,7 @@ class DBuffer:
         return DTensor.from_local(
             local_tensor=local_tensor,
             device_mesh=self.mesh,
-            placements=tuple(torch_placements),
+            placements=dtensor_placements,
             run_check=False,
             shape=tensor_shape,
             stride=local_tensor.stride(),

@@ -247,5 +247,15 @@ def non_leading_numel(shape: torch.Size) -> int:
     return shape[1:].numel()
 
 
+def contiguous_stride(shape: torch.Size) -> tuple[int, ...]:
+    """Return the row-major contiguous stride for ``shape``."""
+    stride: list[int] = []
+    running = 1
+    for dim in reversed(shape):
+        stride.append(running)
+        running *= dim
+    return tuple(reversed(stride))
+
+
 def _pad_to_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
