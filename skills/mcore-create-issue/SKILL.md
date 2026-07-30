@@ -7,6 +7,7 @@ user_invocable: true
 argument: "GitHub Actions run or job URL"
 metadata:
   author: Oliver Koenig <okoenig@nvidia.com>
+  version: "1.0.1"
 ---
 
 # Triage CI Failure into a GitHub Issue
