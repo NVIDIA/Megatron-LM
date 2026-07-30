@@ -183,6 +183,8 @@ class FsdpParameterGroup:
         self.sharded_parameters = tuple(sharded_parameters)
         self.unsharded_parameters = tuple(unsharded_parameters)
 
+        # Compute weights must be initialized before the first forward; subsequent
+        # refreshes happen from the FSDP optimizer's post-step hook.
         self.sync_model_weight_from_main_weight()
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
