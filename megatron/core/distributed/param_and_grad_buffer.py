@@ -31,7 +31,7 @@ from ..fp4_utils import (
 from ..fp8_utils import (
     _stage_param_to_bf16,
     copy_back_gathered_bf16_into_fp8_param,
-    copy_tensor_to_quantized_param,
+    copy_tensors_to_quantized_params,
     is_float8tensor,
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
@@ -379,6 +379,9 @@ class _ParamAndGradBucketGroup:
                 if bucket.param_data is None:
                     continue
                 has_non_quantized_weight = False
+                quantized_params = []
+                param_slices = []
+                flat_param_data = bucket.param_data.view(-1)
                 for param in bucket.params:
                     # Non-quantized weights are already mapped to param.data. Skip
                     # mixed buckets because zeroing bucket.param_data would also
@@ -387,8 +390,11 @@ class _ParamAndGradBucketGroup:
                         has_non_quantized_weight = True
                         break
                     param_start, param_end = bucket.param_to_index[param]
-                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    copy_tensor_to_quantized_param(param, param_slice)
+                    quantized_params.append(param)
+                    param_slices.append(flat_param_data[param_start:param_end])
+                # Cast the bucket in one call: these casts are small, so the per-param cost of
+                # issuing them is worth avoiding.
+                copy_tensors_to_quantized_params(quantized_params, param_slices)
                 if has_non_quantized_weight:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
