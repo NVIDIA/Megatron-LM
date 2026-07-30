@@ -56,7 +56,7 @@ nsys profile \
   --inference-dynamic-batching-max-tokens 4096 \
   --inference-dynamic-batching-max-requests 256 \
   --inference-dynamic-batching-cuda-graph-sizing-distribution exponential \
-  --inference-dynamic-batching-async-sched-mode legacy \
+  --inference-dynamic-batching-async-sched-mode "${ASYNC_SCHED:-legacy}" \
   --inference-dynamic-batching-sampling-backend torch \
   --enable-chunked-prefill \
   --seq-length 4096 --max-position-embeddings 4096 --inference-max-seq-length 4096 \
