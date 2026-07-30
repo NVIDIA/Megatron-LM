@@ -876,6 +876,7 @@ class TestLLaVACudaGraph:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):

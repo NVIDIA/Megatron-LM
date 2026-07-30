@@ -23,6 +23,7 @@ from megatron.core.inference.text_generation_controllers.vlm_text_generation_con
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import Float16Module
@@ -93,6 +94,7 @@ class TestVLMTextGenerationController:
             img_h=self.img_h,
             img_w=self.img_w,
             patch_dim=14,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         self.image_token_index = self.model.image_token_index
         self.model = Float16Module(self.model.config, self.model)
