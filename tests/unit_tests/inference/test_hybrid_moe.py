@@ -31,10 +31,12 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stac
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import HAVE_FA4
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     te_supports_batch_invariant_attention,
 )
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.test_moe_dispatching_and_routing import (
@@ -282,6 +284,9 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
         config = _make_base_config(
             num_layers=3,
             batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            attention_dropout=0.0,
+            flash_attention_version=4 if HAVE_FA4 else 3,
             inference_grouped_gemm_backend="torch",
             inference_moe_token_dispatcher_type="nvls",
         )
