@@ -85,7 +85,7 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext | None
-    _ready_grad_parameters: set[nn.Parameter]
+    _num_ready_grad_parameters: int
     _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
@@ -119,7 +119,7 @@ class FsdpModule:
             for group_parameters in _group_parameters(owned_parameters)
         ]
         self._parameter_groups = tuple(parameter_groups)
-        self._ready_grad_parameters = set()
+        self._num_ready_grad_parameters = 0
         self._num_trainable_parameters = sum(
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
@@ -211,12 +211,12 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             for parameter in group.unsharded_parameters:
-                parameter.register_post_accumulate_grad_hook(self._make_grad_hook(parameter))
+                parameter.register_post_accumulate_grad_hook(self._make_grad_hook())
 
-    def _make_grad_hook(self, parameter: nn.Parameter) -> Callable[[nn.Parameter], None]:
+    def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         def grad_hook(_parameter: nn.Parameter) -> None:
-            self._ready_grad_parameters.add(parameter)
-            if len(self._ready_grad_parameters) == self._num_trainable_parameters:
+            self._num_ready_grad_parameters += 1
+            if self._num_ready_grad_parameters == self._num_trainable_parameters:
                 self.post_backward()
 
         return grad_hook
@@ -229,7 +229,7 @@ class FsdpModule:
         """
         self._lazy_init_context()
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
-        self._ready_grad_parameters.clear()
+        self._num_ready_grad_parameters = 0
         context = self.context
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
@@ -315,7 +315,6 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
-        self._ready_grad_parameters.clear()
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
@@ -361,7 +360,7 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
     parameters: dict[str, nn.Parameter] = {}
 
     def visit(submodule: nn.Module, submodule_fqn: str) -> None:
-        direct_parameters = list(submodule.named_parameters(recurse=False))
+        direct_parameters = submodule.named_parameters(recurse=False, remove_duplicate=False)
 
         for local_parameter_name, parameter in direct_parameters:
             parameter_fqn = (

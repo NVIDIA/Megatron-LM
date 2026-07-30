@@ -38,7 +38,8 @@ class FsdpParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
     owning_module: nn.Module
-    parameter_names: tuple[str, ...]
+    # Each tuple contains every FQN for one physical parameter, relative to owning_module.
+    parameter_fqns: tuple[tuple[str, ...], ...]
     sharded_parameters: tuple[nn.Parameter, ...]
     unsharded_parameters: tuple[nn.Parameter, ...]
     mesh: DeviceMesh
@@ -73,34 +74,38 @@ class FsdpParameterGroup:
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
 
+        parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
+        for fqn, parameter in parameters.items():
+            parameter_to_fqns.setdefault(parameter, []).append(fqn)
+
         model_weight_placements = tuple(placements.parameter)
         main_grad_placements = tuple(placements.gradient)
         main_weight_placements = tuple(placements.optimizer)
 
-        # Python dicts preserve insertion order, so parameter_names and
-        # parameters.values() define the same stable DBuffer tensor order.
+        # Python dicts preserve insertion order, so parameter_to_fqns.keys() and
+        # parameter_to_fqns.values() define the same stable DBuffer tensor order.
         self.owning_module = owning_module
         self.mesh = mesh
-        self.parameter_names = tuple(parameters)
-        first_parameter = next(iter(parameters.values()))
+        self.parameter_fqns = tuple(tuple(fqns) for fqns in parameter_to_fqns.values())
+        first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
-        for name, parameter in parameters.items():
+        for parameter, fqns in parameter_to_fqns.items():
             if parameter.dtype != self.dtype:
                 raise ValueError(
-                    f"Expected parameter {name!r} to have dtype {self.dtype}, "
+                    f"Expected parameter {fqns!r} to have dtype {self.dtype}, "
                     f"got {parameter.dtype}."
                 )
             if parameter.requires_grad != self.requires_grad:
                 raise ValueError(
-                    f"Expected parameter {name!r} to have requires_grad={self.requires_grad}, "
+                    f"Expected parameter {fqns!r} to have requires_grad={self.requires_grad}, "
                     f"got {parameter.requires_grad}."
                 )
 
-        tensor_shapes = tuple(parameter.shape for parameter in parameters.values())
+        tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
+            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
             mesh=self.mesh,
             placements=main_weight_placements,
         )
@@ -156,7 +161,7 @@ class FsdpParameterGroup:
         sharded_parameters: list[nn.Parameter] = []
         unsharded_parameters: list[nn.Parameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
-        for index, parameter in enumerate(parameters.values()):
+        for index, parameter in enumerate(parameter_to_fqns):
             parameter.data = self._unsharded_model_weight.get_local_tensor(index)
             parameter.grad = None
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
@@ -184,9 +189,10 @@ class FsdpParameterGroup:
         return torch.cuda.use_mem_pool(self._symm_mem_pool)
 
     def _set_module_parameters(self, parameters: tuple[nn.Parameter, ...]) -> None:
-        for name, parameter in zip(self.parameter_names, parameters, strict=True):
-            module, parameter_name = _get_parameter_owner(self.owning_module, name)
-            module._parameters[parameter_name] = parameter
+        for fqns, parameter in zip(self.parameter_fqns, parameters, strict=True):
+            for fqn in fqns:
+                module, parameter_name = _get_parameter_owner(self.owning_module, fqn)
+                module._parameters[parameter_name] = parameter
 
     def _switch_to_sharded_parameters(self) -> None:
         self._set_module_parameters(self.sharded_parameters)
@@ -258,9 +264,9 @@ class FsdpParameterGroup:
         # Preserve AVG semantics by reducing SUM and scaling the output below.
         partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         grads: list[torch.Tensor] = []
-        for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
+        for fqns, parameter in zip(self.parameter_fqns, self.unsharded_parameters, strict=True):
             if parameter.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fqns!r}.")
             grads.append(parameter.grad)
         with self._symmetric_memory_context():
             return DBuffer(
