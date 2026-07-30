@@ -1866,9 +1866,8 @@ def _compute_sparse_indexer_loss_and_grads(
     # ``predict - target`` gradient for underflowed softmax entries by keeping
     # selected probabilities nonzero before handing them to cuDNN. Invalid slots
     # stay zero and use negative indices so the main kernel skips their K/dK work.
-    index_score_for_bwd = torch.where(
-        valid_positions, predict.clamp_min(_CLIP_PROB_MIN), torch.zeros_like(predict)
-    )
+    index_score_for_bwd = predict.clamp_min(_CLIP_PROB_MIN)
+    index_score_for_bwd.masked_fill_(~valid_positions, 0.0)
     block_i = 128
     attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd = _pad_sparse_backward_topk(
         attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd, block_i
