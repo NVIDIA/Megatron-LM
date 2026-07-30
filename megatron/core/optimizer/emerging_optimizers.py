@@ -25,6 +25,8 @@ try:
     from emerging_optimizers import registry
     from emerging_optimizers.orthogonalized_optimizers import (
         AdaptiveMuon,
+        Moment2MethodT,
+        MuonScaleT,
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
@@ -33,6 +35,7 @@ try:
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+    from emerging_optimizers.utils import FP32MatmulPrecT
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
@@ -171,16 +174,18 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
-        fp32_matmul_prec: str = "medium",
-        coefficient_type: str = "quintic",
+        fp32_matmul_prec: FP32MatmulPrecT = "medium",
+        coefficient_type: NSCoeffT = "quintic",
         num_ns_steps: int = 5,
-        scale_mode: str = "spectral",
+        scale_mode: MuonScaleT = "spectral",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if split_qkv and is_qkv_fn is None:
+            raise ValueError("`is_qkv_fn` must not be `None` when `split_qkv=True`")
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -369,14 +374,14 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
-        fp32_matmul_prec: str = "medium",
-        coefficient_type: str = "quintic",
+        fp32_matmul_prec: FP32MatmulPrecT = "medium",
+        coefficient_type: NSCoeffT = "quintic",
         num_ns_steps: int = 5,
-        scale_mode: str = "spectral",
+        scale_mode: MuonScaleT = "spectral",
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
-        moment2_method: Literal["adamuon", "normuon"] = "adamuon",
+        moment2_method: Moment2MethodT = "adamuon",
         beta2: float = 0.95,
         eps: float = 1e-8,
     ) -> None:
