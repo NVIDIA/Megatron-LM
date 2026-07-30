@@ -226,6 +226,46 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
     dst.copy_(src.view(dst.shape))
 
 
+def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+    """List form of :func:`copy_tensor_to_quantized_param`, for a whole bucket of params.
+
+    Same values, minus the per-param ``copy_`` and tensor-subclass dispatch: the quantizer is
+    resolved up front and called directly. Cast kernels are unchanged, one per param. Worth it
+    because those casts are small and issuing them is expensive, and under
+    --reuse-grad-buf-for-mxfp8-param-ag they run inside the forward pass.
+
+    Args:
+        params: quantized model params to write into.
+        srcs: high-precision source values, one per param, in the same order.
+    """
+    if len(params) == 0:
+        return
+
+    srcs_to_cast = []
+    dsts_to_cast = []
+    quantizers = []
+    for param, src in zip(params, srcs):
+        dst = _unwrap_parameter_data(param)
+        quantizer = (
+            None
+            if is_grouped_tensor_with_quantized_storage(dst)
+            else getattr(dst, "_quantizer", None)
+        )
+        if quantizer is None:
+            # Grouped storage quantizes per member; a missing quantizer has to be built. Both
+            # cases are handled by the single-param path.
+            copy_tensor_to_quantized_param(param, src)
+            continue
+        srcs_to_cast.append(src.view(dst.shape))
+        dsts_to_cast.append(dst)
+        quantizers.append(quantizer)
+
+    # Equivalent to dst.copy_(src), but entered directly instead of via the aten::copy_ op,
+    # QuantizedTensor.__torch_dispatch__ (type and usage checks) and dst.quantize_(src).
+    for src, quantizer, dst in zip(srcs_to_cast, quantizers, dsts_to_cast):
+        quantizer.update_quantized(src, dst)
+
+
 def modify_grouped_tensor_rowwise_storage(tensor: torch.Tensor, new_storage: torch.Tensor) -> None:
     """Replace a high-precision Transformer Engine GroupedTensor's rowwise storage."""
     tensor = _unwrap_parameter_data(tensor)
