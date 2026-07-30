@@ -162,6 +162,7 @@ class GPTModel(LanguageModule):
             mtp_num_layers=self.config.mtp_num_layers,
             ignore_virtual=False,
             vp_stage=vp_stage,
+            pp_group=self.pp_group,
         )
 
         if self.pre_process or self.mtp_process:

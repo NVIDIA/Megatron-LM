@@ -618,6 +618,8 @@ def mtp_on_this_rank(
     mtp_num_layers: Optional[int] = None,
     ignore_virtual: Optional[bool] = True,
     vp_stage: Optional[int] = None,
+    *,
+    pp_group: torch.distributed.ProcessGroup,
 ) -> bool:
     """
     Check if there is MTP on the current rank.
@@ -632,7 +634,7 @@ def mtp_on_this_rank(
           pipeline stage. The function returns True only on the last pipeline stage.
     """
     mtp_on_this_rank = False
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pp_rank = get_pg_rank(pp_group)
     if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
         if (
