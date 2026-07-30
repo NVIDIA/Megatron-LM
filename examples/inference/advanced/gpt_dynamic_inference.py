@@ -128,7 +128,10 @@ def run_inference(
         """Process a single engine step result, updating bookkeeping state."""
         nonlocal total_output_tokens, num_requests_finished
 
-        is_decode_only = engine.is_decode_only
+        decode_only = engine.decode_only
+        is_decode_only = (
+            decode_only.launched if decode_only.launched is not None else decode_only.consumed
+        )
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
@@ -228,7 +231,7 @@ def run_inference(
             add_times.append(get_curr_time(do_broadcast=False) - add_start)
 
             # Step inference engine (i.e., generate a token for each active request).
-            # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
+            # The engine reports the consumed and launched decode-only states after scheduling.
             try:
                 result = engine.step_modern()
             except EngineSuspendedError as e:
