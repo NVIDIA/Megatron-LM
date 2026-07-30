@@ -118,15 +118,20 @@ def _get_csa_compressed_capacity(
 
 
 def _build_compressed_thd_indexer_metadata(
-    cu_seqlens_q: torch.Tensor, cu_seqlens_compressed: torch.Tensor, total_q: int, ratio: int
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    total_q: int,
+    ratio: int,
+    cu_seqlens_q_unpadded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Lower packed compressed-THD metadata to DSA row-wise varlen bounds.
 
     Compressed keys are concatenated segment-major. For query row ``i`` in
     segment ``b``, the legal global compressed-key interval is
     ``[cu_comp[b], cu_comp[b] + floor((pos_i + 1) / ratio))``. Rows beyond
-    ``cu_seqlens_q[-1]`` are static-capacity padding and receive an empty
-    interval plus ``query_valid_rows=False``.
+    their segment's unpadded length are static-capacity padding and receive
+    an empty interval plus ``query_valid_rows=False``. Physical query and
+    compressed offsets always come from the padded cumulative lengths.
 
     Returns ``(starts, ends, query_valid_rows, compressed_offset_per_row)``.
     The final tensor converts DSA's global compressed indices back to the
@@ -142,6 +147,13 @@ def _build_compressed_thd_indexer_metadata(
         )
     if cu_seqlens_q.device != cu_seqlens_compressed.device:
         raise ValueError("query and compressed cumulative lengths must be on the same device")
+    if cu_seqlens_q_unpadded is not None:
+        if cu_seqlens_q_unpadded.ndim != 1 or cu_seqlens_q_unpadded.shape != cu_seqlens_q.shape:
+            raise ValueError(
+                "unpadded query cumulative lengths must match the physical query segment shape"
+            )
+        if cu_seqlens_q_unpadded.device != cu_seqlens_q.device:
+            raise ValueError("physical and unpadded query lengths must be on the same device")
 
     device = cu_seqlens_q.device
     row_idx = torch.arange(total_q, device=device, dtype=torch.int64)
@@ -150,8 +162,12 @@ def _build_compressed_thd_indexer_metadata(
     compressed_starts = cu_seqlens_compressed[segment_ids].to(dtype=torch.int64)
     compressed_limits = cu_seqlens_compressed[segment_ids + 1].to(dtype=torch.int64)
 
-    query_valid_rows = row_idx < cu_seqlens_q[-1].to(dtype=torch.int64)
     position_in_segment = row_idx - query_starts
+    if cu_seqlens_q_unpadded is None:
+        query_valid_rows = row_idx < cu_seqlens_q[-1].to(dtype=torch.int64)
+    else:
+        real_lens = (cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]).to(dtype=torch.int64)
+        query_valid_rows = position_in_segment < real_lens[segment_ids]
     causal_ends = compressed_starts + torch.div(
         position_in_segment + 1, ratio, rounding_mode="floor"
     )
@@ -692,6 +708,7 @@ def _compute_unfused_csa_non_compressed_lse(
     attn_sink: torch.Tensor,
     window_indices: torch.Tensor,
     softmax_scale: float,
+    chunk_size: int = 512,
 ) -> torch.Tensor:
     """Return detached sliding-window-plus-sink log mass for the CSA teacher.
 
@@ -699,41 +716,88 @@ def _compute_unfused_csa_non_compressed_lse(
     both SBHD and packed THD inputs. THD callers must pass flat-global window
     indices into ``kv_full``.
     """
-    is_thd = query.ndim == 3
-    if is_thd:
-        q_flat = query
-        kv_flat = kv_full
-        global_indices = window_indices
-        batch_size = 1
-        seqlen_q = query.shape[0]
-    else:
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if attn_sink.ndim != 1:
+        raise ValueError(f"attn_sink must be 1D, got shape {tuple(attn_sink.shape)}")
+
+    if query.ndim == 4:
         seqlen_q, batch_size, num_heads, head_dim = query.shape
+        if kv_full.ndim != 3 or kv_full.shape[1:] != (batch_size, head_dim):
+            raise ValueError(
+                "SBHD non-compressed LSE expects kv_full shape "
+                f"[sk, {batch_size}, {head_dim}], got {tuple(kv_full.shape)}"
+            )
+        if window_indices.ndim != 3 or window_indices.shape[:2] != (batch_size, seqlen_q):
+            raise ValueError(
+                "SBHD non-compressed LSE expects window_indices shape "
+                f"[{batch_size}, {seqlen_q}, window], got {tuple(window_indices.shape)}"
+            )
+
         n_kv = kv_full.shape[0]
-        q_flat = query.permute(1, 0, 2, 3).reshape(batch_size * seqlen_q, num_heads, head_dim)
-        kv_flat = kv_full.permute(1, 0, 2).reshape(batch_size * n_kv, head_dim)
-        valid = window_indices >= 0
-        batch_offsets = torch.arange(batch_size, device=query.device).view(batch_size, 1, 1) * n_kv
-        global_indices = torch.where(valid, window_indices + batch_offsets, window_indices).reshape(
-            batch_size * seqlen_q, -1
+        q_flat = query.detach().permute(1, 0, 2, 3).reshape(-1, num_heads, head_dim)
+        kv_flat = kv_full.detach().permute(1, 0, 2).reshape(-1, head_dim)
+        batch_offsets = (
+            torch.arange(batch_size, device=window_indices.device, dtype=torch.int64) * n_kv
+        ).view(batch_size, 1, 1)
+        window_indices_i64 = window_indices.to(dtype=torch.int64)
+        global_indices = torch.where(
+            window_indices_i64 >= 0, window_indices_i64 + batch_offsets, window_indices_i64
+        ).reshape(batch_size * seqlen_q, -1)
+        output_shape = (batch_size, num_heads, seqlen_q)
+    elif query.ndim == 3:
+        total_q, num_heads, head_dim = query.shape
+        if kv_full.ndim != 2 or kv_full.shape[1] != head_dim:
+            raise ValueError(
+                "THD non-compressed LSE expects kv_full shape "
+                f"[total_kv, {head_dim}], got {tuple(kv_full.shape)}"
+            )
+        if window_indices.ndim != 2 or window_indices.shape[0] != total_q:
+            raise ValueError(
+                "THD non-compressed LSE expects window_indices shape "
+                f"[{total_q}, window], got {tuple(window_indices.shape)}"
+            )
+
+        q_flat = query.detach()
+        kv_flat = kv_full.detach()
+        global_indices = window_indices.to(dtype=torch.int64)
+        output_shape = (1, num_heads, total_q)
+    else:
+        raise ValueError(
+            "non-compressed LSE query must be SBHD [sq, b, h, d] or "
+            f"THD [total_q, h, d], got {tuple(query.shape)}"
         )
 
-    rows, num_heads, head_dim = q_flat.shape
-    safe_indices = global_indices.clamp(min=0).long()
-    gathered_kv = torch.gather(
-        kv_flat.unsqueeze(0).expand(rows, -1, -1),
-        dim=1,
-        index=safe_indices.unsqueeze(-1).expand(-1, -1, head_dim),
-    )
-    window_logits = torch.einsum("rhd,rkd->rhk", q_flat.float(), gathered_kv.float())
-    window_logits = (window_logits * softmax_scale).masked_fill(
-        ~(global_indices >= 0).unsqueeze(1), float("-inf")
-    )
-    window_lse = torch.logsumexp(window_logits, dim=-1)
-    non_compressed_lse = torch.logaddexp(window_lse, attn_sink.detach().view(1, num_heads).float())
+    if attn_sink.numel() != num_heads:
+        raise ValueError(f"attn_sink must contain {num_heads} head values, got {attn_sink.numel()}")
+    if not (query.device == kv_full.device == attn_sink.device == global_indices.device):
+        raise ValueError("query, kv_full, attn_sink, and window_indices must be on the same device")
 
-    if is_thd:
-        return non_compressed_lse.transpose(0, 1).unsqueeze(0).contiguous()
-    return non_compressed_lse.reshape(batch_size, seqlen_q, num_heads).permute(0, 2, 1).contiguous()
+    sink = attn_sink.detach().to(dtype=torch.float32).view(1, num_heads)
+    lse_chunks = []
+    num_rows = q_flat.shape[0]
+    for start in range(0, num_rows, chunk_size):
+        end = min(start + chunk_size, num_rows)
+        indices = global_indices[start:end]
+        safe_indices = indices.clamp(min=0)
+        gathered_kv = kv_flat.index_select(0, safe_indices.reshape(-1)).reshape(
+            end - start, indices.shape[-1], head_dim
+        )
+        window_logits = torch.einsum("rhd,rkd->rhk", q_flat[start:end].float(), gathered_kv.float())
+        window_logits = (window_logits * softmax_scale).masked_fill(
+            (indices < 0).unsqueeze(1), float("-inf")
+        )
+        window_lse = torch.logsumexp(window_logits, dim=-1)
+        lse_chunks.append(torch.logaddexp(window_lse, sink))
+
+    if lse_chunks:
+        lse_flat = torch.cat(lse_chunks, dim=0)
+    else:
+        lse_flat = torch.empty((0, num_heads), dtype=torch.float32, device=query.device)
+
+    if query.ndim == 4:
+        return lse_flat.reshape(batch_size, seqlen_q, num_heads).permute(0, 2, 1).contiguous()
+    return lse_flat.transpose(0, 1).unsqueeze(0).reshape(output_shape).contiguous()
 
 
 def _unfused_indexer_sparse_attn_from_topk(
@@ -1762,7 +1826,7 @@ class CompressedSparseAttention(MegatronModule):
                     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
                     weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
                     non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
-                        query, kv_full, self.attn_sink, window_idxs, self.softmax_scale
+                        query, kv_full[:offset], self.attn_sink, window_idxs, self.softmax_scale
                     )
                     topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
                         q_indexer,
@@ -2087,30 +2151,15 @@ class CompressedSparseAttention(MegatronModule):
                     weights_for_unfused = w_thd * self.indexer.softmax_scale
                     indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
 
-                    # Build loss metadata from the original unpadded lengths.
-                    # Indexer K may retain static-capacity tail rows, but DSA's
-                    # row-wise bounds never admit those keys and
-                    # ``query_valid_rows`` zeroes padded query gradients.
-                    cu_seqlens_q_for_loss = packed_seq_params.cu_seqlens_q
-                    seg_lens_q = cu_seqlens_q_for_loss[1:] - cu_seqlens_q_for_loss[:-1]
-                    cu_seqlens_compressed_idx_for_loss = torch.cat(
-                        [
-                            torch.zeros(
-                                1,
-                                dtype=cu_seqlens_q_for_loss.dtype,
-                                device=cu_seqlens_q_for_loss.device,
-                            ),
-                            (seg_lens_q // self.compress_ratio)
-                            .cumsum(0)
-                            .to(cu_seqlens_q_for_loss.dtype),
-                        ]
-                    )
+                    # Physical padded offsets define the packed address space;
+                    # unpadded lengths identify the real rows within each segment.
                     (varlen_starts, varlen_ends, query_valid_rows, compressed_offsets) = (
                         _build_compressed_thd_indexer_metadata(
-                            cu_seqlens_q_for_loss,
-                            cu_seqlens_compressed_idx_for_loss,
+                            cu_seqlens_q,
+                            cu_seqlens_compressed_idx,
                             total_q=q_thd.shape[0],
                             ratio=self.compress_ratio,
+                            cu_seqlens_q_unpadded=packed_seq_params.cu_seqlens_q,
                         )
                     )
                     flat_window_idxs, _ = build_flat_topk_idxs(

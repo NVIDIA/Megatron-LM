@@ -570,7 +570,7 @@ def compute_dsa_indexer_loss(
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     # The target is already non-negative because it is a sum of softmax probabilities.
-    attention_scores = dsa_indexer_loss.normalize_indexer_target(attention_scores)
+    attention_scores = _normalize_indexer_teacher_target(attention_scores, non_compressed_lse)
     return dsa_indexer_loss.indexer_loss_from_target(
         attention_scores,
         index_log_scores,
@@ -615,6 +615,15 @@ def _compute_indexer_teacher_probabilities(
     full_lse = torch.logaddexp(non_compressed_lse.float(), compressed_lse)
     probabilities = torch.exp(masked_scores - full_lse.unsqueeze(-1))
     return torch.where(expanded_valid_mask, probabilities, torch.zeros_like(probabilities))
+
+
+def _normalize_indexer_teacher_target(
+    target: torch.Tensor, non_compressed_lse: torch.Tensor | None
+) -> torch.Tensor:
+    """L1-normalize teacher mass without changing the legacy DSA path."""
+    if non_compressed_lse is None:
+        return dsa_indexer_loss.normalize_indexer_target(target)
+    return target / target.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
 
 
 def _compute_index_scores(
@@ -882,7 +891,9 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize. Fully masked packed/varlen rows can have zero summed
     # attention mass; clamp the denominator so those rows stay finite and are
     # later zeroed by the row-valid loss mask.
-    attention_scores_normalized = dsa_indexer_loss.normalize_indexer_target(attention_scores_sum)
+    attention_scores_normalized = _normalize_indexer_teacher_target(
+        attention_scores_sum, non_compressed_lse
+    )
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 
@@ -1068,6 +1079,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.query_valid_rows = query_valid_rows
         ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.use_relu = use_relu
+        ctx.num_inputs = len(ctx.needs_input_grad)
 
         return topk_indices, loss
 
@@ -1110,7 +1122,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             "key": None,
             "non_compressed_lse": None,
         }
-        return tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        gradients = tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        return gradients[: ctx.num_inputs]
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
