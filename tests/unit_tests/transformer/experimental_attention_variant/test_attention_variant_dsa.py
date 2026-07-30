@@ -2278,12 +2278,7 @@ class TestDSAIndexer:
         )
 
         cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        cls.indexer = DSAIndexer(
-            cls.config,
-            indexer_submodules,
-            cls.pg_collection,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp']),
-        )
+        cls.indexer = DSAIndexer(cls.config, indexer_submodules, cls.pg_collection)
 
         yield
         Utils.destroy_model_parallel()
@@ -3184,12 +3179,7 @@ class TestIndexerTensorParallel:
             linear_weights_proj=ModuleSpec(module=TELinear),
         )
 
-        return DSAIndexer(
-            config,
-            indexer_submodules,
-            pg_collection,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp']),
-        )
+        return DSAIndexer(config, indexer_submodules, pg_collection)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_weight_consistency(self):

@@ -1130,10 +1130,8 @@ class DSAIndexer(MegatronModule):
 
         self.softmax_scale: float = self.index_head_dim**-0.5
 
-        assert pg_collection is not None, (
-            "DSAIndexer requires an explicit pg_collection with tp/cp; "
-            "see docs/developer/parallel-state-deprecation.md"
-        )
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         self.pg_collection = pg_collection
 
         # Initialize Position Embedding.
