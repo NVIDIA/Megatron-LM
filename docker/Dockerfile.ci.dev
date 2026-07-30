@@ -60,7 +60,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "$(uname -m)" = "aarch64" ]; then
         export MAX_JOBS=8
     fi
-    uv sync -v \
+    # Prevent overlapping CUTLASS base and CUDA wheel payloads from interleaving.
+    UV_CONCURRENT_INSTALLS=1 uv sync -v \
         --extra ${IMAGE_TYPE} --extra mlm --extra ssm --extra te ${FLASH_MLA_GROUP} --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \

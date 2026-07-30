@@ -73,6 +73,7 @@ def load(
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -108,6 +109,8 @@ def load(
             and compares against the SHA-256 manifest. Raises `CheckpointingException` on any
             mismatch. Requires that the checkpoint was previously saved with
             `verify_integrity=True`.
+        process_group (ProcessGroup, optional): ranks that collectively describe
+            one complete sharded state dict. Defaults to the global process group.
 
     Returns:
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
@@ -163,7 +166,9 @@ def load(
             k: v for k, v in ckpt_sharded_metadata.items() if v.key != 'common_state'
         }
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
-        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)
+        local_metadata, global_metadata = determine_global_metadata(
+            sharded_state_dict, process_group=process_group
+        )
 
     sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
         sharded_state_dict,
