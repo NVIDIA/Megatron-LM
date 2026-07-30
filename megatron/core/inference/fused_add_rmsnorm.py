@@ -23,7 +23,7 @@ path is used unless explicitly enabled.
 """
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -36,6 +36,12 @@ except ImportError:
     HAVE_TRITON = False
 
 USE_FUSED_ADD_NORM: bool = os.environ.get("MCORE_FUSED_ADD_NORM", "0") == "1"
+
+# Same kernel applied one boundary later: the ``mlp_bda`` residual add at the end of
+# a layer, fused with the *next* layer's QKV input RMSNorm. Gated separately so the
+# two fusions can be A/B'd independently -- this one reaches across the layer
+# boundary and into ``linear_qkv``, so it carries more structural risk.
+USE_FUSED_ADD_NORM_QKV: bool = os.environ.get("MCORE_FUSED_ADD_NORM_QKV", "0") == "1"
 
 # The one-row-per-CTA kernel is launch/latency bound; it wins in the decode
 # regime and should not be used for large prefill token counts.
@@ -137,6 +143,23 @@ def fused_add_rmsnorm(
     return o, nr
 
 
+def _tensors_compatible(w: torch.Tensor, hidden: torch.Tensor, residual: torch.Tensor) -> bool:
+    """Shared shape/layout/token-count check for the fused add+RMSNorm kernel."""
+    hn = hidden.shape[-1]
+    if hidden.shape != residual.shape or hn != w.numel():
+        return False
+    if not (hidden.is_cuda and residual.is_cuda):
+        return False
+    if hidden.stride(-1) != 1 or residual.stride(-1) != 1:
+        return False
+    n_tokens = 1
+    for d in hidden.shape[:-1]:
+        n_tokens *= d
+    if n_tokens > FUSED_ADD_NORM_MAX_TOKENS:
+        return False
+    return True
+
+
 def can_use_fused_add_rmsnorm(
     norm_module, hidden: torch.Tensor, residual: torch.Tensor
 ) -> bool:
@@ -154,16 +177,21 @@ def can_use_fused_add_rmsnorm(
         return False
     if getattr(norm_module, "bias", None) is not None:
         return False
-    hn = hidden.shape[-1]
-    if hidden.shape != residual.shape or hn != w.numel():
+    return _tensors_compatible(w, hidden, residual)
+
+
+def can_use_fused_add_rmsnorm_qkv(
+    weight: Optional[torch.Tensor], hidden: torch.Tensor, residual: torch.Tensor
+) -> bool:
+    """Whether the fused kernel can absorb the *next* layer's QKV input RMSNorm.
+
+    Separate gate from :data:`USE_FUSED_ADD_NORM` because this fuses across the
+    layer boundary: the norm being absorbed belongs to the following layer's
+    ``linear_qkv``, and its weight arrives as a raw tensor
+    (``layer_norm_weight``) rather than as a norm module.
+    """
+    if not (HAVE_TRITON and USE_FUSED_ADD_NORM_QKV):
         return False
-    if not (hidden.is_cuda and residual.is_cuda):
+    if weight is None:
         return False
-    if hidden.stride(-1) != 1 or residual.stride(-1) != 1:
-        return False
-    n_tokens = 1
-    for d in hidden.shape[:-1]:
-        n_tokens *= d
-    if n_tokens > FUSED_ADD_NORM_MAX_TOKENS:
-        return False
-    return True
+    return _tensors_compatible(weight, hidden, residual)
