@@ -32,13 +32,13 @@ def fully_shard(
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     use_symm_mem: bool = False,
 ) -> None:
-    """Shard one module as a per-module FSDP unit.
+    """Apply FSDP to a module in place.
 
     This attaches the FSDP mixin to the original module instance, so parent
     modules do not need to replace existing child-module references.
 
     Args:
-        module: Module whose currently unowned parameters become this FSDP unit.
+        module: Module whose currently unowned parameters are managed by FSDP.
         mesh: Device mesh used for sharding.
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
@@ -68,10 +68,14 @@ def fully_shard(
 
 @contextmanager
 def microbatch(module: nn.Module, is_last: bool) -> Iterator[None]:
-    """Scope experimental FSDP state to one microbatch.
+    """Mark an FSDP microbatch as the last accumulation microbatch.
+
+    At present, this is only needed for HSDP/HFSDP gradient accumulation, so
+    FSDP finalizes gradients only on the last backward. Plain all-Flat data
+    parallelism finalizes gradients on every backward and does not need it.
 
     Args:
-        module: Module tree whose experimental FSDP roots should use this microbatch state.
+        module: Module tree whose FSDP roots should use this microbatch state.
         is_last: Whether forwards in this scope are for the last microbatch.
     """
     contexts: list[FsdpContext] = []

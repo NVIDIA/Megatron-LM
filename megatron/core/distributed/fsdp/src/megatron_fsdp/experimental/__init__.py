@@ -16,6 +16,7 @@
 
 from .dbuffer import DBuffer
 from .fully_shard import fully_shard, microbatch
+from .optimizer import fully_shard_optimizer
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
 __all__ = [
@@ -26,5 +27,6 @@ __all__ = [
     "Placements",
     "Replicate",
     "fully_shard",
+    "fully_shard_optimizer",
     "microbatch",
 ]
