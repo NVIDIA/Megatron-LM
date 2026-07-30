@@ -433,32 +433,38 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         beta2: float = 0.95,
         eps: float = 1e-8,
     ) -> None:
-        TensorParallelMuon.__init__(
+        weight_decay_method, scaled_orthogonalize_fn = _tp_muon_pre_init(
+            self,
+            use_decoupled_weight_decay,
+            split_qkv,
+            is_qkv_fn,
+            qkv_split_shapes,
+            coefficient_type,
+            num_ns_steps,
+            scale_mode,
+            extra_scale_factor,
+            pg_collection,
+            tp_mode,
+        )
+        AdaptiveMuon.__init__(
             self,
             params,
             lr=lr,
             momentum=momentum,
-            nesterov=nesterov,
             weight_decay=weight_decay,
-            use_decoupled_weight_decay=use_decoupled_weight_decay,
-            split_qkv=split_qkv,
-            is_qkv_fn=is_qkv_fn,
-            qkv_split_shapes=qkv_split_shapes,
+            nesterov=nesterov,
+            weight_decay_method=weight_decay_method,
             fp32_matmul_prec=fp32_matmul_prec,
             coefficient_type=coefficient_type,
             num_ns_steps=num_ns_steps,
             scale_mode=scale_mode,
             extra_scale_factor=extra_scale_factor,
-            pg_collection=pg_collection,
-            tp_mode=tp_mode,
+            moment2_method=moment2_method,
+            beta2=beta2,
+            eps=eps,
         )
-        self.scale_mode = scale_mode
-        self.extra_scale_factor = extra_scale_factor
-        self.moment2_method = moment2_method
-
-        for group in self.param_groups:
-            group.setdefault("beta2", beta2)
-            group.setdefault("eps", eps)
+        # AdaptiveMuon sets its own `scaled_orthogonalize_fn`, so we override it afterwards.
+        self.scaled_orthogonalize_fn = scaled_orthogonalize_fn
 
     @torch.no_grad()  # type: ignore[misc]
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
