@@ -76,6 +76,7 @@ def initialize_gpt_model(
             mtp_num_layers=transformer_config.mtp_num_layers,
             ignore_virtual=False,
             vp_stage=i,
+            pp_group=parallel_state.get_pipeline_model_parallel_group(),
         ):
             if is_moe:
                 transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config)
