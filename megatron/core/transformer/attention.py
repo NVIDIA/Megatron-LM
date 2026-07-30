@@ -326,19 +326,12 @@ class Attention(MegatronModule, ABC):
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
-        if pg_collection is None:
-            # 'dp' is only consumed by run_realtime_tests (config.test_mode), but the legacy
-            # fallback must supply it so that path keeps working without an explicit collection.
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'dp']
-            )
-        else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "Attention pg_collection must have tp process group"
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "Attention pg_collection must have cp process group"
+        assert pg_collection is not None, (
+            "Attention requires an explicit pg_collection with tp/cp; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
+        assert hasattr(pg_collection, 'tp'), "Attention pg_collection must have tp process group"
+        assert hasattr(pg_collection, 'cp'), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
         # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
         # it on microbatches that carry no per-microbatch CP group.
@@ -1811,7 +1804,7 @@ class SelfAttention(Attention):
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
         # Only this consistency check needs the DP group, so it is required here rather than in
-        # __init__, which asks use_mpu_process_groups for tp/cp only.
+        # __init__, which requires tp/cp only.
         assert hasattr(
             self.pg_collection, 'dp'
         ), "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"
