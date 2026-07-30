@@ -19,12 +19,13 @@ from collections.abc import Iterable
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import torch.distributed.tensor as dist_tensor
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, Partial, Placement, Replicate
+from .placement import Flat, Partial, Placement, Replicate, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,6 +121,11 @@ class DBuffer:
         # existing Storage releases the allocation while preserving those aliases
         # for a later reallocate_storage().
         self._resize_storage(0)
+
+    def rendezvous(self, mesh_axis: int) -> None:
+        """Rendezvous this local buffer for symmetric-memory collectives."""
+        group = self.mesh.get_group(mesh_axis)
+        symm_mem.rendezvous(self.local_buffer, group=group.group_name)
 
     def _resize_storage(self, numel: int) -> None:
         self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
@@ -238,15 +244,24 @@ class DBuffer:
         return buffer
 
     def _create_or_validate_out(
-        self, placements: Iterable[Placement], out: "DBuffer | None"
+        self,
+        out: "DBuffer | None",
+        *,
+        placements: Iterable[Placement] | None = None,
+        dtype: torch.dtype | None = None,
     ) -> "DBuffer":
-        placements = tuple(placements)
+        if placements is None:
+            placements = self.placements
+        else:
+            placements = tuple(placements)
+        if dtype is None:
+            dtype = self.dtype
         if out is None:
             return DBuffer(
                 mesh=self.mesh,
                 placements=placements,
                 tensor_shapes=self.layout.tensor_shapes,
-                dtype=self.dtype,
+                dtype=dtype,
                 device=self.device,
             )
 
@@ -256,24 +271,18 @@ class DBuffer:
             raise ValueError(f"Expected out placements {placements!r}, got {out.placements!r}.")
         if out.layout != self.layout:
             raise ValueError(f"Expected out layout {self.layout!r}, got {out.layout!r}.")
-        if out.dtype != self.dtype:
-            raise ValueError(f"Expected out dtype {self.dtype}, got {out.dtype}.")
+        if out.dtype != dtype:
+            raise ValueError(f"Expected out dtype {dtype}, got {out.dtype}.")
         if out.device != self.device:
             raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
 
-    def cast(self, dtype: torch.dtype) -> "DBuffer":
+    def cast(self, dtype: torch.dtype, *, out: "DBuffer | None" = None) -> "DBuffer":
         """Return this buffer with the same layout and placements in ``dtype``."""
-        if self.dtype == dtype:
+        if self.dtype == dtype and out is None:
             return self
 
-        destination = DBuffer(
-            mesh=self.mesh,
-            placements=self.placements,
-            tensor_shapes=self.layout.tensor_shapes,
-            dtype=dtype,
-            device=self.device,
-        )
+        destination = self._create_or_validate_out(out, dtype=dtype)
         destination.local_buffer.copy_(self.local_buffer)
         return destination
 
@@ -283,8 +292,9 @@ class DBuffer:
         """Redistribute this buffer to ``new_placements``.
 
         This dispatcher supports the one-axis transitions:
-        Flat -> Replicate, Partial -> Replicate, Partial -> Flat, and
-        Replicate -> Flat. Other placement changes are intentionally unsupported.
+        Flat -> Replicate, Partial -> Replicate, Partial -> Flat,
+        Replicate -> Flat, and Replicate -> Partial. Other placement changes are
+        intentionally unsupported.
         """
         new_placements = tuple(new_placements)
         if len(new_placements) != self.mesh.ndim:
@@ -294,23 +304,11 @@ class DBuffer:
             )
         _validate_placements(new_placements)
 
-        changed_axis: int | None = None
-        for axis, (old_placement, new_placement) in enumerate(
-            zip(self.placements, new_placements, strict=True)
-        ):
-            if old_placement == new_placement:
-                continue
-            if changed_axis is not None:
-                raise NotImplementedError(
-                    "redistribute() currently supports one placement change, "
-                    f"got changed axes {changed_axis} and {axis}."
-                )
-            changed_axis = axis
-
+        changed_axis = changed_mesh_axis(self.placements, new_placements)
         if changed_axis is None:
             if out is None:
                 return self
-            out = self._create_or_validate_out(new_placements, out)
+            out = self._create_or_validate_out(out, placements=new_placements)
             out.local_buffer.copy_(self.local_buffer)
             return out
 
@@ -325,6 +323,23 @@ class DBuffer:
             return self.reduce_scatter(axis, new_placement, out=out)
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
             return self.scatter(axis, new_placement, out=out)
+        if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
+            # Replicate and Partial share the same local layout, so relabel the
+            # buffer without communication. Value-preserving for AVG only -- the
+            # mean of identical per-rank locals is that value; SUM would need a
+            # 1/axis_size rescale, which no caller needs.
+            if new_placement.reduce_op != dist.ReduceOp.AVG:
+                raise NotImplementedError(
+                    "Replicate -> Partial redistribute supports AVG only, got "
+                    f"{new_placement.reduce_op!r}."
+                )
+            if out is not None:
+                raise NotImplementedError(
+                    "Replicate -> Partial redistribute does not support an out buffer."
+                )
+            return DBuffer.from_local(
+                self.local_buffer, self.mesh, new_placements, self.layout.tensor_shapes
+            )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
             f"{axis}: {old_placement!r} -> {new_placement!r}."
@@ -340,7 +355,7 @@ class DBuffer:
         placements = list(self.placements)
         placements[mesh_axis] = Replicate()
         _validate_placements(placements)
-        out = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(out, placements=placements)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,
@@ -357,7 +372,7 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = Replicate()
-        out = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(out, placements=placements)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
             out.local_buffer, op=partial_placement.reduce_op, group=self.mesh.get_group(axis)
@@ -378,7 +393,7 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = new_placement
         _validate_placements(placements)
-        out = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(out, placements=placements)
         dist.reduce_scatter_tensor(
             output=out.local_buffer,
             input=self.local_buffer,
@@ -406,7 +421,7 @@ class DBuffer:
                 self.mesh, placements
             )
         else:
-            out = self._create_or_validate_out(placements, out)
+            out = self._create_or_validate_out(out, placements=placements)
             destination_offset = out.offset
             destination_numel = out.local_buffer.numel()
 
@@ -455,7 +470,17 @@ class DBuffer:
             elif isinstance(placement, Flat):
                 torch_placements.append(dist_tensor.Shard(0))
             elif isinstance(placement, Partial):
-                raise ValueError("Partial DBuffer placements cannot be represented as DTensor.")
+                # main_grad backs .grad while it rests DP-outer-Partial between
+                # microbatches, so a Partial placement must round-trip to a DTensor.
+                if placement.reduce_op == dist.ReduceOp.AVG:
+                    reduce_op = "avg"
+                elif placement.reduce_op == dist.ReduceOp.SUM:
+                    reduce_op = "sum"
+                else:
+                    raise ValueError(
+                        f"Unsupported Partial reduce op for DTensor: {placement.reduce_op!r}."
+                    )
+                torch_placements.append(dist_tensor.Partial(reduce_op))
             else:
                 raise TypeError(f"Unsupported placement for DTensor conversion: {placement!r}.")
 

@@ -22,6 +22,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import DType, IndexedDatasetBuilder
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, compile_helpers, get_blend_from_list
+from megatron.core.safe_globals import safe_numpy_load
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.utils import get_blend_and_blend_per_split
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -117,7 +118,7 @@ def test_builder():
         def build_low_level_dataset(
             dataset_path: str, config: BlendedMegatronDatasetConfig
         ) -> LowLevelDataset:
-            return numpy.load(dataset_path)
+            return safe_numpy_load(dataset_path)
 
         def __len__(self) -> int:
             return len(self.sample_index)

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import threading
 
 import pytest
@@ -74,5 +75,25 @@ class TestEventLoopManager:
 
             with pytest.raises(RuntimeError, match="background loop"):
                 mgr.submit(deadlock_attempt()).result()
+        finally:
+            mgr.stop()
+
+    def test_run_sync_from_foreign_running_loop_returns_result(self):
+        """A thread whose own event loop is running (e.g. an embedder's
+        dispatch loop) may call ``run_sync``: the caller's loop stalls while
+        the coroutine executes on the background loop and the result is
+        handed back."""
+        mgr = _EventLoopManager()
+        mgr.start()
+        try:
+
+            async def inner():
+                return 42
+
+            async def foreign_caller():
+                # Runs on a fresh caller-owned loop, not mgr._loop.
+                return mgr.run_sync(inner())
+
+            assert asyncio.run(foreign_caller()) == 42
         finally:
             mgr.stop()

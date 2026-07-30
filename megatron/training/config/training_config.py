@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
-
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
@@ -367,6 +366,27 @@ class LoggerConfig:
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 
+    moe_routing_trace_path: str | None = None
+    """Directory for MoE router decision traces (JSONL).  When set, a RouterTracer is initialized
+    at training start and hooks are registered on all TopKRouter modules.
+    Traces are written in the same format as inference traces so the analysis scripts under
+    tools/moe_routing work on both."""
+
+    moe_routing_trace_max_training_iters: int | None = None
+    """Maximum number of training iterations to trace.  Tracing stops
+    automatically after this many calls to advance_step().  Defaults
+    to tracing all iterations when moe_routing_trace_path is set.
+    (Inference uses --moe-routing-trace-max-inference-steps instead.)"""
+
+    moe_routing_trace_capture_logits: bool = False
+    """Capture pre-topk routing logits for each router call."""
+
+    moe_routing_trace_capture_hidden_states: bool = False
+    """Capture input hidden-state tensors for each router call."""
+
+    moe_routing_trace_dump_weights: bool = False
+    """Save router weight tensors to a .pt sidecar file."""
+
 
 @dataclass(kw_only=True)
 class CheckpointConfig:
@@ -595,6 +615,13 @@ class CheckpointConfig:
 
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
+
+    stream_ckpt_dequant: bool = True
+    """Per-tensor streaming dequantize when loading checkpoints with quantized model params
+    (FP8, MXFP8, blockwise FP8, NVFP4). The LoadPlanner dequantizes one destination at a time,
+    instead of dequantizing the entire state dict to high precision before the load starts
+    (which allocates N simultaneous scratch tensors and can OOM on large models). On by
+    default; pass --no-stream-ckpt-dequant to fall back to the legacy upfront pass."""
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support

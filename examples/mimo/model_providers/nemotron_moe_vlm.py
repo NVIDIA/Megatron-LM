@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
+from examples.mimo.model_providers import MimoProvider
 from examples.mimo.model_providers.radio_encoder import (
     RADIO_ENCODER_MODULE_NAME,
     _base_config,
@@ -22,8 +23,10 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.hyper_comm_grid import _is_process_group_member as is_process_group_member
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -35,6 +38,9 @@ try:
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
 except ImportError:  # pragma: no cover - TE always present in the CI container
     TERowParallelLinear = None
+
+if TYPE_CHECKING:
+    from examples.mimo.training.topology import HeteroTopology
 
 NEMOTRON_MODEL_PROVIDER = "nemotron-moe-vlm"
 
@@ -232,4 +238,35 @@ def vision_submodules_spec(
             "encoders": {RADIO_ENCODER_MODULE_NAME: vision_encoder_spec},
             "input_projections": [vision_projection_spec],
         },
+    )
+
+
+def nemotron_special_token_ids(args: argparse.Namespace) -> dict[str, int]:
+    """Map each encoder module to the special token id marking its inputs."""
+    return {RADIO_ENCODER_MODULE_NAME: args.image_token_id}
+
+
+def build_nemotron_communicator(
+    args: argparse.Namespace, topology: "HeteroTopology"
+) -> MultiModulePipelineCommunicator:
+    """Wire the RADIO-encoder -> language cross-grid pipeline communicator."""
+    language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
+    language_config = language_model_spec(args, None, language_grid).params["config"]
+    return MultiModulePipelineCommunicator(
+        topology.grids,
+        {RADIO_ENCODER_MODULE_NAME: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []},
+        language_config,
+        dim_mapping={"s": 0, "h": 2, "b": 1},
+        module_output_ndim={RADIO_ENCODER_MODULE_NAME: 2},
+    )
+
+
+def nemotron_provider() -> MimoProvider:
+    """Provider descriptor for the Nemotron6-MoE + RADIO VLM."""
+    return MimoProvider(
+        encoder_module_names=(RADIO_ENCODER_MODULE_NAME,),
+        language_spec=language_model_spec,
+        encoder_specs={RADIO_ENCODER_MODULE_NAME: vision_submodules_spec},
+        special_token_ids=nemotron_special_token_ids,
+        build_communicator=build_nemotron_communicator,
     )

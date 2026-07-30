@@ -54,13 +54,13 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -114,12 +114,14 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
+from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import (
     StragglerDetector,
@@ -148,7 +150,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import is_hybrid_model
+from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -205,6 +207,8 @@ except ImportError:
 
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
+
+    from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -920,7 +924,7 @@ def get_start_time_from_progress_log():
     def _get_field(string, type):
         return type(string.split(': ')[1])
 
-    with open_file(progress_log_filename, 'r') as f:
+    with maybe_msc.open(progress_log_filename, 'r') as f:
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
@@ -984,7 +988,13 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            # Treat missing and explicit None identifier values as equivalent.
+            # Wrap each component so None never compares directly with floats or strings.
+            def key_fn(pg):
+                return [
+                    (value is not None, value)
+                    for value in (pg.get(key) for key in param_group_identifier_keys)
+                ]
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -1004,9 +1014,9 @@ def preprocess_common_state_dict(common_state_dict):
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
-    model_provider,
     model_type,
     forward_step_func,
+    model_provider=None,
     process_non_loss_data_func=None,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
@@ -1014,7 +1024,7 @@ def pretrain(
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
 ):
     """Main training program.
@@ -1074,13 +1084,8 @@ def pretrain(
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
 
-    init_pg_collection = None
-    if schedule_pg_collection is not None:
-        init_pg_collection = (
-            schedule_pg_collection.get_language_model_collection()
-            if schedule_pg_collection.has_language_model()
-            else next(iter(schedule_pg_collection.module_pgs.values()))
-        )
+    # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
+    skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -1088,11 +1093,12 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
         skip_model_parallel_init=skip_model_parallel_init,
-        seed_pp_group=getattr(init_pg_collection, "pp", None),
-        seed_dp_group=getattr(init_pg_collection, "dp", None),
-        seed_tp_group=getattr(init_pg_collection, "tp", None),
-        seed_ep_group=getattr(init_pg_collection, "ep", None),
-        seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
+        skip_random_seed=skip_random_seed,
+        seed_pp_group=getattr(pg_collection, "pp", None),
+        seed_dp_group=getattr(pg_collection, "dp", None),
+        seed_tp_group=getattr(pg_collection, "tp", None),
+        seed_ep_group=getattr(pg_collection, "ep", None),
+        seed_etp_group=getattr(pg_collection, "expt_tp", None),
     )
 
     timestamp_after_initialize_megatron = time.time()
@@ -1108,8 +1114,7 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
-    _jit_tp_size = get_pg_size(init_pg_collection.tp) if init_pg_collection is not None else None
-    set_jit_fusion_options(tp_size=_jit_tp_size)
+    set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1221,7 +1226,16 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_type,
+        model_provider_func=model_provider,
+        checkpointing_context=checkpointing_context,
+        cfg_container=cfg_container,
+        # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
+        pg_collection=(
+            pg_collection
+            if pg_collection is not None
+            else ProcessGroupCollection.use_mpu_process_groups()
+        ),
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1419,7 +1433,7 @@ def pretrain(
                 non_loss_data_func,
                 inference_model,
                 p2p_communicator=p2p_communicator,
-                schedule_pg_collection=schedule_pg_collection,
+                pg_collection=pg_collection,
             )
 
         print_datetime('after training is done')
@@ -1471,7 +1485,8 @@ def pretrain(
                 valid_data_iterator, model,
                 iteration, process_non_loss_data_func, model_cfg,
                 verbose=True, write_to_tensorboard=not cfg_container.validation.skip_train,
-                non_loss_data_func=non_loss_data_func
+                non_loss_data_func=non_loss_data_func,
+                pg_collection=pg_collection, p2p_communicator=p2p_communicator
             )
 
     if args.do_test:
@@ -1487,6 +1502,8 @@ def pretrain(
             verbose=True,
             write_to_tensorboard=not cfg_container.validation.skip_train,
             non_loss_data_func=non_loss_data_func,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
         )
 
     wandb_writer = get_wandb_writer()
@@ -1637,8 +1654,22 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
-            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
+            # The distributed optimizer shards each bucket over the intra-instance group, which
+            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
+            # same group, otherwise the layout reports more shards than the reduce-scatter uses
+            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
+            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
+            # when there are several instances.
+            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
+            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
+            data_parallel_world_size = get_pg_size(
+                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
+            )
+            expert_data_parallel_world_size = get_pg_size(
+                intra_expt_dp_group
+                if intra_expt_dp_group is not None
+                else getattr(layout_pgs, "expt_dp", None)
+            )
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1672,6 +1703,31 @@ def wrap_model_chunks_with_ddp(
     return wrapped
 
 
+def _freeze_all_model_chunks(model_list):
+    """Freeze all parameters in a list of model chunks (for logits-saving runs)."""
+    for model_module in model_list:
+        model_module.requires_grad_(False)
+        # Additionally freeze expert biases of routers
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+    return model_list
+
+
+def _forward_backward_grad_context(args):
+    """Grad context for a train step's forward/backward pass.
+
+    Returns a tuple of (grad_context, forward_only).
+    grad_context is ``torch.no_grad()`` when all layers are frozen (e.g. teacher logits
+    dumps), no parameter needs gradients, so there is no reason to build the
+    autograd graph. Otherwise returns a no-op context.
+    forward_only is True when all layers are frozen, False otherwise.
+    """
+    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
+    forward_only = getattr(args, "freeze_all_layers", False)
+    return grad_context, forward_only
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1693,16 +1749,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
-        from megatron.post_training.checkpointing import has_modelopt_state
-
-        # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
-        # set a flag to use our model provider if so.
-        if args.load is not None and has_modelopt_state(args.load):
-            print_rank_0(f'ModelOpt checkpoint detected')
-            args.modelopt_enabled = True
-        elif getattr(args, "export_kd_teacher_load", None):
-            # For distillation ckpts without ModelOpt state
-            args.modelopt_enabled = True
+        maybe_enable_modelopt(args)
 
     # Build model.
     def build_model():
@@ -1754,12 +1801,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
-        for model_module in model:
-            model_module.requires_grad_(False)
-            # Additionally freeze expert biases of routers
-            for module in model_module.modules():
-                if hasattr(module, "frozen_expert_bias"):
-                    module.frozen_expert_bias = True
+        _freeze_all_model_chunks(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -1775,9 +1817,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, pipeline) '
-            'model parallel rank ({}, {}): {}'.format(
+            ' > number of parameters on (tensor, gtp_weight_remat, pipeline) '
+            'model parallel rank ({}, {}, {}): {}'.format(
                 get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.gtp_remat),
                 get_pg_rank(pg_collection.pp),
                 num_parameters,
             ),
@@ -1844,12 +1887,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for disable in per_chunk_disable_bucketing
         ]
 
-        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
-        #  capture support with DDP, but we sync it with the current stream to avoid races.
-        ddp_stream = torch.cuda.Stream()
-        # Wait for the default stream to complete before starting ddp_stream
+        if config.cuda_graph_impl == "full_iteration":
+            # DDP initialization must use the full-iteration capture stream so its retained
+            # AccumulateGrad nodes do not reference a different, non-capturing stream.
+            ddp_stream = get_shared_capture_stream()
+        else:
+            # Preserve a dedicated initialization stream for all other implementations.
+            ddp_stream = torch.cuda.Stream()
         ddp_stream.wait_stream(torch.cuda.current_stream())
-        # Make ddp_stream start after whatever the default stream already queued
+
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -1866,8 +1912,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # End of setup_stream
-        # Critical: ensure side-stream work completes before touching params on default stream
+        # Ensure initialization-stream work completes before touching params on the default stream.
         torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -1990,10 +2035,12 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
 
 
 def setup_model_and_optimizer(
-    model_provider_func,
     model_type,
+    model_provider_func=None,
     checkpointing_context=None,
-    pg_collection=None,
+    *,
+    cfg_container: PretrainConfigContainer | None = None,
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -2006,12 +2053,69 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(
-        model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection
-    )
+
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+
+    def _build_model_wrapper(wrap_with_ddp: bool):
+        if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
+            from megatron.training.utils import start_memory_history_recording
+
+            start_memory_history_recording(cfg_container.profiling)
+
+            cfg = cfg_container
+            model_config = cfg.model
+            builder_cls = model_config.get_builder_cls()
+            builder = builder_cls(model_config)
+
+            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
+            # and skips grad-buffer allocation for all params (matching get_model behavior).
+            if args.freeze_all_layers:
+                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+
+            return builder.build_distributed_models(
+                pg_collection=pg_collection,
+                ddp_config=cfg.ddp,
+                overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+                use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+                use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+                wrap_with_ddp=wrap_with_ddp,
+                data_parallel_random_init=cfg.rng.data_parallel_random_init,
+            )
+        else:
+            assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
+            return get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection)
+
+    # Configure GTP weight-remat padding/loss reduction before model construction (pad
+    # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
+    # also covers the config-container builder path, which does not call get_model.
+    if is_gtp_remat_active(args):
+        from megatron.core.tensor_parallel.gtp_api import configure_gtp_remat_from_recipe
+
+        configure_gtp_remat_from_recipe(
+            fp4=getattr(args, 'fp4', None) is not None,
+            fp8_recipe=getattr(args, 'fp8_recipe', None),
+            fp8=getattr(args, 'fp8', None) is not None,
+            calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+        )
+
+    model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
-    if args.logits_save_dir is not None:
+    # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
+    # first forward. Placed here (not in get_model) so it also covers the config-container
+    # builder path.
+    if is_gtp_remat_active(args):
+        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+
+        classify_gtp_remat_chains(
+            model,
+            cuda_graph_modules=getattr(args, 'cuda_graph_modules', None),
+            moe_shared_expert_overlap=getattr(args, 'moe_shared_expert_overlap', False),
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
+        )
+
+    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -2023,7 +2127,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None:
+    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -2081,7 +2185,7 @@ def setup_model_and_optimizer(
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
-        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        dense_model_for_upcycling = _build_model_wrapper(wrap_with_ddp=True)
 
         # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts
@@ -2117,6 +2221,7 @@ def setup_model_and_optimizer(
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
+        ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
             model,
             optimizer,
@@ -2125,6 +2230,14 @@ def setup_model_and_optimizer(
             skip_load_to_model_and_opt=HAVE_FSDP2
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
+            tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
+            pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
+            # Replica_id must match the save path (see save_checkpoint_and_time): use the
+            # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
+            dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
+            dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
+            expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
+            rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
         )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
@@ -2138,13 +2251,25 @@ def setup_model_and_optimizer(
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
 
+    # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
+    # Import locally to prevent circular import: megatron.post_training.checkpointing
+    # imports `get_args` from megatron.training at module scope.
+    if has_nvidia_modelopt:
+        from megatron.post_training.checkpointing import load_kd_teacher_checkpoint
+
+        load_kd_teacher_checkpoint(model)
+
     # Validate that the world size can accommodate the current batch size.
     # This catches the case where GPUs were scaled up mid-training but the
     # current position in the batch size schedule yields a batch size that
     # is too small for the number of data-parallel replicas.
     num_microbatches = get_num_microbatches()
     current_global_batch_size = get_current_global_batch_size()
-    data_parallel_size = mpu.get_data_parallel_world_size()
+    data_parallel_size = (
+        mpu.get_data_parallel_world_size()
+        if mpu.model_parallel_is_initialized()
+        else args.data_parallel_size
+    )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
         f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
@@ -2191,7 +2316,7 @@ def dummy_train_step(data_iterator):
     """Single dummy training step."""
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = getattr(args, 'sft', False)
+    has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
     is_hybrid_cp = args.hybrid_context_parallel
 
     BATCH_KEYS = [
@@ -2214,7 +2339,7 @@ def dummy_train_step(data_iterator):
                 batch,
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
-                is_sft=is_sft,
+                has_cu_seqlens=has_cu_seqlens,
                 is_hybrid_cp=is_hybrid_cp,
                 create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
                 cp_size=args.context_parallel_size,
@@ -2234,15 +2359,13 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None, schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
-    pg_collection: optional per-module :class:`ProcessGroupCollection`; None uses the mpu globals,
-        otherwise it must define mp, pp, and dp_cp.
+    pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
+        preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
     """
     args = get_args()
     timers = get_timers()
@@ -2307,20 +2430,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-            p2p_communicator=p2p_communicator,
-            pg_collection=schedule_pg_collection,
-        )
+        grad_context, forward_only = _forward_backward_grad_context(args)
+        with grad_context:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=forward_only,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+                p2p_communicator=p2p_communicator,
+                pg_collection=pg_collection,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2330,6 +2455,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
+
+        # Advance the router tracer step if active.
+        tracer = get_moe_router_tracer()
+        if tracer is not None:
+            tracer.advance_step(iteration)
 
         # Reset force_all_reduce field.
         for model_chunk in model:
@@ -2383,14 +2513,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if save_params_in_this_iteration:
         _save_state_dict(attr_name="data", label="params")
 
+    # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
+    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     for _required in ("mp", "pp", "dp_cp"):
         assert getattr(pg_collection, _required, None) is not None, (
-            f"pg_collection passed to train_step must define {_required}"
+            f"model pg_collection used by train_step must define {_required}"
         )
     mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
+    # gtp_remat-inclusive: the reported global per-token loss must cover gtp_remat peers' distinct
+    # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
+    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -2410,7 +2544,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+        # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so multiply it
+        # back in for the sample count.
+        increment = (
+            get_num_microbatches()
+            * args.micro_batch_size
+            * args.data_parallel_size
+            * args.gtp_weight_remat_size
+        )
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
@@ -2541,8 +2683,15 @@ def training_log(
     if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
-    # Calculate batch size.
-    batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
+    # total_model_size at arguments.py:446); each gtp-remat peer consumes a distinct microbatch,
+    # so multiply it back in for the global sample count.
+    batch_size = (
+        args.micro_batch_size
+        * args.data_parallel_size
+        * args.gtp_weight_remat_size
+        * get_num_microbatches()
+    )
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -2864,9 +3013,29 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     )
 
 
+def _assert_param_gather_overlap_model(model_chunk):
+    """Assert that a model chunk implements the parameter-gather overlap lifecycle."""
+    # MimoModel is a composite wrapper rather than a DDP instance, but delegates this
+    # interface to its active inner DDP modules.
+    required_methods = (
+        'enable_forward_pre_hook',
+        'disable_forward_pre_hook',
+        'start_param_sync',
+    )
+    missing_methods = [
+        method_name
+        for method_name in required_methods
+        if not callable(getattr(model_chunk, method_name, None))
+    ]
+    assert not missing_methods, (
+        f'{type(model_chunk).__name__} does not support parameter-gather overlap; '
+        f'missing callable methods: {", ".join(missing_methods)}'
+    )
+
+
 def enable_forward_pre_hook(model_chunks):
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.enable_forward_pre_hook()
 
 
@@ -2874,15 +3043,15 @@ def disable_forward_pre_hook(model_chunks, optimizer=None, param_sync=True):
     if param_sync and optimizer is not None:
         optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
+def force_param_sync(model_chunks, optimizer=None) -> None:
     if optimizer is not None:
         optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.start_param_sync(force_sync=True)
 
 
@@ -2908,10 +3077,6 @@ def save_checkpoint_and_time(
     timers('interval-time').stop()
     energy_monitor.pause()
 
-    # Extra barrier is added to make sure all ranks report the max time.
-    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=True)
-
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
@@ -2922,12 +3087,9 @@ def save_checkpoint_and_time(
             model_chunk.free_overlap_buffers()
     torch.cuda.empty_cache()
 
-    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-
-    if should_report_memory:
-        # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
+    # timer.log() reports the min & max time. We do not need a barrier here.
+    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+    timers(timer_key, log_level=0).start(barrier=False)
 
     # Resolve checkpoint groups from this rank's module PGC; None for stock runs
     # falls back to the mpu groups inside save_checkpoint (byte-identical).
@@ -2935,10 +3097,18 @@ def save_checkpoint_and_time(
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
+    # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
+    dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
     rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+
+    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+
+    if should_report_memory:
+        # Track memory before checkpoint save.
+        report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
 
     # Save checkpoint.
     save_checkpoint(
@@ -2960,12 +3130,13 @@ def save_checkpoint_and_time(
     )
 
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
-    timers(timer_key).stop(barrier=True)
+    # Since timer.log() reports the min & max time, we do not need a barrier here.
+    timers(timer_key).stop(barrier=False)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
 
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})")
+        report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
     num_checkpoints_memory_reported += 1
 
     if args.fp8:
@@ -3209,14 +3380,14 @@ def train(
     non_loss_data_func,
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
-    schedule_pg_collection: optional per-module groups forwarded to the schedule for the
-        cross-grid case; None preserves the default behavior.
+    pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
+        preserves the default behavior.
     """
     args = get_args()
     timers = get_timers()
@@ -3290,17 +3461,22 @@ def train(
             args.no_load_optim = no_load_optim
 
     lang_pgc = (
-        schedule_pg_collection.get_language_model_collection()
-        if schedule_pg_collection is not None and schedule_pg_collection.has_language_model()
+        pg_collection.get_language_model_collection()
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection)
+        and pg_collection.has_language_model()
         else None
     )
 
     def _dp_world_size():
+        # Full DP x gtp_remat degree (num_microbatches spans the full data-distribution axis).
+        gtp_remat = args.gtp_weight_remat_size
         if lang_pgc is not None:
-            return lang_pgc.dp.size()
+            return lang_pgc.dp.size() * gtp_remat
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        return args.data_parallel_size
+        # args.data_parallel_size is the language (llm) dp on all ranks (set in validate_args) and
+        # excludes gtp_remat, so scale by gtp_remat to span the full data-distribution axis.
+        return args.data_parallel_size * gtp_remat
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
@@ -3397,7 +3573,9 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+    # Preserve a builder-installed finalize hook; only default it when unset.
+    if config.finalize_model_grads_func is None:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
@@ -3409,6 +3587,23 @@ def train(
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
         _run_gpu_sniff_test('before training')
+
+    # Initialize router trace if requested.  The tracer attaches forward hooks
+    # to all TopKRouter modules and writes one JSONL record per (iteration,
+    # layer).  advance_step() is called at the end of each train_step().
+    if getattr(args, 'moe_routing_trace_path', None):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        max_steps = getattr(args, 'moe_routing_trace_max_training_iters', None) or args.train_iters
+        init_moe_router_tracer(
+            output_dir=args.moe_routing_trace_path,
+            max_steps=max_steps,
+            rank=rank,
+            training_mode=True,
+            capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
+            capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
+            dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+        )
+        get_moe_router_tracer().register_hooks(model)
 
     report_memory_flag = True
     pre_hook_enabled = False
@@ -3445,7 +3640,7 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(
-        schedule_pg_collection=schedule_pg_collection
+        schedule_pg_collection=pg_collection
     )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
@@ -3688,8 +3883,8 @@ def train(
                 max_attention_logit,
             ) = train_step(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
-                pg_collection=model_pg_collection,
-                p2p_communicator=p2p_communicator, schedule_pg_collection=schedule_pg_collection
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
@@ -3874,7 +4069,9 @@ def train(
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, verbose=False, write_to_tensorboard=True,
-                                       non_loss_data_func=non_loss_data_func)
+                                       non_loss_data_func=non_loss_data_func,
+                                       pg_collection=pg_collection,
+                                       p2p_communicator=p2p_communicator)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
@@ -3918,6 +4115,13 @@ def train(
         )
         if should_exit:
             break
+
+    # Early-exit paths (exit-duration / exit-interval / signal handler) sys.exit()
+    # below before the normal-path logging, so record the train-loop finish time here.
+    if should_exit:
+        one_logger and one_logger.log_metrics(
+            {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
 
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
@@ -3966,6 +4170,9 @@ def train(
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
                     if getattr(buf, 'nccl_mem_pool', None) is not None:
                         nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
+        one_logger and one_logger.log_metrics(
+            {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
@@ -3987,6 +4194,8 @@ def evaluate(
     verbose=False,
     non_loss_data_func=None,
     eval_iters=None,
+    pg_collection=None,
+    p2p_communicator=None,
 ):
     """Evaluation."""
     args = get_args()
@@ -4008,8 +4217,17 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
-    eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
-    forward_backward_func = get_forward_backward_func()
+    # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
+    # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so include it in the
+    # global sample breadth we divide out to recover the microbatch count.
+    eval_num_microbatches = eval_batch_size // (
+        eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+    )
+    forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
+    eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
+    if eval_pgc is None:
+        eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -4027,7 +4245,7 @@ def evaluate(
             forward_backward_func,
         )
 
-    if has_nvidia_modelopt:
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
@@ -4063,6 +4281,8 @@ def evaluate(
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
@@ -4071,7 +4291,7 @@ def evaluate(
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if is_pp_last_stage(eval_pgc.pp) and loss_dicts:
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
@@ -4084,21 +4304,13 @@ def evaluate(
                             val = torch.vstack(val)
                             val = val[:, 0] / val[:, 1].clamp(min=1)
                             val = val.mean()
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            val /= torch.distributed.get_world_size(
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
+                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
+                            val /= torch.distributed.get_world_size(group=eval_pgc.dp_cp)
                             total_loss_dict[key][0] += val
                             total_loss_dict[key][1] += 1
                         else :
                             val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
+                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
                             total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
@@ -4135,6 +4347,8 @@ def evaluate(
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
             )
 
     # Move model back to the train mode.
@@ -4164,6 +4378,8 @@ def evaluate_and_print_results(
     verbose=False,
     write_to_tensorboard=True,
     non_loss_data_func=None,
+    pg_collection=None,
+    p2p_communicator=None,
 ):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
@@ -4220,6 +4436,8 @@ def evaluate_and_print_results(
             verbose,
             non_loss_data_func,
             eval_iters=iterations,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
         )
         # Timelimit hit during evaluation
         if timelimit:

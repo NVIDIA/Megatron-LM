@@ -934,7 +934,10 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        ],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -1008,8 +1011,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # TP + FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = tensor._local_tensor
 
@@ -1022,10 +1028,54 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
+    # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
+    # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
+    # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8, is_gtp_param
+
+        if is_gtp_param(tensor):
+            gtp_rank = get_pg_rank(tensor.group)
+            gtp_remat_size = get_pg_size(tensor.group)
+            if tp_axis == 0:
+                # same axis as TP → one composite axis-0 offset
+                new_offsets[0] = (
+                    prepend_axis_num,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    tp_size * gtp_remat_size,
+                )
+            else:
+                # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas).
+            dp_replica_id = parallel_state.get_data_parallel_rank(
+                with_context_parallel=True, with_gtp_remat=False
+            )
+            # Saved global is the padded shape when GTP padded out_features for alignment.
+            if getattr(tensor, "pad_length", 0):
+                kwargs.setdefault("allow_shape_mismatch", True)
+            # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
+            # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
+            # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
+            # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
+            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
+            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            if is_float8tensor(tensor):
+                fp8_param = tensor
+                tensor = dequantize_gtp_native_fp8(tensor)
+                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
+                # to model entries by id(entry.data), which this dequantized copy would break
+                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                tensor._gtp_dequant_src = fp8_param
+
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1034,6 +1084,11 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
@@ -1051,6 +1106,18 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
             - dp_cp_group: Data parallel + context parallel group
               (default: None, falls back to parallel_state)
     """
+    # Sanity guard.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+        assert not is_gtp_param(tensor), (
+            f"GTP weight-remat param '{key}' reached make_sharded_tensor_for_checkpoint (the "
+            "replicated path); route GTP-sharded weights through "
+            "make_tp_sharded_tensor_for_checkpoint or make_sharded_tensors_for_checkpoint instead."
+        )
+
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
@@ -1069,16 +1136,20 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     dp_size = get_pg_size(dp_cp_group)
     dp_replica_id = get_pg_rank(dp_cp_group)
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = get_full_tensor_if_necessary(tensor)
+        # Add FSDP sharding rank offsets.
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1087,10 +1158,19 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def get_full_tensor_if_necessary(tensor):
-    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    """
+    Captures an edge case where devices out-number elements in a DTensor,
+    for instance when generating a ShardedTensor. Replicate the DTensor
+    on all ranks to avoid empty DTensors on any rank.
+    """
     need_full_tensor = False
     for i in range(tensor.device_mesh.ndim):
         if (
@@ -2038,7 +2118,7 @@ def is_submodule(module, parent_module, strict=True):
 
 def get_batch_on_this_tp_rank(
     batch: dict[str, torch.Tensor],
-    is_sft: bool,
+    has_cu_seqlens: bool,
     is_hybrid_cp: bool,
     create_attention_mask_in_dataloader: bool,
     broadcast_src_rank: int,
@@ -2073,8 +2153,8 @@ def get_batch_on_this_tp_rank(
         batch (dict[str, torch.Tensor]): The batch dict. On TP rank 0 this
             contains the actual data; on other ranks it is ignored (receive
             buffers are allocated internally).
-        is_sft (bool): Whether this is an SFT (supervised fine-tuning) run
-            using THD packed sequences.
+        has_cu_seqlens (bool): Whether the batch contains cu_seqlens and
+            max_seqlen metadata (e.g., SFT or --dataloader-inter-document-masking).
         is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
         create_attention_mask_in_dataloader (bool): Whether the dataloader
             creates an explicit attention mask tensor.
@@ -2131,7 +2211,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['position_ids'])
-            if is_sft or is_hybrid_cp:
+            if has_cu_seqlens or is_hybrid_cp:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2147,7 +2227,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
-            if is_sft:
+            if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2161,7 +2241,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
-            if is_sft:
+            if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2169,8 +2249,8 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
-        elif is_sft:
-            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermediate stages
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             batch["tokens"] = None
             batch["labels"] = None
             batch["loss_mask"] = None
@@ -2202,8 +2282,10 @@ def get_batch_on_this_tp_rank(
         attention_mask = None
         local_cp_size = None
 
-        if is_sft or is_hybrid_cp:
-            max_seqlen = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
+        if has_cu_seqlens or is_hybrid_cp:
+            max_seqlen = torch.empty(
+                micro_batch_size, dtype=torch.int32, device=torch.cuda.current_device()
+            )
         if create_attention_mask_in_dataloader:
             attention_mask = torch.empty(
                 (micro_batch_size, 1, seq_length, seq_length),
@@ -2225,13 +2307,21 @@ def get_batch_on_this_tp_rank(
                 return None
 
             # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim
-            # throughout (mbs=1 for packed sequences). Allocate (1, n) so the
-            # shape on receiving ranks matches the (1, n) tensor TP rank 0 sent.
-            cu_seqlens = torch.empty((1, n), dtype=torch.int32, device=dev)
+            # (micro_batch_size, padded_len) after default_collate. Preserve
+            # the 2-D layout so flatten_batch_for_packed_sequences can merge
+            # samples correctly when micro_batch_size > 1.
+            assert n % micro_batch_size == 0, (
+                f"cu_seqlens numel ({n}) is not divisible by "
+                f"micro_batch_size ({micro_batch_size})"
+            )
+            cu_seqlens = torch.empty(
+                (micro_batch_size, n // micro_batch_size), dtype=torch.int32, device=dev
+            )
             _broadcast(cu_seqlens)
-            assert (
-                cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-            ), f"Expected cu_seqlens shape (1, n), got {tuple(cu_seqlens.shape)}"
+            assert cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == micro_batch_size, (
+                f"Expected cu_seqlens shape ({micro_batch_size}, "
+                f"{n // micro_batch_size}), got {tuple(cu_seqlens.shape)}"
+            )
             assert (
                 cu_seqlens.dtype == torch.int32
             ), f"Expected cu_seqlens to be of type torch.int32, got {cu_seqlens.dtype}"
@@ -2242,7 +2332,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(position_ids)
-            if is_sft or is_hybrid_cp:
+            if has_cu_seqlens or is_hybrid_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2258,7 +2348,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(tokens)
             _broadcast(position_ids)
-            if is_sft:
+            if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2272,7 +2362,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(labels)
             _broadcast(loss_mask)
-            if is_sft:
+            if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2280,8 +2370,8 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
-        elif is_sft:
-            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermediate stages
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             tokens = None
             labels = None
             loss_mask = None
@@ -2524,50 +2614,55 @@ def get_batch_on_this_cp_rank(
     is_hybrid_cp: bool,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
+    use_per_sequence_balancing: bool = False,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
     Routes to the appropriate CP partitioning strategy based on the batch
     contents and parallelism mode:
+      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, or when
+        ``use_per_sequence_balancing`` is True, delegates to
+        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
       - **Per-document zigzag**: When ``cu_seqlens`` is present and
         ``is_hybrid_cp`` is False, delegates to
         ``_get_batch_on_this_cp_rank_per_document_balancing``.
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
         and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
-      - **Per-sequence zigzag**: When ``cu_seqlens`` is None, delegates to
-        ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
             'cu_seqlens' key (may be None for pretraining).
         is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
         cp_group (Optional[torch.distributed.ProcessGroup]): Context-parallel
-            process group used for SFT and pretraining CP partitioning.
+            process group used for CP partitioning.
         hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
             Factory function that returns a hybrid CP process group for a given
             ``group_size``. Required when ``is_hybrid_cp`` is True.
+        use_per_sequence_balancing (bool): When True, use per-sequence zigzag
+            even when ``cu_seqlens`` is present (e.g., for inter-document
+            masking where document lengths are not divisible by
+            ``2 * cp_size``).
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
 
-    if batch.get("cu_seqlens") is not None:  # NOTE(asolergi-nv): SFT & HybridCP case
-        if is_hybrid_cp:
-            assert (
-                batch['local_cp_size'] is not None
-            ), "local_cp_size is required for hybrid context parallel"
-            if batch['local_cp_size'].item() > 1:
-                hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
-                    batch, cp_group=hybrid_cp_group
-                )
-                batch["hybrid_cp_group"] = hybrid_cp_group
-        else:
-            batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
-    else:  # NOTE(asolergi-nv): Pretrain case
+    if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
+    elif is_hybrid_cp:
+        assert (
+            batch['local_cp_size'] is not None
+        ), "local_cp_size is required for hybrid context parallel"
+        if batch['local_cp_size'].item() > 1:
+            hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
+            batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
+                batch, cp_group=hybrid_cp_group
+            )
+            batch["hybrid_cp_group"] = hybrid_cp_group
+    else:
+        batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
     return batch
 
 

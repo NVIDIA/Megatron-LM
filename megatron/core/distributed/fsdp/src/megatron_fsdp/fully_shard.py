@@ -105,6 +105,7 @@ def fully_shard_model(
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -277,6 +278,13 @@ def fully_shard_model(
             creating a casted-copy of the gradient shard that cannot be dereferenced due
             to replay. Defaults to False.
 
+        maxpool_double_buffer (bool):
+            Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+            FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+            parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+            user buffer registration and CUDA graph replay for models with asymmetrical
+            FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
     """
@@ -373,6 +381,7 @@ def fully_shard_model(
         disable_symmetric_registration=disable_symmetric_registration,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
         megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
+        megatron_fsdp_max_pool_double_buffer=maxpool_double_buffer,
     )
 
     # Create FSDPDistributedIndex.
@@ -680,6 +689,7 @@ def fully_shard(
     enable_fine_grained_param_gather: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -731,6 +741,7 @@ def fully_shard(
         disable_symmetric_registration=disable_symmetric_registration,
         use_decoupled_grad=use_decoupled_grad,
         cuda_graph_mode=cuda_graph_mode,
+        maxpool_double_buffer=maxpool_double_buffer,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.
