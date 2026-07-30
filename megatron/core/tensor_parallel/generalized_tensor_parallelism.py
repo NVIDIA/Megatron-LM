@@ -36,6 +36,7 @@ from typing import Dict, List, Optional
 import torch
 from packaging.version import Version
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.gtp_symm import (
     _gtp_wgrad_pool,
     gtp_mem_pool_ctx,
@@ -390,9 +391,8 @@ class GTPRematConfig:
     # DDP's 1/replicate scaling to yield the full (replicate x gtp) mean.
     calculate_per_token_loss: bool = False
 
-    # Symmetric-memory registration: back the GTP / EGTP AG output cache, RS wgrad padded
-    # buffer, and (under --use-distributed-optimizer) the DDP param buffer with ncclMemAlloc
-    # pools registered on the GTP / EGTP group. Independent of --use-nccl-ub (DP group).
+    # Back the AG output cache, RS send buffers and (under distopt) the DDP param buffer with
+    # ncclMemAlloc pools registered on the GTP / EGTP group. Independent of --use-nccl-ub (DP).
     gtp_nccl_ub: bool = False
     egtp_nccl_ub: bool = False
     # Without distopt the slice-path shard keeps its own storage, so it goes to the symm pool.
@@ -421,26 +421,6 @@ def tag_gtp_params_with_names(model):
             param._debug_name = name
 
 
-def _gtp_remat_group_safe(is_expert: bool = False):
-    """Safe read of the active GTP/EGTP weight-remat group; ``None`` when GTP is off.
-
-    parallel_state's getters assert on an uninitialized group by default, and are split
-    dense/expert rather than taking ``is_expert``. This restores the tolerant lookup the
-    (now removed) ``megatron.core.utils.get_gtp_weight_remat_group`` wrapper provided, so
-    callers on the symm path can probe the group before MPU init without tripping the assert.
-    Local parallel_state import: it imports this module, so a module-level import is circular.
-    """
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-        return None
-    from megatron.core import parallel_state
-
-    if not parallel_state.is_initialized():
-        return None
-    if is_expert:
-        return parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
-    return parallel_state.get_gtp_weight_remat_group(check_initialized=False)
-
-
 def _initialize_gtp_symmetric_group(group):
     """Register a GTP/EGTP group's symmetric pool (idempotent; no-op for absent/trivial groups)."""
     if group is not None and group.size() > 1:
@@ -448,8 +428,14 @@ def _initialize_gtp_symmetric_group(group):
 
 
 def configure_gtp_remat_from_recipe(
-    *, fp4=False, fp8_recipe=None, fp8=False, calculate_per_token_loss=False,
-    gtp_nccl_ub=False, egtp_nccl_ub=False, use_distributed_optimizer=False,
+    *,
+    fp4=False,
+    fp8_recipe=None,
+    fp8=False,
+    calculate_per_token_loss=False,
+    gtp_nccl_ub=False,
+    egtp_nccl_ub=False,
+    use_distributed_optimizer=False,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction + symm mem) from the training recipe.
@@ -459,8 +445,10 @@ def configure_gtp_remat_from_recipe(
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
     # param-state debug asserts, so keep them off for GTP runs.
     update_gtp_config(
-        calculate_per_token_loss=calculate_per_token_loss, check_param_states=False,
-        gtp_nccl_ub=gtp_nccl_ub, egtp_nccl_ub=egtp_nccl_ub,
+        calculate_per_token_loss=calculate_per_token_loss,
+        check_param_states=False,
+        gtp_nccl_ub=gtp_nccl_ub,
+        egtp_nccl_ub=egtp_nccl_ub,
         use_distributed_optimizer=use_distributed_optimizer,
     )
     if fp4:
@@ -472,10 +460,14 @@ def configure_gtp_remat_from_recipe(
 
     # Register the dense-GTP and EGTP pools centrally (pre-construction, before any forward),
     # so all modules -- including TE pre-sharded ones -- share the registered per-group pools.
-    if gtp_nccl_ub:
-        _initialize_gtp_symmetric_group(_gtp_remat_group_safe())
-    if egtp_nccl_ub:
-        _initialize_gtp_symmetric_group(_gtp_remat_group_safe(is_expert=True))
+    if gtp_nccl_ub or egtp_nccl_ub:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat", "expt_gtp_remat"]
+        )
+        if gtp_nccl_ub:
+            _initialize_gtp_symmetric_group(pg_collection.gtp_remat)
+        if egtp_nccl_ub:
+            _initialize_gtp_symmetric_group(pg_collection.expt_gtp_remat)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
@@ -551,9 +543,8 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
 
     shard_size = tensor.shape[0] // gtp_remat_size
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
-    # No distopt: the shard keeps this storage -> put it in the symm pool for a symmetric AG input.
-    # With distopt it's flattened into param_data (which carries symmetry) -> skip, so we don't pay
-    # an extra window-register collective (expensive at scale) for a buffer that gets freed.
+    # No distopt: the shard keeps this storage, so it must be the symm AG input. With distopt it
+    # is flattened into param_data (which carries symmetry) and then freed -- skip the register.
     if is_gtp_pool_registered(gtp_remat_group) and not GTP_CONFIG.use_distributed_optimizer:
         with gtp_mem_pool_ctx(gtp_remat_group):
             gtp_shard = GTPShardedParam(shard.clone())
@@ -587,12 +578,16 @@ def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_id
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+
     # gtp_smr: use per-group ncclMemAlloc pool for AG/RS buffers.
     # param_needs_nccl_mem: signal DDP to allocate param_data from ncclMemAlloc (AG input).
-    # Expert vs dense by group identity: is_grouped misses non-grouped (SequentialMLP) experts.
-    # Local import: parallel_state imports this module, so a module-level import would be circular.
-    _is_expert_group = gtp_remat_group is _gtp_remat_group_safe(is_expert=True)
-    _is_smr_enabled = GTP_CONFIG.egtp_nccl_ub if _is_expert_group else GTP_CONFIG.gtp_nccl_ub
+    # Expert vs dense by group identity check
+    _expert_group = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=["expt_gtp_remat"]
+    ).expt_gtp_remat
+    _is_smr_enabled = (
+        GTP_CONFIG.egtp_nccl_ub if gtp_remat_group is _expert_group else GTP_CONFIG.gtp_nccl_ub
+    )
     gtp_shard.gtp_smr = _is_smr_enabled
     gtp_shard.param_needs_nccl_mem = _is_smr_enabled
     global _GTP_PARAMS
@@ -1639,13 +1634,11 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 w._set_rs_state(new_rs_state)
 
-        # Symm-RS: if the bwd GEMM wrote into the registered padded send buffer
-        # (confirmed via storage aliasing), send it directly — F.pad would produce
-        # an unregistered copy. Non-symm or aliasing-miss falls back to F.pad.
+        # Symm-RS: if the bwd GEMM wrote into the registered padded send buffer (confirmed by
+        # storage aliasing), send it directly -- F.pad would make an unregistered copy.
         use_persistent_wgrad = self.pad_length > 0 and all(
             getattr(w, "_wgrad_padded_buf", None) is not None
-            and w._wgrad_padded_buf.untyped_storage().data_ptr()
-            == g.untyped_storage().data_ptr()
+            and w._wgrad_padded_buf.untyped_storage().data_ptr() == g.untyped_storage().data_ptr()
             for w, g in zip(self._weights, wgrads)
         )
         if use_persistent_wgrad:
@@ -1914,9 +1907,9 @@ class GTPWeightCache:
         else:
             out_shape = param._unsharded_shape_padded
 
-        # Only the AG output needs the symmetric window (store-multicast); the RS output is a local
-        # write -> _graphed_alloc. is_gtp_pool_registered gates the symm pool (gtp_smr implies it;
-        # explicit keeps the custom/unregistered-group path correct and mirrors the TE alloc guard).
+        # Only the AG output needs the symmetric window (store-multicast); the RS output is a
+        # local write -> _graphed_alloc. The registered check keeps custom/unregistered groups
+        # (e.g. in tests) on the plain path.
         symm = getattr(param, 'gtp_smr', False) and not reduce_scatter
         group = getattr(param, "group", None)
         if symm and is_gtp_pool_registered(group):

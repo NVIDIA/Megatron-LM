@@ -2,39 +2,31 @@
 #
 # See LICENSE for license information.
 
-"""GTP symmetric-memory pools (Layer 1: the shared registration primitive).
+"""GTP symmetric-memory pools: the shared registration primitive.
 
-One ``ncclMemAlloc``-backed ``torch.cuda.MemPool`` per GTP process group,
-registered once with ``backend.register_mem_pool(pool, symm=True)``. PyTorch's
-ProcessGroupNCCL segment hook then auto-registers every subsequent allocation
-made under ``gtp_mem_pool_ctx(group)`` via
-``ncclCommWindowRegister(..., NCCL_WIN_COLL_SYMMETRIC)``. With both ends of a
-collective in such a pool on the same group's comm, NCCL selects its symmetric /
-NVLS kernels.
+One ``ncclMemAlloc``-backed ``torch.cuda.MemPool`` per GTP process group, registered once
+via ``backend.register_mem_pool(pool, symm=True)``. PyTorch's ProcessGroupNCCL segment hook
+then auto-registers every later allocation made under ``gtp_mem_pool_ctx(group)``. With both
+ends of a collective in such a pool on the same comm, NCCL selects its symmetric/NVLS kernels.
 
-This module owns *only* the pool + registration concern. Higher layers ride on
-``gtp_mem_pool_ctx``:
-  - persistent ticket cache (``GTPWeightCache``) -> AG output buffers,
-  - a transient LIFO cache -> RS send buffers.
+This module owns only the pool + registration concern. Consumers ride on ``gtp_mem_pool_ctx``:
+``GTPWeightCache`` for AG output buffers, ``RegisteredLifoPool`` for RS send buffers, and
+``register_ddp_buffers_on_gtp_groups`` for the DDP param buffer (the AG input).
 
-A single gate per param class (dense vs expert) controls symmetric memory; it is
-not split by collective (AG and RS share the gate). The gate is set by the
-``--gtp-nccl-ub`` (dense) / ``--egtp-nccl-ub`` (expert) flags, which populate
-``GTPRematConfig.gtp_nccl_ub`` / ``.egtp_nccl_ub`` and are stamped per-param at
-wrap time as ``gtp_smr`` (use this GTP per-group pool) and, under the distributed
-optimizer, ``param_needs_nccl_mem`` (back the DDP param buffer with ncclMemAlloc
-so it can be registered on the GTP group).
+Which params participate is decided at wrap time from ``--gtp-nccl-ub`` (dense) /
+``--egtp-nccl-ub`` (expert) -- independent of ``--use-nccl-ub``, which covers the DP group --
+and stamped by ``_gtp_attach_attrs`` as ``gtp_smr`` (use this GTP pool) and
+``param_needs_nccl_mem`` (back the DDP param buffer with ncclMemAlloc). Sites read both via
+getattr; there is no module-level env gate here.
 
-NCCL env this needs (launcher concern, not set here):
-  NCCL_NVLS_ENABLE=1, TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=0
-(both before init_process_group). The DDP param buffer (the GTP all-gather input) is
-registered on the GTP group by ``register_gtp_buffers_symm`` whenever a param has
-``param_needs_nccl_mem`` set -- independent of ``--use-nccl-ub``.
+Launcher must export ``NCCL_NVLS_ENABLE=1`` and
+``TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=0`` before ``init_process_group``.
 """
 
 import logging
 import math
 from collections import defaultdict
+from contextlib import AbstractContextManager
 
 import torch
 import torch.distributed as dist
@@ -43,13 +35,6 @@ import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
-
-# Whether a param uses GTP symmetric memory is decided per-param at wrap time and
-# stamped on the GTPShardedParam (see generalized_tensor_parallelism.wrap_module_params_gtp,
-# driven by GTPRematConfig.gtp_nccl_ub / .egtp_nccl_ub): ``gtp_smr`` for this GTP
-# per-group pool, and ``param_needs_nccl_mem`` for the core DDP param-buffer pool.
-# Sites read those via getattr -- no module-level env gate here.
-
 
 # group.group_name -> per-group MemPool (one pool per group, registered once).
 _pools: "dict[str, torch.cuda.MemPool]" = {}
@@ -61,7 +46,7 @@ _registered: "dict[str, object]" = {}
 _warmed_groups: "set[str]" = set()
 
 
-def get_gtp_pool(group) -> "torch.cuda.MemPool":
+def get_gtp_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     """Return the per-group ``ncclMemAlloc``-backed MemPool, creating it once."""
     name = group.group_name
     pool = _pools.get(name)
@@ -72,7 +57,7 @@ def get_gtp_pool(group) -> "torch.cuda.MemPool":
     return pool
 
 
-def _warmup_group_comm(group) -> None:
+def _warmup_group_comm(group: dist.ProcessGroup) -> None:
     """Force lazy NCCL comm creation for ``group`` once, so a subsequent register_mem_pool
     sees an initialized communicator. Idempotent across all GTP register paths."""
     if group.group_name in _warmed_groups:
@@ -82,7 +67,7 @@ def _warmup_group_comm(group) -> None:
     _warmed_groups.add(group.group_name)
 
 
-def register_gtp_pool(group) -> "torch.cuda.MemPool":
+def register_gtp_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     """Create (if needed) and register the per-group pool on ``group``. Idempotent.
 
     Call once at model-construction time (before any CUDA-graph capture or
@@ -105,7 +90,7 @@ def register_gtp_pool(group) -> "torch.cuda.MemPool":
     return pool
 
 
-def gtp_mem_pool_ctx(group):
+def gtp_mem_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
     """Context manager: allocations inside land in ``group``'s registered pool.
 
     Pure ``use_mem_pool`` -- no collective -- so it is safe inside CUDA-graph
@@ -115,7 +100,7 @@ def gtp_mem_pool_ctx(group):
     return torch.cuda.use_mem_pool(get_gtp_pool(group))
 
 
-def is_gtp_pool_registered(group) -> bool:
+def is_gtp_pool_registered(group: dist.ProcessGroup | None) -> bool:
     """True once ``register_gtp_pool`` has registered this group's symmetric pool.
 
     Full "use the symm pool for this group?" predicate: also rejects None and trivial
@@ -125,33 +110,34 @@ def is_gtp_pool_registered(group) -> bool:
 
 
 class RegisteredLifoPool:
-    """Group-aware LIFO cache of buffers in the per-group symmetric pool.
+    """Group-aware LIFO cache of reduce-scatter send buffers in the per-group symmetric pool.
 
-    Layer 2b of the symm stack: a transient pool for reduce-scatter *send*
-    buffers (the full-shape wgrad the bwd GEMM writes, then scatters). Fresh
-    allocations go through ``gtp_mem_pool_ctx`` so they are window-registered;
-    freed buffers are recycled (keyed by numel + dtype + group), which keeps
-    memory flat instead of one persistent buffer per weight.
+    Holds the full-shape wgrad the bwd GEMM writes and then scatters. Fresh allocations go
+    through ``gtp_mem_pool_ctx`` so they are window-registered; freed buffers are recycled
+    (keyed by numel + dtype + group), keeping memory flat rather than one buffer per weight.
+    Storage is 1-D so one key serves any shape with that numel, and ``alloc`` returns a view
+    tagged with ``_gtp_symm_group`` for recycling.
 
-    **No ``max_live`` constant.** The steady-state RS concurrency is reached
-    organically during the eager warmup iterations (which run the same RS
-    overlap as the captured steps): each ``alloc`` beyond the free-list does a
-    fresh symm-pool allocation, ``free`` returns it, so by capture time the
-    free-list already holds exactly the peak number of registered buffers.
-    During capture ``alloc`` therefore only ever pops. The single failure mode
-    -- a fresh allocation *during* capture (which would be illegal and would
-    re-register the pool mid-graph) -- is turned into a clear error via
-    ``torch.cuda.is_current_stream_capturing()``, with no magic number to tune.
-
-    Storage is 1-D so one key serves any shape with that numel; ``alloc``
-    returns a view tagged with ``_gtp_symm_group`` for tag-based recycling.
+    The free-list grows to peak RS concurrency during the eager warmup iterations, so under
+    CUDA-graph capture ``alloc`` only ever pops. A fresh allocation during capture would
+    re-register the pool mid-graph, so it raises instead.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         # (numel, dtype, group_name) -> list of free 1-D buffers.
         self._free: "dict[tuple, list]" = defaultdict(list)
 
-    def alloc(self, shape, dtype, device, group) -> "torch.Tensor":
+    def alloc(
+        self,
+        shape: torch.Size | tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor:
+        """Return a buffer of ``shape`` from ``group``'s free-list, allocating one if empty.
+
+        Raises RuntimeError if a fresh allocation would be needed during CUDA-graph capture.
+        """
         numel = int(math.prod(shape))
         bucket = self._free[(numel, dtype, group.group_name)]
         if bucket:
@@ -175,41 +161,44 @@ class RegisteredLifoPool:
         out._gtp_symm_group = group  # tag so callers can recycle via tag dispatch
         return out
 
-    def free(self, buf: "torch.Tensor") -> None:
+    def free(self, buf: torch.Tensor) -> None:
+        """Return ``buf`` to the free-list of the group it was allocated from.
+
+        No-op for a buffer this pool did not allocate (no ``_gtp_symm_group`` tag).
+        """
         group = getattr(buf, "_gtp_symm_group", None)
         if group is None:
             return
         self._free[(buf.numel(), buf.dtype, group.group_name)].append(buf.reshape(-1))
 
     def clear(self) -> None:
+        """Drop every cached buffer. Called at teardown, before the pools they alias go away."""
         self._free.clear()
 
 
-# LIFO of symm RS send buffers, imported by generalized_tensor_parallelism. Grows organically
-# during eager warmup to steady-state RS concurrency; capture-safe (alloc inside a graph raises
-# clearly). Lives here so deregister_gtp_pools can drop its buffers at teardown.
+# Imported by generalized_tensor_parallelism. Lives here so deregister_gtp_pools can drop its
+# buffers at teardown, alongside the pools they alias.
 _gtp_wgrad_pool = RegisteredLifoPool()
 
 
-def _ddp_buffers(ddp_module):
+def _ddp_buffers(ddp_module: torch.nn.Module) -> list:
     """All param/grad buffers of a DDP-wrapped module (dense + expert-parallel)."""
     return list(getattr(ddp_module, "buffers", [])) + list(
         getattr(ddp_module, "expert_parallel_buffers", [])
     )
 
 
-def _buffer_symm_groups(buf):
-    """Distinct GTP comm groups (sorted by name) this buffer's pool must be
-    (de)registered on: params with ``param_needs_nccl_mem`` set and group size > 1.
-    Shared by register/deregister so they stay symmetric. Sorted order is load-bearing:
-    the collective (de)register order must match across ranks to avoid a cross-group
-    NCCL deadlock.
+def _buffer_symm_groups(buf) -> list[dist.ProcessGroup]:
+    """GTP comm groups this buffer's pool must be (de)registered on: params with
+    ``param_needs_nccl_mem`` set and group size > 1.
+
+    Shared by register and deregister so the two stay in step. Sorted by name because the
+    collective (de)register order must match across ranks or the comms cross-deadlock.
     """
     if getattr(buf, "nccl_mem_pool", None) is None:
         return []
-    # Register on a GTP group only when the buffer has a param_data all-gather input (the GTP AG's
-    # source). Without one (no distopt) the pool backs grad_data only, so registering it there is
-    # pointless (the GTP AG never uses it) and needless registration is risky.
+    # Needs a param_data all-gather input: without distopt the pool backs only grad_data, which
+    # the GTP AG never reads, so registering it would cost a window for nothing.
     if getattr(buf, "param_data", None) is None:
         return []
     groups = {}
@@ -222,27 +211,30 @@ def _buffer_symm_groups(buf):
     return [group for _, group in sorted(groups.items())]
 
 
-def register_ddp_buffers_on_gtp_groups(ddp_module: "torch.nn.Module", symmetric: bool = True) -> None:
+def register_ddp_buffers_on_gtp_groups(ddp_module: torch.nn.Module) -> None:
     """Register each DDP buffer's NCCL pool on the GTP group(s) its params opted into
     via ``param_needs_nccl_mem``, so the DDP param buffer (the AG input) is in the
     symmetric window. The GTP-owned cache/RS pool (AG/RS output) is registered separately
     by ``configure_gtp_remat_from_recipe`` before construction. Call once per model chunk
     *after* DDP construction (buffers/pools must exist).
+
+    Always symmetric: ``--disable-symmetric-registration`` scopes to the DP-group
+    registration, not the GTP groups, which are opted into by --gtp-nccl-ub/--egtp-nccl-ub.
     """
     for buf in _ddp_buffers(ddp_module):
         for group in _buffer_symm_groups(buf):
             # buf.nccl_mem_pool is non-None here (checked in _buffer_symm_groups).
             _warmup_group_comm(group)
-            nccl_allocator.register_mem_pool(buf.nccl_mem_pool, group, symmetric=symmetric)
+            nccl_allocator.register_mem_pool(buf.nccl_mem_pool, group, symmetric=True)
             log_single_rank(
                 logger,
                 logging.INFO,
                 f"[MCORE][GTP] Registered DDP param/grad pool on GTP group "
-                f"{group.group_name} (size={group.size()}, symmetric={symmetric})",
+                f"{group.group_name} (size={group.size()})",
             )
 
 
-def deregister_ddp_buffers_from_gtp_groups(ddp_module: "torch.nn.Module") -> None:
+def deregister_ddp_buffers_from_gtp_groups(ddp_module: torch.nn.Module) -> None:
     """Mirror of ``register_ddp_buffers_on_gtp_groups``: deregister each buffer's pool from
     the same GTP group set. Call at graceful exit *before* the ProcessGroupNCCL destructor
     -- window-registered handles left on a comm make its ncclCommDeregister abort
