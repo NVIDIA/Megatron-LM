@@ -369,6 +369,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
 
+        # Per-layer measured profiler. Created only when enabled (zero overhead
+        # otherwise); hooks are installed lazily per logged step by start_step.
+        from megatron.core.transformer.per_layer_profiling import PerLayerProfiler
+
+        self.per_layer_profiler = PerLayerProfiler(
+            enabled=getattr(self.config, "log_per_layer_profiling", False)
+        )
+        for local_idx, layer in enumerate(self.layers):
+            self.per_layer_profiler.register_layer(layer, local_idx)
+
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
@@ -591,6 +601,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        # Per-layer profiling: mark the block input as the innermost backward
+        # boundary (layer_idx = -1). The first layer's backward exits here (not
+        # at any layer's output marker), so this marker is what closes layer 0's
+        # interval -- without it, layer 0 (and single-layer stages) go untimed.
+        plp = getattr(self, "per_layer_profiler", None)
+        if plp is not None and plp.attached and isinstance(hidden_states, torch.Tensor):
+            from megatron.core.transformer.per_layer_profiling import mark_layer_boundary
+
+            hidden_states = mark_layer_boundary(hidden_states, -1, plp)
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
