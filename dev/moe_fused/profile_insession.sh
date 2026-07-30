@@ -33,12 +33,14 @@ nsys --version
 
 QWEN_MODEL_ARGS="--model-provider gpt --num-layers 48 --hidden-size 2048 --ffn-hidden-size 6144 --num-attention-heads 32 --group-query-attention --num-query-groups 4 --kv-channels 128 --num-experts 128 --moe-router-topk 8 --moe-ffn-hidden-size 768 --moe-grouped-gemm --moe-router-dtype fp32 --moe-router-pre-softmax --moe-token-dispatcher-type alltoall --swiglu --normalization RMSNorm --norm-epsilon 1e-6 --position-embedding-type rope --rotary-base 1000000 --qk-layernorm --disable-bias-linear --untie-embeddings-and-output-weights --no-gradient-accumulation-fusion --make-vocab-size-divisible-by 1187 --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --expert-model-parallel-size 4 --expert-tensor-parallel-size 1 --inference-moe-token-dispatcher-type nvls --inference-grouped-gemm-backend vllm"
 
-# Launch server UNDER nsys. --cuda-graph-trace=node traces kernels inside the
-# full_iteration_inference CUDA graph. trace=cuda,nvtx only (no osrt) to bound size.
+# Launch server UNDER nsys. CG_TRACE=node traces each kernel inside the
+# full_iteration_inference graph, which costs per-node overhead on ~1800 kernels
+# per step and inflates the replay; CG_TRACE=graph records one range per replay,
+# so step period and GPU-busy stay faithful. trace=cuda,nvtx only to bound size.
 nsys profile \
   --trace=cuda,nvtx \
   --sample=none --cpuctxsw=none \
-  --cuda-graph-trace=node \
+  --cuda-graph-trace="${CG_TRACE:-node}" \
   --force-overwrite=true \
   -o "$PROF_BASE" \
   $PYBIN -m torch.distributed.run --nproc-per-node 4 --log-dir "$RUN_DIR/torchrun_logs" \
@@ -96,6 +98,13 @@ echo "===== stopping nsys ====="
 kill -INT $NSYS_PID 2>/dev/null || true
 wait $NSYS_PID 2>/dev/null || true
 ls -la "$RUN_DIR"/mcore_profile.* || true
+if [[ "${SKIP_SQLITE:-0}" == "1" ]]; then
+  # Arms that only need the reported throughput (e.g. measuring nsys' own cost)
+  # skip the export: at OSL1024 with node tracing it is ~1.5 GB and several minutes.
+  echo "===== skipping sqlite export (SKIP_SQLITE=1) ====="
+  echo "REP=$PROF_BASE.nsys-rep"
+  exit 0
+fi
 echo "===== exporting sqlite ====="
 nsys export --type sqlite --force-overwrite=true --output "$PROF_BASE.sqlite" "$PROF_BASE.nsys-rep"
 ls -la "$PROF_BASE.sqlite"

@@ -296,6 +296,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         _install_host_timing()
 
+        # GPU-side step accounting: times the transformer-block CUDA graph with
+        # CUDA events and records per-rank step-entry timestamps for EP skew.
+        # Env-gated (``MCORE_INFER_STEP_GPU_TIMING``); no-op by default.
+        from megatron.core.inference.step_gpu_timing import install as _install_step_gpu_timing
+
+        _install_step_gpu_timing()
+
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
             inference_config.materialize_only_last_token_logits
