@@ -1689,10 +1689,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.request_kv_block_counts[active_slice] = 1
         context.token_to_input_ids[active_slice] = torch.tensor([80, 81])
 
-        # Leave room in paused storage but no capacity to keep both requests active.
-        context.kv_block_allocator.active_count = context.kv_block_allocator.get_active_used()
-        context.kv_block_allocator.paused_count = 2
-        context.kv_block_allocator.total_avail = 0
+        # Retain one paused request, but exhaust shared-pool capacity with real allocations.
+        alloc = context.kv_block_allocator
+        alloc.paused_limit = 1
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
 
         sampled_tokens = torch.tensor([90, 91], dtype=torch.int64)
         controller._async_sched_logits = AsyncScheduleLogitsState(
@@ -1736,6 +1739,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         controller._run_async_sched_forward.assert_called_once_with(
             forward_input_ids, forward_position_ids
         )
+        alloc.release_memory_blocks(filler_blocks)
 
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)

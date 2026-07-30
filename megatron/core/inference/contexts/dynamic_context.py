@@ -2368,10 +2368,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._cpu_mha_cu_kv_seq_lengths[real_bs]
             )
 
-        # Block table: [0:real_bs] real, [real_bs:padded_bs] = -1 sentinel.
+        # Block table: [0:real_bs] real, [real_bs:padded_bs] = dummy block.
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
-            self._cpu_mha_block_table[real_bs:padded_bs] = -1
+            self._cpu_mha_block_table[real_bs:padded_bs] = self.kv_block_allocator.dummy_block_idx
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
@@ -3676,7 +3676,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Return whether requests can be prepared without lifecycle changes.
 
         Returns:
-            bool: Whether all requests are active decode requests and the active
+            bool: Whether all requests are active decode requests and the shared
                 KV-block pool can satisfy the exact next-step allocation demand.
         """
         if self.num_prefill_requests != 0 or self.paused_request_count != 0:
@@ -3684,7 +3684,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         rows_requiring_new_block = self._get_async_sched_rows_requiring_new_block()
         num_new_blocks = int(rows_requiring_new_block.sum().item())
-        return num_new_blocks <= self.kv_block_allocator.get_active_avail()
+        return num_new_blocks <= self.kv_block_allocator.get_allocatable_count()
 
     def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.

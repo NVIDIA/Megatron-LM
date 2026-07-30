@@ -1131,7 +1131,7 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(8)
     @pytest.mark.parametrize(
-        "num_speculative_tokens, last_block_offsets, active_avail, expected",
+        "num_speculative_tokens, last_block_offsets, allocatable_count, expected",
         [
             (0, [0, 1], 0, True),
             (0, [3, 1], 0, False),
@@ -1141,14 +1141,14 @@ class TestDynamicContext:
         ],
     )
     def test_async_sched_can_prepare_requests_exact_block_demand(
-        self, num_speculative_tokens, last_block_offsets, active_avail, expected
+        self, num_speculative_tokens, last_block_offsets, allocatable_count, expected
     ):
         """Overlap capacity counts only requests crossing a block boundary."""
         ctx = self._get_async_sched_context(num_speculative_tokens=num_speculative_tokens)
         self._setup_async_sched_decode_rows(
             ctx, active_request_count=len(last_block_offsets), last_block_offsets=last_block_offsets
         )
-        ctx.kv_block_allocator.get_active_avail = mock.Mock(return_value=active_avail)
+        ctx.kv_block_allocator.get_allocatable_count = mock.Mock(return_value=allocatable_count)
 
         assert ctx.can_prepare_requests() is expected
 
@@ -1174,9 +1174,12 @@ class TestDynamicContext:
         self._setup_async_sched_decode_rows(
             ctx, active_request_count=2, last_block_offsets=[ctx.block_size_tokens - 1, 0]
         )
-        ctx.kv_block_allocator.active_count = ctx.kv_block_allocator.get_active_used()
-        ctx.kv_block_allocator.total_avail = 0
-        ctx.kv_block_allocator.paused_count = 100
+        alloc = ctx.kv_block_allocator
+        alloc.paused_limit = 1
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
 
         assert not ctx.can_prepare_requests()
 
@@ -1187,11 +1190,13 @@ class TestDynamicContext:
         assert ctx.paused_request_count == 1
         assert not ctx.can_prepare_requests()
 
-        ctx.kv_block_allocator.total_avail = 1
+        alloc.release_memory_blocks(filler_blocks[:1])
+        assert alloc.get_allocatable_count() == 1
         ctx.update_requests(active_requests_mask=torch.tensor([0]), new_tokens=torch.tensor([92]))
 
         assert ctx.paused_request_count == 0
         assert ctx.can_prepare_requests()
+        alloc.release_memory_blocks(filler_blocks[1:])
 
     @pytest.mark.internal
     @rounder_override(8)
