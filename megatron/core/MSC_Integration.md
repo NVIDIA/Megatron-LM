@@ -1,18 +1,18 @@
 # Multi-Storage Client (MSC) Integration
 
-The [Multi-Storage Client](https://github.com/NVIDIA/multi-storage-client) (MSC) provides a unified interface for reading datasets and storing checkpoints from both filesystems (e.g., local disk, NFS, Lustre) and object storage providers such as S3, GCS, OCI, Azure, AIStore, and SwiftStack.
+The [Multi-Storage Client](https://github.com/NVIDIA/multi-storage-client) (MSC) provides a unified interface for reading datasets and storing checkpoints from both filesystems (such as local disk, NFS, and Lustre) and object storage providers such as S3, Google Cloud Storage (GCS), Oracle Cloud Infrastructure (OCI), Azure, AIStore, and SwiftStack.
 
-This guide will walk you through how to:
+This guide covers:
 
-1. How to install and configure MSC
-2. How to train models directly using datasets in object storage
-3. How to save and load model checkpoints to/from object storage
+1. Installing and configuring MSC
+2. Training models directly from datasets in object storage
+3. Saving and loading model checkpoints to and from object storage
 
 ## Installation
 
-MSC is vended as `the multi-storage-client` package on PyPI.
+Install MSC from PyPI as the `multi-storage-client` package.
 
-The base [client](https://nvidia.github.io/multi-storage-client/user_guide/concepts.html#term-client) supports POSIX file systems by default, but there are extras for each storage service which provide the necessary package dependencies for its corresponding storage provider.
+The base [client](https://nvidia.github.io/multi-storage-client/user_guide/concepts.html#term-client) supports POSIX file systems by default. Install an extra for each storage service to pull in the required dependencies for that provider.
 
 ```bash
 # POSIX file systems.
@@ -27,7 +27,7 @@ pip install "multi-storage-client[google-cloud-storage]"
 
 ## Configuration File
 
-MSC uses a YAML configuration file to define how it connects to object storage systems. This design allows you to specify one or more storage profiles, each representing a different storage backend or bucket. MSC keeps your training scripts clean and portable by centralizing details in a config file. There is no need to hardcode access keys, bucket names, or other provider-specific options directly into your code.
+MSC uses a YAML configuration file to define how it connects to object storage systems. Each profile represents a different storage backend or bucket, keeping access keys, bucket names, and provider-specific options out of your training scripts.
 
 Here's an example configuration:
 
@@ -68,9 +68,9 @@ msc://<profile-name>/<path/to/object>
 
 **Components:**
 
-* `msc://` This is the scheme identifier indicating the path should be interpreted by the Multi-Storage Client.
-* `<profile-name>` This corresponds to a named profile defined in your YAML configuration file under the profiles section. Each profile specifies the storage provider (e.g., S3, GCS), credentials, and storage-specific options such as the bucket name or base path.
-* `<path/to/object>` This is the logical path to the object or directory within the storage provider, relative to the base_path configured in the profile. It behaves similarly to a path in a local filesystem but maps to object keys or blobs in the underlying storage system.
+* `msc://`: The scheme identifier indicating the path should be interpreted by the Multi-Storage Client.
+* `<profile-name>`: A named profile defined in your YAML configuration file under the `profiles` section. Each profile specifies the storage provider (such as S3 or GCS), credentials, and storage-specific options such as the bucket name or base path.
+* `<path/to/object>`: The logical path to the object or directory within the storage provider, relative to the `base_path` configured in the profile. It behaves similarly to a path in a local filesystem but maps to object keys or blobs in the underlying storage system.
 
 **Example:**
 
@@ -91,16 +91,16 @@ The MSC URL:
 msc://my-profile/dataset/train/data.bin
 ```
 
-is interpreted as accessing the object with the key `dataset/train/data.bin` inside the S3 bucket named `my-bucket`. If this were a GCS or OCI profile instead, MSC would apply the appropriate backend logic based on the profile definition, but your code using the MSC URL would remain unchanged.
+resolves to the object key `dataset/train/data.bin` inside the S3 bucket `my-bucket`. If this were a GCS or OCI profile instead, MSC would apply the appropriate backend logic based on the profile definition, but your code using the MSC URL would remain unchanged.
 
-This abstraction allows training scripts to reference storage resources uniformly—whether they're hosted on AWS, GCP, Oracle, or Azure—just by switching profiles in the config file.
+This abstraction allows training scripts to reference storage resources uniformly—whether they are hosted on AWS, Google Cloud, Oracle, or Azure—just by switching profiles in the config file.
 
 
 ## Train from Object Storage
 
 To train with datasets stored in object storage, use an MSC URL with the `--data-path` argument. This URL references a dataset stored under a profile defined in your MSC configuration file.
 
-In addition, Megatron-LM requires the `--object-storage-cache-path` argument when reading from object storage. This path is used to cache the `.idx` index files associated with IndexedDataset, which are needed for efficient data access.
+In addition, Megatron-LM requires the `--object-storage-cache-path` argument when reading from object storage. Megatron uses this path to cache the `.idx` index files associated with `IndexedDataset` for efficient data access.
 
 ```bash
 python pretrain_gpt.py                                      \
@@ -110,7 +110,7 @@ python pretrain_gpt.py                                      \
     --no-mmap-bin-files
 ```
 
-**NOTE:** All four arguments must be provided when training with datasets in object storage using MSC.
+**Note:** All four arguments must be provided when training with datasets in object storage using MSC.
 
 ## Save and Load Checkpoints from Object Storage
 
@@ -123,7 +123,7 @@ python pretrain_gpt.py                \
   --save-interval 1000
 ```
 
-**Notes:** Only the `torch_dist` checkpoint format is currently supported when saving to or loading from MSC URLs.
+**Note:** MSC URLs currently support only the `torch_dist` checkpoint format for saving and loading.
 
 ## Enable MSC
 
@@ -133,19 +133,19 @@ MSC integration is opt-in: even when the `multi-storage-client` library is insta
 python pretrain_gpt.py --enable-msc
 ```
 
-> **Note:** When MSC is enabled, the dist-checkpointing loader uses `msc.torch.MultiStorageFileSystemReader` instead of `CachedMetadataFileSystemReader`. This means `ckpt_assume_constant_structure=True` (and any other path that requests `cache_metadata=True`) will be silently overridden — metadata is re-read on every load. A warning is emitted in this case.
+> **Note:** When MSC is enabled, the dist-checkpointing loader uses `msc.torch.MultiStorageFileSystemReader` instead of `CachedMetadataFileSystemReader`. This means MSC silently overrides `ckpt_assume_constant_structure=True` (and any other path that requests `cache_metadata=True`) and re-reads metadata on every load. MSC emits a warning when this occurs.
 
 ## Performance Considerations
 
-When using object storage with MSC, there are a few important performance implications to keep in mind:
+Object storage introduces performance trade-offs compared to local filesystems. When using object storage with MSC, there are a few important performance implications to keep in mind:
 
 **Reading Datasets**
 
 Reading training datasets directly from object storage is typically slower than reading from local disk. This is primarily due to:
-* High latency of object storage systems, especially for small and random read operations (e.g., reading samples from .bin files).
-* HTTP-based protocols used by object stores (e.g., S3 GET with range requests), which are slower than local filesystem I/O.
+* High latency of object storage systems, especially for small and random read operations (for example, reading samples from `.bin` files).
+* HTTP-based protocols used by object stores (for example, S3 GET with range requests), which are slower than local filesystem I/O.
 
-To compensate for this latency, it is recommended to increase the number of data loading workers using the `--num-workers` argument in your training command:
+To compensate for this latency, increase the number of data loading workers using the `--num-workers` argument:
 
 ```
 python pretrain_gpt.py --num-workers 8 ...
@@ -155,9 +155,9 @@ Increasing the number of workers allows more parallel reads from object storage,
 
 **Checkpoint Loading**
 
-When using MSC to load checkpoints from object storage, it is important to configure the cache section in your MSC configuration file. This local cache is used to store downloaded checkpoint data and metadata, which significantly reduces load time and memory usage.
+When loading checkpoints from object storage, configure the `cache` section in your MSC configuration file. The local cache stores downloaded checkpoint data and metadata, which significantly reduces load time and memory usage.
 
-Example:
+**Example:**
 
 ```
 cache:
@@ -169,8 +169,8 @@ For optimal performance, configure the cache directory on a high-speed local sto
 
 ## Additional Resources and Advanced Configuration
 
-Refer to the [MSC Configuration Documentation](https://nvidia.github.io/multi-storage-client/references/configuration.html) for complete documentation on MSC configuration options, including detailed information about supported storage providers, credentials management, and advanced caching strategies.
+Refer to the [MSC Configuration Documentation](https://nvidia.github.io/multi-storage-client/references/configuration.html) for details on supported storage providers, credentials, and caching strategies.
 
-MSC supports collecting observability metrics and traces to help monitor and debug data access patterns during training. These metrics can help you identify bottlenecks in your data loading pipeline, optimize caching strategies, and monitor resource utilization when training with large datasets in object storage. For more information about MSC's observability features, see the [MSC Observability Documentation](https://nvidia.github.io/multi-storage-client/user_guide/telemetry.html).
+MSC supports collecting observability metrics and traces to help monitor and debug data access patterns during training. These metrics can help you identify bottlenecks in your data loading pipeline, optimize caching strategies, and monitor resource utilization when training with large datasets in object storage. For more information about MSC's observability features, refer to the [MSC Observability Documentation](https://nvidia.github.io/multi-storage-client/user_guide/telemetry.html).
 
-MSC offers an experimental Rust client that bypasses Python's Global Interpreter Lock (GIL) to significantly improve performance for multi-threaded I/O operations. The Rust client supports AWS S3, SwiftStack, and Google Cloud Storage, enabling true concurrent execution for much better performance compared to the Python implementation. To enable it, add `rust_client: {}` to your storage provider configuration. For more details, see the [MSC Rust Client Documentation](https://nvidia.github.io/multi-storage-client/user_guide/rust.html).
+MSC offers an experimental Rust client that bypasses Python's Global Interpreter Lock (GIL) to significantly improve performance for multi-threaded I/O operations. The Rust client supports AWS S3, SwiftStack, and Google Cloud Storage, enabling true concurrent execution for much better performance compared to the Python implementation. To enable it, add `rust_client: {}` to your storage provider configuration. For more details, refer to the [MSC Rust Client Documentation](https://nvidia.github.io/multi-storage-client/user_guide/rust.html).

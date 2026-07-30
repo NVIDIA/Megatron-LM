@@ -9,7 +9,7 @@
 
 # Data Preparation
 
-Preparing your data correctly is essential for successful training with Megatron Core.
+Preparing your data correctly is essential for successful training with Megatron Core. Megatron Core trains on tokenized binary files, not raw text. This guide walks you through converting JSONL data into Megatron's binary format using `preprocess_data.py`, choosing a tokenizer, and optionally tuning worker count for large datasets.
 
 ## Data Format
 
@@ -42,7 +42,7 @@ The following table summarizes the main preprocessor arguments:
 | Argument | Description |
 |----------|-------------|
 | `--input` | Path to input JSON/JSONL file |
-| `--output-prefix` | Prefix for output binary files (.bin and .idx) |
+| `--output-prefix` | Prefix for output binary files (`.bin` and `.idx`) |
 | `--tokenizer-type` | Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, and so on) |
 | `--tokenizer-model` | Path to tokenizer model file |
 | `--workers` | Number of parallel workers for processing |
@@ -65,7 +65,7 @@ python tools/preprocess_data.py \
     --max-documents 50000
 ```
 
-**Required arguments**
+**Required Arguments**
 
 The following table lists the arguments required for worker optimization:
 
@@ -73,9 +73,9 @@ The following table lists the arguments required for worker optimization:
 |----------|-------------|
 | `--find-optimal-num-workers` | Activates search of optimal number of workers |
 | `--workers-to-check` | List of possible number of workers to run |
-| `--max-documents` | Number of documents to be preprocessed during each run |
+| `--max-documents` | Number of documents to preprocess during each run |
 
-**Output example**
+**Output Example**
 
 The command prints performance results similar to the following:
 
@@ -96,8 +96,8 @@ The most optimal num of workers is 16 with avg. preprocessed docs/s: 9606.6476.
 
 The preprocessing tool generates two files:
 
-- `processed_data.bin` - Binary file containing tokenized sequences
-- `processed_data.idx` - Index file for fast random access
+- `processed_data.bin`: binary file with tokenized sequences
+- `processed_data.idx`: index file for fast random access
 
 ## Using Preprocessed Data
 
@@ -110,14 +110,16 @@ Reference your preprocessed data in training scripts:
 
 ## Common Tokenizers
 
-### HuggingFace Tokenizers
+The tokenizer must match the model you plan to train. The following examples show the two most common configurations.
+
+### Hugging Face Tokenizers
 
 ```bash
 --tokenizer-type HuggingFaceTokenizer \
 --tokenizer-model /path/to/tokenizer.model
 ```
 
-### GPT-2 BPE Tokenizer
+### GPT-2 Byte-Pair Encoding (BPE) Tokenizer
 
 ```bash
 --tokenizer-type GPT2BPETokenizer \
