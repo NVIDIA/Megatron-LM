@@ -346,22 +346,15 @@ class FsdpParameterGroup:
     ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
-        For HSDP main_grad rests DP-outer-Partial (Partial where main_weight is
-        Replicate) between microbatches, accumulating each backward through the
-        standard zero_grad contract; the last microbatch reduces the DP-outer axes,
-        finalizing main_grad to main_weight's placements so ``.grad`` is the fully
-        reduced gradient before ``optimizer.step()``. With every axis Flat (plain
-        DP) main_grad already rests finalized.
+        main_grad rests in the gradient placements between microbatches. The last
+        microbatch finalizes any Partial axis to main_weight's placements so ``.grad``
+        is ready for ``optimizer.step()``.
         """
         assert self.main_grad is not None
 
-        optimizer_axis = changed_mesh_axis(
-            self.main_grad.placements, self.main_weight.placements
-        )
-        if (
-            optimizer_axis is not None
-            and isinstance(self.main_grad.placements[optimizer_axis], Replicate)
-            and isinstance(self.main_weight.placements[optimizer_axis], Flat)
+        finalize_axis = changed_mesh_axis(self.main_grad.placements, self.main_weight.placements)
+        if finalize_axis == self.mesh.ndim - 1 and isinstance(
+            self.main_grad.placements[finalize_axis], Partial
         ):
             with self._symmetric_memory_context():
                 partial_grad = partial_grad.cast(self.main_grad.dtype)
@@ -370,10 +363,10 @@ class FsdpParameterGroup:
                 return
             partial_grad.local_buffer.add_(self.main_grad.local_buffer)
             if self._symm_mem_pool is not None:
-                partial_grad.rendezvous(optimizer_axis)
+                partial_grad.rendezvous(finalize_axis)
             optimizer_grad = partial_grad.redistribute(self.main_weight.placements)
-            if partial_grad.placements[optimizer_axis].reduce_op == dist.ReduceOp.SUM:
-                optimizer_grad.local_buffer.div_(self.mesh.size(optimizer_axis))
+            if partial_grad.placements[finalize_axis].reduce_op == dist.ReduceOp.SUM:
+                optimizer_grad.local_buffer.div_(self.mesh.size(finalize_axis))
             self._install_sharded_grads(optimizer_grad)
             self.main_grad.local_buffer.zero_()
             return
