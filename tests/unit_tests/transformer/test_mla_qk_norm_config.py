@@ -116,6 +116,7 @@ def test_fused_norm_projections_carry_attention_latent_epsilon(q_lora_rank, q_pr
     assert submodules.linear_kv_up_proj.params == {"custom": True}
 
 
+@pytest.mark.launch_on_gb200
 def test_dsa_attention_latent_norm_epsilon_matches_native():
     """Exercise distinct global, attention latent, and indexer norm epsilons in DSA."""
     run_absorbed_mla_dsa_parity(
