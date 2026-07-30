@@ -225,6 +225,18 @@ class GatedDeltaProductMixer(MegatronModule):
         if self.in_proj.bias is not None:
             setattr(self.in_proj.bias, "use_muon", False)
 
+        # The fused projection packs independently TP-sharded components. Refit
+        # uses their local sizes to preserve semantic order when TP size changes.
+        in_proj_partition_sizes, _ = _get_in_proj_checkpoint_split_layout(
+            self.d_inner_local_tp,
+            self.ngroups_local_tp * self.d_state,
+            self.nheads_local_tp,
+            self.num_householder,
+        )
+        setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
+        if self.in_proj.bias is not None:
+            setattr(self.in_proj.bias, "partition_sizes", in_proj_partition_sizes)
+
         conv_dim = (
             self.d_inner_local_tp * self.num_householder
             + (self.num_householder + 1) * self.ngroups_local_tp * self.d_state
@@ -243,8 +255,17 @@ class GatedDeltaProductMixer(MegatronModule):
                 dtype=config.params_dtype,
             )
             setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.weight, "partition_dim", 0)
             if conv_bias:
                 setattr(self.conv1d.bias, "tensor_model_parallel", True)
+                setattr(self.conv1d.bias, "partition_dim", 0)
+
+            conv_partition_sizes, _ = _get_conv_checkpoint_split_layout(
+                self.d_inner_local_tp, self.ngroups_local_tp * self.d_state, self.num_householder
+            )
+            setattr(self.conv1d.weight, "partition_sizes", conv_partition_sizes)
+            if conv_bias:
+                setattr(self.conv1d.bias, "partition_sizes", conv_partition_sizes)
 
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
