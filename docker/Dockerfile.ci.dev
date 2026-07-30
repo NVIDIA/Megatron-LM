@@ -126,6 +126,40 @@ EOF
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
+# EXPERIMENT ONLY -- DO NOT MERGE.
+# Replace the locked nvidia-resiliency-ext release with upstream NVRx main so CI
+# exercises the latest NVRx. Installed imperatively rather than via pyproject.toml
+# + uv.lock so that every `uv sync --locked` gate in this repo stays satisfied.
+ARG NVRX_REF=main
+ENV NVRX_REF=${NVRX_REF}
+RUN bash -ex <<"EOF"
+    # NVRx main adds langchain-core/langchain-openai, mcp, logsage, setproctitle,
+    # uvicorn, slowapi and slack-bolt/slack-sdk on top of the pinned 0.6.0, so
+    # --no-deps would leave the package un-importable. Install with deps and reuse
+    # the override trick from pyproject.toml's [tool.uv].override-dependencies to
+    # keep the base image's torch/torchvision/triton untouched.
+    cat >/tmp/nvrx-overrides.txt <<'OVERRIDES'
+torch; sys_platform == 'never'
+torchvision; sys_platform == 'never'
+triton; sys_platform == 'never'
+OVERRIDES
+    # pydantic 2.14 breaks langchain_core's module-level RunnablePassthrough()
+    # instantiation, which NVRx main now imports directly. Same cap the
+    # transformer-engine dependency-metadata entry applies.
+    echo "pydantic<2.14" >/tmp/nvrx-constraints.txt
+
+    uv pip install \
+        --reinstall-package nvidia-resiliency-ext \
+        --overrides /tmp/nvrx-overrides.txt \
+        --constraints /tmp/nvrx-constraints.txt \
+        "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@${NVRX_REF}"
+
+    # Record the resolved commit -- `main` floats, so the build log is the only
+    # record of what was actually tested.
+    uv pip freeze | grep -i resiliency
+    python -c "import nvidia_resiliency_ext; print('NVRx import OK')"
+EOF
+
 ##### For NVIDIANS only #####
 FROM main AS jet
 ARG JET_API_VERSION
