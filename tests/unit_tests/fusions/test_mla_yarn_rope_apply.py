@@ -295,7 +295,7 @@ def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
 class TestFusedApplyMLARope:
     @pytest.mark.flaky_in_dev
     def test_forward_backward_for_q(self, input_format):
-        _test_fused_apply_mla_rope_for_q(input_format)
+        _test_fused_mla_rope_inplace(input_format)
 
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):

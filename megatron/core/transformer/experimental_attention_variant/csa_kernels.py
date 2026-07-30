@@ -23,11 +23,108 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
+
+from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+    mla_rope_apply_raw_,
+    mla_rope_unapply_raw,
+)
+
+# ---------------------------------------------------------------------------
+# Output inverse-RoPE fused into the sparse-attention Functions
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OutputRopeParams:
+    """Inverse-RoPE applied to the attention output inside the fused Functions.
+
+    DSv4 undoes the query-side RoPE on the attention output.  Folding that into
+    the sparse-attention ``Function`` lets the rotation happen in place on the
+    tensor the Function already saves for backward, instead of on a private
+    clone, which removes one full ``(rows, heads, v_head_dim)`` buffer per layer
+    from the forward-to-backward live set.
+
+    The rotation is orthogonal only when the cos/sin were built with
+    ``mscale=1.0`` (DSv4's "pure rotation" contract).  That is what makes
+    :meth:`undo` an exact inverse rather than just a transpose, so the backward
+    can recover the pre-RoPE output and gradient.
+
+    ``sbhd_batch_size`` is required for the sbhd layout, where the flat
+    ``(sq * b, ...)`` rows are sq-major and the kernel derives the token index
+    as ``row // batch_size``.  For thd it must be None and ``cu_seqlens_q``
+    supplies the segment boundaries instead.
+    """
+
+    cos: Tensor
+    sin: Tensor
+    nope_dim: int
+    pos_dim: int
+    cu_seqlens_q: Optional[Tensor] = None
+    cp_rank: int = 0
+    cp_size: int = 1
+    position_ids: Optional[Tensor] = None
+    sbhd_batch_size: Optional[int] = None
+
+    def _kernel_view(self, out_flat: Tensor) -> Tensor:
+        """View a flat ``(rows, heads, head_dim)`` output the way the kernel wants it."""
+        if out_flat.shape[-1] != self.nope_dim + self.pos_dim:
+            raise ValueError(
+                "Output inverse-RoPE expects head_dim == nope_dim + pos_dim, got "
+                f"{out_flat.shape[-1]} != {self.nope_dim} + {self.pos_dim}."
+            )
+        if self.cu_seqlens_q is not None:
+            return out_flat
+        if self.sbhd_batch_size is None:
+            raise ValueError("sbhd_batch_size is required when cu_seqlens_q is None.")
+        rows, nheads, head_dim = out_flat.shape
+        return out_flat.view(rows // self.sbhd_batch_size, self.sbhd_batch_size, nheads, head_dim)
+
+    def _kernel_kwargs(self) -> dict:
+        return dict(
+            cu_seqlens_q=self.cu_seqlens_q,
+            cp_rank=self.cp_rank,
+            cp_size=self.cp_size,
+            inverse=True,
+            remove_interleaving=True,
+            position_ids=self.position_ids,
+        )
+
+    def apply_(self, out_flat: Tensor) -> Tensor:
+        """Inverse-RoPE a ``(rows, heads, head_dim)`` attention output in place."""
+        mla_rope_apply_raw_(
+            self._kernel_view(out_flat),
+            self.cos,
+            self.sin,
+            self.nope_dim,
+            self.pos_dim,
+            **self._kernel_kwargs(),
+        )
+        return out_flat
+
+    def undo(self, t: Tensor, out: Optional[Tensor] = None) -> Tensor:
+        """Recover the pre-RoPE values of ``t``, in place or into ``out``.
+
+        Pass ``out`` whenever ``t`` is aliased by a tensor that another autograd
+        node still expects to hold the rotated values, which is the case for the
+        saved attention output.
+        """
+        mla_rope_unapply_raw(
+            self._kernel_view(t),
+            self.cos,
+            self.sin,
+            self.nope_dim,
+            self.pos_dim,
+            out=None if out is None else self._kernel_view(out),
+            **self._kernel_kwargs(),
+        )
+        return t if out is None else out
+
 
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
@@ -131,6 +228,33 @@ def _csa_fwd_flash_mla(
             return out, lse, lse.clone()
         return out, lse, lse_indexer
     return out, lse, None
+
+
+def _undo_output_rope_for_backward(
+    out_rope: Optional[OutputRopeParams], out_flat: Tensor, dO_flat: Tensor
+) -> Tuple[Tensor, Tensor]:
+    """Recover the pre-RoPE ``(O, dO)`` pair that the cuDNN backward expects.
+
+    ``dO`` is un-rotated in place; the gradient buffer is exclusively ours.
+    ``O`` is un-rotated into a fresh buffer because the saved output aliases the
+    tensor the downstream output projection saved for its own backward, and a
+    triton in-place write would corrupt it without tripping autograd's version
+    counter.
+
+    #TODO:
+    Two follow-ups can remove work here. The only thing ``O`` feeds is cuDNN's
+    internal ``delta = rowsum(dO * O)``, which the rotation leaves unchanged, so
+    a ``sparse_attention_backward_wrapper`` that accepts a precomputed delta
+    would let the ``O`` un-rotation be dropped entirely. Short of that, one
+    triton kernel could un-rotate ``O`` and ``dO`` in a single launch.
+    """
+    if out_rope is None:
+        return out_flat, dO_flat
+    o_unrot = torch.empty_like(out_flat)
+    out_rope.undo(out_flat, out=o_unrot)
+    dO_flat = dO_flat.contiguous()
+    out_rope.undo(dO_flat)
+    return o_unrot, dO_flat
 
 
 def _ensure_dsa_namespace():
@@ -350,6 +474,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         topk_length: Optional[Tensor],  # (total_sq,) int32 or None
         softmax_scale: float,
         indexer_topk: int,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _csa_fwd_flash_mla(
@@ -362,9 +487,16 @@ class CSASparseAttnFunc(torch.autograd.Function):
             indexer_topk=indexer_topk,
         )
 
+        # Inverse-RoPE in place before the save, so the saved tensor, the
+        # returned tensor and what the downstream projection saves are all one
+        # buffer. Mutating after the save would trip the version counter.
+        if out_rope is not None:
+            out_rope.apply_(out)
+
         ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
+        ctx.out_rope = out_rope
         return out, lse, lse_indexer
 
     @staticmethod
@@ -373,6 +505,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
         _ensure_dsa_namespace()
 
         q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
+
+        out, dO = _undo_output_rope_for_backward(ctx.out_rope, out, dO)
 
         result = _DSA.sparse_attention_backward_wrapper(
             q,
@@ -386,7 +520,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_length=ctx.topk_length,
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -398,6 +532,7 @@ def csa_sparse_attn(
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
     is_thd: bool = False,
+    out_rope: Optional[OutputRopeParams] = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -425,9 +560,14 @@ def csa_sparse_attn(
         indexer_topk: int; ``0`` for Paths A/C, positive for Path B.
         is_thd: when True, treat ``query`` and ``kv`` as already-packed
             THD tensors and skip the SBHD reshape steps.
+        out_rope: when given, the DSv4 output inverse-RoPE is applied inside
+            the Function, in place on the tensor it saves for backward, and
+            undone there before the cuDNN backward. Saves one full O buffer
+            per layer against rotating the returned tensor out of place.
 
     Returns:
-        SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16.
+        SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16,
+        inverse-RoPE'd when ``out_rope`` is given.
     """
     # Layout-specific input pre-reshape — the kernel always consumes a
     # flat ``(rows, np, d)`` query and ``(n_kv, d)`` KV; only the rows
@@ -452,7 +592,7 @@ def csa_sparse_attn(
         kv_flat = kv.reshape(skv * b, d)
 
     out_flat, _lse, _lse_indexer = CSASparseAttnFunc.apply(
-        q_flat, kv_flat, attn_sink, topk_idxs, topk_length, softmax_scale, indexer_topk
+        q_flat, kv_flat, attn_sink, topk_idxs, topk_length, softmax_scale, indexer_topk, out_rope
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
@@ -1052,6 +1192,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         max_seqlen_compressed_idx: Optional[int],  # indexer K max
         compressed_kv: Optional[Tensor] = None,  # THD only — pre-packed compressed KV
         cu_seqlens_q_unpadded: Optional[Tensor] = None,  # THD only — unpadded Q cu_seqlens
+        out_rope: Optional[OutputRopeParams] = None,  # inverse-RoPE fused onto the output
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -1382,7 +1523,15 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_q_indexer[padding_row_mask] = 0
             precomputed_grad_weights[padding_row_mask] = 0
 
-        # ---- 7. Save context (only sparse-attn bwd tensors + indexer grads). -
+        # ---- 7. Inverse-RoPE the output, in place, before it is saved. -------
+        # Saving the rotated output means it is the same storage the caller
+        # returns and the downstream projection saves, so only one copy of O is
+        # live from here to backward. Must happen before save_for_backward:
+        # mutating a saved tensor afterwards trips the version counter.
+        if out_rope is not None:
+            out_rope.apply_(out_flat)
+
+        # ---- 8. Save context (only sparse-attn bwd tensors + indexer grads). -
         ctx.save_for_backward(
             q_flat,
             kv_flat,
@@ -1398,6 +1547,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         ctx.is_thd = is_thd
         ctx.np_ = np_
         ctx.d = d
+        ctx.out_rope = out_rope
         if is_thd:
             ctx.total_q = total_q
         else:
@@ -1439,6 +1589,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, skv = ctx.sq, ctx.b, ctx.skv
             dO_flat = grad_output.reshape(sq * b, np_, d_v)
 
+        out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             q_flat,
             kv_flat,
@@ -1469,7 +1621,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         #   cu_seqlens_q, cu_seqlens_kv, cu_seqlens_kv_full,
         #   cu_seqlens_compressed_idx,
         #   max_seqlen_q, max_seqlen_compressed_idx,
-        #   compressed_kv, cu_seqlens_q_unpadded
+        #   compressed_kv, cu_seqlens_q_unpadded, out_rope
         return (
             grad_query,
             grad_kv_full,
@@ -1478,6 +1630,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
             None,
             None,
             None,
@@ -1525,6 +1678,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         max_seqlen_q: int,
         indexer_layout: Tuple[Tensor, Tensor, Tensor],
         q_padding_mask: Optional[Tensor] = None,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -1674,6 +1828,11 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_k_indexer = torch.zeros_like(k_indexer)
             saved_grad_weights = torch.zeros_like(weights)
 
+        # Inverse-RoPE in place before saving, so the saved output and the
+        # returned one are a single buffer. See FusedCSAIndexerSparseAttnFunc.
+        if out_rope is not None:
+            out_rope.apply_(out_flat)
+
         ctx.save_for_backward(
             query,
             kv_full,
@@ -1686,6 +1845,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_weights,
         )
         ctx.softmax_scale = softmax_scale
+        ctx.out_rope = out_rope
 
         return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
 
@@ -1706,6 +1866,8 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ) = ctx.saved_tensors
 
         dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
+        out_flat, dO_flat = _undo_output_rope_for_backward(ctx.out_rope, out_flat, dO_flat)
+
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             query,
             kv_full,
@@ -1725,6 +1887,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_q_indexer * grad_loss,
             saved_grad_k_indexer * grad_loss,
             saved_grad_weights * grad_loss,
+            None,
             None,
             None,
             None,
@@ -1764,6 +1927,7 @@ def fused_csa_indexer_sparse_attn(
     max_seqlen_compressed_idx: Optional[int] = None,
     compressed_kv: Optional[Tensor] = None,
     cu_seqlens_q_unpadded: Optional[Tensor] = None,
+    out_rope: Optional[OutputRopeParams] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -1842,6 +2006,9 @@ def fused_csa_indexer_sparse_attn(
             so padding rows are excluded from the indexer KL loss and
             backward gradients.  Ignored when ``None`` or when it equals
             ``cu_seqlens_q``.
+        out_rope: when supplied, DSv4's inverse RoPE is applied to the attention
+            output in place before it is saved, so the returned output is
+            already rotated and only one copy of it is live until backward.
     """
     if cu_seqlens_q is not None:
         missing = [
@@ -1884,10 +2051,12 @@ def fused_csa_indexer_sparse_attn(
         max_seqlen_compressed_idx,
         compressed_kv,
         cu_seqlens_q_unpadded,
+        out_rope,
     )
 
 
 __all__ = [
+    "OutputRopeParams",
     "batch_of_row",
     "build_flat_topk_idxs",
     "local_to_global_flat",
