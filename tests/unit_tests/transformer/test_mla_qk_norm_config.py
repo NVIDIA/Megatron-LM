@@ -75,7 +75,11 @@ def _mock_backend(monkeypatch):
 @pytest.mark.parametrize("attention_latent_norm_epsilon", [None, 1.0e-6])
 def test_attention_latent_norm_epsilon_default(attention_latent_norm_epsilon):
     config = _make_config(attention_latent_norm_epsilon=attention_latent_norm_epsilon)
-    expected = config.layernorm_epsilon if attention_latent_norm_epsilon is None else attention_latent_norm_epsilon
+    expected = (
+        config.layernorm_epsilon
+        if attention_latent_norm_epsilon is None
+        else attention_latent_norm_epsilon
+    )
 
     assert config.attention_latent_norm_epsilon == expected
 
