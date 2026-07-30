@@ -562,14 +562,36 @@ class MambaSlotAllocator:
         # These snapshots only improve future cache hits; the active requests
         # continue from their live Mamba state if durable capacity is exhausted.
         all_bids = intermediate_bids + eos_bids
+        n_intermediate = len(intermediate_bids)
         try:
             all_slots = self.allocate_slots_batch(all_bids)
-        except MambaSlotCapacityError:
-            self._clear_intermediate_state()
-            return
+        except MambaSlotCapacityError as error:
+            existing_slots = self.block_to_slot[all_bids].tolist()
+            kept_indices = []
+            kept_new_bids = set()
+            for index, (block_id, slot) in enumerate(zip(all_bids, existing_slots)):
+                if slot >= 0 or block_id in kept_new_bids:
+                    kept_indices.append(index)
+                elif len(kept_new_bids) < error.available:
+                    kept_new_bids.add(block_id)
+                    kept_indices.append(index)
+
+            if not kept_indices:
+                self._clear_intermediate_state()
+                return
+
+            all_bids = [all_bids[index] for index in kept_indices]
+            all_hashes = [all_hashes[index] for index in kept_indices]
+            src_offsets = [src_offsets[index] for index in kept_indices if index < n_intermediate]
+            eos_ctx_indices = [
+                eos_ctx_indices[index - n_intermediate]
+                for index in kept_indices
+                if index >= n_intermediate
+            ]
+            all_slots = self.allocate_slots_batch(all_bids)
+            n_intermediate = len(src_offsets)
 
         # Copy intermediate states from output buffers to cache
-        n_intermediate = len(intermediate_bids)
         self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
 
         # Copy EOS states from live buffers to cache
