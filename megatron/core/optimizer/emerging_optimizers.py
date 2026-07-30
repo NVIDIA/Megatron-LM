@@ -23,6 +23,7 @@ from .optimizer_config import ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
+    from emerging_optimizers.mixin import WeightDecayT
     from emerging_optimizers.orthogonalized_optimizers import (
         AdaptiveMuon,
         Moment2MethodT,
@@ -160,8 +161,74 @@ _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 # ===========================================================================
 
 
+def _tp_muon_pre_init(
+    optim: "TensorParallelMuon",
+    use_decoupled_weight_decay: bool = True,
+    split_qkv: bool = False,
+    is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
+    qkv_split_shapes: list[int] | None = None,
+    coefficient_type: NSCoeffT = "quintic",
+    num_ns_steps: int = 5,
+    scale_mode: MuonScaleT = "spectral",
+    extra_scale_factor: float = 1.0,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+) -> tuple[
+    WeightDecayT, Callable[[torch.Tensor, torch.distributed.ProcessGroup, int | None], torch.Tensor]
+]:
+    """Shared initialization functionality of Muon optimizers to support tensor model parallelism.
+
+    Returns the weight decay method and a TP-scaled orthogonalization function.
+    """
+    if num_ns_steps < 1:
+        raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+    if split_qkv and is_qkv_fn is None:
+        raise ValueError("`is_qkv_fn` must not be `None` when `split_qkv=True`")
+
+    def scaled_orthogonalize_fn(
+        grad: torch.Tensor,
+        tp_group: torch.distributed.ProcessGroup,
+        partition_dim: int | None = None,
+    ) -> torch.Tensor:
+        log_single_rank(
+            logger,
+            logging.DEBUG,
+            f'Orthogonalizing grad with {num_ns_steps} steps, '
+            f'{coefficient_type} coefficient, '
+            f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
+        )
+        size = [grad.size(-2), grad.size(-1)]
+        if partition_dim is not None:
+            size[partition_dim] *= get_pg_size(tp_group)
+        orth_grad = newton_schulz_tp(
+            grad,
+            steps=num_ns_steps,
+            coefficient_type=coefficient_type,
+            tp_group=tp_group,
+            partition_dim=partition_dim,
+            tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
+        )
+        scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
+        return orth_grad * scale_factor * extra_scale_factor
+
+    optim.pg_collection = pg_collection
+    optim.tp_mode = tp_mode
+    optim.split_qkv = split_qkv
+    optim.is_qkv_fn = is_qkv_fn
+    optim.qkv_split_shapes = qkv_split_shapes
+
+    weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
+    return weight_decay_method, scaled_orthogonalize_fn
+
+
 class TensorParallelMuon(OrthogonalizedOptimizer):
     """Tensor Parallel Muon optimizer."""
+
+    pg_collection: ProcessGroupCollection | None
+    tp_mode: Literal["blockwise", "duplicated", "distributed"]
+    split_qkv: bool
+    is_qkv_fn: Callable[[torch.Tensor], bool] | None
+    qkv_split_shapes: list[int] | None
 
     def __init__(
         self,
@@ -182,44 +249,21 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
     ) -> None:
-        if num_ns_steps < 1:
-            raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
-        if split_qkv and is_qkv_fn is None:
-            raise ValueError("`is_qkv_fn` must not be `None` when `split_qkv=True`")
-
-        def scaled_orthogonalize_fn(
-            grad: torch.Tensor,
-            tp_group: torch.distributed.ProcessGroup,
-            partition_dim: int | None = None,
-        ) -> torch.Tensor:
-            log_single_rank(
-                logger,
-                logging.DEBUG,
-                f'Orthogonalizing grad with {num_ns_steps} steps, '
-                f'{coefficient_type} coefficient, '
-                f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
-            )
-            size = [grad.size(-2), grad.size(-1)]
-            if partition_dim is not None:
-                size[partition_dim] *= get_pg_size(tp_group)
-            orth_grad = newton_schulz_tp(
-                grad,
-                steps=num_ns_steps,
-                coefficient_type=coefficient_type,
-                tp_group=tp_group,
-                partition_dim=partition_dim,
-                tp_mode="duplicated" if tp_mode == "blockwise" else tp_mode,
-            )
-            scale_factor = get_muon_scale_factor(size[0], size[1], mode=scale_mode)
-            return orth_grad * scale_factor * extra_scale_factor
-
-        self.pg_collection = pg_collection
-        self.tp_mode = tp_mode
-        self.split_qkv = split_qkv
-        self.is_qkv_fn = is_qkv_fn
-        self.qkv_split_shapes = qkv_split_shapes
-
-        weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
+        # When adding common initialization functionality here, please add it to `_tp_muon_pre_init`
+        # so it is also reused by `TensorParallelAdaptiveMuon`.
+        weight_decay_method, scaled_orthogonalize_fn = _tp_muon_pre_init(
+            self,
+            use_decoupled_weight_decay,
+            split_qkv,
+            is_qkv_fn,
+            qkv_split_shapes,
+            coefficient_type,
+            num_ns_steps,
+            scale_mode,
+            extra_scale_factor,
+            pg_collection,
+            tp_mode,
+        )
         # Use explicit class call instead of super() so that subclasses with
         # multiple inheritance (e.g. TensorParallelAdaptiveMuon) don't route
         # through an intermediate class that doesn't accept scaled_orthogonalize_fn.
