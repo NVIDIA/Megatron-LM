@@ -54,7 +54,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1654,8 +1654,22 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
-            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
+            # The distributed optimizer shards each bucket over the intra-instance group, which
+            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
+            # same group, otherwise the layout reports more shards than the reduce-scatter uses
+            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
+            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
+            # when there are several instances.
+            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
+            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
+            data_parallel_world_size = get_pg_size(
+                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
+            )
+            expert_data_parallel_world_size = get_pg_size(
+                intra_expt_dp_group
+                if intra_expt_dp_group is not None
+                else getattr(layout_pgs, "expt_dp", None)
+            )
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1687,6 +1701,31 @@ def wrap_model_chunks_with_ddp(
             )
         )
     return wrapped
+
+
+def _freeze_all_model_chunks(model_list):
+    """Freeze all parameters in a list of model chunks (for logits-saving runs)."""
+    for model_module in model_list:
+        model_module.requires_grad_(False)
+        # Additionally freeze expert biases of routers
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+    return model_list
+
+
+def _forward_backward_grad_context(args):
+    """Grad context for a train step's forward/backward pass.
+
+    Returns a tuple of (grad_context, forward_only).
+    grad_context is ``torch.no_grad()`` when all layers are frozen (e.g. teacher logits
+    dumps), no parameter needs gradients, so there is no reason to build the
+    autograd graph. Otherwise returns a no-op context.
+    forward_only is True when all layers are frozen, False otherwise.
+    """
+    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
+    forward_only = getattr(args, "freeze_all_layers", False)
+    return grad_context, forward_only
 
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
@@ -1762,12 +1801,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
-        for model_module in model:
-            model_module.requires_grad_(False)
-            # Additionally freeze expert biases of routers
-            for module in model_module.modules():
-                if hasattr(module, "frozen_expert_bias"):
-                    module.frozen_expert_bias = True
+        _freeze_all_model_chunks(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -1853,12 +1887,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             for disable in per_chunk_disable_bucketing
         ]
 
-        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
-        #  capture support with DDP, but we sync it with the current stream to avoid races.
-        ddp_stream = torch.cuda.Stream()
-        # Wait for the default stream to complete before starting ddp_stream
+        if config.cuda_graph_impl == "full_iteration":
+            # DDP initialization must use the full-iteration capture stream so its retained
+            # AccumulateGrad nodes do not reference a different, non-capturing stream.
+            ddp_stream = get_shared_capture_stream()
+        else:
+            # Preserve a dedicated initialization stream for all other implementations.
+            ddp_stream = torch.cuda.Stream()
         ddp_stream.wait_stream(torch.cuda.current_stream())
-        # Make ddp_stream start after whatever the default stream already queued
+
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -1875,8 +1912,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # End of setup_stream
-        # Critical: ensure side-stream work completes before touching params on default stream
+        # Ensure initialization-stream work completes before touching params on the default stream.
         torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -2031,6 +2067,12 @@ def setup_model_and_optimizer(
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
+
+            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
+            # and skips grad-buffer allocation for all params (matching get_model behavior).
+            if args.freeze_all_layers:
+                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -2073,7 +2115,7 @@ def setup_model_and_optimizer(
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
 
-    if args.logits_save_dir is not None:
+    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -2085,7 +2127,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None:
+    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -2388,20 +2430,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-            p2p_communicator=p2p_communicator,
-            pg_collection=pg_collection,
-        )
+        grad_context, forward_only = _forward_backward_grad_context(args)
+        with grad_context:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=forward_only,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+                p2p_communicator=p2p_communicator,
+                pg_collection=pg_collection,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
