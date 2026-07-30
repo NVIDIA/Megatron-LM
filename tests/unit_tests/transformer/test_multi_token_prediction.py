@@ -1324,7 +1324,7 @@ class TestMTPLossLoggingHelper:
         assert tracker["avg_group"] is None
 
     def test_save_loss_to_tracker(self):
-        """Test saving a normalized loss to the tracker."""
+        """Test saving a legacy normalized loss to the tracker."""
         loss_sum = torch.tensor(1.3)
         num_tokens = torch.tensor(5.0)
         layer_number = 2
@@ -1344,6 +1344,30 @@ class TestMTPLossLoggingHelper:
         )
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
+
+    def test_save_loss_to_tracker_per_token_stores_raw_loss_and_tokens(self):
+        """Per-token logging keeps raw sums so reduction can weight by tokens."""
+        loss_sum = torch.tensor(1.3)
+        num_tokens = torch.tensor(5.0)
+        layer_number = 2
+        num_layers = self.num_layers
+
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=loss_sum,
+            num_tokens=num_tokens,
+            layer_number=layer_number,
+            num_layers=num_layers,
+            calculate_per_token_loss=True,
+        )
+
+        tracker = MTPLossLoggingHelper.tracker
+        assert "loss_sums" in tracker
+        assert "num_tokens" in tracker
+        assert tracker["calculate_per_token_loss"] is True
+        assert torch.isclose(tracker["loss_sums"][layer_number], loss_sum)
+        assert torch.isclose(tracker["num_tokens"][layer_number], num_tokens)
+        assert tracker["reduce_group"] is None
+        assert tracker["avg_group"] is None
 
     def test_mtp_logits_are_vocab_sharded(self):
         """Test detection for vocab-sharded versus gathered MTP logits."""
@@ -1487,6 +1511,41 @@ class TestMTPLossLoggingHelper:
         global_token_weighted = torch.tensor((8.0 + 4.0) / (2.0 + 4.0))
         assert torch.isclose(logged_loss, microbatch_mean_average)
         assert not torch.isclose(logged_loss, global_token_weighted)
+
+    def test_per_token_loss_is_globally_token_weighted(self):
+        """Per-token MTP logging must match calculate-per-token-loss semantics."""
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(8.0),
+            num_tokens=torch.tensor(2.0),
+            layer_number=0,
+            num_layers=1,
+            calculate_per_token_loss=True,
+        )
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(4.0),
+            num_tokens=torch.tensor(4.0),
+            layer_number=0,
+            num_layers=1,
+            calculate_per_token_loss=True,
+        )
+
+        class DummyWriter:
+            def __init__(self):
+                self.scalars = {}
+
+            def add_scalar(self, name, value, iteration):
+                self.scalars[name] = value
+
+        writer = DummyWriter()
+        MTPLossLoggingHelper.track_mtp_metrics(
+            loss_scale=1.0, iteration=1, writer=writer, total_loss_dict={}
+        )
+
+        logged_loss = torch.as_tensor(writer.scalars["mtp_1 loss"])
+        microbatch_mean_average = torch.tensor(((8.0 / 2.0) + (4.0 / 4.0)) / 2.0)
+        global_token_weighted = torch.tensor((8.0 + 4.0) / (2.0 + 4.0))
+        assert torch.isclose(logged_loss, global_token_weighted)
+        assert not torch.isclose(logged_loss, microbatch_mean_average)
 
     def test_track_mtp_loss_preserves_legacy_normalized_loss_semantics(self):
         """MTP loss logging should not become token-weighted when acceptance counters are added."""

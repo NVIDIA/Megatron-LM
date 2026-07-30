@@ -291,11 +291,23 @@ def apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend):
 
 
 def build_gpt_model(config, vocab_size=512, max_seq_len=300):
-    """Build and return a GPTModel on CUDA from the given config."""
+    """Build and return a GPTModel on CUDA from the given config.
+
+    When ``config.mtp_num_layers`` is set, the MTP block spec is built and passed so the
+    model has a real multi-token-prediction block (needed to exercise the mHC multi-stream
+    path shared between the decoder boundary and MTP depths).
+    """
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
 
     layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)
+    mtp_block_spec = None
+    if config.mtp_num_layers:
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=layer_spec, use_transformer_engine=True
+        )
     model = GPTModel(
         config=config,
         transformer_layer_spec=layer_spec,
@@ -303,6 +315,7 @@ def build_gpt_model(config, vocab_size=512, max_seq_len=300):
         pre_process=True,
         post_process=True,
         max_sequence_length=max_seq_len,
+        mtp_block_spec=mtp_block_spec,
     )
     model.cuda()
     return model

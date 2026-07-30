@@ -792,6 +792,16 @@ class TestGPTModelBuilderBuildDistributedModels:
 
     @patch("megatron.training.models.gpt.compose_hooks")
     @patch("megatron.training.models.gpt.unimodal_build_distributed_models")
+    def test_layer_wise_optimizer_flag_forwarded(self, mock_unimodal, mock_compose):
+        mock_unimodal.return_value = [Mock()]
+        mock_compose.return_value = Mock(return_value=None)
+
+        self.builder.build_distributed_models(self.pg, use_layer_wise_distributed_optimizer=True)
+
+        assert mock_unimodal.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
+
+    @patch("megatron.training.models.gpt.compose_hooks")
+    @patch("megatron.training.models.gpt.unimodal_build_distributed_models")
     def test_default_parameters_forwarded(self, mock_unimodal, mock_compose):
         from megatron.core.enums import ModelType
         from megatron.core.transformer.module import Float16Module

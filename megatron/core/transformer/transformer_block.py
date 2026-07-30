@@ -442,6 +442,115 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 and self.post_layer_norm
             )
 
+    def preprocess_for_layer_schedule(self, hidden_states: Union[Tensor, WrappedTensor]) -> Tensor:
+        """Apply TransformerBlock entry processing for normal and scheduled forward paths.
+
+        On the first pipeline stage, this method uses the provided hidden states. On subsequent
+        stages, it uses the tensor supplied through :meth:`set_input_tensor`. The result is made
+        viewless and, on the first pipeline stage, expanded into mHC residual streams when mHC is
+        enabled.
+
+        Args:
+            hidden_states: Hidden states for the first pipeline stage, optionally wrapped for
+                deferred unwrapping.
+
+        Returns:
+            Viewless hidden states ready for layer execution. When mHC is enabled on the first
+            pipeline stage, the hidden dimension contains all residual streams.
+        """
+        # Delete the obsolete reference to the initial input tensor if necessary.
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
+
+        if not self.pre_process:
+            # See set_input_tensor().
+            hidden_states = self.input_tensor
+
+        # Make the input viewless. This is usually redundant — embedding outputs and
+        # p2p_communication.py both produce viewless tensors — but make_viewless_tensor()
+        # is a negligible-overhead no-op on already-viewless inputs, so it is kept here
+        # defensively for mbs == 1 view-tensor and other corner cases.
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        # Expand hidden states for hyper connections at the start of the block.
+        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage.
+        if self.config.enable_hyper_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
+        return hidden_states
+
+    def postprocess_for_layer_schedule(
+        self,
+        hidden_states: Tensor,
+        *,
+        extract_layer_indices: Optional[Set[int]] = None,
+        return_mhc_multistream: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
+        """Apply TransformerBlock exit processing shared by normal and scheduled forward paths.
+
+        This method contracts mHC residual streams on the stage that owns the final layer norm,
+        applies the final layer norm, and preserves a distinct output node for empty pipeline
+        stages. With MTP, it can also return the pre-contraction mHC streams for the MTP input.
+
+        Args:
+            hidden_states: Hidden states produced by the transformer layers.
+            extract_layer_indices: Requested feature-extraction layer indices. Nonempty feature
+                extraction is not supported when mHC and MTP are both enabled.
+            return_mhc_multistream: Whether to return the pre-contraction mHC streams together with
+                the processed hidden states.
+
+        Returns:
+            The processed hidden states. If ``return_mhc_multistream`` is true, returns a tuple of
+            the processed hidden states and the pre-contraction mHC streams. The second element is
+            ``None`` when no MTP mHC streams need to be preserved.
+
+        Raises:
+            AssertionError: If nonempty feature extraction is requested while mHC and MTP are both
+                enabled.
+        """
+        mhc_multistream = None
+        # Only contract if the final layer norm is in this stage.
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            # When MTP is enabled, save pre-contraction multi-stream for MTP input.
+            if self.config.mtp_num_layers is not None:
+                if extract_layer_indices is not None:
+                    assert (
+                        len(extract_layer_indices) == 0
+                    ), "Feature extraction is not supported with mHC + MTP."
+                mhc_multistream = hidden_states
+            # DSv4 introduced the new output contraction for mHC.
+            # [s, b, n*C] -> [s, b, C]
+            hidden_states = learned_output_contract(
+                hidden_states,
+                self.hc_head_fn,
+                self.hc_head_base,
+                self.hc_head_scale,
+                self.config.num_residual_streams,
+                self.config.layernorm_epsilon,
+            )
+
+        # Final layer norm.
+        if self.final_layernorm is not None:
+            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            # TENorm produces a "viewed" tensor. This will result in schedule.py's
+            # deallocate_output_tensor() throwing an error, so a viewless tensor is
+            # created to prevent this.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
+        # If this TransformerBlock is empty, input and output hidden states will be the same
+        # node on the computational graph and will lead to unexpected errors in pipeline
+        # schedules.
+        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
+            hidden_states = hidden_states.clone()
+
+        if return_mhc_multistream:
+            return hidden_states, mhc_multistream
+        return hidden_states
+
     def _setup_fused_tp_communication(self):
         """Setup fused TP communication for all layers.
         We have a fused reduce-scatter + add + layer-norm + all-gather operation.
@@ -799,37 +908,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config, self.vp_stage, get_pg_rank(pp_group)
         )
 
-        # Delete the obsolete reference to the initial input tensor if necessary
-        if isinstance(hidden_states, WrappedTensor):
-            hidden_states = hidden_states.unwrap()
-
-        if not self.pre_process:
-            # See set_input_tensor()
-            hidden_states = self.input_tensor
-
-        # Viewless tensor.
-        # - We only need to create a viewless tensor in the case of micro batch
-        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
-        #   above creates a view tensor, and '.contiguous()' is a pass-through.
-        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
-        #   the need to make it viewless.
-        #
-        #   However, we don't explicitly check mbs == 1 here because
-        #   make_viewless_tensor() has negligible overhead when its input
-        #   is already viewless.
-        #
-        # - For the 'else' case above, calling make_viewless_tensor() here is
-        #   likely redundant, since p2p_communication.py (likely originator)
-        #   already creates viewless tensors. That said, make_viewless_tensor()
-        #   is called here to be future-proof and corner-case-proof.
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-
-        # Expand hidden states for hyper connections at the start of the block
-        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
-        if self.config.enable_hyper_connections and self.pre_process:
-            hidden_states = HyperConnectionModule.input_expand(
-                hidden_states, self.num_residual_streams
-            )  # [s, b, C] -> [s, b, n*C]
+        hidden_states = self.preprocess_for_layer_schedule(hidden_states)
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -952,40 +1031,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
-        # Only contract if the final layer norm is in this stage
-        mhc_multistream = None
-        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
-            # When MTP is enabled, save pre-contraction multi-stream for MTP input.
-            if self.config.mtp_num_layers is not None:
-                assert (
-                    len(extract_layer_indices) == 0
-                ), "Feature extraction is not supported with mHC + MTP."
-                mhc_multistream = hidden_states
-            # DSv4 introduced the new output contraction for mHC.
-            # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
-
-        # Final layer norm.
-        if self.final_layernorm is not None:
-            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-
-        # If this TransformerBlock is empty, input and output hidden states will be the same node
-        # on the computational graph and will lead to unexpected errors in pipeline schedules.
-        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
-            hidden_states = hidden_states.clone()
+        hidden_states, mhc_multistream = self.postprocess_for_layer_schedule(
+            hidden_states, extract_layer_indices=extract_layer_indices, return_mhc_multistream=True
+        )
 
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states

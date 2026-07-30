@@ -75,6 +75,7 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         # build mock func/state
         node = DummyNode()
         node.is_mtp = False
+        node.is_last_layer = False
         node.chunk_state.model = dummy_model
 
         # attn fwd

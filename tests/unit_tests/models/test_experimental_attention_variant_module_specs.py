@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import MagicMock, patch
 
@@ -323,12 +323,14 @@ class TestGetDsaModuleSpec:
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(cfg, backend=_make_backend())
 
-    def test_returns_mla_self_attention_spec(self):
-        """Verify the returned attention module is MLA self-attention with causal mask."""
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    def test_returns_absorbed_mla_self_attention_spec(self):
+        """Verify the returned attention module is absorbed MLA with causal mask."""
+        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+            AbsorbedMLASelfAttention,
+        )
 
         spec = self._call()
-        assert spec.module is MLASelfAttention
+        assert spec.module is AbsorbedMLASelfAttention
         assert spec.params == {"attn_mask_type": AttnMaskType.causal}
         assert spec.metainfo == {"fuse_input_layernorm": False}
 
@@ -416,6 +418,7 @@ class TestGetExperimentalAttentionVariantModuleSpec:
         [
             ("gated_delta_net", "get_gated_delta_net_module_spec"),
             ("dsa", "get_dsa_module_spec_for_backend"),
+            ("dsv4_hybrid", "get_dsv4_hybrid_module_spec_for_backend"),
         ],
     )
     def test_dispatches_to_variant_handler(self, variant, target_fn):
