@@ -1,5 +1,6 @@
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb_with_cos_sin
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
@@ -10,7 +11,11 @@ class TestRotaryEmbeddingWithPrecomputedCosSin:
         self.batch_size = 3
         self.seq_len = 4
         self.d_rot = 6
-        self.rotary_embedding = RotaryEmbedding(kv_channels=4, rotary_percent=1.0)
+        self.rotary_embedding = RotaryEmbedding(
+            kv_channels=4,
+            rotary_percent=1.0,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
 
     def test_output_shapes_match(self):
 

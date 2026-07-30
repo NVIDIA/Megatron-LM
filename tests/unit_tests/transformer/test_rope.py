@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -27,7 +28,11 @@ class TestMultimodalRotaryEmbedding:
         model_parallel_cuda_manual_seed(123)
         self.kv_channels = 128
         self.rotary_percent = 1.0
-        self.rope_gpu_init = MultimodalRotaryEmbedding(self.kv_channels, self.rotary_percent)
+        self.rope_gpu_init = MultimodalRotaryEmbedding(
+            self.kv_channels,
+            self.rotary_percent,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
 
     def teardown_method(self, method):
         del self.rope_gpu_init
@@ -56,10 +61,16 @@ class TestRotaryEmbedding:
         self.kv_channels = 8
         self.rotary_percent = 1.0
         self.rope_cpu_init = RotaryEmbedding(
-            self.kv_channels, self.rotary_percent, use_cpu_initialization=True
+            self.kv_channels,
+            self.rotary_percent,
+            use_cpu_initialization=True,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
         )
         self.rope_gpu_init = RotaryEmbedding(
-            self.kv_channels, self.rotary_percent, use_cpu_initialization=False
+            self.kv_channels,
+            self.rotary_percent,
+            use_cpu_initialization=False,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
         )
 
     def teardown_method(self, method):
@@ -104,7 +115,10 @@ class TestQKVRotaryEmbedding:
         self.kv_channels = 128
         self.rotary_percent = 1.0
         self.rope_gpu_init = RotaryEmbedding(
-            self.kv_channels, self.rotary_percent, use_cpu_initialization=False
+            self.kv_channels,
+            self.rotary_percent,
+            use_cpu_initialization=False,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
         )
         self.transformer_config = TransformerConfig(
             num_attention_heads=self.num_heads, num_layers=1, apply_rope_fusion=True
