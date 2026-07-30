@@ -1138,13 +1138,18 @@ class DynamicInferenceEngine(AbstractEngine):
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
-        # Check that the KV cache has enough blocks for this request's max sequence length.
-        max_request_tokens = (
-            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
-        )
-        request_block_count = math.ceil(max_request_tokens / self.context.block_size_tokens)
-        total_blocks = self.context.kv_block_allocator.total_count - 1  # -1 for dummy block
-        if request_block_count > total_blocks:
+        # Check that the KV cache has enough blocks for this request's stored tokens:
+        # the prompt, all generated tokens but the last, and the final decode step's drafts.
+        # Blocks are granted to a running request only from the active pool.
+        max_stored_tokens = len(request.prompt_tokens)
+        if request.sampling_params.num_tokens_to_generate > 1:
+            max_stored_tokens += (
+                request.sampling_params.num_tokens_to_generate
+                - 1
+                + self.context.num_speculative_tokens
+            )
+        request_block_count = math.ceil(max_stored_tokens / self.context.block_size_tokens)
+        if request_block_count > self.context.kv_block_allocator.active_count:
             request.status = Status.FAILED
             request.add_event_error_nontransient(BlockOverflowError(request_id))
 

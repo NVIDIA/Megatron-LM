@@ -594,6 +594,8 @@ jobs:
 
       - name: Download test data
         shell: bash
+        env:
+          NEMO_TEST_DATA_ROOT: /mnt/datadrive/TestData/nemo-fw/TestData
         run: |
           echo "::group::Download test data"
           for attempt in 1 2 3; do
