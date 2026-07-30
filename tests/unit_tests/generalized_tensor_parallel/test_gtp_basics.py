@@ -1152,6 +1152,10 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
     grad_data (corrupts reduce_scatter_with_fp32_accumulation). The fix routes grad-ready through
     register_grad_accum_hook (fired after the add) and skips the autograd hook. This pins that
     wiring: every GTP weight has _grad_accum_hook set and none falls through to the autograd list.
+
+    It also checks that the AccumulateGrad node is materialized and stored on the param. Holding
+    that reference is what keeps the leaf on the capture stream for full-iteration CUDA-graph
+    capture.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
@@ -1190,6 +1194,12 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
             assert (
                 getattr(w, "_grad_accum_hook", None) is not None
             ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
+            # The node must also be RETAINED: a live strong reference across the
+            # warmup->capture boundary is what keeps the leaf on the capture stream.
+            # Identity (not just non-None): a dropped node would be recreated by expand_as here.
+            assert (
+                getattr(w, "_grad_accum_node", None) is w.expand_as(w).grad_fn.next_functions[0][0]
+            ), f"{name}.weight must retain its AccumulateGrad node (full-iteration CG capture)"
 
         # bias=False -> all params are GTP_remat -> none took the autograd path.
         assert len(ddp_model.grad_accs) == 0, (
