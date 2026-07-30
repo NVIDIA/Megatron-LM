@@ -293,6 +293,23 @@ class KVBlockAllocator:
     ) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
+        Registration is idempotent: a block that already carries the hash being
+        registered is skipped. Callers may legitimately re-offer an already
+        registered block (a cache-matched block whose block-table slot a later
+        prefill chunk also spans), and the bookkeeping below is one-shot per
+        block — applying it twice adds a second child entry to the block's
+        parent that no deregistration can ever cancel, leaving that parent
+        permanently short of ``child_count == 0`` and therefore never an
+        evictable leaf (see ``evict_lru_blocks``).
+
+        Re-registering a live block under a *different* hash would instead
+        overwrite its recorded parent while leaving the previous parent's child
+        count raised, so that case is rejected rather than absorbed.
+
+        This method never touches reference counts. New blocks are pinned at
+        ``ref_count == 1`` by ``allocate_memory_blocks``, and additional owners
+        of an already registered block are pinned by the caller that matched it.
+
         Args:
             block_ids: List of block IDs.
             block_hashes: List of computed hash values (same length as block_ids).
@@ -303,13 +320,46 @@ class KVBlockAllocator:
         """
         if not block_ids:
             return
-        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
-        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
-        self.block_hashes[id_tensor] = hash_tensor
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
+        # Tensor views of the batch, used to index the per-block state arrays.
+        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
+        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
+
+        # Drop blocks that already carry this hash, and reject hash changes on a
+        # block that is still registered. Read the stored hashes before writing
+        # them below, so this sees each block's pre-call state.
+        # Hash each block holds right now; -1 means it is not registered.
+        current_hashes = self.block_hashes[id_tensor]
+        # Per-entry: this exact (block, hash) pair is already registered -> skip it.
+        already_registered = current_hashes == hash_tensor
+        # Per-entry: block is registered, but under some other hash -> illegal.
+        conflict_mask = (current_hashes != -1) & ~already_registered
+        # Batch positions of the illegal entries, for the failure message.
+        conflicting = torch.nonzero(conflict_mask, as_tuple=True)[0].tolist()
+        assert not conflicting, "block re-registered under a different hash: " + ", ".join(
+            f"block {block_ids[i]} holds {int(current_hashes[i])}, given {block_hashes[i]}"
+            for i in conflicting
+        )
+        if already_registered.any():
+            # Batch positions of the entries that still need registering. Every
+            # list and tensor below is narrowed to these so that the writes, the
+            # hash-map update and the child-count bumps all see the same subset.
+            keep = torch.nonzero(~already_registered, as_tuple=True)[0]
+            if keep.numel() == 0:
+                return
+            keep_list = keep.tolist()
+            block_ids = [block_ids[i] for i in keep_list]
+            block_hashes = [block_hashes[i] for i in keep_list]
+            if parent_hashes is not None:
+                parent_hashes = [parent_hashes[i] for i in keep_list]
+            id_tensor = id_tensor[keep]
+            hash_tensor = hash_tensor[keep]
+
+        self.block_hashes[id_tensor] = hash_tensor
         # Add the new blocks to the hash map first so that a block whose parent is
         # elsewhere in this same batch (block k's parent is block k-1) resolves.
+        # Skipped blocks are already in the map, so they resolve as parents too.
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -320,11 +370,14 @@ class KVBlockAllocator:
             # falls back to -1.
             if parent_hashes is None:
                 parent_hashes = [0] * len(block_ids)
+            # Parent hashes resolved to block ids, aligned with block_ids; -1 for
+            # a root block and for a parent hash that is no longer cached.
             parent_ids = [
                 self.kv_hash_to_block_id.get(ph, -1) if ph != 0 else -1 for ph in parent_hashes
             ]
             parent_id_tensor = torch.tensor(parent_ids, dtype=torch.int64, device=id_tensor.device)
             self.block_parent_id[id_tensor] = parent_id_tensor
+            # Per-entry: this block has a resolved parent whose count to bump.
             has_parent = parent_id_tensor >= 0
             if has_parent.any():
                 self.block_child_count.scatter_add_(

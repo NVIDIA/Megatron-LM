@@ -274,8 +274,8 @@ def test_release_shared_block_decrements_once_per_owner():
     # block mixed into the final batch.
     a = KVBlockAllocator(
         _make_context(),
-        total_count=8,
-        paused_count=2,
+        pool_size=8,
+        paused_limit=2,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
     )
@@ -283,12 +283,12 @@ def test_release_shared_block_decrements_once_per_owner():
     shared, private = int(ids[0]), int(ids[1])
     a.register_kv_block_hashes(block_ids=[shared], block_hashes=[111])
     a.block_ref_counts[shared] += 2  # two more owners pin the shared block -> ref 3
-    avail0 = a.total_avail
+    avail0 = a.pool_avail
 
     # One owner finishes alone: ref 3 -> 2, nothing freed yet.
     a.release_memory_blocks(torch.tensor([shared], dtype=torch.int32))
     assert a.block_ref_counts[shared].item() == 2
-    assert a.total_avail == avail0
+    assert a.pool_avail == avail0
     assert 111 in a.kv_hash_to_block_id
 
     # The final two owners and the private request finish in one batch: the
@@ -297,9 +297,9 @@ def test_release_shared_block_decrements_once_per_owner():
     assert a.block_ref_counts[shared].item() == 0
     assert a.block_ref_counts[private].item() == 0
     # Two distinct blocks return to the pool; the shared one only once (not twice).
-    assert a.total_avail == avail0 + 2
+    assert a.pool_avail == avail0 + 2
     assert 111 not in a.kv_hash_to_block_id  # deregistered exactly once
-    free_region = a.block_bag[: a.total_avail].tolist()
+    free_region = a.block_bag[: a.pool_avail].tolist()
     assert len(set(free_region)) == len(free_region)  # no double-returned id
 
     # LRU: a hashed shared block released by both owners in one batch must hit
@@ -307,8 +307,8 @@ def test_release_shared_block_decrements_once_per_owner():
     # block stays cached for reuse rather than returning to the pool.
     lru = KVBlockAllocator(
         _make_context(),
-        total_count=8,
-        paused_count=2,
+        pool_size=8,
+        paused_limit=2,
         enable_prefix_caching=True,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
     )
@@ -529,6 +529,84 @@ def test_evict_lru_keeps_hottest_leaf_over_cold_interior_parent():
     assert a.block_hashes[5].item() == 60  # hottest leaf E retained
     assert a.block_hashes[1].item() == -1  # cold interior B evicted
     _assert_prefix_invariant(a)
+
+
+def test_register_existing_block_is_idempotent_and_keeps_parent_evictable():
+    """Re-registering an already registered block must not disturb the prefix
+    chain. Callers can re-offer a cached block they matched earlier (a prefill
+    chunk boundary landing inside a matched block makes its slot part of the
+    next chunk's registration span), and a second child increment on that
+    block's parent is unrecoverable: the child can only be deregistered once, so
+    the parent never reaches child_count == 0, is never an evictable leaf, and
+    the leaf peel in evict_lru_blocks runs out of candidates while still
+    counting the parent as cached.
+
+        A(ts 1) -> B(ts 2)      B re-registered with its existing hash
+
+    Both blocks are cached and evicting both must succeed.
+    """
+    a = _lru_allocator()
+    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
+    assert a.block_child_count[0].item() == 1
+
+    # Re-register the child exactly as it stands: same block, hash and parent.
+    a.register_kv_block_hashes(block_ids=[1], block_hashes=[20], parent_hashes=[10])
+
+    # The chain is unchanged -- one child on the parent, not two.
+    assert a.block_child_count[0].item() == 1
+    assert a.block_child_count[1].item() == 0
+    assert a.block_parent_id[1].item() == 0
+    assert a.kv_hash_to_block_id == {10: 0, 20: 1}
+
+    # Both cached blocks stay reachable by the leaf peel: B is evicted first,
+    # which makes A childless and evictable in turn.
+    assert int(a.get_evictable_block_count()) == 2
+    assert a.evict_lru_blocks(2) is True
+    assert a.kv_hash_to_block_id == {}
+    _assert_prefix_invariant(a)
+
+
+def test_register_mixed_batch_skips_only_the_already_registered_blocks():
+    """A batch that mixes an already registered block with new ones registers
+    the new blocks normally. The skipped block still resolves as a parent for
+    its successor in the same batch, so the chain stays connected."""
+    a = _lru_allocator()
+    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
+
+    # Block 1 is already registered; blocks 2 and 3 extend the chain past it.
+    a.register_kv_block_hashes(
+        block_ids=[1, 2, 3], block_hashes=[20, 30, 40], parent_hashes=[10, 20, 30]
+    )
+    a.block_ref_counts[torch.tensor([2, 3])] = 0
+    a.pool_avail -= 2
+
+    assert a.kv_hash_to_block_id == {10: 0, 20: 1, 30: 2, 40: 3}
+    assert a.block_parent_id[2].item() == 1  # resolved through the skipped block
+    assert a.block_parent_id[3].item() == 2
+    assert a.block_child_count.tolist()[:4] == [1, 1, 1, 0]
+
+    # The whole chain peels leaf-first without stalling.
+    assert a.evict_lru_blocks(4) is True
+    assert a.kv_hash_to_block_id == {}
+    _assert_prefix_invariant(a)
+
+
+def test_register_rejects_hash_change_on_a_registered_block():
+    """Registering a live block under a hash other than the one it holds would
+    overwrite its recorded parent while leaving the previous parent's child count
+    raised. That is a bookkeeping error, not a no-op, and must fail loudly."""
+    a = _lru_allocator()
+    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
+
+    with pytest.raises(AssertionError, match="different hash"):
+        a.register_kv_block_hashes(block_ids=[1], block_hashes=[99], parent_hashes=[10])
+
+    # A deregistered block is free to take a new hash.
+    assert a.evict_lru_blocks(1) is True
+    a.pool_avail -= 1
+    a.register_kv_block_hashes(block_ids=[1], block_hashes=[99], parent_hashes=[10])
+    assert a.kv_hash_to_block_id == {10: 0, 99: 1}
+    assert a.block_child_count[0].item() == 1
 
 
 def test_evict_lru_asserts_on_cyclic_parent_graph():
