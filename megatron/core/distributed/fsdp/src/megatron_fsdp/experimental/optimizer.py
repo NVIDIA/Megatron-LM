@@ -109,13 +109,13 @@ def fully_shard_optimizer(
             set_grad(parameter, original_grad)
         casted_grads.clear()
 
-        fsdp_parameter_groups: set[FsdpParameterGroup] = set()
+        fsdp_parameter_groups: dict[FsdpParameterGroup, None] = {}
         for optimizer_group in hooked_optimizer.param_groups:
             for parameter in optimizer_group["params"]:
                 parameter_group = get_containing_parameter_group(parameter)
                 if parameter_group is None:
                     continue
-                fsdp_parameter_groups.add(parameter_group)
+                fsdp_parameter_groups[parameter_group] = None
 
         for parameter_group in fsdp_parameter_groups:
             parameter_group.sync_model_weight_from_main_weight()
