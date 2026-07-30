@@ -36,6 +36,9 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
+    # True from the root pre-backward hook until autograd completes. Forward
+    # hooks use this to identify activation recomputation inside backward.
+    is_backward: bool
     root_module: "FsdpModule"
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
@@ -52,6 +55,7 @@ class FsdpContext:
         """
         self.root_module = root_module
         self.is_last_microbatch = True
+        self.is_backward = False
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         with torch.cuda.device(device):
@@ -73,6 +77,7 @@ class FsdpContext:
 
         def post_backward_final_callback() -> None:
             self.current_stream().wait_stream(self.reduce_scatter_stream)
+            self.is_backward = False
 
         torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
@@ -244,9 +249,13 @@ class FsdpModule:
         # issued afterwards, so it is free to run concurrently with this FsdpModule).
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.forward_order.next_item(self)
-        if next_module is not None:
-            next_module._unshard_parameter_groups()
+        # Activation recomputation runs forward hooks inside backward. Do not
+        # prefetch the next module in forward order: its backward may already
+        # be complete, so no later backward hook would reshard it.
+        if not context.is_backward:
+            next_module = context.forward_order.next_item(self)
+            if next_module is not None:
+                next_module._unshard_parameter_groups()
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -267,7 +276,11 @@ class FsdpModule:
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
-        self._reshard_parameter_groups()
+        # Recomputed parameters are consumed immediately by this module's
+        # backward. Keep them materialized to avoid an unnecessary all-gather;
+        # post_backward() will reshard them after gradient reduction.
+        if not self.context.is_backward:
+            self._reshard_parameter_groups()
         torch.cuda.nvtx.range_pop()
 
     def _reshard_parameter_groups(self) -> None:
@@ -294,6 +307,7 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
+            context.is_backward = True
             context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
