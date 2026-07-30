@@ -129,6 +129,7 @@ def get_mock_mla_config(
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
         multi_latent_attention=True,
+        qk_layernorm=True,
         hidden_size=7168,
         num_attention_heads=128,
         q_lora_rank=1536,

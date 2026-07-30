@@ -4075,6 +4075,14 @@ def _add_checkpointing_args(parser):
         help='Do not load rng state when loading checkpoint.',
     )
     group.add_argument(
+        '--override-ckpt-iteration',
+        type=int,
+        default=None,
+        help='Override the iteration stored in the loaded checkpoint. '
+        'Also resets consumed_train_samples accordingly so the '
+        'data loader replays samples from that iteration onward.',
+    )
+    group.add_argument(
         '--use-dist-ckpt',
         action='store_true',
         dest='use_dist_ckpt_deprecated',

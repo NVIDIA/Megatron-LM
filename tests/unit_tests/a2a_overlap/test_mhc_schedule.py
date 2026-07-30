@@ -88,7 +88,7 @@ class _RecordingLayer:
     def __init__(self, calls, prefix):
         self.calls = calls
         self.config = SimpleNamespace(ep_overlap_early_attn_memory_release=False)
-        self.attn = _RecordingNode(calls, f"{prefix}.attn")
+        self.pre_dispatch_computation = _RecordingNode(calls, f"{prefix}.pre_dispatch_computation")
         self.moe_dispatch = _RecordingNode(calls, f"{prefix}.moe_dispatch")
         self.mlp = _RecordingNode(calls, f"{prefix}.mlp")
         self.moe_combine = _RecordingNode(calls, f"{prefix}.moe_combine")
@@ -99,7 +99,7 @@ class _RecordingLayer:
         return nullcontext()
 
     def release_state(self):
-        self.calls.append(f"{self.attn.name.split('.')[0]}.release_state")
+        self.calls.append(f"{self.pre_dispatch_computation.name.split('.')[0]}.release_state")
 
 
 class _RecordingChunk:
