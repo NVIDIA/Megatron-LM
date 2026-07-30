@@ -153,9 +153,9 @@ def _flat_placements() -> Placements:
 def _strategy_placements(sharding_strategy: str) -> Placements:
     placements = {
         "no_shard": (Replicate(), Replicate(), Replicate()),
-        "zero1": (Replicate(), Replicate(), Flat()),
-        "zero2": (Replicate(), Flat(), Flat()),
-        "zero3": (Flat(), Flat(), Flat()),
+        "optim": (Replicate(), Replicate(), Flat()),
+        "optim_grads": (Replicate(), Flat(), Flat()),
+        "optim_grads_params": (Flat(), Flat(), Flat()),
     }
     parameter, gradient, optimizer = placements[sharding_strategy]
     return Placements(
@@ -187,7 +187,9 @@ _ALLREDUCE_OP_NAME_SUBSTRING = "allreduce"
 _GEMM_OP_NAME_SUBSTRING = "aten::mm"
 
 
-@pytest.mark.parametrize("sharding_strategy", ["no_shard", "zero1", "zero2", "zero3"])
+@pytest.mark.parametrize(
+    "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
+)
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 def test_fully_shard_sgd_losses_match_baseline(
     distributed_setup, num_microbatches, sharding_strategy
