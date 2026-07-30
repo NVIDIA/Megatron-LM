@@ -268,6 +268,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to log the max attention logit across whole model. Decoupled from qk_clip,
     defualts to False. Setting qk_clip will automatically log the max logit"""
 
+    log_per_layer_profiling: bool = False
+    """If set, create a PerLayerProfiler and install hooks lazily on logged steps."""
+
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
