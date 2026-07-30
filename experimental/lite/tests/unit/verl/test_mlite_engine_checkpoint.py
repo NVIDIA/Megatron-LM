@@ -210,9 +210,7 @@ def test_hf_model_save_fails_loudly_when_model_config_is_missing(tmp_path):
 
 
 def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monkeypatch):
-    engine, module, *_ = _initialized_engine(
-        checkpoint_config={"save_contents": ["hf_model"]}
-    )
+    engine, module, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
     model_cfg = object()
     chunks = [module, object()]
     export_calls = []
@@ -235,25 +233,17 @@ def test_hf_model_only_save_uses_protocol_and_writes_hf_metadata(tmp_path, monke
         {
             "model_cfg": model_cfg,
             "model_chunks": chunks,
-            "protocol": SimpleNamespace(
-                save_hf_weights=lambda *args: export_calls.append(args)
-            ),
+            "protocol": SimpleNamespace(save_hf_weights=lambda *args: export_calls.append(args)),
         }
     )
     monkeypatch.setattr(
         "verl_mlite.engine.mlite_engine.save_training_checkpoint",
-        lambda *args, **kwargs: pytest.fail(
-            "hf_model-only save wrote a native checkpoint"
-        ),
+        lambda *args, **kwargs: pytest.fail("hf_model-only save wrote a native checkpoint"),
     )
 
     engine.save_checkpoint(str(tmp_path), global_step=1)
 
     hf_path = str(tmp_path / "huggingface")
     assert export_calls == [(chunks, hf_path, model_cfg, engine.handle._parallel_state)]
-    assert metadata_calls == [
-        ("config", hf_path),
-        ("tokenizer", hf_path),
-        ("processor", hf_path),
-    ]
+    assert metadata_calls == [("config", hf_path), ("tokenizer", hf_path), ("processor", hf_path)]
     assert hf_config.auto_map == {"AutoModel": "modeling.Model"}

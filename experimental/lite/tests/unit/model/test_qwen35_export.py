@@ -162,10 +162,7 @@ def test_qwen35_online_export_keeps_weights_on_the_source_device() -> None:
 
     exported = dict(
         export_hf_weights(
-            TinyQwen35Module(),
-            _tiny_config(),
-            _single_rank_parallel_state(),
-            cpu=False,
+            TinyQwen35Module(), _tiny_config(), _single_rank_parallel_state(), cpu=False
         )
     )
 
@@ -184,9 +181,9 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
                 layer.moe.experts = nn.Module()
                 layer.moe.experts.fc1 = nn.Module()
                 for local_idx in range(config.num_experts // 2):
-                    tensor = torch.arange(
-                        rows * config.hidden_size, dtype=torch.bfloat16
-                    ).reshape(rows, config.hidden_size)
+                    tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
+                        rows, config.hidden_size
+                    )
                     tensor = tensor + layer_idx * 10000 + local_idx * 1000
                     layer.moe.experts.fc1.register_parameter(
                         f"weight{local_idx}", nn.Parameter(tensor)
@@ -215,8 +212,7 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
         output[tensor.numel() :].copy_(tensor + 2000)
 
     monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
-        fake_all_gather,
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor", fake_all_gather
     )
 
     exported = dict(export_hf_weights(model, cfg, ps))
@@ -233,12 +229,9 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
         getattr(model.layers[1].moe.experts.fc1, f"weight{i}").detach()
         for i in range(cfg.num_experts // ps.ep_size)
     ]
-    layer1_expected = torch.stack(
-        layer1_tensors + [tensor + 2000 for tensor in layer1_tensors]
-    )
+    layer1_expected = torch.stack(layer1_tensors + [tensor + 2000 for tensor in layer1_tensors])
     assert torch.equal(
-        exported["model.language_model.layers.1.mlp.experts.gate_up_proj"],
-        layer1_expected,
+        exported["model.language_model.layers.1.mlp.experts.gate_up_proj"], layer1_expected
     )
 
 
@@ -314,8 +307,7 @@ def test_qwen35_export_rank0_only_still_participates_in_ep_gather(monkeypatch) -
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.is_initialized", lambda: True)
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.get_rank", lambda: 1)
     monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
-        fake_all_gather,
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor", fake_all_gather
     )
 
     exported = list(export_hf_weights(TinyQwen35Module(cfg), cfg, ps, rank0_only=True))
@@ -496,8 +488,7 @@ def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:
         output[tensor.numel() :].copy_(shards[1].view(-1))
 
     monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor",
-        fake_all_gather,
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather_into_tensor", fake_all_gather
     )
 
     exported = dict(export_hf_weights(TinyQwen35Module(shards[0]), cfg, ps))

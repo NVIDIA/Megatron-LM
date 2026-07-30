@@ -242,28 +242,19 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     import megatron.lite.runtime.megatron_utils as megatron_utils
 
     monkeypatch.setattr(
-        megatron_utils,
-        "offload_model_to_cpu",
-        lambda chunks: events.append("offload-model"),
+        megatron_utils, "offload_model_to_cpu", lambda chunks: events.append("offload-model")
     )
     monkeypatch.setattr(
-        megatron_utils,
-        "load_model_to_gpu",
-        lambda chunks, load_grad: events.append("load-model"),
+        megatron_utils, "load_model_to_gpu", lambda chunks, load_grad: events.append("load-model")
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
     monkeypatch.setattr(
-        "megatron.lite.runtime.backends.mlite.runtime.gc.collect",
-        lambda: events.append("collect"),
+        "megatron.lite.runtime.backends.mlite.runtime.gc.collect", lambda: events.append("collect")
     )
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty-cache"))
     chunk = Chunk()
-    handle = ModelHandle(
-        model=chunk,
-        optimizer=Optimizer(),
-        _extras={"model_chunks": [chunk]},
-    )
+    handle = ModelHandle(model=chunk, optimizer=Optimizer(), _extras={"model_chunks": [chunk]})
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
     runtime.to(handle, "cpu", model=True, optimizer=False, grad=True)
@@ -291,15 +282,11 @@ def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch)
     import megatron.lite.runtime.megatron_utils as megatron_utils
 
     monkeypatch.setattr(
-        megatron_utils,
-        "offload_model_to_cpu",
-        lambda chunks: events.append("offload-model"),
+        megatron_utils, "offload_model_to_cpu", lambda chunks: events.append("offload-model")
     )
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=HookedOptimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=HookedOptimizer(), _extras={"model_chunks": [chunk]}
     )
 
     MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(

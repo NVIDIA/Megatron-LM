@@ -290,13 +290,7 @@ def _1f1b_schedule(
         # Megatron dynamic shape exchange: the recv buffer is sized from the shape
         # the sender transmits, so no per-mb shape has to be tracked here.
         return _send_recv_pipeline(
-            send_fwd,
-            send_bwd,
-            recv_fwd,
-            recv_bwd,
-            ps,
-            tensor_shape,
-            dynamic_shape=True,
+            send_fwd, send_bwd, recv_fwd, recv_bwd, ps, tensor_shape, dynamic_shape=True
         )
 
     # ── Warmup: pure forward passes ──
@@ -574,12 +568,16 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_next_rank, p2p_group))
     if recv_fwd:
         if dynamic_shape:
-            fwd_buf = torch.empty(recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+            fwd_buf = torch.empty(
+                recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device()
+            )
         else:
             fwd_buf = (
                 fwd_recv_buf
                 if fwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device()
+                )
             )
         ops.append(dist.P2POp(dist.irecv, fwd_buf, ps.pp_prev_rank, p2p_group))
     if send_bwd is not None:
@@ -587,12 +585,16 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_prev_rank, p2p_group))
     if recv_bwd:
         if dynamic_shape:
-            bwd_buf = torch.empty(recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+            bwd_buf = torch.empty(
+                recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device()
+            )
         else:
             bwd_buf = (
                 bwd_recv_buf
                 if bwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device()
+                )
             )
         ops.append(dist.P2POp(dist.irecv, bwd_buf, ps.pp_next_rank, p2p_group))
 

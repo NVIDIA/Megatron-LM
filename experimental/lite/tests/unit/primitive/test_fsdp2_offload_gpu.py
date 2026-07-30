@@ -79,9 +79,7 @@ class TinyPipelineMoEModel(nn.Module):
 class MemoryStressExperts(nn.Module):
     def __init__(self, numel: int):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(numel, device="cuda", dtype=torch.bfloat16)
-        )
+        self.weight = nn.Parameter(torch.empty(numel, device="cuda", dtype=torch.bfloat16))
 
     def forward(self, x):
         return x + self.weight[0] * 0
@@ -90,9 +88,7 @@ class MemoryStressExperts(nn.Module):
 class MemoryStressMoEUnit(nn.Module):
     def __init__(self, expert_numel: int):
         super().__init__()
-        self.dense_scale = nn.Parameter(
-            torch.ones(1, device="cuda", dtype=torch.bfloat16)
-        )
+        self.dense_scale = nn.Parameter(torch.ones(1, device="cuda", dtype=torch.bfloat16))
         self.experts = MemoryStressExperts(expert_numel)
 
     def forward(self, x):
@@ -102,9 +98,7 @@ class MemoryStressMoEUnit(nn.Module):
 class MemoryStressMoEModel(nn.Module):
     def __init__(self, expert_numel: int, num_units: int):
         super().__init__()
-        self.units = nn.ModuleList(
-            MemoryStressMoEUnit(expert_numel) for _ in range(num_units)
-        )
+        self.units = nn.ModuleList(MemoryStressMoEUnit(expert_numel) for _ in range(num_units))
 
     def forward(self, x):
         for unit in self.units:
@@ -243,9 +237,7 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     torch.manual_seed(1234)
     model = TinyPipelineMoEModel().cuda().to(dtype=torch.bfloat16)
     expert_global_numels = {
-        name: param.numel()
-        for name, param in model.named_parameters()
-        if ".experts." in name
+        name: param.numel() for name, param in model.named_parameters() if ".experts." in name
     }
     optimizer = build_fsdp2_training_optimizer(
         [model],
@@ -280,16 +272,13 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     def assert_grad_devices(device: str) -> None:
         grads = [param.grad for param in model.parameters()]
         assert all(grad is not None for grad in grads)
-        assert {to_local_tensor(grad).device.type for grad in grads if grad is not None} == {
-            device
-        }
+        assert {to_local_tensor(grad).device.type for grad in grads if grad is not None} == {device}
 
     def check_expert_shard_after_forward(_module, _inputs, _output) -> None:
         assert_experts_are_local_shards("cuda")
 
     hooks = [
-        unit.experts.register_forward_hook(check_expert_shard_after_forward)
-        for unit in model.units
+        unit.experts.register_forward_hook(check_expert_shard_after_forward) for unit in model.units
     ]
 
     def train_backward(seed: int) -> None:
@@ -362,8 +351,7 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
         stress_shard_checks.append(True)
 
     stress_hooks = [
-        unit.experts.register_forward_hook(check_stress_expert_shard)
-        for unit in stress_model.units
+        unit.experts.register_forward_hook(check_stress_expert_shard) for unit in stress_model.units
     ]
     device_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
     memory_limit_bytes = resident_bytes + 3 * expert_bytes
@@ -371,9 +359,7 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     torch.cuda.set_per_process_memory_fraction(memory_fraction)
     try:
         with torch.no_grad():
-            stress_output = stress_model(
-                torch.ones(1, device="cuda", dtype=torch.bfloat16)
-            )
+            stress_output = stress_model(torch.ones(1, device="cuda", dtype=torch.bfloat16))
         torch.cuda.synchronize()
         assert torch.cuda.memory_allocated() <= resident_bytes + expert_bytes
         assert len(stress_shard_checks) == len(stress_model.units)
@@ -397,8 +383,8 @@ def test_fsdp2_pp_edp_reshard_and_offload_roundtrip_eight_gpus():
     # barrier: parameters are intentionally left materialized after forward,
     # then runtime.to(..., "cpu") must reshard them before Module.to() sees
     # their DTensor state.
-    materialized_model = TinyPipelineMoEModel(hidden_size=512, num_units=1).cuda().to(
-        dtype=torch.bfloat16
+    materialized_model = (
+        TinyPipelineMoEModel(hidden_size=512, num_units=1).cuda().to(dtype=torch.bfloat16)
     )
     materialized_expert_numels = {
         name: param.numel()

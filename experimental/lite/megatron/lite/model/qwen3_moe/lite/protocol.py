@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
@@ -324,10 +325,7 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module],
-    path: str,
-    model_cfg: Qwen3MoEConfig,
-    ps: ParallelState,
+    chunks: list[nn.Module], path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState
 ) -> None:
     from megatron.lite.model.qwen3_moe.lite.checkpoint import save_hf_weights as _save
 

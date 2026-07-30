@@ -85,3 +85,4 @@ AFTER_SCRIPT: |
   check_log -F "Job sharding has changed: Rerun state will be ignored"
   EXIT_CODE=0
 TEST_TYPE: frozen-start
+LAUNCHER: ft_launcher

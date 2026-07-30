@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
@@ -100,8 +101,8 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     FIRST_PREFIX_BLOCK = "first_prefix_block"
     """Route to the rank that has the first block hash cached. O(ranks) check."""
 
-    ROUND_ROBIN = "round_robin"
-    """Route requests to ranks in round-robin order, ignoring prefix affinity."""
+    LOAD_BALANCED = "load_balanced"
+    """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
 class KVCacheManagementMode(str, Enum):
@@ -139,8 +140,8 @@ class AsyncScheduleMode(str, Enum):
     LEGACY = "legacy"
     """Resolve requests before preparing the next forward pass."""
 
-    SERIAL = "serial"
-    """Prepare and forward speculatively before resolving the sampled requests."""
+    ASYNC = "async"
+    """Overlap asynchronous scheduling phases by reordering them to prepare-before-resolve."""
 
 
 @dataclass
@@ -217,7 +218,7 @@ class InferenceConfig:
     Maximum number of cuda graphs to capture.
     Graph token counts are spaced from 1 up to a per-graph-type budget:
       - Decode-only graphs are always bounded by `max_requests * (num_speculative_tokens + 1)`.
-      - Prefill/mixed graphs share that same bound by default,
+      - Prefill/mixed graphs are bounded by `cuda_graph_max_tokens` by default,
         or extend up to `max_tokens` when `cuda_graph_all_prefills` is set.
     Due to rounding, the actual number of cuda graphs may not equal this argument.
     """
@@ -245,9 +246,17 @@ class InferenceConfig:
     cuda_graph_all_prefills: bool = False
     """
     Whether prefill/mixed CUDA graphs should span up to `max_tokens`.
-    When False (default), prefill/mixed graphs are bounded by the same token limit as decode graphs:
-    `max_requests * (num_speculative_tokens + 1)`.
+    When False (default), prefill/mixed graphs are bounded by `cuda_graph_max_tokens`.
     When True, prefill/mixed graph capture is extended to cover the full `max_tokens` budget.
+    """
+
+    cuda_graph_max_tokens: int = 512
+    """
+    Token ceiling for the largest captured prefill/mixed CUDA graph.
+    This is a raw token count (not scaled by speculative decoding). The effective ceiling is
+    clamped to `[max_requests * (num_speculative_tokens + 1), max_tokens]` so it never falls
+    below the decode bound nor exceeds the token budget. Ignored when `cuda_graph_all_prefills`
+    is set, which extends capture to the full `max_tokens`.
     """
 
     static_kv_memory_pointers: bool = False
@@ -300,7 +309,7 @@ class InferenceConfig:
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
@@ -318,7 +327,17 @@ class InferenceConfig:
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
     on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
     at a single block boundary. When set, Mamba states at KV divergence and last-aligned
-    block boundaries are cached and reused across requests with matching prefixes."""
+    block boundaries are cached and reused across requests with matching prefixes.
+
+    This budget covers both buffers allocated by MambaSlotAllocator: the durable cache
+    (ssm_states/conv_states, max_slots slots reused across requests) and the per-step
+    extraction scratch (intermediate_ssm_out/intermediate_conv_out). The scratch is
+    sized to the tighter of two per-step bounds,
+    ``min(ceil(max_tokens / block_size_tokens), 3 * max_requests)``, since a single
+    engine step can extract at most one state per block_size_tokens of its token budget
+    (and at most 3 per request). The scratch is reserved from this budget first, so a
+    smaller ``max_tokens`` (or ``max_requests``) shrinks the scratch and leaves more
+    durable cache slots."""
 
     # =================================
     # Logging config
@@ -346,7 +365,17 @@ class InferenceConfig:
     """
 
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
-    """Which sampling kernels to use during inference."""
+    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
+    "flashinfer" is requested but the package is not installed."""
+
+    offset_sampling_seed_by_dp_rank: bool = True
+    """
+    If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
+    sampling RNG. This gives each DP rank a unique generation seed so that the same prompt
+    routed to different ranks produces different samples (important for RL training).
+    If False (or `ModelParallelConfig.deterministic_mode` / `--deterministic-mode` is
+    enabled), then all DP ranks share the same sampling / generation seed.
+    """
 
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     """Mode used to schedule dynamic batching inference work."""
@@ -414,8 +443,9 @@ class InferenceConfig:
         if self.sampling_backend == 'flashinfer':
             try:
                 import flashinfer  # noqa: F401
-            except ImportError as e:
-                raise ImportError(
-                    "sampling_backend='flashinfer' requires the flashinfer package; "
-                    "install it or set sampling_backend='torch'."
-                ) from e
+            except ImportError:
+                warnings.warn(
+                    "sampling_backend='flashinfer' was requested but the flashinfer "
+                    "package is not installed; falling back to sampling_backend='torch'."
+                )
+                self.sampling_backend = 'torch'
