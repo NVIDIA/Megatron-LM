@@ -2,6 +2,7 @@
 
 import logging
 import math
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -84,6 +85,83 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
             if not param.requires_grad:
                 continue
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+
+
+def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
+    """Map each (E)GTP_remat-REPLICATED param to ``(gtp_rank, gtp_remat_size)`` for folding.
+
+    PROBLEM: LayerWise keeps (E)GTP_remat-replicated params (identical per gtp_remat peer) WHOLE, so
+    their optimizer-state ShardedTensors share one key+offset across those peers. The DP-coord reset
+    in ``sharded_state_dict`` would then mark all peers the all-zero "main replica" -> DCP sees N
+    writers for one shard and rejects the save.
+
+    FIX: fold the (e)gtp_remat rank into ``replica_id[1]`` so one peer writes. (E)GTP_remat-SHARDED
+    params (``is_gtp_param``) are offset-sharded and excluded -- each shard already has a
+    distinct offset, hence a unique writer.
+
+    Returns: ``{param_name: (gtp_rank, gtp_remat_size)}``, empty when GTP_remat is unavailable or
+    no group spans >1 rank. Names are bare (all ``module.`` wrappers stripped, layer index
+    collapsed) to match the optimizer-state checkpoint key suffix.
+    """
+    gtp_fold: Dict[str, Tuple[int, int]] = {}
+    try:
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, is_gtp_param
+    except ImportError:
+        return gtp_fold
+    if not HAVE_GTP:
+        return gtp_fold
+
+    assert pg_collection is not None, (
+        "_build_gtp_replica_fold requires a pg_collection carrying gtp_remat/expt_gtp_remat; "
+        "the optimizer factory must materialize it before constructing the optimizer."
+    )
+    gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+    egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
+
+    for model_chunk in model_chunks:
+        for name, p in model_chunk.named_parameters():
+            if is_gtp_param(p):
+                continue
+            grp = egtp_remat_group if getattr(p, 'is_expert_parallel', False) else gtp_remat_group
+            if grp is None or grp.size() <= 1:
+                continue
+            # Normalize the param name so it matches the optimizer-state checkpoint key suffix,
+            # which is wrapper-free and layer-collapsed. Three transforms, in order:
+            #   1. drop every leading 'module.' (DDP + Float16Module can double-wrap the model),
+            #   2. collapse the layer index (the checkpoint key drops it -- a sharded axis), and
+            #   3. collapse SequentialMLP 'local_experts.<N>' to the grouped key 'experts' (the
+            #      checkpoint groups them, matching TEGroupedMLP), else expert replicas collide.
+            # e.g.  'module.module.decoder.layers.3.mlp.router.weight'
+            #         -> 'decoder.layers.mlp.router.weight'
+            nm = name
+            while nm.startswith('module.'):
+                nm = nm[len('module.') :]
+            nm = re.sub(r'\.layers\.\d+\.', '.layers.', nm)
+            nm = re.sub(r'\.local_experts\.\d+\.', '.experts.', nm)
+            gtp_fold[nm] = (grp.rank(), grp.size())
+    return gtp_fold
+
+
+def _fold_replica_id(replica_id, key, gtp_fold: Dict[str, Tuple[int, int]]):
+    """Compute a ShardedTensor's writer-disambiguating replica_id for fixed-DP checkpointing.
+
+    Base reset: keep (PP, TP), zero DP -- every DP rank holds the same shard, so one writer
+    remains. Correct for normal params.
+
+    For an (e)gtp-replicated param (in ``gtp_fold``), reset leaves ``gtp_remat_size`` writers, so
+    fold the peer gtp_remat rank into TP slot to re-spread: ``new_tp = old_tp * gtp_remat_size +
+    gtp_rank`` (rank 0 stays the writer, the others move off the all-zero main replica) -> one
+    writer per shard. Suffix-match (bare fold name vs fully-qualified key) and collapse the key's
+    layer index too, so it matches per-layer and already-collapsed keys.
+    """
+    rid = (*replica_id[:2], 0)
+    if not gtp_fold:
+        return rid
+    key = re.sub(r'\.layers\.\d+\.', '.layers.', key or '')
+    for nm, (gtp_rank, gtp_remat_size) in gtp_fold.items():
+        if key.endswith(nm):
+            return (rid[0], rid[1] * gtp_remat_size + gtp_rank, rid[2])
+    return rid
 
 
 class LayerWiseDistributedOptimizer(ChainedOptimizer):
@@ -288,6 +366,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             bucket_indices=bucket_indices,
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=dp_size,
         )
 
     @staticmethod
@@ -366,6 +445,27 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
 
+        # The data-parallel groups this optimizer shards parameters over. Cached here so the
+        # sharding, all-gather and broadcast paths read one attribute instead of reaching back
+        # into pg_collection at every use.
+        self.dp_cp = getattr(pg_collection, 'dp_cp', None) if pg_collection is not None else None
+        self.expt_dp = (
+            getattr(pg_collection, 'expt_dp', None) if pg_collection is not None else None
+        )
+
+        # LayerWise assigns whole params to ranks of the full dp_cp group and all-gathers over
+        # that same group, so it has no notion of optimizer instances. With more than one
+        # instance, DDP reduce-scatters gradients over the smaller intra-instance group, so a
+        # rank would be asked to update params whose gradients it does not hold. Reject the
+        # combination instead of silently training on partial gradients.
+        intra_dp_cp = (
+            getattr(pg_collection, 'intra_dp_cp', None) if pg_collection is not None else None
+        )
+        assert intra_dp_cp is None or get_pg_size(intra_dp_cp) == get_pg_size(self.dp_cp), (
+            "LayerWiseDistributedOptimizer does not support "
+            "num_distributed_optimizer_instances > 1."
+        )
+
         full_param_layouts = None
         if model_chunks is not None:
             full_param_layouts = [
@@ -414,6 +514,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
 
+        self.tp_group = self.pg_collection.tp
+        self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
+        for optimizer in optimizers:
+            # Child optimizers perform TP duplicate filtering when collecting gradients.
+            optimizer.tp_group = self.tp_group
+            optimizer.expert_tp_group = self.expert_tp_group
+
         super().__init__(optimizers)
 
         # Assign self.model_chunks AFTER super().__init__: ChainedOptimizer.__init__
@@ -448,13 +555,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 chunk).  ``None`` triggers the legacy fallback.
         """
         # Simplify when dp_cp group size is 1.
-        dp_cp_size = get_pg_size(self.pg_collection.dp_cp)
+        dp_cp_size = get_pg_size(self.dp_cp)
         if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
             return
 
-        expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
+        expt_dp_size = get_pg_size(self.expt_dp)
 
         if full_param_layouts is not None:
             self._shard_params_from_layout(optimizers, full_param_layouts, dp_cp_size, expt_dp_size)
@@ -463,8 +570,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
     def _shard_params_from_layout(self, optimizers, full_param_layouts, dp_cp_size, expt_dp_size):
         """Derive shard assignments from the param layout."""
-        dp_cp_rank = get_pg_rank(self.pg_collection.dp_cp)
-        expt_dp_rank = get_pg_rank(self.pg_collection.expt_dp)
+        dp_cp_rank = get_pg_rank(self.dp_cp)
+        expt_dp_rank = get_pg_rank(self.expt_dp)
 
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
@@ -478,14 +585,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # separate DistributedOptimizer; LayerWise does not own them.
                 if not buffer_key.is_managed_by_layer_wise_optimizer:
                     continue
-                dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
                 for param, (
                     param_start_index,
                     param_end_index,
                     bucket_id,
                 ) in layout.param_index_map.items():
                     bucket_start_index, bucket_end_index = layout.bucket_indices[bucket_id]
-                    shard_size = (bucket_end_index - bucket_start_index) // dp_size
+                    shard_size = (
+                        bucket_end_index - bucket_start_index
+                    ) // layout.num_optimizer_shards
                     shard_id = (param_start_index - bucket_start_index) // shard_size
                     shard_end_index = bucket_start_index + (shard_id + 1) * shard_size
                     assert param_end_index <= shard_end_index, (
@@ -561,12 +669,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Assign params to rank in ping-pong style loop.
         for p, group_index in param_list:
             if param_groups[group_index].get("is_expert_parallel", False):
-                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.pg_collection.expt_dp):
+                if expt_dp_loop[expt_dp_idx] == get_pg_rank(self.expt_dp):
                     param_groups_this_rank[group_index].append(p)
                 self.expt_dp_params_list[expt_dp_loop[expt_dp_idx]].append(p)
                 expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
             else:
-                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.pg_collection.dp_cp):
+                if dp_cp_loop[dp_cp_idx] == get_pg_rank(self.dp_cp):
                     param_groups_this_rank[group_index].append(p)
                 self.dp_cp_params_list[dp_cp_loop[dp_cp_idx]].append(p)
                 dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
@@ -599,13 +707,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for bucket in group.buckets:
                     if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
-                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
-                    for bucket_list, full_params_list in zip(
-                        bucket_params_list, self.dp_cp_params_list
-                    ):
-                        for param in full_params_list:
-                            if param in bucket.params:
-                                bucket_list.append(param)
+                    if self.dp_cp_params_list is not None:
+                        bucket_params_list = [[] for _ in range(get_pg_size(self.dp_cp))]
+                        for bucket_list, full_params_list in zip(
+                            bucket_params_list, self.dp_cp_params_list
+                        ):
+                            for param in full_params_list:
+                                if param in bucket.params:
+                                    bucket_list.append(param)
+                    else:
+                        # dp_cp_size == 1: single rank owns all params, no
+                        # all-gather needed but data structures must be initialized.
+                        bucket_params_list = [list(bucket.params_list)]
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
@@ -613,9 +726,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
                     if self.expt_dp_params_list is not None:
-                        bucket_params_list = [
-                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
-                        ]
+                        bucket_params_list = [[] for _ in range(get_pg_size(self.expt_dp))]
                         for bucket_list, full_params_list in zip(
                             bucket_params_list, self.expt_dp_params_list
                         ):
@@ -678,9 +789,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.pg_collection is None:
             return
         if self.dp_cp_params_list:
-            _allgather_helper(self.dp_cp_params_list, self.pg_collection.dp_cp)
+            _allgather_helper(self.dp_cp_params_list, self.dp_cp)
         if self.expt_dp_params_list:
-            _allgather_helper(self.expt_dp_params_list, self.pg_collection.expt_dp)
+            _allgather_helper(self.expt_dp_params_list, self.expt_dp)
 
     @torch.no_grad()
     def broadcast_params(self):
@@ -689,15 +800,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if self.dp_cp_params_list is None:
             return
         for i, params in enumerate(self.dp_cp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.dp_cp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.dp_cp, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.dp_cp)
+                torch.distributed.broadcast(p, src_global_rank, self.dp_cp)
         if self.expt_dp_params_list is None:
             return
         for i, params in enumerate(self.expt_dp_params_list):
-            src_global_rank = torch.distributed.get_global_rank(self.pg_collection.expt_dp, i)
+            src_global_rank = torch.distributed.get_global_rank(self.expt_dp, i)
             for p in params:
-                torch.distributed.broadcast(p, src_global_rank, self.pg_collection.expt_dp)
+                torch.distributed.broadcast(p, src_global_rank, self.expt_dp)
 
     @torch.no_grad()
     def get_grad_norm(self):
@@ -753,6 +864,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params,
             grad_stats_parallel_group=None,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.tp_group,
+            expert_tp_group=self.expert_tp_group,
         )
 
     def start_param_sync_for_bucket_group_subset(self) -> None:
@@ -830,14 +943,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             model_sharded_state_dict, is_loading, **kwargs
         )
 
+        # (E)GTP_remat-replicated -> (gtp_rank, gtp_remat_size), consumed by _fold_replica_id.
+        gtp_fold = _build_gtp_replica_fold(self.pg_collection, self.model_chunks)
+
         # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
             if hasattr(sh_base, 'replica_id'):
                 assert (
                     isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
                 ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
-                sh_base.replica_id = (
-                    0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
+                if isinstance(sh_base.replica_id, int):
+                    sh_base.replica_id = 0
+                    continue
+                sh_base.replica_id = _fold_replica_id(
+                    sh_base.replica_id, getattr(sh_base, 'key', ''), gtp_fold
                 )
 
         # later code assume list but chained optimizer fallback to non-list if there's only one

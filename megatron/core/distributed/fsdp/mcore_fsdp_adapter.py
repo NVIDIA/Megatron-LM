@@ -119,7 +119,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         config: TransformerConfig,
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
-        # This should be named fsdp_unit_module_types; the v1 name is retained for API compatibility.
+        # This should be named fsdp_unit_module_types; the v1 name is retained for API
+        # compatibility.
         fsdp_unit_modules: Optional[List[Type[torch.nn.Module]]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
