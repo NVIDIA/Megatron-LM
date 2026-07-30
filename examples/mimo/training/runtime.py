@@ -123,7 +123,9 @@ def wrap_active_modules_with_ddp(
                 [submodule],
                 enc_config,
                 topology.module_pgs[name],
-                ddp_config=_ddp_config_from_args(args, enable_overlap=False),
+                ddp_config=_ddp_config_from_args(
+                    args, enable_overlap=getattr(args, "encoder_ddp_overlap", False)
+                ),
                 data_parallel_random_init=data_parallel_random_init,
                 mixed_precision_wrapper=_EncoderFloat16Module,
             )[0]
