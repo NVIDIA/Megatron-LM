@@ -84,8 +84,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """This config provides the necessary information for the mock dataset."""
 
     sequence_packing_scheduler: Optional[str] = None
-    """Scheduler for sequence packing and hybrid context parallel.
-    dp_balanced: DP-balanced scheduler for sequence packing.
+    """Mirrors ``ModelParallelConfig.sequence_packing_scheduler`` (set from
+    ``--sequence-packing-scheduler``) so dataset code can tell whether an upstream
+    packing scheduler will regroup its samples for sequence packing and hybrid
+    context parallelism. ``dp_balanced``, the DP-balanced scheduler, is the only
+    scheduler implemented today; new algorithms are added by subclassing
+    ``BasePackingScheduler`` and registering them in ``data_schedule.scheduler_map``.
     """
 
     varlen_mock_dataset_config_json: Optional[str] = None
@@ -98,7 +102,11 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
     ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
     SBHD reference run that mirrors the THD path's tokenization but skips all
-    packing — useful for THD numerical-correctness validation."""
+    packing — useful for THD numerical-correctness validation.
+
+    NOTE: this is a debugging/verification knob, not a training feature.
+    TODO: drop this field once a functional test covers THD-vs-SBHD numerical
+    parity in CI."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
