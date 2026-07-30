@@ -742,13 +742,13 @@ class MLASelfAttention(MultiLatentAttention):
             self.q_layernorm = layer_classes["q_layernorm"](
                 hidden_size=self.config.q_lora_rank,
                 config=self.config,
-                eps=self.config.layernorm_epsilon,
+                eps=self.config.attention_latent_norm_epsilon,
             )
 
         self.kv_layernorm = layer_classes["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
     def _resolve_qk_norm_config(
@@ -1462,12 +1462,12 @@ class FusedMLASelfAttention(MLASelfAttention):
         self.q_layernorm = layer_classes["q_layernorm"](
             hidden_size=self.config.q_lora_rank,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
         self.kv_layernorm = layer_classes["kv_layernorm"](
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
     def _qkv_down_projection(self, hidden_states):

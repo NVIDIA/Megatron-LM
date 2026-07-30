@@ -422,14 +422,14 @@ class AbsorbedMLASelfAttention(Attention):
                 layer_classes["q_layernorm"],
                 hidden_size=self.config.q_lora_rank,
                 config=self.config,
-                eps=self.config.layernorm_epsilon,
+                eps=self.config.attention_latent_norm_epsilon,
             )
 
         self.kv_layernorm = build_module(
             layer_classes["kv_layernorm"],
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
     def get_query_key_value_tensors(
