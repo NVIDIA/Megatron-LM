@@ -14,6 +14,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -98,6 +99,24 @@ def _make_gdn_config(**overrides):
     }
     config_kwargs.update(overrides)
     return TransformerConfig(**config_kwargs)
+
+
+def _set_gdn_test_cp_partition_mode(packed_seq_params, cp_size, linear_cp_mode):
+    if cp_size <= 1:
+        return packed_seq_params
+    if linear_cp_mode == "headwise":
+        packed_seq_params.cp_partition_mode = "zigzag"
+    elif linear_cp_mode == "chunkwise":
+        packed_seq_params.cp_partition_mode = "contiguous"
+    else:
+        raise ValueError(f"Invalid linear CP mode: {linear_cp_mode}")
+    return packed_seq_params
+
+
+def _make_sbhd_cp_packed_seq_params(cp_group, cp_partition_mode):
+    return PackedSeqParams(
+        qkv_format="sbhd", cp_group=cp_group, cp_partition_mode=cp_partition_mode
+    )
 
 
 def test_gdn_pre_gated_delta_rule_fusion_defaults_to_disabled():
@@ -543,6 +562,7 @@ class TestGatedDeltaNet:
         hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
         attention_mask_thd = None
         packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+        _set_gdn_test_cp_partition_mode(packed_seq_params, self.cp_size, self.linear_cp_mode)
 
         # THD format
         output_thd, _ = self.gdn(
@@ -594,6 +614,7 @@ class TestGatedDeltaNet:
         padded_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 128]
         )
+        _set_gdn_test_cp_partition_mode(padded_params, self.cp_size, self.linear_cp_mode)
         output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
         output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
         torch.testing.assert_close(
@@ -606,6 +627,7 @@ class TestGatedDeltaNet:
 
         # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
         no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
+        _set_gdn_test_cp_partition_mode(no_padding_params, self.cp_size, self.linear_cp_mode)
         output_thd_no_padding, _ = self.gdn(
             hidden_states_thd, None, packed_seq_params=no_padding_params
         )
@@ -631,11 +653,13 @@ class TestGatedDeltaNet:
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
         )
+        _set_gdn_test_cp_partition_mode(padded_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
 
         # E) actual mismatch branch without *_padded: should raise.
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
+        _set_gdn_test_cp_partition_mode(actual_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
 
@@ -747,6 +771,15 @@ class TestFusedPreGatedDeltaRule:
                 rtol=output_rtol,
                 msg=lambda msg, output_name=name: f"{output_name} mismatch: {msg}",
             )
+
+    def _make_pre_gated_delta_rule_grad_outputs(self, outputs):
+        grad_outputs = []
+        for output_idx, output in enumerate(outputs):
+            grad = torch.linspace(
+                -0.1, 0.1, output.numel(), device=output.device, dtype=torch.float32
+            ).reshape(output.shape)
+            grad_outputs.append(grad + (output_idx - 2.5) * 0.01)
+        return grad_outputs
 
     def test_fused_and_unfused_forward_match(self):
         hidden_states = torch.randn(
@@ -941,6 +974,7 @@ class TestFusedPreGatedDeltaRule:
 
         batch = 2
         seq_len = 32
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -956,7 +990,7 @@ class TestFusedPreGatedDeltaRule:
             qkvzba_unfused, batch, seq_len, reference_gdn.cp_size, reference_gdn.pg_collection.cp
         )
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba_fused)
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -992,6 +1026,7 @@ class TestFusedPreGatedDeltaRule:
             [0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32
         )
         seq_len = cu_seqlens[-1].item()
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -1095,7 +1130,7 @@ class TestFusedPreGatedDeltaRule:
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
             qkvzba_fused, cu_seqlens_q=cu_seqlens
         )
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -1401,6 +1436,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
                 cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)
             ),
             total_tokens=cu_seqlens[-1] // cp_size,
+            cp_partition_mode="contiguous",
         )
 
     @staticmethod
@@ -1734,7 +1770,205 @@ def test_parallel_gated_delta_net_correctness(
         sequence_length=256,
         micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
+        cp_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
+        cp_stage_entry_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
+        compare_param_grads=is_chunkwise_cp and tp == 1 and not sequence_packing,
     )
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+@pytest.mark.parametrize("cp", [2, 4])
+def test_mixed_gdn_sdpa_gpt_model_cp_boundary_forward_backward_correctness(tmp_path_dist_ckpt, cp):
+    if not torch.cuda.is_available() or Utils.world_size < cp:
+        pytest.skip(f"Mixed GDN/SDPA CP parity needs at least {cp} CUDA ranks.")
+
+    sequence_length = 64
+    micro_batch_size = 1
+    vocab_size = 128
+    seed = 123
+
+    def make_config(context_parallel_size):
+        return TransformerConfig(
+            hidden_size=128,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=4,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=4,
+            linear_cp_mode="chunkwise",
+            transformer_impl="transformer_engine",
+            context_parallel_size=context_parallel_size,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+
+    def initialize_gpt_model(
+        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
+    ):
+        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=config, vp_stage=vp_stage, pp_rank=0
+        )
+        cp_stage_entry_partition_mode = (
+            get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        )
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=sequence_length,
+            pre_process=pre_process,
+            post_process=post_process,
+            position_embedding_type="rope",
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
+        )
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    input_ids = torch.randint(
+        low=0,
+        high=vocab_size,
+        size=(micro_batch_size, sequence_length),
+        device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+    )
+    position_ids = torch.arange(
+        sequence_length, device=input_ids.device, dtype=torch.long
+    ).unsqueeze(0)
+    labels = (input_ids + 1) % vocab_size
+
+    def _get_param_grad(param):
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is None:
+            param.grad = torch.zeros_like(param)
+            grad = param.grad
+        return grad
+
+    def _scale_grads(model, scale):
+        for param in model.parameters():
+            if param.requires_grad:
+                _get_param_grad(param).data.mul_(scale)
+
+    def _all_reduce_grads(model, group):
+        for param in model.parameters():
+            if param.requires_grad:
+                torch.distributed.all_reduce(_get_param_grad(param), group=group)
+
+    def _collect_grads(model):
+        return {
+            name: _get_param_grad(param).detach().float().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+    def _zero_grads(model):
+        for param in model.parameters():
+            param.grad = None
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad is not None:
+                main_grad.zero_()
+
+    with TempNamedDir(tmp_path_dist_ckpt / 'test_mixed_gdn_sdpa_gpt_cp', sync=True) as ckpt_dir:
+        mock_args = parse_args(ignore_unknown_args=True)
+        set_args(mock_args)
+
+        baseline_config = make_config(context_parallel_size=1)
+        init_basic_mock_args(mock_args, 1, 1, bf16=True)
+        mock_args.context_parallel_size = 1
+        baseline_model = unwrap_model(get_model(initialize_gpt_model, config=baseline_config))
+        baseline_model[0].eval()
+
+        init_checkpointing_mock_args(mock_args, ckpt_dir, False)
+        mock_args.no_save_optim = True
+        mock_args.no_save_rng = True
+        mock_args.no_load_optim = True
+        mock_args.no_load_rng = True
+        save_checkpoint(10, baseline_model, None, None, 0)
+
+        _zero_grads(baseline_model[0])
+        baseline_loss = baseline_model[0](
+            input_ids=input_ids, position_ids=position_ids, attention_mask=None, labels=labels
+        )
+        baseline_loss.float().sum().backward()
+        _scale_grads(baseline_model[0], 1.0 / baseline_loss.numel())
+        baseline_grads = _collect_grads(baseline_model[0])
+        baseline_loss = baseline_loss.detach()
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp
+        )
+        model_parallel_cuda_manual_seed(seed)
+        parallel_config = make_config(context_parallel_size=cp)
+        init_basic_mock_args(mock_args, 1, 1, bf16=True)
+        mock_args.context_parallel_size = cp
+        parallel_model = unwrap_model(get_model(initialize_gpt_model, config=parallel_config))
+        parallel_model[0].eval()
+        with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
+            with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
+                load_checkpoint(parallel_model, None, None)
+
+        cp_group = parallel_state.get_context_parallel_group()
+        input_partition_mode = parallel_model[0].decoder.cp_stage_entry_partition_mode
+        assert input_partition_mode == "contiguous"
+
+        local_input_ids = get_tensor_on_this_cp_rank(
+            input_ids, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        local_position_ids = get_tensor_on_this_cp_rank(
+            position_ids, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        local_labels = get_tensor_on_this_cp_rank(
+            labels, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        _zero_grads(parallel_model[0])
+        parallel_loss = parallel_model[0](
+            input_ids=local_input_ids,
+            position_ids=local_position_ids,
+            attention_mask=None,
+            labels=local_labels,
+            packed_seq_params=_make_sbhd_cp_packed_seq_params(cp_group, input_partition_mode),
+        )
+
+        expected_loss = get_tensor_on_this_cp_rank(
+            baseline_loss, 1, cp_group, cp_partition_mode=input_partition_mode
+        )
+        torch.testing.assert_close(
+            parallel_loss.float(), expected_loss.float(), atol=2e-3, rtol=2e-3
+        )
+
+        parallel_loss.float().sum().backward()
+        _all_reduce_grads(parallel_model[0], cp_group)
+        _scale_grads(parallel_model[0], 1.0 / baseline_loss.numel())
+        parallel_grads = _collect_grads(parallel_model[0])
+
+        assert baseline_grads.keys() == parallel_grads.keys()
+        for name, baseline_grad in baseline_grads.items():
+            torch.testing.assert_close(
+                parallel_grads[name],
+                baseline_grad,
+                atol=2e-3,
+                rtol=2e-3,
+                msg=lambda msg, param_name=name: f"gradient mismatch for {param_name}: {msg}",
+            )
+
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("cp_size", [2, 4], scope="class")
