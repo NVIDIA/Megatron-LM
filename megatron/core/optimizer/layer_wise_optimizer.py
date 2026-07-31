@@ -708,7 +708,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             group["params"] = local_params
 
         # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     def _build_param_sort_keys(self, model_chunks):
@@ -800,7 +800,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             groups["params"] = params
 
         # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     def set_bucket_layerwise_params_list(self, model_chunks):
@@ -930,8 +930,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
         def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+            # Rank 0 may own zero params in this list -- the ping-pong assignment, and the
+            # dtype split in ``_dispatch`` below, both leave per-rank lists that can be empty.
+            # Mirror ``_allgather_helper_fp8``'s lookup instead of indexing rank 0 blindly.
+            _first = next((params[0] for params in params_list if len(params) > 0), None)
+            if _first is None:
+                # No rank owns any param in this group -> nothing to gather.
+                return
+            device = _first.device
+            dtype = _first.dtype
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
