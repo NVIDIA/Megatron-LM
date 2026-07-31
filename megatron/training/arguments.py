@@ -2004,7 +2004,7 @@ def _add_inference_args(parser):
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='Amount of on-GPU memory allocated for the KV cache. '
+                       help='On-GPU portion of the shared KV cache block pool. '
                        'The total amount of memory allocated for the KV cache '
                        '(CPU + GPU memory) depends on the value set for the '
                        'unified virtual memory (UVM) level (via '
@@ -2016,10 +2016,12 @@ def _add_inference_args(parser):
                        'paused_buffer_size_gb`.')
     group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
                        type=float, default=None,
-                       help='Amount of memory reserved for paused requests in '
-                       'the dynamic inference context. Active requests are '
-                       'paused when there are not enough active blocks available '
-                       'to continue generating a request.')
+                       help='Memory used to derive the paused-request block retention '
+                       'budget. This does not reserve blocks from active requests: '
+                       'active requests may use the entire shared pool of usable KV '
+                       'cache blocks. Under allocation pressure, paused requests '
+                       'retain blocks only within this budget and excess paused '
+                       'requests may be evicted.')
     group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
                        help='Percentage of memory buffer to allocate for Mamba states. '
                        'If not specified, allocates Mamba state tensors for each KV cache block. '
