@@ -394,7 +394,10 @@ class FsdpParameterGroup:
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
             # reduce-scatter for HFSDP) before binding the sharded parameter grads.
-            self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
+            accumulation_grad = self.main_grad
+            self.main_grad = accumulation_grad.redistribute(self.main_weight.placements)
+            if self.main_grad is not accumulation_grad:
+                accumulation_grad.local_buffer.record_stream(torch.cuda.current_stream())
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
