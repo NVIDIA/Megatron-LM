@@ -465,6 +465,7 @@ class OptimizerStateOffloader:
         if not self._has_h2d_pending_work():
             return
         self._h2d_stream.synchronize()
+        self._clear_h2d_pending()
 
     def _mcore_master_cpu_buffers_by_param_id(self) -> Dict[int, torch.Tensor]:
         if not self._shard_fp32_from_float16_cpu_buffers:
@@ -489,6 +490,10 @@ class OptimizerStateOffloader:
         enforced at config validation. Requires sync save: an async writer would race
         the next step's chunk offloads overwriting these same CPU buffers.
         """
+        # An enqueued reload() flips _offloaded off before its H2D copies finish;
+        # callers then fall back to raw GPU reads, so those copies must complete
+        # first (also lets skipped-read paths retire the pending-work flags).
+        self.sync_pending_h2d()
         if not self._offloaded:
             return {}
         if self._d2h_inflight:
@@ -511,7 +516,6 @@ class OptimizerStateOffloader:
             if cpu_master is not None:
                 tensors[self.MASTER_WEIGHT_KEY] = cpu_master
         return tensors
-        self._clear_h2d_pending()
 
     def offload(self, offload_optimizer_states: bool = True, offload_master_weights: bool = True):
         """

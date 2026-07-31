@@ -372,7 +372,8 @@ class OptimizerConfig:
     """
     If True, offload optimizer states to CPU after each optimizer step and
     reload them before the next optimizer step.
-    Checkpoint save temporarily reloads all offloaded states back to GPU.
+    Checkpoint saves are served from the offloaded CPU copies; the legacy
+    non-distributed save path reloads states to GPU first.
     """
 
     offload_optimizer_states_chunk_numel: int = 0

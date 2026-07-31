@@ -178,16 +178,33 @@ def get_tensor_snapshot(tensor):
 
 
 def get_optimizer_state_snapshot(dist_optim):
+    # Offload-released states have zero-storage GPU tensors; read those through the
+    # offloader's checkpoint read gate (their CPU copies), like checkpoint save does.
+    offloader = dist_optim._state_offloader
+
+    def snapshot_tensor(tensor):
+        return tensor.detach().float().cpu().clone()
+
+    def snapshot_master(tensor):
+        if offloader is not None and tensor.untyped_storage().size() == 0:
+            cpu_copy = offloader.get_offloaded_states_for_read(tensor).get("master_param")
+            if cpu_copy is not None:
+                tensor = cpu_copy
+        return snapshot_tensor(tensor)
+
     snapshot = []
     for group in dist_optim.optimizer.param_groups:
         group_state = {"step": group.get("step", None), "params": []}
         if isinstance(group_state["step"], torch.Tensor):
-            group_state["step"] = group_state["step"].detach().clone()
+            group_state["step"] = group_state["step"].detach().cpu().clone()
         for param in group["params"]:
             param_state = dist_optim.optimizer.state.get(param, {})
+            released = (
+                offloader.get_offloaded_states_for_read(param) if offloader is not None else {}
+            )
             group_state["params"].append(
                 {
-                    key: value.detach().float().clone()
+                    key: snapshot_tensor(released.get(key, value))
                     for key, value in param_state.items()
                     if key in ("exp_avg", "exp_avg_sq", "master_param")
                     and isinstance(value, torch.Tensor)
@@ -197,7 +214,7 @@ def get_optimizer_state_snapshot(dist_optim):
     snapshot.append(
         {
             "mcore_master": [
-                tensor.detach().float().clone()
+                snapshot_master(tensor)
                 for group in dist_optim.shard_fp32_from_float16_groups
                 for tensor in group
             ]
@@ -900,8 +917,9 @@ def test_chunked_offload_initializes_mcore_master_weights_on_cpu():
 
 
 @pytest.mark.skipif(not TE_FUSED_ADAM_AVAILABLE, reason="Requires TE FusedAdam")
-def test_chunked_offload_releases_and_restores_mcore_master_weights():
-    """Check chunked residency and full offload idempotence after master release."""
+def test_chunked_offload_releases_mcore_master_weights_and_saves_from_cpu():
+    """Check chunked residency, offload idempotence, and that checkpoint reads
+    are served from the CPU copies without restoring GPU residency."""
     Utils.initialize_model_parallel()
     try:
         model, optim = create_model_and_optimizer(
@@ -937,14 +955,16 @@ def test_chunked_offload_releases_and_restores_mcore_master_weights():
         dist_optim.get_parameter_state_dp_reshardable()
 
         state = offloader._collect_memory_state()
-        assert offloader._offloaded is False
-        assert state["state_gpu_exp_avg"] > 0
-        assert state["state_gpu_exp_avg_sq"] > 0
-        assert state["mcore_master_gpu"] > 0
+        assert offloader._offloaded is True
+        assert state["state_gpu_exp_avg"] == 0
+        assert state["state_gpu_exp_avg_sq"] == 0
+        assert state["mcore_master_gpu"] == 0
+        assert state["state_cpu_exp_avg"] > 0
+        assert state["state_cpu_exp_avg_sq"] > 0
+        assert state["mcore_master_cpu"] > 0
         for group in dist_optim.shard_fp32_from_float16_groups:
             for tensor in group:
-                assert tensor.is_cuda
-                assert tensor.untyped_storage().size() > 0
+                assert tensor.untyped_storage().size() == 0
     finally:
         Utils.destroy_model_parallel()
 
@@ -1001,13 +1021,12 @@ def test_incremental_first_step_state_init_offloads_chunks():
 
     dist_optim.get_parameter_state_dp_reshardable()
 
-    assert offloader._offloaded is False
+    assert offloader._offloaded is True
 
     for state in offloader.adam_optimizer.state.values():
         for state_name in offloader.OPTIMIZER_STATE_KEYS:
             if state_name in state:
-                assert state[state_name].is_cuda
-                assert state[state_name].untyped_storage().size() > 0
+                assert state[state_name].untyped_storage().size() == 0
 
     Utils.destroy_model_parallel()
 

@@ -872,6 +872,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         return getattr(self, 'grad_stats_parallel_group', None)
 
+    def _inner_state_dict_for_bookkeeping(self):
+        """Inner optimizer state dict for callers that only consume 'param_groups'.
+
+        TE FusedAdam.state_dict() is torch's base packing plus an unscale pass that
+        materializes every state tensor via get_unscaled_state(); with optimizer
+        state offloading the bf16->fp32 unscale kernel runs on offload-released
+        (zero-storage) states — an asynchronous illegal memory access. Both callers
+        here (state_dict / load_state_dict) drop 'state' and read only
+        'param_groups', so under offloading pack raw references with the torch base
+        implementation instead. Unscaled state values for checkpoints come from the
+        per-param path (_get_main_param_and_optimizer_states), not from here.
+        """
+        if self._state_offloader is not None:
+            return torch.optim.Optimizer.state_dict(self.optimizer)
+        return self.optimizer.state_dict()
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -880,7 +896,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        inner_state_dict = self.optimizer.state_dict()
+        inner_state_dict = self._inner_state_dict_for_bookkeeping()
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
@@ -974,6 +990,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(state_dict)
             return
 
+        # Mid-run load with already-initialized states: the inner load below reads
+        # and rewrites the existing state tensors, which are zero-storage when
+        # offload-released. Same reload gate as _set_main_param_and_optimizer_states;
+        # no-op on the fresh-start path (states not yet offloaded).
+        if len(self.optimizer.state) != 0:
+            self._reload_offloaded_optimizer_states_for_state_dict()
+
         if len(self.optimizer.state) == 0:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
@@ -1004,7 +1027,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
             param_groups_map[needed_groups] = param_group
-        inner_state_dict = self.optimizer.state_dict()
+        inner_state_dict = self._inner_state_dict_for_bookkeeping()
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
@@ -1129,6 +1152,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
+    @staticmethod
+    def _assert_readable_state(tensor, key):
+        """Fail loud on raw reads of offload-released states.
+
+        A released state keeps its shape but has zero-byte storage; any kernel or
+        copy launched on it is an asynchronous illegal memory access that surfaces
+        only at a later sync (and can silently corrupt a checkpoint written in
+        between). Catch it synchronously at the read site instead.
+        """
+        assert (
+            not isinstance(tensor, torch.Tensor)
+            or not tensor.is_cuda
+            or tensor.numel() == 0
+            or tensor.untyped_storage().size() > 0
+        ), (
+            f"optimizer state '{key}' was offload-released but is being read outside "
+            f"the offload read gate (get_offloaded_states_for_read); this is an "
+            f"offload accounting bug"
+        )
+
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
         model_param.
@@ -1163,17 +1206,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensors[k] = self.optimizer.state[sharded_model_param][k]
                     continue
 
+                self._assert_readable_state(self.optimizer.state[sharded_model_param][k], k)
                 tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
             tensors["param"] = tensors.pop("master_param")
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             offloaded = self._offloaded_states_for_read(main_param)
             optim_state = self.optimizer.state[main_param]
+            if OptimizerStateOffloader.MASTER_WEIGHT_KEY not in offloaded:
+                self._assert_readable_state(main_param, OptimizerStateOffloader.MASTER_WEIGHT_KEY)
             tensors = {
                 "param": offloaded.get(OptimizerStateOffloader.MASTER_WEIGHT_KEY, main_param)
             }
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
+                    if k not in offloaded:
+                        self._assert_readable_state(v, k)
                     tensors[k] = offloaded.get(k, v)
         return tensors
 
@@ -2229,6 +2277,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         method, along with `--ckpt-convert-format` and `--ckpt-convert-save` to
         update a legacy-format checkpoint to the modern format.
         """
+        # This path writes into optimizer state tensors directly; materialize any
+        # offload-released (zero-storage) states first.
+        self._reload_offloaded_optimizer_states_for_state_dict()
 
         # Data parallelism variables.
         assert self.data_parallel_group_gloo is not None
