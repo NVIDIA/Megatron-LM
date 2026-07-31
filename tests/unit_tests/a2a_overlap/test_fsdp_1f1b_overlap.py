@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_shard_optimizer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import TrainingState
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer import TransformerLayer
 from megatron.core.utils import is_te_min_version
@@ -89,6 +90,110 @@ class TestFSDP1F1BOverlap:
             recompute_modules=recompute_modules,
             offload_modules=offload_modules,
         )
+
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+    def test_fsdp_1f1b_genuine_forward_state(self):
+        """A genuine forward must leave PRE_BACKWARD without changing its peer layer."""
+        num_layers = 2
+        num_microbatches = 2
+        extra_kwargs = {"overlap_moe_expert_parallel_comm": True}
+        apply_flex_backend_kwargs(extra_kwargs, "alltoall", None)
+
+        def _make_ddp_config():
+            return DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                megatron_fsdp_main_params_dtype=None,
+            )
+
+        with deterministic_mode():
+            data = build_input_data(seq_len=SEQ_LEN, vocab_size=VOCAB_SIZE)
+
+            control_config = get_test_config(num_layers=num_layers, extra_kwargs=extra_kwargs)
+            control_model = build_gpt_model(control_config, vocab_size=VOCAB_SIZE)
+            init_params = reset_model(control_model)
+            control_fsdp = FullyShardedDataParallel(
+                config=control_config,
+                ddp_config=_make_ddp_config(),
+                module=control_model,
+                fsdp_unit_modules=[TransformerLayer],
+            )
+            # Reproduce the old behavior: genuine forwards inherit the root
+            # PRE_BACKWARD marker and therefore disable forward-order prefetch.
+            control_fsdp.module.prepare_forward_module = lambda module: None
+            control_opt = fully_shard_optimizer(
+                optimizer=torch.optim.SGD(control_fsdp.parameters(), lr=LR)
+            )
+
+            test_config = get_test_config(num_layers=num_layers, extra_kwargs=extra_kwargs)
+            test_model = build_gpt_model(test_config, vocab_size=VOCAB_SIZE)
+            reset_model(test_model, init_params)
+            test_fsdp = FullyShardedDataParallel(
+                config=test_config,
+                ddp_config=_make_ddp_config(),
+                module=test_model,
+                fsdp_unit_modules=[TransformerLayer],
+            )
+            genuine_forward_state_transitions = []
+            original_prepare_forward = test_fsdp.module.prepare_forward_module
+
+            def _track_prepare_forward(module):
+                before = tuple(submodule._training_state for submodule in module.modules())
+                peer_layers = [layer for layer in test_model.decoder.layers if layer is not module]
+                peer_states_before = tuple(
+                    tuple(submodule._training_state for submodule in layer.modules())
+                    for layer in peer_layers
+                )
+                result = original_prepare_forward(module)
+                after = tuple(submodule._training_state for submodule in module.modules())
+                peer_states_after = tuple(
+                    tuple(submodule._training_state for submodule in layer.modules())
+                    for layer in peer_layers
+                )
+                assert peer_states_after == peer_states_before
+                genuine_forward_state_transitions.append((before, after))
+                return result
+
+            test_fsdp.module.prepare_forward_module = _track_prepare_forward
+            test_opt = fully_shard_optimizer(
+                optimizer=torch.optim.SGD(test_fsdp.parameters(), lr=LR)
+            )
+
+            rank = torch.distributed.get_rank()
+            for step in range(NUM_STEPS):
+                control_loss = overlap_train_step(
+                    control_fsdp,
+                    control_opt,
+                    control_config,
+                    data,
+                    num_microbatches=num_microbatches,
+                )
+                test_loss = overlap_train_step(
+                    test_fsdp, test_opt, test_config, data, num_microbatches=num_microbatches
+                )
+                assert torch.equal(control_loss, test_loss), (
+                    f"[rank {rank}] Loss mismatch at step {step}: "
+                    f"control={control_loss.item()}, test={test_loss.item()}"
+                )
+
+            assert_models_equal(control_fsdp, test_fsdp)
+            assert len(genuine_forward_state_transitions) == (
+                NUM_STEPS * num_microbatches * num_layers
+            )
+            assert any(
+                TrainingState.PRE_BACKWARD in before
+                for before, _ in genuine_forward_state_transitions
+            )
+            assert all(
+                TrainingState.PRE_BACKWARD not in after
+                for _, after in genuine_forward_state_transitions
+            )
+
+            del control_fsdp, test_fsdp, control_opt, test_opt
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def _run_test_helper(
         self,

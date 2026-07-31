@@ -222,6 +222,7 @@ class TransformerLayerSchedulePlan:
         self.comp_stream = comp_stream
         self.comm_stream = comm_stream
         self._fsdp_prefetch_recompute_forward_parameters = None
+        self._fsdp_prepare_forward_module = None
 
         # Set by _build_recompute_segments(); None means this layer keeps its graph.
         self.recompute_segment = None
@@ -276,6 +277,7 @@ class TransformerLayerSchedulePlan:
                 self.layer._mhc_recompute_manager = None
             del self.layer
         self._fsdp_prefetch_recompute_forward_parameters = None
+        self._fsdp_prepare_forward_module = None
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
@@ -376,7 +378,9 @@ class TransformerLayerSchedulePlan:
         else:
             self.mtp_post_process = NoopScheduleNode()
 
-    def set_fsdp_reshard_hooks(self, post_forward_hook, post_backward_hook):
+    def set_fsdp_reshard_hooks(
+        self, post_forward_hook, post_backward_hook, prepare_forward_module=None
+    ):
         """Wire FSDP parameter release callbacks for the fine-grained overlap schedule.
 
         The EP overlap schedule bypasses the normal FSDP forward/backward hooks
@@ -390,6 +394,8 @@ class TransformerLayerSchedulePlan:
                 (bwd=False). Typically ``fsdp_wrapper.post_forward_release_module``.
             post_backward_hook: Callable(module) that releases backward-pass params
                 (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
+            prepare_forward_module: Optional callable that clears the root
+                ``PRE_BACKWARD`` marker for this genuine-forward layer.
         """
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
         from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -403,6 +409,9 @@ class TransformerLayerSchedulePlan:
             hook_module = self.layer
         else:
             hook_module = self.layer.mtp_model_layer
+
+        if prepare_forward_module is not None:
+            self._fsdp_prepare_forward_module = lambda: prepare_forward_module(hook_module)
 
         # After the last backward op (attn), release backward-pass params.
         self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
@@ -574,6 +583,13 @@ class TransformerLayerSchedulePlan:
             # Full recompute: retain this segment's input for the backward-time replay.
             if f_layer.recompute_segment is not None:
                 f_layer.recompute_segment.capture(f_layer, f_input)
+
+            # With an odd layer count, the middle unit can schedule forward and
+            # backward on the same underlying layer. Keep PRE_BACKWARD there so
+            # recompute weights remain lazily resharded until backward uses them.
+            same_underlying_layer = b_layer is not None and f_layer.layer is b_layer.layer
+            if f_layer._fsdp_prepare_forward_module is not None and not same_underlying_layer:
+                f_layer._fsdp_prepare_forward_module()
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
 

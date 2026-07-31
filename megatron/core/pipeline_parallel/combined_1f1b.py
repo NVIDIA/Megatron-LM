@@ -420,6 +420,7 @@ def combined_forward_backward_step(
                 layer_plan.set_fsdp_reshard_hooks(
                     forward_fsdp_wrapper.post_forward_release_module,
                     forward_fsdp_wrapper.post_backward_release_module,
+                    forward_fsdp_wrapper.prepare_forward_module,
                 )
                 layer_plan.set_fsdp_recompute_prefetch_hook(
                     forward_fsdp_wrapper.prefetch_recompute_forward_parameters

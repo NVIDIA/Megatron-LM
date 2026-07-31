@@ -537,6 +537,20 @@ class MegatronFSDP(torch.nn.Module):
             params=params, prefetch=False, wait_bucket_ready=False, bwd=False
         )
 
+    def prepare_forward_module(self, module: nn.Module) -> None:
+        """Prepare an FSDP unit for a genuine forward scheduled during backward.
+
+        The root pre-backward hook marks every submodule ``PRE_BACKWARD`` so
+        activation-recomputation forwards do not issue forward-order prefetches
+        or eagerly reshard their parameters. The EP-overlap 1F1B schedule also
+        executes a genuine forward for another microbatch inside that backward
+        window. Clear the marker only for that forward layer; recomputation in
+        the independently scheduled backward layer remains ``PRE_BACKWARD``.
+        """
+        for submodule in module.modules():
+            if submodule._training_state == TrainingState.PRE_BACKWARD:
+                submodule._training_state = TrainingState.IDLE
+
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
 
