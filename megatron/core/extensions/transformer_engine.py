@@ -318,7 +318,9 @@ def add_ptq_calibration_metadata_to_state_dict(
                         scale_inv, op=torch.distributed.ReduceOp.MAX, group=reduction_group
                     )
 
-                tensor_name = re.split(r"_tensor_(?:amax_rowwise|scale_inv)_", key, maxsplit=1)[0]
+                tensor_name = re.split(
+                    r"_tensor_(?:amax(?:_rowwise)?|scale_inv)_", key, maxsplit=1
+                )[0]
                 gemm_match = re.fullmatch(r"(input|weight)_gemm(\d+)", tensor_name)
                 processed_buffers.append((key, scale_inv, gemm_match))
 
