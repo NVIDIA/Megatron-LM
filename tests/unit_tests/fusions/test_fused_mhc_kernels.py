@@ -527,7 +527,6 @@ class TestTritonHPostBDABwdE2EDebug:
             _triton_h_post_bda_bwd,
             fused_h_aggregate,
             fused_h_post_bda,
-            fused_proj_rms,
             fused_sinkhorn,
         )
 
@@ -544,7 +543,7 @@ class TestTritonHPostBDABwdE2EDebug:
         hs = hs_data.clone().requires_grad_(True)
         w = w_data.clone().requires_grad_(True)
         x_2d = hs.reshape(s * b, n * C)
-        proj, r = fused_proj_rms(x_2d, w, eps)
+        proj, r = native_proj_rms(x_2d, w, eps)
         proj = proj.view(s, b, -1)
         r = r.view(s, b, 1)
         h = r * proj
@@ -656,45 +655,6 @@ class TestNativeProjRms:
         proj_f, r_f = native_proj_rms(xf, wf, eps)
         (proj_f * grad_proj + r_f * grad_r).sum().backward()
 
-        xr = x_data.clone().requires_grad_(True)
-        wr = w_data.clone().requires_grad_(True)
-        proj_r, r_r = _ref_proj_rms(xr, wr, eps)
-        (proj_r * grad_proj + r_r * grad_r).sum().backward()
-
-        torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
-        torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
-        torch.testing.assert_close(
-            xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
-        )
-        torch.testing.assert_close(
-            wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on weight"
-        )
-
-
-class TestFusedProjRms:
-    """Public fused proj_rms dispatch/fallback plus numerical correctness."""
-
-    @pytest.mark.flaky_in_dev
-    @_require_cutile
-    @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
-    def test_fwd_bwd_vs_reference(self, M, N, K):
-        """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
-        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms
-
-        _info()
-        eps = 1e-6
-        x_data = _rand(M, K)
-        w_data = _rand(N, K)
-        grad_proj = _rand(M, N)
-        grad_r = _rand(M, 1)
-
-        # -- fused path --
-        xf = x_data.clone().requires_grad_(True)
-        wf = w_data.clone().requires_grad_(True)
-        proj_f, r_f = fused_proj_rms(xf, wf, eps)
-        (proj_f * grad_proj + r_f * grad_r).sum().backward()
-
-        # -- reference path --
         xr = x_data.clone().requires_grad_(True)
         wr = w_data.clone().requires_grad_(True)
         proj_r, r_r = _ref_proj_rms(xr, wr, eps)
@@ -898,7 +858,6 @@ class TestEndToEndFused:
         from megatron.core.fusions.fused_mhc_kernels import (
             fused_h_aggregate,
             fused_h_post_bda,
-            fused_proj_rms,
             fused_sinkhorn,
         )
 
@@ -917,7 +876,7 @@ class TestEndToEndFused:
             w = w_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            proj, r = fused_proj_rms(x_2d, w, eps)
+            proj, r = native_proj_rms(x_2d, w, eps)
             proj = proj.view(s, b, -1)
             r = r.view(s, b, 1)
 
@@ -1232,7 +1191,6 @@ class TestEndToEndFusedBroadcast:
             fused_add_3,
             fused_h_aggregate,
             fused_h_post_bda,
-            fused_proj_rms,
             fused_sinkhorn,
         )
         from megatron.core.transformer.hyper_connection import BroadcastTensorFused
@@ -1254,7 +1212,7 @@ class TestEndToEndFusedBroadcast:
             hs_map, hs_agg, hs_res = BroadcastTensorFused.apply(hs, fused_add_3)
 
             x_2d = hs_map.reshape(s * b, n * C)
-            proj, r = fused_proj_rms(x_2d, w, eps)
+            proj, r = native_proj_rms(x_2d, w, eps)
             proj = proj.view(s, b, -1)
             r = r.view(s, b, 1)
 
@@ -1506,6 +1464,36 @@ class TestFusedProjRmsComputeHKeepFp32:
         for t in (h_pre, h_post, h_res, r):
             assert torch.isfinite(t).all()
 
+    @_require_cutile
+    def test_no_fp32_activation_copy(self):
+        """cuTile must consume the bf16 activations, not an fp32 copy of them.
+
+        The kernels load and cast each tile independently, so normalizing the
+        activation dtype ahead of the launch would only cost memory.
+        """
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        _info()
+        M, n, hidden = 4096, 4, 4096
+        K, N = n * hidden, n * n + 2 * n
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        fused_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - before
+
+        fp32_activation_copy = M * K * 4
+        assert peak < fp32_activation_copy // 2, (
+            f"peak allocation {peak} suggests the activations were upcast "
+            f"(an fp32 copy of x is {fp32_activation_copy} bytes)"
+        )
+
     def test_public_entry_point_native_branch(self, monkeypatch):
         """The public op must also run natively — this is the forced-native path.
 
@@ -1568,61 +1556,3 @@ class TestCutileHAggregateBackwardReduction:
         assert torch.equal(c_gx, t_gx)
         # A bf16 product before the fp32 accumulate showed up here as ~2.5x.
         assert rel(c_gh, ref_gh) <= rel(t_gh, ref_gh) * 1.1
-
-
-class TestFusedProjRmsMixedDtype:
-    """Regression: every proj_rms backend must accept keep_in_fp32 parameters.
-
-    The standalone entry point is not on the training path (compute_mappings
-    uses the fused compute_h op), but it must still work with bf16 activations
-    against an fp32 weight, and it must not pay for that with a full fp32 copy
-    of the activations on the cuTile branch.
-    """
-
-    @pytest.mark.parametrize("M,N,K", [(4096, 24, 16384)])
-    def test_cutile_takes_mixed_dtypes_without_copying_activations(self, M, N, K):
-        """cuTile consumes bf16 activations directly, with no fp32 copy of x."""
-        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms, is_cutile_available
-
-        _info()
-        if not is_cutile_available():
-            pytest.skip("cuTile unavailable for current device")
-
-        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
-        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
-
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        before = torch.cuda.memory_allocated()
-        proj, r = fused_proj_rms(x, w, 1e-6)
-        torch.cuda.synchronize()
-        peak = torch.cuda.max_memory_allocated() - before
-
-        # An fp32 copy of x alone would be M * K * 4 bytes.
-        fp32_activation_copy = M * K * 4
-        assert peak < fp32_activation_copy // 2, (
-            f"peak allocation {peak} suggests the activations were upcast "
-            f"(an fp32 copy of x is {fp32_activation_copy} bytes)"
-        )
-
-        # Accuracy against an fp64 reference built from the same input values.
-        x64, w64 = x.to(torch.float64), w.to(torch.float64)
-        ref_proj = x64 @ w64.t()
-        ref_r = 1.0 / (x64.norm(dim=-1, keepdim=True) / math.sqrt(K) + 1e-6)
-        for got, ref, name in ((proj, ref_proj, "proj"), (r, ref_r, "r")):
-            got64, ref64 = got.to(torch.float64), ref
-            rms = ((got64 - ref64).pow(2).mean().sqrt() / ref64.abs().max().clamp_min(1e-30)).item()
-            assert rms < 1e-4, f"{name} rms rel err {rms:.3e}"
-
-    @pytest.mark.parametrize("M,N,K", [(256, 24, 4096)])
-    def test_native_branch_accepts_mixed_dtypes(self, M, N, K, monkeypatch):
-        """With cuTile unavailable the native branch must still run."""
-        from megatron.core.fusions import fused_mhc_kernels as fused_mod
-
-        _info()
-        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: False)
-
-        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
-        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
-        proj, r = fused_mod.fused_proj_rms(x, w, 1e-6)
-        assert torch.isfinite(proj).all() and torch.isfinite(r).all()
