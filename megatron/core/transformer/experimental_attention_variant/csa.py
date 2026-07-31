@@ -1800,9 +1800,10 @@ class CompressedSparseAttention(MegatronModule):
             self.indexer = None
 
         # Compact CUDA graphs reference caller-owned cuDNN buffers by
-        # address. Retain every warmed-up geometry for the lifetime of this
-        # module so later graph captures cannot invalidate an earlier graph's
-        # storage. ``_active_*`` identifies the immediately preceding warmup.
+        # address. Retain every warmed-up static geometry for the lifetime of
+        # this module so later graph captures cannot invalidate an earlier
+        # graph's storage. ``_active_*`` identifies the immediately preceding
+        # warmup.
         self._bshd_compact_indexer_workspaces: list[BSHDCompactIndexerWorkspace] = []
         self._active_bshd_compact_indexer_workspace: BSHDCompactIndexerWorkspace | None = None
         self._thd_compact_indexer_workspaces: list[THDCompactIndexerWorkspace] = []
@@ -1928,7 +1929,6 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_k=max_seqlen_k,
                 q_causal_offsets=q_causal_offsets,
                 return_softmax=return_softmax,
-                check_sequence_values=False,
                 precision=precision,
             ):
                 return workspace
@@ -1949,7 +1949,6 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_k=max_seqlen_k,
                 q_causal_offsets=q_causal_offsets,
                 return_softmax=return_softmax,
-                check_sequence_values=True,
                 precision=precision,
             ):
                 self._active_thd_compact_indexer_workspace = workspace

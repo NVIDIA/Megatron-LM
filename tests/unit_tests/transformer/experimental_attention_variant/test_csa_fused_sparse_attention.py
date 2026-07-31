@@ -3833,6 +3833,31 @@ class TestThdWrapperDispatchAndValidation:
             )
         assert workspace is not None
         assert workspace.softmax_out is None
+        changed_cu_q = _make_cu_seqlens([2, 3], device="cuda")
+        assert workspace.matches(
+            q=q,
+            k=k,
+            topk=topk,
+            ratio=4,
+            cu_seqlens_q=changed_cu_q,
+            cu_seqlens_k=cu_kv,
+            max_seqlen_q=3,
+            max_seqlen_k=2,
+            q_causal_offsets=None,
+            return_softmax=False,
+        )
+        assert not workspace.matches(
+            q=q,
+            k=k,
+            topk=topk,
+            ratio=4,
+            cu_seqlens_q=torch.tensor([0, 1, 3, 5], dtype=torch.int32, device=q.device),
+            cu_seqlens_k=torch.tensor([0, 1, 2, 4], dtype=torch.int32, device=q.device),
+            max_seqlen_q=3,
+            max_seqlen_k=2,
+            q_causal_offsets=None,
+            return_softmax=False,
+        )
         fake_dsa.indexer_forward_top_k_wrapper.return_value = {
             'indices': workspace.out_indices.zero_(),
             'logits': workspace.out_logits.zero_(),
