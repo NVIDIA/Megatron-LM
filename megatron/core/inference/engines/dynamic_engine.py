@@ -1636,6 +1636,26 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
+    def _mamba_batch_invariant_prefill_chunk_length(
+        self, req: DynamicInferenceRequest, capacity: int
+    ) -> int:
+        """Raw prefill length that computes an aligned chunk within ``capacity``.
+
+        Non-final calls must start and end at Mamba chunk boundaries. The final
+        prompt call may be shorter because it seeds the decode replay tail.
+        """
+        remaining = len(req.remaining_prompt_tokens)
+        if capacity >= remaining:
+            return remaining
+
+        chunk_size = self.context.mamba_chunk_size
+        computed_tokens = (capacity // chunk_size) * chunk_size
+        if remaining - computed_tokens == 1:
+            computed_tokens -= chunk_size
+        if computed_tokens <= 0:
+            return 0
+        return computed_tokens
+
     def schedule_waiting_requests(self) -> None:
         """Try to schedule requests from the waiting pool."""
         # Keep track of which requests get scheduled.
@@ -1887,6 +1907,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+            batch_invariant_mamba_prefill = (
+                self.context.batch_invariant_mode and self.context.is_hybrid_model
+            )
 
             # Check for conflicting block hashes.
             if prefix_caching_enabled and not is_continuing_chunked_prefill:
@@ -1939,7 +1962,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     computed_chunk = computed_budget
 
-                prefill_chunk_length = prefix_skip + computed_chunk
+                if batch_invariant_mamba_prefill:
+                    prefill_chunk_length = self._mamba_batch_invariant_prefill_chunk_length(
+                        req, computed_chunk
+                    )
+                    if prefill_chunk_length == 0:
+                        can_schedule = False
+                        break
+                else:
+                    prefill_chunk_length = prefix_skip + computed_chunk
 
                 # Mamba prefix caching: keep chunk boundaries block-aligned.
                 # compute_and_store_offsets() records a recurrent-state snapshot at a
@@ -1975,7 +2006,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # See https://github.com/Dao-AILab/flash-attention/issues/1537
                 # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
                 # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
-                if remaining_len - prefill_chunk_length == 1:
+                if not batch_invariant_mamba_prefill and remaining_len - prefill_chunk_length == 1:
                     if computed_chunk > 1:
                         prefill_chunk_length -= 1
                     else:
