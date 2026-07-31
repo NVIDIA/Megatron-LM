@@ -912,6 +912,9 @@ class Compressor(MegatronModule):
         self.head_dim = head_dim
         self.overlap = compress_ratio == 4
         self.coff = 1 + int(self.overlap)
+        # Same switch as the other optional CSA/DSA fused kernels: attempt the fused
+        # compressor when enabled, keep the eager region otherwise.
+        self.use_fused_compressor = use_fused_dsa_kernels(config)
         self.rotate = rotate
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
 
@@ -1136,6 +1139,7 @@ class Compressor(MegatronModule):
                 ratio=ratio,
                 head_dim=self.head_dim,
                 coff=self.coff,
+                enabled=self.use_fused_compressor,
             )
 
         if compressed_thd is None:

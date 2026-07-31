@@ -27,16 +27,29 @@ bit-identical to the eager region (which rounds the softmax weights to bf16 and
 multiplies in bf16) but at least as accurate against an fp64 oracle; forward, ``dKV``
 and ``dScore`` are bitwise run-to-run deterministic, ``dAPE`` is accumulated with fp32
 atomics and is not — the dispatch therefore keeps the eager path under
-``torch.use_deterministic_algorithms(True)``. Measurements and numerics analysis:
-cudnn-frontend PR #427 and https://github.com/NVIDIA/Megatron-LM/issues/5968.
+``torch.use_deterministic_algorithms(True)``. The two ratio families carry different
+contracts against that fp32-intermediate eager reference: at ``compress_ratio == 4``
+``dKV``/``dScore`` are bit-identical to it, while at ``compress_ratio == 128`` they are
+faithful within the r128 gate tolerances (differing elements <= max(1, 0.1%), max_abs
+<= 1.6e-2 on the frontend gate's documented input distribution). Keeping the softmax
+weights in fp32 also makes the fused output measurably closer to an fp64 oracle than the
+region it replaces: on a 4096-token pack the fused forward's max absolute error against
+that oracle is 1.4-2.6x smaller than the eager region's across ``compress_ratio in
+{4, 128}`` x ``coff in {1, 2}`` x ``head_dim in {128, 512}``, and matches an
+fp32-intermediate eager reference (what remains is the single final bf16 rounding).
+Measurements and numerics analysis: cudnn-frontend PR #427 and
+https://github.com/NVIDIA/Megatron-LM/issues/5968.
 
-Dispatch gating (initial; everything else keeps eager):
-  - ``MCORE_CSA_FUSED_COMPRESSOR=0`` kill switch (disables the dispatch entirely);
+Dispatch gating (everything else keeps eager):
+  - the caller's ``use_fused_dsa_kernels(config)`` decision, i.e. the same switch that
+    gates the other optional CSA/DSA fused kernels (``Compressor.use_fused_compressor``);
   - cudnn-frontend with the CSA compressor API importable, CUDA device with compute
     capability 10.0 (the frontend's validated envelope);
-  - ``compress_ratio == 4`` / ``coff == 2`` (the production CSA/HCA configuration;
-    ``compress_ratio == 128`` stays on eager pending tuning), bf16 ``kv``/``score``,
-    fp32 ``ape``, int32 flat offsets (``total_tokens * coff * head_dim < 2**31``);
+  - ``compress_ratio in {4, 128}`` and ``coff in {1, 2}`` (the frontend's validated
+    envelope; ``Compressor`` itself only produces ``(4, 2)`` and ``(128, 1)``), with
+    ``compress_ratio == 128`` additionally restricted to ``head_dim in {128, 512}``
+    (the r128 kernels' validated head dims); bf16 ``kv``/``score``, fp32 ``ape``, int32
+    flat offsets (``total_tokens * coff * head_dim < 2**31``);
   - eager under deterministic mode (``dAPE`` atomics, above) and under
     ``torch.compile`` tracing (the frontend launch path takes raw pointers; eager lets
     the compiler fuse the region itself).
@@ -48,17 +61,31 @@ configuration before capture (a first call that would JIT under capture raises a
 static ``total_comp`` capacity through, so no device synchronization is introduced.
 """
 
-import os
+import logging
 from typing import Optional
 
 import torch
 
-_ENV_ENABLE = "MCORE_CSA_FUSED_COMPRESSOR"
+logger = logging.getLogger(__name__)
 
 # The compute capability the frontend kernels are validated for (its ``check_support``
 # raises on anything else); the dispatch pre-filters so other devices keep eager
 # silently. Mirrors ``cudnn.csa.compressor``'s envelope — widen together with it.
 _SUPPORTED_COMPUTE_CAPABILITY = (10, 0)
+
+# Mirrors ``cudnn.csa.compressor``'s validated envelope: ``ratio in {4, 128}`` x
+# ``coff in {1, 2}``. ``Compressor`` currently only produces (4, 2) and (128, 1) --
+# ``overlap`` is derived from ``compress_ratio`` -- but the gate follows the kernels
+# rather than that derivation, so a future overlap-policy change keeps the fast path
+# instead of silently falling back to eager. Widen together with the frontend.
+_SUPPORTED_RATIOS = frozenset({4, 128})
+_SUPPORTED_COFF = frozenset({1, 2})
+# ratio 128 is served by the frontend's dedicated r128 kernels, validated for these
+# head dims.
+_R128_HEAD_DIMS = frozenset({128, 512})
+
+# One-shot guard so a missing frontend warns once per process, not once per layer-call.
+_warned_missing_frontend = False
 
 _UNINITIALIZED = object()
 # Lazily resolved ``cudnn.csa.compressor`` module: ``_UNINITIALIZED`` -> not probed yet,
@@ -96,15 +123,13 @@ def _get_frontend():
     return _frontend
 
 
-def _dispatch_enabled() -> bool:
-    """Return True unless the fused compressor is disabled via environment variable."""
-    return os.environ.get(_ENV_ENABLE, "1").lower() not in ("0", "false", "off")
-
-
 def fused_compressor_available(device: Optional[torch.device] = None) -> bool:
-    """Return True when the fused kernels can run: frontend importable + supported device."""
-    if _get_frontend() is None:
-        return False
+    """Return True when the fused kernels can run: supported device + frontend importable.
+
+    The device is checked first so the missing-frontend warning below is only emitted
+    where the kernels could actually have run (compute capability 10.0); on every other
+    device the eager path is the expected outcome, not a misconfiguration.
+    """
     try:
         if not torch.cuda.is_available():
             return False
@@ -120,7 +145,22 @@ def fused_compressor_available(device: Optional[torch.device] = None) -> bool:
     if supported is None:
         supported = torch.cuda.get_device_capability(index) == _SUPPORTED_COMPUTE_CAPABILITY
         _DEVICE_SUPPORTED_CACHE[index] = supported
-    return supported
+    if not supported:
+        return False
+    if _get_frontend() is None:
+        global _warned_missing_frontend
+        if not _warned_missing_frontend:
+            _warned_missing_frontend = True
+            logger.warning(
+                "CSA fused compressor is enabled and this device is supported, but "
+                "cudnn-frontend's CSA compressor API is unavailable (%s: %s); keeping the "
+                "eager compressor. Install nvidia-cudnn-frontend (with the 'cutedsl' "
+                "extra) to enable the fused path.",
+                type(_frontend_error).__name__,
+                _frontend_error,
+            )
+        return False
+    return True
 
 
 class _CompressThdFused(torch.autograd.Function):
@@ -188,6 +228,7 @@ def maybe_compress_thd_fused(
     ratio: int,
     head_dim: int,
     coff: int,
+    enabled: bool = True,
 ) -> Optional[torch.Tensor]:
     """Dispatch helper for ``Compressor._forward_thd``: fused result or None (use eager).
 
@@ -197,13 +238,15 @@ def maybe_compress_thd_fused(
     ``check_support`` re-validates the envelope and raises (instead of falling back) on
     anything the gates below let through.
     """
-    if not _dispatch_enabled():
+    if not enabled:
         return None
     if kv.device.type != "cuda":
         return None
     if not fused_compressor_available(kv.device):
         return None
-    if ratio != 4 or coff != 2:
+    if ratio not in _SUPPORTED_RATIOS or coff not in _SUPPORTED_COFF:
+        return None
+    if ratio == 128 and head_dim not in _R128_HEAD_DIMS:
         return None
     if kv.dtype != torch.bfloat16 or score.dtype != torch.bfloat16:
         return None

@@ -11,8 +11,8 @@ cover the Megatron-side wiring only:
     reference, forward within one bf16 rounding step, tolerance vs the verbatim
     upstream eager numerics;
   - static-capacity padding rows (``fixed_total_comp``) through the dispatch;
-  - dispatch gating / eager fallback of ``maybe_compress_thd_fused``: the
-    ``MCORE_CSA_FUSED_COMPRESSOR=0`` kill switch, deterministic mode, unsupported
+  - dispatch gating / eager fallback of ``maybe_compress_thd_fused``: the caller's
+    ``enabled`` switch, deterministic mode, unsupported
     configurations, and a missing/old cudnn-frontend (no ``cudnn.csa``);
   - ``Compressor._forward_thd`` integration: the fused dispatch engages and matches
     eager, gradients flow, and the module falls back to the bitwise-identical eager
@@ -212,7 +212,7 @@ def test_fixed_total_comp_padding():
     assert (r_fused[3] - r_fp32[3]).abs().max().item() <= 1e-3
 
 
-def test_dispatch_gating_and_fallback(monkeypatch):
+def test_dispatch_gating_and_fallback():
     """``maybe_compress_thd_fused`` returns None for every unsupported configuration."""
     _require_fused()
     kv, score, ape, cu, cuc, total_comp, _ = _make_inputs([512, 256], 128, 4, 2)
@@ -221,10 +221,11 @@ def test_dispatch_gating_and_fallback(monkeypatch):
     supported = cfc.maybe_compress_thd_fused(kv, score, ape, cu, cuc, total_comp, **kwargs)
     assert supported is not None and supported.shape == (total_comp, 1, 128)
 
-    # Kill switch.
-    monkeypatch.setenv("MCORE_CSA_FUSED_COMPRESSOR", "0")
-    assert cfc.maybe_compress_thd_fused(kv, score, ape, cu, cuc, total_comp, **kwargs) is None
-    monkeypatch.delenv("MCORE_CSA_FUSED_COMPRESSOR")
+    # Disabled by the caller (``use_fused_dsa_kernels(config)`` is False).
+    assert (
+        cfc.maybe_compress_thd_fused(kv, score, ape, cu, cuc, total_comp, enabled=False, **kwargs)
+        is None
+    )
 
     # Missing/old cudnn-frontend (no ``cudnn.csa``): the probe caches None and the
     # dispatch keeps eager.
@@ -256,12 +257,39 @@ def test_dispatch_gating_and_fallback(monkeypatch):
     finally:
         torch.use_deterministic_algorithms(prev_det, warn_only=prev_warn)
 
-    # compress_ratio 128 stays on eager (kernels support it in the frontend, not yet a
-    # wall-clock win at production sizes).
+    # compress_ratio 128 / coff 1 (the non-overlapping form) dispatches as well.
     kv1, score1, ape1, cu1, cuc1, tc1, _ = _make_inputs([1024], 128, 128, 1)
+    out_r128 = cfc.maybe_compress_thd_fused(
+        kv1, score1, ape1, cu1, cuc1, tc1, ratio=128, head_dim=128, coff=1
+    )
+    assert out_r128 is not None and out_r128.shape == (tc1, 1, 128)
+
+    # Head dims outside the r128 kernels' validated set stay on eager.
     assert (
         cfc.maybe_compress_thd_fused(
-            kv1, score1, ape1, cu1, cuc1, tc1, ratio=128, head_dim=128, coff=1
+            kv1, score1, ape1, cu1, cuc1, tc1, ratio=128, head_dim=64, coff=1
+        )
+        is None
+    )
+
+    # The gate follows the frontend envelope, not the Compressor's ratio -> coff
+    # derivation: the other two validated combinations dispatch as well.
+    kv2, score2, ape2, cu2, cuc2, tc2, _ = _make_inputs([1024], 128, 128, 2)
+    out_r128_c2 = cfc.maybe_compress_thd_fused(
+        kv2, score2, ape2, cu2, cuc2, tc2, ratio=128, head_dim=128, coff=2
+    )
+    assert out_r128_c2 is not None and out_r128_c2.shape == (tc2, 1, 128)
+
+    kv3, score3, ape3, cu3, cuc3, tc3, _ = _make_inputs([1024], 128, 4, 1)
+    out_r4_c1 = cfc.maybe_compress_thd_fused(
+        kv3, score3, ape3, cu3, cuc3, tc3, ratio=4, head_dim=128, coff=1
+    )
+    assert out_r4_c1 is not None and out_r4_c1.shape == (tc3, 1, 128)
+
+    # Ratios outside the frontend envelope stay on eager.
+    assert (
+        cfc.maybe_compress_thd_fused(
+            kv3, score3, ape3, cu3, cuc3, tc3, ratio=8, head_dim=128, coff=1
         )
         is None
     )
@@ -335,6 +363,9 @@ class TestCompressorFusedIntegration:
             dsa_indexer_head_dim=64,
             dsa_indexer_topk=8,
             dsa_indexer_loss_coeff=0.0,
+            # The fused compressor follows the same switch as the other optional
+            # CSA/DSA fused kernels (use_fused_dsa_kernels).
+            dsa_kernel_backend='cudnn',
         )
         cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
 
@@ -368,7 +399,7 @@ class TestCompressorFusedIntegration:
             pg_collection=self.pg_collection,
         ).cuda()
 
-    def test_forward_thd_fused_matches_eager(self, monkeypatch):
+    def test_forward_thd_fused_matches_eager(self):
         """THD forward: the fused dispatch engages and matches the eager path closely."""
         _require_fused()
         compressor = self._make_compressor()
@@ -394,11 +425,13 @@ class TestCompressorFusedIntegration:
         assert len(returns) == 1
         assert returns[0] is not None, "fused fast path did not engage"
 
-        monkeypatch.setenv("MCORE_CSA_FUSED_COMPRESSOR", "0")
-        out_eager, cuc_eager = compressor._forward_thd(
-            x, cu_seqlens, max_seqlen_q=max(lens), fixed_total_comp=total // 4
-        )
-        monkeypatch.delenv("MCORE_CSA_FUSED_COMPRESSOR")
+        # Scope the disable to this call only: the missing-frontend block below must
+        # reach the frontend probe, not exit early at the ``enabled`` gate.
+        with pytest.MonkeyPatch.context() as mp_off:
+            mp_off.setattr(compressor, "use_fused_compressor", False)
+            out_eager, cuc_eager = compressor._forward_thd(
+                x, cu_seqlens, max_seqlen_q=max(lens), fixed_total_comp=total // 4
+            )
 
         assert out_fused.shape == out_eager.shape
         assert torch.equal(cuc_fused, cuc_eager)
