@@ -188,13 +188,42 @@ class TestLayerWiseOptimizer:
                 assert torch.allclose(param.data, original_params[name])
 
     # TODO(deyuf): check bf16 False case
+    # Cover both sides of use_layer_wise_distributed_optimizer with a real distributed
+    # optimizer on each side. ``plain_distopt`` is an in-file CONTROL -- test_optimizer.py's
+    # resharding tests already cover a plain bf16 DistOpt under fully_reshardable, and harder
+    # resharding cases besides; it is here to show the same harness behaves with and without
+    # LayerWise. ``layerwise_compact`` is the load-bearing arm: it is the only fully_reshardable
+    # coverage of the compact layout above tp=pp=1, and the only one with grad_reduce_in_fp32
+    # left at its default. ``use_param_layout`` is the DDP-level LayerWise routing switch
+    # (ddp_use_layer_wise = use_layer_wise and use_param_layout), so the LayerWise arm needs it
+    # True to build the decoupled layout at all; ``use_layer_wise_param_layout`` stays False,
+    # which selects the COMPACT layout this PR adds -- the padded shard-aligned layout is out of
+    # scope. The legacy ping-pong path (dist_opt=False) is covered by the other tests here.
+    @pytest.mark.parametrize(
+        'layer_wise',
+        [pytest.param(False, id='plain_distopt'), pytest.param(True, id='layerwise_compact')],
+    )
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     @pytest.mark.parametrize('bf16', [True])
-    def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp, pp, bf16):
+    def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp, pp, bf16, layer_wise):
         """Test save/load of LayerWiseDistributedOptimizer checkpoints."""
         if tp * pp > 8:
             pytest.skip(f"TP*PP > 8 is larger than world size")
+        _kw = dict(
+            optimizer='dist_muon' if layer_wise else 'adam',
+            use_param_layout=layer_wise,
+            use_layer_wise_param_layout=False,
+        )
+        # Both arms now build a real DistributedOptimizer, so the format has to be requested:
+        #  - the default fully_sharded_model_space is unusable here -- the compact layout is
+        #    rejected outright, and an ordinary DistOpt dies deeper in ``replace(...)`` with
+        #    "ShardedTensor.flattened_range is not supported";
+        #  - dp_reshardable synthesizes padding with ``torch.empty``, so two saves of identical
+        #    state differ in the uninitialized padding bytes and the check_equal below would be
+        #    flaky (this is why test_decouple_ckpt_roundtrip_values needs its canonical view).
+        # fully_reshardable has neither problem and keeps the plain A-vs-B comparison valid.
+        _md = {'distrib_optim_sharding_type': 'fully_reshardable'}
 
         Utils.initialize_model_parallel(tp, pp)
 
@@ -210,14 +239,14 @@ class TestLayerWiseOptimizer:
                     tp=tp,
                     pp=pp,
                     bf16=bf16,
-                    dist_opt=False,
+                    dist_opt=True,
                     initialize_fn=initialize_gpt_model,
-                    optimizer='dist_muon',
+                    **_kw,
                 )
 
                 # Save checkpoint A
                 model_sharded_sd_A = model_A[0].sharded_state_dict()
-                optim_sd_A = optimizer_A.sharded_state_dict(model_sharded_sd_A)
+                optim_sd_A = optimizer_A.sharded_state_dict(model_sharded_sd_A, metadata=_md)
                 save(optim_sd_A, ckpt_dir_A)
 
                 # Create model and optimizer B with different seed
@@ -226,21 +255,21 @@ class TestLayerWiseOptimizer:
                     tp=tp,
                     pp=pp,
                     bf16=bf16,
-                    dist_opt=False,
+                    dist_opt=True,
                     initialize_fn=initialize_gpt_model,
-                    optimizer='dist_muon',
+                    **_kw,
                 )
 
                 # Load checkpoint A into optimizer B
                 model_sharded_sd_B = model_B[0].sharded_state_dict()
                 load_sharded_sd = optimizer_B.sharded_state_dict(
-                    model_sharded_sd_B, is_loading=True
+                    model_sharded_sd_B, is_loading=True, metadata=_md
                 )
                 state_dict = load(load_sharded_sd, ckpt_dir_A)
                 optimizer_B.load_state_dict(state_dict)
 
                 # Save as checkpoint B
-                optim_sd_B = optimizer_B.sharded_state_dict(model_sharded_sd_B)
+                optim_sd_B = optimizer_B.sharded_state_dict(model_sharded_sd_B, metadata=_md)
                 save(optim_sd_B, ckpt_dir_B)
 
                 Utils.destroy_model_parallel()
@@ -389,10 +418,11 @@ class TestLayerWiseOptimizer:
             save(optim_sd, ckpt_dir)
         Utils.destroy_model_parallel()
 
-    # NOTE: 'fully_sharded_model_space' is intentionally NOT covered here. It is incompatible with
-    # the decoupled compact LayerWise (Muon) DistOpt layout regardless of precision: the sibling
-    # embedding / output_layer params produce a flattened_range ShardedTensor that
-    # dist_checkpointing rejects ('ShardedTensor.flattened_range is not supported'). This was
+    # NOTE: 'fully_sharded_model_space' is intentionally NOT covered here. It is non-functional
+    # for EVERY DistributedOptimizer in this tree, not only the decoupled compact LayerWise (Muon)
+    # layout: sharded_param_state_fs_model_space sets flattened_range on every non-factory param,
+    # and dist_checkpointing rejects that unconditionally ('ShardedTensor.flattened_range is not
+    # supported'); only ShardedTensorFactory (gated-MLP fc1) escapes. This was
     # confirmed to fail identically for bf16 and fp8 (so it is NOT fp8-specific), and it raises
     # non-uniformly across DP ranks, so it cannot be asserted cleanly in a distributed test. It is
     # a pre-existing limitation, independent of the dp_reshardable empty-bucket fix.

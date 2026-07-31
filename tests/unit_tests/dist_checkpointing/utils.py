@@ -212,6 +212,7 @@ def setup_model_and_optimizer(
     ddp_bucket_size=None,
     grad_reduce_in_fp32=False,
     fp8=False,
+    use_layer_wise_param_layout=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -228,6 +229,19 @@ def setup_model_and_optimizer(
     # ``start_param_sync``.
     ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
     ddp_use_layer_wise = use_layer_wise and use_param_layout
+
+    # The padded shard-aligned LayerWise layout only exists under a LayerWise optimizer, so
+    # ``use_layer_wise_param_layout=True`` implies ``use_layer_wise_distributed_optimizer=True``;
+    # the converse does not hold. Only three combinations are meaningful:
+    #   (False, False)  plain DistributedOptimizer
+    #   (True,  False)  LayerWise + compact decoupled layout   [the default since the flag flipped]
+    #   (True,  True)   LayerWise + padded shard-aligned layout
+    assert not (use_layer_wise_param_layout and not ddp_use_layer_wise), (
+        "use_layer_wise_param_layout=True requires LayerWise DDP routing "
+        "(optimizer='muon'/'dist_muon' with dist_opt=True and use_param_layout=True); "
+        "otherwise DDP builds untagged buffers while the optimizer expects the "
+        "shard-aligned layout"
+    )
 
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
@@ -250,6 +264,7 @@ def setup_model_and_optimizer(
         # grad_reduce_in_fp32 -> ddp_config grad_dtype=fp32 while params stay bf16, i.e. the
         # mixed-dtype (bf16, fp32) gradient buffer / optimizer-state bucket.
         mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
+        mock_args.use_layer_wise_param_layout = use_layer_wise_param_layout
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -291,6 +306,7 @@ def setup_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
+        use_layer_wise_param_layout=use_layer_wise_param_layout,
         optimizer=optimizer,
         muon_scalar_optimizer=muon_scalar_optimizer,
     )
@@ -386,6 +402,7 @@ def setup_moe_model_and_optimizer(
     use_param_layout=False,
     ddp_bucket_size=None,
     grad_reduce_in_fp32=False,
+    use_layer_wise_param_layout=False,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -398,6 +415,19 @@ def setup_moe_model_and_optimizer(
     # See setup_model_and_optimizer for the use_param_layout semantics.
     ddp_use_dist_opt = dist_opt and not (use_layer_wise and not use_param_layout)
     ddp_use_layer_wise = use_layer_wise and use_param_layout
+
+    # The padded shard-aligned LayerWise layout only exists under a LayerWise optimizer, so
+    # ``use_layer_wise_param_layout=True`` implies ``use_layer_wise_distributed_optimizer=True``;
+    # the converse does not hold. Only three combinations are meaningful:
+    #   (False, False)  plain DistributedOptimizer
+    #   (True,  False)  LayerWise + compact decoupled layout   [the default since the flag flipped]
+    #   (True,  True)   LayerWise + padded shard-aligned layout
+    assert not (use_layer_wise_param_layout and not ddp_use_layer_wise), (
+        "use_layer_wise_param_layout=True requires LayerWise DDP routing "
+        "(optimizer='muon'/'dist_muon' with dist_opt=True and use_param_layout=True); "
+        "otherwise DDP builds untagged buffers while the optimizer expects the "
+        "shard-aligned layout"
+    )
 
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
@@ -413,6 +443,7 @@ def setup_moe_model_and_optimizer(
         # grad_reduce_in_fp32 -> ddp_config grad_dtype=fp32 while params stay bf16, i.e. the
         # mixed-dtype (bf16, fp32) gradient buffer / optimizer-state bucket.
         mock_args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
+        mock_args.use_layer_wise_param_layout = use_layer_wise_param_layout
         mock_args.use_distributed_optimizer = ddp_use_dist_opt
         mock_args.use_layer_wise_distributed_optimizer = ddp_use_layer_wise
         if ddp_use_layer_wise:
@@ -438,6 +469,7 @@ def setup_moe_model_and_optimizer(
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
+        use_layer_wise_param_layout=use_layer_wise_param_layout,
         optimizer=optimizer,
     )
 
