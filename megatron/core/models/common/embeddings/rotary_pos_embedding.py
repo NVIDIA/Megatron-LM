@@ -182,6 +182,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_partition_mode="zigzag",
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -201,7 +202,7 @@ class RotaryEmbedding(nn.Module):
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group, cp_partition_mode=cp_partition_mode)
 
         return emb
 
@@ -235,8 +236,11 @@ class RotaryEmbedding(nn.Module):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        if packed_seq_params is not None:
-            # max_seqlen are the max sequence length in the packed sequence before being divived
+        if (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "qkv_format", None) == "thd"
+        ):
+            # max_seqlen are the max sequence length in the packed sequence before being divided
             # by the tp and cp size.
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
         elif inference_context is not None:
@@ -317,6 +321,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         mrope_section: List[int],
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_partition_mode="zigzag",
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -363,5 +368,5 @@ class MultimodalRotaryEmbedding(nn.Module):
         if cp_group is not None and cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group, cp_partition_mode=cp_partition_mode)
         return emb
