@@ -932,7 +932,11 @@ def compute_group_stats(
             assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
             group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
             group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
-            group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
+            # completed_epochs is per-turn, so it cannot be masked per-rollout downstream
+            if rollout.trajectory:
+                group_completed_epochs.extend(
+                    turn[-1][1] for turn in rollout.policy_epoch
+                )
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
@@ -992,12 +996,17 @@ def prep_wandb_metrics(
 
     """Make a wandb-parseable dictionary of metrics for logging.
 
+    Zero-turn rollouts are a mark of placeholders (empty-trajectory pads for failed episodes).
+    Their 0.0 reward deliberately stays in the reward and group-mean/std aggregates:
+    it does affect training dynamics.
+    All other per-rollout field of theirs is masked out of stats.
+
     Args:
         wandb_writer: Wandb run to log to.
         traj_lens: Grouped list of trajectory lengths.
         turn_lens: Grouped list of turn lengths.
         rewards: Grouped list of rewards.
-        num_turns: Grouped list of number of turns in the trajectories.
+        num_turns: Grouped list of number of turns in the trajectories. Zero means failure.
         advantages: Flattened list of advantages.
         policy_epoch: Grouped list of per-token policy epoch stamps.
         kv_cache_epoch: Grouped list of per-token KV cache epoch stamps.
@@ -1007,6 +1016,29 @@ def prep_wandb_metrics(
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
+    # Zero-turn rollouts are failure placeholders.
+    real_mask = [[nt > 0 for nt in g] for g in num_turns]
+    total_rollouts = sum(len(g) for g in num_turns)
+    failed_rollouts = sum(not keep for g in real_mask for keep in g)
+    failure_metrics = {
+        'failed_rollouts/count': failed_rollouts,
+        'failed_rollouts/ratio': (
+            failed_rollouts / total_rollouts if total_rollouts else 0.0
+        ),
+    }
+
+    def _real(grouped):
+        """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
+        return [
+            [x for x, keep in zip(g, m) if keep] for g, m in zip(grouped, real_mask)
+        ]
+
+    # Reward metrics include failures. All other metrics do not.
+    table_rewards = [r for g in _real(rewards) for r in g]
+    traj_lens_real = _real(traj_lens)
+    num_turns_real = _real(num_turns)
+    policy_epoch_real = _real(policy_epoch)
+    kv_cache_epoch_real = _real(kv_cache_epoch)
 
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
@@ -1014,14 +1046,22 @@ def prep_wandb_metrics(
     )
 
     # Per-rollout staleness (oldest token)
-    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch for r in g]
-    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch for r in g]
+    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch_real for r in g]
+    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch_real for r in g]
     # Per-rollout staleness (newest token)
-    rollout_policy_last_token_staleness = [current_iteration - r[-1] for g in policy_epoch for r in g]
-    rollout_kv_last_token_staleness = [current_iteration - r[-1] for g in kv_cache_epoch for r in g]
+    rollout_policy_last_token_staleness = [
+        current_iteration - r[-1] for g in policy_epoch_real for r in g
+    ]
+    rollout_kv_last_token_staleness = [
+        current_iteration - r[-1] for g in kv_cache_epoch_real for r in g
+    ]
     # Per-token staleness
-    per_token_policy_staleness = [current_iteration - e for g in policy_epoch for r in g for e in r]
-    per_token_kv_staleness = [current_iteration - e for g in kv_cache_epoch for r in g for e in r]
+    per_token_policy_staleness = [
+        current_iteration - e for g in policy_epoch_real for r in g for e in r
+    ]
+    per_token_kv_staleness = [
+        current_iteration - e for g in kv_cache_epoch_real for r in g for e in r
+    ]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -1042,6 +1082,7 @@ def prep_wandb_metrics(
                 ),
                 'advantages', 'Advantages'
             ),
+            # One row per real rollout.
             'rollout_table': wandb_writer.Table(
                 columns=[
                     'reward', 'traj_length', 'num_evictions',
@@ -1049,9 +1090,9 @@ def prep_wandb_metrics(
                     'policy_last_token_staleness', 'kv_last_token_staleness',
                 ],
                 data=list(zip(
-                    [r for g in rewards for r in g],
-                    [l for g in traj_lens for l in g],
-                    [e for g in num_evictions for e in g],
+                    table_rewards,
+                    [l for g in traj_lens_real for l in g],
+                    [e for g in _real(num_evictions) for e in g],
                     rollout_policy_staleness,
                     rollout_kv_staleness,
                     rollout_policy_last_token_staleness,
@@ -1063,17 +1104,18 @@ def prep_wandb_metrics(
                 columns=['policy_staleness', 'kv_staleness'],
                 data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
             ),
-            'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
-            'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
-            'max_turn_length': max([max(g) for g in turn_lens]),
-            'min_turn_length': min([min(g) for g in turn_lens]),
-            'mean_traj_length': np.mean([np.mean(g) for g in traj_lens]),
-            'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens]),
-            'max_traj_length': max([max(g) for g in traj_lens]),
-            'min_traj_length': min([min(g) for g in traj_lens]),
-            'mean_num_turns': np.mean([np.mean(g) for g in num_turns]),
-            'max_num_turns': max([max(g) for g in num_turns]),
-            'min_num_turns': min([min(g) for g in num_turns]),
+            # Group-level length/turn stats skip groups with all failed rollouts.
+            'mean_turn_length': np.mean([np.mean(g) for g in turn_lens if g]),
+            'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens if g]),
+            'max_turn_length': max(max(g) for g in turn_lens if g),
+            'min_turn_length': min(min(g) for g in turn_lens if g),
+            'mean_traj_length': np.mean([np.mean(g) for g in traj_lens_real if g]),
+            'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens_real if g]),
+            'max_traj_length': max(max(g) for g in traj_lens_real if g),
+            'min_traj_length': min(min(g) for g in traj_lens_real if g),
+            'mean_num_turns': np.mean([np.mean(g) for g in num_turns_real if g]),
+            'max_num_turns': max(max(g) for g in num_turns_real if g),
+            'min_num_turns': min(min(g) for g in num_turns_real if g),
             'mean_reward': np.mean([np.mean(g) for g in rewards]),
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
@@ -1101,6 +1143,7 @@ def prep_wandb_metrics(
                 wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
                 'staleness', 'Per-Token KV Cache Staleness'
             ),
+            **failure_metrics,
     }
     if example_group:
         if tokenizer is None:
