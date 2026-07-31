@@ -6,9 +6,11 @@ from typing import List, Optional, Tuple
 import pytest
 import torch
 import torch.distributed as dist
+from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -24,6 +26,8 @@ from megatron.core.transformer.multi_latent_attention import (
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
+
+fp8_available, reason_for_no_fp8 = check_fp8_support()
 
 
 class MockCoreAttention(torch.nn.Module):
@@ -125,6 +129,8 @@ def get_mock_mla_config(
     context_parallel_size: int,
     sequence_parallel: bool,
     recompute_mla_up_proj: bool,
+    fp8: Optional[str] = None,
+    fp8_recipe: str = "delayed",
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -160,7 +166,8 @@ def get_mock_mla_config(
         recompute_modules=["mla_up_proj"] if recompute_mla_up_proj else [],
         fine_grained_activation_offloading=False,
         gradient_accumulation_fusion=False,
-        fp8=False,
+        fp8=fp8 if fp8 else False,
+        fp8_recipe=fp8_recipe,
         fp4=False,
         init_method=init_method_normal(0.02),
         output_layer_init_method=scaled_init_method_normal(0.02, 61, multiplier=2.0),
@@ -430,5 +437,125 @@ def test_functionality(
             ).item()
             assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
             assert _calculate_tensor_similarity(absorbed_grad, standard_grad) > 0.9999
+
+    Utils.destroy_model_parallel()
+
+
+# Hopper = SM 9.0, Blackwell = SM 10.0+. mxfp8 needs Blackwell.
+_IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+_QUANT_RECIPES = [
+    pytest.param("tensorwise", id="fp8-tensorwise"),
+    pytest.param("delayed", id="fp8-delayed"),
+    pytest.param(
+        "mxfp8",
+        id="fp8-mxfp8",
+        marks=pytest.mark.skipif(not _IS_BLACKWELL, reason="needs Blackwell"),
+    ),
+]
+
+
+def _build_absorbed_mla(config, combined_kv_up_projection, state_dict=None):
+    """Build an AbsorbedMLASelfAttention, optionally loading a shared state dict."""
+    model = AbsorbedMLASelfAttention(
+        config=config,
+        submodules=get_absorbed_mla_submodules(
+            down_proj_use_column_parallel=False,
+            qk_layernorm=True,
+            rms_norm=True,
+            combined_kv_up_projection=combined_kv_up_projection,
+        ),
+        layer_number=0,
+        attn_mask_type=AttnMaskType.causal,
+        cp_comm_type=None,
+        pg_collection=None,
+    ).cuda()
+    if state_dict is not None:
+        model.load_state_dict(state_dict)
+    return model
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("fp8_recipe", _QUANT_RECIPES)
+@pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
+@pytest.mark.parametrize("combined_kv_up_projection", [True, False])
+def test_fp8_up_proj_recompute_parity(
+    fp8_recipe: str, qkv_format: str, combined_kv_up_projection: bool
+):
+    """`mla_up_proj` recompute must be an exact replay under FP8.
+
+    The absorbed up-projection recompute used to be blocked for FP8/FP4. It is
+    allowed now, so pin the contract: running the same inputs through two
+    identically-initialized modules — one recomputing the up projection, one not —
+    must produce bitwise-identical outputs and parameter gradients. Any drift means
+    the replay used a different quantization scale or a stale weight.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+
+    def make_config(recompute: bool) -> MLATransformerConfig:
+        return get_mock_mla_config(
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            sequence_parallel=False,
+            recompute_mla_up_proj=recompute,
+            fp8="hybrid",
+            fp8_recipe=fp8_recipe,
+        )
+
+    baseline = _build_absorbed_mla(make_config(False), combined_kv_up_projection)
+    recomputed = _build_absorbed_mla(
+        make_config(True), combined_kv_up_projection, state_dict=baseline.state_dict()
+    )
+    assert recomputed.recompute_up_proj and not baseline.recompute_up_proj
+
+    # FP8 GEMMs need the token dimension aligned; keep every sequence a multiple of 128.
+    if qkv_format == 'thd':
+        random.seed(42)
+        seqlens = [random.randint(1, 8) * 128 for _ in range(3)]
+        cu_seqlens = [0]
+        for length in seqlens:
+            cu_seqlens.append(cu_seqlens[-1] + length)
+        total_tokens = cu_seqlens[-1]
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=torch.IntTensor(cu_seqlens).cuda(),
+            cu_seqlens_q_padded=torch.IntTensor(cu_seqlens).cuda(),
+            cu_seqlens_kv=torch.IntTensor(cu_seqlens).cuda(),
+            cu_seqlens_kv_padded=torch.IntTensor(cu_seqlens).cuda(),
+            max_seqlen_q=max(seqlens),
+            max_seqlen_kv=max(seqlens),
+            qkv_format='thd',
+        )
+        hidden_states = torch.randn(
+            (total_tokens, 1, baseline.config.hidden_size), dtype=torch.bfloat16, device='cuda'
+        )
+    else:
+        packed_seq_params = None
+        hidden_states = torch.randn(
+            (1024, 2, baseline.config.hidden_size), dtype=torch.bfloat16, device='cuda'
+        )
+    grads = torch.randn_like(hidden_states)
+
+    def run(model):
+        with get_fp8_context(model.config):
+            output, _ = model(
+                hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            )
+        output.backward(grads)
+        return output, {name: param.grad for name, param in model.named_parameters()}
+
+    baseline_output, baseline_grads = run(baseline)
+    recomputed_output, recomputed_grads = run(recomputed)
+
+    torch.testing.assert_close(recomputed_output, baseline_output, atol=0, rtol=0)
+
+    assert recomputed_grads.keys() == baseline_grads.keys()
+    for name, baseline_grad in baseline_grads.items():
+        assert baseline_grad is not None, f"{name} has no gradient"
+        recomputed_grad = recomputed_grads[name]
+        assert recomputed_grad is not None, f"{name} has no gradient with up-proj recompute"
+        torch.testing.assert_close(
+            recomputed_grad, baseline_grad, atol=0, rtol=0, msg=lambda m, n=name: f"{n}: {m}"
+        )
 
     Utils.destroy_model_parallel()
