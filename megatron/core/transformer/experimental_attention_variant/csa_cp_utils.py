@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MCore-facing utilities for the DSv4 THD context-parallel path.
 
 This module owns CP row mapping, boundary exchange, compressor-input layout,
@@ -15,7 +15,7 @@ import torch.distributed as dist
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
-from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
+from megatron.core.transformer.experimental_attention_variant.csa_kernels import indexer_topk
 
 # =============================================================================
 # RoPE Wrappers
