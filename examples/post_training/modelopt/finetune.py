@@ -400,6 +400,14 @@ def get_batch(data_iterator):
         batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[: args.seq_length]
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
 
+    # slice batch along sequence dimension for context parallelism
+    batch = get_batch_on_this_cp_rank(
+        batch,
+        is_hybrid_cp=False,
+        cp_group=get_context_parallel_group(),
+        cp_partition_mode="zigzag",
+    )
+
     return batch
 
 
