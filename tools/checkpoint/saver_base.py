@@ -483,10 +483,15 @@ class MegatronCheckpointSaverBase:
                             "mlp_norm_weight" : post_norm_weight
                         }
                         if self.margs.num_experts:
-                            params_dict.update({
-                                "mlp_fc1_weight" : mlp_l0_weight[ep_rank][tp_rank],
-                                "mlp_fc2_weight" : mlp_l1_weight[ep_rank][tp_rank]
-                            })
+                            # CoreMoETESchema registers per-expert keys
+                            # ("mlp_fc1_weight.{i}" -> mlp.experts.local_experts.{i}.linear_fc1.weight),
+                            # so the stacked expert tensor must be split by local-expert index. A
+                            # single stacked "mlp_fc1_weight" key never matches the schema, leaving
+                            # every expert weight uninitialized.
+                            num_local_experts = self.margs.num_experts // self.args.target_expert_parallel_size
+                            for expert_idx in range(num_local_experts):
+                                params_dict[f"mlp_fc1_weight.{expert_idx}"] = mlp_l0_weight[ep_rank][tp_rank][expert_idx]
+                                params_dict[f"mlp_fc2_weight.{expert_idx}"] = mlp_l1_weight[ep_rank][tp_rank][expert_idx]
                         else:
                             params_dict.update({
                                 "mlp_fc1_weight" : mlp_l0_weight[tp_rank],
