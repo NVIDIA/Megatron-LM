@@ -266,7 +266,6 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         cp=_MockCPGroup(size=4, rank=cp_rank),
     )
     config = SimpleNamespace(
-        cp_partition_mode="contiguous",
         pad_packed_seq_alignment=alignment,
         max_seqlen_per_dp_cp_rank=8,
         thd_max_packed_sequences=None,
@@ -338,7 +337,11 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
     )
 
     result = get_batch_on_this_rank_for_sequence_packing(
-        data_iterator=iter([batch]), dynamic_cp=True, pg_collection=pg_collection, config=config
+        data_iterator=iter([batch]),
+        dynamic_cp=True,
+        pg_collection=pg_collection,
+        config=config,
+        cp_partition_mode="contiguous",
     )
 
     local_tokens, _, _, _, _, packed_seq_params, padding_mask = result
@@ -402,7 +405,6 @@ def test_non_dummy_zigzag_padding_updates_metadata_before_cp_slice(monkeypatch):
         cp=_MockCPGroup(size=cp_size, rank=cp_rank),
     )
     config = SimpleNamespace(
-        cp_partition_mode="zigzag",
         pad_packed_seq_alignment=4,
         max_seqlen_per_dp_cp_rank=local_target,
         thd_max_packed_sequences=None,
@@ -447,7 +449,11 @@ def test_non_dummy_zigzag_padding_updates_metadata_before_cp_slice(monkeypatch):
     )
 
     result = get_batch_on_this_rank_for_sequence_packing(
-        data_iterator=iter([batch]), dynamic_cp=True, pg_collection=pg_collection, config=config
+        data_iterator=iter([batch]),
+        dynamic_cp=True,
+        pg_collection=pg_collection,
+        config=config,
+        cp_partition_mode="zigzag",
     )
 
     local_tokens, _, _, _, _, packed_seq_params, padding_mask = result
@@ -592,12 +598,16 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         else:
             data_iterator = None
 
+        effective_cp = local_cp_size if dynamic_cp else cp
+        cp_partition_mode = "zigzag" if effective_cp is not None and effective_cp > 1 else None
+
         # Call the function under test
         result = get_batch_on_this_rank_for_sequence_packing(
             data_iterator=data_iterator,
             mtp_on_this_rank=False,
             vp_stage=None,
             dynamic_cp=dynamic_cp,
+            cp_partition_mode=cp_partition_mode,
         )
 
         # The helper returns a 7-tuple; scheduler THD always provides padding_mask.
@@ -714,7 +724,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         # =====================================================================
         # TEST 4: Verify CP partitioning
         # =====================================================================
-        effective_cp = local_cp_size if dynamic_cp else cp
         if effective_cp is not None and effective_cp > 1:
             expected_seq_len = args.seq_length // effective_cp
 
