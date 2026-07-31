@@ -3401,6 +3401,11 @@ def fused_h_post_bda(
 def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Projection + RMS normalization using cuTile, then torch."""
     _raise_mhc_backend_validation_error()
+    if x.dtype != weight.dtype:
+        # The mHC mapping parameters are keep_in_fp32 while activations arrive
+        # in the activation dtype. Normalize here so every backend consumes the
+        # same dtype and the native fallback's matmul does not reject the pair.
+        x = x.to(weight.dtype)
     if is_cutile_available():
         return CutileProjRms.apply(x, weight, eps)
     return native_proj_rms(x, weight, eps)

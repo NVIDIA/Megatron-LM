@@ -1505,3 +1505,58 @@ class TestFusedProjRmsComputeHKeepFp32:
         h_pre, h_post, h_res, r = _torch_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
         for t in (h_pre, h_post, h_res, r):
             assert torch.isfinite(t).all()
+
+
+class TestCutileHAggregateBackwardReduction:
+    """Regression: h_aggregate backward is the only other cuTile-only op.
+
+    `grad_h` is a reduction over the hidden dimension; evaluating the product
+    in bf16 before the fp32 accumulate made it ~2.5x noisier than the torch
+    reference at production widths.
+    """
+
+    @_require_cutile
+    @pytest.mark.parametrize("tokens,n,C", [(8192, 4, 1536), (2048, 4, 4096)])
+    def test_grad_h_reduction_not_worse_than_torch(self, tokens, n, C):
+        """cuTile grad_h must be at least as accurate as the torch reference."""
+        from megatron.core.fusions.fused_mhc_kernels import (
+            _cutile_h_aggregate_bwd,
+            _torch_h_aggregate_bwd,
+        )
+
+        _info()
+        s, b = 1, tokens
+        x = torch.randn(s, b, n, C, device=DEVICE, dtype=torch.float32).to(DTYPE)
+        h_pre = (torch.rand(s, b, n, device=DEVICE, dtype=torch.float32) + 0.5).to(DTYPE)
+        go = torch.randn(s, b, C, device=DEVICE, dtype=torch.float32).to(DTYPE)
+
+        goe = go.double().unsqueeze(2)
+        ref_gx = goe * h_pre.double().unsqueeze(-1)
+        ref_gh = (goe * x.double()).sum(-1)
+
+        def rel(a: Tensor, r: Tensor) -> float:
+            a, r = a.double().flatten(), r.double().flatten()
+            return ((a - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
+
+        t_gx, t_gh = _torch_h_aggregate_bwd(go, x, h_pre)
+        c_gx, c_gh = _cutile_h_aggregate_bwd(go, x, h_pre)
+
+        # grad_x is a pure elementwise product — it must stay bit-identical.
+        assert torch.equal(c_gx, t_gx)
+        # A bf16 product before the fp32 accumulate showed up here as ~2.5x.
+        assert rel(c_gh, ref_gh) <= rel(t_gh, ref_gh) * 1.1
+
+
+class TestFusedProjRmsMixedDtype:
+    """Regression: every proj_rms backend must accept keep_in_fp32 parameters."""
+
+    @pytest.mark.parametrize("M,N,K", [(256, 24, 4096)])
+    def test_bf16_activations_fp32_weight(self, M, N, K):
+        """bf16 activations against an fp32 weight must not raise."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms
+
+        _info()
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        proj, r = fused_proj_rms(x, w, 1e-6)
+        assert torch.isfinite(proj).all() and torch.isfinite(r).all()
