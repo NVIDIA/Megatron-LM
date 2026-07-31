@@ -1897,34 +1897,56 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         state = self.get_parameter_state_dp_reshardable()
 
-        # fp32 optimizer-state {key: (dtype, device)} captured before the loop below mutates
-        # ``state``, so an empty shard can synthesize valid padding ShardedTensors.
-        pad_template = None
+        # Optimizer-state {key: dtype} per bucket, captured before the loop below
+        # mutates ``state``, so a shard that is entirely padding can still synthesize valid
+        # ShardedTensors. Keyed per (gbuf_idx, dtype, bucket_idx) because dist_checkpointing
+        # enforces one dtype per KEY (validation.py, ``assert sharding.dtype == dtype``) and each
+        # bucket is its own key -- a template sampled from one bucket is not authoritative for
+        # another. ``step`` is a per-param 0-dim tensor for torch AdamW / non-TE-Apex /
+        # HybridDeviceOptimizer, but it becomes a LocalNonpersistentObject below and never a
+        # ShardedTensor, so it must not be synthesized here.
+        # Device stays OUT of the gathered template: it is rank-local (under
+        # --optimizer-cpu-offload the CPU/GPU split lands on a different param on every
+        # rank, because HybridDeviceOptimizer walks this rank's own shard list), and
+        # dist_checkpointing validates dtype/shape but never device. Comparing it across
+        # ranks would abort the save on a legitimate config.
+        pad_templates = {}
+        pad_device = None
         for _g in range(len(self.gbuf_ranges)):
-            for _bs_all in state[_g].values():
-                for _bs in _bs_all:
+            for _dt_key, _bs_all in state[_g].items():
+                for _b_idx, _bs in enumerate(_bs_all):
                     if _bs:
-                        pad_template = {
-                            k: (v.dtype, v.device)
+                        _key = (_g, str(_dt_key), _b_idx)
+                        pad_templates[_key] = {
+                            k: v.dtype
                             for k, v in _bs[0].items()
-                            if isinstance(v, torch.Tensor)
+                            if isinstance(v, torch.Tensor) and k != 'step'
                         }
-                        break
-                if pad_template is not None:
-                    break
-            if pad_template is not None:
-                break
+                        if pad_device is None and pad_templates[_key]:
+                            pad_device = _bs[0][next(iter(pad_templates[_key]))].device
 
-        # A rank that owns nothing in any bucket has no local sample. The optimizer-state keys
-        # and their dtypes are config-determined and identical on every DP rank, so derive the
-        # template from config instead of gathering it across DP -- no communication needed.
-        if pad_template is None:
-            _pad_device = torch.cuda.current_device()
-            pad_template = {
-                'param': (self.config.main_params_dtype, _pad_device),
-                'exp_avg': (self.config.exp_avg_dtype, _pad_device),
-                'exp_avg_sq': (self.config.exp_avg_sq_dtype, _pad_device),
-            }
+        # A rank that owns nothing in a bucket has no local sample there, yet it may still owe
+        # padding coverage for it. The template cannot be derived from config: the save path runs
+        # the state through ``get_unscaled_state`` (which upcasts bf16/fp16/fp8 state to fp32, and
+        # returns int16 for ``store_param_remainders``), and the key set comes from whatever
+        # ``optimizer.state`` actually holds. So reconcile the observed templates across the DP
+        # group. The assert is per bucket -- the axis dist_checkpointing actually constrains --
+        # so buckets nobody sampled simply stay absent instead of aborting the save.
+        if data_parallel_world_size > 1:
+            _gathered = [None] * data_parallel_world_size
+            torch.distributed.all_gather_object(
+                _gathered, pad_templates, group=self.data_parallel_group
+            )
+            _merged = {}
+            for _candidate in _gathered:
+                for _k, _v in (_candidate or {}).items():
+                    _prev = _merged.setdefault(_k, _v)
+                    assert _prev == _v, (
+                        f"padding template mismatch across DP ranks for bucket {_k}: "
+                        f"{_prev} vs {_v}; the synthesized padding would not match the "
+                        "real shards"
+                    )
+            pad_templates = _merged
 
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
@@ -1983,18 +2005,40 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         pad_len = min(
                             gbuf_local_numel, gbuf_world_numel_unpadded - world_shard_start
                         )
-                        # Synthesize the padding for this shard's overlap with [0, numel_unpadded),
-                        # using pad_template for the correct fp32 keys/dtypes. The template is
-                        # always available (config-derived above); a None here would mean the
-                        # coverage we must emit is being dropped -- fail loudly rather than skip.
-                        assert (
-                            pad_template is not None
-                        ), f'no padding template for {sharded_bucket_key}; coverage would be dropped'
+                        # Synthesize this shard's overlap with [0, numel_unpadded) from the
+                        # template observed for THIS bucket. If no rank sampled it (every shard
+                        # of the bucket is padding), fall back to any observed template rather
+                        # than dropping coverage; an empty map means the coverage is being
+                        # dropped, so fail loudly.
+                        _tpl = pad_templates.get((gbuf_idx, str(dtype), bucket_idx))
+                        if not _tpl:
+                            _tpl = next(iter(pad_templates.values()), None)
+                        assert _tpl, (
+                            f'no optimizer-state template available for {sharded_bucket_key}; '
+                            'the padding coverage this rank owes would be dropped'
+                        )
+                        # ``pad_device`` is a single rank-local device, NOT a per-bucket map.
+                        # Deliberate: we only synthesize for buckets this rank sampled nothing
+                        # in, so a per-bucket lookup would miss by construction. Borrowing a
+                        # device across buckets is safe in a way borrowing a dtype is NOT --
+                        # dtype and shape are validated, device never is, and the padding bytes
+                        # are dropped on load. Do NOT make this symmetric with the dtype path:
+                        # a rank-local device inside the cross-rank compare aborts the save
+                        # under --optimizer-cpu-offload, where the CPU/GPU cutoff differs per
+                        # rank.
                         bucket_state = [
                             {
                                 **{
-                                    k: torch.empty(pad_len, dtype=_dt, device=_dev)
-                                    for k, (_dt, _dev) in pad_template.items()
+                                    k: torch.empty(
+                                        pad_len,
+                                        dtype=_dt,
+                                        device=(
+                                            pad_device
+                                            if pad_device is not None
+                                            else torch.cuda.current_device()
+                                        ),
+                                    )
+                                    for k, _dt in _tpl.items()
                                 },
                                 'gbuf_local_start': 0,
                                 'gbuf_local_end': pad_len,
@@ -2095,6 +2139,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         This will allow changing TP and PP while using DistOpt (as with other optimizers).
         """
 
+        # NB: fully_sharded_model_space is independently non-functional for EVERY
+        # DistributedOptimizer in this tree, not just the decoupled layout -- this function sets
+        # ``flattened_range`` on every non-factory param below, and ShardedTensor rejects that
+        # unconditionally in validate_metadata_integrity. Only ShardedTensorFactory escapes, and
+        # only gated-MLP fc1 produces one. This assert does not fix that; it makes the compact
+        # LayerWise (Muon) case abort earlier and with an actionable message instead of dying
+        # per-param deep inside mapping.py. It is deliberately narrow: broadening it to reject
+        # the format outright is a separate change.
+        assert not (
+            self.config.use_layer_wise_distributed_optimizer
+            and not self.config.use_layer_wise_param_layout
+        ), (
+            "fully_sharded_model_space is not supported for the decoupled compact LayerWise "
+            "(Muon) optimizer layout; use dp_reshardable or fully_reshardable instead"
+        )
+
         param_to_sharded_metadata = {}
         model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(
             model_sharded_state_dict
@@ -2121,11 +2181,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     f"Model param {model_param} not in model_sharded_state_dict"
                     f" Hint: {KEEP_VARS_HINT}"
                 ) from e
-
-            assert isinstance(sharded_metadata, ShardedTensorFactory), (
-                "fully_sharded_model_space is not supported for the decoupled compact "
-                "LayerWise (Muon) optimizer layout"
-            )
 
             # Set DP corresponding replica_id coordinate to 0.
             assert (
