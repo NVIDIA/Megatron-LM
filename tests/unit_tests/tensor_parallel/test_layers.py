@@ -22,12 +22,7 @@ class _RankGroup:
 
 @pytest.mark.parametrize(
     ("allreduce", "regular_tp_rank", "expert_tp_rank", "expected"),
-    [
-        (True, 0, 1, True),
-        (True, 1, 0, False),
-        (False, 0, 1, False),
-        (False, 1, 0, True),
-    ],
+    [(True, 0, 1, True), (True, 1, 0, False), (False, 0, 1, False), (False, 1, 0, True)],
 )
 def test_param_is_not_tensor_parallel_duplicate_uses_parameter_parallel_group(
     allreduce, regular_tp_rank, expert_tp_rank, expected
@@ -37,9 +32,7 @@ def test_param_is_not_tensor_parallel_duplicate_uses_parameter_parallel_group(
     param.allreduce = allreduce
 
     actual = param_is_not_tensor_parallel_duplicate(
-        param,
-        tp_group=_RankGroup(regular_tp_rank),
-        expert_tp_group=_RankGroup(expert_tp_rank),
+        param, tp_group=_RankGroup(regular_tp_rank), expert_tp_group=_RankGroup(expert_tp_rank)
     )
 
     assert actual is expected
