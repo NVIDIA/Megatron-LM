@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 
@@ -129,6 +129,9 @@ class TestFSDP1F1BOverlap:
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 megatron_fsdp_main_params_dtype=None,
+                megatron_fsdp_prefetch_recompute_forward_weights=bool(
+                    recompute_modules and "mla_up_proj" in recompute_modules
+                ),
             )
 
         with deterministic_mode():
@@ -145,6 +148,17 @@ class TestFSDP1F1BOverlap:
                 module=ref_model,
                 fsdp_unit_modules=[TransformerLayer],
             )
+            reference_selective_prefetch_calls = []
+            if ref_fsdp.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights:
+                original_reference_prefetch = ref_fsdp.module.prefetch_recompute_forward_parameters
+
+                def _track_reference_selective_prefetch(module, **kwargs):
+                    reference_selective_prefetch_calls.append(module)
+                    return original_reference_prefetch(module, **kwargs)
+
+                ref_fsdp.module.prefetch_recompute_forward_parameters = (
+                    _track_reference_selective_prefetch
+                )
             ref_opt = torch.optim.SGD(ref_fsdp.parameters(), lr=LR)
             ref_opt = fully_shard_optimizer(optimizer=ref_opt)
 
@@ -160,6 +174,15 @@ class TestFSDP1F1BOverlap:
                 module=test_model,
                 fsdp_unit_modules=[TransformerLayer],
             )
+            selective_prefetch_calls = []
+            if test_fsdp.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights:
+                original_prefetch = test_fsdp.module.prefetch_recompute_forward_parameters
+
+                def _track_selective_prefetch(module):
+                    selective_prefetch_calls.append(module)
+                    return original_prefetch(module)
+
+                test_fsdp.module.prefetch_recompute_forward_parameters = _track_selective_prefetch
             test_opt = torch.optim.SGD(test_fsdp.parameters(), lr=LR)
             test_opt = fully_shard_optimizer(optimizer=test_opt)
 
@@ -176,6 +199,9 @@ class TestFSDP1F1BOverlap:
                 )
 
             assert_models_equal(ref_fsdp, test_fsdp)
+            if test_fsdp.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights:
+                assert len(reference_selective_prefetch_calls) == NUM_STEPS * num_layers
+                assert len(selective_prefetch_calls) == NUM_STEPS * num_layers
 
             del ref_fsdp, test_fsdp, ref_opt, test_opt
             gc.collect()
