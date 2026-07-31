@@ -315,6 +315,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.num_attention_heads_per_partition = 1
 
+        self.batch_invariant_mode = model_config.batch_invariant_mode
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
@@ -356,6 +357,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+
+            if self.batch_invariant_mode:
+                assert not self.enable_prefix_caching, (
+                    "batch_invariant_mode does not support Mamba prefix caching; "
+                    "set enable_prefix_caching=False."
+                )
+                assert self.num_speculative_tokens == 0, (
+                    "batch_invariant_mode for Mamba dynamic inference only supports "
+                    "one-token decode; set num_speculative_tokens=0."
+                )
+                assert self.mamba_ssm_states_dtype == torch.float32, (
+                    "batch_invariant_mode requires FP32 Mamba SSM states so state-passing "
+                    "boundaries are not rounded between decode chunks."
+                )
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -722,6 +737,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
+            # A chunk plus its final token must fit in one step; otherwise a prompt
+            # of that length can never advance without an invalid one-token tail.
+            assert self.max_tokens > self.mamba_chunk_size, (
+                "batch-invariant Mamba chunked prefill requires max_tokens > "
+                f"mamba_chunk_size ({self.mamba_chunk_size})."
+            )
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -877,6 +899,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_intermediate_count=self.max_mamba_intermediate_states_per_step,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
+                decode_indices_dtype=self._mamba_decode_indices_dtype,
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
@@ -1081,12 +1104,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # Mamba section (hybrid models only). Must match the MambaMetadata
         # shapes (mirrors the layout documented in ContextGPUView).
-        # batch_indices_decode is int64; all other fields are int32.
+        # batch_indices_decode is int32 in batch-invariant mode and int64 otherwise;
+        # all other fields are int32.
         if self.is_hybrid_model:
-            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
-            _mamba_align_pad = (8 - _pre_mamba_bytes % 8) % 8
+            self._mamba_decode_indices_dtype = (
+                torch.int32 if self.batch_invariant_mode else torch.int64
+            )
+            _decode_index_bytes = 4 if self.batch_invariant_mode else 8
+            _mamba_align_pad = (
+                _decode_index_bytes - _pre_mamba_bytes % _decode_index_bytes
+            ) % _decode_index_bytes
             self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
-            _mamba_batch_indices_decode_bytes = self.max_requests * 8
+            _mamba_batch_indices_decode_bytes = self.max_requests * _decode_index_bytes
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
             _mamba_seq_idx_bytes = self.max_tokens * 4
             _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
@@ -1250,7 +1279,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off += _mamba_align_pad
             self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_decode_bytes
-            ].view(torch.int64)
+            ].view(self._mamba_decode_indices_dtype)
             _off += _mamba_batch_indices_decode_bytes
             self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_prefill_bytes
@@ -1297,6 +1326,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
+            mamba_decode_indices_dtype=(
+                self._mamba_decode_indices_dtype if self.is_hybrid_model else torch.int64
+            ),
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
