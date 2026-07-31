@@ -20,6 +20,7 @@ def _build_tiny_moe_gpt(
     expert_parallel_size: int,
     expert_tensor_parallel_size: int,
     bf16: bool = False,
+    add_bias_linear: bool = False,
 ) -> GPTModel:
     config = TransformerConfig(
         num_layers=1,
@@ -28,7 +29,8 @@ def _build_tiny_moe_gpt(
         ffn_hidden_size=16,
         num_moe_experts=2,
         moe_ffn_hidden_size=16,
-        moe_shared_expert_intermediate_size=16,
+        # Shared experts do not support linear biases.
+        moe_shared_expert_intermediate_size=None if add_bias_linear else 16,
         moe_router_topk=1,
         moe_router_pre_softmax=True,
         tensor_model_parallel_size=tensor_parallel_size,
@@ -36,7 +38,7 @@ def _build_tiny_moe_gpt(
         expert_tensor_parallel_size=expert_tensor_parallel_size,
         sequence_parallel=tensor_parallel_size > 1,
         use_cpu_initialization=True,
-        add_bias_linear=False,
+        add_bias_linear=add_bias_linear,
         normalization="RMSNorm",
         moe_grouped_gemm=True,
         bf16=bf16,
@@ -51,7 +53,8 @@ def _build_tiny_moe_gpt(
         max_sequence_length=8,
         position_embedding_type="rope",
     )
-    assert any(".shared_experts." in name for name, _ in model.named_parameters())
+    if not add_bias_linear:
+        assert any(".shared_experts." in name for name, _ in model.named_parameters())
     return model.cuda()
 
 
@@ -207,5 +210,88 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
             )
             grads_checked += 1
         assert grads_checked > 0
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_layer_wise_muon_grad_norm_uses_expert_tp_group_for_row_parallel_bias():
+    """LayerWise Muon must deduplicate replicated expert FC2 bias grads over ETP.
+
+    With TP=2, EP=2, and ETP=1, every rank is ETP rank zero.  The two EP ranks own
+    distinct row-parallel expert biases, so both gradients must contribute to the global
+    norm. Falling back to the regular TP rank drops the expert on TP rank one and
+    undercounts the squared norm by a factor of two.
+    """
+    from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    if Utils.world_size < 4 or Utils.world_size % 4 != 0:
+        pytest.skip("test requires a world size divisible by four")
+
+    tensor_parallel_size = 2
+    expert_parallel_size = 2
+    expert_tensor_parallel_size = 1
+
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_parallel_size,
+            expert_model_parallel_size=expert_parallel_size,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+        )
+        model = _build_tiny_moe_gpt(
+            tensor_parallel_size=tensor_parallel_size,
+            expert_parallel_size=expert_parallel_size,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+            bf16=True,
+            add_bias_linear=True,
+        )
+
+        expert_fc2_biases = [
+            param
+            for name, param in model.named_parameters()
+            if ".experts." in name and ".linear_fc2.bias" in name
+        ]
+        assert len(expert_fc2_biases) == model.config.num_moe_experts // expert_parallel_size
+        for parameter in expert_fc2_biases:
+            assert parameter.ndim == 1
+            assert parameter.allreduce is False
+            assert parameter.tensor_model_parallel is False
+
+        model = DistributedDataParallel(
+            model.config, DistributedDataParallelConfig(use_distributed_optimizer=False), model
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="muon",
+                lr=0.0,
+                weight_decay=0.0,
+                bf16=True,
+                use_distributed_optimizer=False,
+                use_layer_wise_distributed_optimizer=True,
+                muon_tp_mode="duplicated",
+            ),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+        assert pg_collection.tp.size() == tensor_parallel_size
+        assert pg_collection.expt_tp.size() == expert_tensor_parallel_size
+
+        for parameter in model.parameters():
+            parameter.main_grad.zero_()
+        for parameter in expert_fc2_biases:
+            parameter.main_grad.fill_(1.0)
+        assert optimizer.prepare_grads() is False
+
+        actual_norm = optimizer.get_grad_norm()
+        actual_norm_value = (
+            actual_norm.item() if isinstance(actual_norm, torch.Tensor) else actual_norm
+        )
+        expected_norm = math.sqrt(model.config.num_moe_experts * model.config.hidden_size)
+
+        assert actual_norm_value == pytest.approx(expected_norm)
     finally:
         Utils.destroy_model_parallel()
