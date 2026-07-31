@@ -278,8 +278,6 @@ class FsdpParameterGroup:
                 self._unsharded_model_weight.placements, out=self._unsharded_model_weight
             )
         self._switch_to_unsharded_parameters()
-        if self.is_first_microbatch:
-            self.is_first_microbatch = False
 
     def reshard_parameters(self) -> None:
         """Install sharded DTensor parameters on the owning modules."""
@@ -345,22 +343,19 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
 
-        # Installed grads distinguish accumulation from overwrite semantics.
-        has_installed_grads = self._has_sharded_grads()
-
-        can_reduce_into_main_grad = (
-            not has_installed_grads and partial_grad.dtype == self.main_grad.dtype
-        )
         reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
         if reduce_axis is None:
             assert isinstance(self.main_grad.placements[-1], Partial), (
                 "The last placement must be Partial"
             )
-            if has_installed_grads:
-                self.main_grad.local_buffer.add_(partial_grad.local_buffer)
-            else:
+            if self.is_first_microbatch:
                 self.main_grad.local_buffer.copy_(partial_grad.local_buffer)
+            else:
+                self.main_grad.local_buffer.add_(partial_grad.local_buffer)
         else:
+            can_reduce_into_main_grad = (
+                self.is_first_microbatch and partial_grad.dtype == self.main_grad.dtype
+            )
             partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
             grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
             if self._symm_mem_pool is not None:
@@ -373,24 +368,27 @@ class FsdpParameterGroup:
                 reduced_grad = partial_grad.redistribute(self.main_grad.placements)
                 if grad_divisor != 1:
                     reduced_grad.local_buffer.div_(grad_divisor)
-                if has_installed_grads:
-                    self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
-                else:
+                if self.is_first_microbatch:
                     self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+                else:
+                    self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
 
         optimizer_grad = self.main_grad
         if is_last_microbatch:
             optimizer_grad = self.main_grad.redistribute(self.main_weight.placements)
             if optimizer_grad is not self.main_grad:
                 self.main_grad.local_buffer.zero_()
-            # Reset for the first microbatch of the next accumulation cycle.
-            self.is_first_microbatch = True
 
         # Install the accumulation grad between microbatches and the finalized grad
         # for optimizer.step() after the last microbatch.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             fsdp_parameter.sharded.grad = optimizer_grad.get_dtensor(index)
 
+        if is_last_microbatch:
+            # Reset for the first microbatch of the next accumulation cycle.
+            self.is_first_microbatch = True
+        else:
+            self.is_first_microbatch = False
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
     """Resolve a root-module-relative parameter FQN to its direct owner."""
