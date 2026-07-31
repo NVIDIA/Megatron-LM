@@ -9,6 +9,7 @@ import torch
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -23,6 +24,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.utils import get_pg_rank
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
 )
@@ -334,6 +336,14 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
                 vp_stage=vp_stage, vp_size=vp_size
             ) and is_pp_last_stage(pg_collection.pp)
 
+        cp_stage_entry_partition_mode = (
+            get_experimental_attention_variant_stage_input_cp_partition_mode(
+                self._model_config.transformer,
+                vp_stage=vp_stage,
+                pp_rank=get_pg_rank(pg_collection.pp),
+            )
+        )
+
         model = GPTModel(
             config=self._model_config.transformer,
             transformer_layer_spec=transformer_layer_spec,
@@ -354,6 +364,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             post_process=post_process,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
         return model
