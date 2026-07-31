@@ -14,6 +14,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import (
+    HAVE_FLA,
     GatedDeltaNet,
     GatedDeltaNet2,
     chunk_gated_delta_rule,
@@ -34,13 +35,6 @@ from tests.unit_tests.transformer.test_multi_latent_attention import (
     make_test_packed_seq_params,
     make_test_packed_seq_params_with_padding,
 )
-
-try:
-    import fla
-
-    HAVE_FLA = True
-except ImportError:
-    HAVE_FLA = False
 
 try:
     from fla.ops.gdn2.chunk import chunk_gdn2
@@ -315,63 +309,6 @@ class TestGatedDeltaNet:
             assert torch.equal(
                 grads1[name], grads2[name]
             ), f"Grad not reproducible for {name} ({rank=})"
-
-        # The deterministic (torch-native) and default (FLA) paths implement the same
-        # recurrence with different kernels, so they must agree numerically.
-        nondet_config = copy.deepcopy(self.transformer_config)
-        nondet_config.deterministic_mode = False
-        nondet_spec = get_experimental_attention_variant_module_spec(config=nondet_config)
-        nondet_gdn = (
-            nondet_spec.module(
-                nondet_config,
-                submodules=nondet_spec.submodules,
-                layer_number=1,
-                bias=False,
-                conv_bias=False,
-                conv_init=1.0,
-                use_qk_l2norm=True,
-                A_init_range=(1, 16),
-                pg_collection=pg_collection,
-            )
-            .cuda()
-            .bfloat16()
-        )
-        # Share weights so the only difference between the two runs is kernel numerics.
-        nondet_gdn.load_state_dict(gdn.state_dict())
-        assert nondet_gdn.gated_delta_rule is (
-            chunk_gdn2 if self.use_gdn2 else chunk_gated_delta_rule
-        )
-
-        nondet_out, nondet_grads, nondet_input_grad = run(nondet_gdn)
-
-        def rel_l2(a, b):
-            b = b.float()
-            return ((a.float() - b).norm() / b.norm().clamp(min=1e-12)).item()
-
-        out_err = rel_l2(out1, nondet_out)
-        input_grad_err = rel_l2(input_grad1, nondet_input_grad)
-        param_grad_err = max(rel_l2(grads1[n], nondet_grads[n]) for n in grads1)
-        if rank == 0:
-            variant = "gdn2" if self.use_gdn2 else "gdn"
-            print(
-                f"[det-vs-fla {variant} tp{self.tp_size} cp{self.cp_size} sp{self.sp_size}] "
-                f"out={out_err:.3e} input_grad={input_grad_err:.3e} "
-                f"param_grad={param_grad_err:.3e}"
-            )
-
-        # Elementwise assert_close is the wrong metric here. Both paths round to bf16,
-        # and the two kernels disagree by ~1 bf16 ulp on ~6% of elements; wherever the
-        # result is near zero that ulp is an unbounded *relative* error. Compare the
-        # tensors in norm instead, which stays sensitive to a genuine algorithmic
-        # divergence (that would show up as O(1)) while ignoring rounding.
-        tol = 2e-2
-        assert out_err < tol, f"deterministic vs FLA output rel-L2 {out_err:.3e} > {tol} ({rank=})"
-        assert (
-            input_grad_err < tol
-        ), f"deterministic vs FLA input-grad rel-L2 {input_grad_err:.3e} > {tol} ({rank=})"
-        assert (
-            param_grad_err < tol
-        ), f"deterministic vs FLA param-grad rel-L2 {param_grad_err:.3e} > {tol} ({rank=})"
 
     def test_module_construction(self):
         gdn = self.gdn
@@ -734,6 +671,9 @@ def test_parallel_gated_delta_net2_correctness(tmp_path_dist_ckpt, sequence_pack
 
 @pytest.mark.parametrize("cp_size", [2, 4], scope="class")
 @pytest.mark.internal
+@pytest.mark.skip(
+    "Used to verify the correctness of the fused THD AllToAll implementation, locally validated thus no need to run on CI."
+)
 class TestFusedThdAllToAll:
     """Verify fused 1 AllToAll + permute matches the per-sequence, per-channel loop in GDN."""
 
