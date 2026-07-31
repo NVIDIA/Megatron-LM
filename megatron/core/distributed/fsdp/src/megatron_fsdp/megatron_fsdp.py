@@ -270,6 +270,11 @@ class MegatronFSDP(torch.nn.Module):
         self.prefetch_recompute_forward_weights = (
             self.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
         )
+        self._selective_recompute_forward_weight_modules = [
+            submodule
+            for submodule in self.module.modules()
+            if getattr(submodule, "_fsdp_recompute_forward_weight", False)
+        ]
         recurse_types = fine_grained_recurse_module_types or ()
         self.fine_grained_recurse_module_types: Tuple[Type[nn.Module], ...] = recurse_types
         self.report_nan_in_param_grad = report_nan_in_param_grad
@@ -500,6 +505,37 @@ class MegatronFSDP(torch.nn.Module):
             # we want to overwrite the `main_grad` which is enabled by this
             # attribute.
             param.overwrite_main_grad = True
+
+    @torch.compiler.disable
+    def prefetch_recompute_forward_parameters(self, module: nn.Module):
+        """Asynchronously gather selective-recompute forward weights for ``module``.
+
+        Selective activation recomputation only replays a subset of a layer. The
+        replayed parameterized modules opt in with
+        ``_fsdp_recompute_forward_weight``. This method starts their rowwise
+        all-gather without waiting; their normal pre-forward hooks wait before
+        the recompute region consumes the weights.
+        """
+        if (
+            not self.prefetch_recompute_forward_weights
+            or not self._selective_recompute_forward_weight_modules
+        ):
+            return
+
+        module_set = set(module.modules())
+        params = []
+        seen_params = set()
+        for recompute_module in self._selective_recompute_forward_weight_modules:
+            if recompute_module not in module_set:
+                continue
+            for param in recompute_module.parameters():
+                if param not in seen_params:
+                    seen_params.add(param)
+                    params.append(param)
+
+        self.all_gather_and_wait_parameters_ready(
+            params=params, prefetch=False, wait_bucket_ready=False, bwd=False
+        )
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
@@ -897,7 +933,10 @@ class MegatronFSDP(torch.nn.Module):
             param_list = _param_list_for_submodule_unshard(module, "backward")
 
             # All-gather / unshard the module parameters before the backward pass.
-            if self.prefetch_recompute_forward_weights:
+            if (
+                self.prefetch_recompute_forward_weights
+                and not self._selective_recompute_forward_weight_modules
+            ):
                 self.all_gather_and_wait_parameters_ready(
                     param_list,
                     prefetch=False,
@@ -920,6 +959,17 @@ class MegatronFSDP(torch.nn.Module):
                 self.all_gather_and_wait_parameters_ready(
                     param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
                 )
+                if (
+                    self.prefetch_recompute_forward_weights
+                    and self._selective_recompute_forward_weight_modules
+                    and not self.enable_fine_grained_param_gather_backward_hook
+                ):
+                    # The regular forward/backward schedule enters an FSDP unit through
+                    # this unit-level pre-backward hook. Start the selective-recompute
+                    # rowwise gather after its backward-layout weights are ready, leaving
+                    # the layer's MLP backward compute to hide the communication before
+                    # attention backward replays mla_up_proj.
+                    self.prefetch_recompute_forward_parameters(module)
 
         self._root_pre_backward_hook_issued = False
 
