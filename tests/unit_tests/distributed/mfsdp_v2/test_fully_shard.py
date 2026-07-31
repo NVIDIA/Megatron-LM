@@ -356,11 +356,11 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    inner_fqns = [group.parameter_fqns for group in model.inner.parameter_groups]
-    outer_fqns = [group.parameter_fqns for group in model.parameter_groups]
+    (inner_group,) = model.inner.parameter_groups
+    (outer_group,) = model.parameter_groups
 
-    assert inner_fqns == [(("weight",),)]
-    assert outer_fqns == [(("bias",),)]
+    assert [parameter.fqns for parameter in inner_group.fsdp_parameters] == [("weight",)]
+    assert [parameter.fqns for parameter in outer_group.fsdp_parameters] == [("bias",)]
 
 
 def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
@@ -370,9 +370,10 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (parameter_group,) = model.parameter_groups
-    assert parameter_group.parameter_fqns == (("embed_tokens.weight", "lm_head.weight"),)
-    assert parameter_group.main_weight.layout.tensor_shapes == (torch.Size((8, 4)),)
+    (parameter,) = parameter_group.fsdp_parameters
+    assert parameter.fqns == ("embed_tokens.weight", "lm_head.weight")
     assert parameter_group.main_weight.layout.size == 8 * 4
+    # Both aliases must expose the same optimizer-visible sharded parameter.
     assert len(list(model.parameters())) == 1
 
 

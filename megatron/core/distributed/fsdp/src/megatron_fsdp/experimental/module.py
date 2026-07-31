@@ -121,7 +121,7 @@ class FsdpModule:
         self._parameter_groups = tuple(parameter_groups)
         self._num_ready_grad_parameters = 0
         self._num_trainable_parameters = sum(
-            len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
+            len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
 
@@ -210,8 +210,8 @@ class FsdpModule:
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
-            for parameter in group.unsharded_parameters:
-                parameter.register_post_accumulate_grad_hook(self._make_grad_hook())
+            for fsdp_parameter in group.fsdp_parameters:
+                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 
     def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         def grad_hook(_parameter: nn.Parameter) -> None:
