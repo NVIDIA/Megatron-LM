@@ -89,11 +89,17 @@ except:
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
 
-def param_is_not_tensor_parallel_duplicate(param, tp_group=None):
-    """Returns true if the passed-in parameter is not a duplicate parameter
-    on another TP rank."""
+def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group=None):
+    """Return whether a parameter contributes to a unique model-parallel shard.
+
+    Parameters reduced over expert data parallel groups use the expert tensor-parallel
+    group for duplicate filtering. Other parameters use the regular tensor-parallel group.
+    """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
+    # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
+    if not getattr(param, "allreduce", True) and expert_tp_group is not None:
+        tp_group = expert_tp_group
     # Prefer provided tp_group when available (new explicit path).
     if tp_group is not None:
         return tp_group.rank() == 0
