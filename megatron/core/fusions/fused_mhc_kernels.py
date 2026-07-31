@@ -1076,7 +1076,9 @@ if _CUTILE_AVAILABLE:
             )
             gx_tile = go_expanded * h_expanded
             ct.store(gx, index=(pid, 0, ct_idx), tile=gx_tile.astype(gx.dtype))
-            gh_acc += ct.sum(go_expanded * x_tile, axis=2)
+            # Reduce in fp32: the torch reference evaluates this product in fp32
+            # under torch.compile, and a bf16 product makes grad_h ~3x noisier.
+            gh_acc += ct.sum(go_expanded.astype(ct.float32) * x_tile.astype(ct.float32), axis=2)
         ct.store(gh, index=(pid, 0), tile=gh_acc.astype(gh.dtype))
 
     def _cutile_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
