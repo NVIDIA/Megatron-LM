@@ -182,9 +182,6 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
-            # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
-            # is finalized to main_weight's placements after the last microbatch.
-            self._accumulation_placements = main_grad_placements
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -338,38 +335,24 @@ class FsdpParameterGroup:
     ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
-        main_grad rests in the gradient placements between microbatches. The last
-        microbatch finalizes any Partial axis to main_weight's placements so ``.grad``
-        is ready for ``optimizer.step()``.
+        main_grad remains in the gradient placements across optimizer steps. The
+        last microbatch produces a separate optimizer gradient when its placements
+        differ from main_grad.
         """
         assert self.main_grad is not None
 
-        # Installed grads indicate that the current main_grad already contains values.
-        has_accumulated_grads = self._has_sharded_grads()
-
-        # A finalized main_grad belongs to the previous optimizer step. Start the
-        # next accumulation cycle with fresh storage rather than reconstructing the
-        # full gradient from its optimizer shard.
-        if self.main_grad.placements != self._accumulation_placements:
-            self.main_grad = DBuffer(
-                mesh=self.mesh,
-                placements=self._accumulation_placements,
-                tensor_shapes=self.main_grad.layout.tensor_shapes,
-                dtype=self.main_grad.dtype,
-                device=self.main_grad.device,
-            )
-            # Old installed grad views do not belong to this fresh storage.
-            has_accumulated_grads = False
+        # Installed grads distinguish accumulation from overwrite semantics.
+        has_installed_grads = self._has_sharded_grads()
 
         can_reduce_into_main_grad = (
-            not has_accumulated_grads and partial_grad.dtype == self.main_grad.dtype
+            not has_installed_grads and partial_grad.dtype == self.main_grad.dtype
         )
         reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
         if reduce_axis is None:
             assert isinstance(self.main_grad.placements[-1], Partial), (
                 "The last placement must be Partial"
             )
-            if has_accumulated_grads:
+            if has_installed_grads:
                 self.main_grad.local_buffer.add_(partial_grad.local_buffer)
             else:
                 self.main_grad.local_buffer.copy_(partial_grad.local_buffer)
@@ -386,22 +369,21 @@ class FsdpParameterGroup:
                 reduced_grad = partial_grad.redistribute(self.main_grad.placements)
                 if grad_divisor != 1:
                     reduced_grad.local_buffer.div_(grad_divisor)
-                if has_accumulated_grads:
+                if has_installed_grads:
                     self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
                 else:
                     self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
+        optimizer_grad = self.main_grad
         if is_last_microbatch:
-            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
-            # reduce-scatter for HFSDP) before binding the sharded parameter grads.
-            accumulation_grad = self.main_grad
-            self.main_grad = accumulation_grad.redistribute(self.main_weight.placements)
-            if self.main_grad is not accumulation_grad:
-                accumulation_grad.local_buffer.record_stream(torch.cuda.current_stream())
+            optimizer_grad = self.main_grad.redistribute(self.main_weight.placements)
+            if optimizer_grad is not self.main_grad:
+                self.main_grad.local_buffer.zero_()
 
-        # Make each sharded parameter's .grad consistent with the final main_grad.
+        # Install the accumulation grad between microbatches and the finalized grad
+        # for optimizer.step() after the last microbatch.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+            fsdp_parameter.sharded.grad = optimizer_grad.get_dtensor(index)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
