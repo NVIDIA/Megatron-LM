@@ -1231,6 +1231,35 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
+    def _prefetch_next(self, fwd: bool, nvtx_label: Optional[str] = None) -> None:
+        """Start the next weight's ordinary forward/backward prefetch."""
+        assert self.next_w is not None
+        _, handle = self.next_w._all_gather_weight(async_op=True, fwd=fwd, nvtx_label=nvtx_label)
+        self.next_w._prefetch_handle = handle
+
+    def _next_prefetch_reuses_current_buffer(self) -> bool:
+        """Return whether the next forward prefetch aliases this weight's gather buffer."""
+        if self.next_w is None:
+            return False
+
+        cache = get_global_GTP_cache()
+        return any(
+            cache.tickets_share_buffer(current._ag_ticket_fwd, following._ag_ticket_fwd)
+            for current in self._weights
+            for following in self.next_w._weights
+        )
+
+    def all_gather_and_prefetch_post_embedding(self, nvtx_label: Optional[str] = None) -> None:
+        """Start a reused-buffer prefetch after the embedding lookup has been enqueued."""
+        if (
+            in_fp8_activation_recompute_phase()
+            or not GTP_CONFIG.weight_prefetch
+            or not self._next_prefetch_reuses_current_buffer()
+            or not self.next_w._need_weight_prefetch
+        ):
+            return
+        self._prefetch_next(fwd=True, nvtx_label=nvtx_label)
+
     def _get_prefetched_weight(self, fwd):
         # Stale-read guard: state must reflect an AG issued for this cycle;
         # otherwise cache.get() would return the prior iter's AG buffer.
@@ -1364,6 +1393,9 @@ class GTPShardedParam(torch.nn.Parameter):
         # (see __init__) instead of the fwd/bwd chains; lazy-built below.
         in_recompute = in_fp8_activation_recompute_phase()
         use_recompute_chain = in_recompute and GTP_CONFIG.weight_prefetch
+        defer_next_prefetch = (
+            not in_recompute and fwd and self._next_prefetch_reuses_current_buffer()
+        )
 
         # Consume current weight.
         if use_recompute_chain and self._recompute_prev is not None:
@@ -1386,13 +1418,11 @@ class GTPShardedParam(torch.nn.Parameter):
             and GTP_CONFIG.weight_prefetch
             and self.next_w is not None
             and self.next_w._need_weight_prefetch
+            and not defer_next_prefetch
         ):
             # Pre-AG work on caller; NCCL wrap lives at the collective site
             # inside _all_gather_weight. See all_gather_and_prefetch_bwd.
-            _, handle = self.next_w._all_gather_weight(
-                async_op=True, fwd=fwd, nvtx_label=nvtx_label
-            )
-            self.next_w._prefetch_handle = handle
+            self._prefetch_next(fwd=fwd, nvtx_label=nvtx_label)
 
         # Unsharded tensor returned, no pending work → reset state to NONE. Skip during recompute:
         # a bwd-chain prefetch may hold an in-flight AG state this weight's later dgrad needs.
@@ -1888,6 +1918,16 @@ class GTPWeightCache:
             )
 
         return slot.buf
+
+    def tickets_share_buffer(
+        self, first_ticket: Optional[int], second_ticket: Optional[int]
+    ) -> bool:
+        """Check allocated ticket-buffer identity without changing ownership."""
+        if first_ticket is None or second_ticket is None:
+            return False
+        first = self._slots[first_ticket].buf
+        second = self._slots[second_ticket].buf
+        return first is not None and first is second
 
     def release(self, ticket: int):
         """Return the buffer to the pool (ticket stays valid).

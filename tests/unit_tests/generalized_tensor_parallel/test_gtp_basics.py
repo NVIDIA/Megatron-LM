@@ -46,6 +46,7 @@ from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPShardedParam,
+    GTPWeightCache,
     wrap_module_params_gtp,
 )
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
@@ -405,6 +406,61 @@ def _worker_chain_async_prefetch(rank, world_size, port):
     assert torch.isfinite(out).all(), "Non-finite output on second pass"
 
 
+def _worker_embedding_output_prefetch_accuracy(rank, world_size, port):
+    """A deferred output-weight prefetch must not overwrite the embedding lookup input."""
+    del rank, port
+    dtype = torch.bfloat16
+    vocab_size = 16 * world_size
+    hidden_size = 1024
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    values = torch.arange(vocab_size * hidden_size, dtype=torch.float32, device="cuda").reshape(
+        vocab_size, hidden_size
+    )
+    embedding_full = values.remainder(113).to(dtype)
+    output_full = -(values.remainder(113) + 1).to(dtype)
+
+    embedding = nn.Module()
+    embedding.weight = nn.Parameter(embedding_full.clone())
+    output = nn.Module()
+    output.weight = nn.Parameter(output_full.clone())
+    wrap_module_params_gtp(embedding, ["weight"], gtp_remat_group)
+    wrap_module_params_gtp(output, ["weight"], gtp_remat_group)
+    embedding.weight._debug_name = "embedding.weight"
+    output.weight._debug_name = "output_layer.weight"
+    embedding.weight._need_weight_prefetch = False
+
+    indices = torch.arange(vocab_size * 64 - 1, -1, -1, dtype=torch.long, device="cuda").remainder(
+        vocab_size
+    )
+    expected_lookup = torch.nn.functional.embedding(indices, embedding_full)
+
+    # The first pass lazily creates the chain and assigns both same-shaped weights
+    # to the same reusable gather buffer.
+    gathered_embedding = embedding.weight.all_gather_and_prefetch(fwd=True)
+    first_lookup = torch.nn.functional.embedding(indices, gathered_embedding)
+    embedding.weight.all_gather_and_prefetch_post_embedding()
+    gathered_output = output.weight.all_gather_and_prefetch(fwd=True)
+    torch.testing.assert_close(first_lookup, expected_lookup, rtol=0, atol=0)
+    torch.testing.assert_close(gathered_output, output_full, rtol=0, atol=0)
+
+    cache = gtp_module.get_global_GTP_cache()
+    assert embedding.weight.next_w is output.weight
+    assert cache.tickets_share_buffer(embedding.weight._ag_ticket_fwd, output.weight._ag_ticket_fwd)
+
+    # Delay the lookup stream so an unordered AG on the separate prefetch stream
+    # would reliably overwrite the aliased buffer before the lookup consumes it.
+    gathered_embedding = embedding.weight.all_gather_and_prefetch(fwd=True)
+    torch.cuda._sleep(5_000_000)
+    lookup = torch.nn.functional.embedding(indices, gathered_embedding)
+    embedding.weight.all_gather_and_prefetch_post_embedding()
+    assert output.weight._prefetch_handle is not None
+    gathered_output = output.weight.all_gather_and_prefetch(fwd=True)
+
+    torch.testing.assert_close(lookup, expected_lookup, rtol=0, atol=0)
+    torch.testing.assert_close(gathered_output, output_full, rtol=0, atol=0)
+
+
 class TestGTPPrefetchChain:
     def test_chain_wired_after_first_pass(self):
         _requires_multi_gpu(4)
@@ -413,6 +469,14 @@ class TestGTPPrefetchChain:
     def test_async_prefetch_second_pass(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_chain_async_prefetch, 4)
+
+    def test_embedding_output_prefetch_accuracy(self, monkeypatch):
+        _requires_multi_gpu(4)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "weight_prefetch", True)
+        monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
+        monkeypatch.setattr(gtp_module, "_GTP_CACHE", GTPWeightCache())
+        monkeypatch.setattr(GTPShardedParam, "_chain_state", {})
+        _run_distributed(_worker_embedding_output_prefetch_accuracy, 4)
 
 
 class TestGroupedExpertChainClassification:

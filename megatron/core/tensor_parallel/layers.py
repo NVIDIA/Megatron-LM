@@ -261,7 +261,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.tp_group = get_tensor_model_parallel_group_if_none(self.tp_group)
 
-        (self.vocab_start_index, self.vocab_end_index) = (
+        self.vocab_start_index, self.vocab_end_index = (
             VocabUtility.vocab_range_from_global_vocab_size(
                 self.num_embeddings, get_pg_rank(self.tp_group), get_pg_size(self.tp_group)
             )
@@ -354,6 +354,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             # F.embedding currently has a non-deterministic backward function
             output_parallel = F.embedding(masked_input, weight)
+        if self.gtp_remat_size > 1:
+            # Release a next-weight prefetch deferred because it reuses the embedding buffer.
+            self.weight.all_gather_and_prefetch_post_embedding()
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
