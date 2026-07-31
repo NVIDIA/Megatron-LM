@@ -54,7 +54,7 @@ MODEL_ARGS:
   --sequence-packing-scheduler: dp_balanced
   --max-seqlen-per-dp-cp-rank: 512
   --pad-packed-seq-alignment: max
-  --no-pad-packed-seq-by-appending-dummy-seq: true
+  --thd-tail-padding-policy: extend_last
   --calculate-per-token-loss: true
   --thd-max-packed-sequences: 8
   --cp-partition-mode: contiguous
