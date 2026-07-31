@@ -24,12 +24,16 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import (
+    get_stage_entry_partition_mode,
+    prebuild_thd_cp_partition_routes,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -94,7 +98,7 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None):
+def get_batch(data_iterator, vp_stage=None, cp_partition_mode: str = "zigzag"):
     """Generate a batch."""
 
     args = get_args()
@@ -170,6 +174,7 @@ def get_batch(data_iterator, vp_stage=None):
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        cp_partition_mode=cp_partition_mode,
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
@@ -291,6 +296,8 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        decoder = get_attr_wrapped_model(model, "decoder")
+        cp_partition_mode = decoder.cp_stage_entry_partition_mode
         (
             attention_mask,
             cu_seqlens,
@@ -302,7 +309,7 @@ def forward_step(data_iterator, model: HybridModel):
             max_seqlen,
             position_ids,
             tokens,
-        ) = get_batch(data_iterator, vp_stage)
+        ) = get_batch(data_iterator, vp_stage, cp_partition_mode=cp_partition_mode)
 
     packed_seq_params = None
     if cu_seqlens is not None:
@@ -327,7 +334,20 @@ def forward_step(data_iterator, model: HybridModel):
             cp_group=hybrid_cp_group,
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
+            cp_partition_mode=cp_partition_mode,
         )
+        packed_seq_params.cp_group = resolve_cp_group(
+            get_context_parallel_group(), packed_seq_params
+        )
+        packed_seq_params.cp_partition_mode = get_stage_entry_partition_mode(
+            packed_seq_params,
+            cp_partition_mode,
+            owner_name="pretrain_hybrid.get_batch",
+            cp_group=packed_seq_params.cp_group,
+        )
+        # TODO(yuzhongw): prebuild THD CP routes only when this model chunk needs
+        # internal layout conversion.
+        prebuild_thd_cp_partition_routes(packed_seq_params)
 
     timers('batch-generator').stop()
 
