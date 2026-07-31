@@ -1472,7 +1472,10 @@ if _CUTILE_AVAILABLE:
             acc = ct.mma(
                 a_tile.astype(ct.tfloat32), b_tile.transpose().astype(ct.tfloat32), acc=acc
             )
-            sum_sq += ct.sum(a_tile * a_tile, axis=1, keepdims=True)
+            # Square in fp32: a bf16 square/reduction loses ~2e-3 relative on the
+            # RMS scale, which native (fp32) does not.
+            a_tile_f32 = a_tile.astype(ct.float32)
+            sum_sq += ct.sum(a_tile_f32 * a_tile_f32, axis=1, keepdims=True)
 
         bid_m_k = tile_m_id + split_k_id * num_m_tiles
         ct.store(PROJ, index=(bid_m_k, 0), tile=acc.astype(PROJ.dtype))
@@ -1622,7 +1625,9 @@ if _CUTILE_AVAILABLE:
             dr_tile = ct.load(
                 DR, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=zero_pad
             )
-            accumulator_da = accumulator_da + _ct_rms_dnorm(a_tile, norm_tile, dr_tile, K, eps)
+            accumulator_da = accumulator_da + _ct_rms_dnorm(
+                a_tile.astype(ct.float32), norm_tile, dr_tile, K, eps
+            )
             b_tile = ct.load(
                 B, index=(0, tile_k_id), shape=(TILE_SIZE_N, TILE_SIZE_K), padding_mode=zero_pad
             )
@@ -1758,6 +1763,11 @@ if _CUTILE_AVAILABLE:
         N = weight.shape[0]
         TILE_N = _next_power_of_2(N)
         dev = x.device
+        # The mHC mapping is a keep_in_fp32 computation (see
+        # HyperConnectionModule._projection_and_get_norm): keep the split-K
+        # partials and the mapping outputs in fp32 even when the activations
+        # arrive in bf16, otherwise this path is ~170x less accurate than native.
+        acc_dtype = torch.float32
         stream = torch.cuda.current_stream()
 
         cache_key = (M, N, K)
@@ -1770,11 +1780,11 @@ if _CUTILE_AVAILABLE:
             else:
                 tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
 
-            proj = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
-            norm = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+            proj = torch.empty(split_k * M, N, dtype=acc_dtype, device=dev)
+            norm = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
             # _ct_proj_rms_fwd_kernel keeps R in its signature; r is computed
             # below from the reduced norm.
-            r = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+            r = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
 
             ct.launch(
                 stream,
@@ -1782,8 +1792,8 @@ if _CUTILE_AVAILABLE:
                 _ct_proj_rms_fwd_kernel,
                 (x, weight, proj, norm, r, M, N, K, eps, tm, tn, tk, split_k),
             )
-            proj = proj.view(split_k, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
-            norm = norm.view(split_k, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+            proj = proj.view(split_k, M, N).to(torch.float32).sum(dim=0).to(dtype=acc_dtype)
+            norm = norm.view(split_k, M, 1).to(torch.float32).sum(dim=0).to(dtype=acc_dtype)
         else:
             # Autotune on first call for this shape.
             from types import SimpleNamespace
@@ -1793,24 +1803,24 @@ if _CUTILE_AVAILABLE:
             configs = [cfg for cfg in configs if cfg.TILE_K <= K and M % cfg.TILE_M == 0]
             if len(configs) == 0:
                 tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
-                proj = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
-                norm = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                proj = torch.empty(split_k * M, N, dtype=acc_dtype, device=dev)
+                norm = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
                 # Signature placeholder for the cuTile kernel; not read.
-                r = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                r = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
                 ct.launch(
                     stream,
                     (math.ceil(M / tm), split_k),
                     _ct_proj_rms_fwd_kernel,
                     (x, weight, proj, norm, r, M, N, K, eps, tm, tn, tk, split_k),
                 )
-                proj = proj.view(split_k, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
-                norm = norm.view(split_k, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+                proj = proj.view(split_k, M, N).to(torch.float32).sum(dim=0).to(dtype=acc_dtype)
+                norm = norm.view(split_k, M, 1).to(torch.float32).sum(dim=0).to(dtype=acc_dtype)
             else:
                 mx_split_k = max(cfg.SPLIT_K for cfg in configs)
-                proj = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
-                norm = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                proj = torch.empty(mx_split_k * M, N, dtype=acc_dtype, device=dev)
+                norm = torch.empty(mx_split_k * M, 1, dtype=acc_dtype, device=dev)
                 # Signature placeholder for autotune launches; not read.
-                r = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                r = torch.empty(mx_split_k * M, 1, dtype=acc_dtype, device=dev)
                 tuned = ct_experimental.autotune_launch(
                     stream,
                     grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
@@ -1839,10 +1849,10 @@ if _CUTILE_AVAILABLE:
                     best.TILE_K,
                     best.SPLIT_K,
                 )
-                proj = torch.empty(best.SPLIT_K * M, N, dtype=x.dtype, device=dev)
-                norm = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
+                proj = torch.empty(best.SPLIT_K * M, N, dtype=acc_dtype, device=dev)
+                norm = torch.empty(best.SPLIT_K * M, 1, dtype=acc_dtype, device=dev)
                 # Signature placeholder for the cuTile kernel; not read.
-                r = torch.empty(best.SPLIT_K * M, 1, dtype=x.dtype, device=dev)
+                r = torch.empty(best.SPLIT_K * M, 1, dtype=acc_dtype, device=dev)
                 # Re-launch with best config for correct output.
                 ct.launch(
                     stream,
@@ -1865,11 +1875,16 @@ if _CUTILE_AVAILABLE:
                     ),
                 )
 
-                proj = proj.view(best.SPLIT_K, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
-                norm = norm.view(best.SPLIT_K, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+                sk = best.SPLIT_K
+                proj = proj.view(sk, M, N).to(torch.float32).sum(dim=0).to(dtype=acc_dtype)
+                norm = norm.view(sk, M, 1).to(torch.float32).sum(dim=0).to(dtype=acc_dtype)
         norm = torch.sqrt(norm)
         r = 1.0 / (norm / math.sqrt(K) + eps)
-        return proj, norm, r
+        # Match native_proj_rms's dtype contract: the result follows the
+        # promoted input/parameter dtype (fp32 in mHC, where the mapping
+        # parameters are keep_in_fp32). `norm` stays fp32 for the backward.
+        out_dtype = torch.promote_types(x.dtype, weight.dtype)
+        return proj.to(out_dtype), norm, r.to(out_dtype)
 
     # -- Reduce + compute_h launcher ------------------------------------------
 
@@ -1913,6 +1928,7 @@ if _CUTILE_AVAILABLE:
         _proj_tile_m: int,
         tile_n: int,
         split_k: int,
+        out_dtype: torch.dtype,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Launch reduce split-K + compute_h kernel.
 
@@ -1928,10 +1944,13 @@ if _CUTILE_AVAILABLE:
 
         bias_2d = bias.unsqueeze(0).contiguous()  # [1, N]
 
-        h_pre_out = torch.empty(M, n, dtype=proj_acc.dtype, device=dev)
-        h_post_out = torch.empty(M, n, dtype=proj_acc.dtype, device=dev)
-        h_res_out = torch.empty(M, N - 2 * n, dtype=proj_acc.dtype, device=dev)
-        r_out = torch.empty(M, 1, dtype=proj_acc.dtype, device=dev)
+        # Mapping outputs follow the promoted input/parameter dtype (fp32 for
+        # mHC's keep_in_fp32 parameters); the reduced projection is kept in the
+        # fp32 accumulator dtype because the backward consumes it.
+        h_pre_out = torch.empty(M, n, dtype=out_dtype, device=dev)
+        h_post_out = torch.empty(M, n, dtype=out_dtype, device=dev)
+        h_res_out = torch.empty(M, N - 2 * n, dtype=out_dtype, device=dev)
+        r_out = torch.empty(M, 1, dtype=out_dtype, device=dev)
         proj_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
 
         default_tm = _default_reduce_compute_h_tile_m(M)
@@ -2013,6 +2032,11 @@ if _CUTILE_AVAILABLE:
         N = weight.shape[0]
         TILE_N = _next_power_of_2(N)
         dev = x.device
+        # The mHC mapping is a keep_in_fp32 computation (see
+        # HyperConnectionModule._projection_and_get_norm): keep the split-K
+        # partials and the mapping outputs in fp32 even when the activations
+        # arrive in bf16, otherwise this path is ~170x less accurate than native.
+        acc_dtype = torch.float32
         stream = torch.cuda.current_stream()
 
         cache_key = (M, N, K)
@@ -2024,11 +2048,11 @@ if _CUTILE_AVAILABLE:
             else:
                 tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
 
-            proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
-            norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+            proj_acc = torch.empty(split_k * M, N, dtype=acc_dtype, device=dev)
+            norm_acc = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
             # _ct_proj_rms_fwd_kernel keeps R in its signature; reduce_compute_h
             # computes r from norm_acc.
-            r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+            r_placeholder = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
 
             ct.launch(
                 stream,
@@ -2043,10 +2067,10 @@ if _CUTILE_AVAILABLE:
             configs = [cfg for cfg in configs if cfg.TILE_K <= K and M % cfg.TILE_M == 0]
             if len(configs) == 0:
                 tm, tn, tk, split_k = _default_proj_rms_fwd_config(M, K, TILE_N)
-                proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
-                norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                proj_acc = torch.empty(split_k * M, N, dtype=acc_dtype, device=dev)
+                norm_acc = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
                 # Signature placeholder for the cuTile kernel; not read.
-                r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                r_placeholder = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
                 ct.launch(
                     stream,
                     (math.ceil(M / tm), split_k),
@@ -2069,10 +2093,10 @@ if _CUTILE_AVAILABLE:
                 )
             else:
                 mx_split_k = max(cfg.SPLIT_K for cfg in configs)
-                proj_acc = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
-                norm_acc = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                proj_acc = torch.empty(mx_split_k * M, N, dtype=acc_dtype, device=dev)
+                norm_acc = torch.empty(mx_split_k * M, 1, dtype=acc_dtype, device=dev)
                 # Signature placeholder for autotune launches; not read.
-                r_placeholder = torch.empty(mx_split_k * M, 1, dtype=x.dtype, device=dev)
+                r_placeholder = torch.empty(mx_split_k * M, 1, dtype=acc_dtype, device=dev)
                 tuned = ct_experimental.autotune_launch(
                     stream,
                     grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M), cfg.SPLIT_K),
@@ -2103,10 +2127,10 @@ if _CUTILE_AVAILABLE:
                 )
                 tm, tn, tk, split_k = best.TILE_M, best.TILE_N, best.TILE_K, best.SPLIT_K
 
-                proj_acc = torch.empty(split_k * M, N, dtype=x.dtype, device=dev)
-                norm_acc = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                proj_acc = torch.empty(split_k * M, N, dtype=acc_dtype, device=dev)
+                norm_acc = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
                 # Signature placeholder for the cuTile kernel; not read.
-                r_placeholder = torch.empty(split_k * M, 1, dtype=x.dtype, device=dev)
+                r_placeholder = torch.empty(split_k * M, 1, dtype=acc_dtype, device=dev)
                 ct.launch(
                     stream,
                     (math.ceil(M / tm), split_k),
@@ -2145,6 +2169,7 @@ if _CUTILE_AVAILABLE:
             tm,
             TILE_N,
             split_k,
+            torch.promote_types(x.dtype, weight.dtype),
         )
         return h_pre, h_post, h_res, r, proj_reduced
 
@@ -3119,6 +3144,10 @@ def _torch_proj_rms_compute_h(
     eps: float,
     compute_h_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    # compute_mappings() hands us activations in the activation dtype while the
+    # mapping parameters are keep_in_fp32, so matmul would reject the pair.
+    # Compute in the parameter dtype, matching the unfused path's fp32 upcast.
+    x = x.to(weight.dtype)
     proj = torch.matmul(x, weight.t())
     r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
     alpha = torch.cat(

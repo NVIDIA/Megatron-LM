@@ -1426,3 +1426,82 @@ class TestEndToEndFusedBroadcast:
             COSINE_SIM_THRESH,
             msg="hidden_states grad (E2E backward, fused compute_h broadcast)",
         )
+
+
+class TestFusedProjRmsComputeHKeepFp32:
+    """Regression: the mHC mapping must stay fp32-accurate with bf16 activations.
+
+    HyperConnectionModule marks mapping_proj.weight / alpha_* / bias as
+    keep_in_fp32 and the unfused path upcasts the activations to fp32, so the
+    fused path must not silently degrade the mapping to the activation dtype.
+    Tolerances here are ~15x tighter than the module-level FWD_ATOL/RTOL: the
+    bug this guards against (bf16 split-K partials and bf16 mapping outputs)
+    cost 170x accuracy while staying well inside the loose tolerances.
+    """
+
+    # Native fp32 reference achieves ~8e-6 rms; the bf16-output bug gave ~1.5e-3.
+    MAPPING_RMS_TOL = 1e-4
+    # r is a pure reduction: native reaches ~5e-8, the bug gave ~2.7e-3.
+    R_RMS_TOL = 1e-5
+
+    @staticmethod
+    def _rms_rel(actual: Tensor, ref64: Tensor) -> float:
+        a = actual.detach().to(torch.float64)
+        r = ref64.detach().to(torch.float64)
+        return ((a - r).pow(2).mean().sqrt() / r.abs().max().clamp_min(1e-30)).item()
+
+    @pytest.mark.parametrize("M,n,hidden", [(256, 4, 4096), (128, 4, 1024)])
+    def test_bf16_activations_fp32_params(self, M, n, hidden):
+        """Fused mapping with production dtypes must match an fp64 reference."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        _info()
+        K = n * hidden
+        N = n * n + 2 * n
+        eps = compute_h_eps = 1e-6
+
+        # Activations arrive in bf16; the mapping parameters are keep_in_fp32.
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        alpha_pre = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        alpha_post = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        alpha_res = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(N, device=DEVICE, dtype=torch.float32) * 0.1
+
+        h_pre, h_post, h_res, r = fused_proj_rms_compute_h(
+            x, w, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+        )
+
+        # fp64 reference from the same input values.
+        x64, w64 = x.to(torch.float64), w.to(torch.float64)
+        proj64 = x64 @ w64.t()
+        r64 = x64.norm(dim=-1, keepdim=True) / math.sqrt(K)
+        alpha64 = torch.cat(
+            [
+                alpha_pre.to(torch.float64).expand(n),
+                alpha_post.to(torch.float64).expand(n),
+                alpha_res.to(torch.float64).expand(N - 2 * n),
+            ],
+            dim=-1,
+        )
+        h64 = proj64 * alpha64.unsqueeze(0) / (r64 + eps) + bias.to(torch.float64).unsqueeze(0)
+
+        assert self._rms_rel(h_pre, h64[..., :n].sigmoid() + compute_h_eps) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(h_post, h64[..., n : 2 * n].sigmoid() * 2) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(h_res, h64[..., 2 * n :]) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(r, r64) < self.R_RMS_TOL
+
+    def test_native_fallback_accepts_mixed_dtypes(self):
+        """The native fallback must run with bf16 activations x fp32 parameters."""
+        from megatron.core.fusions.fused_mhc_kernels import _torch_proj_rms_compute_h
+
+        M, n, K = 64, 4, 512
+        N = n * n + 2 * n
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
+
+        h_pre, h_post, h_res, r = _torch_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        for t in (h_pre, h_post, h_res, r):
+            assert torch.isfinite(t).all()
