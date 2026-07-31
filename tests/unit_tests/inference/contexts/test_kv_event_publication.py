@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
-from megatron.core.inference.contexts.dynamic_context import DynamoHelper, DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext, DynamoHelper
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 
 
