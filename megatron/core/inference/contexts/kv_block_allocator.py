@@ -10,6 +10,9 @@ from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
+# Block deregistration observers are currently registered only by DynamoHelper.
+BlocksDeregisteredObserver = Callable[[list[int], set[int]], None]
+
 
 class KVBlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
@@ -41,6 +44,7 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
         assert (
             0 <= paused_limit <= pool_size - 2
@@ -388,6 +392,13 @@ class KVBlockAllocator:
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
 
+    def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
+        """Register a callback invoked when cached blocks are deregistered.
+
+        Currently used only by DynamoHelper.
+        """
+        self._blocks_deregistered_observers.append(observer)
+
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
 
@@ -414,6 +425,8 @@ class KVBlockAllocator:
         # Notify Mamba slot allocator (if wired) to clean up its state
         if self.on_blocks_deregistered is not None:
             self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:

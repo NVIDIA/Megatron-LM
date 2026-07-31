@@ -271,6 +271,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
+        self.dynamo_helper = context.dynamo_helper
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
@@ -851,6 +852,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         InferenceMode.unset_active()
+        self.dynamo_helper.notify_kv_cache_cleared()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -2084,6 +2086,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        # Discard registrations left by an interrupted prior step before this
+        # step's scheduling queues new registrations.
+        self.dynamo_helper.discard_pending_kv_stored_events()
+
         mode = self.context.config.async_sched_mode
         if mode == AsyncScheduleMode.LEGACY:
             self.schedule_waiting_requests()
@@ -2141,6 +2147,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
+        self.dynamo_helper.publish_pending_kv_stored_events()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
