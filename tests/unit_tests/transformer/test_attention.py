@@ -10,6 +10,7 @@ from packaging import version
 from torch.nn import functional as F
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.context_parallel_layout import get_thd_context_parallel_rank_indices
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
@@ -715,6 +716,9 @@ def _test_parallel_attention_correctness(
     sequence_length=256,
     micro_batch_size=4,
     sequence_packing=False,
+    cp_partition_mode="zigzag",
+    cp_stage_entry_partition_mode="zigzag",
+    compare_param_grads=False,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -729,6 +733,7 @@ def _test_parallel_attention_correctness(
             post_process=post_process,
             vp_stage=vp_stage,
             pg_collection=pg_collection,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
         return gpt_model
 
@@ -766,8 +771,24 @@ def _test_parallel_attention_correctness(
         mock_args.no_load_rng = True
         save_checkpoint(10, gpt_model, None, None, 0)
 
+        def get_param_grad(param):
+            grad = param.grad
+            if grad is None:
+                grad = getattr(param, "main_grad", None)
+            if grad is None:
+                return torch.zeros_like(param, dtype=torch.float32)
+            return grad
+
+        def zero_param_grads(module):
+            for param in module.parameters():
+                param.grad = None
+                main_grad = getattr(param, "main_grad", None)
+                if main_grad is not None:
+                    main_grad.zero_()
+
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention
+        zero_param_grads(attention)
         output_hidden_states_baseline, bias_hidden_states_baseline = attention(
             input_hidden_states, attention_mask=None
         )
@@ -775,6 +796,13 @@ def _test_parallel_attention_correctness(
 
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
+        param_grads_baseline = None
+        if compare_param_grads:
+            param_grads_baseline = {
+                name: get_param_grad(param).detach().float().clone()
+                for name, param in attention.named_parameters()
+                if param.requires_grad
+            }
         output_hidden_states_baseline = output_hidden_states_baseline.detach()
         bias_hidden_states_baseline = bias_hidden_states_baseline
         if bias_hidden_states_baseline is not None:
@@ -806,10 +834,22 @@ def _test_parallel_attention_correctness(
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         def get_tensor_on_this_rank(tensor):
-            if cp > 1:
-                tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
             if sequence_packing:
                 tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
+                if cp > 1:
+                    cu_seqlens_tensor = torch.tensor(
+                        [i * sequence_length for i in range(micro_batch_size + 1)],
+                        device=tensor.device,
+                    )
+                    cp_rank = torch.distributed.get_rank(cp_group)
+                    index = get_thd_context_parallel_rank_indices(
+                        cu_seqlens_tensor, cp, cp_rank, cp_partition_mode
+                    )
+                    tensor = tensor.index_select(0, index)
+            elif cp > 1:
+                tensor = get_tensor_on_this_cp_rank(
+                    tensor, 0, cp_group, cp_partition_mode=cp_partition_mode
+                )
             if tp > 1 and sp:
                 sp_seg = tensor.shape[0] // tp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
@@ -819,15 +859,27 @@ def _test_parallel_attention_correctness(
         if sequence_packing:
             cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            packed_seq_params.cp_partition_mode = cp_partition_mode
         else:
             packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
         input_hidden_states = input_hidden_states.detach().requires_grad_(True)
         parallel_attention = gpt_model[0].decoder.layers[0].self_attention
+        zero_param_grads(parallel_attention)
         output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
             input_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         output_hidden_states_parallel.sum().backward()
+        param_grads_parallel = None
+        if compare_param_grads:
+            assert tp == 1, "Parameter gradient parity only supports unsharded parameters."
+            param_grads_parallel = {}
+            for name, param in parallel_attention.named_parameters():
+                if param.requires_grad:
+                    grad = get_param_grad(param)
+                    if cp > 1:
+                        torch.distributed.all_reduce(grad, group=cp_group)
+                    param_grads_parallel[name] = grad.detach().float().clone()
         input_grad_parallel = input_hidden_states.grad.detach()
 
         # Check if the output is close
@@ -904,6 +956,12 @@ def _test_parallel_attention_correctness(
             assert_close_or_cosine_similarity(
                 bias_hidden_states_baseline, bias_hidden_states_parallel, "bias_hidden_states"
             )
+        if compare_param_grads:
+            assert param_grads_baseline.keys() == param_grads_parallel.keys()
+            for name, grad_baseline in param_grads_baseline.items():
+                assert_close_or_cosine_similarity(
+                    grad_baseline, param_grads_parallel[name], f"param_grad[{name}]"
+                )
 
         Utils.destroy_model_parallel()
 
