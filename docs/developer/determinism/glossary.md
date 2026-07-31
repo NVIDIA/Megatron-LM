@@ -9,6 +9,8 @@ these abbreviations where possible.
 
 ## Determinism Contract
 
+The contract uses these definitions:
+
 - **Bitwise determinism**
 
   Given fixed inputs and seeds, a run yields identical numerical results
@@ -39,17 +41,21 @@ these abbreviations where possible.
 
 ## Terms
 
+The following terms appear throughout the reference:
+
 | Term | Meaning |
 | --- | --- |
 | Deterministic mode | Execution with `--deterministic-mode`. The argument validation and environment defaults from `megatron/training/determinism.py`, plus `torch.use_deterministic_algorithms(True)`. The library code selects deterministic branches using `config.deterministic_mode` or `torch.are_deterministic_algorithms_enabled()`. |
 | Default mode | Execution without `--deterministic-mode`. |
-| Bit-exact / bitwise identical | Byte-identical values for the compared tensors or serialized metrics (see "Verification" above). |
+| Bit-exact / bitwise identical | Byte-identical values for the compared tensors or serialized metrics (refer to "Verification"). |
 | Reproducible | Same result under the same conditions (allocation, caches, environment). This guarantee is weaker than the contract above. A run can repeat within one allocation and still differ on a different physical topology. |
 | Cross-allocation | Comparison of runs on independently assigned resources: a fresh scheduler allocation with generally different physical nodes and network rings. This is the determinism target and the bar a test must meet to count as a determinism certificate. Repeating work inside one allocation exercises less than the contract promises. |
 | Collision-free (unique-index) write | An indexed write (`scatter`, `index_put_(accumulate=False)`) whose indices are unique, so no floating-point accumulation happens and ordering cannot change the result. Deterministic without a special kernel. |
 | Fail closed | When deterministic mode encounters a feature it cannot vouch for, it rejects the configuration at validation time instead of silently running it. |
 
-## Parallelism and infrastructure
+## Parallelism and Infrastructure
+
+The following abbreviations appear in parallelism and infrastructure discussions:
 
 | Term | Meaning |
 | --- | --- |
@@ -60,16 +66,18 @@ these abbreviations where possible.
 | VPP | Virtual pipeline parallelism: interleaved pipeline chunks that reduce pipeline idle time. |
 | EP | Expert parallelism: experts are partitioned across devices. |
 | CP | Context parallelism: one sequence is partitioned across devices. |
-| A2A | All-to-all collective (MoE token dispatch/combine). A rank-indexed permutation, not a floating-point reduction. |
+| A2A | All-to-all collective (MoE token dispatch and combine). A rank-indexed permutation, not a floating-point reduction. |
 | TE | Transformer Engine, NVIDIA's transformer-kernel library. |
 | wgrad / dgrad | Weight gradient / input gradient of a linear layer's backward pass. |
 
-## Model abbreviations
+## Model Abbreviations
+
+The following abbreviations appear in model discussions:
 
 | Term | Meaning |
 | --- | --- |
 | MoE | Mixture of Experts: a layer routes tokens to one or more expert networks. |
-| MLA | Multi-Latent Attention: low-rank latent q/kv projections (DeepSeek family). |
+| MLA | Multi-Latent Attention: low-rank latent qkv projections (DeepSeek family). |
 | DSV3 / DSV4 | DeepSeek-V3- / DeepSeek-V4-style model configurations. DSV3 combines MLA with fine-grained MoE. DSV4 additionally uses DSA sparse attention. |
 | DSA | DeepSeek Sparse Attention: a lightning indexer scores tokens and top-k selection sparsifies core attention. |
 | MTP | Multi-Token Prediction: auxiliary layers predicting additional future tokens. |

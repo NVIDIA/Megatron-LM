@@ -9,10 +9,14 @@ orphan: true
 
 ## Deterministic Mode
 
-`--deterministic-mode` (refer to `megatron/training/determinism.py`) validates the
-determinism environment variables and fills canonical defaults, rejects the
-features that have no deterministic path (cross-entropy fusion and TP
-communication overlap), and enables `torch.use_deterministic_algorithms(True)`.
+`--deterministic-mode` (refer to `megatron/training/determinism.py`) does the
+following:
+
+- Validates the determinism environment variables and fills canonical defaults
+- Rejects features that have no deterministic path (cross-entropy fusion and
+  tensor parallelism (TP) communication overlap)
+- Enables `torch.use_deterministic_algorithms(True)`
+
 The library code then selects the deterministic branches listed in the
 [op catalog](./op-catalog.md). Refer to the user guide for exact flags and
 environment values.

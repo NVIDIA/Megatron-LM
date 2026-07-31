@@ -14,12 +14,14 @@ software, and hardware produce identical results.
 
 ## Contents
 
-- [`status.md`](./status.md): what deterministic mode enforces, how it is
-  validated, performance cost, and a pointer to the live roadmap.
-- [`op-catalog.md`](./op-catalog.md): discusses operations with a deterministic
-  code path and operations that deterministic mode does not support. The goal is
-  to shrink the second bucket and make the first one fast.
-- [`glossary.md`](./glossary.md): definitions and abbreviations.
+This reference includes:
+
+- [`status.md`](./status.md): deterministic-mode enforcement, validation,
+  performance cost, and a pointer to the live roadmap
+- [`op-catalog.md`](./op-catalog.md): operations with a deterministic code path,
+  operations that deterministic mode does not support, and the goal to shrink
+  the unsupported set while speeding up the supported set
+- [`glossary.md`](./glossary.md): definitions and abbreviations
 
 The roadmap is tracked dynamically in
 [issue #5785](https://github.com/NVIDIA/Megatron-LM/issues/5785).
