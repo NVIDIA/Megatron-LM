@@ -110,12 +110,12 @@ class _BSHDCompactIndexerGeometry:
 
 @dataclass(frozen=True)
 class _THDCompactIndexerGeometry:
-    """Packed geometry for which compact THD candidate offsets are valid."""
+    """Static THD geometry for a caller-owned compact workspace."""
 
-    cu_seqlens_q: Tensor
-    cu_seqlens_k: Tensor
-    q_causal_offsets: Tensor | None
-    total_k: int
+    q_shape: tuple[int, ...]
+    k_shape: tuple[int, ...]
+    batch_size: int
+    has_q_causal_offsets: bool
     ratio: int
     max_seqlen_q: int
     max_seqlen_k: int
@@ -297,13 +297,23 @@ class THDCompactIndexerWorkspace:
         max_seqlen_k: int,
         q_causal_offsets: Tensor | None,
         return_softmax: bool,
-        check_sequence_values: bool,
         precision: str = "bf16",
     ) -> bool:
-        """Return whether this workspace can serve the current indexer call."""
+        """Return whether this workspace can serve the current static indexer geometry."""
         geometry = self.geometry
         out_shape = (q.shape[0], topk)
-        batch_size = geometry.cu_seqlens_q.numel() - 1
+        batch_size = geometry.batch_size
+        inputs_valid = all(
+            (
+                q.dtype == torch.bfloat16,
+                k.dtype == torch.bfloat16,
+                tuple(q.shape) == geometry.q_shape,
+                tuple(k.shape) == geometry.k_shape,
+                q.device == k.device,
+                q.is_contiguous(),
+                k.is_contiguous(),
+            )
+        )
         cu_seqlens_valid = all(
             tensor.device == q.device
             and tensor.dtype == torch.int32
@@ -314,7 +324,7 @@ class THDCompactIndexerWorkspace:
         )
         q_causal_offsets_valid = (
             q_causal_offsets is None
-            if geometry.q_causal_offsets is None
+            if not geometry.has_q_causal_offsets
             else (
                 q_causal_offsets is not None
                 and q_causal_offsets.device == q.device
@@ -371,12 +381,11 @@ class THDCompactIndexerWorkspace:
             )
         static_valid = (
             precision in ("bf16", "mxfp8")
+            and inputs_valid
             and geometry.precision == precision
-            and geometry.total_k == k.shape[0]
             and geometry.ratio == ratio
             and geometry.max_seqlen_q == max_seqlen_q
             and geometry.max_seqlen_k == max_seqlen_k
-            and k.device == q.device
             and cu_seqlens_valid
             and q_causal_offsets_valid
             and self.cand_batch_offsets.device == q.device
@@ -398,15 +407,7 @@ class THDCompactIndexerWorkspace:
             and softmax_valid
             and mxfp8_valid
         )
-        if not static_valid or not check_sequence_values:
-            return static_valid
-        return (
-            torch.equal(geometry.cu_seqlens_q, cu_seqlens_q)
-            and torch.equal(geometry.cu_seqlens_k, cu_seqlens_k)
-            and (
-                q_causal_offsets is None or torch.equal(geometry.q_causal_offsets, q_causal_offsets)
-            )
-        )
+        return static_valid
 
     def validate(
         self,
@@ -421,10 +422,9 @@ class THDCompactIndexerWorkspace:
         max_seqlen_k: int,
         q_causal_offsets: Tensor | None,
         return_softmax: bool,
-        capturing: bool,
         precision: str = "bf16",
     ) -> None:
-        """Validate workspace metadata without synchronizing during capture."""
+        """Validate static workspace metadata without synchronizing."""
         if not self.matches(
             q=q,
             k=k,
@@ -436,12 +436,11 @@ class THDCompactIndexerWorkspace:
             max_seqlen_k=max_seqlen_k,
             q_causal_offsets=q_causal_offsets,
             return_softmax=return_softmax,
-            check_sequence_values=not capturing,
             precision=precision,
         ):
             raise ValueError(
-                "THD compact_workspace does not match the current buffers or packed geometry; "
-                "prepare a workspace for this exact call during eager warmup."
+                "THD compact_workspace does not match the current buffers or static geometry; "
+                "prepare a compatible workspace during eager warmup."
             )
 
 
@@ -633,10 +632,10 @@ def prepare_thd_compact_indexer_workspace(
             torch.empty(out_shape, dtype=torch.float32, device=device) if return_softmax else None
         ),
         geometry=_THDCompactIndexerGeometry(
-            cu_seqlens_q=cu_seqlens_q.clone(),
-            cu_seqlens_k=cu_seqlens_k.clone(),
-            q_causal_offsets=(q_causal_offsets.clone() if q_causal_offsets is not None else None),
-            total_k=k.shape[0],
+            q_shape=tuple(q.shape),
+            k_shape=tuple(k.shape),
+            batch_size=cu_seqlens_q.numel() - 1,
+            has_q_causal_offsets=q_causal_offsets is not None,
             ratio=ratio,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
@@ -1602,7 +1601,6 @@ def _indexer_topk_core(
                     max_seqlen_k=int(max_seqlen_kv),
                     q_causal_offsets=q_causal_offsets,
                     return_softmax=return_softmax,
-                    capturing=capturing,
                     precision=precision,
                 )
                 _refresh_thd_compact_cand_batch_offsets(

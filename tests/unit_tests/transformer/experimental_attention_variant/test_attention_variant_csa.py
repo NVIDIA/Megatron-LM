@@ -1991,15 +1991,17 @@ class TestCompressedSparseAttentionThd:
         return query, key, value, x, qr, packed
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_thd_compact_workspace_prepared_in_warmup_and_reused_in_capture(self):
-        """CUDA capture reuses warmup-owned storage without running the sizing helper."""
+    def test_thd_compact_workspace_reused_across_dynamic_boundaries(self):
+        """Dynamic sequence boundaries share one workspace for the same static geometry."""
         csa = self._build_csa(compress_ratio=4)
         previous_cuda_graph_impl = csa.config.cuda_graph_impl
         csa.config.cuda_graph_impl = "local"
-        q = torch.empty(8, 64, 128, dtype=torch.bfloat16, device="cuda")
-        k = torch.empty(2, 128, dtype=torch.bfloat16, device="cuda")
-        cu_q = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
-        cu_k = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+        q = torch.empty(64, 64, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.empty(16, 128, dtype=torch.bfloat16, device="cuda")
+        cu_q_variants = [
+            torch.tensor([0, split, 64], dtype=torch.int32, device="cuda") for split in range(1, 33)
+        ]
+        cu_k = torch.tensor([0, 8, 16], dtype=torch.int32, device="cuda")
         workspace = MagicMock()
         workspace.matches.return_value = True
 
@@ -2015,34 +2017,45 @@ class TestCompressedSparseAttentionThd:
                     "prepare_thd_compact_indexer_workspace",
                     return_value=workspace,
                 ) as prepare_workspace,
-                patch.object(torch.cuda, "is_current_stream_capturing", side_effect=[False, True]),
+                patch.object(
+                    torch.cuda,
+                    "is_current_stream_capturing",
+                    side_effect=[False] * len(cu_q_variants) + [True],
+                ),
             ):
-                warmup_workspace = csa._get_thd_compact_indexer_workspace(
-                    q,
-                    k,
-                    topk=8,
-                    ratio=4,
-                    cu_seqlens_q=cu_q,
-                    cu_seqlens_k=cu_k,
-                    max_seqlen_q=8,
-                    max_seqlen_k=2,
-                )
+                warmup_workspaces = [
+                    csa._get_thd_compact_indexer_workspace(
+                        q,
+                        k,
+                        topk=8,
+                        ratio=4,
+                        cu_seqlens_q=cu_q,
+                        cu_seqlens_k=cu_k,
+                        max_seqlen_q=64,
+                        max_seqlen_k=8,
+                    )
+                    for cu_q in cu_q_variants
+                ]
                 capture_workspace = csa._get_thd_compact_indexer_workspace(
                     q,
                     k,
                     topk=8,
                     ratio=4,
-                    cu_seqlens_q=cu_q,
+                    cu_seqlens_q=cu_q_variants[-1],
                     cu_seqlens_k=cu_k,
-                    max_seqlen_q=8,
-                    max_seqlen_k=2,
+                    max_seqlen_q=64,
+                    max_seqlen_k=8,
                 )
 
-            assert warmup_workspace is workspace
+            assert all(warmup_workspace is workspace for warmup_workspace in warmup_workspaces)
             assert capture_workspace is workspace
             assert csa._thd_compact_indexer_workspaces == [workspace]
             prepare_workspace.assert_called_once()
-            workspace.matches.assert_called_once()
+            assert workspace.matches.call_count == len(cu_q_variants)
+            assert all(
+                "check_sequence_values" not in call.kwargs
+                for call in workspace.matches.call_args_list
+            )
         finally:
             csa.config.cuda_graph_impl = previous_cuda_graph_impl
 
