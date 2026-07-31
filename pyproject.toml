@@ -195,6 +195,8 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+    # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
+    "urllib3>=2.6.3",
 ]
 
 [[tool.uv.dependency-metadata]]
