@@ -503,8 +503,8 @@ class KVBlockAllocator:
         Worked example, evicting 3 from::
 
             A(ts 1) -> B(ts 2) -> C(ts 5)   (C, F are leaves under B)
-                              \-> F(ts 3)
-                    \-> D(ts 3) -> E(ts 5)   (E is a leaf under D)
+                              +-> F(ts 3)
+                    +-> D(ts 3) -> E(ts 5)   (E is a leaf under D)
 
         Leaf-peel evicts F(3), then C(5); B is now childless so it joins the
         leaves with its own ts=2 and is evicted next -> retains {A, D, E}, keeping

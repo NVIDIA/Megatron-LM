@@ -698,6 +698,7 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
         sample=torch.empty(0, dtype=torch.int64),
         accepted_tokens=None,
         log_probs=[],
+        consumed_chunked_prefill_request_id=-1,
     )
 
     assert active_request_ids == []
