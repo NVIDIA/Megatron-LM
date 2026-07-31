@@ -1054,12 +1054,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
 
-        # The MTP inner block's first attention all-gather (the first layer's
-        # self_attention.linear_qkv) reuses the same "tp" symmetric buffer that
-        # _concat_embeddings' output all-gather just wrote, with no reduce-scatter in
-        # between, so it must also barrier before overwriting. Later all-gathers in the
-        # inner block are each preceded by a reduce-scatter and need no barrier. Dispatch
-        # to the first inner layer the same way _proj_and_transformer_layer does.
+        # The MTP inner block's first all-gather reuses the same "tp" symmetric buffer
+        # that _concat_embeddings' output all-gather just wrote, with no reduce-scatter in
+        # between, so it must barrier before overwriting. Later all-gathers in the inner
+        # block are each preceded by a reduce-scatter and need no barrier. modules() yields
+        # in forward order, so the first inference column-parallel linear is that all-gather.
         if self.mtp_layer_pattern is not None:
             # Hybrid path: HybridStack of layers.
             first_inner_layer = self.mtp_model_layer.layers[0]
@@ -1067,17 +1066,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             # GPT path: single TransformerLayer.
             first_inner_layer = self.mtp_model_layer
 
-        assert hasattr(first_inner_layer, "self_attention") and hasattr(
-            first_inner_layer.self_attention, "linear_qkv"
-        ), (
-            "MTP inner-block barrier wiring expects the first inner layer to be an "
-            "attention layer exposing self_attention.linear_qkv. The MTP head structure "
-            "has changed; revisit which all-gather reuses the 'tp' symmetric buffer after "
-            "the output projection and set barrier_before_all_gather on it accordingly."
-        )
-        inner_qkv = first_inner_layer.self_attention.linear_qkv
-        if is_inference_column_parallel_linear(inner_qkv):
-            inner_qkv.set_barrier_before_all_gather(True)
+        for module in first_inner_layer.modules():
+            if is_inference_column_parallel_linear(module):
+                module.set_barrier_before_all_gather(True)
+                break
 
         self.final_layernorm = self.submodules.layer_norm(
             config=self.config,
