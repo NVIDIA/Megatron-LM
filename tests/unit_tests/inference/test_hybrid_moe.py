@@ -31,7 +31,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stac
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import HAVE_FA4
+from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, delete_cuda_graphs
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     te_supports_batch_invariant_attention,
@@ -63,8 +63,11 @@ ALL_STATES = [NONE, DECODE, PREFILL, MIXED, PREFILL_AT_MAX_TOKENS, MIXED_GIANT_P
 # independently.
 _EP_SIZE = 4
 requires_te_batch_invariant_attention = pytest.mark.skipif(
-    not te_supports_batch_invariant_attention(),
-    reason="Batch-invariant attention requires TransformerEngine PR #3204 or >= 2.18.",
+    not te_supports_batch_invariant_attention() or not (HAVE_FA3 or HAVE_FA4),
+    reason=(
+        "Batch-invariant attention requires TransformerEngine PR #3204 or >= 2.18 "
+        "and FlashAttention-3 or -4."
+    ),
 )
 
 # Combinatorial sweep: unordered combinations with repetition of ALL_STATES
