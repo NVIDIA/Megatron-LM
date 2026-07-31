@@ -48,6 +48,7 @@ MODEL_ARGS=(
   # --- DSA config requirements (asserts): RMSNorm, no biases, no rope fusion ---
   --normalization RMSNorm
   --disable-bias-linear
+  --no-rope-fusion
   --untie-embeddings-and-output-weights
   # --- mamba ---
   --mamba-state-dim 128
