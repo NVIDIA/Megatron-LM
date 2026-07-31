@@ -23,6 +23,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -66,13 +67,15 @@ class PrefixCachingTestBase:
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         mamba_config=None,
         prefix_caching_mamba_gb=None,
+        batch_invariant_mode=False,
+        enable_chunked_prefill=False,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
         DynamicInferenceContext.REQUEST_ROUNDER = rounder
 
         transformer_config = TransformerConfig(
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16 if batch_invariant_mode else torch.float32,
             num_layers=4,
             kv_channels=8,
             num_attention_heads=2,
@@ -80,7 +83,14 @@ class PrefixCachingTestBase:
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             use_cpu_initialization=True,
+            batch_invariant_mode=batch_invariant_mode,
+            attention_backend=AttnBackend.flash if batch_invariant_mode else AttnBackend.auto,
+            flash_attention_version=4 if batch_invariant_mode else None,
+            attention_dropout=0.0 if batch_invariant_mode else 0.1,
         )
+        if batch_invariant_mode:
+            max_tokens = 512 if max_tokens is None else max_tokens
+            max_requests = 64 if max_requests is None else max_requests
         inference_config = InferenceConfig(
             max_sequence_length=max_sequence_length,
             buffer_size_gb=buffer_size_gb,
@@ -92,6 +102,7 @@ class PrefixCachingTestBase:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=enable_chunked_prefill,
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
         )
@@ -918,6 +929,46 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         assert msa5.has_state(bid5) and bh5 in msa5.hash_to_block_id
         ctx5.release_memory_blocks_from_request_indexes([0])
         assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
+
+    @pytest.mark.internal
+    def test_batch_invariant_mamba_chunked_prefill_scheduler_alignment(self):
+        ctx = self._mctx(
+            block_size_tokens=32, batch_invariant_mode=True, enable_prefix_caching=False
+        )
+        engine = _StubEngine(ctx, enable_chunked_prefill=True)
+        req = self._req(ctx, self._prompt(500), enable_prefix_caching=False)
+
+        assert engine._mamba_batch_invariant_prefill_chunk_length(req, 300) == 256
+        assert engine._mamba_batch_invariant_prefill_chunk_length(req, 100) == 0
+
+        short_req = self._req(ctx, self._prompt(200), request_id=2, enable_prefix_caching=False)
+        assert engine._mamba_batch_invariant_prefill_chunk_length(short_req, 300) == 200
+
+        one_left_req = self._req(
+            ctx, self._prompt(ctx.mamba_chunk_size + 1), request_id=3, enable_prefix_caching=False
+        )
+        assert (
+            engine._mamba_batch_invariant_prefill_chunk_length(one_left_req, ctx.mamba_chunk_size)
+            == 0
+        )
+        assert (
+            engine._mamba_batch_invariant_prefill_chunk_length(
+                one_left_req, ctx.mamba_chunk_size + 1
+            )
+            == ctx.mamba_chunk_size + 1
+        )
+
+        with pytest.raises(AssertionError, match="max_tokens > mamba_chunk_size"):
+            self._mctx(
+                batch_invariant_mode=True,
+                enable_prefix_caching=False,
+                enable_chunked_prefill=True,
+                max_tokens=ctx.mamba_chunk_size,
+                max_requests=64,
+            )
+
+        with pytest.raises(AssertionError, match="does not support Mamba prefix caching"):
+            self._mctx(batch_invariant_mode=True)
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):
