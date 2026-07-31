@@ -10,7 +10,7 @@ one NCCL process group. Profile the script with:
         --capture-range=cudaProfilerApi --capture-range-end=stop \
         --export=sqlite --output=/tmp/nccl_same_pg_two_streams_async \
         uv run torchrun --nproc-per-node=2 \
-        megatron/core/distributed/fsdp/docs/scripts/nccl_same_pg_two_streams_async.py
+        megatron/core/distributed/fsdp/src/docs/scripts/nccl_same_pg_two_streams_async.py
 
 Then inspect the NCCL kernels with:
 
