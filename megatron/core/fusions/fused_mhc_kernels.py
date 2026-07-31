@@ -3148,8 +3148,9 @@ def _torch_proj_rms_compute_h(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # compute_mappings() hands us activations in the activation dtype while the
     # mapping parameters are keep_in_fp32, so matmul would reject the pair.
-    # Compute in the parameter dtype, matching the unfused path's fp32 upcast.
-    x = x.to(weight.dtype)
+    # Compute in the wider of the two, matching the unfused path's fp32 upcast
+    # without letting a lower-precision parameter downcast the activations.
+    x = x.to(torch.promote_types(x.dtype, weight.dtype))
     proj = torch.matmul(x, weight.t())
     r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
     alpha = torch.cat(
@@ -3401,13 +3402,17 @@ def fused_h_post_bda(
 def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Projection + RMS normalization using cuTile, then torch."""
     _raise_mhc_backend_validation_error()
-    if x.dtype != weight.dtype:
-        # The mHC mapping parameters are keep_in_fp32 while activations arrive
-        # in the activation dtype. Normalize here so every backend consumes the
-        # same dtype and the native fallback's matmul does not reject the pair.
-        x = x.to(weight.dtype)
     if is_cutile_available():
+        # The cuTile kernels load and cast each tile independently, so they take
+        # the keep_in_fp32 weight against activation-dtype inputs directly.
+        # Upcasting x here would only materialize a full fp32 copy of the
+        # activations; bf16 -> fp32 is exact, so it would not buy any accuracy.
         return CutileProjRms.apply(x, weight, eps)
+    if x.dtype != weight.dtype:
+        # native_proj_rms's matmul does reject mixed dtypes, and the copy is
+        # unavoidable on this branch. Promote rather than adopt the weight
+        # dtype so a lower-precision parameter cannot downcast the activations.
+        x = x.to(torch.promote_types(x.dtype, weight.dtype))
     return native_proj_rms(x, weight, eps)
 
 

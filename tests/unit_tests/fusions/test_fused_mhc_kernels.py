@@ -1506,6 +1506,29 @@ class TestFusedProjRmsComputeHKeepFp32:
         for t in (h_pre, h_post, h_res, r):
             assert torch.isfinite(t).all()
 
+    def test_public_entry_point_native_branch(self, monkeypatch):
+        """The public op must also run natively — this is the forced-native path.
+
+        MHC_FORCE_BACKEND=native and an auto run on a cuTile-less container both
+        land here, and the module always calls the public op when
+        use_fused_mhc=True, so this branch is what a real training job hits.
+        """
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        _info()
+        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: False)
+
+        M, n, K = 64, 4, 512
+        N = n * n + 2 * n
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
+
+        outs = fused_mod.fused_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        for t in outs:
+            assert torch.isfinite(t).all()
+
 
 class TestCutileHAggregateBackwardReduction:
     """Regression: h_aggregate backward is the only other cuTile-only op.
@@ -1548,15 +1571,58 @@ class TestCutileHAggregateBackwardReduction:
 
 
 class TestFusedProjRmsMixedDtype:
-    """Regression: every proj_rms backend must accept keep_in_fp32 parameters."""
+    """Regression: every proj_rms backend must accept keep_in_fp32 parameters.
 
-    @pytest.mark.parametrize("M,N,K", [(256, 24, 4096)])
-    def test_bf16_activations_fp32_weight(self, M, N, K):
-        """bf16 activations against an fp32 weight must not raise."""
-        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms
+    The standalone entry point is not on the training path (compute_mappings
+    uses the fused compute_h op), but it must still work with bf16 activations
+    against an fp32 weight, and it must not pay for that with a full fp32 copy
+    of the activations on the cuTile branch.
+    """
+
+    @pytest.mark.parametrize("M,N,K", [(4096, 24, 16384)])
+    def test_cutile_takes_mixed_dtypes_without_copying_activations(self, M, N, K):
+        """cuTile consumes bf16 activations directly, with no fp32 copy of x."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms, is_cutile_available
 
         _info()
+        if not is_cutile_available():
+            pytest.skip("cuTile unavailable for current device")
+
         x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
         proj, r = fused_proj_rms(x, w, 1e-6)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - before
+
+        # An fp32 copy of x alone would be M * K * 4 bytes.
+        fp32_activation_copy = M * K * 4
+        assert peak < fp32_activation_copy // 2, (
+            f"peak allocation {peak} suggests the activations were upcast "
+            f"(an fp32 copy of x is {fp32_activation_copy} bytes)"
+        )
+
+        # Accuracy against an fp64 reference built from the same input values.
+        x64, w64 = x.to(torch.float64), w.to(torch.float64)
+        ref_proj = x64 @ w64.t()
+        ref_r = 1.0 / (x64.norm(dim=-1, keepdim=True) / math.sqrt(K) + 1e-6)
+        for got, ref, name in ((proj, ref_proj, "proj"), (r, ref_r, "r")):
+            got64, ref64 = got.to(torch.float64), ref
+            rms = ((got64 - ref64).pow(2).mean().sqrt() / ref64.abs().max().clamp_min(1e-30)).item()
+            assert rms < 1e-4, f"{name} rms rel err {rms:.3e}"
+
+    @pytest.mark.parametrize("M,N,K", [(256, 24, 4096)])
+    def test_native_branch_accepts_mixed_dtypes(self, M, N, K, monkeypatch):
+        """With cuTile unavailable the native branch must still run."""
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        _info()
+        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: False)
+
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        proj, r = fused_mod.fused_proj_rms(x, w, 1e-6)
         assert torch.isfinite(proj).all() and torch.isfinite(r).all()
