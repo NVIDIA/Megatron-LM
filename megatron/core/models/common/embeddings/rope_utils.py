@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import get_context_parallel_layout_chunk_indices
 
 logger = logging.getLogger(__name__)
 _ROPE_FUSION_FALLBACK_WARNINGS: set[str] = set()
@@ -158,22 +159,30 @@ def _fused_mrope_unavailable_warning_key(reason: str, thd: bool = False) -> str:
 
 
 def get_pos_emb_on_this_cp_rank(
-    pos_emb: Tensor, seq_dim: int, cp_group: torch.distributed.ProcessGroup
+    pos_emb: Tensor,
+    seq_dim: int,
+    cp_group: torch.distributed.ProcessGroup,
+    cp_partition_mode="zigzag",
 ) -> Tensor:
-    """Get the position embedding on the current context parallel rank.
+    """Get the SBHD position embedding on the current context parallel rank.
+
+    This helper slices a full sequence RoPE table into the CP-rank-local layout
+    requested by ``cp_partition_mode``. Packed THD RoPE tables stay in global
+    packed-token order and should not call this helper.
 
     Args:
         pos_emb (Tensor): Positional embedding tensor
         seq_dim (int): Sequence dimension
         cp_group (torch.distributed.ProcessGroup): The context parallel group
+        cp_partition_mode (str): ``"zigzag"`` or ``"contiguous"`` CP layout.
     """
     if cp_group is None:
         raise ValueError("cp_group must be provided to get positional embedding per CP rank")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    cp_idx = torch.tensor(
-        [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-    ).cuda(non_blocking=True)
+    cp_idx = get_context_parallel_layout_chunk_indices(cp_size, cp_rank, cp_partition_mode).to(
+        device=pos_emb.device, non_blocking=True
+    )
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
     )
@@ -273,6 +282,10 @@ def _get_thd_freqs_on_this_cp_rank(
 ) -> Tensor:
     """Get the correct frequency slice for this context parallel rank with optional sequence offset.
 
+    This helper is retained for external/private compatibility.  The in-repo
+    THD RoPE path computes rank-local frequency positions inline in
+    ``_apply_rotary_pos_emb_thd``.
+
     Args:
         cp_rank: Current context parallel rank
         cp_size: Total context parallel size
@@ -328,6 +341,7 @@ def _apply_rotary_pos_emb_thd(
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
+    cp_partition_mode="zigzag",
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
 ) -> Tensor:
@@ -357,7 +371,6 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-
     total_tokens = t.shape[0]
     device = t.device
 
@@ -383,7 +396,26 @@ def _apply_rotary_pos_emb_thd(
     local_seq_len = local_seq_lens[seq_idx]
     global_seq_start = cu_seqlens_i64[seq_idx]
 
-    if cp_size > 1:
+    assert max_seqlen is not None, (
+        "max_seqlen must be provided for THD RoPE so packed-frequency offset "
+        "detection does not silently depend on tensor shape heuristics."
+    )
+    exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
+
+    if cp_partition_mode == "contiguous":
+        # THD contiguous layout partitions the flattened packed buffer into
+        # rank-contiguous spans. Compute absolute packed positions first, then
+        # map them back to sequence-local RoPE positions when needed.
+        if cp_size > 1:
+            part_len = cu_seqlens_i64[-1] // cp_size
+            global_token_pos = cp_rank * part_len + token_pos
+        else:
+            global_token_pos = token_pos
+        seq_idx = torch.searchsorted(cu_seqlens_i64[1:], global_token_pos, right=True)
+        seq_idx = seq_idx.clamp(min=0, max=cu_seqlens.shape[0] - 2)
+        global_seq_start = cu_seqlens_i64[seq_idx]
+        freq_pos = global_token_pos - global_seq_start
+    elif cp_partition_mode == "zigzag" and cp_size > 1:
         first_cp_seg = (local_seq_len + 1) // 2
         second_cp_seg = local_seq_len // 2
         full_seqlen = local_seq_len * cp_size
@@ -393,14 +425,11 @@ def _apply_rotary_pos_emb_thd(
             cp_rank * first_cp_seg + local_pos,
             full_seqlen - (cp_rank + 1) * second_cp_seg + (local_pos - first_cp_seg),
         )
-    else:
+    elif cp_partition_mode == "zigzag" or (cp_partition_mode is None and cp_size <= 1):
         freq_pos = local_pos.to(torch.int64)
+    else:
+        raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
 
-    assert max_seqlen is not None, (
-        "max_seqlen must be provided for THD RoPE so packed-frequency offset "
-        "detection does not silently depend on tensor shape heuristics."
-    )
-    exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
     if exact_packed_freqs:
         # `freqs` covers all positions across all sequences (used for non-1D
         # RoPE / VLMs); shift by the per-sequence start offset so each token
@@ -551,6 +580,7 @@ def _try_fused_mrope_thd(
     mla_rotary_interleaved: bool,
     inverse: bool,
     mla_output_remove_interleaving: bool,
+    cp_partition_mode: Optional[str],
     max_seqlen: Optional[int],
 ) -> Tensor:
     """Dispatch raw 3-axis mRoPE freqs for the THD (packed sequence) path.
@@ -566,6 +596,7 @@ def _try_fused_mrope_thd(
         and not mla_rotary_interleaved
         and not inverse
         and not config.rotary_interleaved
+        and cp_partition_mode in (None, "zigzag")
     )
     if use_fused_mrope_thd:
         unavailable_reason = get_fused_mrope_thd_unavailable_reason(
@@ -618,6 +649,12 @@ def _try_fused_mrope_thd(
                 "Triton fused mRoPE for THD layout currently supports "
                 "rotary_interleaved=False. Using unfused implementation.",
             ),
+            (
+                cp_partition_mode == "contiguous",
+                "triton-mrope-thd-contiguous",
+                "Triton fused mRoPE for THD layout assumes zigzag context-parallel "
+                "layout. Using unfused implementation.",
+            ),
         ]
     ):
         _warn_rope_fusion_fallback_once(
@@ -633,6 +670,7 @@ def _try_fused_mrope_thd(
         mla_rotary_interleaved=mla_rotary_interleaved,
         mscale=mscale,
         cp_group=cp_group,
+        cp_partition_mode=cp_partition_mode,
         inverse=inverse,
         mla_output_remove_interleaving=mla_output_remove_interleaving,
         max_seqlen=max_seqlen,
@@ -649,6 +687,7 @@ def apply_rotary_pos_emb(
     mla_rotary_interleaved: bool = False,
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
+    cp_partition_mode=None,
     max_seqlen: Optional[int] = None,
 ):
     """
@@ -662,7 +701,6 @@ def apply_rotary_pos_emb(
         cp_group = parallel_state.get_context_parallel_group()
     if mla_rotary_interleaved is None:
         mla_rotary_interleaved = config.multi_latent_attention
-
     is_raw_mrope_freqs = (
         _is_raw_mrope_freqs(t, freqs, config)
         if cu_seqlens is None
@@ -725,6 +763,15 @@ def apply_rotary_pos_emb(
             if not use_unfused:
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
+            cp_size = cp_group.size()
+            if cp_partition_mode is None and cp_size > 1:
+                raise ValueError(
+                    "cp_partition_mode must be provided for THD RoPE under context parallelism."
+                )
+            if cp_partition_mode not in (None, "zigzag", "contiguous"):
+                raise ValueError(
+                    f"Unsupported context-parallel partition mode {cp_partition_mode!r}."
+                )
             if is_raw_mrope_freqs:
                 return _try_fused_mrope_thd(
                     t,
@@ -736,6 +783,7 @@ def apply_rotary_pos_emb(
                     mla_rotary_interleaved=mla_rotary_interleaved,
                     inverse=inverse,
                     mla_output_remove_interleaving=mla_output_remove_interleaving,
+                    cp_partition_mode=cp_partition_mode,
                     max_seqlen=max_seqlen,
                 )
             use_unfused_thd = _warn_unsupported_fusion_options(
@@ -764,6 +812,12 @@ def apply_rotary_pos_emb(
                         "Transformer Engine fused RoPE for THD layout is unavailable. "
                         "Using unfused implementation.",
                     ),
+                    (
+                        cp_partition_mode == "contiguous",
+                        "te-rope-thd-contiguous",
+                        "TE fused THD RoPE assumes zigzag context-parallel layout. "
+                        "Using unfused implementation.",
+                    ),
                 ]
             )
             if use_unfused_thd:
@@ -775,6 +829,7 @@ def apply_rotary_pos_emb(
                     mla_rotary_interleaved=mla_rotary_interleaved,
                     mscale=mscale,
                     cp_group=cp_group,
+                    cp_partition_mode=cp_partition_mode,
                     inverse=inverse,
                     mla_output_remove_interleaving=mla_output_remove_interleaving,
                     max_seqlen=max_seqlen,
@@ -783,7 +838,7 @@ def apply_rotary_pos_emb(
                 t,
                 cu_seqlens,
                 freqs,
-                cp_size=cp_group.size(),
+                cp_size=cp_size,
                 cp_rank=cp_group.rank(),
                 interleaved=config.rotary_interleaved,
             )
@@ -810,6 +865,7 @@ def apply_rotary_pos_emb(
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             cp_group=cp_group,
+            cp_partition_mode=cp_partition_mode,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
