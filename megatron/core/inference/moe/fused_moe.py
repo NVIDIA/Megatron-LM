@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.inference.moe.activations import (
     padded_squared_relu,
+    padded_swiglu,
     squared_relu_and_quantize_mxfp8,
 )
 from megatron.core.inference.moe.permute import (
@@ -42,6 +43,7 @@ class ActivationType(Enum):
     """Activation functions supported by mcore_fused_moe."""
 
     SQUARED_RELU = "squared_relu"
+    SWIGLU = "swiglu"
 
 
 def _bf16_grouped_mm(
@@ -75,6 +77,10 @@ def _get_activation_func(activation_type: ActivationType, fused_quant: bool = Fa
     """
     if activation_type == ActivationType.SQUARED_RELU:
         return squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
+    elif activation_type == ActivationType.SWIGLU:
+        if fused_quant:
+            raise NotImplementedError("SWIGLU + MXFP8 fused-quant not implemented (bf16 only)")
+        return padded_swiglu
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
 
