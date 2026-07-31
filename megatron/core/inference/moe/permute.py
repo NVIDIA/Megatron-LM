@@ -8,6 +8,7 @@ Includes:
 - Unpermute expert outputs back to original token order
 """
 
+import os
 from typing import Optional
 from unittest.mock import MagicMock
 
@@ -30,6 +31,14 @@ if not HAVE_TRITON:
 
 
 _NUM_SMS: Optional[int] = None
+
+# Use the tl.histogram-based token-count kernel (one atomic per bin per CTA)
+# instead of the per-pair atomic_add kernel in the decode dispatch path.
+# Env-toggleable for A/B measurement; defaults on.
+# Default OFF: microbench showed the histogram variant is ~equal (0.96x) at decode
+# scale — the count kernel's cost is per-launch fixed overhead, not atomic
+# contention, so an in-kernel rewrite does not help. Kept opt-in for reference.
+_USE_HISTOGRAM_COUNT: bool = os.environ.get("MCORE_MOE_HISTOGRAM_COUNT", "0") == "1"
 
 
 def _get_num_sms(device: torch.device) -> int:
@@ -109,12 +118,61 @@ def _count_local_tokens_kernel_persistent(
             tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
+@triton.jit
+def _count_local_tokens_kernel_histogram(
+    routing_map_ptr,  # [max_tokens, topk] flattened expert assignments
+    tokens_per_expert_ptr,  # [num_local_experts] output counters (zeroed by caller)
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
+    topk,  # number of expert choices per token
+    local_expert_start,  # first global expert index owned by this rank
+    num_local_experts: tl.constexpr,  # number of experts on this rank
+    num_sms,  # number of SMs (grid size for persistent kernel)
+    NUM_BINS: tl.constexpr,  # next_power_of_2(num_local_experts + 1) for tl.histogram
+    BLOCK_SIZE: tl.constexpr,  # number of pairs processed per iteration
+):
+    """Count tokens routed to local experts via per-CTA histograms.
+
+    Semantically identical to ``_count_local_tokens_kernel_persistent`` but
+    accumulates a private ``[NUM_BINS]`` histogram in registers across all of a
+    CTA's chunks (``tl.histogram``), then issues a single ``atomic_add`` per bin
+    at the end. This cuts global atomics from O(valid_pairs) — every (token,
+    topk) pair contended on ``num_local_experts`` counters — down to
+    O(num_sms * num_local_experts), which is the dominant cost of this kernel in
+    the decode routing path. Non-local / out-of-range pairs are folded into the
+    dropped bin ``num_local_experts`` (never written back).
+    """
+    pid = tl.program_id(0)
+    valid_tokens = tl.load(valid_tokens_ptr)
+    valid_pairs = valid_tokens * topk
+
+    total_blocks = tl.cdiv(valid_pairs, BLOCK_SIZE)
+    blocks_per_cta = tl.cdiv(total_blocks, num_sms)
+    block_start = pid * blocks_per_cta
+
+    acc = tl.zeros([NUM_BINS], dtype=tl.int32)
+    if block_start < total_blocks:
+        block_end = tl.minimum(block_start + blocks_per_cta, total_blocks)
+        for block_id in tl.range(block_start, block_end):
+            offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+            mask = offsets < valid_pairs
+            expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
+            local_ids = expert_ids - local_expert_start
+            is_local = (local_ids >= 0) & (local_ids < num_local_experts) & mask
+            # Fold non-local / padding pairs into the dropped bin (num_local_experts).
+            bin_ids = tl.where(is_local, local_ids, num_local_experts)
+            acc += tl.histogram(bin_ids, NUM_BINS)
+
+    bins = tl.arange(0, NUM_BINS)
+    tl.atomic_add(tokens_per_expert_ptr + bins, acc, mask=bins < num_local_experts)
+
+
 def compute_local_tokens_per_expert(
     routing_map: torch.Tensor,
     local_expert_start: int,
     num_local_experts: int,
     valid_tokens: torch.Tensor,
     persistent: bool = False,
+    use_histogram: bool = _USE_HISTOGRAM_COUNT,
 ) -> torch.Tensor:
     """Count tokens routed to each local expert.
 
@@ -126,6 +184,9 @@ def compute_local_tokens_per_expert(
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens
             this iteration. Fixed address; value updated each step before graph replay.
         persistent: use persistent-grid kernel variant (fewer CTAs, looped).
+        use_histogram: use the ``tl.histogram`` persistent variant, which replaces
+            per-pair global atomics with one atomic per bin per CTA. Only takes
+            effect together with ``persistent`` (the decode dispatch path).
     """
     max_pairs = routing_map.numel()
     topk = routing_map.shape[1]
@@ -133,16 +194,30 @@ def compute_local_tokens_per_expert(
     BLOCK = 1024
     if persistent:
         num_sms = _get_num_sms(routing_map.device)
-        _count_local_tokens_kernel_persistent[(num_sms,)](
-            routing_map,
-            tokens_per_expert,
-            valid_tokens,
-            topk,
-            local_expert_start,
-            num_local_experts,
-            num_sms,
-            BLOCK_SIZE=BLOCK,
-        )
+        if use_histogram:
+            num_bins = triton.next_power_of_2(num_local_experts + 1)
+            _count_local_tokens_kernel_histogram[(num_sms,)](
+                routing_map,
+                tokens_per_expert,
+                valid_tokens,
+                topk,
+                local_expert_start,
+                num_local_experts,
+                num_sms,
+                NUM_BINS=num_bins,
+                BLOCK_SIZE=BLOCK,
+            )
+        else:
+            _count_local_tokens_kernel_persistent[(num_sms,)](
+                routing_map,
+                tokens_per_expert,
+                valid_tokens,
+                topk,
+                local_expert_start,
+                num_local_experts,
+                num_sms,
+                BLOCK_SIZE=BLOCK,
+            )
     else:
         _count_local_tokens_kernel[(_ceil_div(max_pairs, BLOCK),)](
             routing_map,
