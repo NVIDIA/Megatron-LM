@@ -88,6 +88,12 @@ NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
 # hybrid models should use 'gsm8k' — synthetic input gives misleading
 # perf because every token is identical (uniform expert routing, hot KV).
 DATASET=$("$YQ" '.DATASET // "synthetic"' "$CONFIG_PATH")
+# Async prefill scheduling for dynamic batching. When true, the server is
+# launched with --inference-dynamic-batching-async-sched-mode async (overlaps
+# the prefill scheduler with GPU compute). Requires greedy sampling / no
+# logprobs / no stop words — the static benchmark client already satisfies
+# these (temperature 0.0, ignore_eos, no stop tokens, no logprobs requested).
+ASYNC_SCHED=$("$YQ" '.ASYNC_SCHED // false' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
 # For MoE configs, expert-parallelism is orthogonal to DP and reshapes the
@@ -193,6 +199,20 @@ SERVER_COMMON_ARGS=(
     --port "$SERVER_PORT"
     --host 0.0.0.0
 )
+
+# Enable async prefill scheduling when the test case opts in. Async scheduling
+# requires materialize_only_last_token_logits=True. run_dynamic_text_generation_server
+# force-sets return_log_probs=True (for echo/loglikelihood support), which would
+# flip materialize_only_last_token_logits to False; passing --skip-prompt-log-probs
+# keeps it True (materialize = not(return_log_probs and not skip_prompt_log_probs)).
+# The perf client never requests prompt logprobs, so this is a no-op for the metrics.
+if [[ "$ASYNC_SCHED" == "true" ]]; then
+    echo "[run_perf_test] async scheduling enabled (--inference-dynamic-batching-async-sched-mode async --skip-prompt-log-probs)"
+    SERVER_COMMON_ARGS+=(
+        --inference-dynamic-batching-async-sched-mode async
+        --skip-prompt-log-probs
+    )
+fi
 
 (
     cd "$ROOT_DIR"

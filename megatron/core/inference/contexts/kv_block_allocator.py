@@ -231,11 +231,20 @@ class KVBlockAllocator:
             return
 
         if self.enable_prefix_caching:
-            self.block_ref_counts[blocks] -= 1
+            # When multiple requests that share the same prefix finish on the same step,
+            # their block IDs appear multiple times in the blocks tensor.
+            # Writing `self.block_ref_counts[blocks] -= 1` would only decrement reference counts
+            # once per unique block. This is wrong. The reference counts must be decremented
+            # once per occurrence of the block in the `blocks` tensor. We need `scatter`.
+            blocks_i64 = blocks.to(torch.int64)
+            self.block_ref_counts.scatter_add_(
+                0, blocks_i64, torch.full_like(blocks_i64, -1, dtype=torch.int32)
+            )
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
                 zero_mask = self.block_ref_counts[blocks] == 0
                 if zero_mask.any():
-                    self._deregister_blocks(blocks[zero_mask])
+                    # Deduplicate so a shared block is deregistered/returned once.
+                    self._deregister_blocks(torch.unique(blocks[zero_mask]))
             elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 # Unregistered blocks (hash == -1, ref_count == 0) have no hash
                 # entry to preserve for reuse (e.g., partial blocks at the end of
@@ -245,7 +254,8 @@ class KVBlockAllocator:
                     self.block_hashes[blocks] == -1
                 )
                 if unreg_mask.any():
-                    unreg_blocks = blocks[unreg_mask]
+                    # Deduplicate so a shared block returns to the pool once.
+                    unreg_blocks = torch.unique(blocks[unreg_mask])
                     num_unreg = unreg_blocks.numel()
                     self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
                     self.total_avail += num_unreg
@@ -269,7 +279,9 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        # Refill the existing buffer so it remains mutable when reset runs under
+        # torch.inference_mode(), such as during CUDA graph setup.
+        torch.arange(self.total_count, out=self.block_bag)
 
         self.total_avail = self.total_count - 1
 

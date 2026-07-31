@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import deque
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,6 +10,10 @@ import torch
 
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.mamba_slot_allocator import (
+    MambaSlotAllocator,
+    MambaSlotCapacityError,
+)
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -1249,6 +1254,85 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list[4]) == fresh_ql
 
 
+def _make_cpu_mamba_slot_allocator(
+    monkeypatch, *, total_blocks: int, max_slots: int
+) -> MambaSlotAllocator:
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    kv_allocator = SimpleNamespace(
+        total_count=total_blocks,
+        block_ref_counts=torch.ones(total_blocks, dtype=torch.int32),
+        block_timestamps=torch.zeros(total_blocks, dtype=torch.int64),
+        block_hashes=torch.full((total_blocks,), -1, dtype=torch.int64),
+    )
+    context = SimpleNamespace(
+        max_requests=1,
+        max_mamba_intermediate_states_per_step=1,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        kv_block_allocator=kv_allocator,
+    )
+    return MambaSlotAllocator(
+        context=context,
+        max_slots=max_slots,
+        num_mamba_layers=1,
+        conv_states_shape=(1,),
+        ssm_states_shape=(1,),
+        conv_states_dtype=torch.float32,
+        ssm_states_dtype=torch.float32,
+    )
+
+
+def test_mamba_slot_allocation_failure_is_atomic(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=2)
+    allocator.allocate_slots_batch([0])
+    block_to_slot_before = allocator.block_to_slot.clone()
+    slot_to_block_before = allocator.slot_to_block.clone()
+    free_count_before = allocator.free_count
+
+    with pytest.raises(MambaSlotCapacityError, match="only 1 free or evictable"):
+        allocator.allocate_slots_batch([1, 2])
+
+    assert allocator.free_count == free_count_before
+    assert torch.equal(allocator.block_to_slot, block_to_slot_before)
+    assert torch.equal(allocator.slot_to_block, slot_to_block_before)
+
+
+def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=6, max_slots=4)
+    allocator.allocate_slots_batch([0, 1, 2, 3])
+    allocator.context.kv_block_allocator.block_ref_counts[:4] = 0
+    allocator.context.kv_block_allocator.block_timestamps[:4] = torch.tensor([40, 10, 30, 20])
+    allocator.context.kv_block_allocator.block_hashes[:4] = torch.tensor([100, 101, 102, 103])
+    allocator.register_block_hashes_batch([0, 1, 2, 3], [100, 101, 102, 103])
+
+    allocator.allocate_slots_batch([4, 5])
+
+    assert allocator.block_to_slot.tolist()[1] == -1
+    assert allocator.block_to_slot.tolist()[3] == -1
+
+
+@pytest.mark.parametrize("max_slots", [0, 1])
+def test_optional_mamba_checkpoint_commit_uses_available_capacity(monkeypatch, max_slots):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=max_slots)
+    allocator._collect_commit_data = lambda: ([1], [0], [2], [0], [101, 102])
+    copy_calls = []
+    store_calls = []
+    register_calls = []
+    clear_calls = []
+    allocator._copy_intermediate_to_cache = lambda *args: copy_calls.append(args)
+    allocator.store_from_live_batch = lambda *args: store_calls.append(args)
+    allocator.register_block_hashes_batch = lambda *args: register_calls.append(args)
+    allocator._clear_intermediate_state = lambda: clear_calls.append(True)
+
+    allocator.commit_intermediate_states()
+
+    expected_slot = 0 if max_slots else -1
+    assert allocator.block_to_slot.tolist() == [-1, expected_slot, -1]
+    assert copy_calls == ([([0], [0])] if max_slots else [])
+    assert store_calls == ([([], [])] if max_slots else [])
+    assert register_calls == ([([1], [101])] if max_slots else [])
+    assert clear_calls == [True]
+
+
 class TestMambaSlotAllocator(PrefixCachingTestBase):
 
     def _mctx(self, **kwargs):
@@ -1656,19 +1740,36 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         assert len(ctx.kv_block_allocator.kv_hash_to_block_id) == 0  # cleared
 
     @pytest.mark.internal
-    def test_reset_disabled_ignores_preserve_flag(self):
-        # When prefix caching is disabled, preserve_prefix_cache=True still performs
-        # a full reset: step_count returns to 0.
-        ctx_off = self._ctx(enable_prefix_caching=False)
-        ctx_off.step_count = 7
-        ctx_off.reset(preserve_prefix_cache=True)
-        assert ctx_off.step_count == 0
+    @pytest.mark.parametrize("enable_prefix_caching", [False, True])
+    @pytest.mark.parametrize("preserve_prefix_cache", [False, True])
+    @pytest.mark.parametrize("preserve_counters", [False, True])
+    def test_reset_counter_preservation_is_explicit(
+        self, enable_prefix_caching, preserve_prefix_cache, preserve_counters
+    ):
+        """Counter preservation is independent of prefix-cache configuration."""
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=8, enable_prefix_caching=enable_prefix_caching)
+        counter_values = {
+            "step_count": 3,
+            "prefix_cache_lru_clock": 4,
+            "lifetime_prefill_token_count": 5,
+            "async_sched_step_count": 6,
+            "async_sched_compaction_step_count": 7,
+        }
+        for name, value in counter_values.items():
+            setattr(ctx, name, value)
+        ctx.total_request_count = 1
+        ctx.active_token_count = 1
+        ctx.request_ids[0] = 10
 
-        # With caching ON, preserve keeps step_count monotonic (for logging cadence).
-        ctx_on = self._ctx(enable_prefix_caching=True)
-        ctx_on.step_count = 7
-        ctx_on.reset(preserve_prefix_cache=True)
-        assert ctx_on.step_count == 7
+        ctx.reset(preserve_prefix_cache=preserve_prefix_cache, preserve_counters=preserve_counters)
+
+        expected_counters = (
+            counter_values if preserve_counters else dict.fromkeys(counter_values, 0)
+        )
+        assert {name: getattr(ctx, name) for name in counter_values} == expected_counters
+        assert ctx.total_request_count == 0
+        assert ctx.active_token_count == 0
+        assert ctx.request_ids[0] == -1
 
     @pytest.mark.internal
     def test_prefill_computed_and_skipped_counters(self):
