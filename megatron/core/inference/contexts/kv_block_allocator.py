@@ -279,7 +279,9 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        # Refill the existing buffer so it remains mutable when reset runs under
+        # torch.inference_mode(), such as during CUDA graph setup.
+        torch.arange(self.total_count, out=self.block_bag)
 
         self.total_avail = self.total_count - 1
 
