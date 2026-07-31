@@ -16,7 +16,17 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterator, List, NamedTuple, Optional, TypeAlias
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    TypeAlias,
+)
 
 import numpy as np
 import torch
@@ -1177,6 +1187,19 @@ def merge_epoch_segments(
                 kv_left = kv_segments[kv_idx].token_count
 
 
+def single_turn_termination_ok(
+    rollout: TokenRollout, turn_traj: Sequence[int], seq_len: int, eod: int
+) -> bool:
+    """Whether a single-turn trajectory ends in a known-legitimate way."""
+    if len(turn_traj) == seq_len:
+        return True
+    if len(turn_traj) > 0 and turn_traj[-1] == eod:
+        return True
+    if rollout.generation_cap is None or not rollout.generation_mask:
+        return False
+    return int(sum(rollout.generation_mask[-1])) == rollout.generation_cap
+
+
 def compute_group_stats(
     rollouts: GroupedRollouts,
     tokenizer: MegatronTokenizer,
@@ -1232,12 +1255,20 @@ def compute_group_stats(
                         f"Rollout too long: {len(turn_traj)} > {seq_len} "
                         f"(last token {turn_traj[-1]})\n{detokenized_traj}"
                     )
-                    # A single-turn completion can only end in eod or be truncated at seq_len.
+                    # A single-turn completion can only end in eod, be truncated at seq_len,
+                    # or stop exactly at the agent's stamped output cap.
                     # Multi-turn agents can additionally end a turn on a tool-call boundary.
                     if len(rollout.trajectory) == 1:
-                        assert len(turn_traj) == seq_len or turn_traj[-1] == tokenizer.eod, (
-                            f"Single-turn rollout under seq_length must end in eod: "
-                            f"len={len(turn_traj)} last={turn_traj[-1]}\n{detokenized_traj}"
+                        assert single_turn_termination_ok(
+                            rollout, turn_traj, seq_len, tokenizer.eod
+                        ), (
+                            f"Single-turn rollout under seq_length must end in eod or exactly "
+                            f"at its generation cap: "
+                            f"env={rollout.env_id} "
+                            f"len={len(turn_traj)} "
+                            f"last={turn_traj[-1] if turn_traj else None} "
+                            f"generated={int(sum(rollout.generation_mask[-1])) if rollout.generation_mask else None} "
+                            f"cap={rollout.generation_cap}\n{detokenized_traj}"
                         )
             else:
                 lang_rl_log(
@@ -1986,7 +2017,7 @@ def prepare_trajectories(
 
         length = len(trajectory)
         assert length <= seq_length, "Rollout too long, how did this happen?"
-        # Single-turn completions under seq_length must end in eod (enforced upstream in
+        # Single-turn completions under seq_length must end in eod or exactly at their stamped generation cap (enforced upstream in
         # compute_group_stats); multi-turn turns may stop on a tool-call boundary.
         if length < seq_length:
             trajectory.extend([tokenizer.pad] * (seq_length - length))
