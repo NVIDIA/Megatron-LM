@@ -67,7 +67,9 @@ def changed_mesh_axis(
     for axis, (old_placement, new_placement) in enumerate(
         zip(old_placements, new_placements, strict=True)
     ):
-        if old_placement == new_placement:
+        if old_placement == new_placement or (
+            isinstance(old_placement, Partial) and isinstance(new_placement, Partial)
+        ):
             continue
         if changed_axis is not None:
             raise NotImplementedError(
