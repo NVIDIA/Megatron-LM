@@ -226,8 +226,6 @@ def get_hybrid_layer_cp_partition_mode(layer_symbol: str, config) -> Optional[Cp
         if getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid":
             return "contiguous"
         return "zigzag"
-    if layer_symbol in {Symbols.CSA, Symbols.HCA, Symbols.WINDOW}:
-        return "contiguous"
     if layer_symbol in {Symbols.MLP, Symbols.MOE}:
         return None
     raise ValueError(f"Unsupported hybrid layer symbol {layer_symbol!r}.")

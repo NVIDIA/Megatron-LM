@@ -29,6 +29,15 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 
 class GatedDeltaNet(_GDNBase):
     # pylint: disable=missing-class-docstring
+    def get_required_cp_partition_mode(self):
+        """Return the CP partition mode required by this GDN layer."""
+        mode = getattr(self.config, "linear_cp_mode", "chunkwise")
+        if mode == "chunkwise":
+            return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
+        raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         # alpha, beta
@@ -97,6 +106,10 @@ class GatedDeltaNet(_GDNBase):
             assert (
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
+            if self.cp_size > 1:
+                self._validate_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, self.get_required_cp_partition_mode()
+                )
 
             # Resolve cu_seqlens with alignment padding handling.
             cu_seqlens_q = self._resolve_cu_seqlens(
@@ -276,3 +289,15 @@ class GatedDeltaNet(_GDNBase):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _validate_packed_seq_params_cp_partition_mode(
+        self, packed_seq_params: PackedSeqParams, expected_cp_partition_mode: str
+    ) -> None:
+        """Ensure block-level CP layout conversion satisfied GDN's THD layout contract."""
+        actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+        if actual_cp_partition_mode != expected_cp_partition_mode:
+            raise ValueError(
+                f"GatedDeltaNet requires cp_partition_mode={expected_cp_partition_mode!r}, "
+                f"but packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                "conversion must be handled before calling GatedDeltaNet."
+            )
