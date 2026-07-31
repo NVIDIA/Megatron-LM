@@ -768,6 +768,7 @@ class _CudagraphRecordNode(torch.autograd.Function):
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
+
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):
         """Replay the forward graph of the passed runner."""
@@ -946,8 +947,8 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
-        # Persistent wgrad slots written by this graph. Replay waits for each
-        # slot's previous RS reader before launching the graph.
+        # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
+        # reader before launching the graph.
         self._gtp_wgrad_ring_slots = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
@@ -1010,8 +1011,7 @@ class _CudaGraphRunner(torch.nn.Module):
     def _register_gtp_side_streams(self, group):
         """Register static streams used by forward capture and GTP warmup.
 
-        Backward capture discovers the exact streams it owns dynamically via
-        track_gtp_capture_comms().
+        Backward capture dynamically discovers exact owned streams via track_gtp_capture_comms().
         """
         ag = get_ag_stream(GTPChain.GRAPHED.value, group)
         rs = get_rs_stream(GTPChain.GRAPHED.value, group)
@@ -1452,11 +1452,10 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.freeze()
 
-        capture_comm_context = (
-            track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
-        )
-        with capture_comm_context as capture_comms, torch.cuda.graph(
-            self.bwd_graph, pool=self.mempool
+        capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+        with (
+            capture_comm_context as capture_comms,
+            torch.cuda.graph(self.bwd_graph, pool=self.mempool),
         ):
 
             grad_inputs = torch.autograd.grad(
@@ -1485,9 +1484,7 @@ class _CudaGraphRunner(torch.nn.Module):
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
                 # Phase 1: drain AG
-                wait_async_comms(
-                    GTPChain.GRAPHED.value, skip_rs=True, params=capture_comms.params
-                )
+                wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=capture_comms.params)
                 self._wait_side_streams(capture_comms.ag_streams)
 
                 if GTP_CONFIG.cross_cg_overlap:
@@ -1496,15 +1493,12 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 # Phase 2: in-graph RS drain + finalize.
                 wait_async_comms(
-                    GTPChain.GRAPHED.value,
-                    finalize_after_drain=True,
-                    params=capture_comms.params,
+                    GTPChain.GRAPHED.value, finalize_after_drain=True, params=capture_comms.params
                 )
                 self._wait_side_streams(capture_comms.rs_streams)
 
                 if not GTP_CONFIG.cross_cg_overlap:
-                    # Fallback: do not release the next graph until RS and
-                    # main_grad finalization have completed.
+                    # Fallback: delay the next graph until RS and main_grad finalization complete.
                     self.bwd_completion_event.record()
 
             if self.use_stream and not self.gtp_remat:
@@ -1519,9 +1513,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = (
             self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
         )
-        self._gtp_wgrad_ring_slots = (
-            list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
-        )
+        self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
 
         # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's
         # replay-invariant — so Graphed.backward avoids per-replay group lookups.

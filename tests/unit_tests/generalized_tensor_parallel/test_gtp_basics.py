@@ -44,6 +44,7 @@ from transformer_engine.pytorch import fp8_autocast
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
+import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -620,7 +621,11 @@ class TestSameKeyNeighbourTiebreak:
 
     def test_parity_zero_keeps_the_shared_buffer(self):
         # Unset and 0 must give the same key: only the second weight of a pair pays.
-        assert self._key(0) == self._key() == ((128, 256), torch.bfloat16, 0, False)
+        assert (
+            self._key(0)
+            == self._key()
+            == (("GTP_ungraphed", 0), (128, 256), torch.bfloat16, 0, False)
+        )
 
     def test_parity_one_gets_its_own_buffer(self):
         assert self._key(1) != self._key()
@@ -1351,7 +1356,7 @@ class TestGTPGraphWgradRing:
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "cross_cg_overlap", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_module, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
 
         weights = self._make_padded_chain()
         monkeypatch.setattr(gtp_module, "_GTP_PARAMS", weights)
@@ -1362,23 +1367,25 @@ class TestGTPGraphWgradRing:
         slot_3 = weights[3]._gtp_graph_wgrad_ring_slot
         assert slot_1 is not slot_2
         assert slot_1 is slot_3
-        assert len(gtp_module._GRAPH_WGRAD_RINGS) == 1
+        assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
         assert slot_1.ready_event.query()
 
+        capture_state = gtp_cuda_graphs.GTPCaptureCommState()
+        monkeypatch.setattr(gtp_cuda_graphs, "_ACTIVE_CAPTURE_COMM_STATE", capture_state)
         logical_view = weights[1].get_wgrad_tensor()
+        assert not capture_state.wgrad_ring_slots
         assert slot_1.tensor.shape == (6, 4)
         assert logical_view.shape == (4, 4)
         assert logical_view.data_ptr() == slot_1.tensor.data_ptr()
 
         logical_view.fill_(7)
         prepared = weights[1]._prepare_wgrad_reduce_scatter_inputs([logical_view])
+        assert capture_state.wgrad_ring_slots == [slot_1]
         assert prepared[0] is slot_1.tensor
         assert torch.count_nonzero(slot_1.tensor[4:]) == 0
 
-        capture_state = gtp_module.GTPCaptureCommState()
-        capture_state.register_wgrad_ring_slot(slot_1, weights[1])
         with pytest.raises(RuntimeError, match="increase GTP_CONFIG.graph_wgrad_ring_size"):
-            capture_state.register_wgrad_ring_slot(slot_1, weights[3])
+            weights[3]._prepare_wgrad_reduce_scatter_inputs([logical_view])
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
     def test_native_fp8_style_param_uses_wgrad_ring(self, monkeypatch):
@@ -1403,7 +1410,7 @@ class TestGTPGraphWgradRing:
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "cross_cg_overlap", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_module, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
 
         group = _FakeGroup(size=2)
         first = NativeFP8StyleParam(group)
@@ -1415,20 +1422,20 @@ class TestGTPGraphWgradRing:
         gtp_module.initialize_graph_wgrad_rings()
 
         assert second._gtp_graph_wgrad_ring_slot.tensor.shape == (6, 4)
-        assert len(gtp_module._GRAPH_WGRAD_RINGS) == 1
+        assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
     def test_cross_cg_overlap_rs_input_matches_fallback(self, monkeypatch):
         monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_module, "_GRAPH_WGRAD_RINGS", {})
+        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
 
         fallback_weights = self._make_padded_chain(count=2)
         monkeypatch.setattr(gtp_module, "_GTP_PARAMS", fallback_weights)
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "cross_cg_overlap", False)
         gtp_module.initialize_graph_wgrad_rings()
-        assert not gtp_module._GRAPH_WGRAD_RINGS
+        assert not gtp_cuda_graphs._GRAPH_WGRAD_RINGS
         assert not hasattr(fallback_weights[1], "_gtp_graph_wgrad_ring_slot")
 
         wgrad = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
