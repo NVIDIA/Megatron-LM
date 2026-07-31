@@ -294,6 +294,13 @@ class TransformerConfig(ModelParallelConfig):
     experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
+    cp_partition_mode: Optional[Literal["zigzag", "contiguous"]] = None
+    """DEPRECATED. CP partition mode is inferred from the model's layer layout.
+
+    This compatibility field is ignored by model-level CP layout planning. Pass
+    cp_partition_mode explicitly to low-level data/layout helpers when needed.
+    """
+
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
 
@@ -1342,6 +1349,18 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"num_query_groups ({self.num_query_groups}) must be a multiple or divisor of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
+
+        if self.cp_partition_mode is not None:
+            if self.cp_partition_mode not in ("zigzag", "contiguous"):
+                raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+            warnings.warn(
+                "TransformerConfig.cp_partition_mode is deprecated and ignored by "
+                "model-level CP layout planning. CP partition mode is inferred from "
+                "the model's layer layout; pass cp_partition_mode explicitly to "
+                "low-level data/layout helpers when needed.",
+                DeprecationWarning,
+                stacklevel=2,
             )
 
         if self.experimental_attention_variant == "gated_delta_net":
