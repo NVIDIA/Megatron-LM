@@ -14,6 +14,7 @@
 
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
+import dataclasses
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -22,7 +23,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule
-from .placement import Placements
+from .placement import MeshAxis, Placements
 
 
 def fully_shard(
@@ -49,6 +50,7 @@ def fully_shard(
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
 
+    placements = _normalize_placements(mesh, placements)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
     original_cls = module.__class__
     _attach_mixin(module)
@@ -64,6 +66,27 @@ def fully_shard(
     except Exception:
         module.__class__ = original_cls
         raise
+
+
+def _normalize_placements(mesh: DeviceMesh, placements: Placements) -> Placements:
+    """Return a copy with data-parallel mesh axes normalized to integer indices."""
+    dp_axes = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
+    return dataclasses.replace(placements, dp_axes=dp_axes)
+
+
+def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
+    if isinstance(axis, int):
+        axis_index = axis
+        if axis_index < 0:
+            axis_index += mesh.ndim
+        if axis_index < 0 or axis_index >= mesh.ndim:
+            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
+        return axis_index
+
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None or axis not in dim_names:
+        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
+    return dim_names.index(axis)
 
 
 @contextmanager

@@ -98,6 +98,20 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     assert a.block_routing == {}
 
 
+def test_reset_under_inference_mode_preserves_mutable_block_bag():
+    allocator = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
+    original_block_bag = allocator.block_bag
+
+    with torch.inference_mode():
+        allocator.reset()
+
+    blocks = allocator.allocate_memory_blocks(1)
+    allocator.release_memory_blocks(blocks)
+
+    assert allocator.block_bag is original_block_bag
+    assert allocator.pool_avail == 7
+
+
 @pytest.mark.parametrize(
     "scope,paused,total,counts,expected_active,expected_paused",
     [
@@ -509,8 +523,8 @@ def test_evict_lru_keeps_hottest_leaf_over_cold_interior_parent():
     it up, so the hot leaf E survives while the colder interior block B is evicted.
 
         A(ts 1) -> B(ts 2) -> C(ts 5)
-                          \-> F(ts 3)
-                \-> D(ts 3) -> E(ts 5)
+                          +-> F(ts 3)
+                +-> D(ts 3) -> E(ts 5)
     """
     a = _lru_allocator(pool_size=8)
     # hashes: A=10, B=20, C=30, F=40, D=50, E=60
