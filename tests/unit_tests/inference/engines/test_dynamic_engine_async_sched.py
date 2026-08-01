@@ -234,6 +234,7 @@ def test_async_forward_routes_one_controller_iteration(
     """Primer-only work crosses the engine boundary without an internal controller loop."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
+    engine.dynamo_helper = mock.Mock()
     engine.logging_step_interval = 0
     engine.metrics_writer = None
     engine.schedule_waiting_requests = mock.Mock()

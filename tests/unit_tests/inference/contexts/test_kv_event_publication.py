@@ -57,7 +57,9 @@ def test_dummy_reset_preserves_prefix_cache_without_publishing_clear():
 
     listener.assert_not_called()
     context.reset_tensors.assert_called_once_with()
-    context.reset_metadata.assert_called_once_with(preserve_prefix_cache=True)
+    context.reset_metadata.assert_called_once_with(
+        preserve_prefix_cache=True, preserve_counters=False
+    )
     context.mamba_slot_allocator.reset.assert_not_called()
     assert context.step_count == 17
     assert context.prefix_cache_lru_clock == 11
