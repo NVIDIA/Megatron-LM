@@ -12,6 +12,9 @@ from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import openai_stream
+
 logger = logging.getLogger(__name__)
 
 # pylint: disable=line-too-long
@@ -603,11 +606,41 @@ try:
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
                 return_prompt_tokens=return_prompt_tokens,
+                streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
+        stream_requested = bool(req.get("stream", False))
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for _ in range(n)
+                ]
+            except ValueError as error:
+                return Response(str(error), status=400)
+
+            streams = [
+                client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
+            ]
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    streams,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=True,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                ),
+                content_type="text/event-stream",
+            )
+            response.timeout = None
+            return response
+
         tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
 
         if current_app.config['verbose']:
