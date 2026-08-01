@@ -354,6 +354,9 @@ jobs:
         run: |
           uv sync --locked --only-group linting
 
+      - name: Test CI cache keys
+        run: .github/scripts/test_cache_keys.sh
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
@@ -591,6 +594,8 @@ jobs:
 
       - name: Download test data
         shell: bash
+        env:
+          NEMO_TEST_DATA_ROOT: /mnt/datadrive/TestData/nemo-fw/TestData
         run: |
           echo "::group::Download test data"
           for attempt in 1 2 3; do
@@ -610,24 +615,45 @@ jobs:
       - name: Compute cache config
         id: cache_keys
         shell: bash
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref || github.ref_name }}
+          CACHE_VARIANT: ${{ needs.configure.outputs.lts == 'true' && 'lts' || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          REF: ${{ github.ref }}
         run: |
-          KEY="${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}"
+          BASE_REF="${BASE_REF#refs/heads/}"
+          CACHE_NAMESPACE=$(printf '%s' "$BASE_REF" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+          if [ -z "$CACHE_NAMESPACE" ]; then
+            echo "Unable to derive a cache namespace from base ref: $BASE_REF" >&2
+            exit 1
+          fi
 
-          # Single coherent cache donor. Dockerfile.ci builds non-reproducible
-          # from-source layers: the same BuildKit cache key yields a different
-          # result digest on every cold build. Listing more than one cache-from
-          # donor lets BuildKit chain from a conflicting copy of such a layer and
-          # miss every layer downstream — a long cold rebuild even when a warm
-          # cache exists. So read EXACTLY ONE donor.
-          #
-          # Key 0 is the no-PR build cache: it is written by the daily schedule
-          # (from main HEAD), the merge queue, and deploy-release builds, so it is
-          # the integration baseline. PR builds seed from it and write their own
-          # ${KEY}-buildcache; baseline builds (KEY=0) seed from and write 0.
-          SEED="0"
+          if [ "$PR_NUMBER" = "0" ] && [ -n "$MERGE_GROUP_HEAD_REF" ]; then
+            PR_NUMBER=$(printf '%s' "$MERGE_GROUP_HEAD_REF" | sed -nE 's#.*pr-([0-9]+)-.*#\1#p')
+          fi
+
+          BASELINE_KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-baseline"
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "0" ]; then
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${PR_NUMBER}"
+          elif [ "$REF" = "refs/heads/$BASE_REF" ] || [ "$EVENT_NAME" = "schedule" ]; then
+            KEY="$BASELINE_KEY"
+          else
+            BRANCH_NAMESPACE=$(printf '%s' "$GITHUB_REF_NAME" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${BRANCH_NAMESPACE}"
+          fi
+
+          if [ "${#KEY}" -gt 100 ]; then
+            KEY="${KEY:0:83}-$(printf '%s' "$KEY" | sha256sum | cut -c1-16)"
+          fi
+          if [ "${#BASELINE_KEY}" -gt 100 ]; then
+            BASELINE_KEY="${BASELINE_KEY:0:83}-$(printf '%s' "$BASELINE_KEY" | sha256sum | cut -c1-16)"
+          fi
 
           echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
-          echo "seed=$SEED" | tee -a "$GITHUB_OUTPUT"
+          echo "baseline=$BASELINE_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Parse baseimage
         shell: bash
@@ -650,6 +676,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
+      - name: Select cache donor
+        id: cache_from
+        shell: bash
+        env:
+          BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
+          LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
+          RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+        run: |
+          DONOR_CACHE="$RUN_CACHE"
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$BASELINE_CACHE"
+          fi
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$LEGACY_CACHE"
+          fi
+          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -660,7 +703,7 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
-          cache-from: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.seed }}-buildcache-${{ matrix.cloud }},mode=max
+          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
           tags: |

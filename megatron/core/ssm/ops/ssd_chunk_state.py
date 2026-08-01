@@ -51,11 +51,13 @@ def _chunk_cumsum_fwd_kernel(
     dt_bias_ptr,
     dt_out_ptr,
     dA_cumsum_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
+    target_rows_ptr,
     # Matrix dimension
     seqlen,
     nheads: tl.constexpr,
     chunk_size: tl.constexpr,
+    HAS_TARGET_ROWS: tl.constexpr,
     dt_min: tl.constexpr,
     dt_max: tl.constexpr,
     # Strides
@@ -79,9 +81,16 @@ def _chunk_cumsum_fwd_kernel(
     # https://github.com/triton-lang/triton/issues/1058
     pid_c = tl.program_id(axis=0).to(tl.int64)
     pid_h = tl.program_id(axis=1)
+    if HAS_TARGET_ROWS:
+        if tl.load(target_rows_ptr + pid_c) < 0:
+            return
 
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
+    if HAS_TARGET_ROWS:
+        # Fixed windows need only a start offset.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
 
     dt_ptr += chunk_seqlen_start * stride_dt_seqlen
     dt_out_ptr += pid_c * stride_dt_out_chunk
@@ -179,7 +188,8 @@ def _chunk_state_fwd_kernel(
     states_ptr,
     dt_ptr,
     dA_cumsum_ptr,
-    cu_chunk_seqlens_ptr,
+    chunk_offsets_ptr,
+    chunk_flags_ptr,
     # Matrix dimensions
     hdim: tl.constexpr,
     dstate: tl.constexpr,
@@ -204,6 +214,7 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_chunk: tl.int64,
     stride_dA_cs_csize: tl.constexpr,
     # Meta-parameters
+    HAS_CHUNK_FLAGS: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -213,8 +224,16 @@ def _chunk_state_fwd_kernel(
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
-    chunk_seqlen_start = tl.load(cu_chunk_seqlens_ptr + pid_c)
-    chunk_seqlen_end = tl.load(cu_chunk_seqlens_ptr + pid_c + 1)
+    if HAS_CHUNK_FLAGS:
+        # Only completed chunks need a boundary state.
+        if tl.load(chunk_flags_ptr + pid_c) == 0:
+            return
+    chunk_seqlen_start = tl.load(chunk_offsets_ptr + pid_c)
+    if HAS_CHUNK_FLAGS:
+        # Chunk flags are paired with fixed-window starts.
+        chunk_seqlen_end = chunk_seqlen_start + chunk_size
+    else:
+        chunk_seqlen_end = tl.load(chunk_offsets_ptr + pid_c + 1)
     b_ptr += chunk_seqlen_start * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
     x_ptr += chunk_seqlen_start * stride_x_seqlen + pid_h * stride_x_head
     dt_ptr += pid_c * stride_dt_chunk + pid_h * stride_dt_head
@@ -277,12 +296,23 @@ def _chunk_cumsum_fwd(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
+    chunk_starts=None,
+    target_rows=None,
 ):
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
-    nchunks = cu_chunk_seqlens.shape[0] - 1
+    has_target_rows = target_rows is not None
+    assert (
+        chunk_starts is not None
+    ) == has_target_rows, "target_rows and chunk_starts must be provided together"
+    if has_target_rows:
+        chunk_offsets = chunk_starts
+        nchunks = chunk_starts.shape[0]
+    else:
+        chunk_offsets = cu_chunk_seqlens
+        nchunks = cu_chunk_seqlens.shape[0] - 1
     dt_out = torch.empty(nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     dA_cumsum = torch.empty(nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
@@ -293,7 +323,8 @@ def _chunk_cumsum_fwd(
             dt_bias_ptr=dt_bias,
             dt_out_ptr=dt_out,
             dA_cumsum_ptr=dA_cumsum,
-            cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            chunk_offsets_ptr=chunk_offsets,
+            target_rows_ptr=target_rows,
             seqlen=seqlen,
             nheads=nheads,
             chunk_size=chunk_size,
@@ -309,6 +340,7 @@ def _chunk_cumsum_fwd(
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
+            HAS_TARGET_ROWS=has_target_rows,
             DT_SOFTPLUS=dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
@@ -316,7 +348,25 @@ def _chunk_cumsum_fwd(
     return dA_cumsum, dt_out
 
 
-def _chunk_state_fwd(B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_in_fp32=True):
+def _chunk_state_fwd(
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    cu_chunk_seqlens,
+    states=None,
+    states_in_fp32=True,
+    chunk_flags=None,
+    chunk_starts=None,
+):
+    has_chunk_flags = chunk_flags is not None
+    assert (
+        chunk_starts is not None
+    ) == has_chunk_flags, "chunk_flags and chunk_starts must be provided together"
+    if has_chunk_flags:
+        chunk_offsets = chunk_starts
+    else:
+        chunk_offsets = cu_chunk_seqlens
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -345,7 +395,8 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_
             states_ptr=states,
             dt_ptr=dt,
             dA_cumsum_ptr=dA_cumsum,
-            cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+            chunk_offsets_ptr=chunk_offsets,
+            chunk_flags_ptr=chunk_flags,
             hdim=headdim,
             dstate=dstate,
             chunk_size=chunk_size,
@@ -367,6 +418,7 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
+            HAS_CHUNK_FLAGS=has_chunk_flags,
         )
     return states
 
