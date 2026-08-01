@@ -75,24 +75,21 @@ class FsdpContext:
             if module in visited:
                 continue
             root_modules.append(module)
-            _collect_context_modules(cast(nn.Module, module), self, visited)
+            _collect_fsdp_modules(cast(nn.Module, module), visited)
         root_modules.reverse()
         for root_module in root_modules:
             root_module._is_root = True
 
-        seen: set[FsdpModule] = set()
         for root_module in root_modules:
-            _collect_forward_order(
-                cast(nn.Module, root_module), self, self.forward_order, seen, name=""
-            )
+            for name, module in cast(nn.Module, root_module).named_modules():
+                if not isinstance(module, FsdpModule):
+                    continue
+                module._name = name
+                self.forward_order.append(module)
 
-        forward_modules = seen.copy()
-        seen.clear()
         for root_module in reversed(root_modules):
-            _collect_backward_order(cast(nn.Module, root_module), self, self.backward_order, seen)
+            _collect_backward_order(cast(nn.Module, root_module), self.backward_order)
 
-        if seen != forward_modules:
-            raise RuntimeError("FSDP context produced inconsistent prefetch orders.")
         self._is_finalized = True
 
     def ensure_finalized(self) -> None:
@@ -175,8 +172,7 @@ class FsdpModule:
 
     @property
     def context(self) -> FsdpContext:
-        """Return the initialized runtime context."""
-        assert self._context is not None
+        """Return the FSDP context."""
         return self._context
 
     @property
@@ -361,54 +357,24 @@ class FsdpModule:
         return f"MFSDP {name} {phase}"
 
 
-def _collect_context_modules(
-    module: nn.Module, context: FsdpContext, modules: set["FsdpModule"]
-) -> None:
-    """Collect same-context FSDP modules reachable from ``module``."""
+def _collect_fsdp_modules(module: nn.Module, modules: set["FsdpModule"]) -> None:
+    """Collect FSDP modules reachable from ``module``."""
     if isinstance(module, FsdpModule):
-        if module._context is not context or module in modules:
+        if module in modules:
             return
         modules.add(module)
 
     for child in module.children():
-        _collect_context_modules(child, context, modules)
+        _collect_fsdp_modules(child, modules)
 
 
-def _collect_forward_order(
-    module: nn.Module,
-    context: FsdpContext,
-    order: IndexedOrder["FsdpModule"],
-    seen: set["FsdpModule"],
-    name: str,
-) -> None:
-    """Collect one root's static forward prefetch order."""
-    if isinstance(module, FsdpModule):
-        if module._context is not context or module in seen:
-            return
-        seen.add(module)
-        module._name = name
-        order.append(module)
-
-    for child_name, child in module.named_children():
-        child_fqn = f"{name}.{child_name}" if name else child_name
-        _collect_forward_order(child, context, order, seen, child_fqn)
-
-
-def _collect_backward_order(
-    module: nn.Module,
-    context: FsdpContext,
-    order: IndexedOrder["FsdpModule"],
-    seen: set["FsdpModule"],
-) -> None:
+def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
     """Collect one root's static backward prefetch order."""
     if isinstance(module, FsdpModule):
-        if module._context is not context or module in seen:
-            return
-        seen.add(module)
         order.append(module)
 
     for child in reversed(list(module.children())):
-        _collect_backward_order(child, context, order, seen)
+        _collect_backward_order(child, order)
 
 
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
