@@ -41,6 +41,9 @@ def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpCont
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
     """
+    if _FSDP_CONTEXT.get() is not None:
+        raise RuntimeError("fully_shard_context does not support nesting.")
+
     device = device or torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":
         raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")

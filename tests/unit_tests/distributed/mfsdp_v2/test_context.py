@@ -170,7 +170,9 @@ def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
         fully_shard(model.right, mesh=mesh, placements=_flat_placements())
 
     context = model.left.context
-    assert context.root_modules == (model.left, model.right)
+    assert model.left.is_root()
+    assert model.right.is_root()
+    assert not model.left.inner.is_root()
     assert list(context.forward_order) == [model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model.right, model.left, model.left.inner]
 
@@ -200,19 +202,19 @@ def test_forward_requires_finalized_context(distributed_setup):
     model(x)
 
 
-def test_nested_context_restores_outer_context(distributed_setup):
-    """A nested construction scope should restore the enclosing active context."""
+def test_fully_shard_context_rejects_nesting(distributed_setup):
+    """A construction scope should reject an ambiguous nested context."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(3)]).to(device)
+    model = nn.ModuleList([nn.Linear(4, 4, bias=False) for _ in range(2)]).to(device)
 
     with fully_shard_context(device=device):
         fully_shard(model[0], mesh=mesh, placements=_flat_placements())
         outer_context = model[0].context
-        with fully_shard_context(device=device):
-            fully_shard(model[1], mesh=mesh, placements=_flat_placements())
-        fully_shard(model[2], mesh=mesh, placements=_flat_placements())
+        with pytest.raises(RuntimeError, match="does not support nesting"):
+            with fully_shard_context(device=device):
+                pass
+        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
 
     assert model[0].context is outer_context
-    assert model[2].context is outer_context
-    assert model[1].context is not outer_context
+    assert model[1].context is outer_context

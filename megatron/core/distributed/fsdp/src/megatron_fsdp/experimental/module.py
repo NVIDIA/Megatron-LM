@@ -37,7 +37,6 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
-    root_modules: tuple["FsdpModule", ...]
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -50,7 +49,6 @@ class FsdpContext:
         Args:
             device: Device on which this context schedules communication.
         """
-        self.root_modules = ()
         self.is_last_microbatch = True
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
@@ -79,17 +77,18 @@ class FsdpContext:
             root_modules.append(module)
             _collect_context_modules(cast(nn.Module, module), self, visited)
         root_modules.reverse()
-        self.root_modules = tuple(root_modules)
+        for root_module in root_modules:
+            root_module._is_root = True
 
         seen: set[FsdpModule] = set()
-        for root_module in self.root_modules:
+        for root_module in root_modules:
             _collect_forward_order(
                 cast(nn.Module, root_module), self, self.forward_order, seen, name=""
             )
 
         forward_modules = seen.copy()
         seen.clear()
-        for root_module in reversed(self.root_modules):
+        for root_module in reversed(root_modules):
             _collect_backward_order(cast(nn.Module, root_module), self, self.backward_order, seen)
 
         if seen != forward_modules:
@@ -131,6 +130,7 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _num_ready_grad_parameters: int
+    _is_root: bool
     _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
@@ -147,6 +147,7 @@ class FsdpModule:
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
+        self._is_root = False
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
@@ -188,7 +189,7 @@ class FsdpModule:
 
     def is_root(self) -> bool:
         """Return whether this module is an outermost FsdpModule in its context."""
-        return self in self.context.root_modules
+        return self._is_root
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
