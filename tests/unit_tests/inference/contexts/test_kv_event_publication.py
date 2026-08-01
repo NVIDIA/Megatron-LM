@@ -52,13 +52,13 @@ def test_dummy_reset_preserves_prefix_cache_without_publishing_clear():
     context.mamba_slot_allocator = Mock()
     context.dynamo_helper.queue_kv_stored_event({"block_hashes": [101]})
 
-    context.reset(preserve_prefix_cache=True)
+    context.reset(preserve_prefix_cache=True, preserve_counters=True)
     context.dynamo_helper.publish_pending_kv_stored_events()
 
     listener.assert_not_called()
     context.reset_tensors.assert_called_once_with()
     context.reset_metadata.assert_called_once_with(
-        preserve_prefix_cache=True, preserve_counters=False
+        preserve_prefix_cache=True, preserve_counters=True
     )
     context.mamba_slot_allocator.reset.assert_not_called()
     assert context.step_count == 17
