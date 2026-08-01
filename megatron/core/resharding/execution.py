@@ -66,9 +66,9 @@ def _requires_bf16_staging(param: torch.Tensor) -> bool:
     scale blocks can cross slice boundaries, so refit assembles the complete
     local BF16 weight and quantizes it once after all receives finish.
     """
-    is_gtp = getattr(param, "is_gtp_weight_remat", False)
-    # MXFP8 staging predates GTP. Broaden it to TE's generic quantized tensor
-    # class only for GTP, adding NVFP4 without changing non-GTP behavior.
+    is_gtp = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(param)
+    # Ordinary params retain the existing MXFP8 path. GTP also accepts TE's
+    # generic quantized tensor type, which includes native NVFP4 weights.
     return is_mxfp8tensor(param) or (is_gtp and is_float8tensor(param))
 
 
@@ -82,7 +82,9 @@ def _get_quantized_accumulator(pending: dict[int, tuple], dst_param: torch.Tenso
     entry = pending.get(param_id)
     if entry is None:
         has_gtp_padding = bool(
-            getattr(dst_param, "is_gtp_weight_remat", False) and getattr(dst_param, "pad_length", 0)
+            gtp_api.HAVE_GTP
+            and gtp_api.is_gtp_param(dst_param)
+            and getattr(dst_param, "pad_length", 0)
         )
         # GTP padding receives no data. Zero it so uninitialized values cannot
         # distort a quantization block shared with logical weight values.
@@ -95,12 +97,12 @@ def _get_quantized_accumulator(pending: dict[int, tuple], dst_param: torch.Tenso
 
 def _native_gtp_load_context(module: torch.nn.Module | None, pending: dict[int, tuple]):
     """Return the special update context required by native quantized GTP params."""
-    if module is None or not any(
-        getattr(param, "is_gtp_weight_remat", False) for param, _buffer in pending.values()
-    ):
+    if not gtp_api.HAVE_GTP:
         return nullcontext()
 
-    if not gtp_api.HAVE_GTP:
+    if module is None or not any(
+        gtp_api.is_gtp_param(param) for param, _buffer in pending.values()
+    ):
         return nullcontext()
 
     return gtp_api.gtp_native_fp8_load_context(module)

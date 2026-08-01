@@ -21,15 +21,15 @@ from megatron.core.resharding.refit import _PlanCacheKey
 from megatron.core.resharding.utils import get_refit_tensor_dict, invalidate_refit_tensor_cache
 
 
-def _config(tp=1, pp=1, ep=1, dp=1, expert_tp=1, gtp=1, expert_gtp=1):
+def _config(tp=1, pp=1, ep=1, dp=1, expert_tp=1, gtp_remat=1, expert_gtp_remat=1):
     return _ParallelConfig(
         tp_size=tp,
         pp_size=pp,
         ep_size=ep,
         dp_size=dp,
         expert_tp_size=expert_tp,
-        gtp_size=gtp,
-        expert_gtp_size=expert_gtp,
+        gtp_remat_size=gtp_remat,
+        expert_gtp_remat_size=expert_gtp_remat,
     )
 
 
@@ -102,17 +102,17 @@ class TestPlanCacheKey:
         k2 = _PlanCacheKey(rank=0, src_config=None, dst_config=None, num_experts=16)
         assert k1 != k2
 
-    def test_gtp_sizes_distinguish(self):
+    def test_gtp_remat_sizes_distinguish(self):
         base = _config(tp=2, dp=2)
         plain = _PlanCacheKey(rank=0, src_config=base, dst_config=base, num_experts=None)
 
-        for config in (_config(tp=2, dp=2, gtp=4), _config(tp=2, dp=2, expert_gtp=2)):
+        for config in (_config(tp=2, dp=2, gtp_remat=4), _config(tp=2, dp=2, expert_gtp_remat=2)):
             assert plain != _PlanCacheKey(
                 rank=0, src_config=config, dst_config=config, num_experts=None
             )
 
 
-def test_parallel_config_includes_gtp_sizes():
+def test_parallel_config_includes_gtp_remat_sizes():
     class Group:
         def __init__(self, size):
             self._size = size
@@ -136,7 +136,7 @@ def test_parallel_config_includes_gtp_sizes():
         )()
 
     assert _get_parallel_config(Core()) == _config(
-        tp=2, pp=3, ep=4, dp=5, expert_tp=6, gtp=7, expert_gtp=8
+        tp=2, pp=3, ep=4, dp=5, expert_tp=6, gtp_remat=7, expert_gtp_remat=8
     )
 
 
