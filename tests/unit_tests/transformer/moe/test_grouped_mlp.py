@@ -261,19 +261,11 @@ def test_apply_bias_combines_packed_grouped_bias_and_accumulates_gradient():
     permuted_probs = torch.tensor([0.25, 0.5, 1.5])
     expected = torch.tensor([[3.5, 7.0], [8.0, 14.0], [155.0, 306.0]])
 
-    output = TEGroupedMLP._apply_bias(
-        intermediate,
-        packed_bias,
-        tokens_per_expert,
-        permuted_probs,
-    )
+    output = TEGroupedMLP._apply_bias(intermediate, packed_bias, tokens_per_expert, permuted_probs)
     output.sum().backward()
 
     torch.testing.assert_close(output, expected)
-    torch.testing.assert_close(
-        packed_bias.grad,
-        torch.tensor([[0.75, 0.75], [1.5, 1.5]]),
-    )
+    torch.testing.assert_close(packed_bias.grad, torch.tensor([[0.75, 0.75], [1.5, 1.5]]))
 
 
 def test_make_fused_impl_pre_forward_hook_dispatches_submodule_hooks():
@@ -1229,12 +1221,10 @@ class TestTEGroupedMLP:
             assert experts.linear_fc2.bias.grad is not None
             packed_dbias = experts.linear_fc2.bias.grad.view(self.num_experts, self.hidden_size)
             torch.testing.assert_close(
-                packed_dbias[0],
-                torch.ones_like(packed_dbias[0]) * probs[:2].detach().sum(),
+                packed_dbias[0], torch.ones_like(packed_dbias[0]) * probs[:2].detach().sum()
             )
             torch.testing.assert_close(
-                packed_dbias[1],
-                torch.ones_like(packed_dbias[1]) * probs[2:].detach().sum(),
+                packed_dbias[1], torch.ones_like(packed_dbias[1]) * probs[2:].detach().sum()
             )
             assert experts._fused_ops[0][2].bias is experts.linear_fc2.bias
         else:
@@ -1256,11 +1246,7 @@ class TestTEGroupedMLP:
         ids=("single-weight", "single-bias", "single-weight-and-bias"),
     )
     def test_gpu_single_grouped_parent_gradient_parity(
-        self,
-        monkeypatch,
-        use_op_fuser,
-        single_grouped_weight,
-        single_grouped_bias,
+        self, monkeypatch, use_op_fuser, single_grouped_weight, single_grouped_bias
     ):
         """Single grouped parents must receive the same gradients as discrete parameters.
 
@@ -1362,9 +1348,7 @@ class TestTEGroupedMLP:
                 grad = getattr(linear, name).grad
                 assert grad is not None, f"Grouped {name} parent did not receive a gradient"
                 return grad.float()
-            grads = [
-                getattr(linear, f"{name}{idx}").grad for idx in range(self.num_experts)
-            ]
+            grads = [getattr(linear, f"{name}{idx}").grad for idx in range(self.num_experts)]
             assert all(grad is not None for grad in grads)
             return torch.stack(grads).float()
 
@@ -1375,31 +1359,19 @@ class TestTEGroupedMLP:
         copy_linear_params(reference.linear_fc1, target.linear_fc1)
         copy_linear_params(reference.linear_fc2, target.linear_fc2)
 
-        tokens_per_expert = torch.tensor(
-            [256, 256], dtype=torch.int64, device="cuda"
-        )
+        tokens_per_expert = torch.tensor([256, 256], dtype=torch.int64, device="cuda")
         num_tokens = int(tokens_per_expert.sum().item())
-        base_input = (
-            0.1
-            * torch.randn(
-                num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
-            )
+        base_input = 0.1 * torch.randn(
+            num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
         )
-        base_probs = torch.rand(
-            num_tokens, dtype=torch.bfloat16, device="cuda"
-        )
-        grad_output = (
-            0.1
-            * torch.randn(
-                num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
-            )
+        base_probs = torch.rand(num_tokens, dtype=torch.bfloat16, device="cuda")
+        grad_output = 0.1 * torch.randn(
+            num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
         )
 
         reference_input = base_input.detach().clone().requires_grad_(True)
         reference_probs = base_probs.detach().clone().requires_grad_(True)
-        reference_output, _ = reference(
-            reference_input, tokens_per_expert, reference_probs
-        )
+        reference_output, _ = reference(reference_input, tokens_per_expert, reference_probs)
         reference_output.backward(grad_output)
 
         target_input = base_input.detach().clone().requires_grad_(True)

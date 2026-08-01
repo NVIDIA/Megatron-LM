@@ -1641,15 +1641,11 @@ class TransformerConfig(ModelParallelConfig):
                     "uses a split-quantize fallback that is being deprecated."
                 )
             if not self.moe_use_grouped_tensor:
-                raise ValueError(
-                    "moe_single_grouped_weight requires moe_use_grouped_tensor=True."
-                )
+                raise ValueError("moe_single_grouped_weight requires moe_use_grouped_tensor=True.")
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
         if self.moe_single_grouped_bias and not self.moe_use_grouped_tensor:
-            raise ValueError(
-                "moe_single_grouped_bias requires moe_use_grouped_tensor=True."
-            )
+            raise ValueError("moe_single_grouped_bias requires moe_use_grouped_tensor=True.")
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":

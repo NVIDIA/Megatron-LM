@@ -305,9 +305,7 @@ class TEGroupedMLP(MegatronModule):
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
             align_size = (
-                get_align_size_for_quantization(self.config)
-                if self._use_grouped_tensor
-                else None
+                get_align_size_for_quantization(self.config) if self._use_grouped_tensor else None
             )
             self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=align_size)
             self.quantization_unpadding = Fp8Unpadding(
@@ -315,9 +313,7 @@ class TEGroupedMLP(MegatronModule):
             )
 
     @staticmethod
-    def _apply_packed_bias(
-        intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs
-    ):
+    def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
         """Apply a packed expert bias without reading token counts on the host."""
         # TODO: get rid of the .float() by having fused kernel compute in FP32
         shape = intermediate_parallel.shape
@@ -340,10 +336,7 @@ class TEGroupedMLP(MegatronModule):
         # Cast before repeating so both forward arithmetic and repeat_interleave's backward
         # reduction are computed in FP32. Autograd casts the final parameter gradient once.
         bias_per_token = torch.repeat_interleave(
-            packed_bias.float(),
-            tokens_per_expert,
-            dim=0,
-            output_size=flat_output.size(0),
+            packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
@@ -355,9 +348,7 @@ class TEGroupedMLP(MegatronModule):
         # CUDA-graph-safe packed path. With single_grouped_bias=True, TE returns one packed
         # GroupedTensor [num_experts, hidden_size]. The grouped-tensor backend also provides
         # tokens_per_expert as a tensor on the same device.
-        if isinstance(bias_parallel, torch.Tensor) and isinstance(
-            tokens_per_expert, torch.Tensor
-        ):
+        if isinstance(bias_parallel, torch.Tensor) and isinstance(tokens_per_expert, torch.Tensor):
             return TEGroupedMLP._apply_packed_bias(
                 intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs
             )
