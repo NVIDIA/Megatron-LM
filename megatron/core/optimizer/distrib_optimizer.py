@@ -75,6 +75,13 @@ from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end,
 logger = getLogger(__name__)
 
 
+def _is_trailing_padding_only_shard(
+    data_parallel_rank: int, gbuf_local_numel: int, gbuf_world_numel_unpadded: int
+) -> bool:
+    """Whether a DP-local bucket shard starts after the checkpointed buffer payload."""
+    return data_parallel_rank * gbuf_local_numel >= gbuf_world_numel_unpadded
+
+
 class Range:
     """
     A range represents a start and end points for indexing a shard
@@ -1894,9 +1901,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
                     )
 
-                    # The global ckpt tensors must be fully covered.
-                    # We add extra empty padding if necessary
-                    assert bucket_state, 'empty bucket encountered'
+                    # A highly padded bucket can assign a DP rank only trailing padding.
+                    # Trailing bucket padding is deliberately excluded from the checkpoint,
+                    # so that rank has no optimizer state to contribute. An empty shard that
+                    # intersects the unpadded payload is still a real coverage error.
+                    if not bucket_state:
+                        assert _is_trailing_padding_only_shard(
+                            data_parallel_rank, gbuf_local_numel, gbuf_world_numel_unpadded
+                        ), 'empty bucket intersects unpadded optimizer state'
+                        continue
 
                     # Insert padding between parameter tensors to ensure full coverage as needed.
                     all_pad_tensors = {}
@@ -2063,6 +2076,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Inverse of the `get_parameter_state_dp_reshardable` method.
         """
+        data_parallel_rank = self.data_parallel_group.rank()
+        data_parallel_world_size = self.data_parallel_group.size()
+
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
@@ -2075,6 +2091,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
+                    if not gbuf_range_map["param_map"]:
+                        bucket = self.buffers[gbuf_idx].buckets[bucket_idx]
+                        gbuf_world_numel = bucket.grad_data.numel()
+                        assert gbuf_world_numel % data_parallel_world_size == 0
+                        assert _is_trailing_padding_only_shard(
+                            data_parallel_rank,
+                            gbuf_world_numel // data_parallel_world_size,
+                            bucket.numel_unpadded,
+                        ), 'empty bucket intersects unpadded optimizer state'
+                        continue
                     bucket_state = state_dict[gbuf_idx][dtype][bucket_idx]
                     bucket_state = [
                         bucket_state_elem
