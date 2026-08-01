@@ -343,6 +343,15 @@ class GPTModel(LanguageModule):
                     f"input_ids shape {input_ids.shape}"
                 )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            # Replace embedding-table rows at multimodal placeholder positions with the
+            # encoder-produced rows staged in the context, before the SP scatter (the staged
+            # rows are indexed by global token position).
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and inference_context.is_dynamic_batching()
+            ):
+                decoder_input = inference_context.apply_multimodal_embeddings(decoder_input)
             if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
                 # The embedding skips SP scatter for models whose outer wrapper scatters instead
                 # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.

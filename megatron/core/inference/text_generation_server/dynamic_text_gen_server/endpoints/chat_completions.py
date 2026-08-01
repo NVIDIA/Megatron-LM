@@ -231,6 +231,36 @@ def _coerce_arguments_mapping(arguments):
     return {}
 
 
+#: OpenAI content block types that carry media rather than text.
+_MEDIA_BLOCK_TYPES = ("image_url", "video_url", "input_audio")
+
+
+def _find_media_block_types(messages):
+    """Media block types present in a conversation, in first-seen order.
+
+    Used to reject multimodal requests explicitly. `_sanitize_messages_for_template` below
+    flattens content blocks to text and discards media, which for a multimodal model means the
+    request quietly answers about nothing. A 400 is the honest response until media has a
+    transport to the engine: this endpoint tokenizes locally and sends token ids over the
+    coordinator, while placeholder expansion needs the encoder towers, which live engine-side.
+    Callers embedding the engine in-process can pass `multimodal_data` to
+    `DynamicInferenceEngine.add_request` directly.
+    """
+    found = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        for block in content:
+            if isinstance(block, dict):
+                block_type = block.get("type")
+                if block_type in _MEDIA_BLOCK_TYPES and block_type not in found:
+                    found.append(block_type)
+    return found
+
+
 def _sanitize_messages_for_template(messages):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
@@ -449,6 +479,14 @@ try:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
+        media_types = _find_media_block_types(messages)
+        if media_types:
+            return Response(
+                f"Multimodal content blocks ({', '.join(media_types)}) are not supported over "
+                "this endpoint: media cannot yet be routed to the engine's encoder towers. Use "
+                "DynamicInferenceEngine.add_request(multimodal_data=...) in-process instead.",
+                status=400,
+            )
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 

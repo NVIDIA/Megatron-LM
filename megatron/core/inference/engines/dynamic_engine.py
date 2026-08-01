@@ -42,6 +42,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.core.inference.multimodal.types import MultimodalData, MultimodalEmbeddingProvider
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
@@ -251,7 +252,12 @@ class DynamicInferenceEngine(AbstractEngine):
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
     )
-    def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
+    def __init__(
+        self,
+        controller: TextGenerationController,
+        context: DynamicInferenceContext,
+        multimodal_encoder: Optional[MultimodalEmbeddingProvider] = None,
+    ):
 
         assert isinstance(
             controller, TextGenerationController
@@ -271,6 +277,24 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
+
+        self.multimodal_encoder = multimodal_encoder
+        if multimodal_encoder is not None:
+            assert inference_config.enable_multimodal, (
+                "A multimodal_encoder was passed but InferenceConfig.enable_multimodal is False, "
+                "so the context has no embedding buffers to scatter into."
+            )
+            assert multimodal_encoder.hidden_size == model_config.hidden_size, (
+                f"multimodal encoder projects to {multimodal_encoder.hidden_size} but the "
+                f"language model has hidden_size {model_config.hidden_size}"
+            )
+            # Multimodal rows are injected after the embedding layer on the first pipeline
+            # stage and are never forwarded to later stages, so PP > 1 would silently drop
+            # them. See the design doc's PP decision.
+            assert self.pg_collection.pp is None or self.pg_collection.pp.size() == 1, (
+                "Multimodal inference requires pipeline_model_parallel_size == 1, got "
+                f"{self.pg_collection.pp.size()}"
+            )
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
@@ -1168,6 +1192,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        multimodal_data: Optional[MultimodalData] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1175,10 +1200,19 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            multimodal_data (Optional[MultimodalData]): Images, videos, and/or audio to attach
+                to the request. Requires the engine to have been built with a
+                `multimodal_encoder`, and `prompt` to be text (placeholder expansion is
+                tokenizer-driven).
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        if multimodal_data is not None and not multimodal_data.is_empty():
+            return self._add_multimodal_request(
+                request_id, prompt, sampling_params, multimodal_data
+            )
+
         prompt_str = None
         # Tokenize prompt if text.
         if isinstance(prompt, str):
@@ -1220,6 +1254,47 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Add request.
+        return self._add_request(request)
+
+    def _add_multimodal_request(
+        self,
+        request_id: int,
+        prompt: Union[str, List[int], Tensor],
+        sampling_params: Optional[SamplingParams],
+        multimodal_data: MultimodalData,
+    ) -> asyncio.Future[DynamicInferenceRequest]:
+        """Expand and encode a multimodal prompt, then admit it as a normal request.
+
+        Placeholder expansion and encoding both happen here, before `_add_request`, because
+        every downstream accounting decision -- block count, chunk lengths,
+        `num_tokens_to_generate`, the max-sequence-length check -- is derived from
+        `len(prompt_tokens)` and must see the expanded length.
+        """
+        assert self.multimodal_encoder is not None, (
+            f"Request {request_id} carries multimodal data but the engine was built without a "
+            "multimodal_encoder."
+        )
+        assert isinstance(prompt, str), (
+            "Multimodal requests require a text prompt; placeholder expansion needs the "
+            f"tokenizer, got {type(prompt).__name__}."
+        )
+
+        processed = self.multimodal_encoder.encode(prompt, multimodal_data)
+
+        request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_tokens=processed.prompt_tokens,
+            sampling_params=sampling_params,
+            block_size_tokens=self.context.block_size_tokens,
+            # DynamicInferenceRequest.__post_init__ forces this off for multimodal requests;
+            # passing the engine's setting keeps the intent visible at the call site.
+            enable_prefix_caching=self.context.enable_prefix_caching,
+            mm_embeddings=processed.mm_embeddings,
+            mm_embed_positions=processed.mm_embed_positions,
+            mm_content_hash=processed.content_hash,
+        )
+
         return self._add_request(request)
 
     def post_process_requests(

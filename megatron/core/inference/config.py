@@ -300,6 +300,21 @@ class InferenceConfig:
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
+    enable_multimodal: bool = False
+    """Whether to reserve the per-token multimodal embedding buffers in the dynamic context.
+
+    When True, `DynamicInferenceContext` allocates `token_to_mm_embedding`
+    (`[max_tokens, 1, hidden_size]`, params_dtype) plus a `[max_tokens, 1, 1]` bool mask, and
+    the model's embedding output is passed through a masked overwrite on every step. The
+    overwrite is unconditional by design: branching on "does this step carry multimodal
+    tokens" would bake the branch into a CUDA graph capture and silently skip injection on
+    replay. Leave this False for text-only deployments, which then allocate nothing and run
+    the embedding path unchanged.
+
+    Requires pipeline parallelism of 1; multimodal embeddings are injected on the first
+    pipeline stage only and are not forwarded across stages.
+    """
+
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
         PrefixCachingEvictionPolicy.REF_ZERO
     )

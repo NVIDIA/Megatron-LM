@@ -27,6 +27,13 @@ class BaseInferenceContext(abc.ABC):
         """Return `True` if context uses dynamic batching."""
         return not self.is_static_batching()
 
+    def apply_multimodal_embeddings(self, decoder_input):
+        """Overwrite embedding rows at multimodal placeholder positions.
+
+        Identity by default; only `DynamicInferenceContext` stages multimodal embeddings.
+        """
+        return decoder_input
+
     def increment_sequence_len_offset(self, increment: int) -> None:
         """Update sequence length offset. No-op for dynamic batching."""
         if self.is_static_batching():

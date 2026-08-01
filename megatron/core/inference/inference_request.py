@@ -389,10 +389,35 @@ class DynamicInferenceRequest(InferenceRequest):
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
 
+    # Multimodal fields. `prompt_tokens` is already the *expanded* prompt (placeholder spans
+    # materialized), so all the usual token accounting works unchanged.
+    #   mm_embeddings:       [N_mm, hidden_size], params_dtype, on GPU. Encoder output, in the
+    #                        same order as mm_embed_positions.
+    #   mm_embed_positions:  [N_mm], int64, on CPU, sorted ascending. Positions within the
+    #                        expanded prompt that receive an encoder row instead of an
+    #                        embedding-table lookup.
+    #   mm_content_hash:     Digest of the decoded media, for a future prefix-cache extension.
+    mm_embeddings: Optional[torch.Tensor] = None
+    mm_embed_positions: Optional[torch.Tensor] = None
+    mm_content_hash: Optional[int] = None
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = self.prompt_tokens
+
+        if self.mm_embeddings is not None:
+            assert self.mm_embed_positions is not None, "mm_embeddings requires mm_embed_positions"
+            assert len(self.mm_embeddings) == len(self.mm_embed_positions), (
+                f"mm_embeddings has {len(self.mm_embeddings)} rows but "
+                f"{len(self.mm_embed_positions)} positions"
+            )
+            # Prefix caching hashes raw token ids, and two different images expand to
+            # identical placeholder ids -- so a cache hit on a multimodal prefix would
+            # serve one image's KV for another. Correctness bug, not a perf issue. The
+            # long-term fix is to chain mm_content_hash into the block digests; until then
+            # multimodal requests bypass the cache entirely.
+            self.enable_prefix_caching = False
 
         # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
         if (
@@ -462,6 +487,13 @@ class DynamicInferenceRequest(InferenceRequest):
             saved_prompt_tokens = self.prompt_tokens
             self.prompt_tokens = None
 
+        # Multimodal embeddings are megabytes of bf16 per request and are consumed on the
+        # engine that produced them. `super().serialize()` would convert them via
+        # `.cpu().tolist()`, which would dominate the engine->coordinator->API host path.
+        saved_mm = (self.mm_embeddings, self.mm_embed_positions)
+        self.mm_embeddings = None
+        self.mm_embed_positions = None
+
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
@@ -479,6 +511,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
         if drop_prompt:
             self.prompt_tokens = saved_prompt_tokens
+        self.mm_embeddings, self.mm_embed_positions = saved_mm
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
@@ -695,13 +728,19 @@ class DynamicInferenceRequestRecord:
             }
         )
 
-        # New request.
+        # New request. Multimodal state carries forward unchanged: the checkpointed prompt
+        # appends generated tokens after the original prompt, so every mm_embed_position still
+        # refers to the same token. Dropping it here would silently re-prefill an evicted
+        # multimodal request with bare placeholder ids.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            mm_embeddings=old_request.mm_embeddings,
+            mm_embed_positions=old_request.mm_embed_positions,
+            mm_content_hash=old_request.mm_content_hash,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -767,6 +806,10 @@ class DynamicInferenceRequestRecord:
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
             num_cached_tokens=self.requests[0].num_cached_tokens,
+            # mm_embeddings are deliberately not carried into the merged result: they are
+            # consumed during prefill and holding them would pin encoder output on the GPU
+            # for the lifetime of the result object.
+            mm_content_hash=self.requests[0].mm_content_hash,
         )
 
         return request

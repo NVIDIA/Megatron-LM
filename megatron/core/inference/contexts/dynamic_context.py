@@ -270,6 +270,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
 
+        # Multimodal configuration. Gates allocation of the per-token embedding buffers.
+        self.enable_multimodal = inference_config.enable_multimodal
+
         # Monotonic clock for prefix caching LRU eviction ordering.
         # Incremented each engine step but kept independent so the engine step
         # counter is not overloaded with cache-eviction semantics.
@@ -1379,6 +1382,31 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
                 dtype=self.params_dtype,
             )
+
+        # Multimodal embedding injection buffers. Deliberately kept out of the coalesced
+        # `_cpu_bookkeeping_buf`: encoder output is produced on GPU and never needs a pinned
+        # H2D mirror, and folding `max_tokens * hidden_size * 2` bytes into the single
+        # per-step `cudaMemcpyAsync` would dominate it. Allocated once here so the addresses
+        # are stable across CUDA graph capture and replay.
+        self.token_to_mm_embedding: Optional[Tensor] = None
+        self.token_to_is_mm: Optional[Tensor] = None
+        if self.enable_multimodal:
+            self.token_to_mm_embedding = torch.empty(
+                self.max_tokens,
+                1,
+                self.hidden_size,
+                device=torch.cuda.current_device(),
+                dtype=self.params_dtype,
+            )
+            # Broadcasts against `[tokens, 1, hidden]` in the masked overwrite, so one bool
+            # per token rather than per element.
+            self.token_to_is_mm = torch.zeros(
+                self.max_tokens, 1, 1, device=torch.cuda.current_device(), dtype=torch.bool
+            )
+
+        # Number of multimodal rows scattered for the current step. Host-side only; used for
+        # metrics and assertions, never to branch inside the graphed region.
+        self.mm_token_count = 0
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -2645,6 +2673,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request.fill_(0)
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
+        self.clear_multimodal_mask()
 
     def reset_metadata(
         self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
@@ -2764,6 +2793,88 @@ class DynamicInferenceContext(BaseInferenceContext):
         cached = (input_ids, pos_ids)
         self._input_position_views[num_tokens] = cached
         return cached
+
+    def apply_multimodal_embeddings(self, decoder_input: Tensor) -> Tensor:
+        """Overwrite embedding-table rows with encoder-produced multimodal rows.
+
+        Called by the model immediately after the embedding layer, before the sequence-parallel
+        scatter and before the quantization padding zero (both of which must still win).
+
+        The overwrite is unconditional whenever multimodal is enabled -- it is *not* gated on
+        whether this step actually carries multimodal tokens. A host-side branch here would be
+        resolved once at CUDA graph capture time and then frozen for every replay, so a step
+        that captured without multimodal tokens would silently skip injection for a later step
+        that has them. An all-False mask makes the overwrite an identity op instead, at the cost
+        of one elementwise pass over `[num_tokens, 1, hidden]`.
+
+        Args:
+            decoder_input (Tensor): Embedding output, `[num_tokens, 1, hidden_size]`.
+
+        Return:
+            (Tensor) `decoder_input` with multimodal positions replaced.
+        """
+        if not self.enable_multimodal:
+            return decoder_input
+
+        # Static under graph capture: the bucket fixes num_tokens, and both buffers were
+        # allocated once in __init__, so every replay reads the same addresses.
+        num_tokens = decoder_input.shape[0]
+        return torch.where(
+            self.token_to_is_mm[:num_tokens], self.token_to_mm_embedding[:num_tokens], decoder_input
+        )
+
+    def clear_multimodal_mask(self) -> None:
+        """Invalidate the multimodal mask for the upcoming step.
+
+        Token slots are recycled every step -- decode tokens occupy `[0, active_token_count)`
+        and prefill chunks are appended after them -- so a slot that held an image row on one
+        step may hold a sampled token on the next. Clearing the whole mask (a few thousand
+        bools) is cheaper than tracking which slots were dirtied, and it also covers the
+        padding range, which `scatter_multimodal_embeddings` never writes.
+
+        The companion embedding buffer is deliberately left untouched: nothing reads it where
+        the mask is False, so zeroing it would be pure bandwidth spent on padding.
+        """
+        if not self.enable_multimodal:
+            return
+        self.token_to_is_mm.zero_()
+        self.mm_token_count = 0
+
+    def scatter_multimodal_embeddings(
+        self, req: "DynamicInferenceRequest", chunk_start: int, chunk_length: int
+    ) -> None:
+        """Copy a request's multimodal rows into the token slots of the current prefill chunk.
+
+        Indexed by absolute position within the expanded prompt, so a chunk boundary landing
+        in the middle of an image's token span is handled by construction: each chunk picks up
+        exactly the rows whose positions fall inside it.
+
+        Args:
+            req (DynamicInferenceRequest): Request being added, carrying `mm_embeddings` on GPU
+                and `mm_embed_positions` on CPU.
+            chunk_start (int): Absolute position within the expanded prompt of the first token
+                written this round (i.e. past any prefix-cache skip).
+            chunk_length (int): Number of tokens written this round.
+        """
+        if not self.enable_multimodal or req.mm_embeddings is None:
+            return
+
+        positions = req.mm_embed_positions
+        # Positions are sorted, so the rows belonging to this chunk form a contiguous range.
+        # searchsorted on the CPU copy keeps the lookup off the device.
+        lo = int(torch.searchsorted(positions, chunk_start, right=False))
+        hi = int(torch.searchsorted(positions, chunk_start + chunk_length, right=False))
+        if lo == hi:
+            return
+
+        # Pageable H2D, so this blocks the host briefly. It only runs on prefill chunks that
+        # carry media, never on decode steps, so it stays out of the per-step critical path.
+        dst_idxs = (positions[lo:hi] - chunk_start + self.active_token_count).to(
+            device=self.token_to_is_mm.device, non_blocking=True
+        )
+        self.token_to_mm_embedding.index_copy_(0, dst_idxs, req.mm_embeddings[lo:hi].unsqueeze(1))
+        self.token_to_is_mm.index_fill_(0, dst_idxs, True)
+        self.mm_token_count += hi - lo
 
     def speculative_required_logit_indices(self) -> Tensor:
         """Token-level indices needed for speculative decode verification.
@@ -3182,6 +3293,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_input_ids[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = this_round_tokens
+        # effective_kv_offset is the absolute position within the expanded prompt of the first
+        # token written this round, so this is chunk- and prefix-skip-aware by construction.
+        self.scatter_multimodal_embeddings(
+            req, chunk_start=effective_kv_offset, chunk_length=effective_prefill_chunk_length
+        )
         self.token_to_request_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = current_id
@@ -4163,6 +4279,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.active_token_count = active_request_count * num_generated_tokens
         sampled_tokens = next_tokens[self.paused_request_count : self.total_request_count]
+
+        # The decode tokens written just below, and any prefill chunk appended after them,
+        # reuse slots that may have held multimodal rows on the previous step. Invalidate the
+        # mask now, before the next step's `add_request` calls re-scatter into it.
+        self.clear_multimodal_mask()
 
         if self.num_speculative_tokens > 0:
             # new_speculative_tokens has shape [num_spec_tokens, num_requests],

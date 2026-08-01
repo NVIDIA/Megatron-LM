@@ -455,6 +455,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
+            # Replace embedding-table rows at multimodal placeholder positions with the
+            # encoder-produced rows staged in the context. Must run before the padding zero
+            # below (so padding still wins) and before the sequence-parallel scatter (the
+            # staged rows are indexed by global token position).
+            if (
+                in_inference_mode
+                and inference_context is not None
+                and inference_context.is_dynamic_batching()
+            ):
+                decoder_input = inference_context.apply_multimodal_embeddings(decoder_input)
+
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
             if (
