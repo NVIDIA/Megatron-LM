@@ -38,7 +38,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
-
 pytestmark = [
     pytest.mark.internal,
     pytest.mark.launch_on_gb200,
@@ -151,8 +150,7 @@ def _build_moe_layer(
     )
     submodules = get_submodules(
         get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=transformer_config.num_moe_experts,
-            moe_grouped_gemm=True,
+            num_experts=transformer_config.num_moe_experts, moe_grouped_gemm=True
         ).mlp
     )
     assert isinstance(submodules, MoESubmodules)
@@ -201,9 +199,7 @@ def _canonical_gradient(linear, parameter_name: str) -> torch.Tensor:
         assert gradient is not None, f"Grouped {parameter_name} parent has no gradient"
         return gradient.reshape(linear.num_gemms, -1).float()
 
-    gradients = [
-        getattr(linear, f"{parameter_name}{idx}").grad for idx in range(linear.num_gemms)
-    ]
+    gradients = [getattr(linear, f"{parameter_name}{idx}").grad for idx in range(linear.num_gemms)]
     assert all(gradient is not None for gradient in gradients)
     return torch.stack([gradient.reshape(-1) for gradient in gradients]).float()
 
@@ -231,17 +227,12 @@ def _run_forward_backward(
 
 
 def _run_numerical_parity_case(
-    dispatcher: str,
-    *,
-    single_grouped_weight: bool,
-    use_bias: bool,
-    single_grouped_bias: bool,
+    dispatcher: str, *, single_grouped_weight: bool, use_bias: bool, single_grouped_bias: bool
 ) -> None:
     """Compare grouped-tensor execution with the old path on the same dispatcher."""
     ep_size = _require_test_environment(dispatcher)
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=ep_size,
+        tensor_model_parallel_size=1, expert_model_parallel_size=ep_size
     )
     mcore_config.ENABLE_EXPERIMENTAL = True
 
@@ -265,11 +256,7 @@ def _run_numerical_parity_case(
     _copy_layer_parameters(reference, target)
 
     base_input = torch.randn(
-        _NUM_LOCAL_TOKENS,
-        1,
-        _HIDDEN_SIZE,
-        dtype=torch.bfloat16,
-        device="cuda",
+        _NUM_LOCAL_TOKENS, 1, _HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
     )
     grad_output = torch.randn_like(base_input)
 
@@ -391,7 +378,7 @@ def _install_padding_probes(layer: MoELayer, monkeypatch):
     layer.experts.quantization_padding.register_forward_hook(capture_padding)
     layer.experts.quantization_unpadding.register_forward_hook(capture_unpadding)
 
-    # All dispatchers share this final restoration API. 
+    # All dispatchers share this final restoration API.
     original_combine_postprocess = layer.token_dispatcher.combine_postprocess
 
     def capture_combine_postprocess(hidden_states, *args, **kwargs):
@@ -399,9 +386,7 @@ def _install_padding_probes(layer: MoELayer, monkeypatch):
         captured["restored_shape"] = output.shape
         return output
 
-    monkeypatch.setattr(
-        layer.token_dispatcher, "combine_postprocess", capture_combine_postprocess
-    )
+    monkeypatch.setattr(layer.token_dispatcher, "combine_postprocess", capture_combine_postprocess)
 
     return captured
 
@@ -419,8 +404,7 @@ def _run_padding_lifecycle_case(dispatcher: str, monkeypatch) -> None:
     # TP remains one to keep the independently reconstructed local-expert counts unambiguous.
     ep_size = _require_test_environment(dispatcher)
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=ep_size,
+        tensor_model_parallel_size=1, expert_model_parallel_size=ep_size
     )
     mcore_config.ENABLE_EXPERIMENTAL = True
 
@@ -441,12 +425,7 @@ def _run_padding_lifecycle_case(dispatcher: str, monkeypatch) -> None:
 
     torch.manual_seed(9753)
     hidden_states = torch.randn(
-        _NUM_LOCAL_TOKENS,
-        1,
-        _HIDDEN_SIZE,
-        dtype=torch.bfloat16,
-        device="cuda",
-        requires_grad=True,
+        _NUM_LOCAL_TOKENS, 1, _HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda", requires_grad=True
     )
     output, _ = layer(hidden_states)
 
