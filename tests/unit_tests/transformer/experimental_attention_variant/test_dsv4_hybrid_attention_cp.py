@@ -11,7 +11,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from tests.unit_tests.test_utilities import Utils
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -22,6 +21,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     _SEED,
     _build_attention,
@@ -554,18 +554,30 @@ class TestDSv4HybridAttentionTHDCP:
         return measured
 
     @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
-    def test_cp2_unfused_indexer_loss_and_grad_matches_cp1(self, sparse_loss):
+    @pytest.mark.parametrize(
+        ("seg_lens", "padded_seg_lens"),
+        [((64,), None), ((5, 11, 17, 19), (8, 12, 20, 24))],
+        ids=["single", "ragged_padded"],
+    )
+    def test_cp2_unfused_indexer_loss_and_grad_matches_cp1(
+        self, sparse_loss, seg_lens, padded_seg_lens, request
+    ):
         """CP2 unfused indexer loss and gradients must match the CP1 teacher."""
         if self.cp_size != 2:
             pytest.skip("The exact unfused indexer regression is a focused CP2 gate")
 
-        seq_len = 64
-        packed = _make_thd_packed_seq_params((seq_len,))
+        def cleanup_indexer_loss_state():
+            DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+            _clear_cuda_test_state()
+
+        request.addfinalizer(cleanup_indexer_loss_state)
+
+        packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
+        seq_len = sum(padded_seg_lens or seg_lens)
         local_rows = seq_len // self.cp_size
         local_idx = torch.arange(
-            self.cp_rank * local_rows,
-            (self.cp_rank + 1) * local_rows,
-            device='cuda',
+            self.cp_rank * local_rows, (self.cp_rank + 1) * local_rows, device='cuda'
         )
 
         common_config = dict(
@@ -667,20 +679,37 @@ class TestDSv4HybridAttentionTHDCP:
         if missing_cp_grads:
             errors.append(f"missing CP2 indexer gradients: {missing_cp_grads}")
 
-        nonzero_grad = False
+        nonzero_cp_grad = False
+        nonzero_ref_grad = False
+        grad_metrics = []
         for name, cp_grad in reduced_cp_grads.items():
             ref_param = ref_params.get(name)
             if ref_param is None or ref_param.grad is None:
                 errors.append(f"missing CP1 indexer gradient: {name}")
                 continue
             ref_grad = ref_param.grad.detach().float()
-            nonzero_grad = nonzero_grad or bool(torch.count_nonzero(ref_grad).item())
-            close = torch.isclose(cp_grad, ref_grad, rtol=1e-3, atol=1e-4)
-            if not bool(close.all().item()):
-                max_abs = (cp_grad - ref_grad).abs().max().item()
+            nonzero_cp_grad = nonzero_cp_grad or bool(torch.count_nonzero(cp_grad).item())
+            nonzero_ref_grad = nonzero_ref_grad or bool(torch.count_nonzero(ref_grad).item())
+            max_abs = (cp_grad - ref_grad).abs().max().item()
+            grad_metrics.append(
+                f"{name}:max_abs={max_abs:.10e},cp_norm={cp_grad.norm().item():.10e},"
+                f"cp1_norm={ref_grad.norm().item():.10e}"
+            )
+            if max_abs > 1e-4:
                 errors.append(f"indexer gradient {name} max_abs={max_abs:.10e}")
-        if not nonzero_grad:
+        if not nonzero_cp_grad:
+            errors.append("all CP2 indexer gradients are zero")
+        if not nonzero_ref_grad:
             errors.append("all CP1 indexer gradients are zero")
+
+        if self.cp_rank == 0:
+            print(
+                f"[CP2-INDEXER] sparse_loss={sparse_loss} seg_lens={seg_lens} "
+                f"padded_seg_lens={padded_seg_lens} cp2={cp_loss.item():.10f} "
+                f"cp1={ref_loss.item():.10f} loss_abs={loss_diff.item():.10e}; "
+                + "; ".join(grad_metrics),
+                flush=True,
+            )
 
         failure_flag = torch.tensor(bool(errors), dtype=torch.int32, device='cuda')
         dist.all_reduce(failure_flag, op=dist.ReduceOp.MAX, group=self.pg.cp)
@@ -688,9 +717,6 @@ class TestDSv4HybridAttentionTHDCP:
             pytest.fail("; ".join(errors) if errors else "peer rank reported an alignment failure")
 
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out
-        DSAIndexerLossAutoScaler.main_loss_backward_scale = None
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
-        _clear_cuda_test_state()
 
     @pytest.mark.parametrize(
         ("layer_number", "sparse_loss"),

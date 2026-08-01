@@ -29,6 +29,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
     FusedDSAIndexerLoss,
+    _compute_indexer_teacher_probabilities,
+    _normalize_indexer_teacher_target,
     fused_qk_topk_naive,
     rotate_activation,
 )
@@ -813,12 +815,13 @@ def _unfused_indexer_sparse_attn_from_topk(
     softmax_scale: float,
     indexer_softmax_scale: float,
     loss_coeff: float,
-    loss_divisor: float,
+    loss_divisor: Union[float, torch.Tensor],
     sparse_loss: bool,
     ratio: int,
     _max_seqlen_q: int,
     indexer_layout: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     q_padding_mask: Optional[torch.Tensor] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """PyTorch sparse attention plus caller-supplied indexer loss for THD CP.
 
@@ -832,6 +835,36 @@ def _unfused_indexer_sparse_attn_from_topk(
 
     total_q, np_, hn = query.shape
     cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
+    indexer_topk = indexer_topk_indices.shape[-1]
+    attention_indices = topk_indices
+    if q_padding_mask is not None:
+        attention_indices = attention_indices.masked_fill(q_padding_mask.unsqueeze(-1), -1)
+    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full, attn_sink, attention_indices[:, indexer_topk:], softmax_scale
+    )
+
+    def compressed_teacher_target(
+        logits: torch.Tensor, valid_mask: torch.Tensor, row_slice: slice
+    ) -> torch.Tensor:
+        lse_slice = non_compressed_lse[:, :, row_slice]
+        probabilities = _compute_indexer_teacher_probabilities(
+            logits.permute(1, 0, 2).unsqueeze(0),
+            valid_mask.unsqueeze(0),
+            non_compressed_lse=lse_slice,
+        )
+        target = probabilities.sum(dim=1).squeeze(0)
+        if tp_group is not None and tp_group.size() > 1:
+            torch.distributed.all_reduce(target, group=tp_group)
+        return _normalize_indexer_teacher_target(target, lse_slice)
+
+    def scale_local_loss(raw_local_loss: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(loss_divisor):
+            divisor = loss_divisor.to(device=raw_local_loss.device, dtype=torch.float32).clamp_min(
+                1.0
+            )
+        else:
+            divisor = max(float(loss_divisor), 1.0)
+        return raw_local_loss * float(loss_coeff) / divisor
 
     if not sparse_loss:
         q_rows = torch.arange(total_q, dtype=cu_seqlens_q.dtype, device=query.device)
@@ -879,15 +912,9 @@ def _unfused_indexer_sparse_attn_from_topk(
             target_logits = (target_logits * softmax_scale).masked_fill(
                 ~valid.unsqueeze(1), float("-inf")
             )
-            target_logits = torch.where(row_valid.unsqueeze(1), target_logits, 0.0)
-            sink = attn_sink.detach().view(1, np_, 1).float()
-            scores_max = torch.maximum(target_logits.max(dim=-1, keepdim=True).values, sink)
-            exp_scores = torch.exp(target_logits - scores_max)
-            exp_sink = torch.exp(sink - scores_max)
-            target = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-            target = (target * row_valid.unsqueeze(1).float()).sum(dim=1)
+            target = compressed_teacher_target(target_logits, valid, slice(start, end))
             eps = torch.finfo(torch.float32).tiny
-            target = target / target.sum(dim=-1, keepdim=True).clamp(min=eps)
+            target = target * row_valid.float()
             target = target.clamp(min=eps)
             predict = predict.clamp(min=eps)
 
@@ -897,9 +924,7 @@ def _unfused_indexer_sparse_attn_from_topk(
             )
             raw_local_loss = raw_local_loss + kl_per_row.sum()
 
-        return output, raw_local_loss * float(loss_coeff) / float(loss_divisor)
-
-    indexer_topk = indexer_topk_indices.shape[-1]
+        return output, scale_local_loss(raw_local_loss)
 
     if q_padding_mask is not None:
         indexer_topk_indices = indexer_topk_indices.masked_fill(q_padding_mask.unsqueeze(-1), -1)
@@ -931,19 +956,12 @@ def _unfused_indexer_sparse_attn_from_topk(
     selected_kv = compressed_kv.detach().index_select(0, safe_indices.reshape(-1))
     selected_kv = selected_kv.reshape(total_q, indexer_topk, hn)
 
-    # This fallback does not run FlashMLA, so it cannot reuse the fused path's
-    # lse_indexer-based target helper. Recompute the same sink-aware target and
-    # KL terms explicitly to keep the no-fusion path numerically aligned.
+    # Normalize selected compressed logits with the same sliding-window and
+    # sink mass used by the real CSA attention teacher.
     attn_scores = torch.einsum("rhd,rkd->rhk", query.detach().float(), selected_kv.float())
     attn_scores = attn_scores * softmax_scale
     attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
-    sink = attn_sink.detach().view(1, np_, 1).float()
-    scores_max = torch.maximum(attn_scores.max(dim=-1, keepdim=True).values, sink)
-    exp_scores = torch.exp(attn_scores - scores_max)
-    exp_sink = torch.exp(sink - scores_max)
-    attn_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-    target = attn_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+    target = compressed_teacher_target(attn_scores, valid, slice(None))
     target = target * row_valid.float()
 
     eps = torch.finfo(torch.float32).tiny
@@ -953,7 +971,7 @@ def _unfused_indexer_sparse_attn_from_topk(
     kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
     raw_local_loss = kl_per_row.sum()
 
-    indexer_loss = raw_local_loss * float(loss_coeff) / float(loss_divisor)
+    indexer_loss = scale_local_loss(raw_local_loss)
     return output, indexer_loss
 
 
@@ -2694,11 +2712,16 @@ class CompressedSparseAttention(MegatronModule):
                 real_seqlens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
                 positions = global_rows - cu_seqlens[batch_ids]
                 q_padding_mask = positions >= real_seqlens[batch_ids]
-            output, indexer_loss = (
-                FusedCSAIndexerSparseAttnFromTopkFunc.apply
-                if self.use_fused_kernels
-                else _unfused_indexer_sparse_attn_from_topk
-            )(
+            loss_divisor = 1 if self.config.calculate_per_token_loss else l_local * cp_size
+            if (
+                not self.use_fused_kernels
+                and not self.config.calculate_per_token_loss
+                and cu_seqlens_q_unpadded is not None
+            ):
+                # Match the reference DSA mean over real query rows. Keep the
+                # scalar on device so padded THD remains CUDA-graph safe.
+                loss_divisor = cu_seqlens_q_unpadded[-1]
+            indexer_loss_args = (
                 query,
                 kv_full_thd,
                 self.attn_sink.float(),
@@ -2711,13 +2734,21 @@ class CompressedSparseAttention(MegatronModule):
                 self.softmax_scale,
                 indexer.softmax_scale,
                 indexer_loss_coeff,
-                1 if self.config.calculate_per_token_loss else l_local * cp_size,
+                loss_divisor,
                 sparse_indexer_loss,
                 ratio,
                 max_seqlen_q,
                 indexer_layout,
                 q_padding_mask,
             )
+            if self.use_fused_kernels:
+                output, indexer_loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+                    *indexer_loss_args
+                )
+            else:
+                output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
+                    *indexer_loss_args, tp_group=indexer.pg_collection.tp
+                )
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
