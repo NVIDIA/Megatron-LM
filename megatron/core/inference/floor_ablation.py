@@ -39,13 +39,23 @@ Two rules keep that from happening:
 
 All gates default off and are read once at import.
 
-Known limitation, ``ABLATE_NVLS_DISPATCH`` / ``ABLATE_NVLS_COMBINE``: prefill runs
-the real collective eagerly while replays skip it, which desynchronizes the
-symmetric-memory barrier sequence across ranks. Both arms hang the benchmark
-(observed: 1500 s timeout), so their block times are measured in a degraded state
-and must not be quoted. Fixing this means suppressing the collective in warmup as
-well, so every rank agrees on the sequence. The other gates are unaffected --
-they touch no cross-rank state.
+``ABLATE_NVLS_DISPATCH`` / ``ABLATE_NVLS_COMBINE`` are retained only as a record of
+a dead end -- **do not read a cost out of them.** They are gated on ``nvls_off()``,
+which is unconditional rather than capture-only, because a capture-only skip leaves
+the ranks disagreeing about how many times the symmetric-memory barrier has been
+passed and hangs the benchmark. That fix works (no hang, all gates fire), and the
+answer it produces is still meaningless: removing both collectives makes the block
+*13.5% slower*.
+
+The reason is structural. ``multimem_all_gatherv_3tensor`` produces the work
+descriptor for everything after it -- ``dispatch_preprocess`` reads ``routing_map``
+back out of the gathered symmetric buffer, and that map sets how many token-expert
+assignments, hence how many grouped-GEMM tiles, the experts run. Skip the gather
+and the buffer still holds warmup's *prefill* values, whose assignment distribution
+is denser than steady-state decode, so the experts silently do more work. No amount
+of better gating fixes this: subtraction cannot measure a component that decides
+how much work its successors do. Time those collectives in place instead, with a
+CUDA event pair inside the captured graph.
 """
 
 import os
@@ -83,6 +93,15 @@ def capturing() -> bool:
     import torch
 
     return torch.cuda.is_current_stream_capturing()
+
+
+def nvls_off(flag: bool) -> bool:
+    """Gate for the two cross-rank collectives: unconditional, not capture-only.
+
+    See the module docstring -- a capture-only skip desynchronizes the
+    symmetric-memory barrier across ranks and hangs the benchmark.
+    """
+    return flag
 
 
 _hits: Dict[str, int] = {}

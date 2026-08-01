@@ -586,7 +586,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Floor attribution: omit the gather from the captured graph. The symmetric
         # buffers already hold the values warmup's real gather left there, so shapes
         # and routing stay valid and only the collective leaves the chain.
-        if not (_ablate.ABLATE_NVLS_DISPATCH and _ablate.capturing() and _ablate.hit("nvls_dispatch")):
+        if not (_ablate.nvls_off(_ablate.ABLATE_NVLS_DISPATCH) and _ablate.hit("nvls_dispatch")):
             multimem_all_gatherv_3tensor(
                 agv_h["tensor"],
                 agv_r["tensor"],
@@ -639,7 +639,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Floor attribution: omit the reduce-scatter from the captured graph and
         # return zeros of its shape, which leaves the residual stream finite so the
         # next layer's routing distribution is unchanged.
-        if _ablate.ABLATE_NVLS_COMBINE and _ablate.capturing() and _ablate.hit("nvls_combine"):
+        if _ablate.nvls_off(_ablate.ABLATE_NVLS_COMBINE) and _ablate.hit("nvls_combine"):
             return _ablate.zeros(
                 (self._local_tokens, hidden_states.shape[1]),
                 torch.bfloat16,
