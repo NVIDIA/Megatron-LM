@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -120,6 +122,17 @@ except ImportError:
     HAVE_FMLA = False
 
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.inference import floor_ablation as _ablate
+
+# See _resolve_flash_version: benchmarking-only override for a config field that
+# has no CLI flag. Empty means "leave the config's choice alone".
+_FA_VERSION_ENV = os.environ.get("MCORE_FLASH_ATTN_VERSION", "")
+
+
+class _FlashVersionLog:
+    """One-shot latch so the resolved generation is logged once, not per layer."""
+
+    done = False
 
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -516,7 +529,15 @@ class Attention(MegatronModule, ABC):
         **extra_kwargs,
     ):
         """Run the configured core attention module."""
-        return apply_module(self.core_attention)(
+        # Floor attribution: drop attention from the captured graph. Warmup ran it
+        # for real, so its output shape is known; zeros keep the residual finite.
+        # If warmup somehow never ran it, fall through rather than guess a shape.
+        if _ablate.ABLATE_ATTN_CORE and _ablate.capturing() and _ablate.hit("attn_core"):
+            shape = _ablate.recall("attn_core_shape")
+            if shape is not None:
+                return _ablate.zeros(shape, query.dtype, query.device)
+
+        out = apply_module(self.core_attention)(
             query,
             key,
             value,
@@ -526,6 +547,9 @@ class Attention(MegatronModule, ABC):
             packed_seq_params=packed_seq_params,
             **extra_kwargs,
         )
+        if _ablate.ABLATE_ATTN_CORE:
+            _ablate.remember("attn_core_shape", tuple(out.shape))
+        return out
 
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
@@ -1013,6 +1037,17 @@ class Attention(MegatronModule, ABC):
         when both are False the FA2 kernel is used.
         """
         pinned = self.flash_attention_version
+        # Benchmarking override: `flash_attention_version` has no CLI flag, so this
+        # is the only way to A/B generations from a launch script. Config wins.
+        if pinned is None and _FA_VERSION_ENV:
+            pinned = int(_FA_VERSION_ENV)
+        if not _FlashVersionLog.done:
+            _FlashVersionLog.done = True
+            print(
+                f"[FLASH_ATTN] pinned={pinned} HAVE_FA4={HAVE_FA4} HAVE_FA3={HAVE_FA3}",
+                file=sys.stderr,
+                flush=True,
+            )
         if pinned == 4:
             assert (
                 HAVE_FA4
@@ -1580,19 +1615,36 @@ class Attention(MegatronModule, ABC):
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
                 cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                    inference_context.is_decode_only(),
-                    softmax_offset=self._get_inference_softmax_offset(),
+                # Floor attribution: drop the dynamic-batching attention kernel from
+                # the captured graph. This is the decode path's real attention call --
+                # _run_core_attention is only reached by the static engine.
+                # Keyed by the query shape: warmup runs prefill as well as decode, and
+                # returning a prefill-shaped buffer into the decode graph would be a
+                # shape error rather than a measurement.
+                _abl_key = f"dyn_attn_out{tuple(q.shape)}"
+                _abl_shape = (
+                    _ablate.recall(_abl_key)
+                    if (_ablate.ABLATE_ATTN_CORE and _ablate.capturing())
+                    else None
                 )
+                if _abl_shape is not None and _ablate.hit("dyn_attn"):
+                    core_attn_out = _ablate.zeros(_abl_shape, q.dtype, q.device)
+                else:
+                    core_attn_out = self.flash_decode_and_prefill(
+                        q,
+                        k,
+                        v,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        cu_query_lengths,
+                        cu_kv_lengths,
+                        kv_lengths,
+                        block_table,
+                        inference_context.is_decode_only(),
+                        softmax_offset=self._get_inference_softmax_offset(),
+                    )
+                    if _ablate.ABLATE_ATTN_CORE:
+                        _ablate.remember(_abl_key, tuple(core_attn_out.shape))
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
                 # Clear the outputs for padding tokens when using quantization scales

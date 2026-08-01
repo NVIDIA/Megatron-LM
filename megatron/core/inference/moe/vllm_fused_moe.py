@@ -32,6 +32,7 @@ if not HAVE_TRITON:
 
 from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe.fused_moe import ActivationType
+from megatron.core.inference import floor_ablation as _ablate
 from megatron.core.inference.moe.permute import (
     _get_num_sms,
     compute_expert_offsets,
@@ -1052,6 +1053,7 @@ def _moe_sum_kernel_fast(
 # decode topk reduction. Env-toggleable for A/B; default off.
 _USE_FAST_MOE_SUM: bool = os.environ.get("MCORE_MOE_SUM_FAST", "0") == "1"
 
+
 # Full hidden-size K tile: one pass over topk per token instead of NUM_K_BLOCKS
 # passes, so the per-token routing_map/prob index loads are issued once.
 _FAST_MOE_SUM_MAX_BLOCK_K = 2048
@@ -1236,25 +1238,37 @@ def vllm_fused_moe(
     # c with c+N/2 across N-tiles; the unfused path writes the 2N intermediate and
     # applies gate/up separately below, while the fused path (use_fused_swiglu)
     # reads both halves per program and writes the N//2 activated output directly.
-    intermediate1 = torch.empty(
-        num_valid, fc1_out_width, dtype=hidden_states.dtype, device=hidden_states.device
+    # Floor attribution: drop both grouped GEMMs (and the standalone activation)
+    # from the captured graph, substituting cached zeros for their outputs. The
+    # align tables and the topk reduce still run, so the delta isolates the GEMMs.
+    _ablate_gemm = (
+        _ablate.ABLATE_EXPERT_GEMM and _ablate.capturing() and _ablate.hit("expert_gemm")
     )
-    _invoke_fused_moe_kernel(
-        hidden_states,
-        fc1_weight,
-        intermediate1,
-        topk_weights_flat,
-        sorted_token_ids,
-        expert_ids,
-        num_post_padded,
-        mul_routed_weight=False,
-        top_k=topk,
-        config=config_fc1,
-        grid_size=grid_size_fc1,
-        fuse_squared_relu=not is_swiglu,
-        fuse_swiglu=use_fused_swiglu,
-    )
-    if is_swiglu and not use_fused_swiglu:
+
+    if _ablate_gemm:
+        intermediate1 = _ablate.zeros(
+            (num_valid, fc1_out_width), hidden_states.dtype, hidden_states.device
+        )
+    else:
+        intermediate1 = torch.empty(
+            num_valid, fc1_out_width, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        _invoke_fused_moe_kernel(
+            hidden_states,
+            fc1_weight,
+            intermediate1,
+            topk_weights_flat,
+            sorted_token_ids,
+            expert_ids,
+            num_post_padded,
+            mul_routed_weight=False,
+            top_k=topk,
+            config=config_fc1,
+            grid_size=grid_size_fc1,
+            fuse_squared_relu=not is_swiglu,
+            fuse_swiglu=use_fused_swiglu,
+        )
+    if is_swiglu and not use_fused_swiglu and not _ablate_gemm:
         # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
         n_rows = (valid_tokens * topk).to(torch.int32)
@@ -1265,27 +1279,40 @@ def vllm_fused_moe(
     # bf16 truncation of prob-scaled values before the topk summation.
     # Only local-expert blocks are processed; non-local positions are left
     # undefined and skipped by _moe_sum (which checks the routing map).
-    intermediate3 = torch.empty(
-        num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
-    )
-    _invoke_fused_moe_kernel(
-        intermediate1,
-        fc2_weight,
-        intermediate3,
-        topk_weights_flat,
-        sorted_token_ids,
-        expert_ids,
-        num_post_padded,
-        mul_routed_weight=False,
-        top_k=1,
-        config=config_fc2,
-        grid_size=grid_size_fc2,
-    )
+    if _ablate_gemm:
+        intermediate3 = _ablate.zeros(
+            (num_valid, K), hidden_states.dtype, hidden_states.device
+        )
+    else:
+        intermediate3 = torch.empty(
+            num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        _invoke_fused_moe_kernel(
+            intermediate1,
+            fc2_weight,
+            intermediate3,
+            topk_weights_flat,
+            sorted_token_ids,
+            expert_ids,
+            num_post_padded,
+            mul_routed_weight=False,
+            top_k=1,
+            config=config_fc2,
+            grid_size=grid_size_fc2,
+        )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
     # Applies routing weights and accumulates in fp32, writes directly to
     # out (if provided), zeros rows beyond valid_tokens, and skips non-local
     # expert slots.
+    if _ablate.ABLATE_MOE_SUM and _ablate.capturing() and _ablate.hit("moe_sum"):
+        # Return the destination buffer unwritten. Returning ``out`` itself (rather
+        # than a fresh zeros) matters: the caller only copies when it gets back a
+        # different tensor, and that copy would land inside the measurement.
+        if out is not None:
+            return out
+        return _ablate.zeros((max_tokens, K), hidden_states.dtype, hidden_states.device)
+
     return _moe_sum(
         intermediate3,
         probs,

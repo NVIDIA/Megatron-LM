@@ -32,6 +32,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
+from megatron.core.inference import floor_ablation as _ablate
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -582,20 +583,24 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
-        multimem_all_gatherv_3tensor(
-            agv_h["tensor"],
-            agv_r["tensor"],
-            agv_p["tensor"],
-            hidden_states,
-            self.routing_map,
-            probs,
-            agv_h["handle"],
-            agv_r["handle"],
-            agv_p["handle"],
-            rank_token_offset=rank_token_offset,
-            ep_max_tokens=ep_max_tokens,
-            per_rank_max_tokens=per_rank_max,
-        )
+        # Floor attribution: omit the gather from the captured graph. The symmetric
+        # buffers already hold the values warmup's real gather left there, so shapes
+        # and routing stay valid and only the collective leaves the chain.
+        if not (_ablate.ABLATE_NVLS_DISPATCH and _ablate.capturing() and _ablate.hit("nvls_dispatch")):
+            multimem_all_gatherv_3tensor(
+                agv_h["tensor"],
+                agv_r["tensor"],
+                agv_p["tensor"],
+                hidden_states,
+                self.routing_map,
+                probs,
+                agv_h["handle"],
+                agv_r["handle"],
+                agv_p["handle"],
+                rank_token_offset=rank_token_offset,
+                ep_max_tokens=ep_max_tokens,
+                per_rank_max_tokens=per_rank_max,
+            )
 
         topk = probs.shape[1]
         hidden_dim = hidden_states.shape[1]
@@ -631,6 +636,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         if hidden_states is not rsv["tensor"]:
             rsv["tensor"].copy_(hidden_states)
+        # Floor attribution: omit the reduce-scatter from the captured graph and
+        # return zeros of its shape, which leaves the residual stream finite so the
+        # next layer's routing distribution is unchanged.
+        if _ablate.ABLATE_NVLS_COMBINE and _ablate.capturing() and _ablate.hit("nvls_combine"):
+            return _ablate.zeros(
+                (self._local_tokens, hidden_states.shape[1]),
+                torch.bfloat16,
+                hidden_states.device,
+            )
+
         output = torch.empty(
             self._local_tokens,
             hidden_states.shape[1],
