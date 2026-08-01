@@ -18,6 +18,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     Replicate,
     fully_shard,
+    fully_shard_context,
     fully_shard_optimizer,
     microbatch,
 )
@@ -173,8 +174,9 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
@@ -246,9 +248,10 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 
     # Shard the child layers, then the model, so the children share a root context
     # and reduce through the overlap path instead of as independent roots.
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
@@ -264,7 +267,7 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
-                with microbatch(model, is_last=is_last):
+                with microbatch(context, is_last=is_last):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
@@ -315,9 +318,10 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     dim = 8
     num_children = 2
     model = MultiChildModel(dim=dim, num_children=num_children).to(device)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
     num_microbatches = 3
@@ -330,7 +334,7 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
             is_last = microbatch_index == num_microbatches - 1
-            with microbatch(model, is_last=is_last):
+            with microbatch(context, is_last=is_last):
                 loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                 (loss / num_microbatches).backward()
         optimizer.step()
@@ -365,8 +369,9 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     mesh = init_device_mesh(device.type, (world_size,))
     model = NestedModel().to(device)
 
-    fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (inner_group,) = model.inner.parameter_groups
     (outer_group,) = model.parameter_groups
@@ -403,9 +408,10 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     model = MultiChildModel(dim=dim, num_children=4).to(dtype=dtype, device=device)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype)
     with torch.no_grad():
@@ -470,9 +476,10 @@ def test_root_forward_returns_to_resting_memory(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype)
     torch.cuda.synchronize(device)
@@ -508,9 +515,10 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype, requires_grad=True)
     output = model(x)
@@ -581,21 +589,22 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=placements,
+                mixed_precision_policy=policy,
+                use_symm_mem=use_symm_mem,
+            )
         fully_shard(
-            layer,
+            model,
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=policy,
             use_symm_mem=use_symm_mem,
         )
-    fully_shard(
-        model,
-        mesh=mesh,
-        placements=placements,
-        mixed_precision_policy=policy,
-        use_symm_mem=use_symm_mem,
-    )
 
     x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
 
@@ -681,9 +690,10 @@ def test_parameterless_parent_with_child_modules_trains(distributed_setup):
     torch.manual_seed(5678)
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False)).to(device)
 
-    fully_shard(model[0], mesh=mesh, placements=_flat_placements())
-    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model[0], mesh=mesh, placements=_flat_placements())
+        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.parameter_groups == ()
 
@@ -707,7 +717,8 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     model = nn.Linear(4, 4, bias=False).to(device)
     model.weight.requires_grad_(False)
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (group,) = model.parameter_groups
     assert not group.requires_grad
@@ -727,7 +738,8 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     with torch.no_grad():
         model.weight.fill_(1.0)
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
     model(x).sum().backward()
@@ -751,12 +763,13 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     with torch.no_grad():
         model.weight.fill_(1.0)
 
-    fully_shard(
-        model,
-        mesh=mesh,
-        placements=_flat_placements(),
-        mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
-    )
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+        )
     # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
     # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
@@ -786,8 +799,9 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
     sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
 
@@ -830,8 +844,9 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
     baseline = TinyModel().to(device=device, dtype=torch.bfloat16)
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     model.load_state_dict(baseline.state_dict())
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
 
     baseline_optimizer = torch.optim.Adam(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -854,22 +869,21 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
         optimizer.step()
 
 
-def test_microbatch_scopes_child_contexts(distributed_setup):
-    """microbatch() should scope FSDP child contexts under an unwrapped parent."""
+def test_microbatch_scopes_context(distributed_setup):
+    """microbatch() should scope state on the supplied FSDP context."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    for layer in model:
-        fully_shard(layer, mesh=mesh, placements=_flat_placements())
-
-    with microbatch(model, is_last=False):
+    with fully_shard_context(device=device) as context:
         for layer in model:
-            assert not layer.context.is_last_microbatch
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
 
-    for layer in model:
-        assert layer.context.is_last_microbatch
+    with microbatch(context, is_last=False):
+        assert not context.is_last_microbatch
+
+    assert context.is_last_microbatch
 
 
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
@@ -887,7 +901,8 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
 
     # Shard the second layer's parameters onto the mesh device; the unwrapped
     # first layer's parameters remain on CPU until model.to(device) below.
-    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
 
     assert model[0].weight.device.type == "cpu"
     assert isinstance(model[1].weight, DTensor)
@@ -934,7 +949,8 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = NonLeafViewModel().to(device)
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     group = model.parameter_groups[0]
     x = torch.randn(8, device=device, requires_grad=True)
@@ -986,15 +1002,16 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
 
     torch.manual_seed(4321)
     model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
-    for layer in model:
-        fully_shard(
-            layer,
-            mesh=mesh,
-            placements=_flat_placements(),
-            mixed_precision_policy=MixedPrecisionPolicy(
-                main_params_dtype=dtype, main_grads_dtype=dtype
-            ),
-        )
+    with fully_shard_context(device=device):
+        for layer in model:
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=_flat_placements(),
+                mixed_precision_policy=MixedPrecisionPolicy(
+                    main_params_dtype=dtype, main_grads_dtype=dtype
+                ),
+            )
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     torch.cuda.empty_cache()
 
