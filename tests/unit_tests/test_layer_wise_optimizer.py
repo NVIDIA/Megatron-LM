@@ -260,6 +260,22 @@ class TestLayerWiseOptimizer:
         # Verify basic properties
         assert optimizer is not None, "Optimizer should not be None"
         assert hasattr(optimizer, 'chained_optimizers'), "Should be a ChainedOptimizer"
+        layer_wise_optimizer = (
+            optimizer
+            if isinstance(optimizer, LayerWiseDistributedOptimizer)
+            else next(
+                opt
+                for opt in optimizer.chained_optimizers
+                if isinstance(opt, LayerWiseDistributedOptimizer)
+            )
+        )
+        assert layer_wise_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
+        assert layer_wise_optimizer.tp_group is pg_collection.tp
+        assert layer_wise_optimizer.expert_tp_group is pg_collection.expt_tp
+        for sub_optimizer in layer_wise_optimizer.chained_optimizers:
+            assert sub_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
+            assert sub_optimizer.tp_group is pg_collection.tp
+            assert sub_optimizer.expert_tp_group is pg_collection.expt_tp
 
         reference_model = self.create_reference_model(model)
 

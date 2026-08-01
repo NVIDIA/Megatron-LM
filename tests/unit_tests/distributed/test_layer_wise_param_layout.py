@@ -13,7 +13,11 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    _all_gather_param_group_metadata,
+    is_managed_by_layer_wise_optimizer,
+)
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
 # ---------------------------------------------------------------------------
@@ -35,6 +39,34 @@ def _make_ddp_config(pad_for_high_busbw=False, grad_reduce_in_fp32=True):
     cfg.pad_buckets_for_high_nccl_busbw = pad_for_high_busbw
     cfg.grad_reduce_in_fp32 = grad_reduce_in_fp32
     return cfg
+
+
+def test_explicit_muon_exclusion_uses_scalar_optimizer_buffer():
+    param = _make_param((32, 16), use_muon=False)
+
+    assert not is_managed_by_layer_wise_optimizer(param)
+
+
+@pytest.mark.parametrize(
+    ("is_expert", "group_name", "group_size"),
+    [(False, "dp_cp", 4), (True, "expt_dp", 2)],
+)
+def test_checkpoint_metadata_uses_owning_module_group(is_expert, group_name, group_size):
+    dp_cp = mock.Mock()
+    dp_cp.size.return_value = 4
+    expt_dp = mock.Mock()
+    expt_dp.size.return_value = 2
+    pg_collection = mock.Mock(dp_cp=dp_cp, expt_dp=expt_dp)
+    param_group = {"is_expert_parallel": is_expert, "params": True}
+    expected_group = getattr(pg_collection, group_name)
+
+    with mock.patch(
+        "megatron.core.optimizer.layer_wise_optimizer.get_pg_size", return_value=group_size
+    ), mock.patch("torch.distributed.all_gather_object") as all_gather:
+        gathered = _all_gather_param_group_metadata(param_group, pg_collection)
+
+    assert len(gathered) == group_size
+    all_gather.assert_called_once_with(gathered, param_group, group=expected_group)
 
 
 # ---------------------------------------------------------------------------

@@ -33,7 +33,14 @@ ENCODER = "images"
 
 def _args(**overrides):
     base = dict(
-        seed=1234, image_token_id=100, fp32=True, ddp_num_buckets=None, ddp_bucket_size=None
+        seed=1234,
+        image_token_id=100,
+        fp32=True,
+        ddp_num_buckets=None,
+        ddp_bucket_size=None,
+        use_distributed_optimizer=True,
+        use_layer_wise_distributed_optimizer=False,
+        use_layer_wise_param_layout=True,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -81,6 +88,18 @@ def test_ddp_overlap_config_is_selected_per_module_role():
     assert not disabled.overlap_param_gather
 
 
+def test_layer_wise_optimizer_selects_distributed_ddp_layout():
+    args = _args(
+        use_distributed_optimizer=False,
+        use_layer_wise_distributed_optimizer=True,
+        use_layer_wise_param_layout=True,
+    )
+
+    config = _ddp_config_from_args(args, enable_overlap=True)
+
+    assert config.use_distributed_optimizer
+
+
 def test_encoder_overlap_opt_in_reaches_encoder_ddp_config(mocker):
     encoder = mocker.MagicMock()
     wrapped_encoder = mocker.MagicMock()
@@ -104,6 +123,32 @@ def test_encoder_overlap_opt_in_reaches_encoder_ddp_config(mocker):
     assert ddp_config.overlap_grad_reduce
     assert ddp_config.overlap_param_gather
     assert mimo_model.modality_submodules[ENCODER] is wrapped_encoder
+
+
+def test_layer_wise_layout_flags_reach_ddp_wrapper(mocker):
+    encoder = mocker.MagicMock()
+    mimo_model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: encoder})
+    topology = SimpleNamespace(module_pgs={ENCODER: mocker.MagicMock()})
+    prepare = mocker.patch(
+        "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
+        return_value=[mocker.MagicMock()],
+    )
+    mocker.patch("examples.mimo.training.runtime._freeze_modality_submodule")
+    mocker.patch("examples.mimo.training.runtime._module_config", return_value=mocker.MagicMock())
+    mocker.patch("examples.mimo.training.runtime.print_rank_0")
+
+    wrap_active_modules_with_ddp(
+        _args(
+            use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=True,
+        ),
+        mimo_model,
+        topology,
+    )
+
+    assert prepare.call_args.kwargs["use_layer_wise_distributed_optimizer"]
+    assert prepare.call_args.kwargs["use_layer_wise_param_layout"]
 
 
 def _eight_gpu_topology():
