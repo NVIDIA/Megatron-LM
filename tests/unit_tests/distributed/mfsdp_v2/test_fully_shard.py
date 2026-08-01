@@ -246,8 +246,6 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
     model = MultiChildModel(dim=dim, num_children=2).to(device)
     model.load_state_dict(baseline.state_dict())
 
-    # Shard the child layers, then the model, so the children share a root context
-    # and reduce through the overlap path instead of as independent roots.
     with fully_shard_context(device=device) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
@@ -296,13 +294,10 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
 
-    ``fully_shard(model)`` makes the child units share a root context so their
-    reductions run through the overlap path rather than as independent roots.
-    Counting linked NCCL kernels over a multi-microbatch step, the DP-inner reduce-scatter
-    fires once per microbatch per group while the DP-outer all-reduce that
-    finalizes main_grad fires only on the last microbatch, so the reduce-scatter
-    count is exactly ``num_microbatches`` times the all-reduce count. This asserts
-    on kernel counts only, not numerics.
+    Counting linked NCCL kernels over a multi-microbatch step, the DP-inner
+    reduce-scatter fires once per microbatch per group while the DP-outer
+    all-reduce that finalizes main_grad fires only on the last microbatch. This
+    asserts on kernel counts only, not numerics.
     """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -411,7 +406,6 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     with fully_shard_context(device=device):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype)
     with torch.no_grad():
@@ -586,7 +580,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         dp_group = dist.new_group(backend="nccl")
 
     mesh = DeviceMesh.from_group(dp_group, device.type)
-    model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(device=device):
@@ -598,13 +592,6 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
                 mixed_precision_policy=policy,
                 use_symm_mem=use_symm_mem,
             )
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=placements,
-            mixed_precision_policy=policy,
-            use_symm_mem=use_symm_mem,
-        )
 
     x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
 
@@ -634,17 +621,16 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
     reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # The num_children child layers plus the root are each a sharded module; each does a
-    # forward and a backward all-gather and one reduce-scatter. Zero-CTA moves the
-    # all-gather to copy-engine memcpys, so it should not emit all-gather kernels.
-    num_sharded_modules = num_children + 1
-    expected_allgather_kernel_count = 0 if use_symm_mem else 2 * num_sharded_modules
+    # Each child layer does a forward and a backward all-gather and one
+    # reduce-scatter. Zero-CTA moves the all-gather to copy-engine memcpys, so it
+    # should not emit all-gather kernels.
+    expected_allgather_kernel_count = 0 if use_symm_mem else 2 * num_children
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
         f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
         f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
     )
-    assert len(reduce_scatter_kernels) == num_sharded_modules, (
-        f"Expected {num_sharded_modules} reduce-scatter kernels, got "
+    assert len(reduce_scatter_kernels) == num_children, (
+        f"Expected {num_children} reduce-scatter kernels, got "
         f"{len(reduce_scatter_kernels)}: {[kernel.name for kernel in reduce_scatter_kernels]}"
     )
 
