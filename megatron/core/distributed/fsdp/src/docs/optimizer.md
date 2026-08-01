@@ -10,13 +10,7 @@ PR [#5865](https://github.com/NVIDIA/Megatron-LM/pull/5865) is the current refer
 
 ## Background
 
-```mermaid
-flowchart LR
-    standalone[Standalone megatron_fsdp] --> local[Standalone MFSDP optimizer]
-    v1[MFSDP v1 in MCore] --> distributed[DistributedOptimizer]
-    v2[MFSDP v2 in MCore] --> sharded[FullyShardedOptimizer]
-    sharded --> mixed[MixedPrecisionOptimizer]
-```
+![MFSDP optimizer architecture](images/optimizer-architecture.png)
 
 FSDP needs custom optimizers because:
 
