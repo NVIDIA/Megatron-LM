@@ -1790,6 +1790,13 @@ def validate_args(args, defaults={}):
             '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
             'Logits are flushed as an async request in the checkpoint queue.'
         )
+        if not args.freeze_all_layers:
+            warn_rank_0(
+                '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
+                'gradients will update the model while logits are dumped. This is intended only '
+                'when dumping logits during active training; for a frozen-teacher dump pass '
+                '--freeze-all-layers.'
+            )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:

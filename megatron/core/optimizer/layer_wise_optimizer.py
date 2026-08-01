@@ -596,6 +596,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         if hasattr(p, 'clear_high_precision_init_val'):
                             p.clear_high_precision_init_val()
 
+        self.tp_group = self.pg_collection.tp
+        self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
+        for optimizer in optimizers:
+            # Child optimizers perform TP duplicate filtering when collecting gradients.
+            optimizer.tp_group = self.tp_group
+            optimizer.expert_tp_group = self.expert_tp_group
+
         super().__init__(optimizers)
 
         # Assign self.model_chunks AFTER super().__init__: ChainedOptimizer.__init__
@@ -1074,6 +1081,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params,
             grad_stats_parallel_group=None,
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
+            tp_group=self.tp_group,
+            expert_tp_group=self.expert_tp_group,
         )
 
     def start_param_sync_for_bucket_group_subset(self) -> None:

@@ -381,20 +381,25 @@ class DistributedDataParallel(_BaseDataParallel):
                                         self._make_backward_post_hook(param)
                                     )
                                     break
-                elif getattr(param, 'is_gtp_weight_remat', False) and hasattr(
-                    param, 'register_grad_accum_hook'
-                ):
-                    # GTP_remat defers the main_grad add to a later backward node, so drive the
-                    # post-hook from its manual call (_handle_megatron_grad_accum) rather than
-                    # autograd's AccumulateGrad, which would fire grad-ready on stale main_grad.
-                    param.register_grad_accum_hook(None, self._make_backward_post_hook(param))
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
-                    self.grad_accs.append(grad_acc)
+                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                        param, 'register_grad_accum_hook'
+                    ):
+                        # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
+                        # AccumulateGrad sees only a dummy; grad-ready is driven manually from
+                        # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
+                        # keeps it on the capture stream for full-iteration CUDA-graph capture.
+                        # No autograd hook or grad_accs entry: either would fire on a stale grad.
+                        param.register_grad_accum_hook(
+                            grad_acc, self._make_backward_post_hook(param)
+                        )
+                    else:
+                        grad_acc.register_hook(self._make_backward_post_hook(param))
+                        self.grad_accs.append(grad_acc)
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
