@@ -75,7 +75,7 @@ class FsdpContext:
             if module in visited:
                 continue
             root_modules.append(module)
-            _collect_fsdp_modules(cast(nn.Module, module), visited)
+            _collect_fsdp_modules_under(cast(nn.Module, module), visited)
         root_modules.reverse()
         for root_module in root_modules:
             root_module._is_root = True
@@ -357,7 +357,7 @@ class FsdpModule:
         return f"MFSDP {name} {phase}"
 
 
-def _collect_fsdp_modules(module: nn.Module, modules: set["FsdpModule"]) -> None:
+def _collect_fsdp_modules_under(module: nn.Module, modules: set["FsdpModule"]) -> None:
     """Collect FSDP modules reachable from ``module``."""
     if isinstance(module, FsdpModule):
         if module in modules:
@@ -365,7 +365,7 @@ def _collect_fsdp_modules(module: nn.Module, modules: set["FsdpModule"]) -> None
         modules.add(module)
 
     for child in module.children():
-        _collect_fsdp_modules(child, modules)
+        _collect_fsdp_modules_under(child, modules)
 
 
 def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
