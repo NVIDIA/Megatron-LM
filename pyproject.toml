@@ -168,7 +168,7 @@ build = [
 ]
 linting = [
     "ruff~=0.9.0",
-    "black==24.4.2",
+    "black==26.3.0",
     "isort==5.13.2",
     "flake8==7.1.0",
     "pylint==3.2.6",
@@ -250,7 +250,7 @@ line_length = 100
 skip_string_normalization = true
 # recognized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
-required_version = "24"
+required_version = "26"
 skip_magic_trailing_comma = true
 include = '\.pyi?$'
 exclude = '''
