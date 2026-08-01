@@ -73,6 +73,20 @@ class MultiChildModel(nn.Module):
         return x
 
 
+class TiedLM(nn.Module):
+    """Tiny language model with shared input and output embedding weights."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
+        self.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Compute a scalar loss using both aliases of the shared weight."""
+        return self.lm_head(self.embed_tokens(token_ids)).float().sum()
+
+
 class SaveNonLeafWeightView(torch.autograd.Function):
     """Autograd function that saves a non-leaf parameter view for backward."""
 
@@ -342,11 +356,25 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    inner_names = [name for group in model.inner.parameter_groups for name in group.parameter_names]
-    outer_names = [name for group in model.parameter_groups for name in group.parameter_names]
+    (inner_group,) = model.inner.parameter_groups
+    (outer_group,) = model.parameter_groups
 
-    assert inner_names == ["weight"]
-    assert outer_names == ["bias"]
+    assert [parameter.fqns for parameter in inner_group.fsdp_parameters] == [("weight",)]
+    assert [parameter.fqns for parameter in outer_group.fsdp_parameters] == [("bias",)]
+
+
+def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
+    """Tied registrations should allocate one DBuffer entry and optimizer parameter."""
+    model = TiedLM()
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    (parameter_group,) = model.parameter_groups
+    (parameter,) = parameter_group.fsdp_parameters
+    assert parameter.fqns == ("embed_tokens.weight", "lm_head.weight")
+    assert parameter_group.main_weight.layout.size == 8 * 4
+    # Both aliases must expose the same optimizer-visible sharded parameter.
+    assert len(list(model.parameters())) == 1
 
 
 def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setup):
