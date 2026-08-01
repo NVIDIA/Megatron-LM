@@ -223,6 +223,9 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 num_replicas=serve_config.frontend_replicas,
                 hostname=serve_config.host,
                 sock=serve_config.sock,
+                default_top_p=serve_config.default_top_p,
+                default_top_k=serve_config.default_top_k,
+                serving_mode=serve_config.serving_mode,
             )
             self._serve_started = True
 
