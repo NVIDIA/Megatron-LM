@@ -169,8 +169,19 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            parameter.data = self._unsharded_model_weight.get_local_tensor(index)
-            parameter.grad = None
+            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            if parameter.is_meta:
+                # A meta Parameter cannot set .data to a real tensor because their
+                # TensorImpl types are incompatible, so swap in a materialized Parameter.
+                # This may be problematic if attributes from the original Parameter need
+                # to be copied to the unsharded Parameter.
+                materialized_parameter = nn.Parameter(
+                    unsharded_tensor, requires_grad=parameter.requires_grad
+                )
+                torch.utils.swap_tensors(parameter, materialized_parameter)
+            else:
+                parameter.data = unsharded_tensor
+                parameter.grad = None
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
 
             sharded_parameter = nn.Parameter(

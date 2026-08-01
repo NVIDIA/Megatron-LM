@@ -866,6 +866,32 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(output, expected_output)
 
 
+def test_meta_parameters_shard_to_mesh_device(distributed_setup):
+    """A sharded meta model should support initialization and forward."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Sequential(
+        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
+        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
+    )
+
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    with torch.no_grad():
+        model[0].weight.fill_(2.0)
+        model[1].weight.fill_(3.0)
+    # The exposed parameters update FP32 main weights, while forward uses separate BF16
+    # model weights. This simulates load_checkpoint() until
+    # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
+    for parameter_group in model.parameter_groups:
+        parameter_group.sync_model_weight_from_main_weight()
+
+    output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
+    torch.testing.assert_close(output, torch.full_like(output, 96.0))
+
+
 def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     """A non-leaf parameter view saved for backward should survive full-storage resize."""
     world_size = distributed_setup.world_size
