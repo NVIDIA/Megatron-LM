@@ -42,8 +42,8 @@ class _ParallelConfig(NamedTuple):
     ep_size: int
     dp_size: int
     expert_tp_size: int
-    gtp_size: int
-    expert_gtp_size: int
+    gtp_remat_size: int
+    expert_gtp_remat_size: int
 
 
 @dataclass(frozen=True)
@@ -70,7 +70,7 @@ class _PlanCacheKey:
 
 
 def _get_parallel_config(core) -> Optional[_ParallelConfig]:
-    """Extract TP/PP/EP/DP/expert-TP/GTP/expert-GTP sizes, memoized on the core.
+    """Extract TP/PP/EP/DP/expert-TP/GTP-remat sizes, memoized on the core.
 
     Process-group sizes don't change after init, so the result is cached on the
     core object itself to avoid repeated ``get_process_group_ranks`` calls on
@@ -91,8 +91,8 @@ def _get_parallel_config(core) -> Optional[_ParallelConfig]:
         ep_size=pg.ep.size() if pg.ep else 1,
         dp_size=pg.dp.size() if pg.dp else 1,
         expert_tp_size=expt_tp.size() if expt_tp else 1,
-        gtp_size=gtp_remat.size() if gtp_remat else 1,
-        expert_gtp_size=expt_gtp_remat.size() if expt_gtp_remat else 1,
+        gtp_remat_size=gtp_remat.size() if gtp_remat else 1,
+        expert_gtp_remat_size=expt_gtp_remat.size() if expt_gtp_remat else 1,
     )
     core._refit_parallel_config = result
     return result

@@ -1,7 +1,7 @@
 # Resharding (Refit)
 
 Transfer model weights between different parallelism configurations
-(TP, GTP, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
+(TP, GTP_remat, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
 Used primarily in RL loops to move weights from a training model to an
 inference model that may use a different parallelism layout.
 
@@ -89,7 +89,7 @@ through the network stack.
 
 ## How the Reshard Plan Works
 
-1. Each rank extracts parameter metadata (shape, sharding, TP/GTP/EP/PP groups).
+1. Each rank extracts parameter metadata (shape, sharding, TP/GTP_remat/EP/PP groups).
 2. Metadata is all-gathered so **every** rank has the full picture
    (`dist.all_gather_object()`) — no rank-0 bottleneck, no scatter.
 3. Every rank independently replays the **same deterministic schedule**
@@ -108,21 +108,23 @@ through the network stack.
 
 ## Generalized Tensor Parallelism
 
-GTP stores a contiguous dim-0 slice of the already TP-local weight. The shard
+See the [GTP user guide](../../../docs/api-guide/core/generalized_tensor_parallel.md)
+for the current GTP design and configuration. GTP_remat stores a contiguous
+dim-0 slice of the already TP-local weight. The shard
 planner represents every local weight as intervals in the logical, unpadded
-global weight and intersects source intervals with destination intervals. GTP
-therefore uses the same algorithm as ordinary TP. This single rule covers:
+global weight and intersects source intervals with destination intervals.
+GTP_remat therefore uses the same algorithm as ordinary TP. This single rule covers:
 
-- column parallel weights, where TP and GTP both cut dim 0;
-- row parallel weights, where TP cuts dim 1 and GTP cuts dim 0;
+- column parallel weights, where TP and GTP_remat both cut dim 0;
+- row parallel weights, where TP cuts dim 1 and GTP_remat cuts dim 0;
 - strided TP weights such as gated MLP projections;
 - packed TP layouts such as Mamba `in_proj`; and
-- transitions to or from a non-GTP model, or between different GTP sizes.
+- transitions to or from a non-GTP_remat model, or between different GTP_remat sizes.
 
-Alignment-only GTP padding is excluded from transfers. Quantized destinations
+Alignment-only GTP_remat padding is excluded from transfers. Quantized destinations
 are assembled once in a zeroed BF16 buffer and requantized once, so padding
 cannot affect the scale of logical weight values. Native TransformerEngine
-MXFP8/NVFP4 GTP parameters are temporarily presented as their base TE class
+MXFP8/NVFP4 GTP_remat parameters are temporarily presented as their base TE class
 while dequantizing or updating them.
 
 The deterministic schedule stays stable when a larger roster is supplied: existing
@@ -155,7 +157,7 @@ across refits.
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
 | `_service_cache` | Backend name | `CopyService` instance | Avoid re-creating CUDA streams / NVSHMEM buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP sizes |
+| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP_remat sizes |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.
@@ -172,8 +174,8 @@ attribute with the following groups:
 | `pp` | If PP > 1 | Pipeline stage / layer index remapping |
 | `ep` | If MoE | Expert parallelism routing |
 | `expt_tp` | If expert TP | Expert-specific tensor parallelism |
-| `gtp_remat` | If dense GTP | Dense weight-rematerialization shards |
-| `expt_gtp_remat` | If expert GTP | Expert weight-rematerialization shards |
+| `gtp_remat` | If dense GTP_remat | Dense weight-rematerialization shards |
+| `expt_gtp_remat` | If expert GTP_remat | Expert weight-rematerialization shards |
 
 ## File Reference
 
