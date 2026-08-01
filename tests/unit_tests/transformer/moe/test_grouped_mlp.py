@@ -201,8 +201,12 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
         moe_router_padding_for_quantization=False,
         moe_token_dispatcher_type=None,
         moe_flex_dispatcher_backend=None,
+        moe_use_grouped_tensor=True,
         moe_paged_stash=False,
     )
+    module._use_grouped_tensor = True
+    module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
+    module.quantization_unpadding = lambda tensor, token_counts: tensor
     module._fused_ops = None
     module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
     fused_ops = FakeFusedOps()
@@ -216,11 +220,11 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
     torch.testing.assert_close(output, torch.ones_like(hidden_states))
     assert module._fused_ops[0] is fused_ops
     assert fused_ops.args[0] is hidden_states
-    assert fused_ops.args[1] is tokens_per_expert
-    assert fused_ops.args[2] is probs
-    assert fused_ops.args[3] is tokens_per_expert
+    torch.testing.assert_close(fused_ops.args[1], tokens_per_expert)
+    torch.testing.assert_close(fused_ops.args[2], probs)
+    torch.testing.assert_close(fused_ops.args[3], tokens_per_expert)
     if fc2_bias:
-        assert fused_ops.args[4] is probs
+        torch.testing.assert_close(fused_ops.args[4], probs)
     else:
         assert len(fused_ops.args) == 4
 
@@ -1381,14 +1385,18 @@ class TestTEGroupedMLP:
                 num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
             )
         )
-        base_probs = torch.rand(
-            num_tokens, dtype=torch.bfloat16, device="cuda"
+        # This test checks that gradients reach the registered grouped parents, not whether
+        # PyTorch's sum_to and index_add_ reductions round random BF16 values identically.
+        # Each FC2 bias-gradient contribution is exactly 0.125 * 0.5 = 0.0625, so summing
+        # 256 tokens produces exactly 16 in either reduction order.
+        base_probs = torch.full(
+            (num_tokens,), 0.5, dtype=torch.bfloat16, device="cuda"
         )
-        grad_output = (
-            0.1
-            * torch.randn(
-                num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
-            )
+        grad_output = torch.full(
+            (num_tokens, self.hidden_size),
+            0.125,
+            dtype=torch.bfloat16,
+            device="cuda",
         )
 
         reference_input = base_input.detach().clone().requires_grad_(True)
@@ -1407,6 +1415,21 @@ class TestTEGroupedMLP:
         torch.testing.assert_close(target_output, reference_output, **tolerances)
         torch.testing.assert_close(target_input.grad, reference_input.grad, **tolerances)
         torch.testing.assert_close(target_probs.grad, reference_probs.grad, **tolerances)
+        expected_fc2_bias_grad = torch.full(
+            (self.num_experts, self.hidden_size), 16.0, dtype=torch.float32, device="cuda"
+        )
+        torch.testing.assert_close(
+            packed_grad(reference.linear_fc2, "bias"),
+            expected_fc2_bias_grad,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            packed_grad(target.linear_fc2, "bias"),
+            expected_fc2_bias_grad,
+            rtol=0,
+            atol=0,
+        )
         for target_linear, reference_linear in (
             (target.linear_fc1, reference.linear_fc1),
             (target.linear_fc2, reference.linear_fc2),
