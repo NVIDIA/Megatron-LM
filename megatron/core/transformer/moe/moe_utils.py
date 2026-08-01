@@ -1378,10 +1378,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            # TODO: investigate numerical difference between bias fusion ON/OFF
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=None)[0]
-            if bias is not None:
-                output = output + bias.to(router_dtype)
+            # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
+            # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
+            # small bias vector before passing it to TE.
+            gemm_bias = bias.to(router_dtype) if bias is not None else None
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
         else:
