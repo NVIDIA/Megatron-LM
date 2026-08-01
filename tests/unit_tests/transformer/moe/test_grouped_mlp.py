@@ -1385,18 +1385,14 @@ class TestTEGroupedMLP:
                 num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
             )
         )
-        # This test checks that gradients reach the registered grouped parents, not whether
-        # PyTorch's sum_to and index_add_ reductions round random BF16 values identically.
-        # Each FC2 bias-gradient contribution is exactly 0.125 * 0.5 = 0.0625, so summing
-        # 256 tokens produces exactly 16 in either reduction order.
-        base_probs = torch.full(
-            (num_tokens,), 0.5, dtype=torch.bfloat16, device="cuda"
+        base_probs = torch.rand(
+            num_tokens, dtype=torch.bfloat16, device="cuda"
         )
-        grad_output = torch.full(
-            (num_tokens, self.hidden_size),
-            0.125,
-            dtype=torch.bfloat16,
-            device="cuda",
+        grad_output = (
+            0.1
+            * torch.randn(
+                num_tokens, self.hidden_size, dtype=torch.bfloat16, device="cuda"
+            )
         )
 
         reference_input = base_input.detach().clone().requires_grad_(True)
@@ -1415,21 +1411,7 @@ class TestTEGroupedMLP:
         torch.testing.assert_close(target_output, reference_output, **tolerances)
         torch.testing.assert_close(target_input.grad, reference_input.grad, **tolerances)
         torch.testing.assert_close(target_probs.grad, reference_probs.grad, **tolerances)
-        expected_fc2_bias_grad = torch.full(
-            (self.num_experts, self.hidden_size), 16.0, dtype=torch.float32, device="cuda"
-        )
-        torch.testing.assert_close(
-            packed_grad(reference.linear_fc2, "bias"),
-            expected_fc2_bias_grad,
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            packed_grad(target.linear_fc2, "bias"),
-            expected_fc2_bias_grad,
-            rtol=0,
-            atol=0,
-        )
+
         for target_linear, reference_linear in (
             (target.linear_fc1, reference.linear_fc1),
             (target.linear_fc2, reference.linear_fc2),

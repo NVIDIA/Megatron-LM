@@ -319,10 +319,12 @@ class TEGroupedMLP(MegatronModule):
         intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs
     ):
         """Apply a packed expert bias without reading token counts on the host."""
+        # TODO: get rid of the .float() by having fused kernel compute in FP32
         shape = intermediate_parallel.shape
         hidden_size = shape[-1]
-        flat_output = intermediate_parallel.view(-1, hidden_size)
-        flat_probs = permuted_probs.reshape(-1, 1)
+        output_dtype = intermediate_parallel.dtype
+        flat_output = intermediate_parallel.view(-1, hidden_size).float()
+        flat_probs = permuted_probs.reshape(-1, 1).float()
 
         if tokens_per_expert.device != packed_bias.device:
             raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
@@ -335,15 +337,15 @@ class TEGroupedMLP(MegatronModule):
         #   bias_per_token     = [bias_e0, bias_e0, bias_e1]
         #
         # output_size avoids a stream synchronization to compute sum(tokens_per_expert).
+        # Cast before repeating so both forward arithmetic and repeat_interleave's backward
+        # reduction are computed in FP32. Autograd casts the final parameter gradient once.
         bias_per_token = torch.repeat_interleave(
-            packed_bias,
+            packed_bias.float(),
             tokens_per_expert,
             dim=0,
             output_size=flat_output.size(0),
         )
-        return (flat_output + bias_per_token * flat_probs).view(shape).to(
-            intermediate_parallel.dtype
-        )
+        return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
