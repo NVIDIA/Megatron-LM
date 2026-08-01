@@ -28,8 +28,11 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 try:
     # The GDN2 kernel is only available in flash-linear-attention >= 0.5.1.
     from fla.ops.gdn2.chunk import chunk_gdn2
+
+    HAVE_FLA_GDN2 = True
 except ImportError:
     chunk_gdn2 = None
+    HAVE_FLA_GDN2 = False
 
 logger = logging.getLogger(__name__)
 
