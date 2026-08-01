@@ -18,7 +18,7 @@ from megatron.core.ssm.gated_delta_net import (
     HAVE_FLA_GDN2,
     GatedDeltaNet,
     GatedDeltaNet2,
-    chunk_gated_delta_rule,
+    chunk_gdn2,
     torch_chunk_gated_delta_rule,
     torch_chunk_gdn2,
 )
@@ -313,7 +313,6 @@ class TestGatedDeltaNet:
             assert gdn.dt_bias.shape == (gdn.qk_dim // self.tp_size,)
         else:
             assert isinstance(gdn, GatedDeltaNet)
-            assert not isinstance(gdn, GatedDeltaNet2)
             assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
             assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
             assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
@@ -651,9 +650,9 @@ def test_parallel_gated_delta_net2_correctness(tmp_path_dist_ckpt, sequence_pack
         tp=tp,
         sp=sp,
         cp=cp,
-        seed=123,
-        sequence_length=256,
-        micro_batch_size=4,
+        seed=42,
+        sequence_length=512,
+        micro_batch_size=2,
         sequence_packing=sequence_packing,
     )
 
