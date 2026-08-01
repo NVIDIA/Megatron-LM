@@ -226,6 +226,9 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 multimodal_prompt_config=(
                     self._controller.inference_wrapped_model.multimodal_prompt_config
                 ),
+                default_top_p=serve_config.default_top_p,
+                default_top_k=serve_config.default_top_k,
+                serving_mode=serve_config.serving_mode,
             )
             self._serve_started = True
 

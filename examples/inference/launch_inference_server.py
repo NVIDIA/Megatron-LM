@@ -49,6 +49,23 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
         "--frontend-replicas", type=int, default=4,
         help="Number of HTTP frontend processes spawned on the primary rank.",
     )
+    group.add_argument(
+        "--default-top-p",
+        type=float,
+        default=1.0,
+        help="Default top-p sampling value when a request omits top_p.",
+    )
+    group.add_argument(
+        "--default-top-k",
+        type=int,
+        default=0,
+        help="Default top-k sampling value when a request omits top_k.",
+    )
+    group.add_argument(
+        "--serving-mode",
+        action="store_true",
+        help="Avoid returning prompt token IDs by default for pure serving.",
+    )
     return parser
 
 
@@ -67,6 +84,9 @@ async def _serve(args, model, tokenizer, inference_config):
             parsers=args.parsers,
             verbose=args.verbose,
             frontend_replicas=args.frontend_replicas,
+            default_top_p=args.default_top_p,
+            default_top_k=args.default_top_k,
+            serving_mode=args.serving_mode,
         )
         await llm.serve(serve_config, blocking=True)
 
