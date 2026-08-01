@@ -16,14 +16,12 @@
 
 from .dbuffer import DBuffer
 from .fully_shard import fully_shard, fully_shard_context, microbatch
-from .module import FsdpContext
 from .optimizer import fully_shard_optimizer
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
 __all__ = [
     "DBuffer",
     "Flat",
-    "FsdpContext",
     "Partial",
     "Placement",
     "Placements",
