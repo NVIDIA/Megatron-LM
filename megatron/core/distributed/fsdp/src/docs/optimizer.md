@@ -10,8 +10,6 @@ PR [#5865](https://github.com/NVIDIA/Megatron-LM/pull/5865) is the current refer
 
 ## Background
 
-![MFSDP optimizer architecture](images/optimizer-architecture.png)
-
 FSDP needs custom optimizers because:
 
 - Lower-precision model weights than main weights: after `optimizer.step()`, the updated main weights must be synchronized back to the lower-precision compute weights.
