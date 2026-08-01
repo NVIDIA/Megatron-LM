@@ -353,6 +353,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # Generated token count already streamed for each request.
+        self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
@@ -2145,6 +2147,44 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return result, context_state, step_time
 
+    def _try_send_streaming_partials(self) -> None:
+        """Send pending token deltas to the inference coordinator."""
+        partials: list = []
+        emit_lengths: Dict[int, int] = {}
+        for rid, entry in self.requests.items():
+            request = entry.record[-1]
+            if not getattr(request.sampling_params, "streaming", False):
+                continue
+            already = self._partial_emit_lengths.get(rid, 0)
+            total = len(request.generated_tokens)
+            stop_word_ids = getattr(request, "stop_word_ids", None)
+            holdback = 0
+            if stop_word_ids and not getattr(
+                request.sampling_params, "detokenize_stop_sequence", False
+            ):
+                holdback = max(0, max(len(ids) for ids in stop_word_ids) - 1)
+            emit_end = max(already, total - holdback)
+            streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
+            if emit_end - already >= streaming_interval:
+                new_tokens = list(request.generated_tokens[already:emit_end])
+                partial = {"request_id": rid, "new_tokens": new_tokens}
+                if request.sampling_params.return_log_probs:
+                    partial["new_log_probs"] = list(
+                        (request.generated_log_probs or [])[already:emit_end]
+                    )
+                partials.append(partial)
+                emit_lengths[rid] = emit_end
+
+        if not partials:
+            return
+
+        payload = msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
+        nvtx_range_push("coordinator_streaming")
+        self.socket_for_receiving_requests.send(payload)
+        nvtx_range_pop("coordinator_streaming")
+
+        self._partial_emit_lengths.update(emit_lengths)
+
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
@@ -2251,6 +2291,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 self.socket_for_receiving_requests.send(payload)
                 nvtx_range_pop("coordinator_communication")
+
+            # Stream newly generated tokens for active requests. Finished
+            # requests were already popped from self.requests above, so their
+            # emit lengths are dropped here rather than in the loop.
+            for record in finished_request_records:
+                self._partial_emit_lengths.pop(record.requests[-1].request_id, None)
+            self._try_send_streaming_partials()
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -2580,6 +2627,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.ABORT_REQUEST:
+                request_id = int(data[1])
+                entry = self.requests.get(request_id)
+                if entry is not None:
+                    request = entry.record[-1]
+                    # Force active requests to finish on the next step.
+                    request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
+                    active_ids = self.context.request_ids[: self.context.total_request_count]
+                    matches = torch.where(active_ids == request_id)[0]
+                    if matches.numel() > 0:
+                        assert matches.numel() == 1
+                        idx = int(matches[0].item())
+                        self.context.request_output_lengths[idx] = (
+                            self.context.request_kv_length_offsets[idx]
+                            + self.context.request_query_lengths[idx]
+                        )
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             elif header == Headers.START_CUDA_PROFILER:
