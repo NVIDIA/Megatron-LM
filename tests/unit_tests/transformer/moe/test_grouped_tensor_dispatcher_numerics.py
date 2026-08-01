@@ -14,6 +14,7 @@ boundary to ensure padding rows are zero and the dispatcher-specific inverse rem
 """
 
 import inspect
+import os
 from typing import Dict
 
 import pytest
@@ -62,22 +63,8 @@ _PARAMETER_LAYOUTS = (
 )
 
 
-@pytest.fixture(autouse=True)
-def _clean_distributed_state(monkeypatch):
-    """Keep TE feature gates and process-global dispatcher state isolated per case."""
-    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
-    previous_experimental = mcore_config.ENABLE_EXPERIMENTAL
-    yield
-    mcore_config.ENABLE_EXPERIMENTAL = previous_experimental
-    reset_hybrid_ep_buffer()
-    Utils.destroy_model_parallel()
-
-
 def _require_test_environment(dispatcher: str) -> int:
     """Validate runtime support and return the EP world size used by the test."""
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        pytest.skip("Distributed dispatcher tests must be launched with torchrun")
-
     world_size = torch.distributed.get_world_size()
     if world_size < 2:
         pytest.skip("DeepEP/HybridEP parity requires at least two distributed ranks")
@@ -301,44 +288,6 @@ def _run_numerical_parity_case(
         )
 
 
-@pytest.mark.parametrize("single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS)
-@pytest.mark.timeout(180)
-def test_alltoall_grouped_tensor_moe_parity(
-    single_grouped_weight, use_bias, single_grouped_bias
-):
-    """All-to-All grouped-tensor MoE forward/backward matches its legacy expert path."""
-    _run_numerical_parity_case(
-        "alltoall",
-        single_grouped_weight=single_grouped_weight,
-        use_bias=use_bias,
-        single_grouped_bias=single_grouped_bias,
-    )
-
-
-@pytest.mark.parametrize("single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS)
-@pytest.mark.timeout(180)
-def test_deepep_grouped_tensor_moe_parity(single_grouped_weight, use_bias, single_grouped_bias):
-    """DeepEP grouped-tensor MoE forward/backward matches its legacy expert path."""
-    _run_numerical_parity_case(
-        "deepep",
-        single_grouped_weight=single_grouped_weight,
-        use_bias=use_bias,
-        single_grouped_bias=single_grouped_bias,
-    )
-
-
-@pytest.mark.parametrize("single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS)
-@pytest.mark.timeout(180)
-def test_hybridep_grouped_tensor_moe_parity(single_grouped_weight, use_bias, single_grouped_bias):
-    """HybridEP grouped-tensor MoE forward/backward matches its legacy expert path."""
-    _run_numerical_parity_case(
-        "hybridep",
-        single_grouped_weight=single_grouped_weight,
-        use_bias=use_bias,
-        single_grouped_bias=single_grouped_bias,
-    )
-
-
 def _make_padding_mask(
     real_tokens_per_expert: torch.Tensor, padded_tokens_per_expert: torch.Tensor
 ) -> torch.Tensor:
@@ -549,19 +498,84 @@ def _run_padding_lifecycle_case(dispatcher: str, monkeypatch) -> None:
     assert torch.isfinite(hidden_states.grad).all()
 
 
-@pytest.mark.timeout(180)
-def test_alltoall_grouped_tensor_padding_lifecycle(monkeypatch):
-    """All-to-All explicitly pads in TEGroupedMLP and removes it before combine."""
-    _run_padding_lifecycle_case("alltoall", monkeypatch)
+class TestGroupedTensorDispatcherNumerics:
+    """Distributed numerical and padding coverage for grouped-tensor dispatchers."""
 
+    def setup_method(self, method):
+        if not torch.distributed.is_available() or Utils.world_size < 2:
+            pytest.skip("Distributed dispatcher tests must be launched with torchrun")
+        self._old_single_param_env = os.environ.get("NVTE_GROUPED_LINEAR_SINGLE_PARAM")
+        self._previous_experimental = mcore_config.ENABLE_EXPERIMENTAL
+        os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
+        Utils.initialize_distributed()
 
-@pytest.mark.timeout(180)
-def test_deepep_grouped_tensor_padding_lifecycle(monkeypatch):
-    """DeepEP fused local permutation pads, and local unpermute removes those rows."""
-    _run_padding_lifecycle_case("deepep", monkeypatch)
+    def teardown_method(self, method):
+        try:
+            mcore_config.ENABLE_EXPERIMENTAL = self._previous_experimental
+            reset_hybrid_ep_buffer()
+            Utils.destroy_model_parallel()
+        finally:
+            if self._old_single_param_env is None:
+                os.environ.pop("NVTE_GROUPED_LINEAR_SINGLE_PARAM", None)
+            else:
+                os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = self._old_single_param_env
 
+    @pytest.mark.parametrize(
+        "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
+    )
+    @pytest.mark.timeout(180)
+    def test_alltoall_grouped_tensor_moe_parity(
+        self, single_grouped_weight, use_bias, single_grouped_bias
+    ):
+        """All-to-All grouped-tensor MoE forward/backward matches its legacy expert path."""
+        _run_numerical_parity_case(
+            "alltoall",
+            single_grouped_weight=single_grouped_weight,
+            use_bias=use_bias,
+            single_grouped_bias=single_grouped_bias,
+        )
 
-@pytest.mark.timeout(180)
-def test_hybridep_grouped_tensor_padding_lifecycle(monkeypatch):
-    """HybridEP fused dispatch pads, and fused combine returns the original token shape."""
-    _run_padding_lifecycle_case("hybridep", monkeypatch)
+    @pytest.mark.parametrize(
+        "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
+    )
+    @pytest.mark.timeout(180)
+    def test_deepep_grouped_tensor_moe_parity(
+        self, single_grouped_weight, use_bias, single_grouped_bias
+    ):
+        """DeepEP grouped-tensor MoE forward/backward matches its legacy expert path."""
+        _run_numerical_parity_case(
+            "deepep",
+            single_grouped_weight=single_grouped_weight,
+            use_bias=use_bias,
+            single_grouped_bias=single_grouped_bias,
+        )
+
+    @pytest.mark.parametrize(
+        "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
+    )
+    @pytest.mark.timeout(180)
+    def test_hybridep_grouped_tensor_moe_parity(
+        self, single_grouped_weight, use_bias, single_grouped_bias
+    ):
+        """HybridEP grouped-tensor MoE forward/backward matches its legacy expert path."""
+        _run_numerical_parity_case(
+            "hybridep",
+            single_grouped_weight=single_grouped_weight,
+            use_bias=use_bias,
+            single_grouped_bias=single_grouped_bias,
+        )
+
+    @pytest.mark.timeout(180)
+    def test_alltoall_grouped_tensor_padding_lifecycle(self, monkeypatch):
+        """All-to-All explicitly pads in TEGroupedMLP and removes it before combine."""
+        _run_padding_lifecycle_case("alltoall", monkeypatch)
+
+    @pytest.mark.timeout(180)
+    def test_deepep_grouped_tensor_padding_lifecycle(self, monkeypatch):
+        """DeepEP fused local permutation pads, and local unpermute removes those rows."""
+        _run_padding_lifecycle_case("deepep", monkeypatch)
+
+    @pytest.mark.timeout(180)
+    def test_hybridep_grouped_tensor_padding_lifecycle(self, monkeypatch):
+        """HybridEP fused dispatch pads, and fused combine returns the original token shape."""
+        _run_padding_lifecycle_case("hybridep", monkeypatch)
