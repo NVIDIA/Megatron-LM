@@ -2522,6 +2522,66 @@ from this session because no same-node vLLM run was taken.
 This is the first confirmation of the `GAP-DECOMP-S17` strategy: the change removes
 kernels rather than making any kernel faster, and it converted directly into throughput.
 
+### QWEN-037 / QWEN-038 — two env-only follow-ups, both neutral
+
+Same allocation as QWEN-036, so each is directly comparable to the `a2qkv` arm
+(27,954 tok/s) without re-running a baseline.
+
+| arm | change | mean tok/s | vs `a2qkv` |
+| --- | --- | --- | --- |
+| `b1maxtok` | `MCORE_FUSED_ADD_NORM_MAX_TOKENS=512` | 27,862 | −0.33% |
+| `b2nosplitk` | `CUBLASLT_WORKSPACE_SIZE=1` | 27,811 | −0.51% |
+
+**QWEN-037** aimed at the 9.2 boundaries/step that still fall back to the unfused path
+(96 possible − 86.8 fused). Raising the token ceiling did not recover them and cost
+slightly, so those fallbacks are not token-count rejections. One is layer 47, whose
+`mlp_bda` has no next layer to donate a norm to; the rest are most likely the coupling in
+`FUSION-INERT-S17` (a layer is eligible on the MLP side only if the attention side fired).
+
+**QWEN-038** tried to delete the ~76 `splitKreduce` launches/step (0.185 ms of kernel
+time) by starving the cuBLASLt workspace that split-K algorithms require. Neutral. Two
+readings, and the second is the important one: either the heuristic ignored the limit, or
+it switched to non-split-K kernels that gave back exactly what the reduce cost. **The run
+did not verify which**, so "split-K removal doesn't pay" is not yet established — only
+"this way of attempting it doesn't." A profile of the arm would settle it.
+
+### LAUNCH-VS-WORK-S17 — the QWEN-036 win came from removed GPU work, not removed launches
+
+Worth pinning down, because the two readings of QWEN-036 point at completely different
+next targets, and the launch-count reading is the wrong one.
+
+The fusion removed **111 launches/step** *and* **~0.386 ms/step of kernel time** in the
+four affected kernel families:
+
+| family | before (n × µs) | after (n × µs) |
+| --- | --- | --- |
+| `triton_poi_fused_add_copy__0` | 96 × 1.27 | 9.2 × 2.35 |
+| `at::native::elementwise_kernel<128,4>` | 96 × 2.56 | 52.1 × 3.11 |
+| `rmsnorm_fwd_tuned` | 85.1 × 2.73 | 9.8 × 3.36 |
+| `rmsnorm_fwd_general` | 96 × 1.95 | 8.3 × 3.50 |
+| `_fused_add_rmsnorm_kernel` | — | 86.8 × 1.79 |
+| **total** | **0.787 ms** | **0.401 ms** |
+
+The measured end-to-end saving was **0.261 ms/step — 68% of the 0.386 ms of kernel time
+removed**, which is what partial overlap predicts. It is *not* explained by launch count:
+QWEN-038 attacked 76 launches carrying 0.185 ms and returned nothing, and
+`GRAPH-LAUNCH-S17` already showed launch submission costs ~10 µs, not the ~180 µs the
+launch-bound reading needs.
+
+**So size every remaining candidate by the GPU work it deletes, not by how many kernels it
+deletes.** Under that rule the routing-mask kernel — 48 launches/step but only
+48 × 0.97 µs = 0.047 ms — is worth at most ~0.5% and is *not* the next lever, despite
+being the most attractive item on a launch-count ranking. This also retires the last
+operational use of `GAP-DECOMP-S17`'s "+346 excess launches" framing: the launch delta is
+a symptom of unfused work, and the work is what costs.
+
+Ranked by kernel time, the remaining decode candidates are `_moe_sum_kernel_fast`
+(48 × 5.81 = 0.279 ms), `_align_single_kernel` (39.5 × 4.67 = 0.185 ms), the residual
+`elementwise_kernel<128,4>` (52.1 × 3.11 = 0.162 ms, identity not yet established), and
+`_fused_qk_rmsnorm` (0.105 ms). Caveat on all four: these averages come from a profile
+whose window was not restricted to steady-state decode, so they are inflated by prefill
+instances and are ranking hints, not budgets.
+
 ## Optimization rules
 
 1. Profile and classify before proposing a code change.
