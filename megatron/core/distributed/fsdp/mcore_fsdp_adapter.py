@@ -600,6 +600,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     mixed_precision_policy=self.mp_policy,
                     fine_grained=fine_grained,
                     skip_backward_callback=skip_backward_cb,
+                    grad_divisor=config.expert_model_parallel_size,
                 )
         fully_shard(
             module,
