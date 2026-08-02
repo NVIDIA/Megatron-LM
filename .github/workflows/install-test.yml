@@ -29,7 +29,7 @@ on:
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@6a2f81195fd910ae91d3c001d2e32ceb6d82e975 # v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@e58e3b6631161a5de373d4acc45523a8b647be5d # main
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   pip-test-pytorch:
