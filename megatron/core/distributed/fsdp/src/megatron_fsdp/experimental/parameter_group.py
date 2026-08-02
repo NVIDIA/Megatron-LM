@@ -59,6 +59,7 @@ class FsdpParameterGroup:
     main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
+    grad_divisor: int
 
     def __init__(
         self,
@@ -68,6 +69,7 @@ class FsdpParameterGroup:
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symm_mem: bool = False,
+        grad_divisor: int = 1,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -79,6 +81,8 @@ class FsdpParameterGroup:
             mixed_precision_policy: Precision policy for main weights and gradients.
             use_symm_mem: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
+            grad_divisor: Additional divisor applied on top of the mesh-size
+                averaging. See ``fully_shard``.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -95,6 +99,7 @@ class FsdpParameterGroup:
         # fsdp_parameters define the same stable DBuffer tensor order.
         self.owning_module = owning_module
         self.mesh = mesh
+        self.grad_divisor = grad_divisor
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -348,9 +353,19 @@ class FsdpParameterGroup:
         if reduce_axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
         partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
+        # Start from the caller's extra divisor (1 unless this group sees more than one
+        # contribution per mesh rank, as expert parallelism does), then add back the axis
+        # size when the collective reduced with SUM instead of averaging.
+        grad_divisor = self.grad_divisor
+        if partial_reduce_op == dist.ReduceOp.SUM:
+            grad_divisor *= self.mesh.size(reduce_axis)
         if self._symm_mem_pool is not None:
             partial_grad.rendezvous(reduce_axis)
+        # Divide this backward's contribution, not the accumulated total: with plain
+        # all-Flat DP every backward is a last microbatch, so main_grad accumulates
+        # across microbatches below and a scale applied to the running sum would
+        # compound. Dividing before the deferred DP-outer reduction is equivalent because
+        # both that reduction and this scale are linear.
         if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
             if grad_divisor != 1:
