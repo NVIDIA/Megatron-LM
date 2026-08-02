@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import builtins
 import json
 from types import SimpleNamespace
 
@@ -107,6 +108,20 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
         "prompt_tokens_details": {"cached_tokens": 2},
     }
     assert records[-1] == "data: [DONE]\n\n"
+
+
+def test_huggingface_fast_incremental_detokenizer_requires_optional_dependencies(monkeypatch):
+    original_import = builtins.__import__
+
+    def import_without_transformers(name, *args, **kwargs):
+        if name == "transformers":
+            raise ImportError("transformers is unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_transformers)
+
+    with pytest.raises(ImportError, match="requires the tokenizers and transformers packages"):
+        HuggingFaceFastIncrementalDetokenizer(_Tokenizer(), [])
 
 
 def test_huggingface_fast_incremental_detokenizer_preserves_utf8_boundaries():
