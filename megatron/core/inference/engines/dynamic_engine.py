@@ -303,6 +303,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         _install_step_gpu_timing()
 
+        # Host cost of CUDA graph replay, measured with no profiler attached, because
+        # the profiled figure is confounded by node-level graph tracing.
+        # Env-gated (``MCORE_GRAPH_LAUNCH_TIMING``); no-op by default.
+        from megatron.core.inference.graph_launch_timing import install as _install_graph_timing
+
+        _install_graph_timing()
+
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
             inference_config.materialize_only_last_token_logits
