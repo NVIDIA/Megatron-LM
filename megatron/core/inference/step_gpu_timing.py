@@ -120,6 +120,14 @@ def _report():
         lines.append(f"  => block graph is {100 * g / p:5.1f}% of the step; "
                      f"{p - g:6.3f} ms/step is outside it")
     print("\n".join(lines), file=sys.stderr, flush=True)
+    # Per-component in-situ attribution, printed against the block total it has to
+    # reconcile with -- the parts are only meaningful if they reconstruct the whole.
+    try:
+        from megatron.core.inference import insitu_timing
+
+        insitu_timing.report(block_ms=g)
+    except Exception as e:
+        print(f"[STEP_GPU] insitu report failed: {e}", file=sys.stderr, flush=True)
     # Dump here rather than only at exit: the harness SIGTERMs the server, which
     # skips atexit handlers, so an exit-only dump would usually produce nothing.
     _dump_entry_times()

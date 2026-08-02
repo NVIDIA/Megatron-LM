@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference import insitu_timing as _insitu
 from megatron.core.inference.moe.router_topk import can_use_fused_softmax_topk, fused_softmax_topk
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
@@ -967,7 +968,8 @@ class InferenceTopKRouter(TopKRouter):
             expert_bias=self.expert_bias,
             router_replay=self.router_replay,
         ):
-            return fused_softmax_topk(logits, self.topk)
+            with _insitu.site("router_topk"):
+                return fused_softmax_topk(logits, self.topk)
 
         probs, top_indices = self._compiled_topk_routing(
             logits,

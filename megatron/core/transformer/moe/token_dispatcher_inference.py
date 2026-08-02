@@ -33,6 +33,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference import floor_ablation as _ablate
+from megatron.core.inference import insitu_timing as _insitu
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -586,21 +587,26 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Floor attribution: omit the gather from the captured graph. The symmetric
         # buffers already hold the values warmup's real gather left there, so shapes
         # and routing stay valid and only the collective leaves the chain.
+        # Empty region in the same graph: its reading is the per-pair event overhead
+        # that every other site is reported net of.
+        with _insitu.site(_insitu.CALIB):
+            pass
         if not (_ablate.nvls_off(_ablate.ABLATE_NVLS_DISPATCH) and _ablate.hit("nvls_dispatch")):
-            multimem_all_gatherv_3tensor(
-                agv_h["tensor"],
-                agv_r["tensor"],
-                agv_p["tensor"],
-                hidden_states,
-                self.routing_map,
-                probs,
-                agv_h["handle"],
-                agv_r["handle"],
-                agv_p["handle"],
-                rank_token_offset=rank_token_offset,
-                ep_max_tokens=ep_max_tokens,
-                per_rank_max_tokens=per_rank_max,
-            )
+            with _insitu.site("nvls_dispatch"):
+                multimem_all_gatherv_3tensor(
+                    agv_h["tensor"],
+                    agv_r["tensor"],
+                    agv_p["tensor"],
+                    hidden_states,
+                    self.routing_map,
+                    probs,
+                    agv_h["handle"],
+                    agv_r["handle"],
+                    agv_p["handle"],
+                    rank_token_offset=rank_token_offset,
+                    ep_max_tokens=ep_max_tokens,
+                    per_rank_max_tokens=per_rank_max,
+                )
 
         topk = probs.shape[1]
         hidden_dim = hidden_states.shape[1]
@@ -652,14 +658,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        multimem_reduce_scatter_v(
-            output,
-            rsv["tensor"],
-            rsv["handle"],
-            rank_token_offset=self._rank_token_offset(),
-            ep_max_tokens=self._ep_max_tokens(),
-            per_rank_max_tokens=self._per_rank_worst_case_token_count,
-        )
+        with _insitu.site("nvls_combine"):
+            multimem_reduce_scatter_v(
+                output,
+                rsv["tensor"],
+                rsv["handle"],
+                rank_token_offset=self._rank_token_offset(),
+                ep_max_tokens=self._ep_max_tokens(),
+                per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            )
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):

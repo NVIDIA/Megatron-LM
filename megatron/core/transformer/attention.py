@@ -123,6 +123,7 @@ except ImportError:
 
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.inference import floor_ablation as _ablate
+from megatron.core.inference import insitu_timing as _insitu
 
 # See _resolve_flash_version: benchmarking-only override for a config field that
 # has no CLI flag. Empty means "leave the config's choice alone".
@@ -1630,19 +1631,20 @@ class Attention(MegatronModule, ABC):
                 if _abl_shape is not None and _ablate.hit("dyn_attn"):
                     core_attn_out = _ablate.zeros(_abl_shape, q.dtype, q.device)
                 else:
-                    core_attn_out = self.flash_decode_and_prefill(
-                        q,
-                        k,
-                        v,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        cu_query_lengths,
-                        cu_kv_lengths,
-                        kv_lengths,
-                        block_table,
-                        inference_context.is_decode_only(),
-                        softmax_offset=self._get_inference_softmax_offset(),
-                    )
+                    with _insitu.site("attn_core"):
+                        core_attn_out = self.flash_decode_and_prefill(
+                            q,
+                            k,
+                            v,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            cu_query_lengths,
+                            cu_kv_lengths,
+                            kv_lengths,
+                            block_table,
+                            inference_context.is_decode_only(),
+                            softmax_offset=self._get_inference_softmax_offset(),
+                        )
                     if _ablate.ABLATE_ATTN_CORE:
                         _ablate.remember(_abl_key, tuple(core_attn_out.shape))
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
@@ -1675,7 +1677,8 @@ class Attention(MegatronModule, ABC):
         nvtx_range_push(suffix="linear_proj")
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
-            output, bias = apply_module(self.linear_proj)(core_attn_out)
+            with _insitu.site("out_proj"):
+                output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
@@ -1888,7 +1891,8 @@ class SelfAttention(Attention):
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
+        with _insitu.site("qkv_proj"):
+            mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
