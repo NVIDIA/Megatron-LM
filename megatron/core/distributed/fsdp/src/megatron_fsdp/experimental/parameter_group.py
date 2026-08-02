@@ -101,7 +101,9 @@ class FsdpParameterGroup:
 
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
-            parameters: Root-module-relative FQNs and their parameters.
+            parameters: Root-module-relative FQNs and their parameters.  Must be
+                on a real (non-meta) device — the caller is responsible for
+                materializing meta parameters before constructing this group.
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
@@ -223,6 +225,7 @@ class FsdpParameterGroup:
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            sharded_parameter.__fsdp_param__ = True
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
