@@ -6,9 +6,6 @@
 import logging
 from typing import Any
 
-import tokenizers
-from transformers import PreTrainedTokenizerFast
-
 logger = logging.getLogger(__name__)
 
 _INVALID_PREFIX_ERROR = "Invalid prefix encountered"
@@ -23,13 +20,22 @@ class HuggingFaceFastIncrementalDetokenizer:
     """
 
     def __init__(self, tokenizer: Any, prompt_token_ids: list[int]) -> None:
+        try:
+            import tokenizers
+            from transformers import PreTrainedTokenizerFast
+        except ImportError as exc:
+            raise ImportError(
+                "Incremental detokenization requires the tokenizers and transformers packages."
+            ) from exc
+
+        self._tokenizers = tokenizers
         tokenizer_wrapper = getattr(tokenizer, "_tokenizer", None)
         huggingface_tokenizer = getattr(tokenizer_wrapper, "tokenizer", None)
         if not isinstance(huggingface_tokenizer, PreTrainedTokenizerFast):
             raise ValueError(
                 "Streaming is currently supported only for Hugging Face fast tokenizers."
             )
-        if not hasattr(tokenizers.decoders, "DecodeStream"):
+        if not hasattr(self._tokenizers.decoders, "DecodeStream"):
             raise ValueError(
                 "Streaming with Hugging Face fast tokenizers requires tokenizers>=0.22.0."
             )
@@ -44,7 +50,7 @@ class HuggingFaceFastIncrementalDetokenizer:
         kwargs = {"skip_special_tokens": self._skip_special_tokens}
         if prompt_token_ids is not None:
             kwargs["ids"] = list(prompt_token_ids)
-        return tokenizers.decoders.DecodeStream(**kwargs)
+        return self._tokenizers.decoders.DecodeStream(**kwargs)
 
     def update(self, token_ids: list[int]) -> str:
         """Decode token IDs and return only newly stable text."""
