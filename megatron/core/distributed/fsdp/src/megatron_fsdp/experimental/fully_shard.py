@@ -32,6 +32,8 @@ def fully_shard(
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     use_symm_mem: bool = False,
+    fine_grained: bool = False,
+    skip_backward_callback: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -46,6 +48,11 @@ def fully_shard(
             and parameter-dtype main gradients.
         use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
             PyTorch's NCCL symmetric-memory pool.
+        fine_grained: Register pre-forward and pre-backward hooks on every sub-module
+            so the 1F1B EP overlap schedule can call sub-modules directly.
+        skip_backward_callback: Skip per-param post_accumulate_grad_hook. Required
+            when ``delay_wgrad_compute=True`` so gradient reduction waits for
+            ``backward_dw()`` to complete.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -62,6 +69,8 @@ def fully_shard(
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
             use_symm_mem=use_symm_mem,
+            fine_grained=fine_grained,
+            skip_backward_callback=skip_backward_callback,
         )
     except Exception:
         module.__class__ = original_cls

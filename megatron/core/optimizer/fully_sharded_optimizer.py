@@ -8,6 +8,7 @@ import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
@@ -59,8 +60,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
-        if len(model_chunks) != 1:
-            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
+        if not model_chunks:
+            raise ValueError("MFSDP v2 requires at least one model chunk.")
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
         if config.loss_scale is not None:
@@ -120,7 +121,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """No-op: MFSDP v2 reduces directly into optimizer-visible sharded grads."""
 
     def _copy_main_params_to_model_params(self) -> None:
-        """No-op: MFSDP v2 currently syncs compute weights in its forward pre-hook."""
+        """Refresh compute weights from the optimizer-owned main weights."""
+        for model_chunk in self.model_chunks:
+            for module in model_chunk.modules():
+                if not isinstance(module, FsdpModule):
+                    continue
+                for parameter_group in module.parameter_groups:
+                    parameter_group.sync_model_weight_from_main_weight()
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""
