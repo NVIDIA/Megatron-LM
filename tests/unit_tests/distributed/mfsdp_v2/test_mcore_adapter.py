@@ -56,7 +56,7 @@ class TestMcoreAdapterDense:
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
-    def test_wraps_fsdp_unit_modules_before_root(self):
+    def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -81,11 +81,14 @@ class TestMcoreAdapterDense:
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
-            pg_collection=self.pg_collection,
+            pg_collection=ProcessGroupCollection(dp_cp=self.pg_collection.dp_cp),
         )
 
         assert isinstance(wrapped.module, FsdpModule)
         assert isinstance(wrapped.module[0], FsdpModule)
+        assert all(
+            getattr(parameter, "__fsdp_param__", False) for parameter in wrapped.parameters()
+        )
 
         # Post-order wrapping gives the selected TransformerLayer its own parameter group;
         # the root FSDP unit should own only the parameters of the remaining Linear module.
@@ -139,7 +142,7 @@ class TestMcoreAdapterDense:
         assert fully_shard_context_calls == [True]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
-    def test_build_train_and_step(self, optimizer_cuda_graph):
+    def test_build_train_and_step(self, optimizer_cuda_graph, monkeypatch):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -205,6 +208,23 @@ class TestMcoreAdapterDense:
         optimizer.reload_model_params()
         if optimizer_cuda_graph:
             optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
+
+        parameter_groups = [
+            parameter_group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for parameter_group in module.parameter_groups
+        ]
+        assert parameter_groups
+        sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
+        for parameter_group in parameter_groups:
+            sync_model_weight = parameter_group.sync_model_weight_from_main_weight
+
+            def count_sync(parameter_group=parameter_group, sync_model_weight=sync_model_weight):
+                sync_counts[parameter_group] += 1
+                sync_model_weight()
+
+            monkeypatch.setattr(parameter_group, "sync_model_weight_from_main_weight", count_sync)
 
         steps = [
             [
