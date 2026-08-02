@@ -2582,6 +2582,55 @@ Ranked by kernel time, the remaining decode candidates are `_moe_sum_kernel_fast
 whose window was not restricted to steady-state decode, so they are inflated by prefill
 instances and are ranking hints, not budgets.
 
+### BUDGET-S17 — first trustworthy per-kernel decode budget, and how to window a trace
+
+Every per-kernel table before this one was taken over a window that included model load,
+graph capture, warmup and the gaps *between* benchmark iterations. That inflates
+`wall/step` without bound and pollutes every average with prefill instances — it is why an
+earlier pass of this same trace reported `wall/step=199 ms` and a 6.5 ms
+`_fused_metadata_kernel`. `nsys_trace/steady_window.py` locates the window from the cadence
+of the one-per-layer-per-step collective, takes the last *N* whole steps, and **warns when
+the span still contains an inter-iteration gap**. Narrowing 150 → 60 steps moved
+`wall/step` from 34.6 ms to 7.217 ms and `_fused_metadata_kernel` from 13,182 µs to 116 µs.
+
+> **Always run the window guard.** Two sessions' worth of component sizing was distorted by
+> unwindowed spans. If `wall/step` does not land near the throughput-derived step time,
+> the window is wrong and nothing else in the table means anything.
+
+Config: both fusion boundaries on, FA2, BS256, **OSL128** (`wall/step` 7.217 ms; the
+OSL1024 regime is 9.16 ms, the difference being KV-length-dependent attention). 60 steps,
+rank 0, `sum-of-durations` 5.627 ms/step over 1025 launches.
+
+| ms/step | n/step | avg µs | group |
+| --- | --- | --- | --- |
+| 1.949 | 96 | 20.31 | `_fused_moe_kernel` — expert GEMMs, **35% of all kernel time** |
+| 0.769 | 34-14 | 3.4-6.7 | dense projection GEMMs (`nvjet_*`) |
+| 0.759 | 48+48 | 9.33/6.49 | NVLS collectives (reduce-scatter 0.448 + all-gather 0.311) |
+| 0.558 | 34-14 | 4.3-10.4 | FlashAttention decode + splitkv combine |
+| 0.218 | 48 | 4.54 | `_moe_sum_kernel_fast` |
+| 0.217 | 48 | 4.52 | `_align_single_kernel` |
+| 0.179 | 48+34 | 2.05/2.33 | `cublasLt::splitKreduce` |
+| 0.168 | 95 | 1.77 | `_fused_add_rmsnorm_kernel` (the QWEN-036 fusion) |
+| 0.127 | 48 | 2.66 | `at::native::elementwise_kernel<128,4>` — 1/layer, **identity unknown** |
+| 0.085 / 0.084 / 0.070 / 0.062 / 0.036 | 48 each | ~0.8-1.8 | qk_rmsnorm, rotary, softmax_topk, append_kv, mask_routing_padding |
+
+Sized by `LAUNCH-VS-WORK-S17`'s rule (removed GPU work × ~68% conversion, against the
+9.16 ms OSL1024 step), the ranked remaining candidates are:
+
+1. **`_fused_moe_kernel`, 1.949 ms — the only large target left.** No fusion helps here;
+   it is bandwidth-bound (FC1 at 80% of achievable HBM, FC2 at 56%). The lever is fewer
+   bytes, i.e. **FP8 expert weights**, worth up to ~0.9 ms. This is the one item whose
+   payoff justifies a large implementation.
+2. `_moe_sum_kernel_fast` + `_align_single_kernel`, 0.435 ms combined → ~1.5-3% if folded
+   into neighbours. Both are already single-kernel-per-layer, so this means changing what
+   they are fused *with*, not fusing them together.
+3. `elementwise_kernel<128,4>`, 0.127 ms → ~0.9%. **Identify it first**: one per layer at
+   2.66 µs, and if it is a stray cast or copy it may be removable outright rather than
+   fused. Cheapest next step in the list and the only one that starts with a question
+   rather than a kernel.
+4. `_mask_routing_padding_kernel`, 0.036 ms → ~0.3%. Explicitly **not worth it**, recorded
+   here only because a launch-count ranking puts it near the top (48/step).
+
 ## Optimization rules
 
 1. Profile and classify before proposing a code change.
