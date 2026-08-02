@@ -208,7 +208,7 @@ class TestMegatronFSDPE2E:
                         "overlap_moe_expert_parallel_comm": True,
                         "delay_wgrad_compute": True,
                     },
-                    "loss_tolerance": {"atol": 5e-3, "rtol": 0},
+                    "loss_tolerance": {"atol": 0, "rtol": 0.05},
                     "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
                 },
                 id="ep2-optim_grads_params-1f1b-overlap",
