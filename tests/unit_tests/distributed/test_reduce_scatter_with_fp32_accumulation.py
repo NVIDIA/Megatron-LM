@@ -76,3 +76,69 @@ class TestReduceScatterWithFP32Accumulation:
             assert (
                 torch.allclose(tensor1_shard, tensor2_shard) == baseline_reduce_scatter_in_fp32
             ), f"{get_non_matching_values(tensor1_shard, tensor2_shard)}"
+
+    @pytest.mark.parametrize("async_op", [True, False])
+    def test_scale_is_folded_into_the_fp32_sum(self, async_op: bool):
+        """`scale` must be applied to the FP32 sum, not to the low-precision input.
+
+        Pre-scaling the BF16 input and SUMming would round every contribution on the way in, so
+        the result must match an FP32 reduce-scatter scaled in FP32.
+        """
+        rank, world_size = Utils.rank, Utils.world_size
+        # Deliberately NOT 1/world_size: that is a power of two, so pre-scaling BF16 would be
+        # exact and the anti-pattern this test exists to catch would slip through.
+        scale = 1.0 / 3.0
+        tensor = torch.rand(100000, device='cuda', dtype=torch.bfloat16)
+        kwargs = {"op": torch.distributed.ReduceOp.SUM, "group": None, "async_op": async_op}
+        # Snapshot before the call: the output tensor is a view into the input, as above.
+        reference = tensor.float()
+
+        handle = reduce_scatter_with_fp32_accumulation(
+            shard_buffer(tensor, world_size)[rank], tensor, scale=scale, **kwargs
+        )
+        if async_op:
+            handle.wait()
+
+        torch.distributed.reduce_scatter_tensor(
+            shard_buffer(reference, world_size)[rank], reference, op=kwargs["op"]
+        )
+        expected = (shard_buffer(reference, world_size)[rank] * scale).bfloat16()
+
+        got = shard_buffer(tensor, world_size)[rank]
+        assert torch.allclose(got, expected), f"{get_non_matching_values(got, expected)}"
+
+    def test_caller_provided_all_to_all_output_tensor(self):
+        """A caller-supplied scratch (GTP passes one from its wgrad pool) must be honored.
+
+        A mis-sized one must be rejected before the all-to-all: bailing out mid-flight
+        desynchronizes the group.
+        """
+        rank, world_size = Utils.rank, Utils.world_size
+        kwargs = {"op": torch.distributed.ReduceOp.SUM, "group": None, "async_op": False}
+        tensor = torch.rand(100000, device='cuda', dtype=torch.bfloat16)
+
+        internal = tensor.clone()
+        reduce_scatter_with_fp32_accumulation(
+            shard_buffer(internal, world_size)[rank], internal, **kwargs
+        )
+        provided = tensor.clone()
+        reduce_scatter_with_fp32_accumulation(
+            shard_buffer(provided, world_size)[rank],
+            provided,
+            all_to_all_output_tensor=torch.empty_like(tensor),
+            **kwargs,
+        )
+        torch.testing.assert_close(
+            shard_buffer(provided, world_size)[rank],
+            shard_buffer(internal, world_size)[rank],
+            rtol=0,
+            atol=0,
+        )
+
+        with pytest.raises(AssertionError):
+            reduce_scatter_with_fp32_accumulation(
+                shard_buffer(tensor, world_size)[rank],
+                tensor,
+                all_to_all_output_tensor=torch.empty_like(tensor)[:-world_size],
+                **kwargs,
+            )
