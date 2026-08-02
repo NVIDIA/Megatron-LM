@@ -26,6 +26,7 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+
 from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.deterministic import set_deterministic
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
@@ -64,11 +65,11 @@ def _optimizer_config() -> OptimizerConfig:
     )
 
 
-def _random_packed_batch(vocab_size: int) -> PackedBatch:
+def _random_packed_batch(vocab_size: int, *, num_tokens: int = 2048) -> PackedBatch:
     return PackedBatch(
-        input_ids=torch.randint(0, vocab_size, (2048,), device="cuda"),
-        labels=torch.randint(0, vocab_size, (2048,), device="cuda"),
-        seq_lens=torch.full((1,), 2048, dtype=torch.int64, device="cuda"),
+        input_ids=torch.randint(0, vocab_size, (num_tokens,), device="cuda"),
+        labels=torch.randint(0, vocab_size, (num_tokens,), device="cuda"),
+        seq_lens=torch.full((1,), num_tokens, dtype=torch.int64, device="cuda"),
     )
 
 
@@ -196,6 +197,50 @@ def _glm5():
         n_routed_experts=4,
         n_shared_experts=1,
         num_experts_per_tok=2,
+    )
+    return cfg, protocol
+
+
+def _glm52_indexer_types(num_layers=78):
+    full_layers = {0, 1, 2, *range(6, num_layers, 4)}
+    return ["full" if idx in full_layers else "shared" for idx in range(num_layers)]
+
+
+def _glm52_indexshare():
+    pytest.importorskip("cudnn", reason="glm5 fused DSA needs the cudnn DSA stack.")
+    _require_te()
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite import protocol
+
+    cfg = Glm5Config(
+        num_hidden_layers=78,
+        hidden_size=128,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        head_dim=256,
+        vocab_size=32,
+        max_position_embeddings=512,
+        initializer_range=0.002,
+        q_lora_rank=16,
+        kv_lora_rank=512,
+        qk_head_dim=256,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=512,
+        intermediate_size=20,
+        moe_intermediate_size=6,
+        first_k_dense_replace=1,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        num_nextn_predict_layers=1,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=_glm52_indexer_types(),
+        index_share_for_mtp_iteration=True,
     )
     return cfg, protocol
 
@@ -330,23 +375,35 @@ def _proxy_topology(model_name: str, pp_layout=None) -> ParallelConfig:
     return ParallelConfig(tp=2, ep=2, etp=1, pp=_PP, cp=1, pp_layout=pp_layout)
 
 
-def _build_handle(model_name: str, *, seed: int, pp_layout=None):
+def _build_handle_from_config(
+    model_name: str,
+    cfg,
+    protocol,
+    *,
+    seed: int,
+    parallel: ParallelConfig | None = None,
+    pp_layout=None,
+    impl_overrides: dict | None = None,
+):
     from types import SimpleNamespace
 
     from megatron.lite.runtime.contracts.handle import ModelHandle
 
-    cfg, protocol = MODELS[model_name]()
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    parallel = _proxy_topology(model_name, pp_layout=pp_layout)
-    impl_cfg = protocol.ImplConfig(
+    if parallel is None:
+        parallel = _proxy_topology(model_name, pp_layout=pp_layout)
+    impl_kwargs = dict(
         parallel=parallel,
         optimizer="dist_opt",
         optimizer_config=_optimizer_config(),
         use_deepep=False,
         deterministic=True,
     )
+    if impl_overrides:
+        impl_kwargs.update(impl_overrides)
+    impl_cfg = protocol.ImplConfig(**impl_kwargs)
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
     chunks = bundle.chunks
     extras = dict(bundle.extras)
@@ -367,6 +424,17 @@ def _build_handle(model_name: str, *, seed: int, pp_layout=None):
     )
     _BUILT_PARALLEL_STATES.append(bundle.parallel_state)
     return handle, cfg
+
+
+def _build_handle(model_name: str, *, seed: int, pp_layout=None):
+    cfg, protocol = MODELS[model_name]()
+    return _build_handle_from_config(
+        model_name,
+        cfg,
+        protocol,
+        seed=seed,
+        pp_layout=pp_layout,
+    )
 
 
 def _local_layer_indices(handle) -> list[int]:
@@ -443,6 +511,81 @@ def test_uneven_pp_builds_trains_and_exports(model_name):
             "NON_SKIP_UNEVEN_PP_BUILD_TRAIN_EXPORT "
             f"model={model_name} num_layers={cfg.num_hidden_layers} "
             f"split={local} exported_decoder_layers={len(present & expected)}"
+        )
+
+
+def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_groups():
+    """GLM5.2 has 78 trunk layers plus one MTP layer and reuses DSA indexer
+    top-k across groups. The real PP build must use the auto layout while keeping
+    each full source layer on the same stage as its shared layers."""
+    if dist.get_world_size() != 8:
+        pytest.skip("GLM5.2 IndexShare uneven-PP smoke requires exactly 8 GPUs.")
+
+    from megatron.lite.primitive.modules.attention.dsa import (
+        validate_dsa_index_share_pipeline_split,
+    )
+
+    set_deterministic(2026)
+
+    cfg, protocol = _glm52_indexshare()
+    parallel = ParallelConfig(tp=1, ep=1, etp=1, pp=8, cp=1)
+    handle, cfg = _build_handle_from_config(
+        "glm5",
+        cfg,
+        protocol,
+        seed=5252,
+        parallel=parallel,
+        impl_overrides={"mtp_enable": True, "mtp_enable_train": True},
+    )
+    ps = handle._parallel_state
+    assert ps.pp_size == 8
+    assert cfg.num_hidden_layers == 78
+    assert cfg.num_nextn_predict_layers == 1
+    assert cfg.uses_dsa_index_share is True
+
+    local = _local_layer_indices(handle)
+    assert local == sorted(local) and len(set(local)) == len(local), local
+    validate_dsa_index_share_pipeline_split(
+        local,
+        topk_freq=cfg.index_topk_freq,
+        skip_topk_offset=cfg.index_skip_topk_offset,
+        indexer_types=cfg.indexer_types,
+    )
+    local_shared_sources = [
+        (layer_idx, cfg.dsa_indexer_source_layer(layer_idx))
+        for layer_idx in local
+        if cfg.dsa_indexer_type(layer_idx) == "shared"
+    ]
+    assert all(source_idx in local for _, source_idx in local_shared_sources), local_shared_sources
+
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    batch = _random_packed_batch(cfg.vocab_size, num_tokens=512)
+    runtime.zero_grad(handle)
+    result = runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
+    runtime.optimizer_step(handle)
+    loss = result.model_output.loss
+    assert loss is not None and torch.isfinite(loss).all(), (
+        f"glm52_indexshare: non-finite loss {loss} on 78-layer uneven PP layout"
+    )
+
+    stage_info = {
+        "pp_rank": ps.pp_rank,
+        "layers": local,
+        "shared_sources": local_shared_sources,
+        "has_mtp": bool(unwrap_model(handle._extras["model_chunks"][0]).mtp is not None),
+    }
+    gathered = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(gathered, stage_info)
+    if dist.get_rank() == 0:
+        ordered = sorted(gathered, key=lambda item: item["pp_rank"])
+        splits = [item["layers"] for item in ordered]
+        shared_pairs = sum(len(item["shared_sources"]) for item in ordered)
+        mtp_ranks = [item["pp_rank"] for item in ordered if item["has_mtp"]]
+        print(
+            "NON_SKIP_GLM52_INDEXSHARE_UNEVEN_PP_PASSED "
+            f"pp=8 num_layers=78 mtp_layers=1 splits={splits} "
+            f"shared_pairs={shared_pairs} mtp_ranks={mtp_ranks} "
+            f"loss={float(loss.detach().item()):.6e}"
         )
 
 

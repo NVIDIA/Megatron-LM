@@ -13,6 +13,7 @@ final/loss stage — mlite's MTP shares the head there; cross-stage MTP is a fol
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -28,21 +29,132 @@ class PipelineChunkLayout:
     has_mtp: bool = False
 
 
-def _auto_layout(num_hidden_layers: int, pp_size: int, num_mtp_layers: int):
+def _auto_layout(
+    num_hidden_layers: int,
+    pp_size: int,
+    num_mtp_layers: int,
+    *,
+    rows: list[list[str]] | None = None,
+):
     """Balance ``[E, decoder*N, mtp*K, loss]`` into even contiguous chunks; the
     embedding/MTP/loss slots make their stages carry fewer decoders (e.g. 6/pp4 ->
     [1,2,2,1]) — Megatron's embedding/loss split accounting."""
-    from megatron.core.transformer.pipeline_parallel_layer_layout import (
-        PipelineParallelLayerLayout,
-    )
+    from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
-    units = ["embedding"] + ["decoder"] * num_hidden_layers + ["mtp"] * max(num_mtp_layers, 0) + ["loss"]
-    base, remainder = divmod(len(units), pp_size)
-    rows, pos = [], 0
-    for size in (base + (1 if s < remainder else 0) for s in range(pp_size)):
-        rows.append(units[pos : pos + size])
-        pos += size
+    if rows is None:
+        units = ["embedding"] + ["decoder"] * num_hidden_layers + ["mtp"] * max(num_mtp_layers, 0) + ["loss"]
+        base, remainder = divmod(len(units), pp_size)
+        rows, pos = [], 0
+        for size in (base + (1 if s < remainder else 0) for s in range(pp_size)):
+            rows.append(units[pos : pos + size])
+            pos += size
     return PipelineParallelLayerLayout(rows, pipeline_model_parallel_size=pp_size)
+
+
+def _validate_decoder_layer_groups(
+    num_hidden_layers: int,
+    decoder_layer_groups: Sequence[Sequence[int]],
+) -> list[list[int]]:
+    groups = [list(group) for group in decoder_layer_groups]
+    if any(not group for group in groups):
+        raise ValueError("decoder_layer_groups must not contain empty groups.")
+    flattened = [layer_idx for group in groups for layer_idx in group]
+    expected = list(range(num_hidden_layers))
+    if flattened != expected:
+        raise ValueError(
+            "decoder_layer_groups must cover decoder layers 0..num_hidden_layers-1 "
+            f"exactly once in order; got {flattened[:8]}...{flattened[-8:]} "
+            f"for num_hidden_layers={num_hidden_layers}."
+        )
+    for group in groups:
+        if group != list(range(group[0], group[0] + len(group))):
+            raise ValueError(f"decoder_layer_groups must be contiguous; got {group}.")
+    return groups
+
+
+def _auto_layout_with_decoder_groups(
+    num_hidden_layers: int,
+    pp_size: int,
+    num_mtp_layers: int,
+    decoder_layer_groups: Sequence[Sequence[int]],
+):
+    """Auto-balance like ``_auto_layout`` while never splitting protected decoder groups."""
+    groups = _validate_decoder_layer_groups(num_hidden_layers, decoder_layer_groups)
+    lengths = [len(group) for group in groups]
+    prefix = [0]
+    for length in lengths:
+        prefix.append(prefix[-1] + length)
+
+    tail_slots = max(num_mtp_layers, 0) + 1  # MTP slots plus loss.
+    total_cells = num_hidden_layers + 1 + tail_slots
+    base, remainder = divmod(total_cells, pp_size)
+    target_cells = [base + (1 if stage < remainder else 0) for stage in range(pp_size)]
+
+    def overhead(stage: int) -> int:
+        return (1 if stage == 0 else 0) + (tail_slots if stage == pp_size - 1 else 0)
+
+    # Linear partition DP: minimize the largest per-stage cell count, then prefer
+    # non-empty decoder stages and closeness to Megatron's unprotected target sizes.
+    n_groups = len(groups)
+    dp: list[dict[int, tuple[int, int, int, int | None]]] = []
+    first: dict[int, tuple[int, int, int, int | None]] = {}
+    for end in range(n_groups + 1):
+        cells = overhead(0) + prefix[end]
+        first[end] = (
+            cells,
+            1 if end == 0 else 0,
+            abs(cells - target_cells[0]),
+            None,
+        )
+    dp.append(first)
+
+    for stage in range(1, pp_size):
+        current: dict[int, tuple[int, int, int, int | None]] = {}
+        for end in range(n_groups + 1):
+            best: tuple[int, int, int, int | None] | None = None
+            for start, prev in dp[stage - 1].items():
+                if start > end:
+                    continue
+                cells = overhead(stage) + prefix[end] - prefix[start]
+                score = (
+                    max(prev[0], cells),
+                    prev[1] + (1 if end == start else 0),
+                    prev[2] + abs(cells - target_cells[stage]),
+                    start,
+                )
+                if best is None or score[:3] < best[:3]:
+                    best = score
+            assert best is not None
+            current[end] = best
+        dp.append(current)
+
+    segments: list[tuple[int, int]] = []
+    end = n_groups
+    for stage in range(pp_size - 1, 0, -1):
+        start = dp[stage][end][3]
+        assert start is not None
+        segments.append((start, end))
+        end = start
+    segments.append((0, end))
+    segments.reverse()
+
+    rows: list[list[str]] = []
+    for stage, (start, end) in enumerate(segments):
+        row: list[str] = []
+        if stage == 0:
+            row.append("embedding")
+        for group_len in lengths[start:end]:
+            row.extend(["decoder"] * group_len)
+        if stage == pp_size - 1:
+            row.extend(["mtp"] * max(num_mtp_layers, 0))
+            row.append("loss")
+        rows.append(row)
+    return _auto_layout(
+        num_hidden_layers,
+        pp_size,
+        num_mtp_layers,
+        rows=rows,
+    )
 
 
 def build_pipeline_chunk_layout(
@@ -52,6 +164,7 @@ def build_pipeline_chunk_layout(
     vpp_chunk_id: int | None = None,
     *,
     num_mtp_layers: int = 0,
+    decoder_layer_groups: Sequence[Sequence[int]] | None = None,
 ) -> PipelineChunkLayout:
     """``layer_indices`` / ``has_embed`` / ``has_head`` / ``has_mtp`` for this PP rank,
     from ``ps.pp_layout`` (custom) or an auto-balanced layout. ``has_mtp`` follows the
@@ -68,15 +181,17 @@ def build_pipeline_chunk_layout(
         )
 
     from megatron.core.transformer.enums import LayerType
-    from megatron.core.transformer.pipeline_parallel_layer_layout import (
-        PipelineParallelLayerLayout,
-    )
+    from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
     pp_layout = getattr(ps, "pp_layout", None)
     if pp_layout is not None:
         layout = PipelineParallelLayerLayout(pp_layout, pipeline_model_parallel_size=ps.pp_size)
         if layout.virtual_pipeline_model_parallel_size > 1:
             raise NotImplementedError("VPP pp_layout is not supported (one stage per pp rank).")
+    elif decoder_layer_groups is not None:
+        layout = _auto_layout_with_decoder_groups(
+            num_hidden_layers, ps.pp_size, num_mtp_layers, decoder_layer_groups
+        )
     else:
         layout = _auto_layout(num_hidden_layers, ps.pp_size, num_mtp_layers)
 

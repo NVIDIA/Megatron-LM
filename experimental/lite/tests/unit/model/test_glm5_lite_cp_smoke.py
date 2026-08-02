@@ -278,7 +278,8 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
     input_ids = zigzag_slice_for_cp(full_ids, rank, world, seq_dim=1).contiguous()
 
     output = model(input_ids=input_ids)
-    assert output["hidden_states"].shape == (batch, seq // world, cfg.hidden_size)
+    # The model contract keeps hidden states in sequence-major (SBH) layout.
+    assert output["hidden_states"].shape == (seq // world, batch, cfg.hidden_size)
     assert torch.isfinite(output["hidden_states"].float()).all()
     loss = output["hidden_states"].float().square().mean()
     assert loss.ndim == 0
@@ -298,16 +299,27 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.protocol import _forward_step, unpack_forward_output
     from megatron.lite.primitive.parallel.state import ParallelState
-    from megatron.lite.primitive.parallel.thd import pack_nested_thd, unpack_packed_thd_to_nested
+    from megatron.lite.runtime.contracts.data import PackedBatch
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
     rank = dist.get_rank()
     cfg_kwargs = _tiny_config_kwargs()
-    cfg_kwargs.update(max_position_embeddings=64, num_nextn_predict_layers=1)
-    cfg = Glm5Config(**cfg_kwargs)
-    cfg.mlp_layer_types = ["dense", "dense"]
+    cfg_kwargs.update(
+        max_position_embeddings=64,
+        num_hidden_layers=6,
+        num_nextn_predict_layers=1,
+    )
+    indexer_types = ["full", "full", "full", "shared", "shared", "shared"]
+    cfg = Glm5Config(
+        **cfg_kwargs,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=indexer_types,
+    )
+    cfg.mlp_layer_types = ["dense"] * 7
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(20260614)
@@ -317,42 +329,36 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     model.train()
 
     lengths = [16, 20, 24]
-    ids = torch.nested.as_nested_tensor(
-        [
-            torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
-            for length in lengths
-        ],
-        layout=torch.jagged,
-    )
-    labels = torch.nested.as_nested_tensor(
-        [
-            torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
-            for length in lengths
-        ],
-        layout=torch.jagged,
-    )
-    loss_mask = torch.nested.as_nested_tensor(
-        [torch.ones(length, device=device, dtype=torch.float32) for length in lengths],
-        layout=torch.jagged,
-    )
-    packed = pack_nested_thd(
-        ids,
-        cp_size=world,
-        cp_rank=rank,
-        cp_group=ps.cp_group,
-        labels=labels,
-        loss_mask=loss_mask,
+    batch = PackedBatch(
+        input_ids=torch.cat(
+            [
+                torch.randint(
+                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
+                )
+                for length in lengths
+            ]
+        ),
+        labels=torch.cat(
+            [
+                torch.randint(
+                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
+                )
+                for length in lengths
+            ]
+        ),
+        seq_lens=torch.tensor(lengths, device=device, dtype=torch.int32),
+        loss_mask=torch.ones(sum(lengths), device=device, dtype=torch.float32),
     )
 
-    out = model(
-        input_ids=packed.input_ids,
-        labels=packed.labels,
-        loss_mask=packed.loss_mask,
-        position_ids=packed.position_ids,
-        packed_seq_params=packed.packed_seq_params,
-    )
+    out = _forward_step(model, batch)
     assert torch.isfinite(out["loss"])
     assert "mtp_loss" in out
+    assert model.layers[3].self_attention.self_attention.skip_topk is True
+    assert model.mtp is not None
+    assert (
+        model.mtp.layers[0].transformer_layer.self_attention.self_attention.skip_topk
+        is False
+    )
     out["loss"].backward()
 
     grad_norm = torch.zeros((), device=device)
@@ -361,14 +367,14 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
             grad_norm = grad_norm + param.grad.detach().float().norm()
     assert torch.isfinite(grad_norm)
 
-    nested_log_probs = unpack_packed_thd_to_nested(out["log_probs"], packed)
+    nested_log_probs = unpack_forward_output(model, batch, out["log_probs"])
     assert nested_log_probs.offsets().numel() == len(lengths) + 1
     assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths
 
     if rank == 0:
         print(
             "NON_SKIP_GLM5_THD_CP_SMOKE_PASSED "
-            f"world_size={world} lengths={lengths} "
+            f"world_size={world} lengths={lengths} index_share=true mtp_indexer=full "
             f"loss={float(out['loss'].detach().item()):.6e} "
             f"grad_norm={float(grad_norm.detach().item()):.6e}"
         )
