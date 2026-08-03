@@ -252,10 +252,10 @@ class MambaSlotAllocator:
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.block_to_slot.device)
         self.slot_to_block[slot_tensor] = -1
 
-        # Clean up hash dict (CPU loop)
-        for h in hashes:
-            if h > 0 and h in self.hash_to_block_id:
-                del self.hash_to_block_id[h]
+        # Clean up mappings still owned by the evicted physical blocks.
+        for block_id, block_hash in zip(evict_ids.tolist(), hashes):
+            if block_hash > 0 and self.hash_to_block_id.get(block_hash) == block_id:
+                del self.hash_to_block_id[block_hash]
 
         return slots
 
@@ -326,13 +326,17 @@ class MambaSlotAllocator:
             block_ids_list: List of deregistered block IDs.
             hashes_to_delete: Set of hashes being deregistered (excludes -1).
         """
-        if self.hash_to_block_id:
-            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
-            if mamba_keys:
-                from collections import deque
+        block_id_set = set(block_ids_list)
+        mamba_keys = {
+            block_hash
+            for block_hash in hashes_to_delete
+            if self.hash_to_block_id.get(block_hash) in block_id_set
+        }
+        if mamba_keys:
+            from collections import deque
 
-                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
-                self._invalidate_blocks_batch(block_ids_list)
+            deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
+        self._invalidate_blocks_batch(block_ids_list)
 
     # =========================================================================
     # State store/restore

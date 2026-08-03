@@ -623,6 +623,27 @@ def test_register_rejects_hash_change_on_a_registered_block():
     assert a.block_child_count[0].item() == 1
 
 
+def test_releasing_duplicate_hash_block_preserves_new_mapping():
+    allocator = KVBlockAllocator(
+        _make_context(),
+        pool_size=8,
+        paused_limit=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+    )
+    old_block, new_block = allocator.allocate_memory_blocks(2).tolist()
+    allocator.register_kv_block_hashes([old_block], [101])
+    allocator.register_kv_block_hashes([new_block], [101])
+
+    allocator.release_memory_blocks(torch.tensor([old_block], dtype=torch.int32))
+
+    assert allocator.kv_hash_to_block_id[101] == new_block
+
+    allocator.release_memory_blocks(torch.tensor([new_block], dtype=torch.int32))
+
+    assert 101 not in allocator.kv_hash_to_block_id
+
+
 def test_evict_lru_asserts_on_cyclic_parent_graph():
     """The parent graph is assumed acyclic (a forest). A hash collision producing
     a cycle exposes no leaf, so the peel cannot collect enough blocks; this is a

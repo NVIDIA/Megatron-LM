@@ -403,17 +403,22 @@ class KVBlockAllocator:
         # Gather hashes via batched tensor indexing
         block_ids_i64 = block_ids.to(torch.int64)
         hashes = self.block_hashes[block_ids_i64].tolist()
+        block_ids_list = block_ids.tolist()
+        block_id_set = set(block_ids_list)
+        candidate_hashes = set(hashes) - {-1}
 
-        # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
-        keys_to_delete = set(hashes) - {-1}
-        deque(
-            map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
-            maxlen=0,
-        )
+        # A hash can be re-registered to a newer physical block before an older
+        # duplicate is released. Remove only mappings still owned by these blocks.
+        keys_to_delete = {
+            block_hash
+            for block_hash in candidate_hashes
+            if self.kv_hash_to_block_id.get(block_hash) in block_id_set
+        }
+        deque(map(self.kv_hash_to_block_id.pop, keys_to_delete), maxlen=0)
 
-        # Notify Mamba slot allocator (if wired) to clean up its state
+        # Mamba needs every physical block/hash pair for ownership-safe slot cleanup.
         if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
+            self.on_blocks_deregistered(block_ids_list, candidate_hashes)
 
         # Reset block state (batched tensor ops)
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:

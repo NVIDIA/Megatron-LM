@@ -1449,6 +1449,35 @@ def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
     assert allocator.block_to_slot.tolist()[3] == -1
 
 
+def test_mamba_duplicate_hash_cleanup_preserves_new_mapping(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=2, max_slots=2)
+    allocator.allocate_slots_batch([0, 1])
+    allocator.register_block_hashes_batch([0], [101])
+    allocator.register_block_hashes_batch([1], [101])
+
+    allocator.on_kv_blocks_deregistered([0], {101})
+
+    assert allocator.hash_to_block_id[101] == 1
+    assert not allocator.has_state(0)
+    assert allocator.has_state(1)
+
+
+def test_mamba_duplicate_hash_eviction_preserves_new_mapping(monkeypatch):
+    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=2)
+    allocator.allocate_slots_batch([0, 1])
+    allocator.context.kv_block_allocator.block_ref_counts[:2] = 0
+    allocator.context.kv_block_allocator.block_timestamps[:2] = torch.tensor([0, 1])
+    allocator.context.kv_block_allocator.block_hashes[:2] = 101
+    allocator.register_block_hashes_batch([0], [101])
+    allocator.register_block_hashes_batch([1], [101])
+
+    allocator.allocate_slots_batch([2])
+
+    assert allocator.hash_to_block_id[101] == 1
+    assert not allocator.has_state(0)
+    assert allocator.has_state(1)
+
+
 @pytest.mark.parametrize("max_slots", [0, 1])
 def test_optional_mamba_checkpoint_commit_uses_available_capacity(monkeypatch, max_slots):
     allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=max_slots)
