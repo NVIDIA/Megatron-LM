@@ -31,6 +31,12 @@ class DistributedDataParallelConfig:
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
+    disable_grad_buffers_cpu_backup: bool = False
+    """If true, allocate DDP gradient buffers in a torch_memory_saver region without CPU backup."""
+
+    disable_param_buffers_cpu_backup: bool = False
+    """If true, allocate DDP parameter buffers in a torch_memory_saver region without CPU backup."""
+
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
@@ -253,6 +259,15 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_max_pool_double_buffer: bool = False
+    """
+    Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+    FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+    user buffer registration and CUDA graph replay for models with asymmetrical
+    FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+    """
+
     def __post_init__(self):
         import os
 
@@ -290,3 +305,7 @@ class DistributedDataParallelConfig:
         if self.num_buckets is not None:
             assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
+
+        if self.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of double-buffer allocator.
+            self.fsdp_double_buffer = True

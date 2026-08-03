@@ -83,7 +83,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     pretrained_model_name_or_path=tokenizer_path,
                     vocab_file=vocab_file,
-                    merge_files=merges_file,
+                    merges_file=merges_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
                 )

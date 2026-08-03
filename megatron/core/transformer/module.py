@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
 from functools import partial
@@ -106,11 +106,13 @@ class MegatronModule(torch.nn.Module):
         """Sets the is_first_microbatch flag if it exists and config.fp8==True.
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
+        A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
         if (
             self.config.fp8 is not None
             or self.config.fp4 is not None
             or getattr(self.config, 'use_kitchen', False)
+            or getattr(self.config, 'quant_recipe', None) is not None
         ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
@@ -353,6 +355,9 @@ class GraphableMegatronModule(MegatronModule):
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
+            # TE captures/replays the module on its own graph stream. Passing the
+            # offload stream/event in lets TE order graph compute with D2H/H2D
+            # transfers managed by the fine-grained offload manager.
             cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
             cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs

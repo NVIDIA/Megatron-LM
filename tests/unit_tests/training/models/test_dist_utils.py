@@ -7,11 +7,13 @@ import torch
 import torch.nn as nn
 
 from megatron.core.enums import ModelType
+from megatron.core.transformer.module import Float16Module
 from megatron.training.models.dist_utils import (
     _ddp_wrap,
     _print_num_params,
     _wrap_with_mp_wrapper,
     build_virtual_pipeline_stages,
+    prepare_existing_model_chunks_for_distributed_training,
     to_empty_if_meta_device,
     unimodal_build_distributed_models,
 )
@@ -680,6 +682,48 @@ class TestDdpWrapFullParamLayout:
         self._opt.compute_full_param_layout.assert_not_called()
         assert "full_param_layout" not in mock_ddp.call_args.kwargs
 
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layer_wise_optimizer_tags_params_and_uses_layer_wise_layout(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, param = self._make_chunk_with_params()
+        ddp_config = self._ddp_config(use_distributed_optimizer=False)
+
+        with (
+            patch(
+                "megatron.training.models.dist_utils.LayerWiseDistributedOptimizer"
+            ) as mock_layer_wise_optimizer,
+            patch(
+                "megatron.training.models.dist_utils.tag_params_for_buffer_routing"
+            ) as mock_tag_params,
+        ):
+            mock_layer_wise_optimizer.compute_full_param_layout.return_value = "LAYERWISE_LAYOUT"
+            _ddp_wrap(
+                [chunk],
+                False,
+                ddp_config,
+                False,
+                pg_collection=self.pg,
+                use_layer_wise_distributed_optimizer=True,
+            )
+
+        assert ddp_config.use_distributed_optimizer is True
+        mock_tag_params.assert_called_once_with([chunk])
+        self._opt.compute_full_param_layout.assert_not_called()
+        mock_layer_wise_optimizer.compute_full_param_layout.assert_called_once()
+        layout_call = mock_layer_wise_optimizer.compute_full_param_layout.call_args
+        assert layout_call.args[0] == [param]
+        assert layout_call.args[2] == 4
+        assert layout_call.args[3] is ddp_config
+        assert layout_call.kwargs["expert_data_parallel_world_size"] == 2
+        assert mock_ddp.call_args.kwargs["full_param_layout"] == "LAYERWISE_LAYOUT"
+
     @patch("megatron.training.models.dist_utils.FullyShardedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
@@ -860,6 +904,27 @@ class TestUnimodalBuildDistributedModels:
                 self.pg,
                 self.transformer_config.virtual_pipeline_model_parallel_size,
                 ModelType.encoder_or_decoder,
+            )
+        finally:
+            self._stop_patches()
+
+    def test_prepare_existing_chunks_runs_lifecycle_without_building_stages(self):
+        param = Mock()
+        self.mock_model.parameters.return_value = [param]
+        mocks = self._standard_patches()
+        prebuilt_chunks = [self.mock_model]
+        try:
+            result = prepare_existing_model_chunks_for_distributed_training(
+                prebuilt_chunks, self.transformer_config, self.pg, wrap_with_ddp=False
+            )
+
+            assert result is prebuilt_chunks
+            mocks["bvps"].assert_not_called()
+            mocks["tp_attr"].assert_called_once_with(param)
+            mocks["print"].assert_called_once_with(prebuilt_chunks, pg_collection=self.pg)
+            self.mock_model.cuda.assert_called_once()
+            mocks["mp_wrap"].assert_called_once_with(
+                prebuilt_chunks, self.transformer_config, Float16Module
             )
         finally:
             self._stop_patches()
@@ -1062,6 +1127,22 @@ class TestUnimodalBuildDistributedModels:
                 Mock(), self.transformer_config, self.pg, ddp_config=ddp_config, wrap_with_ddp=True
             )
             mocks["ddp"].assert_called_once()
+        finally:
+            self._stop_patches()
+
+    def test_layer_wise_optimizer_flag_forwarded_to_ddp_wrap(self):
+        mocks = self._standard_patches()
+        try:
+            ddp_config = Mock()
+            unimodal_build_distributed_models(
+                Mock(),
+                self.transformer_config,
+                self.pg,
+                ddp_config=ddp_config,
+                wrap_with_ddp=True,
+                use_layer_wise_distributed_optimizer=True,
+            )
+            assert mocks["ddp"].call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
         finally:
             self._stop_patches()
 

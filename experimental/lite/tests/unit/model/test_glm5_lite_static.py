@@ -1,9 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Static and CPU smoke tests for native GLM-5 lite."""
 
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
 
 
 def _make_train_config(ps):
@@ -180,6 +183,22 @@ def test_glm5_lite_uses_shared_mla_and_dsa_primitive():
     assert "torch.topk" not in primitive_text
     assert "torch.softmax" not in primitive_text
     assert "torch.matmul" not in primitive_text
+
+
+def test_lite_csa_imports_core_csa_kernel_namespace():
+    root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
+    csa_text = (root / "primitive" / "modules" / "attention" / "csa.py").read_text()
+
+    assert (
+        "from megatron.core.transformer.experimental_attention_variant.csa_kernels import"
+        in csa_text
+    )
+    assert "FusedCSAIndexerSparseAttnFromTopkFunc" in csa_text
+    assert "csa_sparse_attn" in csa_text
+    assert (
+        "from megatron.core.transformer.experimental_attention_variant.dsa_kernels import"
+        not in csa_text
+    )
 
 
 def test_glm5_dsa_kernel_routes_indexer_forward_by_sm(monkeypatch):
@@ -391,11 +410,11 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     state = model.state_dict()
 
     assert torch.equal(
-        exported["model.layers.1.mlp.experts.2.gate_proj.weight"],
+        exported["model.layers.1.mlp.experts.2.gate_proj.weight"].detach().cpu(),
         state["layers.1.moe.experts.fc1.weight2"][: cfg.moe_intermediate_size].detach().cpu(),
     )
     assert torch.equal(
-        exported["model.layers.1.mlp.gate.e_score_correction_bias"],
+        exported["model.layers.1.mlp.gate.e_score_correction_bias"].detach().cpu(),
         state["layers.1.moe.router.expert_bias"].detach().cpu(),
     )
     assert "model.layers.1.mlp.experts.gate_up_proj" not in exported
@@ -445,6 +464,14 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
         .to(torch.bfloat16)
         .to(torch.float32),
     )
+
+
+def test_glm5_hf_export_rejects_missing_model_config():
+    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights
+    from megatron.lite.primitive.parallel import ParallelState
+
+    with pytest.raises(ValueError, match="non-null model config"):
+        next(export_hf_weights(None, None, ParallelState()))
 
 
 def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):

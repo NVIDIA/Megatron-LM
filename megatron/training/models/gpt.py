@@ -94,7 +94,16 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
         )
     elif isinstance(transformer_cfg, HeterogeneousTransformerConfig):
         return get_gpt_heterogeneous_layer_spec(transformer_cfg, use_te)
-    elif use_te:
+    else:
+        return _te_or_local_layer_spec(config, vp_stage)
+
+
+def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
+    """Need to be able to call just these branches for mtp transformer layer spec."""
+
+    transformer_cfg = config.transformer
+    use_te = transformer_cfg.transformer_impl == "transformer_engine"
+    if use_te:
         if (
             "use_te_op_fuser"
             in inspect.signature(get_gpt_layer_with_transformer_engine_spec).parameters
@@ -114,6 +123,7 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
             use_kitchen_attention=config.transformer.use_kitchen_attention,
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
+            use_grouped_gemm_for_dense_mlp=config.transformer.use_grouped_gemm_for_dense_mlp,
             **kwargs,
         )
     else:
@@ -179,7 +189,6 @@ class GPTModelConfig(ModelConfig):
     """Config file when tp_comm_overlap is enabled."""
 
     ### settings for default layer spec options ###
-    use_transformer_engine_op_fuser: bool = False
     use_arbitrary_attention_mask: bool | None = None
 
     @override
@@ -362,6 +371,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             Callable[[Any, MegatronModule], MegatronModule] | None
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
+        use_layer_wise_distributed_optimizer: bool = False,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -376,6 +386,8 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
+            use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
+                parameters for the layer-wise distributed optimizer.
 
         Returns:
             List of model stages.
@@ -395,6 +407,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             mixed_precision_wrapper,
             composed_pre_wrap_hook,
             model_type,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
@@ -430,7 +443,7 @@ def mtp_block_spec(
         ):
             # Get the decoder layer spec explicitly if no decoder layer in the last stage,
             # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-            spec = default_layer_spec(config, vp_stage)
+            spec = _te_or_local_layer_spec(config, vp_stage)
         else:
             decoder_specs = get_gpt_decoder_layer_specs(
                 transformer_cfg,

@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
@@ -255,6 +255,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
+        self._validate_async_sched_support_for_config()
+        # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
+        # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
+        self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
         # Initialize engine.
         self.reset()
 
@@ -395,6 +399,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
+
+        # Pre-size the GlobalMemoryBuffer sequence-parallel all-gather buffer ("mpu")
+        # to the worst case BEFORE capturing graphs. get_tensor() is grow-only: in
+        # training the shape is static so it settles before capture, but dynamic
+        # inference issues forwards of varying token counts. A forward larger than
+        # the capture-time size would reallocate (and free) the buffer whose address
+        # a captured graph still writes to on replay, corrupting whatever later
+        # reuses that freed block. Allocating the max size up front keeps the address
+        # stable for the graph's lifetime. Only needed when sequence parallel is on
+        # (otherwise the "mpu" all-gather path is not taken).
+        if getattr(model_config, "sequence_parallel", False):
+            from megatron.core.parallel_state import get_global_memory_buffer
+
+            max_ag_numel = self.context.max_tokens * model_config.hidden_size
+            get_global_memory_buffer().get_tensor((max_ag_numel,), model_config.params_dtype, "mpu")
 
         # MTP warmup preparation: capture MTP CUDA graphs alongside the
         # decoder graphs within the same loop rather than in a separate pass.
@@ -966,11 +985,56 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return self.requests[request_id].record[-1]
 
+    def _validate_async_sched_support_for_config(self) -> None:
+        """Validate config-level restrictions for serial async scheduling.
+
+        Raises if the config does not support serial async scheduling.
+        """
+        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+            return
+
+        model_config = self.controller.inference_wrapped_model.model.config
+        if self.num_speculative_tokens > 0:
+            raise ValueError("Async scheduling does not support speculative tokens.")
+        if self.context.is_hybrid_model:
+            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
+        if self.context.enable_prefix_caching:
+            raise ValueError("Async scheduling does not support prefix caching.")
+        if not self.materialize_only_last_token_logits:
+            raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
+        if model_config.expert_model_parallel_size > 1:
+            raise ValueError("Async scheduling does not support expert parallelism.")
+        if model_config.num_moe_experts is not None:
+            raise ValueError("Async scheduling does not support MoE models.")
+        if model_config.moe_enable_routing_replay:
+            raise ValueError("Async scheduling does not support routing replay.")
+
+    def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
+        """Validate request-level restrictions for serial async scheduling.
+
+        Args:
+            request (DynamicInferenceRequest): Request being added to the engine.
+        """
+        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+            return
+
+        sampling_params = request.sampling_params
+        if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
+            raise ValueError(
+                "Async scheduling only supports greedy sampling "
+                "(SamplingParams.top_k == 1 and top_p == 0.0)."
+            )
+        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+            raise ValueError("Async scheduling does not support log probabilities.")
+        if sampling_params.stop_words:
+            raise ValueError("Async scheduling does not support stop words.")
+
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
 
         request_id = request.request_id
+        self._validate_async_sched_support_for_request(request)
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.

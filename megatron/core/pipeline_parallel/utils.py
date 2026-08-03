@@ -1,8 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 
 import torch
@@ -156,6 +156,8 @@ class ScheduleNode:
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
+        forward_nvtx_name: Optional[str] = None,
+        backward_nvtx_name: Optional[str] = None,
     ):
         """Initialize a schedule node.
 
@@ -173,8 +175,12 @@ class ScheduleNode:
             free_input (bool): Flag to indicate if the input should be freed after the
                 forward pass.
             name (str): Name of the node for debugging purposes.
+            forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
+            backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
         """
         self.name = name
+        self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
+        self.backward_nvtx_name = backward_nvtx_name or f"{name} backward"
         self.forward_func = forward_func
         self.backward_func = backward_func if backward_func else self.default_backward_func
         self.stream = stream
@@ -182,6 +188,11 @@ class ScheduleNode:
         self.free_input = free_input
         self.inputs = None
         self.outputs = None
+        # When True, the forward function runs under torch.no_grad() so no autograd
+        # graph / saved activations are retained. Used by the VPP-stage full recompute
+        # path (EP A2A overlap): the initial forward keeps only the stage input tensor
+        # and the whole stage is recomputed with grad enabled at backward time.
+        self.forward_no_grad = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -206,16 +217,23 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(f"{self.name} forward"):
+        with self.stream_acquire_context(self.forward_nvtx_name):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
                     input.requires_grad = inputs[i].requires_grad
 
             data = tuple(self.inputs)
-            data = self.forward_func(*data)
+            # Under the VPP-stage full recompute path, the initial forward runs
+            # without building an autograd graph; the graph is rebuilt at backward
+            # time by re-running this same forward with grad enabled.
+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
+            with grad_ctx:
+                data = self.forward_func(*data)
 
-            if not isinstance(data, tuple):
+            if data is None:
+                pass
+            elif not isinstance(data, tuple):
                 data = make_viewless(data)
             else:
                 data = tuple([make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data])
@@ -246,7 +264,7 @@ class ScheduleNode:
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
-        with self.stream_acquire_context(f"{self.name} backward"):
+        with self.stream_acquire_context(self.backward_nvtx_name):
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)

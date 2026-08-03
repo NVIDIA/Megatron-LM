@@ -78,6 +78,7 @@ def model_provider(
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+    vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
     if getattr(args, "recompute_vision", False):
         vision_config.recompute_granularity = "full"
@@ -162,7 +163,7 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         datasets_provider,
-        model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider=model_provider,
     )

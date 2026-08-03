@@ -81,6 +81,7 @@ class MambaLayer(GraphableMegatronModule):
         """
         super().__init__(config)
         assert pg_collection is not None, "pg_collection must be provided for MambaLayer"
+        self.tp_group = pg_collection.tp
 
         self.config = config
         self.submodules_config = submodules

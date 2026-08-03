@@ -25,7 +25,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl_mlite.compat import load_verl_engine_api
+from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -35,6 +35,8 @@ except Exception:  # pragma: no cover - older VERL without Metric
     _VerlMetric = None
 
 from .config import MegatronLiteEngineConfig
+
+_patch_bucketed_weight_sender()
 
 BaseEngine, BaseEngineCtx, EngineRegistry, postprocess_batch_func, prepare_micro_batches = (
     load_verl_engine_api()
@@ -379,7 +381,11 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
-        if self.engine_config.model_name == "qwen3_5":
+        if self.engine_config.resync_format is not None:
+            export_kwargs["target"] = self.engine_config.resync_format
+            if self.engine_config.resync_config:
+                export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+        elif self.engine_config.model_name == "qwen3_5":
             export_kwargs["target"] = "vllm"
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
@@ -432,7 +438,8 @@ class MegatronLiteEngine(BaseEngine):
         save_contents = self.checkpoint_config.get("save_contents", None)
         save_model = save_contents is None or "model" in save_contents
         save_optimizer = save_contents is None or "optimizer" in save_contents
-        if not save_model and not save_optimizer:
+        save_hf_model = save_contents is not None and "hf_model" in save_contents
+        if not save_model and not save_optimizer and not save_hf_model:
             if self._rank == 0:
                 print(
                     f"Skipping Megatron Lite checkpoint save at step {global_step}: save_contents={save_contents}"
@@ -448,28 +455,72 @@ class MegatronLiteEngine(BaseEngine):
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
-            save_training_checkpoint(
-                self.module,
-                self.handle._optimizer,
-                global_step,
-                local_path,
-                self.handle._config.parallel,
-                self.handle._parallel_state,
-                get_placements=placement_fn,
-                is_expert=expert_classifier,
-                save_model=save_model,
-                save_optimizer=save_optimizer,
-            )
+            if save_model or save_optimizer:
+                save_training_checkpoint(
+                    self.module,
+                    self.handle._optimizer,
+                    global_step,
+                    local_path,
+                    self.handle._config.parallel,
+                    self.handle._parallel_state,
+                    get_placements=placement_fn,
+                    is_expert=expert_classifier,
+                    save_model=save_model,
+                    save_optimizer=save_optimizer,
+                )
             if self.handle._lr_scheduler is not None and self._rank == 0:
                 torch.save(
                     self.handle._lr_scheduler.state_dict(),
                     os.path.join(local_path, _LR_SCHEDULER_STATE),
                 )
+            if save_hf_model:
+                self._save_hf_checkpoint(local_path)
             if dist.is_initialized():
                 dist.barrier()
         finally:
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+    def _save_hf_checkpoint(self, local_path: str) -> None:
+        proto = self.handle._extras.get("protocol")
+        if proto is None or not hasattr(proto, "save_hf_weights"):
+            raise RuntimeError(
+                "hf_model save requested, but the model protocol does not expose "
+                "save_hf_weights; refusing to report a successful checkpoint save."
+            )
+
+        model_chunks = self.handle._extras.get("model_chunks", [self.handle._model])
+        model_cfg = self.handle._extras.get("model_cfg")
+        if model_cfg is None:
+            raise RuntimeError(
+                "hf_model save requested, but the runtime handle has no model_cfg; "
+                "the model-specific exporter cannot be called safely."
+            )
+        ps = self.handle._parallel_state
+        hf_local_path = os.path.join(local_path, "huggingface")
+
+        if self._rank == 0:
+            os.makedirs(hf_local_path, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
+
+        proto.save_hf_weights(model_chunks, hf_local_path, model_cfg, ps)
+
+        if self._rank == 0:
+            hf_config = getattr(self.model_config, "hf_config", None)
+            if hf_config is not None:
+                auto_map = getattr(hf_config, "auto_map", None)
+                if isinstance(auto_map, dict) and None in auto_map:
+                    hf_config.auto_map = {k: v for k, v in auto_map.items() if k is not None}
+                hf_config.save_pretrained(hf_local_path)
+            tokenizer = getattr(self.model_config, "tokenizer", None)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(hf_local_path)
+            processor = getattr(self.model_config, "processor", None)
+            if processor is not None:
+                processor.save_pretrained(hf_local_path)
+        if dist.is_initialized():
+            dist.barrier()
 
     def load_checkpoint(
         self,
@@ -686,12 +737,23 @@ class MegatronLiteEngine(BaseEngine):
         if loss_function is not None or forward_only:
             runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
+        replay_specs = [
+            runtime_batch.routed_experts is not None
+            for runtime_batch, _loss_context in runtime_batches
+        ]
+        replay_enabled = self.engine_config.router_replay_mode == "R3"
+        if replay_enabled and not all(replay_specs):
+            raise ValueError(
+                "router_replay_mode='R3' requires routed_experts on every "
+                "actor micro-batch in a step."
+            )
         result = self.runtime.forward_backward(
             self.handle,
             iter(runtime_batches),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
+            router_replay={"action": "replay"} if replay_enabled else None,
         )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
@@ -725,11 +787,18 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
+        routed_experts = micro_batch.get("routed_experts", None)
+        if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
+            raise ValueError(
+                "R3 routed_experts must use VERL's jagged no-padding layout; "
+                f"got shape {tuple(routed_experts.shape)}."
+            )
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
             loss_mask=None if loss_mask is None else loss_mask.values().contiguous().float(),
             seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
+            routed_experts=routed_experts,
         )
 
     def _make_runtime_loss_context(
@@ -756,8 +825,35 @@ class MegatronLiteEngine(BaseEngine):
             return None
 
         loss_mask = micro_batch["loss_mask"]
+        input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
-            return loss_mask
+            # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
+            # nested tensor (shape ``[bsz, response_len]``), while ``input_ids`` is
+            # the full ``[prompt; response]`` packed sequence. Returning it as-is
+            # left the packed loss_mask (sum of response lengths) shorter than the
+            # ``input_ids`` seq_lens, so ``_nested_from_packed_tensor`` narrowed a
+            # full-length slice out of a response-only buffer and crashed the
+            # actor-update step. Expand it here to the full sequence the same way
+            # the native Megatron path does (``_build_mtp_loss_mask_nested``):
+            # left-pad each row with prompt zeros and keep the whole valid response
+            # span (response_mask may carry internal zeros for tool outputs).
+            resp_offsets = loss_mask.offsets().tolist()
+            resp_values = loss_mask.values()
+            rows = []
+            for i, total in enumerate(input_lengths):
+                start, end = resp_offsets[i], resp_offsets[i + 1]
+                response_piece = resp_values[start:end]
+                prompt_len = total - (end - start)
+                if prompt_len < 0:
+                    raise ValueError(
+                        f"response loss mask has {end - start} tokens but packed input "
+                        f"sequence has {total} tokens"
+                    )
+                prompt_pad = torch.zeros(
+                    prompt_len, dtype=response_piece.dtype, device=response_piece.device
+                )
+                rows.append(torch.cat([prompt_pad, response_piece], dim=0))
+            return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
         rows = []
         for seq_ids, row_mask in zip(input_ids.unbind(0), loss_mask, strict=True):

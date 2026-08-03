@@ -158,15 +158,6 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
                 hybrid_stack_spec = default_hybrid_stack_spec
 
         assert (
-            getattr(self._model_config.transformer, "virtual_pipeline_model_parallel_size", None)
-            is None
-            and vp_stage is None
-        ), (
-            "Virtual pipeline model parallelism is temporarily unsupported in Hybrid "
-            "models due to upstream MCore HybridModel API dependency"
-        )
-
-        assert (
             self._model_config.vocab_size is not None
         ), "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:
@@ -216,6 +207,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             Callable[[Any, MegatronModule], MegatronModule] | None
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
+        use_layer_wise_distributed_optimizer: bool = False,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
 
@@ -230,6 +222,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
+            use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
+                parameters for the layer-wise distributed optimizer.
 
         Returns:
             List of model stages.
@@ -249,6 +243,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             mixed_precision_wrapper,
             composed_pre_wrap_hook,
             model_type,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)

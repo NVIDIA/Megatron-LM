@@ -15,7 +15,12 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
     save_hf_weights as _save_hf_weights_impl,
 )
-from megatron.lite.model.protocol_utils import add_loss_context_kwargs
+from megatron.lite.model.protocol_utils import (
+    add_loss_context_kwargs,
+    nested_from_packed,
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+    pack_routed_experts as _pack_routed_experts,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
@@ -79,6 +84,7 @@ _MODEL_FORWARD_KEYS = (
     "temperature",
     "calculate_entropy",
     "enable_mtp",
+    "packed_seq_params",
 )
 
 
@@ -126,23 +132,12 @@ def _infer_cp_local_seq_len(
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
 
-def _nested_from_packed_tensor(tensor, seq_lens):
-    if tensor is None:
-        return None
-    if tensor.dim() == 2 and tensor.size(0) == 1:
-        tensor = tensor.squeeze(0)
-    if tensor.dim() != 1:
-        raise ValueError(f"PackedBatch tensor must be 1-D, got {tuple(tensor.shape)}.")
-
-    pieces = []
-    offset = 0
-    for length_t in seq_lens:
-        length = int(length_t.item())
-        pieces.append(tensor.narrow(0, offset, length))
-        offset += length
-    if offset != tensor.numel():
-        raise ValueError(f"PackedBatch sizes sum to {offset}, tensor has {tensor.numel()} tokens.")
-    return torch.nested.as_nested_tensor(pieces, layout=torch.jagged)
+# The 1-D-packed -> jagged-nested split is model-agnostic and lives in the shared
+# protocol_utils layer. DS4 only forks the *CP layout* pair (contiguous DSA, see
+# ``_prepare_packed_batch_kwargs`` below); this pre-CP primitive must not diverge,
+# so alias the shared implementation instead of re-copying it. Keeping the local
+# name preserves existing call sites and unit tests.
+_nested_from_packed_tensor = nested_from_packed
 
 
 def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
@@ -155,9 +150,9 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         cp_group=ps.cp_group,
         split_cp=False,
         labels=_nested_from_packed_tensor(batch.labels, seq_lens),
-        roll_labels=True,
-        roll_loss_mask=True,
         loss_mask=_nested_from_packed_tensor(batch.loss_mask, seq_lens),
+        roll_labels=batch.labels is not None,
+        roll_loss_mask=batch.loss_mask is not None,
     )
     kwargs: dict[str, Any] = {
         "input_ids": packed.input_ids,
@@ -169,7 +164,6 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     }
     add_loss_context_kwargs(kwargs)
     _prepare_packed_contiguous_cp_kwargs(model, kwargs)
-    kwargs.pop("packed_seq_params", None)
     return {key: value for key, value in kwargs.items() if key in _MODEL_FORWARD_KEYS}
 
 
@@ -270,6 +264,28 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_to_nested(output, meta, contiguous=True)
 
 
+def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
+    """Pack R3 routes using DS4's contiguous CP token layout."""
+
+    return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
+
+
+def pack_r3_replay_mask(model: nn.Module, batch: PackedBatch) -> torch.Tensor:
+    """Pack the causal R3 mask using DS4's contiguous CP token layout."""
+
+    return _pack_r3_replay_mask(model, batch, contiguous=True)
+
+
+def router_replay_roots(chunk: nn.Module) -> list[nn.Module]:
+    """Return main decoder layers only; rollout R3 has no MTP layer axis."""
+
+    model = getattr(chunk, "model", chunk)
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return [chunk]
+    return list(layers.values())
+
+
 def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
     override = impl_cfg.num_nextn_predict_layers
     if override is None:
@@ -321,9 +337,10 @@ def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
-    model = getattr(chunk, "model", None)
-    if model is None:
-        return []
+    # Native DS4 chunks are DeepseekV4Model instances themselves. Keep support
+    # for wrapper-style chunks, but do not require a `.model` indirection or
+    # recompute/offload silently applies to zero transformer layers.
+    model = getattr(chunk, "model", chunk)
     layers = list(getattr(model, "layers", {}).values())
     mtp_layers = list(getattr(model, "mtp", []))
     return [*layers, *mtp_layers]

@@ -22,6 +22,7 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -278,6 +279,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
+        self.async_sched_step_count = 0
+        self.async_sched_compaction_step_count = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -2421,6 +2424,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count = 0
         self.active_token_count = 0
         self.lifetime_prefill_token_count = 0
+        self.async_sched_step_count = 0
+        self.async_sched_compaction_step_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -3234,6 +3239,159 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
+    def prepare_requests(self, new_tokens: Tensor) -> None:
+        """Speculatively prepare active decode requests for the next forward pass.
+
+        Async scheduling only supports decode-only steps with no pause,
+        evict, or resume lifecycle changes. If preparing the next token would
+        require one of those lifecycle changes, this method raises and the caller
+        should treat async scheduling as unsupported for that workload.
+
+        Args:
+            new_tokens (Tensor): Newly sampled token for each active request.
+        """
+        if new_tokens.is_cuda:
+            new_tokens = new_tokens.cpu()
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        if self.num_speculative_tokens != 0:
+            raise RuntimeError("Async scheduling does not support speculative tokens.")
+        if self.num_prefill_requests != 0:
+            raise RuntimeError("Async scheduling only supports decode-only steps.")
+        if self.paused_request_count != 0:
+            raise RuntimeError("Async scheduling does not support paused requests.")
+        if new_tokens.numel() != active_request_count:
+            raise RuntimeError(
+                f"Expected {active_request_count} new tokens, got {new_tokens.numel()}."
+            )
+
+        if active_request_count == 0:
+            self.active_token_count = 0
+            return
+
+        active_slice = slice(0, active_request_count)
+        rows_requiring_new_block = (
+            self.request_last_kv_block_offset[active_slice] >= self.block_size_tokens - 1
+        )
+        num_new_blocks = rows_requiring_new_block.sum().item()
+        if num_new_blocks > 0:
+            active_block_count_avail = self.kv_block_allocator.get_active_avail()
+            if num_new_blocks > active_block_count_avail:
+                raise RuntimeError("Async scheduling cannot pause requests to allocate new blocks.")
+
+            block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+            if block_ids is None:
+                raise RuntimeError("Async scheduling cannot evict requests to allocate new blocks.")
+
+            row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
+            col_idx = self.request_kv_block_counts[row_idx]
+            self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
+            self.request_kv_block_counts[row_idx] += 1
+            self.request_last_kv_block_id[row_idx] = block_ids
+
+        self.request_kv_length_offsets[active_slice].add_(self.request_query_lengths[active_slice])
+        self.request_query_lengths[active_slice].fill_(1)
+
+        self.request_last_kv_block_offset[active_slice] = (
+            self.request_last_kv_block_offset[active_slice] + 1
+        ) % self.block_size_tokens
+
+        self.active_token_count = active_request_count
+        self.token_to_input_ids[:active_request_count] = new_tokens
+        self.token_to_pos_ids[:active_request_count] = self.request_kv_length_offsets[active_slice]
+        self.token_to_request_idx[:active_request_count] = torch.arange(
+            active_request_count, device='cpu'
+        )
+        self.token_to_position_in_request[:active_request_count] = self.token_to_pos_ids[
+            :active_request_count
+        ]
+        self.token_to_local_position_within_kv_block[:active_request_count] = (
+            self.token_to_pos_ids[:active_request_count] % self.block_size_tokens
+        )
+        self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
+
+    def resolve_requests(self, active_requests_mask: Tensor) -> Tensor:
+        """Resolve finished requests after an async scheduling forward pass.
+
+        Async scheduling supports only request completion. The active request rows
+        and current decode-token rows are compacted in survivor order so any
+        following legacy or async scheduling step sees a consistent context.
+
+        Args:
+            active_requests_mask (Tensor): 1D mask marking requests that remain active.
+
+        Returns:
+            Tensor: Request IDs for requests that finished during resolution.
+        """
+        if active_requests_mask.is_cuda:
+            active_requests_mask = active_requests_mask.cpu()
+
+        if self.num_speculative_tokens != 0:
+            raise RuntimeError("Async scheduling does not support speculative tokens.")
+        if self.num_prefill_requests != 0:
+            raise RuntimeError("Async scheduling only supports decode-only steps.")
+        if self.paused_request_count != 0:
+            raise RuntimeError("Async scheduling does not support paused requests.")
+
+        old_active_request_count = self.total_request_count
+        if active_requests_mask.numel() != old_active_request_count:
+            raise RuntimeError(
+                f"Expected active mask of length {old_active_request_count}, "
+                f"got {active_requests_mask.numel()}."
+            )
+
+        survivor_idxs = torch.nonzero(active_requests_mask == 1, as_tuple=True)[0]
+        finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
+        finished_request_ids = self.request_ids[finished_idxs].clone()
+
+        self.reset_attention_state()
+
+        if finished_idxs.numel() > 0:
+            self.release_memory_blocks_from_request_indexes(finished_idxs)
+
+        active_request_count = survivor_idxs.numel()
+        if active_request_count == 0:
+            self.request_to_kv_block_ids.fill_(-1)
+            self.total_request_count = 0
+            self.active_token_count = 0
+            self.reset_mamba_state()
+            return finished_request_ids
+
+        dst_idxs = torch.arange(active_request_count, device='cpu')
+        if not torch.equal(survivor_idxs, dst_idxs):
+            self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
+            self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
+                survivor_idxs
+            ]
+            self.request_query_lengths[dst_idxs] = self.request_query_lengths[survivor_idxs]
+            self.request_output_lengths[dst_idxs] = self.request_output_lengths[survivor_idxs]
+            self.request_ids[dst_idxs] = self.request_ids[survivor_idxs]
+            self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[survivor_idxs]
+            self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[survivor_idxs]
+            self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[survivor_idxs]
+            self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[
+                survivor_idxs
+            ]
+            for metadata_tensor in self.request_metadata.values():
+                metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
+
+            self.token_to_input_ids[dst_idxs] = self.token_to_input_ids[survivor_idxs]
+            self.token_to_pos_ids[dst_idxs] = self.token_to_pos_ids[survivor_idxs]
+            self.token_to_block_idx[dst_idxs] = self.token_to_block_idx[survivor_idxs]
+            self.token_to_local_position_within_kv_block[dst_idxs] = (
+                self.token_to_local_position_within_kv_block[survivor_idxs]
+            )
+            self.token_to_position_in_request[dst_idxs] = self.token_to_position_in_request[
+                survivor_idxs
+            ]
+
+        self.token_to_request_idx[:active_request_count] = dst_idxs
+        stale_slice = slice(active_request_count, old_active_request_count)
+        self.request_to_kv_block_ids[stale_slice] = -1
+        self.total_request_count = active_request_count
+        self.active_token_count = active_request_count
+        return finished_request_ids
+
     def update_requests(
         self,
         active_requests_mask: Tensor,
@@ -3691,8 +3849,38 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
+    def _processed_log_probs(
+        self,
+        logits: Tensor,
+        n_active: int,
+        active_query_lengths: Optional[Tensor],
+        sampling: Optional[Sampling],
+    ) -> Tensor:
+        """Sample the logprobs if desired."""
+        if self.config.logprobs_mode == "raw_logprobs":
+            return F.log_softmax(logits, dim=-1)
+
+        assert sampling is not None, "processed_logprobs requires a sampling backend"
+
+        # Map each logits row to its active request.
+        request_idx = torch.arange(n_active, device=logits.device)
+        row_to_request = (
+            request_idx
+            if active_query_lengths is None
+            else request_idx.repeat_interleave(active_query_lengths)
+        )
+        md = self.active_request_metadata
+        temperature = md["temperature"][:n_active].to(logits.device, torch.float32)[row_to_request]
+        top_k = md["top_k"][:n_active].to(logits.device, torch.long)[row_to_request]
+        top_p = md["top_p"][:n_active].to(logits.device, torch.float32)[row_to_request]
+        return sampling.log_probs_kernel(logits, temperature, top_k, top_p)
+
     def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: Optional[bool] = False,
+        sampling: Optional[Sampling] = None,
     ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs for all active requests and return them.
 
@@ -3702,6 +3890,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
             new_tokens (Tensor): The newly sampled tokens.
             only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            sampling (Optional[Sampling]): Backend used to optionally modify log-probs.
 
         Returns:
             List of lists where each inner list contains log probs for a request in the
@@ -3711,14 +3900,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Calculate log_probs (sequence_length x vocab_size)
         logits_squeezed = logits.squeeze(0).float()
+        n_active = self.total_request_count - self.paused_request_count
 
         if only_last_token_logits or self.is_decode_only():
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
+            log_probs = self._processed_log_probs(
+                logits_squeezed[seq_idx], n_active, None, sampling
+            )
             selected_log_probs = log_probs[seq_idx, new_tokens]
             return [[lp] for lp in selected_log_probs.tolist()], log_probs
 
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
@@ -3742,12 +3933,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         #
         #   active_token_ids[new_token_idx] = new_tokens
         #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        n_active = self.total_request_count - self.paused_request_count
         active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
         active_query_lengths = self.gpu_view.request_query_lengths[:n_active]
 
         new_token_idx = active_query_lengths.cumsum(0) - 1
         active_token_ids[new_token_idx] = new_tokens
+
+        # Compute (possibly processed) log-probs over all active-token rows.
+        log_probs = self._processed_log_probs(
+            logits_squeezed, n_active, active_query_lengths, sampling
+        )
 
         # Extract the log probs for only the selected tokens.
         # (sequence_length x vocab_size) -> (sequence_length)
