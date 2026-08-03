@@ -2582,6 +2582,31 @@ Ranked by kernel time, the remaining decode candidates are `_moe_sum_kernel_fast
 whose window was not restricted to steady-state decode, so they are inflated by prefill
 instances and are ranking hints, not budgets.
 
+### QWEN-039 — raise `CUDA_DEVICE_MAX_CONNECTIONS` from 1 to 8: **+0.9%, provisional**
+
+`GAP-DECOMP-S17` observed that mcore gets essentially no stream concurrency (interval
+union 6.926 ms ≈ sum-of-durations 6.970 ms) while vLLM recovers 0.36 ms through overlap.
+The harness pins `CUDA_DEVICE_MAX_CONNECTIONS=1` (`dev/moe_fused/run_e2e_cfg.sh`), which
+puts every stream on one hardware channel and serializes work that has no data dependency
+— notably the shared-expert stream against the main stream. Env-only test:
+
+| arm | `CUDA_DEVICE_MAX_CONNECTIONS` | mean tok/s | vs `a2qkv` |
+| --- | --- | --- | --- |
+| `a2qkv` | 1 | 27,954 | — |
+| `c2conn4` | 4 | 27,999 | +0.16% |
+| `c1conn8` | 8 | **28,214** | **+0.93%** |
+
+**Provisional, not confirmed.** All 5 of `c1conn8`'s iterations sit above `a2qkv`'s mean,
+which is suggestive, but the two arms' per-iteration spreads overlap (553 and 611) and the
+allocation expired before a repeat could be run. **Re-run `a2qkv` and `c1conn8` back to
+back before believing +0.9%**, and note that `=1` is often set deliberately to keep
+collectives from being starved of channels, so a confirmation should check the collective
+timings too, not just throughput.
+
+Session best configuration: standing 12 gates + FA2 + `MCORE_FUSED_ADD_NORM_QKV=1` +
+`CUDA_DEVICE_MAX_CONNECTIONS=8` = **28,214 tok/s, +3.80%** over the same node's baseline
+of 27,182.
+
 ### BUDGET-S17 — first trustworthy per-kernel decode budget, and how to window a trace
 
 Every per-kernel table before this one was taken over a window that included model load,
