@@ -9,6 +9,7 @@ at the same import path; the names below preserve that module's public surface.
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
+    _split_tensor_factory,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
@@ -22,6 +23,7 @@ __all__ = [
     "HAVE_FLA",
     "GatedDeltaNet",
     "GatedDeltaNetSubmodules",
+    "_split_tensor_factory",
     "causal_conv1d",
     "chunk_gated_delta_rule",
     "get_parameter_local_cp",

@@ -43,10 +43,12 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
+    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
+    build_cp_context = None
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
@@ -181,6 +183,21 @@ class _GDNBase(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
+        # Headwise CP shards heads over the CP group; chunkwise CP keeps heads local.
+        if self.config.linear_cp_mode == "headwise":
+            num_key_heads_per_tp = self.num_key_heads // self.tp_size
+            num_value_heads_per_tp = self.num_value_heads // self.tp_size
+            assert num_key_heads_per_tp % self.cp_size == 0, (
+                f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+                f"to evenly divide num_key_heads per TP rank ({num_key_heads_per_tp}); "
+                f"all runtime dynamic cp_size values divide the static one and so will also divide."
+            )
+            assert num_value_heads_per_tp % self.cp_size == 0, (
+                f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+                f"to evenly divide num_value_heads per TP rank ({num_value_heads_per_tp}); "
+                f"all runtime dynamic cp_size values divide the static one and so will also divide."
+            )
+
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
@@ -268,6 +285,9 @@ class _GDNBase(MegatronModule):
         self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -283,6 +303,9 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
+        # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
+        # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
+        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
 
@@ -387,6 +410,7 @@ class _GDNBase(MegatronModule):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        cp_size_headwise: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -400,11 +424,11 @@ class _GDNBase(MegatronModule):
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
+        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
+
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
+            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
         )
 
         # Reshape query_key and value
@@ -416,7 +440,7 @@ class _GDNBase(MegatronModule):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
@@ -645,7 +669,7 @@ def _build_head_perm_for_split_sections(
 def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
@@ -663,12 +687,14 @@ def get_parameter_local_cp(
         torch.Tensor: The local parameter for the current context parallel rank.
     """
 
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to split if CP size is 1.
     if cp_size == 1:
         return param
+
+    assert cp_group is not None
+    cp_rank = cp_group.rank()
 
     # Split first if needed.
     if split_sections is not None:
@@ -691,7 +717,7 @@ def tensor_a2a_cp2hp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
     undo_attention_load_balancing: bool = True,
 ):
@@ -712,11 +738,13 @@ def tensor_a2a_cp2hp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
+
+    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_cp2hp.
     assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
@@ -754,7 +782,7 @@ def tensor_a2a_hp2cp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
     redo_attention_load_balancing: bool = True,
 ):
@@ -775,11 +803,13 @@ def tensor_a2a_hp2cp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
+
+    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
     assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
