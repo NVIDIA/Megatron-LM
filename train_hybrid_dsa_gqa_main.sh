@@ -16,8 +16,11 @@ cd "$(dirname "$0")"
 
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 NAME=${NAME:-hybrid_dsa_gqa_main}
-SEQ_LEN=${SEQ_LEN:-4096}         # keep >= dsa-indexer-topk
-TOPK=${TOPK:-2048}               # must be a multiple of 128 for cuDNN
+SEQ_LEN=${SEQ_LEN:-2048}         # keep >= dsa-indexer-topk
+TOPK=${TOPK:-1024}               # must be a multiple of 128 for cuDNN
+# NOTE: option-1 uses main's PyTorch reference loss, whose dense teacher scores are
+# O(seq^2) memory (~1GB/DSA-layer at seq=4096). Long sequences OOM here; that path
+# needs the (later) Triton kernel. Keep seq modest for the cuDNN-indexer timing run.
 DSA_BACKEND=${DSA_BACKEND:-cudnn}  # cudnn | tilelang | none
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1   # pre-Blackwell TP>1/CP>1 non-FSDP; harmless otherwise
