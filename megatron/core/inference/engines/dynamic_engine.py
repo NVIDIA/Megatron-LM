@@ -271,7 +271,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
-        self.dynamo_helper = context.dynamo_helper
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
@@ -852,13 +851,23 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         InferenceMode.unset_active()
-        self.dynamo_helper.notify_kv_cache_cleared()
+        dynamo_helper = getattr(self.context, "dynamo_helper", None)
+        if dynamo_helper is not None:
+            dynamo_helper.discard_pending_kv_stored_events()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_inference_state_buffers()
+
+        if (
+            dynamo_helper is not None
+            and self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+        ):
+            # PERSIST and OFFLOAD restore the same cache contents on resume; only
+            # RECOMPUTE invalidates the blocks previously advertised to Dynamo.
+            dynamo_helper.notify_kv_cache_cleared()
 
         if (
             self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -2088,7 +2097,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Discard registrations left by an interrupted prior step before this
         # step's scheduling queues new registrations.
-        self.dynamo_helper.discard_pending_kv_stored_events()
+        dynamo_helper = getattr(self.context, "dynamo_helper", None)
+        if dynamo_helper is not None:
+            dynamo_helper.discard_pending_kv_stored_events()
 
         mode = self.context.config.async_sched_mode
         if mode == AsyncScheduleMode.LEGACY:
@@ -2147,7 +2158,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
-        self.dynamo_helper.publish_pending_kv_stored_events()
+        if dynamo_helper is not None:
+            dynamo_helper.publish_pending_kv_stored_events()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()

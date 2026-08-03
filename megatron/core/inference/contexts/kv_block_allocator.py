@@ -413,6 +413,7 @@ class KVBlockAllocator:
 
         # Gather hashes via batched tensor indexing
         block_ids_i64 = block_ids.to(torch.int64)
+        block_ids_list = block_ids.tolist()
         hashes = self.block_hashes[block_ids_i64].tolist()
 
         # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
@@ -421,12 +422,6 @@ class KVBlockAllocator:
             map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
             maxlen=0,
         )
-
-        # Notify Mamba slot allocator (if wired) to clean up its state
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
-        for observer in tuple(self._blocks_deregistered_observers):
-            observer(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -450,6 +445,13 @@ class KVBlockAllocator:
         # Return blocks to free pool
         self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
         self.pool_avail += num_blocks
+
+        # Notify dependent allocators and external observers only after KV allocator
+        # bookkeeping commits, so callback failures cannot leave this allocator partial.
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(block_ids_list, keys_to_delete)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids_list, keys_to_delete)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.

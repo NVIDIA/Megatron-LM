@@ -1,11 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import Mock
 
 import pytest
 
-from megatron.core.inference.config import AsyncScheduleMode
+from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext, DynamoHelper
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 
@@ -63,6 +66,61 @@ def test_dummy_reset_preserves_prefix_cache_without_publishing_clear():
     context.mamba_slot_allocator.reset.assert_not_called()
     assert context.step_count == 17
     assert context.prefix_cache_lru_clock == 11
+
+
+def test_full_reset_publishes_clear_after_cache_reset():
+    context, listener = _context_with_listener()
+    order = []
+    context.enable_prefix_caching = True
+    context.reset_tensors = Mock(side_effect=lambda: order.append("reset_tensors"))
+    context.reset_metadata = Mock(side_effect=lambda **_kwargs: order.append("reset_metadata"))
+    context.step_count = 17
+    context.prefix_cache_lru_clock = 11
+    context.mamba_slot_allocator = Mock()
+    context.mamba_slot_allocator.reset.side_effect = lambda: order.append("reset_mamba")
+    listener.side_effect = lambda kind, _payload: order.append(kind)
+
+    context.reset()
+
+    assert order == ["reset_tensors", "reset_metadata", "reset_mamba", "cleared"]
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "expect_clear"),
+    [
+        (KVCacheManagementMode.PERSIST, False),
+        (KVCacheManagementMode.OFFLOAD, False),
+        (KVCacheManagementMode.RECOMPUTE, True),
+    ],
+)
+def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
+    context, listener = _context_with_listener()
+    order = []
+    context.kv_cache_management_mode = cache_mode
+    context.static_kv_memory_pointers = True
+    context.deallocate_inference_state_buffers = Mock(
+        side_effect=lambda: order.append("deallocate")
+    )
+    listener.side_effect = lambda kind, _payload: order.append(kind)
+    context.dynamo_helper.queue_kv_stored_event({"block_hashes": [101]})
+
+    engine = object.__new__(DynamicInferenceEngine)
+    engine.state = EngineState.RUNNING
+    engine.context = context
+    engine.unified_memory_level = 0
+    engine.requests = {}
+    engine.waiting_request_ids = deque()
+    engine.use_coordinator = False
+
+    with (
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
+    ):
+        engine.suspend()
+    context.dynamo_helper.publish_pending_kv_stored_events()
+
+    expected_order = ["deallocate", "cleared"] if expect_clear else ["deallocate"]
+    assert order == expected_order
 
 
 def test_reset_metadata_can_preserve_prefix_allocator():
@@ -131,7 +189,6 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
     engine.context = context
-    engine.dynamo_helper = context.dynamo_helper
     engine.logging_step_interval = 0
     engine.schedule_waiting_requests = schedule
     engine.controller = SimpleNamespace(async_generate_output_tokens_dynamic_batch=forward)

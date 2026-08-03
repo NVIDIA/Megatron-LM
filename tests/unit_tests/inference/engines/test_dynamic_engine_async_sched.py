@@ -249,7 +249,6 @@ def test_async_forward_routes_one_controller_iteration(
         is_decode_only=mock.Mock(return_value=decode_only.launched),
         dynamo_helper=DynamoHelper(),
     )
-    engine.dynamo_helper = engine.context.dynamo_helper
     output = None if primer_only else {"sample": "tokens"}
     engine.controller = SimpleNamespace(
         async_generate_output_tokens_dynamic_batch=mock.AsyncMock(

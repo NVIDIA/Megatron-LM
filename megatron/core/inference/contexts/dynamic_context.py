@@ -284,8 +284,12 @@ class DynamoHelper:
             self._emit_kv_event("cleared", {})
 
     def _emit_kv_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Notify Dynamo listeners without allowing frontend failures to stop inference."""
         for listener in tuple(self._kv_event_listeners):
-            listener(kind, payload)
+            try:
+                listener(kind, payload)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logging.exception("KV-event listener failed while handling %r", kind)
 
 
 @internal_api
@@ -2825,10 +2829,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
-        if preserve_prefix_cache:
-            self.dynamo_helper.discard_pending_kv_stored_events()
-        else:
-            self.dynamo_helper.notify_kv_cache_cleared()
+        self.dynamo_helper.discard_pending_kv_stored_events()
         self.reset_tensors()
         self.reset_metadata(
             preserve_prefix_cache=preserve_prefix_cache, preserve_counters=preserve_counters
@@ -2841,6 +2842,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset Mamba cache state.
         if not preserve_prefix_cache and self.mamba_slot_allocator is not None:
             self.mamba_slot_allocator.reset()
+        if not preserve_prefix_cache:
+            self.dynamo_helper.notify_kv_cache_cleared()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
