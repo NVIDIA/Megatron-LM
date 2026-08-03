@@ -1572,18 +1572,11 @@ class GTPShardedParam(torch.nn.Parameter):
         counts gtp_remat peers' tokens) normalizes instead — there the gtp_remat axis must SUM
         like the DP axis (a 1/gtp_remat mean would shrink every gtp_remat grad).
         """
-        scale = self._mean_rs_scale()
-        if scale is not None:
-            torch._foreach_mul_(list(wgrads), scale)
-
-    def _mean_rs_scale(self):
-        """The 1/gtp_remat mean factor for the wgrad RS, or None when the axis must SUM."""
         gtp_remat_size = self.group.size()
         if gtp_remat_size > 1 and not GTP_CONFIG.calculate_per_token_loss:
-            return 1.0 / gtp_remat_size
-        return None
+            torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
 
-    def _reduce_scatter_fp32_accum(self, tensor, out_buffer, scale):
+    def _reduce_scatter_fp32_accum(self, tensor, out_buffer):
         """Issue one fp32-accum reduce-scatter (all-to-all now, FP32 sum at wait) -> (out, handle).
 
         Always issued async, even for a sync RS: under a coalescing manager the all-to-all is
@@ -1610,7 +1603,6 @@ class GTPShardedParam(torch.nn.Parameter):
             op=torch.distributed.ReduceOp.SUM,
             group=self.group,
             async_op=True,
-            scale=scale,
             all_to_all_output_tensor=a2a_buf,
         )
         # Input to the deferred FP32 sum: held until the handle is waited on, then released by
@@ -1624,18 +1616,8 @@ class GTPShardedParam(torch.nn.Parameter):
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
-        # Size <= 2 bypasses fp32-accum: one addition rounds the same either way, so it would
-        # buy nothing and still cost the all-to-all scratch. self.group is per chain, so each
-        # axis decides on its own (GTP_remat=8 x EGTP_remat=2 -> fp32-accum on dense only).
-        use_fp32_accum = GTP_CONFIG.reduce_scatter_with_fp32_accumulation and self.group.size() > 2
-        if use_fp32_accum:
-            # Pass the mean to the collective so it lands on the FP32 sum; pre-scaling the
-            # low-precision wgrad here would round away what fp32-accum is meant to preserve.
-            rs_scale = self._mean_rs_scale()
-        else:
-            rs_scale = None
-            # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
-            self._prescale_wgrads_for_mean_rs(wgrads)
+        # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
+        self._prescale_wgrads_for_mean_rs(wgrads)
 
         if GTP_CONFIG.check_param_states:
             new_rs_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
@@ -1674,7 +1656,9 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
-            if use_fp32_accum:
+            # Size <= 2 gains nothing (one addition) and still costs the scratch, so it bypasses.
+            # self.group is per chain, so each axis decides on its own.
+            if GTP_CONFIG.reduce_scatter_with_fp32_accumulation and self.group.size() > 2:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
                 outputs, sum_handles = [], []
                 if len(wgrads) > 1:
@@ -1687,7 +1671,7 @@ class GTPShardedParam(torch.nn.Parameter):
                         group=self.group, device=wgrads[0].device, async_ops=True
                     ) as cm:
                         for out_buffer, tensor in zip(out_buffers, wgrads):
-                            out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer, rs_scale)
+                            out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer)
                             outputs.append(out)
                             sum_handles.append(h)
                     # The grouped work from _end_coalescing is the real completion; the per-op
@@ -1696,9 +1680,7 @@ class GTPShardedParam(torch.nn.Parameter):
                         h.all_to_all_handle = None
                     handle = _GTPCompositeWorkHandle([cm, *sum_handles])
                 else:
-                    out, handle = self._reduce_scatter_fp32_accum(
-                        wgrads[0], out_buffers[0], rs_scale
-                    )
+                    out, handle = self._reduce_scatter_fp32_accum(wgrads[0], out_buffers[0])
                     outputs.append(out)
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs_fp32accum")
                 if async_op:

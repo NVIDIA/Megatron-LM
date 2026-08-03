@@ -311,14 +311,26 @@ update_gtp_config(
 | **Gain** | the `N-1` intermediate roundings disappear, leaving only the final downcast — so the error stops growing with the axis, and the benefit grows with it |
 | **Cost** | one unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter, plus a local FP32 sum and downcast at `wait()` time |
 
-Only the *accumulation* dtype changes: the all-to-all carries the same wgrad dtype and the same byte volume as the ring reduce-scatter it replaces, but the `gtp_remat_size` received contributions are summed in FP32 instead of being rounded back to BF16 after every addition. Implemented in `megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py`. This is the gtp_remat-axis analogue of `--ddp-reduce-scatter-with-fp32-accumulation` and **independent of it** — a different collective over a different process group, so enable either, both, or neither.
+Implemented in `megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py`. This is the
+gtp_remat-axis analogue of `--ddp-reduce-scatter-with-fp32-accumulation` and **independent of
+it** — a different collective over a different process group, so enable either, both, or neither.
 
 **Behaviour notes**
 
-- **Where the mean goes.** Off: `1/gtp_remat` is a pre-scale on the wgrad before a SUM collective (§3.2 table). On: the pre-scale is skipped and the factor is handed to the collective (`scale`) so it lands on the FP32 sum — pre-scaling in BF16 would round every contribution on the way in, discarding the precision this flag exists to preserve. Under `calculate_per_token_loss` the axis SUMs and no factor applies either way.
-- **Auto-bypass at axis size ≤ 2.** Two addends is a single addition, and rounding its exact FP32 result gives the same bits as accumulating in BF16 — so at size 2 the flag cannot change the result, only add the scratch buffer's cost. The gate reads the per-chain group, so each axis decides independently: a `GTP_remat=8 × EGTP_remat=2` run gets FP32 accumulation on the dense weights and the plain reduce-scatter on the experts.
-- **Scratch lifetime.** The buffer comes from GTP's wgrad pool rather than a fresh `empty_like` — GTP keeps several reduce-scatters in flight, and per-RS allocation would add that much peak memory. It is the *input* to the deferred FP32 sum, so it is returned only after the handle is waited: in `_wait_reduce_scatter` for an async RS, immediately after the wait for a sync one.
-- **Batched (grouped / routed-expert) path.** The all-to-alls are grouped in a `_coalescing_manager` just like the plain batched reduce-scatter — one `ncclGroupStart/End` instead of one launch per weight. Only the handle differs: the manager waits solely the NCCL work it collects, while each fp32-accum handle still owes a local FP32 sum, so the sums are deferred behind the manager's work in one composite handle. Hence the all-to-alls must be issued with `async_op=True` — for this primitive that flag is what defers the sum, not merely what returns a handle. (DDP's own fp32-accumulation flag sidesteps all of this by asserting a single bucket.)
+- **The mean stays a pre-scale.** Both paths apply `1/gtp_remat` to the wgrad before the
+  collective (§3.2 table); under `calculate_per_token_loss` the axis SUMs and no factor
+  applies either way.
+- **Auto-bypass at axis size ≤ 2.** The gate reads the per-chain group, so each axis decides
+  independently: a `GTP_remat=8 × EGTP_remat=2` run gets FP32 accumulation on the dense weights
+  and the plain reduce-scatter on the experts.
+- **Scratch lifetime.** The buffer comes from GTP's wgrad pool rather than a fresh `empty_like`,
+  and is returned only once the handle is waited — it is the *input* to the deferred FP32 sum.
+- **Batched (grouped / routed-expert) path.** The all-to-alls share one `ncclGroupStart/End` via
+  `_coalescing_manager`, but the manager cannot serve as the handle: it waits only the NCCL work
+  it collects, while each fp32-accum handle still owes a local FP32 sum. The sums are deferred
+  behind it in one composite handle — which is why the all-to-alls are issued with
+  `async_op=True`: for this primitive that flag defers the sum, it does not merely return a
+  handle. (DDP's own flag sidesteps all this by asserting a single bucket.)
 
 ---
 
@@ -456,7 +468,8 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 | final normalization | net grad = full `(replicate × gtp_remat)` **mean** | grads summed over all axes, then `÷ total_global_tokens` in `finalize_model_grads` |
 
 - **Default (mean) path** decouples gradient scaling from the gtp_remat degree: the DP `1/replicate` mean × the reduce-scatter `1/gtp_remat` mean (sharded weights) — or × the finalize AVG (replicated params) — equals the exact full mean, independent of the gtp_remat axis size.
-- **`--gtp-remat-reduce-scatter-with-fp32-accumulation` moves the mean** from a BF16 pre-scale on the wgrad to the FP32 sum inside the collective. The net scaling in the table is unchanged — only the precision at which the factor is applied (§2.5).
+- **`--gtp-remat-reduce-scatter-with-fp32-accumulation` swaps the collective, not the scaling**
+  — this table applies unchanged (§2.5).
 - **Per-token-loss path** must SUM over gtp_remat (like the DP axis): `total_global_tokens` already counts the gtp_remat peers' distinct tokens, so the single `÷ total_global_tokens` does all normalization. A `1/gtp_remat` mean here would shrink every gtp_remat gradient by `1/gtp_remat` (grad-norm mismatch + divergence), so the reduce-scatter mean and finalize AVG are both gated on `not calculate_per_token_loss`.
 
 > **`average_in_collective` must be off (the default).** The default-path scaling is a *pre-scale* applied before a SUM collective. `average_in_collective=True` instead uses NCCL AVG over the collective's own (replicate) group, which interacts incorrectly with the gtp_remat completion. Asserted via `ProcessGroupCollection.is_gtp_remat_active` in both `arguments.py` (training) and `DistributedDataParallel.__init__` (direct megatron-core users). (Independently, `calculate_per_token_loss` already forbids `average_in_collective`.)

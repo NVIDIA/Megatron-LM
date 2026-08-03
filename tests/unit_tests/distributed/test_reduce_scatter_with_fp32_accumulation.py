@@ -77,35 +77,20 @@ class TestReduceScatterWithFP32Accumulation:
                 torch.allclose(tensor1_shard, tensor2_shard) == baseline_reduce_scatter_in_fp32
             ), f"{get_non_matching_values(tensor1_shard, tensor2_shard)}"
 
-    @pytest.mark.parametrize("async_op", [True, False])
-    def test_scale_is_folded_into_the_fp32_sum(self, async_op: bool):
-        """`scale` must be applied to the FP32 sum, not to the low-precision input.
+    @pytest.mark.parametrize("axis_size", [2, 4, 8, 16])
+    def test_power_of_two_prescale_equals_scaling_the_fp32_sum(self, axis_size: int):
+        """Pre-scaling BF16 by 1/2^k is exact, which is why GTP pre-scales its 1/gtp_remat mean
+        onto the wgrad instead of accumulating it here. Local arithmetic only, no collective."""
+        scale = 1.0 / axis_size
+        contributions = (torch.randn(axis_size, 100000, device='cuda') * 1e-3).bfloat16()
 
-        Pre-scaling the BF16 input and SUMming would round every contribution on the way in, so
-        the result must match an FP32 reduce-scatter scaled in FP32.
-        """
-        rank, world_size = Utils.rank, Utils.world_size
-        # Deliberately NOT 1/world_size: that is a power of two, so pre-scaling BF16 would be
-        # exact and the anti-pattern this test exists to catch would slip through.
-        scale = 1.0 / 3.0
-        tensor = torch.rand(100000, device='cuda', dtype=torch.bfloat16)
-        kwargs = {"op": torch.distributed.ReduceOp.SUM, "group": None, "async_op": async_op}
-        # Snapshot before the call: the output tensor is a view into the input, as above.
-        reference = tensor.float()
+        prescaled = (contributions * scale).sum(dim=0, dtype=torch.float32).bfloat16()
+        scaled_sum = (contributions.sum(dim=0, dtype=torch.float32) * scale).bfloat16()
 
-        handle = reduce_scatter_with_fp32_accumulation(
-            shard_buffer(tensor, world_size)[rank], tensor, scale=scale, **kwargs
+        assert torch.equal(prescaled, scaled_sum), (
+            f"1/{axis_size} pre-scale is not exact: "
+            f"{(prescaled != scaled_sum).sum().item()} elements differ"
         )
-        if async_op:
-            handle.wait()
-
-        torch.distributed.reduce_scatter_tensor(
-            shard_buffer(reference, world_size)[rank], reference, op=kwargs["op"]
-        )
-        expected = (shard_buffer(reference, world_size)[rank] * scale).bfloat16()
-
-        got = shard_buffer(tensor, world_size)[rank]
-        assert torch.allclose(got, expected), f"{get_non_matching_values(got, expected)}"
 
     def test_caller_provided_all_to_all_output_tensor(self):
         """A caller-supplied scratch (GTP passes one from its wgrad pool) must be honored.

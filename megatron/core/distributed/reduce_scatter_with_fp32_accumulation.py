@@ -16,14 +16,12 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
         all_to_all_output_tensor: torch.Tensor,
         output_tensor: torch.Tensor,
         world_size: int,
-        scale: Optional[float] = None,
     ):
         """Initialize WorkHandle object."""
         self.all_to_all_handle = all_to_all_handle
         self.all_to_all_output_tensor = all_to_all_output_tensor
         self.output_tensor = output_tensor
         self.world_size = world_size
-        self.scale = scale
 
     def wait(self):
         """Wait until communication (and associated computation) is completed."""
@@ -37,11 +35,6 @@ class _ReduceScatterWithFP32AccumulationWorkHandle:
         )
         assert output_tensor_in_fp32.dtype == torch.float32
 
-        # Apply the mean/normalization factor while still in fp32; scaling the low-precision
-        # input beforehand would round away the precision this implementation preserves.
-        if self.scale is not None:
-            output_tensor_in_fp32 *= self.scale
-
         # Copy downcasted sum into output_tensor.
         self.output_tensor.copy_(output_tensor_in_fp32.view(self.output_tensor.shape))
 
@@ -52,7 +45,6 @@ def reduce_scatter_with_fp32_accumulation(
     op: torch.distributed.ReduceOp,
     group: torch.distributed.ProcessGroup,
     async_op: bool,
-    scale: Optional[float] = None,
     all_to_all_output_tensor: Optional[torch.Tensor] = None,
 ):
     """Reduce-scatter with FP32 accumulation.
@@ -67,8 +59,6 @@ def reduce_scatter_with_fp32_accumulation(
         op (torch.distributed.ReduceOp): Only torch.distributed.ReduceOp.SUM is supported.
         group (torch.distributed.ProcessGroup): Process group to use for reduce-scatter.
         async_op (bool): Only False is supported right now.
-        scale (float, optional): Factor applied to the FP32 sum before the downcast. Use this
-            for a mean-reduction rather than pre-scaling input_tensor, which rounds on the way in.
         all_to_all_output_tensor (torch.Tensor, optional): Caller-provided scratch matching
             input_tensor's shape and dtype, for callers with their own buffer pool. Allocated
             internally when omitted; must stay alive until .wait() returns.
@@ -102,7 +92,7 @@ def reduce_scatter_with_fp32_accumulation(
 
     # Create a work handle to finish communication and reduction.
     reduce_scatter_handle = _ReduceScatterWithFP32AccumulationWorkHandle(
-        all_to_all_handle, all_to_all_output_tensor, output_tensor, world_size, scale=scale
+        all_to_all_handle, all_to_all_output_tensor, output_tensor, world_size
     )
     if async_op:
         # Return work handle; consumers can call .wait() to ensure communication and associated

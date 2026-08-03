@@ -758,10 +758,30 @@ def _saved_unsharded_weights(moe=False):
     return saved
 
 
+def _max_rel_grad_diff(reference, other):
+    """Largest per-param relative gradient difference -> (value, param name).
+
+    Relative, not absolute: max|grad| is ~1e-4 on this micro-model, so an absolute bound would
+    read benign rounding as a huge error. All-zero params are skipped.
+    """
+    worst, worst_name = 0.0, None
+    for name, ref_grad in reference.items():
+        denom = ref_grad.abs().max().item()
+        if denom < 1e-30:
+            continue
+        rel = (ref_grad - other[name]).abs().max().item() / denom
+        if rel > worst:
+            worst, worst_name = rel, name
+    return worst, worst_name
+
+
 def _worker_gtp_rs_fp32accum(rank, world_size, port, moe):
-    """FP32 accumulation changes the gtp_remat RS's summation precision, never its math, so the
-    reduced gradients must still agree. Guards the integration: the mean moving onto the FP32
-    sum, the pooled scratch, and (moe=True) the batched grouped path."""
+    """FP32 accumulation must not change the reduced gradients.
+
+    It alters only the summation precision of the gtp_remat reduce-scatter, never its math.
+    Guards the integration: the pooled all-to-all scratch, the deferred FP32 sums, and
+    (moe=True) the batched grouped path.
+    """
     saved = _saved_unsharded_weights(moe)
 
     with _fp32accum_probe() as counts:
@@ -781,16 +801,7 @@ def _worker_gtp_rs_fp32accum(rank, world_size, port, moe):
         )
 
     if rank == 0:
-        worst, worst_name = 0.0, None
-        for name, ref_grad in plain.items():
-            # Relative, not absolute: max|grad| is ~1e-4 here, so an absolute bound would read
-            # benign rounding as a huge error.
-            denom = ref_grad.abs().max().item()
-            if denom < 1e-30:
-                continue
-            rel = (ref_grad - fp32[name]).abs().max().item() / denom
-            if rel > worst:
-                worst, worst_name = rel, name
+        worst, worst_name = _max_rel_grad_diff(plain, fp32)
         print(
             f"[gtp-rs-fp32accum moe={moe}] dispatches={n_fp32} "
             f"max rel grad diff={worst:.3e} ({worst_name})",
