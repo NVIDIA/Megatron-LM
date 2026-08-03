@@ -198,9 +198,28 @@ def is_nccl_ep_zero_copy_available():
 
 
 def is_nccl_ep_available():
+    """NCCL EP built into TE, with the eager/drop-capable ``ep_bootstrap`` signature.
+
+    ``ensure_nccl_ep_bootstrapped`` always passes ``recv_capacity_per_rank`` and
+    ``drop_on_overflow``, so a TE predating that signature raises TypeError on the first
+    bootstrap for every ncclEP path -- static as much as eager. Gate on it here so such builds
+    skip cleanly instead of erroring. ``recv_capacity_per_rank`` must also be *optional*: that
+    is what makes eager (the over-budget replay) expressible.
+    """
     from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
 
-    return HAVE_TE_EP
+    if not HAVE_TE_EP:
+        return False
+
+    import inspect
+
+    from transformer_engine.pytorch.ep import ep_bootstrap
+
+    params = inspect.signature(ep_bootstrap).parameters
+    recv_capacity = params.get("recv_capacity_per_rank")
+    return (
+        recv_capacity is not None and recv_capacity.default is None and "drop_on_overflow" in params
+    )
 
 
 def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
@@ -460,6 +479,247 @@ class TestNcclEpPagedStashing:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.internal
+    def test_over_budget(self):
+        """Budget matches _NCCLEPManager._ensure_bootstrap; over_budget matches map-derived load.
+
+        Mirrors TestPagedStashingOverBudget for HybridEP, plus the peak capacity NCCL EP
+        reports -- HybridEP has no equivalent because it recovers by going dropless and so
+        never needs to know how much was required. The capacity factor is deliberately below
+        1.0: each rank receives num_tokens*topk on average, so 1.0 sits exactly at the mean
+        and anything under it overflows.
+        """
+        if not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+
+        config.ENABLE_EXPERIMENTAL = True
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=8,
+            num_layers=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_permute_fusion=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend="ncclep",
+            test_dtype=torch.bfloat16,
+            moe_grouped_gemm=True,
+            moe_use_legacy_grouped_gemm=False,
+            moe_paged_stash=True,
+            moe_expert_rank_capacity_factor=0.6,
+            use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
+            moe_router_padding_for_quantization=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+        )
+
+        seq_length = 1024
+        batch_size = 1
+        topk = container.config.moe_router_topk
+        capacity_factor = container.config.moe_expert_rank_capacity_factor
+        hidden_states = torch.randn(
+            (seq_length, batch_size, container.config.hidden_size), dtype=torch.bfloat16
+        )
+
+        num_tokens = seq_length * batch_size * topk
+        pad_multiple = get_align_size_for_quantization(container.config)
+        budget = int(num_tokens * capacity_factor)
+        budget += -budget % pad_multiple
+
+        paged_stash_reset(True, config=container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        _forward_backward_all_layers(container, hidden_states)
+
+        # NCCL EP's manager keeps token_probs/token_indices rather than the routing map, and a
+        # rank's received load depends on every rank's routing, so the HybridEP map-derived
+        # cross-check does not transfer. Check the device-side accounting against the budget
+        # instead: required_recv is filled by ep_prepare before any dropping, and over_budget is
+        # the same comparison made on device, so the two must agree with config arithmetic.
+        any_over_budget = False
+        for layer_idx, layer in enumerate(container.moe_layers):
+            comm = layer.token_dispatcher._comm_manager
+            over_budget = layer.token_dispatcher.check_over_budget().item()
+            required = layer.token_dispatcher.check_required_capacity().item()
+
+            assert comm._recv_capacity == budget, (
+                f"layer {layer_idx}: dispatcher budget ({comm._recv_capacity}) != expected "
+                f"({budget}) for capacity factor {capacity_factor}"
+            )
+            assert required > 0, f"layer {layer_idx}: required capacity was never recorded"
+            assert over_budget == (required > budget), (
+                f"layer {layer_idx}: over_budget={over_budget} disagrees with required "
+                f"({required}) vs budget ({budget})"
+            )
+            any_over_budget |= over_budget
+
+        assert any_over_budget, (
+            f"no layer exceeded budget {budget} at capacity factor {capacity_factor}; "
+            "the test is not exercising overflow"
+        )
+
+        # Leave a clean slate. The EP context is process-wide and ep_bootstrap refuses a second
+        # call, so a later test would otherwise reuse this capacity. Drop the layers before
+        # finalizing and force a collection: this container has no __del__, so its EpBuffers
+        # would otherwise be freed at an arbitrary later point -- inside the next test, against
+        # a context that has since been re-bootstrapped.
+        import gc
+
+        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+
+        del container
+        gc.collect()
+        nccl_ep_release_context()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.internal
+    @pytest.mark.parametrize("zero_copy", [False, True])
+    def test_over_budget_recovery(self, zero_copy):
+        """Replay an over-budget step eager, then restore the budget grown to the observed peak.
+
+        Drives the same sequence PagedStashRunner.prepare_for_rerun / its success branch do.
+        The runner itself is not reachable from a unit test (it walks model_chunk.decoder.layers
+        and is built in training.py), but its orchestration is not the risky part -- the
+        teardown, re-bootstrap and symm-buffer reallocation are, and those are exercised here.
+
+        zero_copy=True is the case the flag plumbing exists for: the replay must drop to eager
+        WITHOUT zero-copy (eager cannot use the fixed-size symm buffers), and the restore must
+        re-rendezvous them at the grown capacity. With zero_copy=False the mode-switching in
+        set_rerun_mode is a no-op, so only this parametrization exercises it.
+        """
+        if not is_nccl_ep_available():
+            pytest.skip("NCCL EP is not available")
+        if zero_copy and not is_nccl_ep_zero_copy_available():
+            pytest.skip("NCCL EP zero-copy TE API is not available")
+
+        from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
+
+        config.ENABLE_EXPERIMENTAL = True
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=8,
+            num_layers=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_permute_fusion=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend="ncclep",
+            test_dtype=torch.bfloat16,
+            moe_grouped_gemm=True,
+            moe_use_legacy_grouped_gemm=False,
+            moe_paged_stash=True,
+            moe_expert_rank_capacity_factor=0.6,
+            moe_ncclep_zero_copy=zero_copy,
+            use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
+            moe_router_padding_for_quantization=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+        )
+
+        seq_length = 1024
+        batch_size = 1
+        hidden_states = torch.randn(
+            (seq_length, batch_size, container.config.hidden_size), dtype=torch.bfloat16
+        )
+
+        def run():
+            paged_stash_reset(True, config=container.config)
+            paged_stash_init_chunk_handler(1, 0)
+            out, _, _, _ = _forward_backward_all_layers(container, hidden_states)
+            container.zero_grad()
+            torch.cuda.synchronize()
+            return out
+
+        # 1. Undersized budget: the step drops tokens and reports it.
+        out_dropped = run()
+        over_1 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
+        req_1 = [l.token_dispatcher.check_required_capacity().item() for l in container.moe_layers]
+        # No assertions until every collective below is done -- one that fires on a subset of
+        # ranks strands the rest in ep_finalize or the all_reduce, and pytest's deferred
+        # FAILURES section is destroyed by the resulting watchdog kill, hiding the cause.
+        # MAX across ranks, as PagedStashRunner.check_moe_overflow does. ncclEpCreateGroup
+        # asserts every rank passes an identical max_recv_tokens_per_rank, so growing to a
+        # per-rank local peak makes the re-bootstrap diverge and hang.
+        required_t = torch.tensor([max(req_1)], dtype=torch.int64, device="cuda")
+        torch.distributed.all_reduce(required_t, op=torch.distributed.ReduceOp.MAX)
+        required = int(required_t.item())
+        budget_before = container.moe_layers[0].token_dispatcher._comm_manager._recv_capacity
+
+        # 2. prepare_for_rerun: degrade to eager, release the EP context, replay.
+        for layer in container.moe_layers:
+            layer.token_dispatcher.reset_over_budget()
+            layer.token_dispatcher.set_ep_rerun_mode(True)
+        nccl_ep_release_context()
+
+        out_replay = run()
+        eager_3 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
+        zc_3 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
+        replay_nan = bool(torch.isnan(out_replay).any())
+        # atol=0 so the comparison is purely relative: these activations are ~1e-15, and
+        # allclose's default atol=1e-8 would call any result "close", including a completely
+        # wrong one. NaN compares not-close, so a dropped step that corrupts to NaN is caught
+        # by the same check without depending on it staying NaN.
+        dropped_differs = not torch.allclose(out_dropped, out_replay, rtol=1e-2, atol=0)
+
+        # 3. Success branch: restore static, grown to the observed peak.
+        for layer in container.moe_layers:
+            layer.token_dispatcher.reset_over_budget()
+            layer.token_dispatcher.set_ep_rerun_mode(False, new_capacity=required)
+        nccl_ep_release_context()
+
+        out_grown = run()
+        eager_5 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
+        zc_5 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
+        caps_5 = [l.token_dispatcher._comm_manager._recv_capacity for l in container.moe_layers]
+        over_5 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
+        nccl_ep_release_context()
+
+        # Assertions only past this point: every collective is behind us, so a failure on a
+        # subset of ranks can no longer strand the others in ep_finalize or an all_reduce.
+        # required is the MAX across ranks, so this is a group-wide statement that somebody
+        # overflowed -- unlike any(over_1), which is only true on the ranks that did.
+        assert required > budget_before, (
+            f"nothing exceeded budget {budget_before} at capacity factor "
+            f"{container.config.moe_expert_rank_capacity_factor}; not exercising overflow"
+        )
+        # The replay must be eager AND non-zero-copy: eager sizes its recv buffers per step, so it
+        # cannot use the fixed [recv_capacity, hidden] symm buffers.
+        assert all(eager_3) and not any(zc_3), f"replay did not degrade: eager={eager_3} zc={zc_3}"
+        assert not replay_nan, "eager replay produced NaNs"
+        # Only ranks that actually dropped can differ: overflow is per-rank, so a rank whose
+        # experts stayed under budget legitimately reproduces the same output.
+        if any(over_1):
+            assert dropped_differs, (
+                "this rank was over budget, so the dropped step must differ from the dropless "
+                "eager replay"
+            )
+        assert not any(eager_5), f"restore did not return to the static budget: {eager_5}"
+        # Restore must also put zero-copy back, which means the symm buffers were re-rendezvoused
+        # at the grown capacity. Vacuous when zero_copy=False, load-bearing when True.
+        assert all(
+            z == zero_copy for z in zc_5
+        ), f"restore did not return zero_copy to {zero_copy}: {zc_5}"
+        assert all(
+            c >= required > budget_before for c in caps_5
+        ), f"budget did not grow: {budget_before} -> {caps_5}, observed peak {required}"
+        assert not any(over_5), f"still over budget after growing: {over_5}"
+        # Same reasoning as above: atol=0, so this cannot pass by both tensors being tiny.
+        torch.testing.assert_close(out_grown, out_replay, rtol=1e-2, atol=0)
+
+        nccl_ep_release_context()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.

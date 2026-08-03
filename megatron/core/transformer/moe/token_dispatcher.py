@@ -29,6 +29,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     hybrid_ep_dispatch,
     nccl_ep_combine,
     nccl_ep_dispatch,
+    nccl_ep_finalize,
     new_nccl_ep_buffer,
     set_deepep_num_sms,
 )
@@ -1526,12 +1527,24 @@ class _NCCLEPManager(_DispatchManager):
         self.hidden_dim = config.moe_latent_size or config.hidden_size
         # Per-expert packing alignment for the receive buffer (grouped-GEMM tile)
         self.alignment = get_align_size_for_quantization(config)
-        self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
+        self.moe_expert_rank_capacity_factor = config.moe_expert_rank_capacity_factor
         # An unset capacity factor selects eager mode: TE sizes the receive buffer per step from
         # the actual received-token count instead of a fixed budget.
-        self.eager = self.rank_capacity_factor is None
+        self.eager = self.moe_expert_rank_capacity_factor is None
         self.zero_copy = config.moe_ncclep_zero_copy
         self._zc_quant = self.zero_copy and bool(config.fp8 or config.fp4)
+        # eager/zero_copy/_zc_quant are the LIVE mode: set_rerun_mode() degrades them to replay
+        # an overflowed step, and restores them from these. Every other read stays correct
+        # without knowing replay exists.
+        self._config_eager = self.eager
+        self._config_zero_copy = self.zero_copy
+        # Grown by set_rerun_mode() after an overflow, to the peak the dropped step needed.
+        # Monotonic: a routing pattern that overflowed once is likely to do so again.
+        self._recv_capacity_override = None
+        if not self.eager:
+            # Accumulated device-side per dispatch, so the happy path never syncs.
+            self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+            self.required_recv = torch.zeros(1, dtype=torch.int64, device='cuda')
 
         if nccl_ep_dispatch is None:
             raise ImportError(
@@ -1540,9 +1553,7 @@ class _NCCLEPManager(_DispatchManager):
             )
         # [TODO] Add support for drop and pad with the 'ncclep' backend.
         if config.moe_pad_expert_input_to_capacity or config.moe_expert_capacity_factor is not None:
-            raise ValueError(
-                "drop and pad is not supported yet with the 'ncclep' backend."
-            )
+            raise ValueError("drop and pad is not supported yet with the 'ncclep' backend.")
 
         if self.eager:
             if self.zero_copy:
@@ -1616,7 +1627,11 @@ class _NCCLEPManager(_DispatchManager):
         if self.eager:
             self._recv_capacity = None
         else:
-            budget = int(self._max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
+            budget = int(
+                self._max_tokens_per_rank * self.router_topk * self.moe_expert_rank_capacity_factor
+            )
+            if self._recv_capacity_override is not None:
+                budget = max(budget, self._recv_capacity_override)
             if self.alignment != 0:
                 budget += -budget % self.alignment
             self._recv_capacity = budget
@@ -1701,11 +1716,47 @@ class _NCCLEPManager(_DispatchManager):
             recv_topk_weights=_NCCLEPManager._zc_recv_topk_weights_buf,
         )
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+        if not self.eager:
+            # ep_prepare fills total_recv_tokens from the routing map, before any dropping, so
+            # it is the capacity this step actually needed.
+            total_recv_tokens = self._buffer.total_recv_tokens
+            self.over_budget |= total_recv_tokens > self._recv_capacity
+            torch.maximum(self.required_recv, total_recv_tokens, out=self.required_recv)
         # fp8 zero-copy: dispatched_probs aliases the recv_topk_weights symm buffer, which the
         # next layer's dispatch reuses; copy it out so it stays valid through this layer's backward.
         # bf16 gets a fresh per-call pool buffer (not shared), so no copy is needed.
         self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
         return recv_tokens
+
+    def set_rerun_mode(self, enabled: bool, new_capacity: Optional[int] = None) -> None:
+        """Degrade to eager without zero-copy to replay an overflowed step, or restore.
+
+        Eager has no receive budget to exceed, so the replay cannot overflow again; zero-copy
+        must go with it because its symm buffers are a fixed ``[recv_capacity, hidden]`` and
+        TE rejects ``zero_copy`` in eager mode. On restore, ``new_capacity`` (the peak the
+        dropped step needed) grows the budget so the next step does not overflow the same way.
+
+        Only drops this manager's bootstrap -- the caller must also call
+        ``nccl_ep_release_context()`` once, and the next dispatch then re-bootstraps in the
+        un-captured warmup iteration that ``reset_cuda_graph`` guarantees. That is also what
+        makes growing safe: the symm buffers are reallocated at the new capacity outside
+        CUDA-graph capture.
+        """
+        if self._config_eager:
+            return
+        self.eager = enabled
+        self.zero_copy = self._config_zero_copy and not enabled
+        self._zc_quant = self.zero_copy and bool(self.config.fp8 or self.config.fp4)
+        if not enabled and new_capacity is not None:
+            # Overflow means total_recv_tokens > _recv_capacity >= the current override, so the
+            # peak that triggered it is always strictly larger. Anything else is stale accounting.
+            assert new_capacity > (self._recv_capacity_override or 0), (
+                f"receive capacity must grow on overflow: peak {new_capacity} is not above the "
+                f"current override {self._recv_capacity_override}"
+            )
+            self._recv_capacity_override = new_capacity
+        self._buffer = None
+        self._bootstrapped = False
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states, self.dispatched_probs
@@ -1738,6 +1789,19 @@ class _NCCLEPManager(_DispatchManager):
         self.dispatched_probs = None
         self.tokens_per_expert = None
         return hidden_states
+
+
+def nccl_ep_release_context() -> None:
+    """Release the process-wide NCCL EP context and the shared zero-copy symm buffers.
+
+    Collective, and process-wide rather than per-layer: call it once after every manager has
+    been flipped with ``set_rerun_mode()``. ``_ensure_bootstrap`` rebuilds both lazily, so the
+    symm-buffer rendezvous lands outside CUDA-graph capture.
+    """
+    _NCCLEPManager._zc_fwd_token_buf = None
+    _NCCLEPManager._zc_bwd_token_buf = None
+    _NCCLEPManager._zc_recv_topk_weights_buf = None
+    nccl_ep_finalize()
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
@@ -1992,7 +2056,22 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         else:
             return None
 
+    def check_required_capacity(self):
+        """Peak per-rank receive capacity the dispatcher needed, or None if it is not tracked."""
+        if hasattr(self._comm_manager, 'required_recv'):
+            return self._comm_manager.required_recv
+        else:
+            return None
+
+    def set_ep_rerun_mode(self, enabled: bool, new_capacity: Optional[int] = None) -> None:
+        """Degrade the dispatcher to replay an overflowed step, or restore it, growing the
+        receive budget to ``new_capacity``. No-op unless the backend supports it."""
+        if hasattr(self._comm_manager, 'set_rerun_mode'):
+            self._comm_manager.set_rerun_mode(enabled, new_capacity)
+
     def reset_over_budget(self):
         """Reset the accumulated over-budget flag on the communication manager."""
         if hasattr(self._comm_manager, 'over_budget'):
             self._comm_manager.over_budget.fill_(0)
+        if hasattr(self._comm_manager, 'required_recv'):
+            self._comm_manager.required_recv.fill_(0)

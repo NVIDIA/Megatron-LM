@@ -637,9 +637,8 @@ def ensure_nccl_ep_bootstrapped(
         max_tokens_per_rank (int): Upper bound on local input tokens per forward. Must be
             even (NCCL EP requires ``num_tokens_per_rank * inner_dim % 4 == 0``).
         recv_capacity_per_rank (int, optional): Per-rank receive-buffer capacity in tokens. Must
-            be ``>= max_tokens_per_rank``; runtime overflow hard-traps (no soft drop). ``None``
-            selects eager mode, where TE sizes the receive buffer per step from the actual
-            received-token count.
+            be ``>= max_tokens_per_rank``. ``None`` selects eager mode, where TE sizes the
+            receive buffer per step from the actual received-token count.
         hidden_dim (int): Token hidden size.
         num_topk (int): Per-token top-k over ``ep_group``; sizes NCCL EP's internal buffers.
             This is the same TP-scaled top-k used for the receive-capacity budget, not the
@@ -662,6 +661,7 @@ def ensure_nccl_ep_bootstrapped(
         num_topk=num_topk,
         max_num_sms=num_sms,
         zero_copy=zero_copy,
+        drop_on_overflow=recv_capacity_per_rank is not None,
     )
 
 
