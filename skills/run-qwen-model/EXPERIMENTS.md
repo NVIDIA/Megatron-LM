@@ -2656,6 +2656,45 @@ Sized by `LAUNCH-VS-WORK-S17`'s rule (removed GPU work × ~68% conversion, again
 4. `_mask_routing_padding_kernel`, 0.036 ms → ~0.3%. Explicitly **not worth it**, recorded
    here only because a launch-count ranking puts it near the top (48/step).
 
+### FP8-WEIGHTS-S18 — candidate 1 above is dead: fewer bytes does not mean less time
+
+Weight-only fp8 (e4m3, one fp32 scale per output channel, activations and accumulation
+unchanged) was implemented end to end — `moe/fp8_experts.py`, an `FP8_WEIGHTS` path in
+`_fused_moe_kernel`, quantized buffers built in `_build_concatenated_weights` — and it
+**loses at every tile configuration**, so the 0.9 ms above is not available this way.
+
+| GEMM | best bf16 | best weight-only fp8 | fp8 penalty |
+| --- | --- | --- | --- |
+| FC1 (+SwiGLU epilogue) | **36.24 µs** @ M16 N64 K64 w4 s3 | 40.08 µs @ M32 N64 K128 w8 s4 | +10.6% |
+| FC2 | **18.86 µs** @ M32 N256 K64 w8 s4 | 22.24 µs @ M32 N256 K128 w4 s3 | +17.9% |
+
+Numerics were never the problem: cosine similarity 0.9989, mean relative error 6.6e-2
+concentrated in near-zero outputs, weight bytes 302.0 → 151.5 MB/layer exactly as intended.
+
+**Why halving the bytes cannot help here.** With bf16 activations every fp8 weight tile must
+be widened back to bf16 in registers before the MMA, one convert per weight element. The
+best bf16 configs run at 5.55 TB/s (FC1) and 5.34 TB/s (FC2) — ~90% of this part's
+achievable HBM — so the byte saving is worth at most ~45% of each kernel, and the converts
+cost more than that. The fp8 arms land at 40/22 µs against an fp8 *bandwidth* floor of
+~18/9 µs, i.e. once the bytes are halved the kernel is no longer bandwidth-bound at all.
+The only version of this lever that can pay is **w8a8**, where activations are also fp8 and
+the tensor cores consume both operands directly with nothing converted.
+
+> **Two measurement traps, both of which produced a wrong answer first.**
+> 1. An earlier harness reported fp8 at 0.995× and was read as "no effect". It was timing
+>    **Python**: four Triton launches per call, ~153 µs/call, host-bound with the GEMM
+>    invisible underneath. Any A/B of a <50 µs kernel must time **graph replay**, not a
+>    launch loop — `harness_gemmgrid.py` captures one launch and replays it.
+> 2. `_get_decode_tuned_configs`' shipped tiles were re-derived independently by this sweep
+>    and are **already optimal**, including the shared `BLOCK_SIZE_M=16`: M32 makes FC2 13%
+>    faster (21.33 → 18.86 µs) but FC1 10% slower, and the two share one indirection table,
+>    so M16 wins on the sum (57.6 vs 58.8 µs). Retuning tiles is closed.
+
+Combined with QWEN-014 (flashinfer cutlass, 0.921×) and QWEN-010 (torch grouped_mm, 0.82×),
+**every dtype-preserving and vendor-kernel route into the expert GEMM has now been measured
+and none beats the shipping Triton path.** The candidate list above should be read as: item 1
+requires w8a8 or nothing; items 2-4 are the only cheap ones left.
+
 ## Optimization rules
 
 1. Profile and classify before proposing a code change.

@@ -30,10 +30,11 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
-from megatron.core.inference.moe.activations import bounded_silu_mul
-from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference import floor_ablation as _ablate
 from megatron.core.inference import insitu_timing as _insitu
+from megatron.core.inference.moe.activations import bounded_silu_mul
+from megatron.core.inference.moe.fp8_experts import Fp8ExpertWeights
+from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
     _get_num_sms,
     compute_expert_offsets,
@@ -161,6 +162,8 @@ def _fused_moe_kernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
+    b_scale_ptr,
+    a_scale_ptr,
     # Dimensions
     N,
     K,
@@ -173,10 +176,13 @@ def _fused_moe_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_bse,
     # Flags / constexprs
     MUL_ROUTED_WEIGHT: tl.constexpr,
     FUSE_SQUARED_RELU: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr,
+    FP8_WEIGHTS: tl.constexpr,
+    FP8_ACT: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -255,15 +261,42 @@ def _fused_moe_kernel(
                     other=0.0,
                 )
                 b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+                # With fp8 activations both operands feed the fp8 tensor cores
+                # directly and nothing is converted; with bf16 activations the
+                # weight tile has to be widened first, which costs one convert
+                # per element and is why weight-only fp8 does not pay.
+                if FP8_WEIGHTS and not FP8_ACT:
+                    b = b.to(a.dtype)
                 accumulator += tl.dot(a, b)
                 if FUSE_SWIGLU:
                     b_up = tl.load(
                         b_up_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                     )
+                    if FP8_WEIGHTS and not FP8_ACT:
+                        b_up = b_up.to(a.dtype)
                     up_accumulator += tl.dot(a, b_up)
                     b_up_ptrs += BLOCK_SIZE_K * stride_bk
                 a_ptrs += BLOCK_SIZE_K * stride_ak
                 b_ptrs += BLOCK_SIZE_K * stride_bk
+
+            # Per-output-channel dequantization. The scale factors out of the K
+            # sum exactly (W[n,k] = q[n,k] * s[n]), so one multiply on the fp32
+            # accumulator recovers the full-precision GEMM up to the fp8
+            # rounding of q — and it must land before the activation.
+            if FP8_WEIGHTS:
+                b_scale_row = b_scale_ptr + off_experts * stride_bse
+                accumulator *= tl.load(b_scale_row + offs_bn)[None, :]
+                if FUSE_SWIGLU:
+                    up_accumulator *= tl.load(b_scale_row + offs_bn + N)[None, :]
+            # The activation scale is per token, so it scales whole rows of the
+            # accumulator and likewise survives the K sum untouched.
+            if FP8_ACT:
+                a_scale_col = tl.load(
+                    a_scale_ptr + offs_token // top_k, mask=token_mask, other=0.0
+                )
+                accumulator *= a_scale_col[:, None]
+                if FUSE_SWIGLU:
+                    up_accumulator *= a_scale_col[:, None]
 
             # Megatron-only: squared-relu fused on the fp32 accumulator before
             # the bf16 cast.  Upstream runs relu+square as a separate bf16 kernel.
@@ -879,6 +912,8 @@ def _invoke_fused_moe_kernel(
     grid_size: int,
     fuse_squared_relu: bool = False,
     fuse_swiglu: bool = False,
+    b_scale: Optional[torch.Tensor] = None,
+    a_scale: Optional[torch.Tensor] = None,
 ):
     """Launch the Triton fused-MoE kernel for one GEMM pass.
 
@@ -910,6 +945,8 @@ def _invoke_fused_moe_kernel(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
+        b_scale,
+        a_scale,
         n_dim,
         B.size(2),
         num_tokens,
@@ -920,9 +957,12 @@ def _invoke_fused_moe_kernel(
         B.stride(1),
         C.stride(0),
         C.stride(1),
+        b_scale.stride(0) if b_scale is not None else 0,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         FUSE_SQUARED_RELU=fuse_squared_relu,
         FUSE_SWIGLU=fuse_swiglu,
+        FP8_WEIGHTS=b_scale is not None,
+        FP8_ACT=a_scale is not None,
         top_k=top_k,
         BLOCK_SIZE_M=config['BLOCK_SIZE_M'],
         BLOCK_SIZE_N=config['BLOCK_SIZE_N'],
@@ -1142,6 +1182,8 @@ def vllm_fused_moe(
     out: Optional[torch.Tensor] = None,
     num_tokens_hint: Optional[int] = None,
     fuse_fc1_activation: bool = False,
+    fc1_fp8: Optional[Fp8ExpertWeights] = None,
+    fc2_fp8: Optional[Fp8ExpertWeights] = None,
 ) -> torch.Tensor:
     """Fused MoE using the vLLM Triton grouped-GEMM kernel (BF16).
 
@@ -1165,6 +1207,10 @@ def vllm_fused_moe(
         num_tokens_hint: optional host-side int with the expected number of
             valid tokens (e.g. batch_size * ep_size). Used to select a better
             BLOCK_SIZE_M instead of using the worst-case buffer size.
+        fc1_fp8, fc2_fp8: optional fp8 e4m3 twins of the two weights with
+            per-output-channel scales. When given they replace the bf16 weights
+            in the GEMMs, halving weight traffic; see
+            ``megatron.core.inference.moe.fp8_experts``.
 
     Returns:
         [max_tokens, hidden_size] output (fp32 when out=None, else out's dtype).
@@ -1258,7 +1304,7 @@ def vllm_fused_moe(
         with _insitu.site("expert_gemm_fc1"):
             _invoke_fused_moe_kernel(
                 hidden_states,
-                fc1_weight,
+                fc1_weight if fc1_fp8 is None else fc1_fp8.weight,
                 intermediate1,
                 topk_weights_flat,
                 sorted_token_ids,
@@ -1270,6 +1316,7 @@ def vllm_fused_moe(
                 grid_size=grid_size_fc1,
                 fuse_squared_relu=not is_swiglu,
                 fuse_swiglu=use_fused_swiglu,
+                b_scale=None if fc1_fp8 is None else fc1_fp8.scale,
             )
     if is_swiglu and not use_fused_swiglu and not _ablate_gemm:
         # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
@@ -1293,7 +1340,7 @@ def vllm_fused_moe(
         with _insitu.site("expert_gemm_fc2"):
             _invoke_fused_moe_kernel(
                 intermediate1,
-                fc2_weight,
+                fc2_weight if fc2_fp8 is None else fc2_fp8.weight,
                 intermediate3,
                 topk_weights_flat,
                 sorted_token_ids,
@@ -1303,6 +1350,7 @@ def vllm_fused_moe(
                 top_k=1,
                 config=config_fc2,
                 grid_size=grid_size_fc2,
+                b_scale=None if fc2_fp8 is None else fc2_fp8.scale,
             )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]

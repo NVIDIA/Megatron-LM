@@ -15,6 +15,8 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.inference import copy_trace as _copy_trace
+from megatron.core.inference import dispatch_ballast as _dispatch_ballast
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -785,10 +787,26 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        inference_context = kwargs.get("inference_context", None)
+        if _copy_trace.ENABLED and _copy_trace.in_decode(inference_context):
+            trace = _copy_trace.trace_one_layer()
+            if trace is not None:
+                with trace:
+                    out = self._forward_layer(inference_context, *args, **kwargs)
+                _copy_trace.report()
+                return out
+        output, context = self._forward_layer(inference_context, *args, **kwargs)
+        if _dispatch_ballast.COUNT:
+            _dispatch_ballast.tick()
+        return output, context
+
+    def _forward_layer(self, inference_context, *args, **kwargs):
+        """Attention then MLP — the layer body, factored out so a diagnostic mode can
+        wrap it without paying for a context manager on the fast path."""
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
-            kwargs.get("inference_context", None),
+            inference_context,
             padding_mask=kwargs.get("padding_mask", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
