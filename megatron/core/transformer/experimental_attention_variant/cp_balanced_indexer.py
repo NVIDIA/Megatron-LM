@@ -15,11 +15,16 @@ light) and chunk ``2 * cp_size - 1 - r`` (a high-position "tail", heavy), so
 ``csa_cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
 ``[l_local, topk]`` layout, so the downstream index-building and sparse attention are unchanged.
 """
+
+import logging
+
 import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+logger = logging.getLogger(__name__)
 
 
 def _all_gather_rows(x, l_local, cp_group, cp_size):
@@ -166,7 +171,17 @@ def _alltoall_dispatch_async(x, meta, cp_group, tag):
     return work, recv
 
 
-def dispatch_chunks_async(indexer_qr, weights_indexer_cp, cp_group, cp_size, l_local):
+def dispatch_chunks_async(
+    indexer_qr,
+    weights_indexer_cp,
+    cp_group,
+    cp_size,
+    l_local,
+    max_seqlen_q=None,
+    config=None,
+    use_fused=True,
+    multi_seq=False,
+):
     """Issue the chunk dispatch as early as possible; returns an opaque handle.
 
     Called by the CSA forward right after ``indexer_qr``/``weights_indexer_cp`` are
@@ -176,15 +191,28 @@ def dispatch_chunks_async(indexer_qr, weights_indexer_cp, cp_group, cp_size, l_l
     """
     if cp_size <= 1:
         return None
-    meta = _a2a_meta(cp_group, cp_size, l_local)
     q_lora = indexer_qr.shape[-1]
     n_heads = weights_indexer_cp.shape[-1]
     q2 = indexer_qr.reshape(-1, q_lora)
     w2 = weights_indexer_cp.reshape(-1, n_heads)
+    if config is not None and _use_zigzag(multi_seq, cp_size, l_local, use_fused, config):
+        # Per-sequence zigzag path: static-shape AllGather; row selection happens on device
+        # from cu_seqlens at consume time (CUDA-graph friendly with per-iteration packs).
+        if q2.dtype == w2.dtype:
+            width = q_lora + n_heads
+            payload = _a2a_buf("zz_qw", l_local, width, q2.dtype, q2.device, cp_group)
+            payload[:, :q_lora].copy_(q2)
+            payload[:, q_lora:].copy_(w2)
+            work, g = _all_gather_rows_buf(payload, l_local, cp_group, cp_size, "zz_qw")
+            return {"kind": "ag", "works": [work], "g": g, "q_lora": q_lora}
+        wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
+        ww, gw = _all_gather_rows_buf(w2, l_local, cp_group, cp_size, "zz_w")
+        return {"kind": "ag2", "works": [wq, ww], "gq": gq, "gw": gw, "q_lora": q_lora}
+    meta = _a2a_meta(cp_group, cp_size, l_local)
     if q2.dtype != w2.dtype:
         wq, rq = _alltoall_dispatch_async(q2, meta, cp_group, "qr")
         ww, rw = _alltoall_dispatch_async(w2, meta, cp_group, "w")
-        return {"meta": meta, "works": [wq, ww], "recvs": [rq, rw], "q_lora": q_lora}
+        return {"kind": "a2a", "meta": meta, "works": [wq, ww], "recvs": [rq, rw], "q_lora": q_lora}
     rows = q2.shape[0]
     width = q_lora + n_heads
     dev = q2.device
@@ -207,7 +235,7 @@ def dispatch_chunks_async(indexer_qr, weights_indexer_cp, cp_group, cp_size, l_l
         group=cp_group,
         async_op=True,
     )
-    return {"meta": meta, "works": [work], "recvs": [recv], "q_lora": q_lora}
+    return {"kind": "a2a", "meta": meta, "works": [work], "recvs": [recv], "q_lora": q_lora}
 
 
 def _dispatch_wait(handle, meta):
@@ -256,6 +284,168 @@ def _alltoall_combine(tk_head, tk_tail, meta, cp_group):
     return out
 
 
+def _all_gather_rows_buf(x, l_local, cp_group, cp_size, tag):
+    """AllGather into a persistent buffer (async): returns (work, gathered[cp_size*l_local, D])."""
+    D = x.shape[-1]
+    x2 = x.reshape(l_local, D)
+    send = _a2a_buf(tag + "_agsend", l_local, D, x2.dtype, x.device, cp_group)
+    send.copy_(x2)
+    g = _a2a_buf(tag + "_agrecv", cp_size * l_local, D, x2.dtype, x.device, cp_group)
+    work = dist.all_gather_into_tensor(g, send, group=cp_group, async_op=True)
+    return work, g
+
+
+def _excl_cumsum(x):
+    z = torch.zeros_like(x[:1])
+    return torch.cat((z, torch.cumsum(x, 0)[:-1]))
+
+
+def _use_zigzag(multi_seq, cp_size, l_local, use_fused, config):
+    """Per-sequence zigzag applies to multi-sequence packs on the fused path.
+
+    Requires the packed-sequence alignment to be a multiple of ``2 * cp_size`` so every
+    (padded) sequence splits into equal chunks. Single full-pack sequences keep the static
+    all_to_all global folding (cheapest). ``MCORE_DSA_CP_BAL_PACK_SCOPE=1`` forces the
+    global-folding path (A/B testing).
+    """
+    import os
+
+    verdict = None
+    if os.environ.get("MCORE_DSA_CP_BAL_PACK_SCOPE") == "1":
+        verdict = False
+    elif not use_fused:
+        verdict = False
+    elif not multi_seq:
+        # Single full-pack sequence: the per-sequence zigzag degenerates to the global
+        # folding, whose static all_to_all is cheaper — keep the fast path.
+        verdict = False
+    if verdict is None:
+        pad = getattr(config, "pad_packed_seq_alignment", None)
+        verdict = isinstance(pad, int) and pad % (2 * cp_size) == 0 and (l_local % 2 == 0)
+    if os.environ.get("MCORE_DSA_CP_BAL_DEBUG") == "1" and not getattr(
+        _use_zigzag, "_logged", False
+    ):
+        _use_zigzag._logged = True
+        logger.info(
+            "[zz-gate] verdict=%s multi_seq=%s S=%s use_fused=%s pad=%r env=%r",
+            verdict,
+            multi_seq,
+            cp_size * l_local,
+            use_fused,
+            getattr(config, "pad_packed_seq_alignment", None),
+            os.environ.get("MCORE_DSA_CP_BAL_PACK_SCOPE"),
+        )
+    return verdict
+
+
+def _rope_positions(q, pos_ids, cu_q, nope_dim, pos_dim, indexer, config, table_len):
+    """Apply MLA RoPE at explicit sequence-relative positions (zigzag packed rows)."""
+    if config.apply_rope_fusion:
+        from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+
+        cos, sin = indexer.rotary_pos_emb.get_cached_cos_sin(
+            table_len, dtype=q.dtype, packed_seq=True, mscale=1.0
+        )
+        return fused_mla_rope_inplace(
+            q,
+            cos,
+            sin,
+            nope_dim,
+            pos_dim,
+            cu_seqlens_q=cu_q,
+            remove_interleaving=True,
+            position_ids=pos_ids,
+        )
+    from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+
+    rpe = indexer.rotary_pos_emb(table_len, packed_seq=True)
+    rpe = rpe[0] if isinstance(rpe, tuple) else rpe
+    freqs = torch.index_select(rpe, 0, pos_ids)
+    content, rotary = torch.split(q, [nope_dim, pos_dim], dim=-1)
+    rotary = _apply_rotary_pos_emb_bshd(
+        rotary,
+        freqs,
+        rotary_interleaved=config.rotary_interleaved,
+        mscale=1.0,
+        mla_rotary_interleaved=True,
+        mla_output_remove_interleaving=True,
+    )
+    return torch.cat((content, rotary), dim=-1)
+
+
+def _zigzag_plan(cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache):
+    """Per-sequence zigzag plan for this microbatch (cached on the layout cache).
+
+    Requires every (padded) sequence length — including the capacity-padding pseudo-sequence —
+    to be divisible by ``2 * cp_size`` (guaranteed by ``pad_packed_seq_alignment`` >= 2*cp).
+    Rank ``r`` computes, for EVERY sequence, its intra-sequence chunks ``r`` (head) and
+    ``2N-1-r`` (tail), so per-rank causal work is exactly constant for any pack composition.
+    All indices/layouts are computed on device from ``cu_seqlens`` (no host sync); shapes are
+    static, so the plan is CUDA-graph friendly (values refresh through captured kernels).
+    """
+    if layout_cache is not None:
+        cached = layout_cache.get(("zigzag", r))
+        if cached is not None:
+            return cached
+    N = cp_size
+    nch = 2 * N
+    S = N * l_local
+    cu = cu_seqlens.reshape(-1)
+    dt = cu.dtype
+    # Sequence starts/lengths including the capacity-padding pseudo-sequence [cu[-1], S).
+    starts = torch.cat((cu[:-1], cu[-1:]))
+    ends = torch.cat((cu[1:], torch.full_like(cu[:1], S)))
+    lens = ends - starts
+    c = torch.div(lens, nch, rounding_mode="floor")  # exact when alignment % (2*cp) == 0
+    half = l_local // 2
+    nseg = int(starts.shape[0])
+
+    # Ragged [seg, offset] enumeration over the head (and tail) rows: static shape `half`.
+    base = _excl_cumsum(c)  # offset of each sequence inside the packed half
+    rows = torch.arange(half, device=dev, dtype=dt)
+    seg_id = (torch.bucketize(rows, base[1:] if nseg > 1 else base[:0], right=True)).clamp_max(
+        nseg - 1
+    )
+    off = rows - base[seg_id]
+    head_idx = starts[seg_id] + r * c[seg_id] + off
+    tail_idx = starts[seg_id] + (nch - 1 - r) * c[seg_id] + off
+    gather_idx = torch.cat((head_idx, tail_idx)).long()
+    pos_head = (r * c)[seg_id] + off  # sequence-relative positions for RoPE
+    pos_tail = ((nch - 1 - r) * c)[seg_id] + off
+
+    # Inverse permutation: for each of my OWNED contiguous rows, its position in the
+    # rank-major all-gathered zigzag output Z[[rank] * l_local rows each, [heads | tails]].
+    g = torch.arange(r * l_local, (r + 1) * l_local, device=dev, dtype=dt)
+    s_own = torch.bucketize(g, starts[1:], right=True).clamp_max(nseg - 1)
+    p = g - starts[s_own]
+    k = torch.div(p, c[s_own].clamp_min(1), rounding_mode="floor").clamp_max(nch - 1)
+    q_in = p - k * c[s_own]
+    rho = torch.where(k < N, k, (nch - 1) - k)
+    is_head = k < N
+    pos_in_block = torch.where(is_head, base[s_own] + q_in, half + base[s_own] + q_in)
+    inv_idx = (rho * l_local + pos_in_block).long()
+
+    # Synthetic packed layouts (one segment per sequence; K keeps full compressed ranges).
+    cu_comp = cu_seqlens_compressed.reshape(-1)
+    comp_pad = torch.cat((cu_comp, cu_comp[-1:]))  # padding pseudo-seq: zero K rows
+    cu_q = torch.cat((torch.zeros_like(c[:1]), torch.cumsum(c, 0))).to(dt)
+    head_layout = (cu_q, comp_pad, (r * c).to(dt))
+    tail_layout = (cu_q, comp_pad, ((nch - 1 - r) * c).to(dt))
+
+    plan = {
+        "gather_idx": gather_idx,
+        "inv_idx": inv_idx,
+        "pos_head": pos_head.long(),
+        "pos_tail": pos_tail.long(),
+        "head_layout": head_layout,
+        "tail_layout": tail_layout,
+        "half": half,
+    }
+    if layout_cache is not None:
+        layout_cache[("zigzag", r)] = plan
+    return plan
+
+
 def balanced_compute_cp_indexer_topk(
     indexer_qr,  # [l_local, 1, q_lora]  detached indexer qr (pre-projection)
     weights_indexer_cp,  # [l_local, n_heads]    already-scaled indexer weights
@@ -276,6 +466,7 @@ def balanced_compute_cp_indexer_topk(
     dispatch='alltoall',
     dispatch_handle=None,
     layout_cache=None,
+    multi_seq=False,
 ):
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
@@ -322,7 +513,7 @@ def balanced_compute_cp_indexer_topk(
     # One full-pack sequence (the extreme long-context case): every chunk's rows belong to
     # that sequence, so a chunk can score against a sliced K prefix with an exact synthetic
     # layout (see _chunk_topk).
-    single_full_seq = int(max_seqlen_q) >= S
+    single_full_seq = not multi_seq
 
     def _kslice_layout(gs_, rows_, kb_):
         key = ("kslice", gs_, rows_, kb_)
@@ -423,6 +614,96 @@ def balanced_compute_cp_indexer_topk(
             for work in dispatch_handle["works"]:
                 work.wait()
         return _chunk_topk(indexer_qr, weights_indexer_cp, int(global_start), l_local), layout
+
+    zz = (
+        dispatch_handle.get("kind") in ("ag", "ag2")
+        if dispatch_handle is not None
+        else (
+            dispatch != 'hybridep' and _use_zigzag(multi_seq, cp_size, l_local, use_fused, config)
+        )
+    )
+    if zz:
+        # ---- Per-sequence zigzag: exact balance for any pack composition -------------
+        plan = _zigzag_plan(
+            cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache
+        )
+        half = plan["half"]
+        mq = max(1, min(int(max_seqlen_q), half))
+        gkv = max(1, int(max_seqlen_q) // int(ratio))
+
+        def _packed_topk(qr_rows, w_rows, layout3, pos_ids):
+            sz = qr_rows.shape[0]
+            q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
+            q = q.reshape(sz, n_heads, head_dim)
+            q = _rope_positions(
+                q, pos_ids, layout3[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
+            )
+            q = rotate_activation(q)
+            tk, _ = _cu.compute_cp_indexer_topk(
+                q,
+                w_rows.reshape(sz, n_heads),
+                k_seq_major,
+                cu_seqlens,
+                cu_seqlens_compressed,
+                0,
+                ratio,
+                topk,
+                softmax_scale,
+                max_seqlen_q=mq,
+                use_fused=True,
+                max_seqlen_kv=gkv,
+                prebuilt_layout=layout3,
+            )
+            return tk
+
+        nvtx_range_push("Bal_Dispatch")
+        if dispatch_handle is not None:
+            for work in dispatch_handle["works"]:
+                work.wait()
+            if dispatch_handle["kind"] == "ag":
+                g = dispatch_handle["g"]
+                qlw = dispatch_handle["q_lora"]
+                rows = torch.index_select(g, 0, plan["gather_idx"])
+                qr_h, w_h = rows[:half, :qlw].contiguous(), rows[:half, qlw:].contiguous()
+                qr_t, w_t = rows[half:, :qlw].contiguous(), rows[half:, qlw:].contiguous()
+            else:
+                gq, gw = dispatch_handle["gq"], dispatch_handle["gw"]
+                qh = torch.index_select(gq, 0, plan["gather_idx"])
+                wh = torch.index_select(gw, 0, plan["gather_idx"])
+                qr_h, qr_t = qh[:half].contiguous(), qh[half:].contiguous()
+                w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
+        else:
+            q2 = indexer_qr.reshape(l_local, q_lora)
+            w2 = weights_indexer_cp.reshape(l_local, n_heads)
+            wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
+            ww, gw = _all_gather_rows_buf(w2, l_local, cp_group, cp_size, "zz_w")
+            wq.wait()
+            ww.wait()
+            qh = torch.index_select(gq, 0, plan["gather_idx"])
+            wh = torch.index_select(gw, 0, plan["gather_idx"])
+            qr_h, qr_t = qh[:half].contiguous(), qh[half:].contiguous()
+            w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
+        nvtx_range_pop("Bal_Dispatch")
+
+        nvtx_range_push("BalancedIndexerScore")
+        nvtx_range_push("Bal_Head")
+        tk_head = _packed_topk(qr_h, w_h, plan["head_layout"], plan["pos_head"])
+        nvtx_range_pop("Bal_Head")
+        nvtx_range_push("Bal_Tail")
+        tk_tail = _packed_topk(qr_t, w_t, plan["tail_layout"], plan["pos_tail"])
+        nvtx_range_pop("Bal_Tail")
+        nvtx_range_pop("BalancedIndexerScore")
+
+        nvtx_range_push("Bal_Combine")
+        tkw = tk_head.shape[-1]
+        send = _a2a_buf("zz_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
+        send[:half].copy_(tk_head)
+        send[half:].copy_(tk_tail)
+        Z = _a2a_buf("zz_cmb_recv", S, tkw, tk_head.dtype, dev, cp_group)
+        dist.all_gather_into_tensor(Z, send, group=cp_group)
+        compressed_topk = torch.index_select(Z, 0, plan["inv_idx"])
+        nvtx_range_pop("Bal_Combine")
+        return compressed_topk, layout
 
     # Tile [0, S) into ``nch`` near-equal chunks: even l_local -> bounds[k] = k*(l_local//2); odd
     # l_local -> chunk sizes differ by at most one row, so no row is ever dropped.
