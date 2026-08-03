@@ -100,7 +100,7 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
     """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
-    # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
+    # allreduce=False marks parameters using the expert topology, so filter duplicates over ETP.
     if not getattr(param, "allreduce", True) and expert_tp_group is not None:
         tp_group = expert_tp_group
     # Prefer provided tp_group when available (new explicit path).
@@ -961,6 +961,7 @@ class ColumnParallelLinear(torch.nn.Module):
         use_expert_pgs = self.is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
         )
         self.output_size_per_partition = divide(output_size, world_size)
 
@@ -1379,6 +1380,7 @@ class RowParallelLinear(torch.nn.Module):
         use_expert_pgs = self.is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
         )
         setattr(self.weight, "allreduce", not use_expert_pgs)
 
