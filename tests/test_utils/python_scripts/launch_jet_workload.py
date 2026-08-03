@@ -6,7 +6,6 @@ import os
 import pathlib
 import re
 import signal
-import subprocess
 import sys
 import time
 import uuid
@@ -31,44 +30,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
-
-
-def send_slack_alert(test_case: str, context: str, n_iteration: int, n_attempts: int) -> None:
-    """Send a Slack alert via notify.py for the current release pipeline state.
-
-    Args:
-        test_case: Name of the release test case being run.
-        context: Human-readable context string appended to the pipeline context label.
-        n_iteration: Current training iteration (pipeline relaunch count).
-        n_attempts: Current attempt count within this iteration.
-    """
-    pipeline_id = os.getenv("PARENT_PIPELINE_ID")
-    pipeline_created_at = os.getenv("CI_PIPELINE_CREATED_AT", "")
-
-    if not pipeline_id or not pipeline_created_at:
-        logger.info("Missing PARENT_PIPELINE_ID or CI_PIPELINE_CREATED_AT, skipping Slack alert.")
-        return
-
-    pipeline_context = f"{test_case} | iteration={n_iteration} | attempt={n_attempts} | {context}"
-
-    try:
-        subprocess.run(
-            [
-                sys.executable,
-                str(BASE_PATH / "notify.py"),
-                "--pipeline-id",
-                pipeline_id,
-                "--check-for",
-                "functional-tests",
-                "--pipeline-context",
-                pipeline_context,
-                "--pipeline-created-at",
-                pipeline_created_at,
-            ],
-            check=False,
-        )
-    except Exception as e:
-        logger.warning("Failed to send Slack alert: %s", e)
 
 
 def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
@@ -414,6 +375,8 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
         or "Fatal glibc error" in concat_allranks_logs
+        or "Disk quota exceeded" in concat_allranks_logs
+        or "basic_ios::clear: iostream error" in concat_allranks_logs
     )
 
 
@@ -644,34 +607,15 @@ def main(
                 or "exiting program at iteration" in concat_allranks_logs
             ):
                 logger.info("Release training finished")
-                send_slack_alert(
-                    test_case=test_case,
-                    context="training finished",
-                    n_iteration=n_iteration,
-                    n_attempts=n_attempts,
-                )
                 sys.exit(int(not success))  # invert for exit 0
 
             if not success or parse_failed_job(logs=mainrank_log):
                 logger.error("Release pipeline finished with status %s, retrying.", status.name)
-                send_slack_alert(
-                    test_case=test_case,
-                    context=f"pipeline finished with status {status.name}, retrying",
-                    n_iteration=n_iteration,
-                    n_attempts=n_attempts,
-                )
                 n_attempts += 1
                 continue
 
             n_iteration += 1
 
-    if test_type == "release":
-        send_slack_alert(
-            test_case=test_case,
-            context="max attempts exhausted",
-            n_iteration=n_iteration,
-            n_attempts=n_attempts,
-        )
     telemetrics_and_exit(
         success=False,
         test_case=test_case,

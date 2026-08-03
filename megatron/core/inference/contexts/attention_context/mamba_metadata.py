@@ -21,6 +21,7 @@ class MambaMetadata:
         max_intermediate_count: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
+        decode_indices_dtype: torch.dtype = torch.int64,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -36,12 +37,15 @@ class MambaMetadata:
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
+            decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv
         self.device = torch.cuda.current_device()
+        assert decode_indices_dtype in (torch.int32, torch.int64)
+        self.decode_indices_dtype = decode_indices_dtype
 
         # Maximum possible chunks across all batch configurations
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
@@ -52,9 +56,10 @@ class MambaMetadata:
         )
 
         # Map from requests to slots in the static Mamba state buffer for active decode requests.
-        # int64 so selective_state_update can index directly without a per-layer upcast kernel;
+        # Non-BIK decode uses int64 for selective_state_update; BIK uses int32
+        # for the exact causal-conv1d update kernel.
         self._batch_indices_decode_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int64, device=self.device
+            (self.max_requests,), -1, dtype=self.decode_indices_dtype, device=self.device
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
@@ -111,13 +116,11 @@ class MambaMetadata:
         self._intermediate_abs_positions_buffer = torch.full(
             (self.max_intermediate_count,), d_conv, dtype=torch.int32, device=self.device
         )
-        # Constant gather offsets for conv state extraction: [-d_conv, ..., -1]
-        if d_conv > 0:
-            self.conv_gather_offsets = torch.arange(
-                -d_conv, 0, dtype=torch.int32, device=self.device
-            )
-        else:
-            self.conv_gather_offsets = None
+        # Runtime real-count tensor read by the fused gather+scatter Triton
+        # kernels (intermediate_extraction.py). Fixed-address, rewritten each step
+        # so captured CUDA graphs stay valid while the kernels skip padded slots
+        # (pid_slot >= real_count).
+        self._intermediate_real_count_buffer = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         # Coalesced production path: pinned CPU views + shared GPU views bound
         # by DynamicInferenceContext so that the per-step Mamba metadata fields
@@ -180,6 +183,7 @@ class MambaMetadata:
         # Intermediate state extraction views
         self.intermediate_chunk_indices = None
         self.intermediate_abs_positions = None
+        self.intermediate_real_count = None
         self.intermediate_count = 0
         self.per_request_intermediate_counts = []
 
@@ -494,6 +498,11 @@ class MambaMetadata:
 
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            # Publish real_count to the fixed-address GPU tensor the scatter
+            # kernels consult. fill_ is async (no host sync) and keeps the tensor
+            # at the same address captured graphs reference.
+            self._intermediate_real_count_buffer.fill_(self.intermediate_count)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
             # (same rationale as padding comment above; abs_positions=d_conv may
@@ -505,6 +514,8 @@ class MambaMetadata:
             self.per_request_intermediate_counts = []
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            self._intermediate_real_count_buffer.fill_(0)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
 
     def compute_cpu_metadata(
         self,
