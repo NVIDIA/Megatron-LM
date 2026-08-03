@@ -258,15 +258,6 @@ class InferenceStateHandoffMixin:
             layer_end=layer_end,
         )
 
-        # Cache static peer metadata for every request.
-        self._kv_peer_metas = self._kv_transfer_agent.export_meta()
-        if torch.distributed.is_initialized() and tp_size > 1:
-            gathered: list = [None] * tp_size
-            torch.distributed.all_gather_object(
-                gathered, self._kv_peer_metas, group=self.pg_collection.tp
-            )
-            self._kv_peer_metas = gathered
-
         # Mamba uses the same transport segments as KV, with conv channels or
         # SSM heads as the fragment axis.
         self._mamba_transfer_agents = {}
@@ -323,9 +314,10 @@ class InferenceStateHandoffMixin:
                     msa.ssm_states.shape[-2] * msa.ssm_states.shape[-1],
                 ),
             }
+            backend_factory = getattr(self._kv_transfer_agent, "new_registered_buffer", backend_cls)
             for state_kind, (memory_buffer, width, state_dim) in state_specs.items():
                 ssm_state_kind = "recurrent" if state_kind == "ssm" else state_kind
-                self._mamba_transfer_agents[state_kind] = backend_cls(
+                self._mamba_transfer_agents[state_kind] = backend_factory(
                     agent_name=f"{role}-mamba-{state_kind}-rank{rank}",
                     memory_buffer=memory_buffer,
                     expected_num_blocks=msa.max_slots,
@@ -339,6 +331,16 @@ class InferenceStateHandoffMixin:
                 state_kind: agent.export_meta()
                 for state_kind, agent in self._mamba_transfer_agents.items()
             }
+
+        # Shared-agent metadata covers every registered state buffer, so export
+        # it only after the optional Mamba buffers have been registered.
+        self._kv_peer_metas = self._kv_transfer_agent.export_meta()
+        if torch.distributed.is_initialized() and tp_size > 1:
+            gathered: list = [None] * tp_size
+            torch.distributed.all_gather_object(
+                gathered, self._kv_peer_metas, group=self.pg_collection.tp
+            )
+            self._kv_peer_metas = gathered
 
     def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
         """Push a pinned hand-off's KV (and Mamba snapshots) to the decode
