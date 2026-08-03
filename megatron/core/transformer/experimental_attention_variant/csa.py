@@ -2637,6 +2637,15 @@ class CompressedSparseAttention(MegatronModule):
                     and cp_size > 1
                     and max_seqlen_q >= (self.config.dsa_cp_balance_min_seqlen or 0)
                 )
+                if use_balance:
+                    # context_parallel_layout contract: this layer declares
+                    # required_cp_partition_mode == "contiguous", so any populated
+                    # batch layout metadata must agree before rows are re-balanced.
+                    _cp_mode = getattr(packed_seq_params, "cp_partition_mode", None)
+                    assert _cp_mode in (None, "contiguous"), (
+                        "balanced CP indexer requires contiguous layer input layout, got "
+                        f"PackedSeqParams.cp_partition_mode={_cp_mode!r}"
+                    )
                 # q_indexer_cp (projected + roped) feeds the contiguous top-k and the train-time
                 # fused sparse-attn + indexer-loss path (which consumes it regardless of
                 # indexer_loss_coeff); the balanced path re-projects per chunk. Skip this

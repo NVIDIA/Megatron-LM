@@ -12,7 +12,7 @@ light) and chunk ``2 * cp_size - 1 - r`` (a high-position "tail", heavy), so
 ``use_fused`` flag, and non-even per-rank lengths are all handled exactly as in the reference path.
 
 ``balanced_compute_cp_indexer_topk`` is a drop-in replacement for
-``csa_cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
+``csa_utils.cp_utils.compute_cp_indexer_topk``: it returns the top-k in the same contiguous
 ``[l_local, topk]`` layout, so the downstream index-building and sparse attention are unchanged.
 """
 
@@ -479,7 +479,7 @@ def balanced_compute_cp_indexer_topk(
     top-k back to contiguous order. ``dispatch`` selects the redistribute backend ('alltoall' or
     'hybridep'; 'hybridep' requires an even ``l_local`` and otherwise uses 'alltoall').
     """
-    from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as _cu
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
     q_lora = indexer_qr.shape[-1]
     n_heads, head_dim = indexer.index_n_heads, indexer.index_head_dim
@@ -849,3 +849,144 @@ def _hybridep_dispatch_chunks(qr, weights, cp_group, cp_size, l_local, C, r, q_l
     qr_tail, w_tail = disp[C : 2 * C, :q_lora], disp[C : 2 * C, q_lora:]
     _validate_hep_order(qr, qr_head, qr_tail, cp_group, cp_size, l_local, C, r)
     return qr_head, w_head, qr_tail, w_tail
+
+
+def _thd_zigzag_rank_indices(cu_list, cp_size, cp_rank, device):
+    """Global THD token indices owned by ``cp_rank`` under the zigzag CP layout.
+
+    Mirrors the canonical segment math in
+    ``megatron.core.context_parallel_layout.routes`` (rank ``r`` owns chunk ``r``
+    and chunk ``2 * cp_size - r - 1`` of every packed sequence), returned in
+    rank-local storage order. That module only exposes the segments through a
+    private helper today, so the expansion is kept here.
+
+    TODO(cp-layout): drop this in favour of a public per-rank ownership helper
+    once ``context_parallel_layout`` exports one again.
+    """
+    rows = []
+    for seq_start, seq_end in zip(cu_list[:-1], cu_list[1:]):
+        chunk_len = (seq_end - seq_start) // (2 * cp_size)
+        if chunk_len == 0:
+            continue
+        head_start = seq_start + cp_rank * chunk_len
+        tail_start = seq_start + (2 * cp_size - cp_rank - 1) * chunk_len
+        rows.extend(range(head_start, head_start + chunk_len))
+        rows.extend(range(tail_start, tail_start + chunk_len))
+    return torch.tensor(rows, device=device, dtype=torch.long)
+
+
+def prebuild_balanced_layouts(packed_seq_params, cp_group=None):
+    """Data-prep-time prebuild of the balanced-indexer zigzag plan and multi-seq gate.
+
+    Mirrors ``context_parallel_layout.prebuild_thd_cp_partition_routes``: this runs
+    where host syncs are free, so the forward path never has to build layout
+    metadata (or run its one D2H segment-count probe) inside a CUDA graph capture.
+
+    The zigzag ownership indices come from
+    ``context_parallel_layout`` zigzag segment ownership — the shared
+    canonical CP layout definition — reordered into the ``[heads | tails]`` packing
+    that the fused indexer requires (its packed calls allow only one segment per
+    sequence per call, so head and tail chunks go into two separate calls). The
+    static-shape device-side builder in ``_zigzag_plan`` remains as the
+    capture-safe fallback for callers that do not prebuild.
+    """
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return
+    if cp_group is None:
+        cp_group = getattr(packed_seq_params, "cp_group", None)
+    if cp_group is None or cp_group.size() <= 1:
+        return
+    from megatron.core.context_parallel_layout.utils import (
+        get_packed_seq_params_cp_partition_cu_seqlens,
+    )
+
+    cu = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
+    if cu is None:
+        return
+    N, r = cp_group.size(), cp_group.rank()
+    cu = cu.reshape(-1)
+    total = int(cu[-1].item())
+    if total <= 0 or total % N != 0:
+        return
+    l_local = total // N
+    if l_local % 2 != 0:
+        return
+
+    # Multi-seq gate: one D2H probe here instead of in the first forward.
+    cu_real = packed_seq_params.cu_seqlens_q if packed_seq_params.cu_seqlens_q is not None else cu
+    seg_lens = cu_real[1:] - cu_real[:-1]
+    nseg_real = int((seg_lens > 0).sum().item())
+    total_real = int(cu_real[-1].item())
+    packed_seq_params._dsa_cp_multi_seq = not (nseg_real == 1 and total_real == total)
+    if not packed_seq_params._dsa_cp_multi_seq:
+        # Single full sequence: the folding + K-slice path is used, no zigzag plan.
+        return
+
+    cu_list = [int(v) for v in cu.tolist()]
+    # Same sequence enumeration as _zigzag_plan: real segments plus the
+    # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
+    seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
+    if any(sl % (2 * N) for sl in seq_lens_list):
+        # Runtime gate falls back to folding for non-2N-aligned packs.
+        return
+
+    dev, dt = cu.device, cu.dtype
+    half = l_local // 2
+    # Canonical per-rank zigzag ownership (per-seq interleaved [head seg, tail seg]).
+    per_rank = [_thd_zigzag_rank_indices(cu_list, N, rho, dev) for rho in range(N)]
+
+    # Reorder the canonical per-seq-interleaved local order into [heads | tails].
+    c_list = [sl // (2 * N) for sl in seq_lens_list]
+    head_pos, tail_pos = [], []
+    off = 0
+    for c in c_list:
+        head_pos.extend(range(off, off + c))
+        tail_pos.extend(range(off + c, off + 2 * c))
+        off += 2 * c
+    assert off == l_local and len(head_pos) == half, (off, l_local, len(head_pos), half)
+    perm = torch.tensor(head_pos + tail_pos, device=dev, dtype=torch.long)
+
+    gather_idx = per_rank[r].index_select(0, perm)
+
+    # Sequence-relative positions for RoPE (relative to real segment starts; rows in
+    # the capacity pseudo-sequence use cu[-1] as their start, matching _zigzag_plan).
+    starts_t = torch.tensor(cu_list[:-1] + [cu_list[-1]], device=dev, dtype=torch.long)
+    bounds_t = torch.tensor(cu_list[1:] + [total], device=dev, dtype=torch.long)
+    seq_of = torch.bucketize(gather_idx, bounds_t[:-1], right=True).clamp_max(starts_t.numel() - 1)
+    pos = gather_idx - starts_t[seq_of]
+    pos_head, pos_tail = pos[:half].long(), pos[half:].long()
+
+    # Inverse permutation: my contiguous rows' positions in the rank-major
+    # [heads | tails] all-gather concat — derived from the canonical indices.
+    pos_global = torch.empty(total, device=dev, dtype=torch.long)
+    ar = torch.arange(l_local, device=dev, dtype=torch.long)
+    for rho in range(N):
+        pos_global[per_rank[rho].index_select(0, perm)] = rho * l_local + ar
+    mine = torch.arange(r * l_local, (r + 1) * l_local, device=dev, dtype=torch.long)
+    inv_idx = pos_global.index_select(0, mine)
+
+    # Packed call layouts. ratio == 4 is the only compress ratio that instantiates
+    # an indexer (mirrors CSAAttention.__init__), so its compressed cu is fixed here.
+    ratio = 4
+    c_t = torch.tensor(c_list, device=dev, dtype=torch.int64)
+    cu_q = torch.cat((torch.zeros(1, device=dev, dtype=torch.int64), torch.cumsum(c_t, 0))).to(dt)
+    comp_lens = torch.div(cu[1:] - cu[:-1], ratio, rounding_mode="floor")
+    cu_comp = torch.cat(
+        (torch.zeros_like(cu[:1]), torch.cumsum(comp_lens, dim=0, dtype=torch.int32))
+    ).reshape(-1)
+    comp_pad = torch.cat((cu_comp, cu_comp[-1:]))
+    nch = 2 * N
+    plan = {
+        "gather_idx": gather_idx.long(),
+        "inv_idx": inv_idx.long(),
+        "pos_head": pos_head,
+        "pos_tail": pos_tail,
+        "head_layout": (cu_q, comp_pad, (r * c_t).to(dt)),
+        "tail_layout": (cu_q, comp_pad, ((nch - 1 - r) * c_t).to(dt)),
+        "half": half,
+    }
+    cache = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
+    if cache is None:
+        cache = {}
+        packed_seq_params._dsa_cp_balance_layout_cache = cache
+    cache[("zigzag", r)] = plan
