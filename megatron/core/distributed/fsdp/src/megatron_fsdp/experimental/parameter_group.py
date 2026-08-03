@@ -30,6 +30,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from ..utils import HAVE_TE
 from . import layout_builder
 from .dbuffer import DBuffer
+from .grouped_tensor import get_values, install_storage, is_grouped_tensor
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic, RowAtomic, TensorAtomic
@@ -292,7 +293,7 @@ class FsdpParameterGroup:
                     )
                 parameter.clear_high_precision_init_val()
             else:
-                initial_value = parameter
+                initial_value = get_values(parameter)
             self.main_weight.copy_from(index, initial_value)
 
         if use_symmetric_memory:
@@ -384,6 +385,9 @@ class FsdpParameterGroup:
                 )
                 copy_parameter_attributes(parameter, materialized_parameter)
                 torch.utils.swap_tensors(parameter, materialized_parameter)
+            elif is_grouped_tensor(parameter):
+                install_storage(parameter, unsharded_tensor)
+                parameter.grad = None
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
@@ -499,7 +503,7 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
+            grads.append(get_values(fsdp_parameter.unsharded.grad))
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
@@ -513,7 +517,7 @@ class FsdpParameterGroup:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
+            partial_grad.get_tensor_view(index).copy_(get_values(fsdp_parameter.unsharded.grad))
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
