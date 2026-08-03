@@ -464,6 +464,9 @@ class DataParallelInferenceCoordinator:
             finished_request (dict): The serialized merged request containing the
                 generated tokens to be detokenized. It is modified in place.
         """
+        if not finished_request["sampling_params"]["detokenize_generations"]:
+            return
+
         detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
             "detokenize_stop_sequence", False
         )
