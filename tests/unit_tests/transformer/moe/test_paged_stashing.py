@@ -583,17 +583,16 @@ class TestNcclEpPagedStashing:
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     def test_over_budget_recovery(self, zero_copy):
-        """Replay an over-budget step eager, then restore the budget grown to the observed peak.
+        """Replay an over-budget step at a budget grown to the peak the dropped step needed.
 
-        Drives the same sequence PagedStashRunner.prepare_for_rerun / its success branch do.
-        The runner itself is not reachable from a unit test (it walks model_chunk.decoder.layers
-        and is built in training.py), but its orchestration is not the risky part -- the
-        teardown, re-bootstrap and symm-buffer reallocation are, and those are exercised here.
+        Drives the same sequence PagedStashRunner.prepare_for_rerun does. The runner itself is
+        not reachable from a unit test (it walks model_chunk.decoder.layers and is built in
+        training.py), but its orchestration is not the risky part -- the teardown, re-bootstrap
+        and symm-buffer reallocation are, and those are exercised here.
 
-        zero_copy=True is the case the flag plumbing exists for: the replay must drop to eager
-        WITHOUT zero-copy (eager cannot use the fixed-size symm buffers), and the restore must
-        re-rendezvous them at the grown capacity. With zero_copy=False the mode-switching in
-        set_rerun_mode is a no-op, so only this parametrization exercises it.
+        zero_copy=True is the case that matters: growing reallocates the symm buffers at the new
+        capacity, and the replay has to come back with zero-copy still on. With zero_copy=False
+        that reallocation never happens, so only this parametrization covers it.
         """
         if not is_nccl_ep_available():
             pytest.skip("NCCL EP is not available")
@@ -658,33 +657,25 @@ class TestNcclEpPagedStashing:
         required = int(required_t.item())
         budget_before = container.moe_layers[0].token_dispatcher._comm_manager._recv_capacity
 
-        # 2. prepare_for_rerun: degrade to eager, release the EP context, replay.
+        # 2. prepare_for_rerun: grow the budget to the observed peak, release the EP context,
+        #    replay. The mode never changes -- the replay is still static and still zero-copy,
+        #    and the grown budget carries forward, so there is no restore step.
         for layer in container.moe_layers:
             layer.token_dispatcher.reset_over_budget()
-            layer.token_dispatcher.set_ep_rerun_mode(True)
+            layer.token_dispatcher.grow_ep_recv_capacity(required)
         nccl_ep_release_context()
 
         out_replay = run()
-        eager_3 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
-        zc_3 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
+        eager_2 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
+        zc_2 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
+        caps_2 = [l.token_dispatcher._comm_manager._recv_capacity for l in container.moe_layers]
+        over_2 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
         replay_nan = bool(torch.isnan(out_replay).any())
         # atol=0 so the comparison is purely relative: these activations are ~1e-15, and
         # allclose's default atol=1e-8 would call any result "close", including a completely
         # wrong one. NaN compares not-close, so a dropped step that corrupts to NaN is caught
         # by the same check without depending on it staying NaN.
         dropped_differs = not torch.allclose(out_dropped, out_replay, rtol=1e-2, atol=0)
-
-        # 3. Success branch: restore static, grown to the observed peak.
-        for layer in container.moe_layers:
-            layer.token_dispatcher.reset_over_budget()
-            layer.token_dispatcher.set_ep_rerun_mode(False, new_capacity=required)
-        nccl_ep_release_context()
-
-        out_grown = run()
-        eager_5 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
-        zc_5 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
-        caps_5 = [l.token_dispatcher._comm_manager._recv_capacity for l in container.moe_layers]
-        over_5 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
         nccl_ep_release_context()
 
         # Assertions only past this point: every collective is behind us, so a failure on a
@@ -695,31 +686,26 @@ class TestNcclEpPagedStashing:
             f"nothing exceeded budget {budget_before} at capacity factor "
             f"{container.config.moe_expert_rank_capacity_factor}; not exercising overflow"
         )
-        # The replay must be eager AND non-zero-copy: eager sizes its recv buffers per step, so it
-        # cannot use the fixed [recv_capacity, hidden] symm buffers.
-        assert all(eager_3) and not any(zc_3), f"replay did not degrade: eager={eager_3} zc={zc_3}"
-        assert not replay_nan, "eager replay produced NaNs"
+        assert all(
+            c >= required > budget_before for c in caps_2
+        ), f"budget did not grow: {budget_before} -> {caps_2}, observed peak {required}"
+        # Growing must not change the mode: staying static is what keeps the replay capturable,
+        # and zero-copy must survive the symm buffers being re-rendezvoused at the new capacity.
+        # The zero_copy check is vacuous when False, load-bearing when True.
+        assert not any(eager_2), f"replay must stay static, not degrade to eager: {eager_2}"
+        assert all(
+            z == zero_copy for z in zc_2
+        ), f"replay did not keep zero_copy={zero_copy}: {zc_2}"
+        # The point of growing to the observed peak: the replay drops nothing.
+        assert not any(over_2), f"still over budget after growing to {required}: {over_2}"
+        assert not replay_nan, "replay produced NaNs"
         # Only ranks that actually dropped can differ: overflow is per-rank, so a rank whose
         # experts stayed under budget legitimately reproduces the same output.
         if any(over_1):
             assert dropped_differs, (
                 "this rank was over budget, so the dropped step must differ from the dropless "
-                "eager replay"
+                "replay"
             )
-        assert not any(eager_5), f"restore did not return to the static budget: {eager_5}"
-        # Restore must also put zero-copy back, which means the symm buffers were re-rendezvoused
-        # at the grown capacity. Vacuous when zero_copy=False, load-bearing when True.
-        assert all(
-            z == zero_copy for z in zc_5
-        ), f"restore did not return zero_copy to {zero_copy}: {zc_5}"
-        assert all(
-            c >= required > budget_before for c in caps_5
-        ), f"budget did not grow: {budget_before} -> {caps_5}, observed peak {required}"
-        assert not any(over_5), f"still over budget after growing: {over_5}"
-        # Same reasoning as above: atol=0, so this cannot pass by both tensors being tiny.
-        torch.testing.assert_close(out_grown, out_replay, rtol=1e-2, atol=0)
-
-        nccl_ep_release_context()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.

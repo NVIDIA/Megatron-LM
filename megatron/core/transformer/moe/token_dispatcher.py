@@ -1533,13 +1533,8 @@ class _NCCLEPManager(_DispatchManager):
         self.eager = self.moe_expert_rank_capacity_factor is None
         self.zero_copy = config.moe_ncclep_zero_copy
         self._zc_quant = self.zero_copy and bool(config.fp8 or config.fp4)
-        # eager/zero_copy/_zc_quant are the LIVE mode: set_rerun_mode() degrades them to replay
-        # an overflowed step, and restores them from these. Every other read stays correct
-        # without knowing replay exists.
-        self._config_eager = self.eager
-        self._config_zero_copy = self.zero_copy
-        # Grown by set_rerun_mode() after an overflow, to the peak the dropped step needed.
-        # Monotonic: a routing pattern that overflowed once is likely to do so again.
+        # Grown by grow_recv_capacity() after an overflow, to the peak the dropped step needed.
+        # Monotonic, and it stays for every later step: the mode never changes, only the budget.
         self._recv_capacity_override = None
         if not self.eager:
             # Accumulated device-side per dispatch, so the happy path never syncs.
@@ -1728,33 +1723,31 @@ class _NCCLEPManager(_DispatchManager):
         self.dispatched_probs = dispatched_probs.clone() if self._zc_quant else dispatched_probs
         return recv_tokens
 
-    def set_rerun_mode(self, enabled: bool, new_capacity: Optional[int] = None) -> None:
-        """Degrade to eager without zero-copy to replay an overflowed step, or restore.
+    def grow_recv_capacity(self, new_capacity: int) -> None:
+        """Grow the receive budget to ``new_capacity`` and drop this manager's bootstrap.
 
-        Eager has no receive budget to exceed, so the replay cannot overflow again; zero-copy
-        must go with it because its symm buffers are a fixed ``[recv_capacity, hidden]`` and
-        TE rejects ``zero_copy`` in eager mode. On restore, ``new_capacity`` (the peak the
-        dropped step needed) grows the budget so the next step does not overflow the same way.
+        Recovery from a token drop replays the step at a budget grown to the peak the dropped
+        step needed, rather than degrading to a dropless mode. ``new_capacity`` is the pre-drop
+        requirement TE reported, so the replay is dropless as long as it routes the same way,
+        and one EP rebuild serves both the replay and every later step. Staying static also
+        keeps the replay CUDA-graph capturable and keeps zero-copy, neither of which eager
+        supports.
 
         Only drops this manager's bootstrap -- the caller must also call
         ``nccl_ep_release_context()`` once, and the next dispatch then re-bootstraps in the
-        un-captured warmup iteration that ``reset_cuda_graph`` guarantees. That is also what
-        makes growing safe: the symm buffers are reallocated at the new capacity outside
-        CUDA-graph capture.
+        un-captured warmup iteration that ``reset_cuda_graph`` guarantees. That is what makes
+        growing safe: the symm buffers are reallocated at the new capacity outside CUDA-graph
+        capture.
         """
-        if self._config_eager:
+        if self.eager:
             return
-        self.eager = enabled
-        self.zero_copy = self._config_zero_copy and not enabled
-        self._zc_quant = self.zero_copy and bool(self.config.fp8 or self.config.fp4)
-        if not enabled and new_capacity is not None:
-            # Overflow means total_recv_tokens > _recv_capacity >= the current override, so the
-            # peak that triggered it is always strictly larger. Anything else is stale accounting.
-            assert new_capacity > (self._recv_capacity_override or 0), (
-                f"receive capacity must grow on overflow: peak {new_capacity} is not above the "
-                f"current override {self._recv_capacity_override}"
-            )
-            self._recv_capacity_override = new_capacity
+        # Overflow means total_recv_tokens > _recv_capacity >= the current override, so the
+        # peak that triggered it is always strictly larger. Anything else is stale accounting.
+        assert new_capacity > (self._recv_capacity_override or 0), (
+            f"receive capacity must grow on overflow: peak {new_capacity} is not above the "
+            f"current override {self._recv_capacity_override}"
+        )
+        self._recv_capacity_override = new_capacity
         self._buffer = None
         self._bootstrapped = False
 
@@ -1795,7 +1788,7 @@ def nccl_ep_release_context() -> None:
     """Release the process-wide NCCL EP context and the shared zero-copy symm buffers.
 
     Collective, and process-wide rather than per-layer: call it once after every manager has
-    been flipped with ``set_rerun_mode()``. ``_ensure_bootstrap`` rebuilds both lazily, so the
+    grown via ``grow_recv_capacity()``. ``_ensure_bootstrap`` rebuilds both lazily, so the
     symm-buffer rendezvous lands outside CUDA-graph capture.
     """
     _NCCLEPManager._zc_fwd_token_buf = None
@@ -2063,11 +2056,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         else:
             return None
 
-    def set_ep_rerun_mode(self, enabled: bool, new_capacity: Optional[int] = None) -> None:
-        """Degrade the dispatcher to replay an overflowed step, or restore it, growing the
-        receive budget to ``new_capacity``. No-op unless the backend supports it."""
-        if hasattr(self._comm_manager, 'set_rerun_mode'):
-            self._comm_manager.set_rerun_mode(enabled, new_capacity)
+    def grow_ep_recv_capacity(self, new_capacity: int) -> None:
+        """Grow the backend's receive budget to ``new_capacity`` so an overflowed step can be
+        replayed without dropping. No-op unless the backend supports it."""
+        if hasattr(self._comm_manager, 'grow_recv_capacity'):
+            self._comm_manager.grow_recv_capacity(new_capacity)
 
     def reset_over_budget(self):
         """Reset the accumulated over-budget flag on the communication manager."""
