@@ -98,6 +98,13 @@ def initialize_megatron(
         enable_batch_invariant_mode()
 
     # torch.distributed initialization
+    # Training scripts do not necessarily build a TransformerConfig before the
+    # first Triton kernel runs, so install the autotune policy here too. It is
+    # idempotent, and does nothing unless the policy asks for an interception.
+    from megatron.core.tuning import install_from_env
+
+    install_from_env()
+
     def finish_mpu_init():
         args = get_args()
         # Pytorch distributed.
@@ -184,6 +191,7 @@ def _compile_dependencies():
 
     torch.distributed.barrier()
 
+
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
     communication overlap"""
@@ -262,8 +270,9 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
-                            skip_model_parallel_init=False):
+def _initialize_distributed(
+    get_embedding_ranks, get_position_embedding_ranks, store, skip_model_parallel_init=False
+):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -435,11 +444,17 @@ def _set_random_seed(
     """
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        pp_rank = get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
+        pp_rank = (
+            get_pg_rank(pp_group)
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_rank()
+        )
         seed = seed_ + (100 * pp_rank)
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
-            dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            dp_rank = (
+                get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+            )
             seed = seed + (10 * dp_rank)
         random.seed(seed)
         np.random.seed(seed)
