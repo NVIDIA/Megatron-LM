@@ -96,7 +96,7 @@ def autotune_configs(configs):
             if TRITON_HAS_CACHE_RESULTS
             else "Deterministic mode: upgrade to Triton >= 3.4.0 for cached autotuning."
         )
-        warnings.warn(msg)
+        warnings.warn(msg, stacklevel=2)
     filtered = _filter_configs_by_block_sizes(configs)
     if filtered:
         return filtered

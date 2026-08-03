@@ -848,7 +848,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
                 warnings.warn(
                     "When using sequence parallelism it is recommended to set the "
                     "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for "
-                    "maximum speedup"
+                    "maximum speedup",
+                    stacklevel=2,
                 )
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
@@ -856,7 +857,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
                 warnings.warn(
                     "When using async grad allreduce it is recommended to set the "
                     "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 for "
-                    "maximum speedup"
+                    "maximum speedup",
+                    stacklevel=2,
                 )
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
@@ -1060,7 +1062,8 @@ class ColumnParallelLinear(torch.nn.Module):
         if self.sequence_parallel and world_size <= 1:
             warnings.warn(
                 "`sequence_parallel` is set to `True`, but tensor model parallel size "
-                f"is {world_size}. Disabling sequence parallel."
+                f"is {world_size}. Disabling sequence parallel.",
+                stacklevel=2,
             )
             self.sequence_parallel = False
 
