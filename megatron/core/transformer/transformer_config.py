@@ -3,7 +3,7 @@
 import logging
 import math
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -1206,10 +1206,32 @@ class TransformerConfig(ModelParallelConfig):
     during training."""
 
     heterogeneous_block_specs: bool = False
-    """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
+    """Whether to use heterogeneous block specs (nemotron-nas architecture).
+    Automatically enabled by `_validate_moe_per_layer_lists` when any
+    `*_per_layer` list below is set."""
 
     hetereogenous_dist_checkpoint: bool = False
     """Whether to use heterogenous layers in distributed checkpoint."""
+
+    ffn_hidden_size_per_layer: Optional[List[int]] = None
+    """Per-layer override for `ffn_hidden_size`. Length must equal `num_layers`.
+    Use `-1` on layers that should keep the global value (e.g. non-MLP layers)."""
+
+    moe_ffn_hidden_size_per_layer: Optional[List[int]] = None
+    """Per-layer override for `moe_ffn_hidden_size`. Length must equal `num_layers`.
+    Use `-1` on layers that are not MoE."""
+
+    num_moe_experts_per_layer: Optional[List[int]] = None
+    """Per-layer override for `num_moe_experts`. Length must equal `num_layers`.
+    Use `-1` on layers that are not MoE."""
+
+    moe_router_topk_per_layer: Optional[List[int]] = None
+    """Per-layer override for `moe_router_topk`. Length must equal `num_layers`.
+    Use `-1` on layers that are not MoE."""
+
+    moe_shared_expert_intermediate_size_per_layer: Optional[List[int]] = None
+    """Per-layer override for `moe_shared_expert_intermediate_size`. Length must equal
+    `num_layers`. Use `-1` on layers that should disable/inherit the global value."""
 
     ####################
     # Quantization
@@ -2952,6 +2974,108 @@ class TransformerConfig(ModelParallelConfig):
                     "Batch-invariant MoE supports dynamic dropless routing only. "
                     "Disable MoE capacity/expert padding."
                 )
+
+        self._validate_moe_per_layer_lists()
+
+    def _validate_moe_per_layer_lists(self) -> None:
+        """Validate per-layer MoE / MLP hidden-size lists and enable heterogeneous specs.
+
+        Each `*_per_layer` list, when set, must have length equal to `num_layers` and
+        contain either `-1` (no override for that layer) or a strictly positive integer.
+        If any list is set, `heterogeneous_block_specs` is flipped to True so downstream
+        block builders route per-layer configs through `get_config_for_layer`.
+        """
+        per_layer_fields = [
+            "ffn_hidden_size_per_layer",
+            "moe_ffn_hidden_size_per_layer",
+            "num_moe_experts_per_layer",
+            "moe_router_topk_per_layer",
+            "moe_shared_expert_intermediate_size_per_layer",
+        ]
+
+        has_per_layer = False
+        for field_name in per_layer_fields:
+            values = getattr(self, field_name)
+            if values is None:
+                continue
+            has_per_layer = True
+            # HybridModelProvider defers num_layers derivation until finalize(); only
+            # length-check when num_layers is available.
+            if self.num_layers is not None and len(values) != self.num_layers:
+                raise ValueError(
+                    f"{field_name} length ({len(values)}) must match num_layers "
+                    f"({self.num_layers})."
+                )
+            for value in values:
+                if not isinstance(value, int):
+                    raise ValueError(f"All values in {field_name} must be ints, got {type(value)}.")
+                if value != -1 and value <= 0:
+                    raise ValueError(
+                        f"All values in {field_name} must be -1 or > 0, got {value}."
+                    )
+
+        if has_per_layer:
+            self.heterogeneous_block_specs = True
+
+    def get_config_for_layer(self, layer_number: int) -> "TransformerConfig":
+        """Return a per-layer transformer config with `*_per_layer` overrides applied.
+
+        `layer_number` is 1-indexed and interpreted against the global layer numbering
+        used by hybrid/transformer block builders.
+        """
+        layer_idx = layer_number - 1
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise ValueError(
+                f"Invalid layer_number={layer_number}. Must be in [1, {self.num_layers}]."
+            )
+
+        keys_to_update: dict = {}
+
+        if self.num_moe_experts_per_layer is not None:
+            value = self.num_moe_experts_per_layer[layer_idx]
+            if value != -1:
+                keys_to_update["num_moe_experts"] = value
+        if self.ffn_hidden_size_per_layer is not None:
+            value = self.ffn_hidden_size_per_layer[layer_idx]
+            if value != -1:
+                keys_to_update["ffn_hidden_size"] = value
+        if self.moe_ffn_hidden_size_per_layer is not None:
+            value = self.moe_ffn_hidden_size_per_layer[layer_idx]
+            if value != -1:
+                keys_to_update["moe_ffn_hidden_size"] = value
+        if self.moe_router_topk_per_layer is not None:
+            value = self.moe_router_topk_per_layer[layer_idx]
+            if value != -1:
+                keys_to_update["moe_router_topk"] = value
+        if self.moe_shared_expert_intermediate_size_per_layer is not None:
+            value = self.moe_shared_expert_intermediate_size_per_layer[layer_idx]
+            keys_to_update["moe_shared_expert_intermediate_size"] = (
+                None if value == -1 else value
+            )
+
+        if not keys_to_update:
+            return self
+
+        # Use `dataclasses.replace` (not asdict) so:
+        #  * ProcessGroup / ProcessGroupCollection handles carried on subclasses like
+        #    HybridModelProvider are passed by reference instead of triggering a
+        #    deepcopy that fails on distributed handles.
+        #  * The returned instance preserves the concrete subclass, so downstream
+        #    code that reads Hybrid/MLA-specific fields still finds them.
+        # We also null out the per-layer lists on the returned instance so no code
+        # that inspects it can accidentally recurse through get_config_for_layer.
+        from dataclasses import replace as _dc_replace
+
+        keys_to_update.setdefault("heterogeneous_block_specs", False)
+        for name in (
+            "ffn_hidden_size_per_layer",
+            "moe_ffn_hidden_size_per_layer",
+            "num_moe_experts_per_layer",
+            "moe_router_topk_per_layer",
+            "moe_shared_expert_intermediate_size_per_layer",
+        ):
+            keys_to_update.setdefault(name, None)
+        return _dc_replace(self, **keys_to_update)
 
 
 @dataclass
