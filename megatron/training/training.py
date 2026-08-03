@@ -299,7 +299,7 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
-def update_seqlen_stats_from_cu_seqlens(cu_seqlens, vp_stage=None):
+def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
     Args:
@@ -308,14 +308,14 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens, vp_stage=None):
             ``cu_seqlens`` rather than ``cu_seqlens_padded`` so the FLOPs
             metric reports useful work only, not work on CP-alignment or
             end-of-sequence padding tokens.
-        vp_stage: The calling model chunk's virtual pipeline stage, or ``None``
-            when interleaved pipelining is off. Under interleaved (virtual)
-            pipeline parallelism the forward step runs once per virtual model
-            chunk for the same logical micro-batch, and every chunk observes
-            identical ``cu_seqlens``. Only virtual stage 0 contributes stats so
-            model chunking does not multiply the whole-model FLOPs estimate
-            (the formula already covers all ``args.num_layers``); ``None`` and
-            ``0`` both denote the primary/only chunk.
+
+    Call this ONCE per logical micro-batch. Under interleaved (virtual) pipeline
+    parallelism the forward step runs once per virtual model chunk for the same
+    micro-batch and every chunk observes identical ``cu_seqlens``, so callers
+    must record only from the primary chunk (``vp_stage`` ``None`` or ``0``) --
+    the whole-model FLOPs formula already covers all ``args.num_layers``, so
+    recording per chunk would multiply the estimate by the virtual-pipeline
+    size. See the call sites in ``pretrain_gpt.py`` / ``pretrain_hybrid.py``.
 
     Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
     broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
@@ -325,8 +325,6 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens, vp_stage=None):
     flag at ``False`` and pay zero collective cost.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active
-    if vp_stage not in (None, 0):
-        return
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the

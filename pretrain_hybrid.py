@@ -314,8 +314,10 @@ def forward_step(data_iterator, model: HybridModel):
         # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
         # attention only computes work for real tokens within each chunk. With
         # interleaved pipelining every virtual chunk re-runs forward_step on the
-        # same micro-batch, so only virtual stage 0 records the stats.
-        update_seqlen_stats_from_cu_seqlens(cu_seqlens, vp_stage=vp_stage)
+        # same micro-batch with identical cu_seqlens, so only the primary chunk
+        # records -- the FLOPs formula already spans all args.num_layers.
+        if vp_stage in (None, 0):
+            update_seqlen_stats_from_cu_seqlens(cu_seqlens)
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",

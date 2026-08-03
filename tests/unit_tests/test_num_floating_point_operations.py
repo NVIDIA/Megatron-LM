@@ -472,15 +472,27 @@ class TestAccumulator:
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
 
 
+def _record_like_forward_step(cu_seqlens, vp_stage):
+    """Mirror of the accumulator call site in ``forward_step``.
+
+    ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` both guard the call with
+    ``if vp_stage in (None, 0):``. Keep this helper in sync with them; it is
+    what makes the tests below exercise the contract rather than the plumbing.
+    """
+    if vp_stage in (None, 0):
+        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+
+
 class TestAccumulatorVirtualPipeline:
     """Interleaved (virtual) pipeline parallelism must not multiply the stats.
 
     With ``virtual_pipeline_model_parallel_size = V``, the schedule calls the
     user ``forward_step`` once per (micro-batch, model chunk) and every chunk
-    observes an identical micro-batch through its cached iterator view. The
+    observes an identical micro-batch through its own data iterator. The
     whole-model FLOPs formula already covers all ``args.num_layers``, so only
-    virtual stage 0 may contribute -- otherwise reported FLOPs inflate by
-    exactly ``V``.
+    the primary chunk may contribute -- otherwise reported FLOPs inflate by
+    exactly ``V``. The guard lives at the ``forward_step`` call sites, which
+    ``_record_like_forward_step`` reproduces.
     """
 
     def setup_method(self):
@@ -493,7 +505,7 @@ class TestAccumulatorVirtualPipeline:
         cu = torch.tensor([0, 100, 300], dtype=torch.int32)
         # Simulate VPP=4: the same micro-batch is seen by four model chunks.
         for vp_stage in range(4):
-            update_seqlen_stats_from_cu_seqlens(cu, vp_stage=vp_stage)
+            _record_like_forward_step(cu, vp_stage)
         total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
         # Counted once, not four times.
         assert total_real_tokens == 100 + 200
@@ -501,14 +513,14 @@ class TestAccumulatorVirtualPipeline:
 
     def test_none_vp_stage_means_no_interleaving(self):
         cu = torch.tensor([0, 100, 300], dtype=torch.int32)
-        update_seqlen_stats_from_cu_seqlens(cu, vp_stage=None)
+        _record_like_forward_step(cu, None)
         total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == 100 + 200
         assert seqlen_squared_sum == 100**2 + 200**2
 
     def test_non_primary_chunk_alone_records_nothing(self):
         cu = torch.tensor([0, 100, 300], dtype=torch.int32)
-        update_seqlen_stats_from_cu_seqlens(cu, vp_stage=1)
+        _record_like_forward_step(cu, 1)
         assert training_module._seqlen_stats_active is False
         total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
         assert total_real_tokens is None
@@ -520,7 +532,7 @@ class TestAccumulatorVirtualPipeline:
         cu_b = torch.tensor([0, 50], dtype=torch.int32)
         for cu in (cu_a, cu_b):
             for vp_stage in range(2):  # VPP=2
-                update_seqlen_stats_from_cu_seqlens(cu, vp_stage=vp_stage)
+                _record_like_forward_step(cu, vp_stage)
         total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
         assert total_real_tokens == (100 + 200) + 50
         assert seqlen_squared_sum == (100**2 + 200**2) + 50**2
@@ -529,13 +541,12 @@ class TestAccumulatorVirtualPipeline:
     def test_reported_flops_are_invariant_to_virtual_pipeline_size(self, vp_size):
         """The reported FLOPs must not depend on how the model is chunked.
 
-        This is the invariant the ``vp_stage`` gate exists to protect. The
-        interleaved schedule runs ``forward_step`` once per (micro-batch, model
-        chunk) and every chunk observes the same ``cu_seqlens`` for a given
-        micro-batch, while the closed-form formula already spans all
+        The interleaved schedule runs ``forward_step`` once per (micro-batch,
+        model chunk) and every chunk observes the same ``cu_seqlens`` for a
+        given micro-batch, while the closed-form formula already spans all
         ``args.num_layers``. Chunking the model therefore must not change the
-        answer. Without the gate this fails with exactly ``vp_size``-fold
-        inflation.
+        answer. Without the call-site guard this fails with exactly
+        ``vp_size``-fold inflation.
         """
         args = _make_gpt_args()
         num_microbatches = 3
@@ -545,7 +556,7 @@ class TestAccumulatorVirtualPipeline:
         # arguments.py, and the non-interleaved schedule never sets a vp_stage.
         for _ in range(num_microbatches):
             for chunk in range(vp_size):
-                update_seqlen_stats_from_cu_seqlens(cu, vp_stage=None if vp_size == 1 else chunk)
+                _record_like_forward_step(cu, None if vp_size == 1 else chunk)
         total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
 
         # Each micro-batch counted exactly once, whatever vp_size is.
@@ -562,7 +573,7 @@ class TestAccumulatorVirtualPipeline:
         # ... and the user-visible number matches the unchunked reference.
         _reset_seqlen_accumulator()
         for _ in range(num_microbatches):
-            update_seqlen_stats_from_cu_seqlens(cu, vp_stage=None)
+            _record_like_forward_step(cu, None)
         ref_tokens, ref_squared_sum = consume_seqlen_stats_in_iteration()
         reference_flops = num_floating_point_operations(
             args,
