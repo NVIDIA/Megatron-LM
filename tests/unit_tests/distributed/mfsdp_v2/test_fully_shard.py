@@ -423,46 +423,8 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     )
 
 
-def test_root_forward_returns_to_resting_memory(distributed_setup):
-    """Root forward should release child all-gather storage before returning."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
-    dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-
-    x = torch.randn(2, dim, device=device, dtype=dtype)
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
-    resting_allocated = torch.cuda.memory_allocated(device)
-
-    with torch.no_grad():
-        output = model(x)
-    del output
-    torch.cuda.synchronize(device)
-    allocated_after_forward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_forward - resting_allocated
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-
-    assert extra_allocated < child_weight_nbytes, (
-        "Root forward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
-    )
-
-
-def test_root_backward_returns_to_resting_memory(distributed_setup):
-    """Root backward should release child all-gather storage before returning."""
+def test_training_returns_to_resting_memory(distributed_setup):
+    """Forward and backward should release child all-gather storage."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -480,23 +442,35 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype, requires_grad=True)
-    output = model(x)
-    loss = output.float().square().mean()
+    loss = model(x).float().square().mean()
     torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
-    allocated_before_backward = torch.cuda.memory_allocated(device)
+
+    memory_slack = 1024**2
+    # Two child weight matrices and the root bias are Flat-sharded; both main
+    # weights and same-dtype main gradients retain one local shard.
+    parameter_nbytes = (2 * dim**2 + dim) * torch.empty((), dtype=dtype).element_size()
+    expected_persistent_nbytes = 2 * parameter_nbytes // world_size
+    expected_forward_nbytes = (
+        expected_persistent_nbytes + x.nbytes + torch.backends.cuda.cublas_workspace_size()
+    )
+    allocated_after_forward = torch.cuda.memory_allocated(device)
+    assert allocated_after_forward <= expected_forward_nbytes + memory_slack, (
+        "Forward retained more than its persistent FSDP buffers: "
+        f"rank={rank}, allocated={_mb(allocated_after_forward)}, "
+        f"expected={_mb(expected_forward_nbytes)}, slack={_mb(memory_slack)}"
+    )
 
     loss.backward()
-    del loss, output
+    del loss
     torch.cuda.synchronize(device)
     allocated_after_backward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_backward - allocated_before_backward
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-
-    assert extra_allocated < child_weight_nbytes, (
-        "Root backward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
+    expected_backward_nbytes = (
+        expected_forward_nbytes + x.grad.nbytes + torch.backends.cuda.cublas_workspace_size()
+    )
+    assert allocated_after_backward <= expected_backward_nbytes + memory_slack, (
+        "Backward retained more than its persistent FSDP buffers: "
+        f"rank={rank}, allocated={_mb(allocated_after_backward)}, "
+        f"expected={_mb(expected_backward_nbytes)}, slack={_mb(memory_slack)}"
     )
 
 

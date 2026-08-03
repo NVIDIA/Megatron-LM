@@ -157,7 +157,9 @@ class FsdpParameterGroup:
                 placements=main_grad_placements,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=grad_dtype,
-                device=self.main_weight.device,
+                # The shared reduce-scatter stream is created during first-forward
+                # context initialization, so allocate storage only then.
+                device="meta",
             )
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "

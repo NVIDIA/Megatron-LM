@@ -115,6 +115,17 @@ class DBuffer:
         """Restore the local buffer's backing storage to its logical size."""
         self._resize_storage(self.local_buffer.numel())
 
+    @classmethod
+    def empty_like(cls, buffer: "DBuffer", device: torch.device) -> "DBuffer":
+        """Create an empty buffer with ``buffer``'s distributed layout."""
+        return cls(
+            mesh=buffer.mesh,
+            placements=buffer.placements,
+            tensor_shapes=buffer.layout.tensor_shapes,
+            dtype=buffer.dtype,
+            device=device,
+        )
+
     def release_storage(self) -> None:
         """Release local buffer storage without replacing the Storage object."""
         # Autograd may save views that share this Storage object. Resizing the

@@ -22,6 +22,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
+from .dbuffer import DBuffer
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
@@ -169,6 +170,18 @@ class FsdpModule:
             submodule._context = context
             submodule._name = submodule_name
             context.forward_order.append(submodule)
+
+        # main_grad buffers start meta-backed because fully_shard() runs before
+        # a shared context (and its communication streams) exists. Materialize
+        # all trainable groups together on the reduce-scatter stream now that
+        # the final subtree context has been assigned.
+        with torch.cuda.stream(context.reduce_scatter_stream):
+            for submodule in context.forward_order:
+                for group in submodule._parameter_groups:
+                    if group.requires_grad:
+                        group.main_grad = DBuffer.empty_like(
+                            group.main_grad, group.main_weight.device
+                        )
 
         # Backward starts from the root pre-backward hook before visiting child
         # subtrees in reverse module order.
