@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import copy
 import logging
 import multiprocessing as mp
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import List, Optional
 
@@ -80,6 +82,15 @@ async def _run_text_gen_server(
         app.config['tokenizer'] = tokenizer
         app.config['parsers'] = parsers
         app.config['verbose'] = verbose
+
+        # Applying the chat template is synchronous and O(prompt); on the event loop it
+        # stalls every other request this replica owns, including delivery of responses
+        # that already finished. One worker is enough - the point is the yield, not
+        # throughput. The copy is required: HF tokenizers are not thread-safe.
+        app.config['tokenize_executor'] = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tokenize"
+        )
+        app.config['tokenize_tokenizer'] = copy.deepcopy(tokenizer)
 
         # Register all blueprints from the 'endpoints' package
         for endpoint in endpoints.__all__:

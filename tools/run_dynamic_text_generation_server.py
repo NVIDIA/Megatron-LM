@@ -2,9 +2,11 @@
 
 import argparse
 import asyncio
+import logging
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     start_text_gen_server,
@@ -30,6 +32,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
     )
+    parser.add_argument(
+        "--frontend-replicas", type=int, default=-1,
+        help="Number of HTTP frontend processes spawned on the primary rank. "
+             "-1 (default) uses max(data parallel size, 4), so frontend capacity "
+             "scales with the number of engines.",
+    )
     return parser
 
 
@@ -54,6 +62,15 @@ async def run_text_generation_server(
         hostname=hostname,
     )
 
+    num_replicas = args.frontend_replicas
+    if num_replicas < 0:
+        # Each replica is a single event loop, so frontend capacity has to scale with
+        # the number of engines it feeds. The floor of 4 preserves the previous default
+        # for small deployments.
+        num_replicas = max(parallel_state.get_data_parallel_world_size(), 4)
+    if rank == 0:
+        logging.info("Starting %d HTTP frontend replica(s).", num_replicas)
+
     try:
         if rank == 0:
             start_text_gen_server(
@@ -63,6 +80,7 @@ async def run_text_generation_server(
                 rank=rank,
                 server_port=server_port,
                 verbose=args.inference_text_gen_server_logging,
+                num_replicas=num_replicas,
                 hostname=hostname,
             )
 
