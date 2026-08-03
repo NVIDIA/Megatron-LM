@@ -16,13 +16,14 @@
 
 from collections.abc import Callable
 from typing import Literal, cast
+from weakref import ReferenceType, ref
 
 import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .indexed_order import IndexedOrder
+from .indexed_order import WeakIndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
 
@@ -36,12 +37,12 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
-    root_module: "FsdpModule"
+    _root_module: ReferenceType["FsdpModule"]
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder["FsdpModule"]
-    backward_order: IndexedOrder["FsdpModule"]
+    forward_order: WeakIndexedOrder["FsdpModule"]
+    backward_order: WeakIndexedOrder["FsdpModule"]
 
     def __init__(self, device: torch.device, root_module: "FsdpModule") -> None:
         """Create rank-local runtime state for a root FSDP subtree.
@@ -50,10 +51,10 @@ class FsdpContext:
             device: Device on which this context schedules communication.
             root_module: Outermost module that owns this context.
         """
-        self.root_module = root_module
+        self._root_module = ref(root_module)
         self.is_last_microbatch = True
-        self.forward_order = IndexedOrder()
-        self.backward_order = IndexedOrder()
+        self.forward_order = WeakIndexedOrder()
+        self.backward_order = WeakIndexedOrder()
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
@@ -61,6 +62,14 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    @property
+    def root_module(self) -> "FsdpModule":
+        """Return the root module while its FSDP context remains active."""
+        root_module = self._root_module()
+        if root_module is None:
+            raise RuntimeError("FSDP context outlived its root module.")
+        return root_module
 
     def register_post_backward_final_callback(self) -> None:
         """Register this root context's final callback for the current backward.
@@ -194,12 +203,22 @@ class FsdpModule:
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
-        module.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
-        module.register_forward_hook(lambda _module, _args, _output: self.post_forward())
-        module.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
+        # Use PyTorch's callback module argument instead of capturing self so
+        # these hooks do not retain a deleted FSDP module.
+        module.register_forward_pre_hook(
+            lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
+        )
+        module.register_forward_hook(
+            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+        )
+        module.register_full_backward_pre_hook(
+            lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
+        )
         if self._num_trainable_parameters == 0:
             module.register_full_backward_hook(
-                lambda _module, _grad_input, _grad_output: self.post_backward()
+                lambda hooked_module, _grad_input, _grad_output: cast(
+                    FsdpModule, hooked_module
+                ).post_backward()
             )
             return
 
@@ -214,10 +233,15 @@ class FsdpModule:
                 fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 
     def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
+        module_ref = ref(self)
+
         def grad_hook(_parameter: nn.Parameter) -> None:
-            self._num_ready_grad_parameters += 1
-            if self._num_ready_grad_parameters == self._num_trainable_parameters:
-                self.post_backward()
+            module = module_ref()
+            if module is None:
+                return
+            module._num_ready_grad_parameters += 1
+            if module._num_ready_grad_parameters == module._num_trainable_parameters:
+                module.post_backward()
 
         return grad_hook
 
@@ -347,7 +371,7 @@ class FsdpModule:
         return f"MFSDP {name} {phase}"
 
 
-def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
+def _collect_backward_order(module: nn.Module, order: WeakIndexedOrder["FsdpModule"]) -> None:
     """Collect FsdpModules in static backward prefetch order."""
     if isinstance(module, FsdpModule):
         order.append(module)

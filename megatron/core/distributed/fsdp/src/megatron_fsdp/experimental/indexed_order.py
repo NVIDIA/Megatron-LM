@@ -16,6 +16,7 @@
 
 from collections.abc import Iterator
 from typing import Generic, TypeVar
+from weakref import WeakKeyDictionary, ref
 
 T = TypeVar("T")
 
@@ -51,3 +52,34 @@ class IndexedOrder(Generic[T]):
         index = self._index_by_item[item]
         next_index = index + 1
         return self._items[next_index] if next_index < len(self._items) else None
+
+
+class WeakIndexedOrder(Generic[T]):
+    """Insertion order with weakly held items and successor lookup."""
+
+    def __init__(self) -> None:
+        """Create an empty weak indexed order."""
+        self._items: list[ref[T]] = []
+        self._index_by_item: WeakKeyDictionary[T, int] = WeakKeyDictionary()
+
+    def append(self, item: T) -> None:
+        """Append ``item`` to the order."""
+        if item in self._index_by_item:
+            raise ValueError("WeakIndexedOrder does not support duplicate items.")
+        self._index_by_item[item] = len(self._items)
+        self._items.append(ref(item))
+
+    def __iter__(self) -> Iterator[T]:
+        """Iterate over live items in order."""
+        for item_ref in self._items:
+            item = item_ref()
+            if item is not None:
+                yield item
+
+    def next_item(self, item: T) -> T | None:
+        """Return the live item that follows ``item``, if any."""
+        index = self._index_by_item[item]
+        next_index = index + 1
+        if next_index >= len(self._items):
+            return None
+        return self._items[next_index]()

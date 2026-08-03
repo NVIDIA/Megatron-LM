@@ -16,6 +16,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from weakref import ReferenceType, ref
 
 import torch
 import torch.distributed as dist
@@ -32,7 +33,8 @@ _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
-    return getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
+    parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
+    return parameter_group_ref() if parameter_group_ref is not None else None
 
 
 @dataclass(frozen=True, eq=False)
@@ -49,7 +51,7 @@ class FsdpParameter:
 class FsdpParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
-    owning_module: nn.Module
+    _owning_module: ReferenceType[nn.Module]
     fsdp_parameters: tuple[FsdpParameter, ...]
     mesh: DeviceMesh
     dtype: torch.dtype
@@ -93,7 +95,7 @@ class FsdpParameterGroup:
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
-        self.owning_module = owning_module
+        self._owning_module = ref(owning_module)
         self.mesh = mesh
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
@@ -182,14 +184,14 @@ class FsdpParameterGroup:
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
-            setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
+            setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
-            setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
+            setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
             fsdp_parameters.append(
                 FsdpParameter(fqns=tuple(fqns), sharded=sharded_parameter, unsharded=parameter)
             )
@@ -200,6 +202,14 @@ class FsdpParameterGroup:
         self.sync_model_weight_from_main_weight()
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
+
+    @property
+    def owning_module(self) -> nn.Module:
+        """Return this group's module while it remains alive."""
+        owning_module = self._owning_module()
+        if owning_module is None:
+            raise RuntimeError("FSDP parameter group outlived its owning module.")
+        return owning_module
 
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:

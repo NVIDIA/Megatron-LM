@@ -73,6 +73,18 @@ class MultiChildModel(nn.Module):
         return x
 
 
+class ElementwiseModel(nn.Module):
+    """Small activation path over a large FSDP-managed weight."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the first weight row to an activation tensor."""
+        return torch.relu(x + self.weight[0])
+
+
 class TiedLM(nn.Module):
     """Tiny language model with shared input and output embedding weights."""
 
@@ -421,6 +433,26 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
         f"rank={rank}, peak_delta={_mb(peak_delta)}, "
         f"three_child_weights={_mb(bound_nbytes)}"
     )
+
+
+def test_deleted_model_releases_fsdp_storage(distributed_setup):
+    """Deleting an FSDP model should release its persistent storage."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
+    output = model(x)
+    torch.cuda.synchronize(device)
+    del output, x, model
+    torch.cuda.synchronize(device)
+
+    # This forward has no GEMM workspace. Retain at most negligible runtime
+    # bookkeeping, not the deleted model's persistent FSDP buffers.
+    assert torch.cuda.memory_allocated(device) < 1024**2
 
 
 def test_root_forward_returns_to_resting_memory(distributed_setup):
