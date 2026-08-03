@@ -151,3 +151,27 @@ async def test_stream_close_sends_abort_and_terminates_iterator():
     assert iterator.request_id not in client.streams
     assert iterator.request_id not in client.request_submission_times
     assert [item async for item in iterator] == []
+
+
+async def test_add_request_with_kv_handoff_streaming_returns_stream():
+    """Streaming handoffs opt into partial replies and register an AsyncStream."""
+    client, fake_socket = _make_client()
+    params = SamplingParams(temperature=0.5)
+
+    stream = client.add_request_with_kv_handoff_streaming(
+        [1, 2, 3], params, {"agent": "prefill"}, [10, 11]
+    )
+
+    assert isinstance(stream, AsyncStream)
+    assert params.streaming is True
+    assert client.streams == {0: stream}
+    assert client.completion_futures == {}
+    payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert payload[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    assert payload[1] == 0
+    assert payload[2] == [1, 2, 3]
+    assert payload[3]["streaming"] is True
+    assert payload[4] == {"agent": "prefill"}
+    assert payload[5] == [10, 11]
+
+    await stream.aclose()

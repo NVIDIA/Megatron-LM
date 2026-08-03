@@ -129,14 +129,57 @@ class InferenceClient:
         sampling_params: SamplingParams,
         kv_meta: dict,
         src_block_ids: List[int],
-    ) -> AsyncStream[dict]:
-        """Submit a streaming request with remote KV metadata.
+    ) -> asyncio.Future:
+        """Submit a request with remote KV metadata.
 
         The decode engine allocates local blocks, pulls the KV from the
         prefill peer described by ``kv_meta``, then begins generation.
 
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the decode request.
+            kv_meta: Metadata identifying the remote KV buffers.
+            src_block_ids: Remote block IDs containing the request's KV state.
+
+        Returns:
+            asyncio.Future: A future that resolves to the completed request.
+        """
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = make_submit_request_with_kv_message(
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            kv_meta,
+            src_block_ids,
+        )
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        assert request_id not in self.completion_futures
+        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
+        self.request_submission_times[request_id] = time.perf_counter()
+        return self.completion_futures[request_id]
+
+    def add_request_with_kv_handoff_streaming(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> AsyncStream[dict]:
+        """Submit a streaming request with remote KV metadata.
+
         Returns the same per-step partial/final iterator as
         :meth:`add_request_streaming`.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the decode request.
+            kv_meta: Metadata identifying the remote KV buffers.
+            src_block_ids: Remote block IDs containing the request's KV state.
+
+        Returns:
+            AsyncStream[dict]: Per-step partial and final reply frames.
         """
         sampling_params.streaming = True
         request_id = self.next_request_id
