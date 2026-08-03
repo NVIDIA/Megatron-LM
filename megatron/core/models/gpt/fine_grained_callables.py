@@ -368,11 +368,11 @@ class TransformerLayerNode(ScheduleNode):
         """Release the forward activation tensors held by this node while keeping the
         node reusable for a later recompute forward.
 
-        Used by the VPP-stage full recompute path (EP A2A overlap): after the initial
-        (no-grad) forward, the layer node's activation tensors are freed so that only
-        the stage input tensor survives the forward->backward gap. The same node
-        object is later re-run (with grad enabled) to rebuild ``inputs``/``output``/
-        ``detached`` before the backward pass.
+        Used by the layer-level full recompute path (EP A2A overlap): after the
+        initial (no-grad) forward, the layer node's activation tensors are freed so that
+        only each recompute segment's input tensor survives the forward->backward gap.
+        The same node object is later re-run (with grad enabled) to rebuild
+        ``inputs``/``output``/``detached`` before the backward pass.
         """
         self.inputs = None
         self.output = None

@@ -115,7 +115,7 @@ class MoETokenDispatcher:
         """Release the transient per-forward routing state held on the dispatcher
         (probs / routing map / permutation mappings, etc.).
 
-        Used by the EP A2A overlap VPP-stage full recompute path: after the initial
+        Used by the EP A2A overlap layer-level full recompute path: after the initial
         no-grad forward, this state is no longer needed until the backward-time
         recompute, which re-runs ``dispatch_preprocess`` and unconditionally
         repopulates all of it. Freeing it here is therefore correctness-neutral and
@@ -1025,7 +1025,7 @@ class _DispatchManager(ABC):
     def reset_transient_forward_state(self) -> None:
         """Release the transient per-forward routing metadata cached on the manager.
 
-        Used by the EP A2A overlap VPP-stage full recompute path: the backward-time
+        Used by the EP A2A overlap layer-level full recompute path: the backward-time
         recompute re-runs setup_metadata / dispatch / get_permuted, which repopulate
         all of this before combine, and the backward reads autograd-saved tensors
         rather than these attributes. Clearing them after the initial forward is

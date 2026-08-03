@@ -189,9 +189,9 @@ class ScheduleNode:
         self.inputs = None
         self.outputs = None
         # When True, the forward function runs under torch.no_grad() so no autograd
-        # graph / saved activations are retained. Used by the VPP-stage full recompute
-        # path (EP A2A overlap): the initial forward keeps only the stage input tensor
-        # and the whole stage is recomputed with grad enabled at backward time.
+        # graph / saved activations are retained. Used by the layer-level full recompute
+        # path (EP A2A overlap): the initial forward keeps only each recompute segment's
+        # input tensor, and a segment is replayed with grad enabled at backward time.
         self.forward_no_grad = False
 
     def default_backward_func(self, outputs, output_grad):
@@ -224,7 +224,7 @@ class ScheduleNode:
                     input.requires_grad = inputs[i].requires_grad
 
             data = tuple(self.inputs)
-            # Under the VPP-stage full recompute path, the initial forward runs
+            # Under the layer-level full recompute path, the initial forward runs
             # without building an autograd graph; the graph is rebuilt at backward
             # time by re-running this same forward with grad enabled.
             grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
