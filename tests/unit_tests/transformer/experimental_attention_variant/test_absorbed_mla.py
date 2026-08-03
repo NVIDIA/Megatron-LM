@@ -446,12 +446,12 @@ _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()
 
 _QUANT_RECIPES = [
     pytest.param("tensorwise", id="fp8-tensorwise"),
-    pytest.param("delayed", id="fp8-delayed"),
     pytest.param(
         "mxfp8",
         id="fp8-mxfp8",
         marks=pytest.mark.skipif(not _IS_BLACKWELL, reason="needs Blackwell"),
     ),
+    pytest.param("blockwise", id="fp8-blockwise"),
 ]
 
 
