@@ -43,6 +43,10 @@ USE_FUSED_QK_NORM: bool = os.environ.get("MCORE_FUSED_QK_NORM", "0") == "1"
 # Restrict to decode; prefill / large batches keep the two-call path.
 FUSED_QK_NORM_MAX_TOKENS: int = int(os.environ.get("MCORE_FUSED_QK_NORM_MAX_TOKENS", "256"))
 
+# Read the query out of the grouped QKV output rather than out of a repacked copy,
+# removing one full-query strided copy per layer per step. Requires the fused norm.
+USE_GROUPED_QK_NORM: bool = os.environ.get("MCORE_GROUPED_QK_NORM", "0") == "1"
+
 
 if HAVE_TRITON:
 
@@ -60,8 +64,12 @@ if HAVE_TRITON:
         q_out_rs,
         k_out_rs,
         eps,
+        q_grp_rs,
         HN: tl.constexpr,
         ZERO_CENTERED: tl.constexpr,
+        Q_GROUPED: tl.constexpr,
+        NPG: tl.constexpr,
+        HEADS: tl.constexpr,
     ):
         """One CTA per row across the concatenated [q_rows; k_rows] space.
 
@@ -69,6 +77,12 @@ if HAVE_TRITON:
         the rest normalize a key row with ``wk``. Both candidate loads are
         issued (the off-path one clamped to row 0 and masked out of the store),
         which keeps the kernel branch-free on the hot path for a 128-wide row.
+
+        With ``Q_GROUPED`` the query is read straight out of the QKV projection's
+        output instead of from a repacked copy. There, q heads are grouped with the
+        k and v head of their group, so a q row's address needs two strides -- one
+        per group (``q_grp_rs``) and one per head inside it -- and no single row
+        stride exists. See ``fused_qk_rmsnorm_grouped`` for why that matters.
         """
         row = tl.program_id(0)
         cols = tl.arange(0, HN)
@@ -77,7 +91,14 @@ if HAVE_TRITON:
         q_row = tl.where(is_q, row, 0)
         k_row = tl.where(is_q, 0, row - n_q_rows)
 
-        xq = tl.load(q_ptr + q_row * q_in_rs + cols).to(tl.float32)
+        if Q_GROUPED:
+            head = q_row % HEADS
+            q_off = (
+                (q_row // HEADS) * (HEADS // NPG) + head // NPG
+            ) * q_grp_rs + (head % NPG) * HN
+        else:
+            q_off = q_row * q_in_rs
+        xq = tl.load(q_ptr + q_off + cols).to(tl.float32)
         xk = tl.load(k_ptr + k_row * k_in_rs + cols).to(tl.float32)
         x = tl.where(is_q, xq, xk)
 
@@ -147,11 +168,112 @@ def fused_qk_rmsnorm(
         qo2.stride(0),
         ko2.stride(0),
         float(eps),
+        0,
         HN=hn,
         ZERO_CENTERED=zero_centered_gamma,
+        Q_GROUPED=False,
+        NPG=1,
+        HEADS=1,
         num_warps=1,
     )
     return qo, ko
+
+
+def fused_qk_rmsnorm_grouped(
+    grouped_query: torch.Tensor,
+    key: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    eps: float,
+    zero_centered_gamma: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Same norm, but reading the query straight out of the QKV projection.
+
+    Megatron's QKV projection writes ``[sq, b, ng, (np/ng + 2) * hn]`` -- each group's
+    q heads sit next to that group's k and v head. Reshaping the q slice to
+    ``[sq, b, np, hn]`` therefore **cannot** be a view: merging the group axis with the
+    head axis needs the group stride to equal ``(np/ng) * hn``, and it is
+    ``(np/ng + 2) * hn`` instead. For Qwen3-30B that is 1280 against 1024, so
+    `Tensor.reshape` silently materializes the whole query -- one full-size strided copy
+    per layer per step, which showed up in the profile as a 2.8 us
+    ``elementwise_kernel<128,4>`` between the QKV GEMM and this norm and took four
+    attempts to attribute.
+
+    Since this norm already writes a fresh output, it can absorb the repack for free:
+    read with the two strides the grouped layout needs, write the contiguous
+    ``[sq, b, np, hn]`` result the rest of attention wants. Values and arithmetic order
+    are unchanged, so the result is bit-identical to normalizing the copy.
+
+    Args:
+        grouped_query: the q slice of the QKV output, ``[sq, b, ng, (np/ng) * hn]``.
+        key: ``[sq, b, ng, hn]``, as for :func:`fused_qk_rmsnorm`.
+
+    Returns:
+        ``(query_normed, key_normed)``; the query is ``[sq, b, np, hn]`` contiguous.
+    """
+    hn = key.shape[-1]
+    sq, b, ng = grouped_query.shape[0], grouped_query.shape[1], grouped_query.shape[2]
+    npg = grouped_query.shape[3] // hn
+    heads = ng * npg
+
+    k2 = key.reshape(-1, hn)
+    qo = torch.empty(sq, b, heads, hn, dtype=grouped_query.dtype, device=grouped_query.device)
+    ko = torch.empty(key.shape, dtype=key.dtype, device=key.device)
+    qo2 = qo.view(-1, hn)
+    ko2 = ko.view(-1, hn)
+
+    n_q_rows = sq * b * heads
+    n_rows = n_q_rows + k2.shape[0]
+
+    _fused_qk_rmsnorm_kernel[(n_rows,)](
+        grouped_query,
+        k2,
+        qo2,
+        ko2,
+        weight_q,
+        weight_k,
+        n_q_rows,
+        0,  # unused: grouped q rows have no single stride
+        k2.stride(0),
+        qo2.stride(0),
+        ko2.stride(0),
+        float(eps),
+        grouped_query.stride(2),
+        HN=hn,
+        ZERO_CENTERED=zero_centered_gamma,
+        Q_GROUPED=True,
+        NPG=npg,
+        HEADS=heads,
+        num_warps=1,
+    )
+    return qo, ko
+
+
+def can_use_grouped_qk_norm(
+    q_layernorm, k_layernorm, grouped_query: torch.Tensor, key: torch.Tensor
+) -> bool:
+    """Whether the grouped-read path is safe, i.e. the copy can be skipped entirely.
+
+    Everything :func:`can_use_fused_qk_norm` requires, plus the two assumptions the
+    grouped addressing makes about the QKV output: that a token's groups are evenly
+    spaced (so a token stride is ``ng * group_stride``), and that the heads inside a
+    group are contiguous.
+    """
+    if not USE_GROUPED_QK_NORM:
+        return False
+    if grouped_query.ndim != 4 or key.ndim != 4:
+        return False
+    hn = key.shape[-1]
+    if grouped_query.shape[3] % hn != 0:
+        return False
+    ng = grouped_query.shape[2]
+    if grouped_query.stride(3) != 1 or grouped_query.stride(1) != ng * grouped_query.stride(2):
+        return False
+    # `key` stands in for the query in the shared check: the grouped query's last dim is
+    # `(np/ng) * hn` rather than `hn`, and every property that check reads off the query
+    # -- head_dim, cuda-ness, last-dim contiguity, token count from `shape[:-2]` -- is
+    # identical between the two here, with the query's own layout verified just above.
+    return can_use_fused_qk_norm(q_layernorm, k_layernorm, key, key)
 
 
 def can_use_fused_qk_norm(q_layernorm, k_layernorm, query: torch.Tensor, key: torch.Tensor) -> bool:

@@ -41,11 +41,15 @@ from megatron.core.transformer.module import MegatronModule
 try:
     from megatron.core.inference.attention.fused_qk_norm import (
         can_use_fused_qk_norm as _can_use_fused_qk_norm,
+        can_use_grouped_qk_norm as _can_use_grouped_qk_norm,
         fused_qk_rmsnorm as _fused_qk_rmsnorm,
+        fused_qk_rmsnorm_grouped as _fused_qk_rmsnorm_grouped,
     )
 except Exception:  # keep attention importable if the inference helper is unavailable
     _can_use_fused_qk_norm = None
     _fused_qk_rmsnorm = None
+    _can_use_grouped_qk_norm = None
+    _fused_qk_rmsnorm_grouped = None
 
 try:
     from megatron.core.inference.attention import flashinfer_decode as _flashinfer_decode
@@ -1987,26 +1991,18 @@ class SelfAttention(Attention):
             else:
                 (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
 
-        # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
-        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
-
-        if self.config.num_query_groups < self.world_size:
-            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
-            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
-            # This is step 4 in the list of steps above.
-            idx = get_pg_rank(self.pg_collection.tp) % (
-                self.world_size // self.config.num_query_groups
-            )
-            size = self.num_attention_heads_per_partition // (
-                self.world_size // self.config.num_query_groups
-            )
-            query = query[:, :, idx * size : (idx + 1) * size, :]
-
-        if _can_use_fused_qk_norm is not None and _can_use_fused_qk_norm(
-            self.q_layernorm, self.k_layernorm, query, key
+        # The [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] reshape below is a *copy*, not a
+        # view: merging the group and head axes needs the group stride to equal
+        # (np/ng) * hn, and it is (np/ng + 2) * hn because each group's k and v head sit
+        # between consecutive groups' q heads. When the fused q/k norm can read the
+        # grouped layout directly it writes that shape itself for free, and the copy --
+        # one full-size strided copy per layer per decode step -- never happens.
+        if (
+            _can_use_grouped_qk_norm is not None
+            and self.config.num_query_groups >= self.world_size
+            and _can_use_grouped_qk_norm(self.q_layernorm, self.k_layernorm, query, key)
         ):
-            # Fuse the two per-head RMSNorm launches into one (env-gated, decode).
-            query, key = _fused_qk_rmsnorm(
+            query, key = _fused_qk_rmsnorm_grouped(
                 query,
                 key,
                 self.q_layernorm.weight,
@@ -2015,11 +2011,41 @@ class SelfAttention(Attention):
                 self.config.layernorm_zero_centered_gamma,
             )
         else:
-            if self.q_layernorm is not None:
-                query = apply_module(self.q_layernorm)(query)
+            # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+            query = query.reshape(
+                query.size(0), query.size(1), -1, self.hidden_size_per_attention_head
+            )
 
-            if self.k_layernorm is not None:
-                key = apply_module(self.k_layernorm)(key)
+            if self.config.num_query_groups < self.world_size:
+                # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+                # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+                # This is step 4 in the list of steps above.
+                idx = get_pg_rank(self.pg_collection.tp) % (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = self.num_attention_heads_per_partition // (
+                    self.world_size // self.config.num_query_groups
+                )
+                query = query[:, :, idx * size : (idx + 1) * size, :]
+
+            if _can_use_fused_qk_norm is not None and _can_use_fused_qk_norm(
+                self.q_layernorm, self.k_layernorm, query, key
+            ):
+                # Fuse the two per-head RMSNorm launches into one (env-gated, decode).
+                query, key = _fused_qk_rmsnorm(
+                    query,
+                    key,
+                    self.q_layernorm.weight,
+                    self.k_layernorm.weight,
+                    self.config.layernorm_epsilon,
+                    self.config.layernorm_zero_centered_gamma,
+                )
+            else:
+                if self.q_layernorm is not None:
+                    query = apply_module(self.q_layernorm)(query)
+
+                if self.k_layernorm is not None:
+                    key = apply_module(self.k_layernorm)(key)
 
         if self.config.test_mode:
             self.run_realtime_tests()
