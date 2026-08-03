@@ -845,3 +845,120 @@ def _hybridep_dispatch_chunks(qr, weights, cp_group, cp_size, l_local, C, r, q_l
     qr_tail, w_tail = disp[C : 2 * C, :q_lora], disp[C : 2 * C, q_lora:]
     _validate_hep_order(qr, qr_head, qr_tail, cp_group, cp_size, l_local, C, r)
     return qr_head, w_head, qr_tail, w_tail
+
+
+def prebuild_balanced_layouts(packed_seq_params, cp_group=None):
+    """Data-prep-time prebuild of the balanced-indexer zigzag plan and multi-seq gate.
+
+    Mirrors ``context_parallel_layout.prebuild_thd_cp_partition_routes``: this runs
+    where host syncs are free, so the forward path never has to build layout
+    metadata (or run its one D2H segment-count probe) inside a CUDA graph capture.
+
+    The zigzag ownership indices come from
+    ``context_parallel_layout.get_thd_context_parallel_rank_indices`` — the shared
+    canonical CP layout definition — reordered into the ``[heads | tails]`` packing
+    that the fused indexer requires (its packed calls allow only one segment per
+    sequence per call, so head and tail chunks go into two separate calls). The
+    static-shape device-side builder in ``_zigzag_plan`` remains as the
+    capture-safe fallback for callers that do not prebuild.
+    """
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return
+    if cp_group is None:
+        cp_group = getattr(packed_seq_params, "cp_group", None)
+    if cp_group is None or cp_group.size() <= 1:
+        return
+    cu = packed_seq_params.cu_seqlens_q_padded
+    if cu is None:
+        cu = packed_seq_params.cu_seqlens_q
+    if cu is None:
+        return
+    N, r = cp_group.size(), cp_group.rank()
+    cu = cu.reshape(-1)
+    total = int(cu[-1].item())
+    if total <= 0 or total % N != 0:
+        return
+    l_local = total // N
+    if l_local % 2 != 0:
+        return
+
+    # Multi-seq gate: one D2H probe here instead of in the first forward.
+    cu_real = packed_seq_params.cu_seqlens_q if packed_seq_params.cu_seqlens_q is not None else cu
+    seg_lens = cu_real[1:] - cu_real[:-1]
+    nseg_real = int((seg_lens > 0).sum().item())
+    total_real = int(cu_real[-1].item())
+    packed_seq_params._dsa_cp_multi_seq = not (nseg_real == 1 and total_real == total)
+    if not packed_seq_params._dsa_cp_multi_seq:
+        # Single full sequence: the folding + K-slice path is used, no zigzag plan.
+        return
+
+    cu_list = [int(v) for v in cu.tolist()]
+    # Same sequence enumeration as _zigzag_plan: real segments plus the
+    # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
+    seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
+    if any(sl % (2 * N) for sl in seq_lens_list):
+        # Runtime gate falls back to folding for non-2N-aligned packs.
+        return
+
+    from megatron.core.context_parallel_layout import get_thd_context_parallel_rank_indices
+
+    dev, dt = cu.device, cu.dtype
+    half = l_local // 2
+    # Canonical per-rank zigzag ownership (per-seq interleaved [head seg, tail seg]).
+    per_rank = [get_thd_context_parallel_rank_indices(cu, N, rho, "zigzag") for rho in range(N)]
+
+    # Reorder the canonical per-seq-interleaved local order into [heads | tails].
+    c_list = [sl // (2 * N) for sl in seq_lens_list]
+    head_pos, tail_pos = [], []
+    off = 0
+    for c in c_list:
+        head_pos.extend(range(off, off + c))
+        tail_pos.extend(range(off + c, off + 2 * c))
+        off += 2 * c
+    assert off == l_local and len(head_pos) == half, (off, l_local, len(head_pos), half)
+    perm = torch.tensor(head_pos + tail_pos, device=dev, dtype=torch.long)
+
+    gather_idx = per_rank[r].index_select(0, perm)
+
+    # Sequence-relative positions for RoPE (relative to real segment starts; rows in
+    # the capacity pseudo-sequence use cu[-1] as their start, matching _zigzag_plan).
+    starts_t = torch.tensor(cu_list[:-1] + [cu_list[-1]], device=dev, dtype=torch.long)
+    bounds_t = torch.tensor(cu_list[1:] + [total], device=dev, dtype=torch.long)
+    seq_of = torch.bucketize(gather_idx, bounds_t[:-1], right=True).clamp_max(starts_t.numel() - 1)
+    pos = gather_idx - starts_t[seq_of]
+    pos_head, pos_tail = pos[:half].long(), pos[half:].long()
+
+    # Inverse permutation: my contiguous rows' positions in the rank-major
+    # [heads | tails] all-gather concat — derived from the canonical indices.
+    pos_global = torch.empty(total, device=dev, dtype=torch.long)
+    ar = torch.arange(l_local, device=dev, dtype=torch.long)
+    for rho in range(N):
+        pos_global[per_rank[rho].index_select(0, perm)] = rho * l_local + ar
+    mine = torch.arange(r * l_local, (r + 1) * l_local, device=dev, dtype=torch.long)
+    inv_idx = pos_global.index_select(0, mine)
+
+    # Packed call layouts. ratio == 4 is the only compress ratio that instantiates
+    # an indexer (mirrors CSAAttention.__init__), so its compressed cu is fixed here.
+    ratio = 4
+    c_t = torch.tensor(c_list, device=dev, dtype=torch.int64)
+    cu_q = torch.cat((torch.zeros(1, device=dev, dtype=torch.int64), torch.cumsum(c_t, 0))).to(dt)
+    comp_lens = torch.div(cu[1:] - cu[:-1], ratio, rounding_mode="floor")
+    cu_comp = torch.cat(
+        (torch.zeros_like(cu[:1]), torch.cumsum(comp_lens, dim=0, dtype=torch.int32))
+    ).reshape(-1)
+    comp_pad = torch.cat((cu_comp, cu_comp[-1:]))
+    nch = 2 * N
+    plan = {
+        "gather_idx": gather_idx.long(),
+        "inv_idx": inv_idx.long(),
+        "pos_head": pos_head,
+        "pos_tail": pos_tail,
+        "head_layout": (cu_q, comp_pad, (r * c_t).to(dt)),
+        "tail_layout": (cu_q, comp_pad, ((nch - 1 - r) * c_t).to(dt)),
+        "half": half,
+    }
+    cache = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
+    if cache is None:
+        cache = {}
+        packed_seq_params._dsa_cp_balance_layout_cache = cache
+    cache[("zigzag", r)] = plan

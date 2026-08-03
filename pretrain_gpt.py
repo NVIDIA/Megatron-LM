@@ -25,6 +25,9 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
+    prebuild_balanced_layouts,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -132,7 +135,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
         # and returns a 7-tuple including `padding_mask`.
-        return get_batch_on_this_rank_for_sequence_packing(
+        batch = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
@@ -140,6 +143,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
+        if getattr(args, "dsa_cp_balance_indexer", False) and batch[5] is not None:
+            prebuild_balanced_layouts(batch[5], cp_group=mpu.get_context_parallel_group())
+        return batch
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
@@ -174,19 +180,24 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen are needed (for attention masking); skip the full batch.
     if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+            qkv_format='thd',
+        )
+        if getattr(args, "dsa_cp_balance_indexer", False):
+            prebuild_balanced_layouts(
+                packed_seq_params, cp_group=mpu.get_context_parallel_group()
+            )
         return (
             None,
             None,
             None,
             None,
             None,
-            PackedSeqParams(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=int(max_seqlen[0].item()),
-                max_seqlen_kv=int(max_seqlen[0].item()),
-                qkv_format='thd',
-            ),
+            packed_seq_params,
             None,
         )
 
