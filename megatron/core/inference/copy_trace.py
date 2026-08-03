@@ -21,11 +21,13 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 ENABLED: bool = os.environ.get("MCORE_COPY_TRACE", "0") == "1"
+SKIP: int = int(os.environ.get("MCORE_COPY_TRACE_SKIP", "500"))
 
 # Ops that move bytes without changing them: the copies a fusion could remove.
 _WATCHED = {"copy_", "_to_copy", "clone", "contiguous", "cat", "index_select", "gather"}
 
 _armed: bool = ENABLED
+_calls: int = 0
 _seen: Dict[Tuple, int] = {}
 
 
@@ -57,17 +59,22 @@ class _CopyTrace(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def in_decode(inference_context) -> bool:
-    """Only the decode path is worth naming, and it is not the first forward.
+def ready() -> bool:
+    """True once enough layer forwards have gone by to be past one-time work.
 
-    Arming on the first layer forward instead catches prefill *and* the one-time
-    lazy weight consolidation, which is how a first attempt at this concluded
-    that 32 expert weights were being copied every layer of every step.
+    Arming on the *first* forward catches the lazy expert-weight consolidation and
+    reports 32 weight copies per layer, which is one-time cost misread as per-step.
+    Gating on ``inference_context.is_decode_only()`` instead looked more precise but
+    never fired at all: by the time the layer runs under graph capture the context
+    is not reaching it as a keyword argument. A call counter needs nothing from the
+    caller — ``MCORE_COPY_TRACE_SKIP`` forwards (default 500, i.e. past 48 layers of
+    first-touch several times over) are ignored, then the next one is traced.
     """
-    if inference_context is None:
+    global _calls
+    if not _armed:
         return False
-    is_decode = getattr(inference_context, "is_decode_only", None)
-    return bool(is_decode()) if callable(is_decode) else False
+    _calls += 1
+    return _calls > SKIP
 
 
 def trace_one_layer() -> Optional[_CopyTrace]:

@@ -2695,6 +2695,73 @@ Combined with QWEN-014 (flashinfer cutlass, 0.921×) and QWEN-010 (torch grouped
 and none beats the shipping Triton path.** The candidate list above should be read as: item 1
 requires w8a8 or nothing; items 2-4 are the only cheap ones left.
 
+### GAP-S18 — the gap is two-thirds packing, one-third work, and the expert GEMM is done
+
+First decomposition built from a **fresh** mcore trace (current gate set, OSL1024, 60
+steady steps, no window warnings) against the vLLM baseline trace, both bucketed by
+`nsys_trace/compare_budget.py` and both measured for interval-union busy by
+`nsys_trace/union_window.py`. Every prior version of this comparison used the Jul 27
+mcore trace, which predates the FA2 pin and both add+norm fusions and therefore
+overstated attention, norm and copies.
+
+| | vLLM | mcore | delta |
+| --- | --- | --- | --- |
+| GPU busy, interval union | 6.989 ms | 7.478 ms | +0.489 |
+| exposed gap (true step − union) | ~0.54 ms | ~1.43 ms | **+0.89** |
+| step time, unprofiled | 7.53 ms | 8.91 ms | +1.38 |
+
+Per-bucket device time (ms/step, launches/step), mcore minus vLLM:
+
+| bucket | vLLM | mcore | delta |
+| --- | --- | --- | --- |
+| attention | 1.214 (48) | 1.623 (50) | **+0.409** |
+| elementwise / copy | 0.004 (1) | 0.232 (107) | +0.228 |
+| splitK reduce | 0 (0) | 0.204 (95) | +0.204 |
+| MoE finalize | 0.215 (47) | 0.261 (48) | +0.046 |
+| expert GEMM | 2.376 (94) | 2.436 (96) | **+0.060** |
+| norm | 0.251 (95) | 0.272 (145) | +0.021 |
+| MoE routing | 0.475 (142) | 0.367 (144) | −0.108 |
+| collective | 1.607 (94) | 1.035 (96) | **−0.572** |
+| **sum of durations** | **7.341 (810)** | **7.521 (1027)** | **+0.180 (+217)** |
+
+Three conclusions, in order of how much they should change what gets worked on:
+
+1. **Only 0.18 ms of the 1.38 ms gap is extra kernel work.** The expert GEMM is at
+   parity (+0.06 ms) and mcore's collectives are *half a millisecond faster* than
+   vLLM's. Four sessions of MoE GEMM work, `FP8-WEIGHTS-S18` included, were aimed at a
+   bucket that had already converged.
+2. **mcore overlaps nothing.** Sum-of-durations 7.521 vs union 7.478 means 0.6% of its
+   work runs concurrently with other work; vLLM hides 0.352 ms (4.8%). mcore's 1.035 ms
+   of collectives is fully serialized against compute. Matching vLLM's overlap ratio is
+   worth ~0.3 ms and is a scheduling change, not a kernel.
+3. **The gaps are launch-shaped.** 892 of mcore's 934 per-step gaps are sub-microsecond
+   and sum to 0.456 ms — consistent with `BALLAST-S18`'s 1.34 µs/node (~0.85 µs kernel
+   + ~0.5 µs gap) across 1027 launches vs vLLM's 810. Every removed launch pays twice.
+
+### COPY-ID-S18 — both copy families named from the trace, after three failed hooks
+
+The 107 copy launches/step were finally identified **positionally in the trace**, by
+aggregating each copy's immediate predecessor and successor, after three attempts to
+name them with a `TorchDispatchMode` hook produced nothing usable:
+
+| n/step | kernel | sits between | what it is |
+| --- | --- | --- | --- |
+| 47 | `vectorized_elementwise_kernel<8>` (bf16 copy) | `_multimem_reduce_scatter_v` → `_fused_add_rmsnorm` | materializes the MoE output that the next kernel immediately reads |
+| 48 | `elementwise_kernel<128,4>` | QKV GEMM (`nvjet_*`) → `_fused_qk_rmsnorm` | contiguous copy of the strided Q/K slices |
+
+Both are removable without new math: have `_fused_add_rmsnorm` read the collective's
+output buffer directly, and make `_fused_qk_rmsnorm` stride-aware. Worth 0.232 ms of
+device time plus ~96 launches of gap ≈ 0.28 ms/step ≈ 3%, and both kernels are ours.
+
+> **Lesson on the failed hook.** `copy_trace` was armed three ways: on the first layer
+> forward (caught the one-time lazy expert-weight consolidation and reported 32 weight
+> copies per layer as if per-step), on `inference_context.is_decode_only()` (never fired
+> — under graph capture the context does not reach the layer as a keyword), and finally
+> on a call counter. Meanwhile the trace already contained the answer. **When a kernel
+> needs identifying and a profile exists, read the profile's neighbours first**;
+> instrumenting the framework to re-derive what the trace already recorded cost three
+> allocation slots here.
+
 ## Optimization rules
 
 1. Profile and classify before proposing a code change.

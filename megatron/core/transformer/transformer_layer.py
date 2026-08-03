@@ -787,26 +787,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        inference_context = kwargs.get("inference_context", None)
-        if _copy_trace.ENABLED and _copy_trace.in_decode(inference_context):
+        if _copy_trace.ENABLED and _copy_trace.ready():
             trace = _copy_trace.trace_one_layer()
             if trace is not None:
                 with trace:
-                    out = self._forward_layer(inference_context, *args, **kwargs)
+                    out = self._forward_layer(*args, **kwargs)
                 _copy_trace.report()
                 return out
-        output, context = self._forward_layer(inference_context, *args, **kwargs)
+        output, context = self._forward_layer(*args, **kwargs)
         if _dispatch_ballast.COUNT:
             _dispatch_ballast.tick()
         return output, context
 
-    def _forward_layer(self, inference_context, *args, **kwargs):
+    def _forward_layer(self, *args, **kwargs):
         """Attention then MLP — the layer body, factored out so a diagnostic mode can
         wrap it without paying for a context manager on the fast path."""
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
-            inference_context,
+            kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
