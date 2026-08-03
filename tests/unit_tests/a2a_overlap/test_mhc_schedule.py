@@ -94,6 +94,20 @@ class _RecordingLayer:
         self.moe_combine = _RecordingNode(calls, f"{prefix}.moe_combine")
         self.mhc_recompute = None
         self.mtp_post_process = _RecordingNode(calls, f"{prefix}.mtp_post_process")
+        # This layer exercises mHC selective recompute, not full recompute, so it
+        # belongs to no RecomputeSegment and the segment hooks short-circuit.
+        self.recompute_segment = None
+        self.is_segment_head = False
+        self.is_segment_tail = False
+
+    def maybe_capture_recompute_input(self, f_input):
+        pass
+
+    def maybe_recompute_segment(self):
+        pass
+
+    def maybe_release_recompute_input(self):
+        pass
 
     def get_fp8_context(self):
         return nullcontext()
@@ -109,6 +123,7 @@ class _RecordingChunk:
         self.pre_process = _RecordingNode(calls, "chunk.pre_process")
         self.post_process = None
         self.vp_stage = 0
+        self.recompute_full = False
 
     def record_current_stream(self):
         self.calls.append("chunk.record_current_stream")
@@ -125,13 +140,9 @@ class _RecordingChunk:
     def release_state(self):
         self.calls.append("chunk.release_state")
 
-    def snapshot_rng_for_recompute(self):
-        # This chunk exercises mHC selective recompute, not VPP-stage full recompute,
-        # so the real method short-circuits to a no-op (recompute_vpp_stage is off).
-        pass
-
-    def recompute_model_chunk_schedule_plan(self):
-        # No-op for the same reason as snapshot_rng_for_recompute above.
+    def release_layer_activations(self):
+        # This chunk exercises mHC selective recompute, not full recompute, so it has
+        # no RecomputeSegments and the real method iterates an empty list.
         pass
 
 

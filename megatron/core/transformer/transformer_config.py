@@ -2112,30 +2112,18 @@ class TransformerConfig(ModelParallelConfig):
                     'or "selective".'
                 )
 
-            # EP A2A overlap drives its own VPP-stage full recompute (the whole model
-            # chunk is recomputed as a single unit) and therefore does not use
-            # recompute_method / recompute_num_layers. Skip the block/uniform
-            # requirement below in that case.
-            ep_overlap_full_recompute = (
-                self.overlap_moe_expert_parallel_comm and self.recompute_granularity == "full"
-            )
-
             if self.recompute_method is not None:
                 if self.recompute_method not in ["block", "uniform"]:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )
-            elif self.recompute_granularity != "selective" and not ep_overlap_full_recompute:
+            elif self.recompute_granularity != "selective":
                 raise ValueError(
                     f"Using recompute_granularity: {self.recompute_granularity} so "
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if (
-                self.recompute_granularity != "selective"
-                and self.recompute_num_layers is None
-                and not ep_overlap_full_recompute
-            ):
+            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "
@@ -3192,22 +3180,30 @@ class TransformerConfig(ModelParallelConfig):
             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
             if self.recompute_granularity == 'full':
-                # EP A2A overlap supports full recompute through a dedicated
-                # VPP-stage (model-chunk) recompute path: only the input tensor of
-                # each VPP stage is retained across the forward->backward gap, and
-                # the whole stage forward is recomputed (with an exposed,
-                # non-overlapped A2A) at the start of its backward. The normal
-                # forward/backward A2A overlap is preserved.
+                # EP A2A overlap supports full recompute through a dedicated layer-level
+                # recompute path: the chunk's layers are split into segments of
+                # recompute_num_layers layers, only each segment's input tensor is
+                # retained across the forward->backward gap, and a segment's forward is
+                # replayed (with an exposed, non-overlapped A2A) at the start of its own
+                # backward. The normal forward/backward A2A overlap is preserved.
+                # recompute_method / recompute_num_layers keep exactly the same meaning
+                # as on the non-overlap path (megatron/core/recompute.py for the decoder,
+                # MultiTokenPredictionLayer._checkpointed_forward for MTP), and are
+                # validated above by the shared recompute_granularity checks.
                 # See megatron/core/models/common/model_chunk_schedule_plan.py.
-                assert self.recompute_method is None, (
-                    'recompute_method must be None with overlap_moe_expert_parallel_comm full '
-                    'recompute: the whole VPP stage (model chunk) is recomputed as a single unit'
-                )
-                assert self.recompute_num_layers is None, (
-                    'recompute_num_layers must be None with overlap_moe_expert_parallel_comm '
-                    'full recompute (the whole VPP stage is recomputed as a single unit)'
-                )
-                # The recompute replays the stage forward. With attention/hidden
+                if self.mtp_num_layers:
+                    if self.recompute_method == 'uniform':
+                        # Mirrors the assert in
+                        # MultiTokenPredictionLayer._checkpointed_forward.
+                        assert self.recompute_num_layers == 1, (
+                            'recompute_num_layers must be 1 for MTP recompute'
+                        )
+                    else:
+                        warnings.warn(
+                            "recompute_method == 'block' is not supported for MTP yet."
+                            " Skipping recompute."
+                        )
+                # The recompute replays the segment forward. With attention/hidden
                 # dropout the forward RNG stream is interleaved across microbatches
                 # in the 1F1B schedule and cannot yet be faithfully replayed, so the
                 # recomputed activations would diverge from the forward pass.
@@ -3216,7 +3212,7 @@ class TransformerConfig(ModelParallelConfig):
                     'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '
                     'interleaved 1F1B schedule is not yet supported for nonzero dropout)'
                 )
-                # The VPP-stage recompute re-runs the stage forward at backward time.
+                # The layer-level recompute re-runs a segment forward at backward time.
                 # Combining it with CUDA graphs is not yet supported: the graph captures
                 # a fixed forward/backward node sequence and pre-allocates static buffers,
                 # which the inserted (no_grad) initial forward + backward-time recompute

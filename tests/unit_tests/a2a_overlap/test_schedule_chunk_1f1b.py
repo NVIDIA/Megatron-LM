@@ -283,3 +283,117 @@ class TestA2AOverlap:
                 gpt_models[i] = None
             gc.collect()
             torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("mtp_layers", [0, 1])
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
+    @pytest.mark.parametrize(
+        "recompute_method,recompute_num_layers", [("uniform", 1), ("uniform", 2), ("block", 1)]
+    )
+    def test_1f1b_schedule_model_chunk_full_recompute(
+        self,
+        mtp_layers,
+        dispatcher_type,
+        flex_backend,
+        fp8_flag,
+        recompute_method,
+        recompute_num_layers,
+    ):
+        """
+        Verifies that layer-level full activation recompute on the a2a overlap schedule
+        produces the same gradients as the reference (non-overlap) implementation, which
+        recomputes through ``megatron.core.recompute.checkpointed_forward`` /
+        ``MultiTokenPredictionLayer._checkpointed_forward`` with the same
+        ``recompute_method`` / ``recompute_num_layers``.
+        """
+        if mtp_layers > 0 and not (recompute_method == "uniform" and recompute_num_layers == 1):
+            # MTP only supports uniform recompute with recompute_num_layers == 1; the
+            # non-overlap reference warns and skips recompute otherwise, so the two
+            # paths would not be comparable.
+            pytest.skip("MTP recompute requires recompute_method='uniform' with num_layers=1")
+
+        microbatches = 1
+        layers = [3, 2]
+
+        gpt_models = []
+        schedule_plans = []
+        ref_captures = []
+        datas = []
+
+        extra_kwargs = {
+            "recompute_granularity": "full",
+            "recompute_method": recompute_method,
+            "recompute_num_layers": recompute_num_layers,
+        }
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
+        if fp8_flag is not None:
+            extra_kwargs["fp8"] = fp8_flag[0]
+            extra_kwargs["fp8_recipe"] = fp8_flag[1]
+        if mtp_layers > 0:
+            extra_kwargs["mtp_num_layers"] = mtp_layers
+            extra_kwargs["mtp_loss_scaling_factor"] = 1.1
+        with deterministic_mode():
+            for layer_num in layers:
+                output_tensors = []
+                config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)
+                gpt_model, schedule_plan, data = build_model(config)
+                gpt_model.cuda()
+                gpt_models.append(gpt_model)
+                datas.append(data)
+                schedule_plans.append(schedule_plan)
+
+                # Reference: the non-overlap forward, which recomputes through the
+                # torch / TE checkpoint primitives with the same method and num_layers.
+                for _ in range(microbatches):
+                    loss = gpt_model.forward(**data)
+                    loss = float16_to_fp32(loss)
+                    loss.backward(torch.ones_like(loss))
+                    output_tensors.append(loss)
+
+                capture = {"outputs": output_tensors}
+                for name, param in gpt_model.named_parameters():
+                    capture[name] = param.grad
+                ref_captures.append(capture)
+                gpt_model.zero_grad()
+
+            # Guard against the test silently degrading into the plain overlap test.
+            for plan in schedule_plans:
+                assert len(plan._recompute_segments) > 0, "no recompute segments were built"
+
+            capture_0 = {"outputs": []}
+            capture_1 = {"outputs": []}
+            a2a_captures = [capture_0, capture_1]
+            for i in range(microbatches):
+                if i > 0:
+                    schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])
+                    schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])
+                f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)
+                capture_0["outputs"].append(f_input_0)
+                f_input_1 = TransformerModelChunkSchedulePlan.run(
+                    schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)
+                )
+                capture_1["outputs"].append(f_input_1)
+                TransformerModelChunkSchedulePlan.run(
+                    None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)
+                )
+            for i in range(len(gpt_models)):
+                for name, param in gpt_models[i].named_parameters():
+                    a2a_captures[i][name] = param.grad
+
+            for i in range(len(ref_captures)):
+                comp_res = compare_captures(ref_captures[i], a2a_captures[i], True, True)
+                assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+
+            # release resources is necessary, otherwise later testcases will oom
+            for i in range(len(schedule_plans)):
+                schedule_plans[i] = None
+                ref_captures[i] = None
+                a2a_captures[i] = None
+                for k in datas[i]:
+                    datas[i][k] = None
+                datas[i] = None
+                gpt_models[i].zero_grad()
+                gpt_models[i] = None
+            gc.collect()
+            torch.cuda.empty_cache()
