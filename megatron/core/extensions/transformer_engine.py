@@ -93,7 +93,7 @@ def _set_expert_parameter_attributes(
 ) -> None:
     """Set process-group and tensor-partition metadata on an expert TE module.
 
-    ``allreduce=False`` selects EDP for gradient reduction.
+    ``allreduce=False`` selects the expert topology, including EDP for gradient reduction.
 
     Weights and biases, including TEGroupedLinear's numbered parameters, are also marked as
     TP-partitioned according to ``parallel_mode``; row-parallel biases remain replicated.
@@ -104,7 +104,7 @@ def _set_expert_parameter_attributes(
     Args:
         module: Transformer Engine module whose direct parameters should be marked.
         parallel_mode: Tensor-parallel mode used by the module (``"column"``, ``"row"``, or None).
-        use_expert_pgs: Whether to use EP/ETP/EDP process groups instead of TP/CP/DP.
+        use_expert_pgs: Whether to use EP/ETP/EGTP/EDP process groups instead of TP/GTP/CP/DP.
     """
     for name, param in module.named_parameters(recurse=False):
         param.allreduce = not use_expert_pgs
@@ -982,6 +982,7 @@ class TELinear(te.pytorch.Linear):
         use_expert_pgs = is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
         )
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
@@ -1475,6 +1476,7 @@ class TEColumnParallelLinear(TELinear):
             use_expert_pgs = (
                 config.expert_model_parallel_size > 1
                 or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+                or config.expert_gtp_weight_remat_size != config.gtp_weight_remat_size
             )
             _set_expert_parameter_attributes(self, "column", use_expert_pgs)
 
@@ -1731,6 +1733,7 @@ class TERowParallelLinear(TELinear):
             use_expert_pgs = (
                 config.expert_model_parallel_size > 1
                 or config.expert_tensor_parallel_size != config.tensor_model_parallel_size
+                or config.expert_gtp_weight_remat_size != config.gtp_weight_remat_size
             )
             _set_expert_parameter_attributes(self, "row", use_expert_pgs)
 
@@ -2163,6 +2166,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             use_expert_pgs = is_expert and (
                 self.expert_parallel
                 or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+                or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
             )
             if is_expert:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
