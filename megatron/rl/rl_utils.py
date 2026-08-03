@@ -498,8 +498,12 @@ def align_unpacked_inference_logprobs(
     first_gen_tok = gen_masks_for_alignment.int().argmax(dim=1) - 1
 
     # Align inference logprobs with old_logprobs
-    # Note: We use old_logprobs_for_data as template since it has correct shape
-    padded_inference_logprobs = old_logprobs_for_data.clone()
+    # Note: We use old_logprobs_for_data as template since it has correct shape.
+    # Inference logprobs ride in float32, matching pack_inference_logprobs: the
+    # IS-correction ratio is precision-sensitive, and under bf16 training
+    # old_logprobs arrives bf16 while the wire logprobs are float32 — cloning
+    # the template dtype would silently downcast them in the assignment below.
+    padded_inference_logprobs = old_logprobs_for_data.clone().float()
 
     # We need to align old_logprobs and inference logprobs as the latter are only for generations
     for i, inf_logprobs in enumerate(inference_logprobs):
@@ -512,7 +516,9 @@ def align_unpacked_inference_logprobs(
         end_idx = min(first_gen_idx + len(inf_logprobs), padded_inference_logprobs.shape[1])
         actual_len = end_idx - first_gen_idx
         if actual_len > 0:
-            padded_inference_logprobs[i, first_gen_idx:end_idx] = inf_logprobs[:actual_len]
+            padded_inference_logprobs[i, first_gen_idx:end_idx] = inf_logprobs[:actual_len].to(
+                padded_inference_logprobs.dtype
+            )
 
     # Create truncated mask for statistics
     if old_logprobs_for_data.shape[1] + 1 < gen_masks_for_alignment.shape[1]:
