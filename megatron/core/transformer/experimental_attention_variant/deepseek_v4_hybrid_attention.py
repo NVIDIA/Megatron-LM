@@ -8,10 +8,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fusions.fused_mla_yarn_rope_apply import (
-    fused_mla_rope_inplace,
-    fused_mla_rope_out_of_place,
-)
+from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -342,121 +339,9 @@ class DSv4HybridAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
-        # inverse RoPE on last qk_pos_emb_head_dim of each head
-        seq_len = core_attn_out.size(0)
-        n_heads = self.num_attention_heads_per_partition
-        pos_dim = self.config.qk_pos_emb_head_dim
-        nope_dim = self.config.v_head_dim - pos_dim
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq:
-            cu_seqlens_kv = (
-                packed_seq_params.cu_seqlens_kv_padded
-                if packed_seq_params.cu_seqlens_kv_padded is not None
-                else packed_seq_params.cu_seqlens_kv
-            )
-            rope_seqlen = packed_seq_params.max_seqlen_kv
-            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
-        else:
-            cu_seqlens_kv = None
-            rope_seqlen = seq_len
-            rope_max_seqlen_kv = None
-        # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-        # concentration factor (mscale) is NOT part of the DSv4 model contract --
-        # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
-        mscale = 1.0
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        if self.config.apply_rope_fusion:
-            # ``mscale=1.0`` strips yarn's concentration factor from the
-            # cached cos/sin so the fused kernel matches the unfused
-            # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
-            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
-            )
-            rotary_pos_emb = None
-            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
-        elif self._dsv4_uses_yarn_rope:
-            rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        else:
-            rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        if self.config.apply_rope_fusion:
-            if use_thd_cp:
-                global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
-                core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
-                    core_attn_out,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    nope_dim,
-                    pos_dim,
-                    cu_seqlens_kv,
-                    global_start,
-                    inverse=True,
-                )
-            else:
-                if packed_seq:
-                    core_attn_out = core_attn_out.squeeze(1)
-                # Fused DSA backward retains the raw attention output O. Applying
-                # inverse RoPE to its view in-place corrupts the retained O used by
-                # the softmax backward, so this call needs private storage.
-                core_attn_out = fused_mla_rope_out_of_place(
-                    core_attn_out,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    nope_dim,
-                    pos_dim,
-                    cu_seqlens_kv,
-                    self.pg_collection.cp.rank(),
-                    self.pg_collection.cp.size(),
-                    inverse=True,
-                    remove_interleaving=True,
-                )
-                if packed_seq:
-                    core_attn_out = core_attn_out.unsqueeze(1)
-        elif use_thd_cp:
-            global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
-            core_attn_out = cp_utils.apply_thd_cp_local_rope_unfused(
-                core_attn_out,
-                rotary_pos_emb,
-                nope_dim,
-                pos_dim,
-                cu_seqlens_kv,
-                global_start,
-                self.config,
-                inverse=True,
-            )
-        else:
-            content_part, rot_part = torch.split(
-                core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
-            )
-            # ``_apply_rotary_pos_emb_thd`` documents 3-D ``(total, h, d)`` input
-            # and adds its own batch dim internally; drop the dummy ``b=1`` axis
-            # for THD before the rope and add it back after.
-            if packed_seq:
-                rot_part_in = rot_part.squeeze(1)
-            else:
-                rot_part_in = rot_part
-            rot_part_out = apply_rotary_pos_emb(
-                rot_part_in,
-                rotary_pos_emb,
-                self.config,
-                cu_seqlens=cu_seqlens_kv,
-                mscale=mscale,
-                cp_group=self.pg_collection.cp,
-                mla_rotary_interleaved=True,
-                inverse=True,
-                mla_output_remove_interleaving=True,
-                max_seqlen=rope_max_seqlen_kv,
-            )
-            if packed_seq:
-                rot_part = rot_part_out.unsqueeze(1)
-            else:
-                rot_part = rot_part_out
-            core_attn_out = torch.cat([content_part, rot_part], dim=-1)
-        core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
+        # ``core_attention`` already applied the inverse RoPE to the last
+        # qk_pos_emb_head_dim of each head, fusing it into the sparse-attention
+        # Function where that path allows it.
 
         # Grouped output
         core_attn_out = core_attn_out.view(
