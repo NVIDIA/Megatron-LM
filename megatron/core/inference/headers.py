@@ -29,6 +29,9 @@ class Request(IntEnum):
     ENGINE_REPLY = 21
     ENGINE_REPLY_PARTIAL = 22
     ABORT_REQUEST = 23
+    SUBMIT_REQUEST_WITH_KV = 24  # Decode-side KV import.
+    RELEASE_KV = 25  # Free pinned handoff blocks.
+    SEND_KV = 26  # Tell the prefill engine to send a handoff's KV.
 
 
 class Control(IntEnum):
