@@ -489,6 +489,9 @@ def test_fp8_up_proj_recompute_parity(
     identically-initialized modules — one recomputing the up projection, one not —
     must produce bitwise-identical outputs and parameter gradients. Any drift means
     the replay used a different quantization scale or a stale weight.
+
+    A bf16 reference run guards against the parity check passing vacuously, that is,
+    both modules silently falling back to bf16.
     """
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     model_parallel_cuda_manual_seed(123)
@@ -557,5 +560,41 @@ def test_fp8_up_proj_recompute_parity(
         torch.testing.assert_close(
             recomputed_grad, baseline_grad, atol=0, rtol=0, msg=lambda m, n=name: f"{n}: {m}"
         )
+
+    # The assertions above hold trivially if the FP8 recipe never engaged, since two
+    # bf16 replays also match bitwise. Run the same weights through a bf16 module: the
+    # FP8 output must track it closely (the math is right) yet differ from it (the
+    # values really went through quantization).
+    bf16_model = _build_absorbed_mla(
+        get_mock_mla_config(
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            sequence_parallel=False,
+            recompute_mla_up_proj=False,
+        ),
+        combined_kv_up_projection,
+    )
+    # Copy parameters directly rather than via state_dict, which also carries the FP8
+    # `_extra_state` blobs that a bf16 module has no use for.
+    baseline_params = dict(baseline.named_parameters())
+    with torch.no_grad():
+        for name, param in bf16_model.named_parameters():
+            param.copy_(baseline_params[name])
+        bf16_output, _ = bf16_model(
+            hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+
+    assert not torch.equal(
+        recomputed_output, bf16_output
+    ), "FP8 output is bitwise equal to bf16, so the recipe never engaged"
+    # The bound stays loose on purpose: it only has to catch an FP8 path that produces
+    # garbage, and it must hold across recipes and architectures whose quantization error
+    # differs by an order of magnitude. Accuracy itself is pinned by the exact comparisons
+    # above and by test_functionality.
+    cosine_sim = torch.nn.functional.cosine_similarity(
+        recomputed_output.flatten().float().unsqueeze(0),
+        bf16_output.flatten().float().unsqueeze(0),
+    ).item()
+    assert cosine_sim > 0.99, f"FP8 output diverges from bf16: cosine similarity = {cosine_sim}"
 
     Utils.destroy_model_parallel()
