@@ -69,12 +69,10 @@ class GatedDeltaNetSubmodules:
 
 class GatedDeltaRuleInterface(Protocol):
     """
-    Unified typing protocol for GDN core computation interfaces.
-    Including interfaces from FLA, and deterministic torch-native implementations for GDN & GDN2.
+    Unified typing protocol for linear attention interfaces, comliant to upstream FLA interfaces.
 
     Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
-    variant inserts its own gates after ``g`` (``beta`` for GDN, ``b``/``w`` for GDN2),
-    which shifts the positional index of everything that follows.
+    variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
     """
 
     def __call__(

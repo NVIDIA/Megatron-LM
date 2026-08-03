@@ -123,7 +123,7 @@ class GatedDeltaNet2(_GDNBase):
         dt_bias_local_cp: torch.Tensor,
         batch: int,
         seq_len: int,
-        *gate_feats: tuple[torch.Tensor],
+        *gate_feats: tuple[torch.Tensor, ...],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute the per-channel log-decay g and the erase/write gates b/w."""
         f, b, w = gate_feats
