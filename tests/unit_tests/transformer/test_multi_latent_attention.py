@@ -166,6 +166,56 @@ class TestParallelMLAAttention:
         missing_params = attn_params - mla_params
         assert not missing_params, f"Missing parameters in MultiLatentAttention: {missing_params}"
 
+    @pytest.mark.parametrize("is_decode_only", [False, True])
+    def test_dynamic_inference_forwards_decode_only_to_flash_attention(self, is_decode_only):
+        """Test that MLA forwards the dynamic context's decode-only state."""
+        attention = self.parallel_attention
+        attention.eval()
+        attention.config.cache_mla_latents = True
+        attention.cache_mla_latents = True
+
+        hidden_states = torch.empty((1, 1, attention.config.hidden_size))
+        query = torch.empty((1, 1, 1, 1))
+        key = torch.empty_like(query)
+        value = torch.empty_like(query)
+        block_table = torch.zeros((1, 1), dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+        sequence_lengths = torch.ones(1, dtype=torch.int32)
+
+        inference_context = mock.Mock()
+        inference_context.is_static_batching.return_value = False
+        inference_context.is_decode_only.return_value = is_decode_only
+        inference_context.cu_query_lengths.return_value = (cu_seqlens, 1)
+        inference_context.cu_kv_lengths.return_value = (cu_seqlens, sequence_lengths, 1)
+
+        with (
+            mock.patch.object(attention, "prepare_for_absorption"),
+            mock.patch.object(
+                attention,
+                "get_query_key_value_tensors",
+                return_value=(query, key, value, None, None),
+            ),
+            mock.patch.object(
+                attention,
+                "_adjust_key_value_for_inference",
+                return_value=(query, key, value, None, AttnMaskType.causal, block_table),
+            ),
+            mock.patch.object(
+                attention,
+                "flash_decode_and_prefill",
+                side_effect=RuntimeError("flash attention call reached"),
+            ) as flash_decode_and_prefill,
+            pytest.raises(RuntimeError, match="flash attention call reached"),
+        ):
+            attention(hidden_states, attention_mask=None, inference_context=inference_context)
+
+        flash_call = signature(Attention.flash_decode_and_prefill).bind(
+            attention,
+            *flash_decode_and_prefill.call_args.args,
+            **flash_decode_and_prefill.call_args.kwargs,
+        )
+        assert flash_call.arguments["is_decode_only"] is is_decode_only
+
     def test_constructor(self):
         assert isinstance(self.parallel_attention, MLASelfAttention)
         assert self.parallel_attention.layer_number == 1

@@ -40,6 +40,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     MambaInferenceStateConfig,
     PrefixCachingEvictionPolicy,
@@ -195,6 +196,7 @@ class TestMambaPrefixCachingE2E:
         enable_chunked_prefill=False,
         max_tokens=None,
         max_requests=None,
+        async_sched_mode=AsyncScheduleMode.LEGACY,
     ):
         set_rounder(request_rounder)
         inference_config_kwargs = dict(
@@ -202,17 +204,18 @@ class TestMambaPrefixCachingE2E:
             buffer_size_gb=buffer_size_gb,
             block_size_tokens=BLOCK_SIZE,
             mamba_inference_state_config=mamba_config,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=async_sched_mode == AsyncScheduleMode.ASYNC,
             enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=enable_chunked_prefill,
             unified_memory_level=0,
             num_cuda_graphs=num_cuda_graphs,
             sampling_backend='torch',
-            enable_chunked_prefill=enable_chunked_prefill,
+            async_sched_mode=async_sched_mode,
         )
         if max_tokens is not None:
-            inference_config_kwargs['max_tokens'] = max_tokens
+            inference_config_kwargs["max_tokens"] = max_tokens
         if max_requests is not None:
-            inference_config_kwargs['max_requests'] = max_requests
+            inference_config_kwargs["max_requests"] = max_requests
         if enable_prefix_caching:
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
@@ -438,6 +441,31 @@ class TestMambaPrefixCachingE2E:
             ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
         assert off_prefill == 3800 and on_prefill == 2008 and on_prefill < off_prefill
 
+    @torch.inference_mode()
+    def test_async_sched_mamba_prefix_caching_with_chunked_prefill_e2e(self):
+        """Async combined chunking and Mamba prefix caching matches legacy output."""
+        skip_if_mamba_sequence_packing_not_available()
+        model = self._create_model()
+        mamba_config = MambaInferenceStateConfig.from_model(model)
+        prompts = self._create_prompts()[:3]
+
+        legacy_outputs, legacy_prefill = self._run_simple(
+            model, mamba_config, prompts, enable_pc=False
+        )
+        async_outputs, async_prefill = self._run_simple(
+            model,
+            mamba_config,
+            prompts,
+            enable_pc=True,
+            enable_chunked_prefill=True,
+            max_tokens=400,
+            max_requests=4,
+            async_sched_mode=AsyncScheduleMode.ASYNC,
+        )
+
+        assert async_outputs == legacy_outputs
+        assert async_prefill < legacy_prefill
+
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
     def test_mamba_prefix_caching_multi_group_e2e(self, num_cuda_graphs):
@@ -593,7 +621,7 @@ class TestMambaPrefixCachingE2E:
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
 
-        assert alloc.total_count == 3, f"expected 3 total blocks, got {alloc.total_count}"
+        assert alloc.pool_size == 3, f"expected 3 total blocks, got {alloc.pool_size}"
         assert ctx.max_requests >= 1
 
         finished = {}
@@ -616,7 +644,7 @@ class TestMambaPrefixCachingE2E:
         assert (
             h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
         )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
+        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.pool_avail == 1
 
         # F: disjoint prefix, forces eviction of E's cached block
         req_F = _run_one(1, prompts[1])
