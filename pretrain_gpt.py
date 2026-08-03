@@ -467,7 +467,6 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
-        "sequence_packing_scheduler": args.sequence_packing_scheduler,
     }
 
     # add FIM args to the config
