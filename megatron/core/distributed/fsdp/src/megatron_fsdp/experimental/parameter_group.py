@@ -25,6 +25,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
+from .grouped_tensor import get_values, install_storage, is_grouped_tensor
 from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -117,8 +118,10 @@ class FsdpParameterGroup:
 
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
+        # get_values() reads a grouped parameter's values out of its separate backing buffer;
+        # for an ordinary parameter it is the parameter itself.
         self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
+            (get_values(parameter).to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
             mesh=self.mesh,
             placements=main_weight_placements,
         )
@@ -184,6 +187,12 @@ class FsdpParameterGroup:
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
+            elif is_grouped_tensor(parameter):
+                # A grouped parameter's kernels read its separate backing buffer, so assigning
+                # .data would leave them reading the original allocation -- silently freezing
+                # the parameter, since FSDP would then own storage nothing ever consumes.
+                install_storage(parameter, unsharded_tensor)
+                parameter.grad = None
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
@@ -291,7 +300,7 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
+            grads.append(get_values(fsdp_parameter.unsharded.grad))
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
@@ -305,7 +314,7 @@ class FsdpParameterGroup:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
+            partial_grad.get_local_tensor(index).copy_(get_values(fsdp_parameter.unsharded.grad))
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
