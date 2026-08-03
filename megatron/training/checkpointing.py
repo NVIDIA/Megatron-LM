@@ -2017,14 +2017,14 @@ def _maybe_setup_gpt_to_hybrid_load(
         ckpt_args, 'hybrid_override_pattern', None
     )
     checkpoint_is_hybrid = bool(ckpt_pattern)
-    if runtime_is_hybrid and ckpt_args is None:
+    if ckpt_args is None:
         if ckpt_format == 'torch_dist':
             checkpoint_keys = dist_checkpointing.load_tensors_metadata(checkpoint_name)
         else:
             checkpoint_keys = FileSystemReader(checkpoint_name).read_metadata().state_dict_metadata
         has_gpt_layout = any('decoder.final_layernorm.' in key for key in checkpoint_keys)
         checkpoint_is_hybrid = any('decoder.final_norm.' in key for key in checkpoint_keys)
-        if has_gpt_layout == checkpoint_is_hybrid:
+        if has_gpt_layout == checkpoint_is_hybrid and (has_gpt_layout or runtime_is_hybrid):
             raise RuntimeError(
                 'Checkpoint tensor metadata does not uniquely identify a GPTModel or '
                 'HybridModel layout.'

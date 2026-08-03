@@ -816,7 +816,8 @@ class TestNoArgsHybridCheckpointLoad:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    def test_native_hybrid_layout_loads_through_load_checkpoint(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize('runtime_is_hybrid', [True, False], ids=['hybrid', 'gpt'])
+    def test_layout_is_checked_through_load_checkpoint(self, tmp_path_dist_ckpt, runtime_is_hybrid):
         parallel = (1, 1, 1, 1, 1)
         pattern = '*-*-'
         Utils.initialize_model_parallel(1, 1)
@@ -843,6 +844,11 @@ class TestNoArgsHybridCheckpointLoad:
                 Utils.destroy_model_parallel()
 
                 Utils.initialize_model_parallel(1, 1)
+                initialize_fn = (
+                    partial(hybrid_provider_for_opt, pattern=pattern, moe=False)
+                    if runtime_is_hybrid
+                    else partial(gpt_provider_for_opt, num_gpt_layers=2, moe=False)
+                )
                 loaded_model, loaded_optimizer = setup_model_and_optimizer(
                     seed=12,
                     tp=1,
@@ -851,15 +857,20 @@ class TestNoArgsHybridCheckpointLoad:
                     ep=1,
                     etp=1,
                     use_megatron_fsdp=False,
-                    initialize_fn=partial(hybrid_provider_for_opt, pattern=pattern, moe=False),
+                    initialize_fn=initialize_fn,
                 )
-                loaded_module = _unwrap_interop_model(loaded_model[0])
-                before_load = _model_parameter_snapshot(loaded_module)
 
                 _configure_checkpoint_args(mock_args, ckpt_dir, parallel, False, False)
                 mock_args.finetune = True
-                mock_args.hybrid_layer_pattern = pattern
-                mock_args.num_layers = len(pattern)
+                mock_args.hybrid_layer_pattern = pattern if runtime_is_hybrid else None
+                mock_args.num_layers = len(pattern) if runtime_is_hybrid else 2
+                if not runtime_is_hybrid:
+                    with pytest.raises(RuntimeError, match='hybrid model run'):
+                        load_checkpoint(loaded_model, loaded_optimizer, None)
+                    return
+
+                loaded_module = _unwrap_interop_model(loaded_model[0])
+                before_load = _model_parameter_snapshot(loaded_module)
                 iteration, _ = load_checkpoint(loaded_model, loaded_optimizer, None)
 
                 assert iteration == 0
