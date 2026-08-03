@@ -83,15 +83,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     sft_mock_dataset_config_json: Optional[str] = None
     """This config provides the necessary information for the mock dataset."""
 
-    sequence_packing_scheduler: Optional[str] = None
-    """Mirrors ``ModelParallelConfig.sequence_packing_scheduler`` (set from
-    ``--sequence-packing-scheduler``) so dataset code can tell whether an upstream
-    packing scheduler will regroup its samples for sequence packing and hybrid
-    context parallelism. ``dp_balanced``, the DP-balanced scheduler, is the only
-    scheduler implemented today; new algorithms are added by subclassing
-    ``BasePackingScheduler`` and registering them in ``data_schedule.scheduler_map``.
-    """
-
     varlen_mock_dataset_config_json: Optional[str] = None
     """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
     used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
