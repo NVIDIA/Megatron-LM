@@ -1551,7 +1551,7 @@ class GTPShardedParam(torch.nn.Parameter):
         """Release the buffers a finished RS was reading.
 
         Its wgrad inputs, and the fp32-accum all-to-all scratch (input to the deferred FP32 sum,
-        so only free once the handle has been waited). UNGRAPHED buffers go back to the pool;
+        so only free once the handle has been waited on). UNGRAPHED buffers go back to the pool;
         GRAPHED just drops Python refs (addresses must stay stable for CG).
         """
         for attr in attrs:
@@ -1664,9 +1664,9 @@ class GTPShardedParam(torch.nn.Parameter):
                 if len(wgrads) > 1:
                     # Batched: group the all-to-alls into one ncclGroupStart/End, exactly like
                     # the plain batched RS below. Unlike that path we cannot hand the manager
-                    # back as the handle: the manager waits only the NCCL work it collects, and
-                    # each fp32-accum handle still owes a local FP32 sum. So the sums are
-                    # deferred behind the manager's work in one composite handle.
+                    # back as the handle: the manager waits only on the underlying NCCL collective
+                    # to complete, and each fp32-accum handle still owes a local FP32 sum. So the
+                    # sums are deferred behind the manager's work in one composite handle.
                     with torch.distributed._coalescing_manager(
                         group=self.group, device=wgrads[0].device, async_ops=True
                     ) as cm:
