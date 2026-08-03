@@ -22,6 +22,7 @@ per-step metadata kernel is captured inside the CUDA graph.
 """
 
 import operator
+import os
 from functools import reduce
 from typing import List, Optional
 
@@ -48,6 +49,10 @@ from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDisp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+# Reduce the MoE combine in bf16 instead of fp32. Off by default because it changes
+# numerics; see the buffer allocation for why it is worth measuring.
+_NVLS_RS_BF16: bool = os.environ.get("MCORE_NVLS_RS_BF16", "0") == "1"
 
 
 class InferenceAllGatherDispatcherBase(MoEAllGatherTokenDispatcher):
@@ -432,9 +437,17 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
         ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
 
+        # The combine reduce-scatter buffer. fp32 makes the cross-rank sum exact but
+        # costs twice the NVLink bytes on the largest collective in the step, and it
+        # forces a per-layer cast on the way out because everything downstream is
+        # bf16. vLLM reduces in bf16 (`ncclDevKernel_ReduceScatter_Sum_bf16`), and the
+        # multimem kernel already accepts either, so bf16 is a supported point on the
+        # same curve: the top-k sum still accumulates in fp32 registers inside
+        # `_moe_sum`, only the store and the 4-way cross-rank add become bf16.
+        rsv_dtype = torch.bfloat16 if _NVLS_RS_BF16 else torch.float32
         cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
-        ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
+            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, rsv_dtype)
+        ).maybe_get_tensor(rsv_shape, dtype=rsv_dtype)
 
         # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
         cls._symm_metadata = SymmetricMemoryManager.get_buffer(

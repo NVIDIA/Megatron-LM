@@ -2695,6 +2695,57 @@ Combined with QWEN-014 (flashinfer cutlass, 0.921×) and QWEN-010 (torch grouped
 and none beats the shipping Triton path.** The candidate list above should be read as: item 1
 requires w8a8 or nothing; items 2-4 are the only cheap ones left.
 
+### QWEN-040 — reduce the MoE combine in bf16, not fp32: **+2.37%**
+
+| arm | gates on top of standing set | tok/s | vs control |
+| --- | --- | --- | --- |
+| s1base | control (FA2) | 28,594.3 | — |
+| **t1rsbf16** | **`MCORE_NVLS_RS_BF16=1`** | **29,271.8** | **+2.37%** |
+| t2rsbf16 | repeat of t1 | 29,354.2 | +2.66% |
+| t3rsconn8 | + `CUDA_DEVICE_MAX_CONNECTIONS=8` | 29,346.3 | +0.0% vs t2 |
+| s2fa4 | FA4 (version pin removed) | 27,716.1 | −3.07% |
+| s3conn8fa4 | FA4 + `CUDA_DEVICE_MAX_CONNECTIONS=8` | 27,812.6 | +0.35% vs s2fa4 |
+
+Found by following `COPY-ID-S18`'s post-reduce-scatter copy back to its cause rather
+than trying to fuse it away. The copy is `output.to(torch.bfloat16)` in
+`NVLSAllGatherVDispatcher.combine`, and it exists because the `ep_rsv` symmetric buffer
+is allocated fp32 — so the MoE writes fp32 through `_moe_sum`'s `out=`, the combine
+reduce-scatter moves **twice the NVLink bytes it needs to**, and every layer pays a cast
+on the way back to a bf16 residual stream. Allocating the buffer bf16 fixes all three at
+once: `_moe_sum`'s `tl.store` casts on the way in for free, and `output.to(bfloat16)`
+becomes a no-op that returns its argument, so the cast kernel disappears.
+
+The precision cost is far smaller than "reduce in bf16" suggests, and this is the part
+worth remembering: `multimem.ld_reduce` **accumulates in f32 regardless** — `REDUCE_F32`
+only selects whether the operands it loads are `f32` or `bf16x2`. So the change halves
+the bytes on the step's largest collective while keeping f32 accumulation in hardware,
+and it lands where vLLM already is (`ncclDevKernel_ReduceScatter_Sum_bf16`). Greedy
+decode stays coherent on all three probes and the five iterations span 0.4%.
+
+Two arms, 29,271.8 and 29,354.2, put the mean at 29,313 (**+2.52%**), and TPOT drops from
+~8.95 to 8.75 ms — 0.23 ms/step against the 0.29 ms predicted from the trace, so the
+accounting holds. Stacking `CUDA_DEVICE_MAX_CONNECTIONS=8` on top adds nothing (29,346),
+which retires `QWEN-039`: that flag's earlier +0.4-0.9% was relieving contention on the
+same fp32 reduce-scatter this change shrinks, so the two are one win, not two.
+
+Left env-gated and **off by default**: it is a numerics change, and enabling it by
+default needs an accuracy run (lm-eval or equivalent), not three greedy-decode probes.
+
+> **Lesson.** A "removable copy" is usually a symptom. Three sessions treated the
+> per-layer copies as fusion targets worth ~0.06 ms each; the copy was actually pointing
+> at a **buffer dtype** decision upstream worth 2.5%. When a copy shows up next to a
+> collective, check what dtype the collective is moving before trying to fuse the copy.
+
+### FA4-RECHECK-S18 — the FA2 pin survives upstream's split-KV fix
+
+`QWEN-0xx` pinned `MCORE_FLASH_ATTN_VERSION=2` because FA4 hardcoded `num_splits=1` and
+so could not split KV across SMs at decode. The rebase brought `num_splits=0` (auto), so
+the rejection was re-tested per the rebase rule — and FA4 is **still 3.07% slower**
+(27,716 vs 28,594). `num_splits` was therefore not the dominant term; the FA4 path's
+routing through the varlen interface is. Attention stays the largest work-bucket gap
+(+0.409 ms/step) with no env-level lever left, so closing it needs a different kernel
+(flashinfer/TRT-LLM-gen decode), not a flag.
+
 ### GAP-S18 — the gap is two-thirds packing, one-third work, and the expert GEMM is done
 
 First decomposition built from a **fresh** mcore trace (current gate set, OSL1024, 60
