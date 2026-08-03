@@ -28,11 +28,15 @@ from megatron.core.inference.disaggregation.utils import transfer_peer_records
 logger = logging.getLogger(__name__)
 
 try:
-    from nixl._api import nixl_agent  # type: ignore[import-not-found]
+    from nixl import _api as _nixl_api  # type: ignore[import-not-found]
+
+    nixl_agent = _nixl_api.nixl_agent
+    _NIXL_VARIANT = _nixl_api.__name__.split(".", maxsplit=1)[0]
 
     _HAVE_NIXL = True
 except ImportError:
     nixl_agent = None  # type: ignore[assignment]
+    _NIXL_VARIANT = None
     _HAVE_NIXL = False
 
 
@@ -40,6 +44,35 @@ except ImportError:
 # fabric failure, so cap the wait.
 _POLL_INTERVAL_S = 0.0005  # 0.5 ms
 _POLL_TIMEOUT_S = 30.0
+
+
+def _validate_nixl_cuda_support(agent: Any, memory_buffer: torch.Tensor) -> None:
+    """Reject a NIXL/UCX runtime that cannot safely register CUDA memory."""
+    if not memory_buffer.is_cuda:
+        return
+
+    cuda_version = torch.version.cuda
+    if cuda_version and _NIXL_VARIANT:
+        expected_variant = f"nixl_cu{cuda_version.split('.', maxsplit=1)[0]}"
+        if _NIXL_VARIANT.startswith("nixl_cu") and _NIXL_VARIANT != expected_variant:
+            expected_package = expected_variant.replace("_", "-")
+            raise RuntimeError(
+                f"PyTorch uses CUDA {cuda_version}, but NIXL selected {_NIXL_VARIANT}. "
+                f"Install the matching backend with `pip install {expected_package}` "
+                "before starting a disaggregated worker. A mismatched NIXL backend can make "
+                "UCX classify GPU buffers as host memory."
+            )
+
+    get_memory_types = getattr(agent, "get_backend_mem_types", None)
+    if get_memory_types is None:
+        return
+    ucx_memory_types = {str(mem_type).lower() for mem_type in get_memory_types("UCX")}
+    if not any("cuda" in mem_type or "vram" in mem_type for mem_type in ucx_memory_types):
+        raise RuntimeError(
+            "The NIXL UCX backend does not report CUDA/VRAM memory support "
+            f"(reported memory types: {sorted(ucx_memory_types)}). Install a NIXL backend "
+            "built for this CUDA major version, or rebuild UCX with `--with-cuda=<cuda-root>`."
+        )
 
 
 @dataclass
@@ -178,6 +211,7 @@ class NixlTransferBackend:
         os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
 
         self._agent = nixl_agent(agent_name)
+        _validate_nixl_cuda_support(self._agent, memory_buffer)
         self._reg_handle = self._agent.register_memory(memory_buffer)
 
         # Base64 keeps NIXL metadata safe for msgpack/json control messages.

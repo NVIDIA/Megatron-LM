@@ -7,6 +7,49 @@ from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, S
 from megatron.core.inference.disaggregation.transfer_backends import base
 
 
+class _FakeCudaBuffer:
+    is_cuda = True
+
+
+def test_nixl_rejects_cuda_major_variant_mismatch(monkeypatch):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    monkeypatch.setattr(nixl_mod, "_NIXL_VARIANT", "nixl_cu12")
+    monkeypatch.setattr(nixl_mod.torch.version, "cuda", "13.2")
+
+    with pytest.raises(RuntimeError, match="NIXL selected nixl_cu12"):
+        nixl_mod._validate_nixl_cuda_support(object(), _FakeCudaBuffer())
+
+
+def test_nixl_rejects_ucx_without_vram_support(monkeypatch):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    class FakeAgent:
+        def get_backend_mem_types(self, backend):
+            assert backend == "UCX"
+            return ["DRAM"]
+
+    monkeypatch.setattr(nixl_mod, "_NIXL_VARIANT", "nixl_cu13")
+    monkeypatch.setattr(nixl_mod.torch.version, "cuda", "13.2")
+
+    with pytest.raises(RuntimeError, match="does not report CUDA/VRAM"):
+        nixl_mod._validate_nixl_cuda_support(FakeAgent(), _FakeCudaBuffer())
+
+
+def test_nixl_accepts_matching_variant_with_vram_support(monkeypatch):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    class FakeAgent:
+        def get_backend_mem_types(self, backend):
+            assert backend == "UCX"
+            return ["DRAM", "VRAM"]
+
+    monkeypatch.setattr(nixl_mod, "_NIXL_VARIANT", "nixl_cu13")
+    monkeypatch.setattr(nixl_mod.torch.version, "cuda", "13.2")
+
+    nixl_mod._validate_nixl_cuda_support(FakeAgent(), _FakeCudaBuffer())
+
+
 def test_backend_registry_selects_by_explicit_name():
     assert base.construct_kv_transfer_backend_class("nixl").name == "nixl"
 
