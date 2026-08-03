@@ -746,7 +746,6 @@ def _compute_unfused_csa_non_compressed_lse(
         global_indices = torch.where(
             window_indices_i64 >= 0, window_indices_i64 + batch_offsets, window_indices_i64
         ).reshape(batch_size * seqlen_q, -1)
-        output_shape = (batch_size, num_heads, seqlen_q)
     elif query.ndim == 3:
         total_q, num_heads, head_dim = query.shape
         if kv_full.ndim != 2 or kv_full.shape[1] != head_dim:
