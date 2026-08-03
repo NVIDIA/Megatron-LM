@@ -13,8 +13,8 @@ import torch
 from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotCapacityError
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
-    _common_mamba_positions,
-    _executable_mamba_position,
+    _common_ssm_positions,
+    _executable_ssm_position,
 )
 from megatron.core.inference.disaggregation.pending_handoff_imports import PendingKvImport
 from megatron.core.inference.inference_request import compute_block_hashes_batched
@@ -111,7 +111,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             memory_buffer=torch.empty(1),
         )
         self._kv_transfer_agent = _TransferAgent()
-        self._mamba_transfer_agents = {"conv": _TransferAgent(), "ssm": _TransferAgent()}
+        self._ssm_transfer_agents = {"conv": _TransferAgent(), "recurrent": _TransferAgent()}
         self.pg_collection = SimpleNamespace(mp=None)
         self.waiting_request_ids = deque()
         self.requests = {}
@@ -135,10 +135,10 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
 def _meta(request_id, positions):
     return {
         "request_id": request_id,
-        "mamba": {
+        "ssm": {
             "positions": positions,
             "conv": {"request_id": request_id},
-            "ssm": {"request_id": request_id},
+            "recurrent": {"request_id": request_id},
         },
     }
 
@@ -168,11 +168,11 @@ def handoff_loop():
     loop.close()
 
 
-def test_mamba_handoff_selects_common_farthest_executable_checkpoint():
-    assert _common_mamba_positions(
+def test_ssm_handoff_selects_common_farthest_executable_checkpoint():
+    assert _common_ssm_positions(
         [{"positions": [0, 1, 2]}, {"positions": [0, 2]}, {"positions": [2, 0]}]
     ) == [0, 2]
-    assert _executable_mamba_position([0, 1, 2], prompt_length=10, block_size_tokens=4) == [1]
+    assert _executable_ssm_position([0, 1, 2], prompt_length=10, block_size_tokens=4) == [1]
 
 
 def test_setup_pins_handoff_outputs_only_on_prefill():
@@ -232,7 +232,7 @@ def test_capacity_miss_defers_before_any_transfer(handoff_loop):
     assert [item.request_id for item in engine._deferred_kv_handoffs] == [7]
     assert not engine._pending_kv_imports
     assert not engine._kv_transfer_agent.calls
-    assert not engine._mamba_transfer_agents["conv"].calls
+    assert not engine._ssm_transfer_agents["conv"].calls
     assert engine.context.kv_block_allocator.releases == [[10, 11]]
 
     engine.context.mamba_slot_allocator.available = 1
@@ -242,8 +242,8 @@ def test_capacity_miss_defers_before_any_transfer(handoff_loop):
     assert not engine._deferred_kv_handoffs
     assert len(engine._pending_kv_imports) == 1
     assert len(engine._kv_transfer_agent.calls) == 1
-    assert len(engine._mamba_transfer_agents["conv"].calls) == 1
-    assert len(engine._mamba_transfer_agents["ssm"].calls) == 1
+    assert len(engine._ssm_transfer_agents["conv"].calls) == 1
+    assert len(engine._ssm_transfer_agents["recurrent"].calls) == 1
 
 
 def test_peer_capacity_miss_rolls_back_before_any_transfer(handoff_loop, monkeypatch):
@@ -263,7 +263,7 @@ def test_peer_capacity_miss_rolls_back_before_any_transfer(handoff_loop, monkeyp
 
     assert [item.request_id for item in engine._deferred_kv_handoffs] == [8]
     assert not engine._kv_transfer_agent.calls
-    assert not engine._mamba_transfer_agents["conv"].calls
+    assert not engine._ssm_transfer_agents["conv"].calls
     assert engine.context.mamba_slot_allocator.invalidated == [10]
     assert engine.context.kv_block_allocator.releases == [[10, 11]]
 
@@ -283,7 +283,7 @@ def test_reset_cancels_capacity_queued_handoffs(handoff_loop):
 def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     engine = _HandoffHarness(handoff_loop, available=0)
     engine.context.mamba_slot_allocator = None
-    engine._mamba_transfer_agents = {}
+    engine._ssm_transfer_agents = {}
     prompt = [1] * 12
     hashes = compute_block_hashes_batched(
         torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
@@ -310,7 +310,7 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
     engine = _HandoffHarness(handoff_loop, available=0)
     engine.context.mamba_slot_allocator = None
-    engine._mamba_transfer_agents = {}
+    engine._ssm_transfer_agents = {}
     prompt = [2] * 12
     hashes = compute_block_hashes_batched(
         torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
@@ -339,7 +339,7 @@ def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
 def test_nccl_handoff_does_not_filter_source_push(handoff_loop):
     engine = _HandoffHarness(handoff_loop, available=0)
     engine.context.mamba_slot_allocator = None
-    engine._mamba_transfer_agents = {}
+    engine._ssm_transfer_agents = {}
     engine._kv_transfer_agent.is_push = True
     prompt = [3] * 8
     hashes = compute_block_hashes_batched(
@@ -388,38 +388,38 @@ def test_chunked_admission_releases_import_owner(handoff_loop):
     assert not engine._handoff_import_owners
 
 
-def test_push_handoff_reuses_mamba_slots_advertised_during_capture():
+def test_push_handoff_reuses_ssm_slots_advertised_during_capture():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock())
     engine.context.mamba_slot_allocator.get_slot.side_effect = AssertionError(
-        "SEND_KV must use the captured Mamba slots"
+        "SEND_KV must use the captured SSM slots"
     )
     engine._kv_transfer_agent = mock.Mock()
-    engine._mamba_transfer_agents = {"conv": mock.Mock()}
+    engine._ssm_transfer_agents = {"conv": mock.Mock()}
     engine._pinned_handoff_blocks[7] = [20, 21]
-    engine._pinned_handoff_mamba_slots[7] = [3]
-    decode_metas = [{"mamba": {"conv": {"agent": "decode"}}}]
+    engine._pinned_handoff_ssm_slots[7] = [3]
+    decode_metas = [{"ssm": {"conv": {"agent": "decode"}}}]
 
     engine.push_handoff_kv(7, decode_metas)
 
     engine._kv_transfer_agent.begin_push_blocks.assert_called_once_with(
         {"tp_metas": decode_metas}, [20, 21]
     )
-    engine._mamba_transfer_agents["conv"].begin_push_blocks.assert_called_once_with(
+    engine._ssm_transfer_agents["conv"].begin_push_blocks.assert_called_once_with(
         {"tp_metas": [{"agent": "decode"}]}, [3]
     )
 
 
-def test_capture_handoff_keeps_request_mamba_metadata_independent():
+def test_capture_handoff_keeps_request_ssm_metadata_independent():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.pg_collection = SimpleNamespace(tp=None, pp=None)
     engine._kv_peer_metas = {"transport": "nccl", "global_rank": 0}
-    engine._mamba_transfer_agents = {"conv": mock.Mock(), "ssm": mock.Mock()}
-    engine._mamba_peer_metas = {
+    engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
+    engine._ssm_peer_metas = {
         "conv": {"transport": "nccl", "state": "conv"},
-        "ssm": {"transport": "nccl", "state": "ssm"},
+        "recurrent": {"transport": "nccl", "state": "recurrent"},
     }
     engine.context = SimpleNamespace(block_size_tokens=4, mamba_slot_allocator=mock.Mock())
     first = SimpleNamespace(request_id=2, prompt_tokens=[0] * 10, disaggregated_params=None)
@@ -431,8 +431,8 @@ def test_capture_handoff_keeps_request_mamba_metadata_independent():
         engine._capture_handoff_meta(first, [10, 11])
         engine._capture_handoff_meta(second, [12])
 
-    assert first.disaggregated_params["kv_meta"]["mamba"]["positions"] == [1]
-    assert second.disaggregated_params["kv_meta"]["mamba"]["positions"] == [0]
-    assert engine._pinned_handoff_mamba_slots == {2: [5], 3: [6]}
+    assert first.disaggregated_params["kv_meta"]["ssm"]["positions"] == [1]
+    assert second.disaggregated_params["kv_meta"]["ssm"]["positions"] == [0]
+    assert engine._pinned_handoff_ssm_slots == {2: [5], 3: [6]}
     assert first.disaggregated_params["kv_meta"] is not second.disaggregated_params["kv_meta"]
-    assert "mamba" not in engine._kv_peer_metas
+    assert "ssm" not in engine._kv_peer_metas

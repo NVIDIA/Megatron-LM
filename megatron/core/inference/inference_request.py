@@ -406,7 +406,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
     # KV handoff metadata for decode-side NIXL pulls.
     # Shape: {"request_id", "block_ids", "kv_meta"}.
-    # Hybrid models may add kv_meta["mamba"] for conv/ssm state.
+    # Hybrid models may add kv_meta["ssm"] for recurrent state.
     disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):

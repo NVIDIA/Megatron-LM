@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""State records for KV-cache and Mamba-state imports awaiting completion."""
+"""State records for KV-cache and SSM-state imports awaiting completion."""
 
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ class DeferredKvHandoff:
 
 
 @dataclass(kw_only=True)
-class PendingMambaImport:
-    """Mamba state transfers attached to a pending KV-cache import."""
+class PendingSSMImport:
+    """SSM state transfers attached to a pending KV-cache import."""
 
     handles: dict[str, Any]
     local_slots: List[int]
@@ -48,4 +48,4 @@ class PendingKvImport:
     hash_registration_start: int
     handle: Any
     future: asyncio.Future
-    mamba: Optional[PendingMambaImport] = None
+    ssm: Optional[PendingSSMImport] = None

@@ -23,7 +23,7 @@ from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotCapac
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
     PendingKvImport,
-    PendingMambaImport,
+    PendingSSMImport,
 )
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     construct_kv_transfer_backend_class,
@@ -39,11 +39,11 @@ if TYPE_CHECKING:
     from megatron.core.inference.inference_request import DynamicInferenceRequest
     from megatron.core.inference.sampling_params import SamplingParams
 
-_MAMBA_STATE_KINDS = ("conv", "ssm")
+_SSM_STATE_KINDS = ("conv", "recurrent")
 
 
-def _common_mamba_positions(entries: list) -> list:
-    """Return positions cached by every participating Mamba rank."""
+def _common_ssm_positions(entries: list) -> list:
+    """Return positions cached by every participating SSM rank."""
 
     if not entries:
         return []
@@ -59,7 +59,7 @@ def _common_mamba_positions(entries: list) -> list:
 # only the farthest executable position. Earlier positions could seed reuse for
 # future requests that diverge sooner, but would add transfer traffic and
 # durable slot pressure for the current request.
-def _executable_mamba_position(positions: list, prompt_length: int, block_size_tokens: int) -> list:
+def _executable_ssm_position(positions: list, prompt_length: int, block_size_tokens: int) -> list:
     """Return the farthest checkpoint that leaves executable prompt tokens."""
 
     max_skip_tokens = max(0, prompt_length - 2)
@@ -71,12 +71,12 @@ def _executable_mamba_position(positions: list, prompt_length: int, block_size_t
     return [max(executable)] if executable else []
 
 
-def _select_mamba_positions(meta: dict, source_positions: list, selected_positions: list) -> dict:
+def _select_ssm_positions(meta: dict, source_positions: list, selected_positions: list) -> dict:
     """Filter one rank's transfer metadata to selected checkpoint positions."""
 
     block_ids = meta.get("block_ids")
     if block_ids is None or len(block_ids) != len(source_positions):
-        raise RuntimeError("Mamba handoff metadata must contain one block ID per cached position")
+        raise RuntimeError("SSM handoff metadata must contain one block ID per cached position")
     position_to_index = {int(position): index for index, position in enumerate(source_positions)}
     filtered = dict(meta)
     filtered["block_ids"] = [
@@ -85,29 +85,29 @@ def _select_mamba_positions(meta: dict, source_positions: list, selected_positio
     return filtered
 
 
-def _select_mamba_state_meta(meta: Any, source_positions: list, selected_positions: list) -> Any:
+def _select_ssm_state_meta(meta: Any, source_positions: list, selected_positions: list) -> Any:
     """Filter a TP rank metadata dictionary or its gathered list."""
 
     if isinstance(meta, list):
         return [
-            _select_mamba_positions(rank_meta, source_positions, selected_positions)
+            _select_ssm_positions(rank_meta, source_positions, selected_positions)
             for rank_meta in meta
         ]
-    return _select_mamba_positions(meta, source_positions, selected_positions)
+    return _select_ssm_positions(meta, source_positions, selected_positions)
 
 
 class InferenceStateHandoffMixin:
-    """Optional KV/Mamba handoff behavior composed into the dynamic engine."""
+    """Optional KV/SSM handoff behavior composed into the dynamic engine."""
 
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
 
         self._pinned_handoff_blocks: Dict[int, list] = {}
-        self._pinned_handoff_mamba_slots: Dict[int, list] = {}
+        self._pinned_handoff_ssm_slots: Dict[int, list] = {}
         self._kv_transfer_agent = None
         self._kv_peer_metas = None
-        self._mamba_transfer_agents = {}
-        self._mamba_peer_metas = {}
+        self._ssm_transfer_agents = {}
+        self._ssm_peer_metas = {}
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
         self._handoff_import_owners: Dict[int, list[int]] = {}
@@ -218,26 +218,24 @@ class InferenceStateHandoffMixin:
         tp_size = get_pg_size(self.pg_collection.tp)
         tp_rank = get_pg_rank(self.pg_collection.tp)
 
-        # Compute this PP rank's global attention- and Mamba-layer ranges.
+        # Compute this PP rank's global attention- and SSM-layer ranges.
         pp_size = get_pg_size(self.pg_collection.pp)
         pp_rank = get_pg_rank(self.pg_collection.pp)
         local_num_layers = self.context.num_attention_layers
-        local_num_mamba_layers = getattr(self.context, "num_mamba_layers", 0)
+        local_num_ssm_layers = getattr(self.context, "num_mamba_layers", 0)
 
         if pp_size > 1 and torch.distributed.is_initialized():
             layer_counts: list = [None] * pp_size
             torch.distributed.all_gather_object(
-                layer_counts,
-                (local_num_layers, local_num_mamba_layers),
-                group=self.pg_collection.pp,
+                layer_counts, (local_num_layers, local_num_ssm_layers), group=self.pg_collection.pp
             )
             layer_start = sum(counts[0] for counts in layer_counts[:pp_rank])
             num_layers_global = sum(counts[0] for counts in layer_counts)
-            mamba_layer_start = sum(counts[1] for counts in layer_counts[:pp_rank])
+            ssm_layer_start = sum(counts[1] for counts in layer_counts[:pp_rank])
         else:
             layer_start = 0
             num_layers_global = local_num_layers
-            mamba_layer_start = 0
+            ssm_layer_start = 0
         layer_end = layer_start + local_num_layers
 
         self._kv_transfer_agent = backend_cls(
@@ -258,32 +256,32 @@ class InferenceStateHandoffMixin:
             layer_end=layer_end,
         )
 
-        # Mamba uses the same transport segments as KV, with conv channels or
-        # SSM heads as the fragment axis.
-        self._mamba_transfer_agents = {}
-        self._mamba_peer_metas = {}
+        # Recurrent state uses the same transport segments as KV, with conv
+        # channels or SSM heads as the fragment axis.
+        self._ssm_transfer_agents = {}
+        self._ssm_peer_metas = {}
         if getattr(self.context, "is_hybrid_model", False):
             from megatron.core.inference.disaggregation.ssm_reshard import (
                 SSMShardLayout,
                 SSMStateDims,
             )
 
-            msa = getattr(self.context, "mamba_slot_allocator", None)
-            if msa is None:
+            ssm_cache = getattr(self.context, "mamba_slot_allocator", None)
+            if ssm_cache is None:
                 raise RuntimeError(
-                    "Hybrid model KV handoff requires the Mamba state cache. "
+                    "Hybrid model KV handoff requires an SSM state cache. "
                     "Pass --inference-dynamic-batching-prefix-caching and "
                     "--inference-dynamic-batching-prefix-caching-mamba-gb <GB> "
-                    "so the decode engine can restore transferred Mamba state."
+                    "so the decode engine can restore transferred recurrent state."
                 )
-            conv_shape = msa.conv_states.shape
-            ssm_shape = msa.ssm_states.shape
+            conv_shape = ssm_cache.conv_states.shape
+            ssm_shape = ssm_cache.ssm_states.shape
             nheads_local = int(ssm_shape[-3])
             nheads_global = nheads_local * tp_size
             configured_nheads = model_config.mamba_num_heads
             if configured_nheads is not None and configured_nheads != nheads_global:
                 raise ValueError(
-                    f"Mamba state shape implies {nheads_global} global heads, "
+                    f"SSM state shape implies {nheads_global} global heads, "
                     f"but model config specifies {configured_nheads}"
                 )
             ssm_dims = SSMStateDims(
@@ -297,43 +295,46 @@ class InferenceStateHandoffMixin:
                 global_rank=rank,
                 tp_size=tp_size,
                 tp_rank=tp_rank,
-                layer_start=mamba_layer_start,
-                num_layers=local_num_mamba_layers,
+                layer_start=ssm_layer_start,
+                num_layers=local_num_ssm_layers,
                 dims=ssm_dims,
             )
             if int(conv_shape[-2]) != ssm_layout.conv_dim_local:
                 raise ValueError(
-                    "Mamba conv state shape does not match the model TP layout: "
+                    "SSM conv state shape does not match the model TP layout: "
                     f"{conv_shape[-2]} vs {ssm_layout.conv_dim_local}"
                 )
             state_specs = {
-                "conv": (msa.conv_states, msa.conv_states.shape[-2], msa.conv_states.shape[-1]),
-                "ssm": (
-                    msa.ssm_states,
-                    msa.ssm_states.shape[-3],
-                    msa.ssm_states.shape[-2] * msa.ssm_states.shape[-1],
+                "conv": (
+                    ssm_cache.conv_states,
+                    ssm_cache.conv_states.shape[-2],
+                    ssm_cache.conv_states.shape[-1],
+                ),
+                "recurrent": (
+                    ssm_cache.ssm_states,
+                    ssm_cache.ssm_states.shape[-3],
+                    ssm_cache.ssm_states.shape[-2] * ssm_cache.ssm_states.shape[-1],
                 ),
             }
             backend_factory = getattr(self._kv_transfer_agent, "new_registered_buffer", backend_cls)
             for state_kind, (memory_buffer, width, state_dim) in state_specs.items():
-                ssm_state_kind = "recurrent" if state_kind == "ssm" else state_kind
-                self._mamba_transfer_agents[state_kind] = backend_factory(
-                    agent_name=f"{role}-mamba-{state_kind}-rank{rank}",
+                self._ssm_transfer_agents[state_kind] = backend_factory(
+                    agent_name=f"{role}-ssm-{state_kind}-rank{rank}",
                     memory_buffer=memory_buffer,
-                    expected_num_blocks=msa.max_slots,
+                    expected_num_blocks=ssm_cache.max_slots,
                     heads_per_partition=width,
                     head_dim=state_dim,
                     tokens_per_block=1,
                     ssm_layout=ssm_layout,
-                    ssm_state_kind=ssm_state_kind,
+                    ssm_state_kind=state_kind,
                 )
-            self._mamba_peer_metas = {
+            self._ssm_peer_metas = {
                 state_kind: agent.export_meta()
-                for state_kind, agent in self._mamba_transfer_agents.items()
+                for state_kind, agent in self._ssm_transfer_agents.items()
             }
 
         # Shared-agent metadata covers every registered state buffer, so export
-        # it only after the optional Mamba buffers have been registered.
+        # it only after the optional SSM buffers have been registered.
         self._kv_peer_metas = self._kv_transfer_agent.export_meta()
         if torch.distributed.is_initialized() and tp_size > 1:
             gathered: list = [None] * tp_size
@@ -343,7 +344,7 @@ class InferenceStateHandoffMixin:
             self._kv_peer_metas = gathered
 
     def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
-        """Push a pinned hand-off's KV (and Mamba snapshots) to the decode
+        """Push a pinned hand-off's KV and SSM snapshots to the decode
         instance described by `decode_metas` (two-sided transports only).
 
         The decode posted its matching receives when SUBMIT_REQUEST_WITH_KV
@@ -357,25 +358,25 @@ class InferenceStateHandoffMixin:
             return
         kv_peer = {"tp_metas": list(decode_metas)}
         handles = [self._kv_transfer_agent.begin_push_blocks(kv_peer, block_ids)]
-        if self._mamba_transfer_agents:
+        if self._ssm_transfer_agents:
             # Reuse the exact slots advertised in the handoff metadata. The
-            # allocator can acquire more cached Mamba states between metadata
+            # allocator can acquire more cached SSM states between metadata
             # capture and SEND_KV; recomputing here would make the sender post
             # more NCCL operations than the decode peer posted receives for.
-            slots = self._pinned_handoff_mamba_slots.get(request_id, [])
+            slots = self._pinned_handoff_ssm_slots.get(request_id, [])
             if slots:
-                for state_kind, agent in self._mamba_transfer_agents.items():
+                for state_kind, agent in self._ssm_transfer_agents.items():
                     peer = {
                         "tp_metas": [
-                            e["mamba"][state_kind]
+                            e["ssm"][state_kind]
                             for e in decode_metas
-                            if isinstance(e, dict) and e.get("mamba")
+                            if isinstance(e, dict) and e.get("ssm")
                         ]
                     }
                     handles.append(agent.begin_push_blocks(peer, slots))
         self._pending_kv_pushes.append((request_id, handles))
         logging.info(
-            "DISAGG_PREFILL_PUSH request_id=%d blocks=%d mamba=%d",
+            "DISAGG_PREFILL_PUSH request_id=%d blocks=%d ssm=%d",
             request_id,
             len(block_ids),
             len(handles) - 1,
@@ -412,61 +413,55 @@ class InferenceStateHandoffMixin:
             raise RuntimeError("KV handoff requested before transfer setup")
         local_kv: Any = self._kv_peer_metas
 
-        local_mamba = None
-        local_mamba_slots = []
+        local_ssm = None
+        local_ssm_slots = []
         local_position_to_slot = {}
-        if self._mamba_transfer_agents:
-            msa = self.context.mamba_slot_allocator
+        if self._ssm_transfer_agents:
+            ssm_cache = self.context.mamba_slot_allocator
             positions = []
             slots = []
             for pos, block in enumerate(block_ids):
-                slot = msa.get_slot(int(block))
+                slot = ssm_cache.get_slot(int(block))
                 if slot >= 0:
                     positions.append(pos)
                     slots.append(int(slot))
-            local_mamba_slots = slots
+            local_ssm_slots = slots
             local_position_to_slot = dict(zip(positions, slots))
-            local_mamba = {
+            local_ssm = {
                 "positions": positions,
                 **{
                     state_kind: {**meta, "block_ids": slots}
-                    for state_kind, meta in self._mamba_peer_metas.items()
+                    for state_kind, meta in self._ssm_peer_metas.items()
                 },
             }
 
         tp_size = get_pg_size(self.pg_collection.tp)
         if tp_size > 1 and torch.distributed.is_initialized():
-            gathered_mamba: list = [None] * tp_size
+            gathered_ssm: list = [None] * tp_size
             torch.distributed.all_gather_object(
-                gathered_mamba, local_mamba, group=self.pg_collection.tp
+                gathered_ssm, local_ssm, group=self.pg_collection.tp
             )
-            present_mamba = [entry for entry in gathered_mamba if entry is not None]
-            if present_mamba:
-                if len(present_mamba) != tp_size:
-                    raise RuntimeError("Mamba handoff agents are not configured on every TP rank")
-                positions = _common_mamba_positions(present_mamba)
-                local_mamba = {
+            present_ssm = [entry for entry in gathered_ssm if entry is not None]
+            if present_ssm:
+                if len(present_ssm) != tp_size:
+                    raise RuntimeError("SSM handoff agents are not configured on every TP rank")
+                positions = _common_ssm_positions(present_ssm)
+                local_ssm = {
                     "positions": positions,
                     **{
                         state_kind: [
-                            _select_mamba_positions(
-                                entry[state_kind], entry["positions"], positions
-                            )
-                            for entry in present_mamba
+                            _select_ssm_positions(entry[state_kind], entry["positions"], positions)
+                            for entry in present_ssm
                         ]
-                        for state_kind in _MAMBA_STATE_KINDS
+                        for state_kind in _SSM_STATE_KINDS
                     },
                 }
             else:
-                local_mamba = None
+                local_ssm = None
 
         pp_size = get_pg_size(self.pg_collection.pp)
         if pp_size > 1 and torch.distributed.is_initialized():
-            local_entry = {
-                "kv_meta": local_kv,
-                "block_ids": list(block_ids),
-                "mamba_meta": local_mamba,
-            }
+            local_entry = {"kv_meta": local_kv, "block_ids": list(block_ids), "ssm_meta": local_ssm}
             gathered: list = [None] * pp_size
             torch.distributed.all_gather_object(gathered, local_entry, group=self.pg_collection.pp)
             kv_meta: Any = {
@@ -475,67 +470,65 @@ class InferenceStateHandoffMixin:
                 ]
             }
             top_block_ids: Any = gathered[0]["block_ids"]
-            mamba_stages = [
-                entry["mamba_meta"] for entry in gathered if entry["mamba_meta"] is not None
-            ]
-            if mamba_stages:
-                positions = _executable_mamba_position(
-                    _common_mamba_positions(mamba_stages),
+            ssm_stages = [entry["ssm_meta"] for entry in gathered if entry["ssm_meta"] is not None]
+            if ssm_stages:
+                positions = _executable_ssm_position(
+                    _common_ssm_positions(ssm_stages),
                     len(request.prompt_tokens),
                     self.context.block_size_tokens,
                 )
-                mamba_meta = {
+                ssm_meta = {
                     "positions": positions,
                     **{
                         state_kind: {
                             "pp_metas": [
                                 {
-                                    "tp_metas": _select_mamba_state_meta(
+                                    "tp_metas": _select_ssm_state_meta(
                                         stage[state_kind], stage["positions"], positions
                                     )
                                 }
-                                for stage in mamba_stages
+                                for stage in ssm_stages
                             ]
                         }
-                        for state_kind in _MAMBA_STATE_KINDS
+                        for state_kind in _SSM_STATE_KINDS
                     },
                 }
             else:
-                mamba_meta = None
+                ssm_meta = None
         else:
             kv_meta = local_kv
             top_block_ids = block_ids
-            mamba_meta = local_mamba
-            if mamba_meta is not None:
-                source_positions = mamba_meta["positions"]
-                positions = _executable_mamba_position(
+            ssm_meta = local_ssm
+            if ssm_meta is not None:
+                source_positions = ssm_meta["positions"]
+                positions = _executable_ssm_position(
                     source_positions, len(request.prompt_tokens), self.context.block_size_tokens
                 )
-                mamba_meta = {
+                ssm_meta = {
                     "positions": positions,
                     **{
-                        state_kind: _select_mamba_state_meta(
-                            mamba_meta[state_kind], source_positions, positions
+                        state_kind: _select_ssm_state_meta(
+                            ssm_meta[state_kind], source_positions, positions
                         )
-                        for state_kind in _MAMBA_STATE_KINDS
+                        for state_kind in _SSM_STATE_KINDS
                     },
                 }
 
-        if mamba_meta is not None:
-            local_mamba_slots = [
-                local_position_to_slot[position] for position in mamba_meta["positions"]
+        if ssm_meta is not None:
+            local_ssm_slots = [
+                local_position_to_slot[position] for position in ssm_meta["positions"]
             ]
-        self._pinned_handoff_mamba_slots[rid] = local_mamba_slots
+        self._pinned_handoff_ssm_slots[rid] = local_ssm_slots
 
         if isinstance(kv_meta, list):
             kv_meta = {"tp_metas": kv_meta}
         else:
             # TP=1 caches one static metadata dictionary for the engine. Keep
-            # request-specific Mamba metadata out of that shared object so a
+            # request-specific SSM metadata out of that shared object so a
             # later handoff cannot overwrite an earlier request's positions.
             kv_meta = dict(kv_meta)
-        if mamba_meta is not None:
-            kv_meta["mamba"] = mamba_meta
+        if ssm_meta is not None:
+            kv_meta["ssm"] = ssm_meta
 
         request.disaggregated_params = {
             "request_id": rid,
@@ -543,16 +536,16 @@ class InferenceStateHandoffMixin:
             "kv_meta": kv_meta,
         }
         logging.info(
-            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d mamba_blocks=%d",
+            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d ssm_blocks=%d",
             rid,
             len(block_ids),
-            len(mamba_meta["positions"]) if mamba_meta is not None else 0,
+            len(ssm_meta["positions"]) if ssm_meta is not None else 0,
         )
 
     def release_handoff_blocks(self, request_id: int) -> None:
         """Release blocks pinned by a previous do_kv_handoff completion."""
         block_ids = self._pinned_handoff_blocks.pop(request_id, None)
-        self._pinned_handoff_mamba_slots.pop(request_id, None)
+        self._pinned_handoff_ssm_slots.pop(request_id, None)
         if not block_ids:
             return
         released = self._release_pinned_handoff_blocks(block_ids)
@@ -583,12 +576,12 @@ class InferenceStateHandoffMixin:
                 "decode engine; the prefill-skip path uses the prefix-cache match logic."
             )
 
-        mamba_meta = kv_meta.get("mamba") if isinstance(kv_meta, dict) else None
-        local_has_mamba = bool(self._mamba_transfer_agents)
-        if local_has_mamba and mamba_meta is None:
+        ssm_meta = kv_meta.get("ssm") if isinstance(kv_meta, dict) else None
+        local_has_ssm = bool(self._ssm_transfer_agents)
+        if local_has_ssm and ssm_meta is None:
             raise RuntimeError(
-                "Decode has Mamba state transfer agents but the handoff contains no "
-                "Mamba metadata; prefill and decode must use the same hybrid model"
+                "Decode has SSM state transfer agents but the handoff contains no "
+                "SSM metadata; prefill and decode must use the same hybrid model"
             )
         if self._kv_transfer_agent is None:
             raise RuntimeError("KV handoff received without a transfer backend")
@@ -660,53 +653,53 @@ class InferenceStateHandoffMixin:
         owned_blocks_tensor = torch.tensor(local_blocks, dtype=torch.int32, device="cpu")
 
         handle = None
-        mamba_import = None
+        ssm_import = None
         capacity_error = None
         try:
             transfer_meta, transfer_src_blocks = drop_transfer_prefix_blocks(
                 handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
             )
-            mamba_meta = handoff.kv_meta.get("mamba") if isinstance(handoff.kv_meta, dict) else None
-            if mamba_meta and self._mamba_transfer_agents:
+            ssm_meta = handoff.kv_meta.get("ssm") if isinstance(handoff.kv_meta, dict) else None
+            if ssm_meta and self._ssm_transfer_agents:
                 try:
-                    mamba_import = self._reserve_mamba_handoff_import(
-                        mamba_meta, local_blocks, handoff.hashes
+                    ssm_import = self._reserve_ssm_handoff_import(
+                        ssm_meta, local_blocks, handoff.hashes
                     )
                 except MambaSlotCapacityError as exc:
                     capacity_error = exc
 
-            capacity_error = self._agree_mamba_handoff_capacity(mamba_meta, capacity_error)
+            capacity_error = self._agree_ssm_handoff_capacity(ssm_meta, capacity_error)
             if capacity_error is not None:
-                if mamba_import is not None:
-                    msa = self.context.mamba_slot_allocator
-                    for block_id in mamba_import.target_blocks:
-                        msa.invalidate_block(block_id)
+                if ssm_import is not None:
+                    ssm_cache = self.context.mamba_slot_allocator
+                    for block_id in ssm_import.target_blocks:
+                        ssm_cache.invalidate_block(block_id)
                 allocator.release_memory_blocks(owned_blocks_tensor)
                 return False, capacity_error
 
             handle = self._kv_transfer_agent.begin_pull_blocks(
                 transfer_meta, transfer_src_blocks, imported_blocks
             )
-            if mamba_import is not None:
-                self._start_mamba_handoff_import(handoff.request_id, mamba_meta, mamba_import)
+            if ssm_import is not None:
+                self._start_ssm_handoff_import(handoff.request_id, ssm_meta, ssm_import)
         except Exception as exc:
             safe_to_release = getattr(exc, "transfer_destinations_safe", True)
             handles = [handle]
-            if mamba_import is not None:
-                handles.extend(mamba_import.handles.values())
+            if ssm_import is not None:
+                handles.extend(ssm_import.handles.values())
             safe_to_release &= self._wait_for_transfer_handles(*handles)
             if safe_to_release:
                 allocator.release_memory_blocks(owned_blocks_tensor)
-                if mamba_import is not None:
-                    msa = self.context.mamba_slot_allocator
-                    for block_id in mamba_import.target_blocks:
-                        msa.invalidate_block(block_id)
+                if ssm_import is not None:
+                    ssm_cache = self.context.mamba_slot_allocator
+                    for block_id in ssm_import.target_blocks:
+                        ssm_cache.invalidate_block(block_id)
             else:
                 logging.error(
                     "Quarantining cache storage after a timed-out handoff submission: "
-                    "KV blocks=%s, Mamba slots=%s",
+                    "KV blocks=%s, SSM slots=%s",
                     local_blocks,
-                    mamba_import.local_slots if mamba_import is not None else [],
+                    ssm_import.local_slots if ssm_import is not None else [],
                 )
             raise
 
@@ -720,7 +713,7 @@ class InferenceStateHandoffMixin:
             hash_registration_start=len(cached_blocks),
             handle=handle,
             future=handoff.future,
-            mamba=mamba_import,
+            ssm=ssm_import,
         )
         self._pending_kv_imports.append(pending)
         logging.debug(
@@ -752,12 +745,12 @@ class InferenceStateHandoffMixin:
             allocator.update_timestamps(block_tensor)
         return cached_blocks
 
-    def _agree_mamba_handoff_capacity(
-        self, mamba_meta: Optional[dict], local_error: Optional[MambaSlotCapacityError]
+    def _agree_ssm_handoff_capacity(
+        self, ssm_meta: Optional[dict], local_error: Optional[MambaSlotCapacityError]
     ) -> Optional[MambaSlotCapacityError]:
         """Agree on decode capacity before any model-parallel rank starts transport."""
 
-        positions = mamba_meta.get("positions", []) if isinstance(mamba_meta, dict) else []
+        positions = ssm_meta.get("positions", []) if isinstance(ssm_meta, dict) else []
         mp_group = getattr(self.pg_collection, "mp", None)
         if (
             not positions
@@ -803,8 +796,8 @@ class InferenceStateHandoffMixin:
     @staticmethod
     def _pending_transfer_handles(pending: PendingKvImport) -> list:
         handles = [pending.handle]
-        if pending.mamba is not None:
-            handles.extend(pending.mamba.handles.values())
+        if pending.ssm is not None:
+            handles.extend(pending.ssm.handles.values())
         return [handle for handle in handles if handle is not None]
 
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
@@ -828,8 +821,8 @@ class InferenceStateHandoffMixin:
                 local_blocks[start:end], pending.hashes[start:end], parent_hashes=parent_hashes
             )
 
-        if pending.mamba is not None:
-            self._complete_mamba_handoff_import(pending.request_id, pending.mamba, pending.hashes)
+        if pending.ssm is not None:
+            self._complete_ssm_handoff_import(pending.request_id, pending.ssm, pending.hashes)
 
         logging.debug(
             "DISAGG_DECODE_IMPORT request_id=%d prompt_tokens=%d "
@@ -886,11 +879,11 @@ class InferenceStateHandoffMixin:
         if pending.local_blocks and not owner_released:
             block_tensor = torch.tensor(pending.local_blocks, dtype=torch.int32, device="cpu")
             self.context.kv_block_allocator.release_memory_blocks(block_tensor)
-        if pending.mamba is not None:
-            msa = self.context.mamba_slot_allocator
-            if msa is not None:
-                for block_id in pending.mamba.target_blocks:
-                    msa.invalidate_block(int(block_id))
+        if pending.ssm is not None:
+            ssm_cache = self.context.mamba_slot_allocator
+            if ssm_cache is not None:
+                for block_id in pending.ssm.target_blocks:
+                    ssm_cache.invalidate_block(int(block_id))
 
     @staticmethod
     def _wait_for_transfer_handles(*handles) -> bool:
@@ -983,66 +976,66 @@ class InferenceStateHandoffMixin:
             )
         return ready
 
-    def _reserve_mamba_handoff_import(
-        self, mamba_meta: dict, local_blocks: list, hashes: list
-    ) -> Optional[PendingMambaImport]:
+    def _reserve_ssm_handoff_import(
+        self, ssm_meta: dict, local_blocks: list, hashes: list
+    ) -> Optional[PendingSSMImport]:
         """Atomically reserve destination slots without starting a transfer."""
 
-        positions = [int(pos) for pos in mamba_meta.get("positions", [])]
+        positions = [int(pos) for pos in ssm_meta.get("positions", [])]
         if not positions:
             return None
-        if not self._mamba_transfer_agents:
+        if not self._ssm_transfer_agents:
             raise RuntimeError(
-                "Received Mamba handoff state but this decode engine has no "
-                "Mamba transfer agents. Ensure it runs a hybrid model with "
+                "Received SSM handoff state but this decode engine has no "
+                "SSM transfer agents. Ensure it runs a hybrid model with "
                 "--inference-dynamic-batching-prefix-caching-mamba-gb set and "
                 "KV transfer enabled."
             )
-        msa = self.context.mamba_slot_allocator
-        if msa is None:
+        ssm_cache = self.context.mamba_slot_allocator
+        if ssm_cache is None:
             raise RuntimeError(
-                "Mamba handoff requires the decode engine's Mamba state cache; "
+                "SSM handoff requires the decode engine's recurrent state cache; "
                 "pass --inference-dynamic-batching-prefix-caching-mamba-gb."
             )
 
         if any(pos < 0 or pos >= len(local_blocks) or pos >= len(hashes) for pos in positions):
             raise ValueError(
-                f"Mamba handoff positions are outside the imported KV blocks: {positions}"
+                f"SSM handoff positions are outside the imported KV blocks: {positions}"
             )
         target_blocks = [int(local_blocks[p]) for p in positions]
-        local_slots = msa.allocate_slots_batch(target_blocks)
-        return PendingMambaImport(
+        local_slots = ssm_cache.allocate_slots_batch(target_blocks)
+        return PendingSSMImport(
             handles={}, local_slots=local_slots, target_blocks=target_blocks, positions=positions
         )
 
-    def _start_mamba_handoff_import(
-        self, request_id: int, mamba_meta: dict, pending: PendingMambaImport
+    def _start_ssm_handoff_import(
+        self, request_id: int, ssm_meta: dict, pending: PendingSSMImport
     ) -> None:
         """Post transfers into slots already reserved for one handoff."""
 
         handles = {}
         pending.handles = handles
-        for state_kind, agent in self._mamba_transfer_agents.items():
+        for state_kind, agent in self._ssm_transfer_agents.items():
             handles[state_kind] = agent.begin_pull_blocks(
-                mamba_meta[state_kind], [], pending.local_slots
+                ssm_meta[state_kind], [], pending.local_slots
             )
         logging.debug(
-            "DISAGG_DECODE_MAMBA_IMPORT_SUBMIT request_id=%d mamba_blocks=%d",
+            "DISAGG_DECODE_SSM_IMPORT_SUBMIT request_id=%d ssm_blocks=%d",
             request_id,
             len(pending.target_blocks),
         )
 
-    def _complete_mamba_handoff_import(
-        self, request_id: int, pending: PendingMambaImport, hashes: list
+    def _complete_ssm_handoff_import(
+        self, request_id: int, pending: PendingSSMImport, hashes: list
     ) -> None:
-        msa = self.context.mamba_slot_allocator
-        if msa is None:
-            raise RuntimeError("Mamba handoff completed but the decode cache is unavailable.")
-        msa.register_block_hashes_batch(
+        ssm_cache = self.context.mamba_slot_allocator
+        if ssm_cache is None:
+            raise RuntimeError("SSM handoff completed but the decode cache is unavailable.")
+        ssm_cache.register_block_hashes_batch(
             pending.target_blocks, [hashes[p] for p in pending.positions]
         )
         logging.debug(
-            "DISAGG_DECODE_MAMBA_IMPORT request_id=%d mamba_blocks=%d",
+            "DISAGG_DECODE_SSM_IMPORT request_id=%d ssm_blocks=%d",
             request_id,
             len(pending.target_blocks),
         )

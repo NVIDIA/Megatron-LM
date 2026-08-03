@@ -112,7 +112,7 @@ def test_nixl_registered_buffers_share_agent_and_peer_cache(monkeypatch):
         "prefill", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
     )
     sibling = backend.new_registered_buffer(
-        agent_name="prefill-mamba-conv",
+        agent_name="prefill-ssm-conv",
         memory_buffer=torch.zeros(2, 4, 5, dtype=torch.float32),
         expected_num_blocks=4,
     )
