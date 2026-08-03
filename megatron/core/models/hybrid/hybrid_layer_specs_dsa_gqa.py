@@ -22,14 +22,12 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec as _base_stack_spec
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    DSAttention,
-    DSAttentionSubmodules,
-)
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAttentionSubmodules
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGQAIndexer,
     DSGQAIndexerSubmodules,
     DSGQASelfAttention,
+    DSGQAttention,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import (
@@ -50,7 +48,7 @@ dsa_gqa_layer = ModuleSpec(
             submodules=SelfAttentionSubmodules(
                 linear_qkv=TELayerNormColumnParallelLinear,  # folds input-LN + GQA QKV
                 core_attention=ModuleSpec(
-                    module=DSAttention,
+                    module=DSGQAttention,
                     submodules=DSAttentionSubmodules(
                         indexer=ModuleSpec(
                             module=DSGQAIndexer,

@@ -40,6 +40,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant import dsa_layout
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
+    DSAttention,
     rotate_activation,
 )
 from megatron.core.transformer.module import MegatronModule
@@ -251,35 +252,43 @@ class DSGQAIndexer(DSAIndexer):
         return q, k, weights
 
 
+class DSGQAttention(DSAttention):
+    """DSA core that supplies its own ``x``/``qr`` from stashed hidden states.
+
+    Main's base ``Attention.forward`` calls the core attention inline as
+    ``core_attention(query, key, value, attention_mask, ...)`` — it never passes
+    the DSA ``x``/``qr`` (only MLA's overridden forward does). Rather than
+    reimplement that forward, this subclass makes ``x``/``qr`` optional and fills
+    them from ``_dsa_hidden_states`` (stashed by :class:`DSGQASelfAttention` during
+    QKV projection) when the caller omits them. Works for both the static and
+    activation-checkpointed core-call paths.
+    """
+
+    def forward(self, query, key, value, attention_mask, x=None, qr=None, **kwargs):
+        """Fill x/qr from stashed hidden states when the base forward omits them."""
+        if x is None:
+            x = getattr(self, "_dsa_hidden_states", None)
+        if qr is None:
+            qr = x  # GQA indexer reads x and ignores qr; a real tensor is enough.
+        if x is None:
+            raise RuntimeError(
+                "DSGQAttention has no hidden states to use as DSA x/qr. Expected "
+                "DSGQASelfAttention to stash them via get_query_key_value_tensors."
+            )
+        return super().forward(query, key, value, attention_mask, x, qr, **kwargs)
+
+
 class DSGQASelfAttention(SelfAttention):
     """GQA self-attention that feeds the DSA core its required ``x``/``qr`` inputs.
 
     A plain ``SelfAttention`` never supplies the DSA core with hidden states; only
-    MLA's overridden forward does (via ``core_attention_extra_kwargs``). This
-    subclass stashes ``hidden_states`` during QKV projection and injects
-    ``x = qr = hidden_states`` into the core-attention call when the core requests
-    DSA inputs (``requires_dsa_inputs``). The GQA indexer reads ``x`` and ignores
-    ``qr``.
-
-    Note: activation-recompute of the core attention (the ``_checkpointed_*`` path)
-    is not wired here yet — run without ``--recompute-*`` on the DSA layers for the
-    first cut.
+    MLA's overridden forward does. This subclass stashes ``hidden_states`` on the
+    DSA core during QKV projection so :class:`DSGQAttention` can supply them as
+    ``x``/``qr``. Pair it with a :class:`DSGQAttention` core.
     """
 
     def get_query_key_value_tensors(self, hidden_states, *args, **kwargs):
-        """Stash hidden states so ``_run_core_attention`` can pass them to the DSA core."""
-        self._dsa_hidden_states = hidden_states
-        return super().get_query_key_value_tensors(hidden_states, *args, **kwargs)
-
-    def _run_core_attention(self, query, key, value, attention_mask, **extra_kwargs):
-        """Inject DSA ``x``/``qr`` inputs before dispatching to the core attention."""
+        """Stash hidden states on the DSA core for use as its x/qr inputs."""
         if getattr(self.core_attention, "requires_dsa_inputs", False):
-            hidden = getattr(self, "_dsa_hidden_states", None)
-            if hidden is None:
-                raise RuntimeError(
-                    "DSGQASelfAttention expected hidden states to be stashed by "
-                    "get_query_key_value_tensors before _run_core_attention."
-                )
-            extra_kwargs.setdefault("x", hidden)
-            extra_kwargs.setdefault("qr", hidden)
-        return super()._run_core_attention(query, key, value, attention_mask, **extra_kwargs)
+            self.core_attention._dsa_hidden_states = hidden_states
+        return super().get_query_key_value_tensors(hidden_states, *args, **kwargs)
