@@ -2931,6 +2931,155 @@ hook has answered a different question than the one asked.
 > instrumenting the framework to re-derive what the trace already recorded cost three
 > allocation slots here.
 
+## Session 19 (2026-08-03) — the QKV copy, named by arithmetic
+
+`COPY-ID-S18` left one kernel unattributed after four attempts: a 2.8 us
+`elementwise_kernel<128,4>` between the QKV GEMM and the q/k norm, once per layer per
+step, QKV-sized. It is the `reshape`, and it is provable on a laptop in ten seconds with
+no GPU, no cluster, and no profiler:
+
+```
+q slice   [sq, b, ng, (np/ng) * hn]   strides (.., .., 1280, 1)
+q reshape [sq, b, np, hn]             strides (.., .., 128, 1)      COPY MATERIALIZED
+```
+
+Megatron's QKV projection writes `[sq, b, ng, (np/ng + 2) * hn]` -- each group's k and v
+head sit *between* consecutive groups' q heads. Merging the group axis with the head axis
+therefore requires the group stride to equal `(np/ng) * hn`; it equals
+`(np/ng + 2) * hn`. For Qwen3-30B that is **1024 required against 1280 actual**, so
+`Tensor.reshape` cannot return a view and silently copies the whole query instead.
+
+### Why four attempts missed it
+
+All four tested *the split*: `SplitAlongDim` against `torch.split` (`u1qkvsplit`, exactly
+neutral), then three `copy_trace` arms. The neutral split result was read as "the copy is
+elsewhere", when it was itself the answer -- both split branches feed the same reshape, so
+of course they measured the same. The one line never questioned was the one carrying a
+comment that explained it as a shape change.
+
+> **Lesson.** A layout claim is decidable from strides alone, and `reshape` reports a copy
+> as silently as it reports a view. When a profile shows a copy the size of a known
+> tensor, walk the *strides* of every reshape/view/permute between that tensor's producer
+> and its consumer before instrumenting anything. Four GPU sessions guessed at this; one
+> CPU-only `python3 -c` settled it.
+
+### The fix is free because the norm already pays for the write
+
+The fused q/k norm allocates its output anyway, so it can repack on the way through: read
+the query with the two strides the grouped layout needs (one per group, one per head
+inside a group) and write the contiguous `[sq, b, np, hn]` result the rest of attention
+wants. Same values in the same order, so the result is **bit-identical** -- the right
+acceptance bar here, because a head-permutation bug would produce individually plausible
+values in every head and sail past a tolerance check.
+
+| | reshape + norm | grouped norm |
+|---|---:|---:|
+| kernel, 256 tokens (graph replay) | 12.30 us | **8.22 us** |
+| launches per layer | 2 | **1** |
+| per step, 48 layers | — | **0.196 ms saved** |
+
+### QWEN-043 — grouped-read q/k norm: **+1.5%**
+
+Four alternating arms on one node, so node drift shows up as base-to-base spread:
+
+| Arm | Gates | Steady-state tok/s |
+|---|---|---:|
+| `h2base` | standing set | 29,828 |
+| `h3grp` | `+MCORE_GROUPED_QK_NORM=1` | 30,312 |
+| `h4base` | standing set | 29,858 |
+| `h5grp` | `+MCORE_GROUPED_QK_NORM=1` | 30,284 |
+
+Base-to-base spread **0.10%**, so the effect is ~15x the noise. Pooled
+**29,845 -> 30,298 tok/s (+1.52%)**, i.e. 8.58 -> 8.45 ms/step -- 0.13 ms of the
+microbenchmark's 0.196 ms lands end-to-end. Generated text is identical character for
+character, as bit-exactness requires. Shipped behind `MCORE_GROUPED_QK_NORM=1`; requires
+the fused q/k norm, and declines when the query needs the tensor-parallel head slice.
+
+**Status: 30,298 against vLLM's 33,994.5 = 89.1% of vLLM** (from 87.9% at session start,
+65.9% at the campaign's start). Remaining gap 0.90 ms/step.
+
+
+### The trace confirms it, and nothing else moved
+
+Diffing the fresh trace against the previous one, same anchor and window, is the cleanest
+attribution in this campaign:
+
+| bucket | before | after | delta |
+|---|---:|---:|---:|
+| elementwise / copy | 0.164 ms, 59 launches | **0.042 ms, 11 launches** | **-0.122 ms, -48** |
+| every other bucket | — | — | within +/-0.012 ms, 0 launches |
+| TOTAL | 5.923 ms, 963 | 5.804 ms, 916 | -0.120 ms, -48 |
+
+Exactly one launch per layer left the copy bucket and nothing else changed, which also
+re-validates the window: the buckets the change cannot touch held still, the check
+`union_window.py` demands after the 27%-seqlen-skew incident. The 0.122 ms of device time
+matches the 0.13 ms measured end-to-end.
+
+### The last mcore-only bucket, attributed
+
+`splitKreduce` is the one category vLLM has none of (82 launches, 0.173 ms/step). Its trace
+neighbours name both parents:
+
+| n/step | parent GEMM | successor |
+|---:|---|---|
+| 48 | `nvjet_..._2cta_h_bz_splitK_TNT` / `..._4x1_v_bz_splitK_TNN` | `_softmax_topk_kernel` |
+| 34 | `nvjet_..._2cta_h_bz_splitK_TNT` | `_fused_add_rmsnorm_kernel` |
+
+So it is the **router GEMM** (one per layer, exactly 48) and the **attention output
+projection** (34 of 48 layers; the rest pick a non-splitK algorithm). The router case is
+not a mis-tuned heuristic: at M=256, K=2048, N=128 the output is a couple of tiles, so
+splitting K is the only way cuBLASLt gets parallelism, and the reduce is the price of it.
+That reframes the target -- not "stop cuBLASLt from splitting K", but "fuse the router",
+which would collapse GEMM + splitK reduce + softmax-topk + padding mask (4 launches/layer,
+~192 total) into one. A fused router must beat GEMM+reduce on its own terms, so it needs a
+microbenchmark before any integration: 256 CTAs each reading the whole 512 KB weight is
+128 MB of L2 traffic, and blocking tokens instead leaves 4 CTAs on 148 SMs.
+
+### QWEN-044 — eight rows per CTA in the q/k norm: **+0.35%**
+
+The grouped norm moves ~4.5 MB in 8.22 us -- about 570 GB/s on a GB200, because one CTA
+per 128-wide row means 9,216 single-warp CTAs. A rows x warps sweep, keeping only
+bit-exact candidates:
+
+| rows/CTA | warps | us | GB/s | vs 1x1 |
+|---:|---:|---:|---:|---:|
+| 1 | 1 | 8.21 | 574 | 1.00x |
+| 2 | 2 | 6.17 | 765 | 1.33x |
+| 4 | 4 | 6.15 | 767 | 1.34x |
+| **8** | **8** | **4.12** | **1146** | **2.00x** |
+
+In-tree the same shape measures **6.16 us**, not 4.12 -- a 2 us gap between the harness
+kernel and the shipped one at identical rows/warps that is **still unexplained**. Making
+the output row stride a constexpr was the obvious suspect (the harness had it as one) and
+did not move the number. Open item; there is another ~0.1 ms/step behind it.
+
+End-to-end, both arms from the same file so the launch shape is the only variable:
+1x1 controls **30,341 / 30,399** against 8x8 **30,482** tok/s, i.e. **+0.35%** on a
+control-to-control spread of 0.19%. Note the microbenchmark predicted 1.17%
+(2.06 us x 48 layers on an 8.44 ms step) and a third of that landed -- a reminder that a
+kernel-level win on a non-critical-path kernel is an upper bound, not a forecast.
+
+### Session 19 status
+
+| | tok/s | ms/step | vs vLLM |
+|---|---:|---:|---:|
+| vLLM DP4+EP (`VLLM-BASELINE`) | 33,994.5 | 7.53 | — |
+| **mcore, current best** (`hftune`) | **30,482** | **8.40** | **89.7%** |
+| mcore at session-19 start (`y2pdl`) | 29,898 | 8.56 | 87.9% |
+| mcore at session-2 start | 22,398.9 | 11.71 | 65.9% |
+
+Session 19: **+1.95%** from two changes to one kernel, both bit-exact. Remaining gap
+0.87 ms/step.
+
+**Where the remaining gap is not.** Per-launch, mcore is now at or better than vLLM in
+every functional bucket, including attention and the expert GEMM. The residue is
+launch count (916 against 810) and packing: the overlap ratio is 1.008x against vLLM's
+1.050x. And the >100 us gap band is *not* the lever it looks like -- mcore shows
+0.893 ms/step there against vLLM's 2.727 ms/step in its own trace, so that band is
+dominated by profiler-inflated host work on both sides and cannot be compared across
+traces captured with different `--cuda-graph-trace` settings.
+
+
 ## Optimization rules
 
 1. Profile and classify before proposing a code change.
