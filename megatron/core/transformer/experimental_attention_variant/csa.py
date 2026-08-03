@@ -2636,6 +2636,9 @@ class CompressedSparseAttention(MegatronModule):
                     and cp_size > 1
                     and max_seqlen_q >= (self.config.dsa_cp_balance_min_seqlen or 0)
                 )
+                # Layout precondition (contiguous) is enforced module-wide above:
+                # CompressedSparseAttention raises for any CP run whose
+                # PackedSeqParams.cp_partition_mode is not "contiguous".
 
                 nvtx_range_push("dsv4_cp_indexer_k_compressor")
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
