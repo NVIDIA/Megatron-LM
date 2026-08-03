@@ -2695,6 +2695,46 @@ Combined with QWEN-014 (flashinfer cutlass, 0.921×) and QWEN-010 (torch grouped
 and none beats the shipping Triton path.** The candidate list above should be read as: item 1
 requires w8a8 or nothing; items 2-4 are the only cheap ones left.
 
+### QWEN-041 — Blackwell-native decode attention via flashinfer trtllm-gen: **+2.61%**
+
+| arm | gates on top of standing set (incl. `MCORE_NVLS_RS_BF16=1`) | tok/s | vs control |
+| --- | --- | --- | --- |
+| x1base | control (FA2 decode) | 29,043.8 | — |
+| **x2fi** | **`MCORE_FLASHINFER_DECODE=1`** | **29,802.9** | **+2.61%** |
+
+`GAP-S18` put attention 0.409 ms/step behind vLLM at an *identical* launch count, which
+rules out anything Megatron does around the call and points at the kernel generation:
+Megatron's decode runs FA2's `flash_attn_with_kvcache`, whose kernels predate Blackwell,
+while vLLM reaches `fmhaSm100f` through flashinfer. flashinfer 0.6.14 turned out to be
+**already installed** in the same venv as flash-attn, so this needed no new dependency.
+
+Measured in isolation first (`dev/moe_fused/harness_attn.py`), at B=256, 32 q heads,
+4 kv heads, D=128, under graph replay so the number is device time and not Python:
+
+| KV len | FA2 | trtllm-gen | delta |
+| --- | --- | --- | --- |
+| 512 | 59.6 us | 45.1 us | −24.3% |
+| 1024 | 105.8 us | 80.7 us | −23.7% |
+| 2048 | 199.3 us | 151.9 us | −23.8% |
+
+A flat ~24% across the range, with outputs matching FA2 to bf16 tolerance (rel ~3e-3).
+Two properties made the integration small: with `kv_layout="NHD"` the kernel takes
+**exactly the paged layout Megatron already has**, and unlike flashinfer's wrapper APIs
+the trtllm-gen entry point needs no host-side `plan()`, so it captures in the decode
+graph. Page size is irrelevant to it (256/128/64 all within 0.1 us), so Megatron's
+256-token pages stay -- and FA2 is the stricter of the two, *requiring* pages be a
+multiple of 256.
+
+The e2e gain (+2.61%) is smaller than the kernel gain (24% of a 1.36 ms bucket would be
+0.33 ms of an 8.8 ms step, or 3.8%) because the removed device time partly un-hides host
+work, the same ~68% conversion `LAUNCH-VS-WORK-S17` measured for the add-norm fusion.
+
+> **Lesson.** The gap said "attention, same launch count, more time", which reads as *our
+> kernel is the wrong generation for this GPU* -- and the right kernel was already sitting
+> in the venv. Before treating a kernel-quality gap as a porting project, check what the
+> reference implementation calls and whether it is installed: two sessions of FA2-vs-FA4
+> flag flipping never left the flash-attn package, where the answer was not.
+
 ### QWEN-040 — reduce the MoE combine in bf16, not fp32: **+2.37%**
 
 | arm | gates on top of standing set | tok/s | vs control |
