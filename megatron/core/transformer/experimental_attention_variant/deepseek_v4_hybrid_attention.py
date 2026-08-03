@@ -2,7 +2,7 @@
 
 
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 from typing import Callable, NoReturn, Optional, Union
 
@@ -207,9 +207,6 @@ class DSv4HybridAttention(Attention):
                 dtype=self.config.params_dtype,
             )
             self.config.init_method(linear_o_group_proj)
-            linear_o_group_proj = linear_o_group_proj.view(
-                self.o_local_groups, self.config.o_lora_rank, group_proj_in_size
-            )
             self.linear_o_group_proj = torch.nn.Parameter(linear_o_group_proj)
         else:
             self.linear_o_group_proj = build_module(
@@ -227,7 +224,7 @@ class DSv4HybridAttention(Attention):
                 ),
                 name=(name + ".linear_o_group_proj") if name is not None else None,
             )
-        self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
+            self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
 
@@ -270,11 +267,6 @@ class DSv4HybridAttention(Attention):
             return self.linear_o_group_proj.weight
         return self.linear_o_group_proj
 
-    def _linear_o_group_proj_runtime_key(self, prefix: str) -> str:
-        """State-dict key used by the initialized runtime implementation."""
-        key = f"{prefix}linear_o_group_proj"
-        return f"{key}.weight" if self._uses_te_batched_linear else key
-
     @property
     def _linear_o_group_proj_checkpoint_shape(self) -> tuple[int, int]:
         """Legacy 2D checkpoint shape for the grouped output projection."""
@@ -286,100 +278,79 @@ class DSv4HybridAttention(Attention):
     def _linear_o_group_proj_state_dict_hook(
         self, module, state_dict, prefix, local_metadata
     ) -> None:
-        """Keep the grouped output projection in its legacy 2D checkpoint layout."""
+        """Serialize the TE grouped output projection in its legacy 2D layout."""
         assert module is self
         checkpoint_key = f"{prefix}linear_o_group_proj"
-        runtime_key = self._linear_o_group_proj_runtime_key(prefix)
+        runtime_key = f"{checkpoint_key}.weight"
         state_dict[checkpoint_key] = state_dict.pop(runtime_key).reshape(
             self._linear_o_group_proj_checkpoint_shape
         )
-        if self._uses_te_batched_linear:
-            state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
+        state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        """Accept both legacy 2D and runtime 3D grouped projection weights."""
-        checkpoint_key = f"{prefix}linear_o_group_proj"
-        runtime_key = self._linear_o_group_proj_runtime_key(prefix)
-        if checkpoint_key != runtime_key and checkpoint_key in state_dict:
-            checkpoint_weight = state_dict.pop(checkpoint_key)
-            state_dict.setdefault(runtime_key, checkpoint_weight)
-        checkpoint_weight = state_dict.get(runtime_key)
-        if (
-            isinstance(checkpoint_weight, torch.Tensor)
-            and tuple(checkpoint_weight.shape) == self._linear_o_group_proj_checkpoint_shape
-        ):
-            state_dict[runtime_key] = checkpoint_weight.reshape(
-                self._linear_o_group_proj_weight.shape
-            )
+        """Map legacy 2D grouped projection weights into TE's 3D layout."""
         if self._uses_te_batched_linear:
+            checkpoint_key = f"{prefix}linear_o_group_proj"
+            runtime_key = f"{checkpoint_key}.weight"
+            if checkpoint_key in state_dict:
+                checkpoint_weight = state_dict.pop(checkpoint_key)
+                state_dict.setdefault(runtime_key, checkpoint_weight)
+            checkpoint_weight = state_dict.get(runtime_key)
+            if (
+                isinstance(checkpoint_weight, torch.Tensor)
+                and tuple(checkpoint_weight.shape) == self._linear_o_group_proj_checkpoint_shape
+            ):
+                state_dict[runtime_key] = checkpoint_weight.reshape(
+                    self._linear_o_group_proj_weight.shape
+                )
             state_dict.setdefault(f"{prefix}linear_o_group_proj._extra_state", None)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
-        """Preserve the legacy 2D layout in distributed checkpoints."""
+        """Map TE's 3D grouped weight to the legacy 2D dist-checkpoint layout."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        if not self._uses_te_batched_linear:
+            return sharded_state_dict
+
         checkpoint_key = f"{prefix}linear_o_group_proj"
-        runtime_key = self._linear_o_group_proj_runtime_key(prefix)
+        runtime_key = f"{checkpoint_key}.weight"
         runtime_sharded_weight = sharded_state_dict.pop(runtime_key)
-        if self._uses_te_batched_linear:
-            sharded_state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
+        sharded_state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
         assert isinstance(runtime_sharded_weight, ShardedTensor)
         runtime_shape = runtime_sharded_weight.local_shape
         assert len(runtime_shape) == 3, runtime_shape
-
-        prepend_axis_num = runtime_sharded_weight.prepend_axis_num
-        global_prefix = runtime_sharded_weight.global_shape[:prepend_axis_num]
-        offset_prefix = runtime_sharded_weight.global_offset[:prepend_axis_num]
-        global_group_shape = runtime_sharded_weight.global_shape[prepend_axis_num:]
-        global_group_offset = runtime_sharded_weight.global_offset[prepend_axis_num:]
-        assert len(global_group_shape) == len(global_group_offset) == 3
-
         local_groups, local_rank, local_in_features = runtime_shape
-        global_groups, global_rank, global_in_features = global_group_shape
-        group_offset, rank_offset, in_features_offset = global_group_offset
-        assert global_rank == local_rank and rank_offset == 0, (
-            "The grouped output projection may only be sharded along its group "
-            "or input-feature dimensions"
-        )
+        checkpoint_shape = (local_groups * local_rank, local_in_features)
 
-        checkpoint_local_shape = (local_groups * local_rank, local_in_features)
-        checkpoint_global_shape = (*global_prefix, global_groups * global_rank, global_in_features)
-        checkpoint_global_offset = (*offset_prefix, group_offset * global_rank, in_features_offset)
-        checkpoint_axis_fragmentations = runtime_sharded_weight.axis_fragmentations
-        if checkpoint_axis_fragmentations is not None:
-            fragmentation_prefix = checkpoint_axis_fragmentations[:prepend_axis_num]
-            group_fragmentation, rank_fragmentation, in_features_fragmentation = (
-                checkpoint_axis_fragmentations[prepend_axis_num:]
-            )
-            assert rank_fragmentation == 1
-            checkpoint_axis_fragmentations = (
-                *fragmentation_prefix,
-                group_fragmentation,
-                in_features_fragmentation,
-            )
-
-        checkpoint_sharded_weight_no_data = replace(
-            runtime_sharded_weight.without_data(),
-            local_shape=checkpoint_local_shape,
-            global_shape=checkpoint_global_shape,
-            global_offset=checkpoint_global_offset,
-            axis_fragmentations=checkpoint_axis_fragmentations,
-        )
+        # TP is fixed at one for DSv4. The only possible parameter sharding is
+        # FSDP along the group axis, which becomes axis 0 in the legacy layout.
+        group_axis = len(sharded_offsets)
+        assert runtime_sharded_weight.prepend_axis_num == group_axis
+        assert runtime_sharded_weight.axis_fragmentations is not None
+        group_fragmentation = runtime_sharded_weight.axis_fragmentations[group_axis]
+        group_offset = runtime_sharded_weight.global_offset[group_axis]
+        group_rank, remainder = divmod(group_offset, local_groups)
+        assert remainder == 0
+        checkpoint_group_offset = (group_axis, group_rank, group_fragmentation)
 
         @torch.no_grad()
         def build_fn(
             key: str, tensor: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
         ) -> ShardedTensor:
-            checkpoint_tensor = tensor.reshape(checkpoint_local_shape)
-            return replace(
-                checkpoint_sharded_weight_no_data,
-                key=key,
-                data=checkpoint_tensor,
-                dtype=checkpoint_tensor.dtype,
+            if flattened_range is not None:
+                raise ValueError(
+                    "DSv4 grouped output projection does not support the deprecated "
+                    "fully_sharded_model_space optimizer checkpoint format"
+                )
+            return ShardedTensor.from_rank_offsets(
+                key,
+                tensor.reshape(checkpoint_shape),
+                *sharded_offsets,
+                checkpoint_group_offset,
                 replica_id=replica_id,
-                flattened_range=flattened_range,
+                prepend_axis_num=len(sharded_offsets),
             )
 
         def merge_fn(checkpoint_tensor: torch.Tensor) -> torch.Tensor:
@@ -388,12 +359,7 @@ class DSv4HybridAttention(Attention):
         runtime_weight = runtime_sharded_weight.data
         assert runtime_weight is not None
         sharded_state_dict[checkpoint_key] = ShardedTensorFactory(
-            checkpoint_key,
-            runtime_weight,
-            build_fn,
-            merge_fn,
-            runtime_sharded_weight.replica_id,
-            flattened_range=runtime_sharded_weight.flattened_range,
+            checkpoint_key, runtime_weight, build_fn, merge_fn, runtime_sharded_weight.replica_id
         )
         return sharded_state_dict
 

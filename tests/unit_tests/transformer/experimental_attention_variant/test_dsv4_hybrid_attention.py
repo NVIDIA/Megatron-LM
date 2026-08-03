@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 import megatron.core.parallel_state as parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -498,6 +498,14 @@ class TestDSv4HybridGroupedOutput:
         assert restored_weight.shape == runtime_weight.shape
         torch.testing.assert_close(restored_weight, reloaded_weight, **tolerances)
 
+        factory_with_offset = reloaded_attn.sharded_state_dict(sharded_offsets=((0, 1, 2),))[
+            "linear_o_group_proj"
+        ]
+        checkpoint_shard = factory_with_offset.build()
+        assert checkpoint_shard.global_shape == (2, *checkpoint_shape)
+        assert checkpoint_shard.global_offset == (1, 0, 0)
+        assert checkpoint_shard.prepend_axis_num == 1
+
     @pytest.mark.parametrize(
         ("use_mxfp8", "quantized_weight"),
         [(False, False), (True, False), (True, True)],
@@ -635,8 +643,18 @@ class TestDSv4HybridGroupedOutput:
         weight = attn._linear_o_group_proj_weight
         assert weight is attn.linear_o_group_proj
         assert not isinstance(weight, TEQuantizedTensor)
+        checkpoint_shape = (
+            config.o_groups * config.o_lora_rank,
+            (config.v_head_dim * config.num_attention_heads) // config.o_groups,
+        )
+        assert weight.shape == checkpoint_shape
         assert "linear_o_group_proj" in attn.state_dict()
         assert "linear_o_group_proj.weight" not in attn.state_dict()
+        sharded_weight = attn.sharded_state_dict()["linear_o_group_proj"]
+        assert isinstance(sharded_weight, ShardedTensor)
+        assert sharded_weight.data is weight
+        assert sharded_weight.local_shape == checkpoint_shape
+        assert sharded_weight.global_shape == checkpoint_shape
 
         seq_len, batch_size = 4, 8
         in_features = weight.size(-1)
@@ -647,7 +665,11 @@ class TestDSv4HybridGroupedOutput:
         input_test = input_ref.detach().clone().requires_grad_(True)
         weight_ref = weight.detach().clone().requires_grad_(True)
 
-        output_ref = torch.einsum("...gd,grd->...gr", input_ref, weight_ref)
+        output_ref = torch.einsum(
+            "...gd,grd->...gr",
+            input_ref,
+            weight_ref.reshape(config.o_groups, config.o_lora_rank, -1),
+        )
         output_test = attn._apply_linear_o_group_proj(input_test)
         grad_output = torch.empty_like(output_ref).uniform_(-0.25, 0.25)
         output_ref.backward(grad_output)
