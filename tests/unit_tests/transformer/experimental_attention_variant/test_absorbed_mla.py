@@ -6,10 +6,11 @@ from typing import List, Optional, Tuple
 import pytest
 import torch
 import torch.distributed as dist
-from transformer_engine.pytorch.fp8 import check_fp8_support
+from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -25,9 +26,11 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
+from tests.unit_tests.determinism.utils import capture_rng_state, restore_rng_state
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, reason_for_no_fp8 = check_fp8_support()
+nvfp4_available, reason_for_no_nvfp4 = check_nvfp4_support()
 
 
 class MockCoreAttention(torch.nn.Module):
@@ -131,6 +134,8 @@ def get_mock_mla_config(
     recompute_mla_up_proj: bool,
     fp8: Optional[str] = None,
     fp8_recipe: str = "delayed",
+    fp4: Optional[str] = None,
+    fp4_recipe: str = "nvfp4",
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -168,7 +173,8 @@ def get_mock_mla_config(
         gradient_accumulation_fusion=False,
         fp8=fp8 if fp8 else False,
         fp8_recipe=fp8_recipe,
-        fp4=False,
+        fp4=fp4,
+        fp4_recipe=fp4_recipe,
         init_method=init_method_normal(0.02),
         output_layer_init_method=scaled_init_method_normal(0.02, 61, multiplier=2.0),
         kv_channels=56,
@@ -445,13 +451,26 @@ def test_functionality(
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 _QUANT_RECIPES = [
-    pytest.param("tensorwise", id="fp8-tensorwise"),
     pytest.param(
-        "mxfp8",
-        id="fp8-mxfp8",
-        marks=pytest.mark.skipif(not _IS_BLACKWELL, reason="needs Blackwell"),
+        {"fp8": "hybrid", "fp8_recipe": "tensorwise"},
+        id="fp8-tensorwise",
+        marks=pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8),
     ),
-    pytest.param("blockwise", id="fp8-blockwise"),
+    pytest.param(
+        {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
+        id="fp8-mxfp8",
+        marks=pytest.mark.skipif(not fp8_available or not _IS_BLACKWELL, reason="needs Blackwell"),
+    ),
+    pytest.param(
+        {"fp8": "hybrid", "fp8_recipe": "blockwise"},
+        id="fp8-blockwise",
+        marks=pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8),
+    ),
+    pytest.param(
+        {"fp4": "e2m1", "fp4_recipe": "nvfp4"},
+        id="fp4-nvfp4",
+        marks=pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4),
+    ),
 ]
 
 
@@ -475,14 +494,13 @@ def _build_absorbed_mla(config, combined_kv_up_projection, state_dict=None):
     return model
 
 
-@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
-@pytest.mark.parametrize("fp8_recipe", _QUANT_RECIPES)
+@pytest.mark.parametrize("quant_overrides", _QUANT_RECIPES)
 @pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
 @pytest.mark.parametrize("combined_kv_up_projection", [True, False])
-def test_fp8_up_proj_recompute_parity(
-    fp8_recipe: str, qkv_format: str, combined_kv_up_projection: bool
+def test_quantized_up_proj_recompute_parity(
+    quant_overrides: dict, qkv_format: str, combined_kv_up_projection: bool
 ):
-    """`mla_up_proj` recompute must be an exact replay under FP8.
+    """`mla_up_proj` recompute must be an exact replay under FP8 and FP4.
 
     The absorbed up-projection recompute used to be blocked for FP8/FP4. It is
     allowed now, so pin the contract: running the same inputs through two
@@ -502,8 +520,7 @@ def test_fp8_up_proj_recompute_parity(
             context_parallel_size=1,
             sequence_parallel=False,
             recompute_mla_up_proj=recompute,
-            fp8="hybrid",
-            fp8_recipe=fp8_recipe,
+            **quant_overrides,
         )
 
     baseline = _build_absorbed_mla(make_config(False), combined_kv_up_projection)
@@ -512,7 +529,8 @@ def test_fp8_up_proj_recompute_parity(
     )
     assert recomputed.recompute_up_proj and not baseline.recompute_up_proj
 
-    # FP8 GEMMs need the token dimension aligned; keep every sequence a multiple of 128.
+    # Quantized GEMMs need the token dimension aligned; keep every sequence a multiple
+    # of 128, which satisfies both the FP8 (16) and FP4 (32) alignment requirements.
     if qkv_format == 'thd':
         random.seed(42)
         seqlens = [random.randint(1, 8) * 128 for _ in range(3)]
@@ -539,15 +557,24 @@ def test_fp8_up_proj_recompute_parity(
         )
     grads = torch.randn_like(hidden_states)
 
+    def quantization_context(config):
+        # Mirrors the dispatch in TransformerBlock.
+        return get_fp8_context(config) if config.fp8 else get_fp4_context(config)
+
     def run(model):
-        with get_fp8_context(model.config):
+        with quantization_context(model.config):
             output, _ = model(
                 hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
             )
         output.backward(grads)
         return output, {name: param.grad for name, param in model.named_parameters()}
 
+    # NVFP4 draws randomness in the backward (stochastic rounding), so the two runs have
+    # to start from the same RNG state to be comparable at all. Same ritual as
+    # BitExactRunner._two_runs.
+    rng_state = capture_rng_state()
     baseline_output, baseline_grads = run(baseline)
+    restore_rng_state(rng_state)
     recomputed_output, recomputed_grads = run(recomputed)
 
     torch.testing.assert_close(recomputed_output, baseline_output, atol=0, rtol=0)
@@ -561,10 +588,10 @@ def test_fp8_up_proj_recompute_parity(
             recomputed_grad, baseline_grad, atol=0, rtol=0, msg=lambda m, n=name: f"{n}: {m}"
         )
 
-    # The assertions above hold trivially if the FP8 recipe never engaged, since two
-    # bf16 replays also match bitwise. Run the same weights through a bf16 module: the
-    # FP8 output must track it closely (the math is right) yet differ from it (the
-    # values really went through quantization).
+    # The assertions above hold trivially if the recipe never engaged, since two bf16
+    # replays also match bitwise. Run the same weights through a bf16 module: the
+    # quantized output must track it closely (the math is right) yet differ from it
+    # (the values really went through quantization).
     bf16_model = _build_absorbed_mla(
         get_mock_mla_config(
             tensor_model_parallel_size=1,
@@ -574,8 +601,8 @@ def test_fp8_up_proj_recompute_parity(
         ),
         combined_kv_up_projection,
     )
-    # Copy parameters directly rather than via state_dict, which also carries the FP8
-    # `_extra_state` blobs that a bf16 module has no use for.
+    # Copy parameters directly rather than via state_dict, which also carries the
+    # quantization `_extra_state` blobs that a bf16 module has no use for.
     baseline_params = dict(baseline.named_parameters())
     with torch.no_grad():
         for name, param in bf16_model.named_parameters():
@@ -586,15 +613,19 @@ def test_fp8_up_proj_recompute_parity(
 
     assert not torch.equal(
         recomputed_output, bf16_output
-    ), "FP8 output is bitwise equal to bf16, so the recipe never engaged"
-    # The bound stays loose on purpose: it only has to catch an FP8 path that produces
-    # garbage, and it must hold across recipes and architectures whose quantization error
-    # differs by an order of magnitude. Accuracy itself is pinned by the exact comparisons
-    # above and by test_functionality.
+    ), "quantized output is bitwise equal to bf16, so the recipe never engaged"
+    # The bound stays loose on purpose: it only has to catch a quantized path that
+    # produces garbage, and it must hold across recipes and architectures whose
+    # quantization error differs by an order of magnitude — hence the separate, coarser
+    # bound for 4-bit elements. Accuracy itself is pinned by the exact comparisons above
+    # and by test_functionality.
+    threshold = 0.9 if quant_overrides.get("fp4") else 0.99
     cosine_sim = torch.nn.functional.cosine_similarity(
         recomputed_output.flatten().float().unsqueeze(0),
         bf16_output.flatten().float().unsqueeze(0),
     ).item()
-    assert cosine_sim > 0.99, f"FP8 output diverges from bf16: cosine similarity = {cosine_sim}"
+    assert (
+        cosine_sim > threshold
+    ), f"{'FP8' if quant_overrides.get('fp8') else 'FP4'} quantized output diverges from bf16: cosine similarity = {cosine_sim}"
 
     Utils.destroy_model_parallel()
