@@ -1136,7 +1136,7 @@ def print_torch_dcp_in_json(torch_dcp_dir, model_weight_prefix="model.module"):
         dcp_to_torch_save(torch_dcp_dir, tmp_file.name)
 
         # Load the state dict from the temporary file
-        state_dict = torch.load(tmp_file.name, map_location="cpu")
+        state_dict = torch.load(tmp_file.name, map_location="cpu", weights_only=True)
 
         click.echo(f"torch dcp content: {json.dumps(state_dict)}")
 

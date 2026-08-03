@@ -67,9 +67,9 @@ class TestMultimodalProjector:
         path = tmp_path / "mlp.pt"
         torch.save(self.mlp.state_dict(), path)
 
-        self.mlp.load_state_dict(torch.load(path))
+        self.mlp.load_state_dict(torch.load(path, weights_only=True))
 
         path = tmp_path / "affine.pt"
         torch.save(self.affine.state_dict(), path)
 
-        self.affine.load_state_dict(torch.load(path))
+        self.affine.load_state_dict(torch.load(path, weights_only=True))

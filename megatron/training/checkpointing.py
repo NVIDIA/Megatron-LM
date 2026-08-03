@@ -1788,7 +1788,7 @@ def _load_base_checkpoint(
                 load_dir, iteration, release, return_base_dir=False
             )
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=True)
         except Exception as e:
             print('could not load the checkpoint')
             print(e)
@@ -2861,7 +2861,7 @@ def load_biencoder_checkpoint(
             )
         )
 
-    state_dict = torch.load(checkpoint_name, map_location='cpu')
+    state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=True)
     ret_state_dict = state_dict['model']
 
     if only_query_model:

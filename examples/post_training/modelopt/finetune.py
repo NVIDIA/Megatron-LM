@@ -58,7 +58,7 @@ class OfflineDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         idx = idx % len(self.file_paths)
         file_path = self.file_paths[idx]
-        sample = torch.load(file_path)
+        sample = torch.load(file_path, weights_only=True)
         return sample
 
 class SFTDataset(torch.utils.data.Dataset):

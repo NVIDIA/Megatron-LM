@@ -31,7 +31,7 @@ class TestSafeGlobals:
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        torch.load(ckpt_path)
+        torch.load(ckpt_path, weights_only=True)
 
     @pytest.mark.skipif(not is_torch_min_version("2.6a0"), reason="PyTorch 2.6 is required")
     def test_unsafe_globals(self, tmp_path_dist_ckpt):
@@ -45,11 +45,11 @@ class TestSafeGlobals:
 
         # expected error
         with pytest.raises(UnpicklingError):
-            torch.load(ckpt_path)
+            torch.load(ckpt_path, weights_only=True)
 
         # add class to safe globals
         torch.serialization.add_safe_globals([UnsafeClass])
-        torch.load(ckpt_path)
+        torch.load(ckpt_path, weights_only=True)
 
 
 class TestSafeUnpickler:

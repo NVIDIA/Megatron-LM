@@ -29,7 +29,7 @@ def combine(input_files, module_prefixes, output_files):
             # initialize the combined state dict using the first provided input file
             # NOTE: To load legacy checkpoints, set TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
             # (only use with trusted files — allows arbitrary code execution).
-            current_state_dict = torch.load(input_file)
+            current_state_dict = torch.load(input_file, weights_only=True)
             if i == 0:
                 combined_state_dict = current_state_dict.copy()
                 combined_state_dict["model"] = dict()

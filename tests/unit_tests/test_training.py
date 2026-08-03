@@ -208,7 +208,7 @@ class TestSaveGrads:
             assert expected_file.exists(), f"Expected file {expected_file} to exist"
 
             # Verify saved content.
-            loaded = torch.load(expected_file)
+            loaded = torch.load(expected_file, weights_only=True)
             assert "model_chunk0" in loaded
             assert "layer.weight" in loaded["model_chunk0"]
             assert "layer.bias" in loaded["model_chunk0"]

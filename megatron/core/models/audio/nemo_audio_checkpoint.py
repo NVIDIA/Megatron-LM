@@ -65,7 +65,7 @@ def _torch_load(path: str) -> Any:
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def _load_json(path: str | Path) -> Dict[str, Any]:

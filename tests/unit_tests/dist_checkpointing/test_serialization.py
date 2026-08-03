@@ -452,7 +452,7 @@ class TestSerialization:
             load_state_dict = load(state_dict, ckpt_dir)
             assert 'other_key' in load_state_dict
             load_state_dict['other_key'].seek(0)
-            loaded_state = torch.load(load_state_dict['other_key'])
+            loaded_state = torch.load(load_state_dict['other_key'], weights_only=True)
 
             assert loaded_state == {'some': 'dict'}
 

@@ -53,7 +53,7 @@ class TestCLIPViTModel:
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)
 
-        self.model.load_state_dict(torch.load(path))
+        self.model.load_state_dict(torch.load(path, weights_only=True))
 
 
 @pytest.mark.internal

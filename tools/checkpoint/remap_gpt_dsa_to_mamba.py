@@ -124,7 +124,7 @@ def convert(input_path: Path, output_path: Path, num_gpt_layers: int) -> None:
     tmp_flat = output_path.parent / "_tmp_gpt_flat.pt"
     try:
         dcp_to_torch_save(str(input_path), str(tmp_flat))
-        gpt_sd = torch.load(tmp_flat, map_location="cpu")
+        gpt_sd = torch.load(tmp_flat, map_location="cpu", weights_only=True)
         print(f"Loaded {len(gpt_sd)} keys from GPTModel checkpoint.")
 
         # --- Remap keys ---

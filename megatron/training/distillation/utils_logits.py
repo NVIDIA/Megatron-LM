@@ -361,7 +361,7 @@ def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch
             "Install via `pip install zstandard`."
         )
     data = zstandard.ZstdDecompressor().decompress(data)
-    tensors = torch.load(io.BytesIO(data), weights_only=True)
+    tensors = torch.load(io.BytesIO(data, weights_only=True), weights_only=True)
     indices_list = [
         unpack_indices(low, bit17)
         for low, bit17 in zip(tensors["indices_low"], tensors["bit_17"])

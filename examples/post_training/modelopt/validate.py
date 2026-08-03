@@ -110,7 +110,7 @@ if __name__ == "__main__":
             prompts = [json.loads(line) for line in f]
 
     if args.ground_truth_path is not None:
-        ground_truth = torch.load(args.ground_truth_path)
+        ground_truth = torch.load(args.ground_truth_path, weights_only=True)
         ground_truth = [gt.to(torch.cuda.current_device()) for gt in ground_truth]
     else:
         ground_truth = [None for _ in range(len(prompts))]

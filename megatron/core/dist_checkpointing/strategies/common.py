@@ -45,7 +45,7 @@ def load_common(checkpoint_dir: str):
 
     load_path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
     try:
-        return maybe_msc.torch.load(load_path, map_location='cpu')
+        return maybe_msc.torch.load(load_path, map_location='cpu', weights_only=True)
     except FileNotFoundError as e:
         err_msg = f'Common file {load_path} does not exist'
         ckpt_files = [f.name for f in maybe_msc.Path(checkpoint_dir).iterdir()]

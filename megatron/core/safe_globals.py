@@ -59,7 +59,7 @@ def register_safe_globals():
 
 def safe_load_from_bytes(b):
     """Safe version (weights_only=True) of `torch.storage._load_from_bytes`."""
-    return torch.load(io.BytesIO(b), weights_only=True)
+    return torch.load(io.BytesIO(b, weights_only=True), weights_only=True)
 
 
 def _safe_pickle_load(file, **kwargs):
