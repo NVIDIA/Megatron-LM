@@ -72,6 +72,8 @@ MODEL_ARGS=(
   --micro-batch-size 1
   --global-batch-size 4
   --train-iters 50
+  --eval-interval 1000
+  --eval-iters 0
   --lr 1.5e-4
   --min-lr 1e-5
   --lr-decay-style cosine
