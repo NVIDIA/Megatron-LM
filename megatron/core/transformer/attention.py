@@ -325,19 +325,12 @@ class Attention(MegatronModule, ABC):
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
-        if pg_collection is None:
-            # 'dp' is only consumed by run_realtime_tests (config.test_mode), but the legacy
-            # fallback must supply it so that path keeps working without an explicit collection.
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'dp']
-            )
-        else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "Attention pg_collection must have tp process group"
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "Attention pg_collection must have cp process group"
+        assert pg_collection is not None, (
+            "Attention requires an explicit pg_collection with tp/cp; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
+        assert hasattr(pg_collection, 'tp'), "Attention pg_collection must have tp process group"
+        assert hasattr(pg_collection, 'cp'), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
