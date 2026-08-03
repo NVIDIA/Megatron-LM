@@ -11,6 +11,9 @@ from functools import partial
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
@@ -632,6 +635,9 @@ try:
                 termination_id=-1 if ignore_eos else None,
                 return_prompt_tokens=return_prompt_tokens,
                 streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
+                # This frontend detokenizes its own output below. Keeping it off the
+                # coordinator matters because that is one process shared by all DP ranks.
+                detokenize_generations=False,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
@@ -730,7 +736,11 @@ try:
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
 
-            text_output = result["generated_text"]
+            text_output = TextGenerationController.detokenize(
+                tokenizer,
+                result["generated_tokens"],
+                remove_EOD=not sampling_params.detokenize_stop_sequence,
+            )
             # The engine always reports prompt_length (for usage), but drops the
             # prompt_tokens tensor unless return_prompt_tokens was set.
             prompt_tokens_count = result.get("prompt_length")
