@@ -11,6 +11,21 @@ class _FakeCudaBuffer:
     is_cuda = True
 
 
+@pytest.mark.parametrize(
+    ("package_name", "distribution_name"), [("nixl_cu12", "nixl-cu12"), ("nixl_cu13", "nixl-cu13")]
+)
+def test_nixl_detects_active_cuda_distribution(monkeypatch, package_name, distribution_name):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    monkeypatch.setattr(
+        nixl_mod.importlib_metadata,
+        "packages_distributions",
+        lambda: {"nixl": ["nixl"], package_name: [distribution_name]},
+    )
+
+    assert nixl_mod._detect_nixl_variant(f"{package_name}._api") == package_name
+
+
 @pytest.mark.parametrize("configured_tls", ["tcp", "^cuda", "^cuda_copy,cuda_ipc,gdr_copy"])
 def test_nixl_rejects_ucx_config_without_cuda_transport(monkeypatch, configured_tls):
     from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
@@ -25,12 +40,15 @@ def test_nixl_rejects_ucx_config_without_cuda_transport(monkeypatch, configured_
 def test_nixl_accepts_ucx_config_with_cuda_transport(monkeypatch, configured_tls):
     from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
 
+    monkeypatch.delenv("UCX_MEMTYPE_CACHE", raising=False)
     if configured_tls is None:
         monkeypatch.delenv("UCX_TLS", raising=False)
     else:
         monkeypatch.setenv("UCX_TLS", configured_tls)
 
     nixl_mod._validate_ucx_transport_config(_FakeCudaBuffer())
+
+    assert nixl_mod.os.environ["UCX_MEMTYPE_CACHE"] == "n"
 
 
 def test_nixl_rejects_cuda_major_variant_mismatch(monkeypatch):
@@ -160,6 +178,7 @@ def test_nixl_registered_buffers_share_agent_and_peer_cache(monkeypatch):
     class FakeAgent:
         def __init__(self, name, config):
             self.registrations = []
+            self.deregistrations = []
             agents.append(self)
 
         def get_agent_metadata(self):
@@ -168,6 +187,9 @@ def test_nixl_registered_buffers_share_agent_and_peer_cache(monkeypatch):
         def register_memory(self, tensor):
             self.registrations.append(tensor)
             return ("reg", len(self.registrations))
+
+        def deregister_memory(self, registration):
+            self.deregistrations.append(registration)
 
     monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
     monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
@@ -187,6 +209,20 @@ def test_nixl_registered_buffers_share_agent_and_peer_cache(monkeypatch):
     assert sibling._known_peers is backend._known_peers
     assert sibling.export_meta()["agent_name"] == "prefill"
     assert backend.export_meta()["agent_metadata_b64"] == "cmVnaXN0cmF0aW9ucz0y"
+
+    agent = backend._agent
+    agent_context = backend._agent_context
+    assert agent_context.ref_count == 2
+
+    backend.close()
+    assert agent_context.ref_count == 1
+    assert agent_context.agent is agent
+    assert sibling._agent is agent
+
+    sibling.close()
+    assert agent_context.ref_count == 0
+    assert agent_context.agent is None
+    assert agent.deregistrations == [("reg", 1), ("reg", 2)]
 
 
 def test_nixl_begin_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch):
