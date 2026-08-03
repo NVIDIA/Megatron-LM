@@ -1008,6 +1008,33 @@ class GTPShardedParam(torch.nn.Parameter):
             self._buf_parity = p
         return p
 
+    def _gather_buffer_identity(self, dtype) -> tuple:
+        """The part of the cache key that decides which weights share a gather buffer."""
+        return (self._unsharded_shape_padded, dtype, self.expert_idx)
+
+    def _ensure_distinct_buffer_from_prev(self, dtype):
+        """Move self to a second buffer if its chain predecessor would share one.
+
+        One-step-ahead prefetch keeps prev_w and self live at once, so sharing a buffer lets
+        self's gather clobber the weight prev_w's GEMM is still reading. Neighbours normally
+        differ in shape; a CUDA-graph-partitioned chain can leave two same-shaped weights
+        adjacent (embedding + output_layer alone in the UNGRAPHED chain).
+
+        Grouped chains use their own counter (``_GTP_GROUPED_BUF_PARITY_COUNTER``).
+        """
+        prev = self.prev_w
+        if prev is None or _chain_is_grouped(self.chain_id):
+            return
+        if self.is_routed_expert or prev.is_routed_expert:
+            return
+        if prev._cached_dtypes is None:  # never gathered — no buffer to collide with
+            return
+        if prev._gather_buffer_identity(prev._cached_dtypes[0]) != self._gather_buffer_identity(
+            dtype
+        ):
+            return
+        self._buf_parity = 1 - (getattr(prev, "_buf_parity", None) or 0)
+
     def _get_cache_key(self, dtype, fwd: bool, reduce_scatter: bool) -> tuple:
         """Build cache key from output shape + dtype.
 
@@ -1034,6 +1061,10 @@ class GTPShardedParam(torch.nn.Parameter):
             # chain_id keeps fc1/fc2 apart (both can be in flight at once, even if same-shaped);
             # parity alternates consecutive blocks between two buffers.
             key = key + (self.chain_id, self._double_buffer_parity())
+        elif getattr(self, "_buf_parity", None):
+            # Set by _ensure_distinct_buffer_from_prev. Parity 0 keeps the shared buffer, so
+            # only the second weight of an adjacent same-key pair costs an extra allocation.
+            key = key + (self._buf_parity,)
         return key
 
     def _strip_padding(self, tensor):
@@ -1432,6 +1463,9 @@ class GTPShardedParam(torch.nn.Parameter):
             dtypes = [
                 q.dtype if q is not None else w.dtype for q, w in zip(quantizers, self._weights)
             ]
+            # Must run before the reserve below — it decides which buffer the ticket gets.
+            self._ensure_distinct_buffer_from_prev(dtypes[0])
+
             for w, dt in zip(self._weights, dtypes):
                 w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
                 cache.get(w._ag_ticket_fwd)
