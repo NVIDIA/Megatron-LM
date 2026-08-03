@@ -8,7 +8,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
+pytestmark = [
+    pytest.mark.gpus(1),
+    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+]
 
 
 def _qwen3_symbols():

@@ -35,8 +35,10 @@ import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
 from megatron.lite.model.glm5.config import Glm5Config
+from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.modules.attention import (
     DynamicSparseAttention,
+    build_rope_cache,
     build_rotary_embeddings,
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
@@ -47,7 +49,6 @@ from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entro
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.primitive.ops.sp_ops import ReduceScatterDim0
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
     ParallelState,
@@ -59,6 +60,7 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
+    zigzag_position_ids_for_cp,
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
 from megatron.lite.primitive.utils.moe import (
@@ -153,7 +155,7 @@ class Glm5DSAAttention(nn.Module):
     where ``x_sbhd`` is ``[S, B, H]``.  DSA is hard-wired ``[B, S, H]`` and needs
     explicit ``cos`` / ``sin`` / ``position_ids``.  This wrapper:
       1. transposes ``[S, B, H] -> [B, S, H]``,
-      2. builds ``position_ids`` (local sequence) and the rotary ``cos`` / ``sin``,
+      2. builds CP-aware ``position_ids`` and rotary ``cos`` / ``sin`` inputs,
       3. runs DSA,
       4. transposes the ``[B, S, H]`` output back to ``[S, B, H]``.
     The Kimi skeleton therefore never observes the batch-first interior.
@@ -194,19 +196,32 @@ class Glm5DSAAttention(nn.Module):
         # Kimi feeds SBHD [S, B, H]; DSA needs batch-first [B, S, H].
         x_bsh = x.transpose(0, 1).contiguous()
         batch, seq_len, _ = x_bsh.shape
-        # Local (this-rank) position ids; DSA reconstructs the full sequence
-        # itself when CP > 1.
-        position_ids = (
-            torch.arange(seq_len, device=x_bsh.device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch, -1)
-        )
-        cos, sin = build_rotary_embeddings(
-            position_ids=position_ids,
-            dim=self.qk_rope_head_dim,
-            rope_theta=self.rope_theta,
-            dtype=x_bsh.dtype,
-        )
+        if self.ps.cp_size > 1 and packed_seq_params is None:
+            # Dense CP reconstructs x before applying rotary embeddings. Give
+            # DSA global zigzag positions and a full 2-D cache so the rebuilt
+            # sequence and its rotary inputs have the same length.
+            full_seq_len = seq_len * self.ps.cp_size
+            position_ids = zigzag_position_ids_for_cp(
+                full_seq_len, self.ps.cp_rank, self.ps.cp_size, x_bsh.device
+            ).expand(batch, -1)
+            cos, sin = build_rope_cache(
+                dim=self.qk_rope_head_dim,
+                max_position_embeddings=full_seq_len,
+                rope_theta=self.rope_theta,
+                device=x_bsh.device,
+            )
+        else:
+            position_ids = (
+                torch.arange(seq_len, device=x_bsh.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch, -1)
+            )
+            cos, sin = build_rotary_embeddings(
+                position_ids=position_ids,
+                dim=self.qk_rope_head_dim,
+                rope_theta=self.rope_theta,
+                dtype=x_bsh.dtype,
+            )
         out_bsh = self.self_attention(
             x_bsh,
             cos=cos,
