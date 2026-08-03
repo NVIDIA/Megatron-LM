@@ -1090,16 +1090,15 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum):
     q_term = args.q_lora_rank * (
         args.hidden_size + nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1
     )
-    kv_term = args.kv_lora_rank * (
-        args.hidden_size + nh * (args.qk_head_dim + args.v_head_dim) + 1
-    ) + args.hidden_size * args.qk_pos_emb_head_dim
+    kv_term = (
+        args.kv_lora_rank * (args.hidden_size + nh * (args.qk_head_dim + args.v_head_dim) + 1)
+        + args.hidden_size * args.qk_pos_emb_head_dim
+    )
     o_term = nh * args.v_head_dim * args.hidden_size
     mla_proj_per_layer = fwd_bwd * fma * (q_term + kv_term + o_term)
 
     # ---- Core attention: MLA cost scaled down to top-k sparse pairs ----
-    raw_core = (
-        nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2 + nh * args.v_head_dim / 2
-    )
+    raw_core = nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2 + nh * args.v_head_dim / 2
     mean_seqlen = seqlen_squared_sum / total_tokens
     topk = args.dsa_indexer_topk
     if mean_seqlen <= topk:
