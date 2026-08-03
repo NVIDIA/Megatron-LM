@@ -2695,6 +2695,56 @@ Combined with QWEN-014 (flashinfer cutlass, 0.921×) and QWEN-010 (torch grouped
 and none beats the shipping Triton path.** The candidate list above should be read as: item 1
 requires w8a8 or nothing; items 2-4 are the only cheap ones left.
 
+### STATUS-S18 — mcore at 87.9% of vLLM; the remaining gap is packing, not work
+
+| | tok/s | ms/step | vs vLLM |
+| --- | --- | --- | --- |
+| vLLM DP4+EP (`VLLM-BASELINE` / `PROFILE-OSL1024`) | 33,994.5 | 7.53 | — |
+| **mcore, current best** (`y2pdl`) | **29,898.3** | **8.56** | **87.9%** (vLLM 1.137x) |
+| mcore at session-18 start | 28,594.3 | 8.95 | 84.1% |
+| mcore at session-2 start (`SESSION2-BASE`) | 22,398.9 | 11.71 | 65.9% |
+
+Session 18 closed 0.35 ms of the 1.38 ms/step gap (**+4.56%**), from three changes that
+stack: `QWEN-040` bf16 MoE combine (+2.5%), `QWEN-041` flashinfer trtllm-gen decode
+(+1.7%), `QWEN-042` PDL on that kernel (+0.3%).
+
+**Attention is now at parity, and that closes the largest work-bucket gap.** In the final
+trace it runs 22.9 us/launch against vLLM's 25.3 us -- both engines now execute the same
+trtllm-gen kernel family, and what is left of the difference is window seqlen, not
+kernel quality. The 0.409 ms/step deficit `GAP-S18` measured is gone.
+
+What remains, in order:
+
+1. **Serialization, ~0.3 ms.** mcore's sum-of-durations (5.922 ms) and interval union
+   (5.877 ms) differ by 0.8%, so **almost nothing overlaps**; vLLM hides 4.8% of its work.
+   mcore's 0.905 ms/step of collectives is fully exposed against compute. This is now the
+   single largest structural difference and it is a scheduling change, not a kernel.
+2. **Dispatch overhead, 0.416 ms.** 806 sub-microsecond gaps per step, at 963 launches
+   against vLLM's 810. Priced by `BALLAST-S18` at ~0.5 us of gap per node, so each fusion
+   still pays twice.
+3. **Work vLLM does not do at all**: splitK reduce 0.167 ms/step (82 launches, no vLLM
+   equivalent) and the 0.164 ms of copies whose origin is still open after four attempts
+   (`COPY-ID-S18` -- `SplitAlongDim` eliminated).
+
+> **Reading the trace tables above.** Per-bucket ms/step may only be compared *within* one
+> trace. This window's attention is 22.9 us/launch against the harness's 45.1 us at KV
+> length 512, which puts its average KV length near 260 -- so its absolute times are
+> cheaper than the run average and not comparable to the earlier traces'. The throughput
+> column is the authority; the buckets rank levers, they do not size them.
+
+### QWEN-042 — PDL on the flashinfer decode kernel: **+0.30%**
+
+| arm | gates | tok/s | vs control |
+| --- | --- | --- | --- |
+| x2fi | control (flashinfer decode) | 29,802.9 | — |
+| y1pdl | + `MCORE_FLASHINFER_PDL=1` | 29,888.2 | +0.29% |
+| y2pdl | repeat | 29,898.3 | +0.32% |
+
+Programmatic Dependent Launch lets the kernel's prologue start while its predecessor
+drains, aimed at the 0.416 ms/step of sub-microsecond gaps. Small but reproducible across
+two arms, and above the 0.5% iteration spread only because both arms agree; kept on the
+strength of the repeat rather than the single measurement.
+
 ### QWEN-041 — Blackwell-native decode attention via flashinfer trtllm-gen: **+2.61%**
 
 | arm | gates on top of standing set (incl. `MCORE_NVLS_RS_BF16=1`) | tok/s | vs control |
