@@ -9,34 +9,17 @@
 
 Kernel-config selection used to live here, but it is not specific to SSM: the
 same wall-clock autotuning affects Transformer Engine's MoE permutation kernels,
-and a model without Mamba needs it just as much. It now lives in
-:mod:`megatron.core.tuning`, and this module re-exports the parts the SSM
-kernels use so their imports keep working.
+and a model without Mamba needs it just as much. It moved to
+:mod:`megatron.core.tuning`, which is also where the policy is installed from.
 
-What remains here is genuinely SSM-specific: the tile workspaces that let the
-SSD kernels accumulate in a fixed order.
+What remains here is the tile workspaces that let the SSD kernels accumulate in
+a fixed order, plus re-exports of the names this module defined before the move
+so out-of-tree callers keep working.
 """
 
 import torch
 
-from megatron.core.tuning import install as _install_autotune_policy
-from megatron.core.tuning.policy import (
-    AutotunePolicy,
-    set_deterministic_mode,
-    use_deterministic_mode,
-)
-from megatron.core.tuning.selection import autotune_configs
-
-
-def pin_external_mamba_autotuners():
-    """Install the autotune policy for this process.
-
-    Deprecated: prefer :func:`megatron.core.tuning.install`, which is not tied to
-    the Mamba path. Kept so existing call sites keep working, and because
-    ``MambaMixer`` is still a convenient place to guarantee the policy is
-    installed before the first SSD kernel launches.
-    """
-    _install_autotune_policy(AutotunePolicy.from_env())
+from megatron.core.tuning import autotune_configs, set_deterministic_mode, use_deterministic_mode
 
 
 def alloc_tile_workspace(base_shape, tile_dim, dtype, device, deterministic, *, zero_init=True):
@@ -63,7 +46,6 @@ __all__ = [
     "alloc_tile_workspace",
     "autotune_configs",
     "finalize_tile_workspace",
-    "pin_external_mamba_autotuners",
     "set_deterministic_mode",
     "use_deterministic_mode",
 ]
