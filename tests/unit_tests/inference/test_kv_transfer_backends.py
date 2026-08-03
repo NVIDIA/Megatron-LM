@@ -7,6 +7,32 @@ from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, S
 from megatron.core.inference.disaggregation.transfer_backends import base
 
 
+class _FakeCudaBuffer:
+    is_cuda = True
+
+
+@pytest.mark.parametrize("configured_tls", ["tcp", "^cuda", "^cuda_copy,cuda_ipc,gdr_copy"])
+def test_nixl_rejects_ucx_config_without_cuda_transport(monkeypatch, configured_tls):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    monkeypatch.setenv("UCX_TLS", configured_tls)
+
+    with pytest.raises(RuntimeError, match="does not enable a CUDA transport"):
+        nixl_mod._validate_ucx_transport_config(_FakeCudaBuffer())
+
+
+@pytest.mark.parametrize("configured_tls", [None, "all", "rc,cuda_copy", "^tcp"])
+def test_nixl_accepts_ucx_config_with_cuda_transport(monkeypatch, configured_tls):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    if configured_tls is None:
+        monkeypatch.delenv("UCX_TLS", raising=False)
+    else:
+        monkeypatch.setenv("UCX_TLS", configured_tls)
+
+    nixl_mod._validate_ucx_transport_config(_FakeCudaBuffer())
+
+
 def test_backend_registry_selects_by_explicit_name():
     assert base.construct_kv_transfer_backend_class("nixl").name == "nixl"
 

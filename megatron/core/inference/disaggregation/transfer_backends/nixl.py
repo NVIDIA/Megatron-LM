@@ -43,6 +43,35 @@ _POLL_INTERVAL_S = 0.0005  # 0.5 ms
 _POLL_TIMEOUT_S = 30.0
 
 
+def _validate_ucx_transport_config(memory_buffer: torch.Tensor) -> None:
+    """Reject an explicit UCX transport configuration that cannot handle CUDA memory."""
+    if not memory_buffer.is_cuda:
+        return
+
+    configured_tls = os.environ.get("UCX_TLS")
+    if not configured_tls:
+        return
+
+    tokens = {
+        token.strip().lower().lstrip("\\")
+        for token in configured_tls.lstrip("^").split(",")
+        if token.strip()
+    }
+    cuda_transports = {"cuda_copy", "cuda_ipc", "gdr_copy"}
+    if configured_tls.startswith("^"):
+        excludes_all_cuda = "cuda" in tokens or cuda_transports.issubset(tokens)
+        if not excludes_all_cuda:
+            return
+    elif "all" in tokens or "cuda" in tokens or tokens & cuda_transports:
+        return
+
+    raise RuntimeError(
+        f"UCX_TLS={configured_tls!r} does not enable a CUDA transport for NIXL GPU "
+        "buffers. Remove the override to let UCX select transports automatically, or "
+        "include a CUDA transport such as cuda_copy or cuda_ipc."
+    )
+
+
 @dataclass
 class NixlPullHandle:
     """Pollable handle for one logical pull made of one or more NIXL transfers."""
@@ -185,13 +214,7 @@ class NixlTransferBackend:
         self._ssm_layout = ssm_layout
         self._ssm_state_kind = ssm_state_kind
 
-        # Configure UCX before agent construction. Avoid TCP for VRAM addresses;
-        # operators may override this by setting UCX_TLS before launch.
-        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,cma,shm,self")
-        # Explicit registration makes the UCX memtype cache unnecessary and
-        # avoids stale VRAM/host classifications.
-        os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
-
+        _validate_ucx_transport_config(memory_buffer)
         if _shared_context is None:
             _shared_context = _NixlAgentContext(agent_name)
         self._agent_context = _shared_context
