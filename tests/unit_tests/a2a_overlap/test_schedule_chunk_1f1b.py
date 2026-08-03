@@ -289,7 +289,17 @@ class TestA2AOverlap:
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize(
-        "recompute_method,recompute_num_layers", [("uniform", 1), ("uniform", 2), ("block", 1)]
+        "recompute_method,recompute_num_layers",
+        [
+            ("uniform", 1),
+            ("uniform", 2),
+            # 'block' leaves the trailing decoder layers (and MTP) outside the recompute
+            # scope, so these two pin down the recomputed -> non-recomputed hand-off:
+            # n=1 keeps layers 1.. eager, n=3 recomputes every decoder layer of the
+            # 3-layer model while its MTP layer stays eager.
+            ("block", 1),
+            ("block", 3),
+        ],
     )
     def test_1f1b_schedule_model_chunk_full_recompute(
         self,
