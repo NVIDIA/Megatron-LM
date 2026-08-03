@@ -225,17 +225,6 @@ class KVBlockAllocator:
         if blocks.numel() == 0:
             return
 
-        # Handoff blocks are released separately after the remote pull.
-        if self.pinned_blocks and not self.enable_prefix_caching:
-            pinned = self.pinned_blocks
-            keep_mask = torch.tensor(
-                [int(b) not in pinned for b in blocks.tolist()], dtype=torch.bool
-            )
-            if not keep_mask.all():
-                blocks = blocks[keep_mask]
-                if blocks.numel() == 0:
-                    return
-
         self._release_memory_blocks(blocks)
 
     def pin_memory_blocks(self, block_ids: list[int]) -> None:

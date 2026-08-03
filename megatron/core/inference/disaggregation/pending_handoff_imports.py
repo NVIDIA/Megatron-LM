@@ -12,10 +12,25 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 
 @dataclass(kw_only=True)
+class DeferredKvHandoff:
+    """Decode handoff waiting for local cache capacity before transfer starts."""
+
+    request_id: int
+    prompt: list
+    sampling_params: SamplingParams
+    kv_meta: dict
+    src_block_ids: List[int]
+    hashes: List[int]
+    num_blocks: int
+    future: asyncio.Future
+
+
+@dataclass(kw_only=True)
 class PendingMambaImport:
     """Mamba state transfers attached to a pending KV-cache import."""
 
     handles: dict[str, Any]
+    local_slots: List[int]
     target_blocks: List[int]
     positions: List[int]
 
@@ -30,6 +45,7 @@ class PendingKvImport:
     local_blocks: List[int]
     hashes: list
     hashes_to_register: int
+    hash_registration_start: int
     handle: Any
     future: asyncio.Future
     mamba: Optional[PendingMambaImport] = None
