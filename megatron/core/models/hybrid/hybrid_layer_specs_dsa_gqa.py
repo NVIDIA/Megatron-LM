@@ -20,13 +20,16 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec as _base_stack_spec
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
-    DSAIndexer,
-    DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+    DSGQAIndexer,
+    DSGQAIndexerSubmodules,
+    DSGQASelfAttention,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import (
@@ -34,14 +37,15 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-# GQA DSA layer: standard SelfAttention (GQA) with DSAttention as core_attention.
-# This is main's `attention_layer` spec with core_attention swapped from
-# TEDotProductAttention -> the DSAttention ModuleSpec (with the indexer submodules).
+# GQA DSA layer: DSGQASelfAttention (GQA QKV + DSA-input injection) with a plain
+# DSAttention core whose indexer is the hidden-based DSGQAIndexer. Because value is
+# a real GQA value tensor, DSAttention.forward takes its non-absorbed path: cuDNN
+# indexer top-k + PyTorch reference loss + PyTorch unfused_dsa_fn output.
 dsa_gqa_layer = ModuleSpec(
     module=TransformerLayer,
     submodules=TransformerLayerSubmodules(
         self_attention=ModuleSpec(
-            module=SelfAttention,
+            module=DSGQASelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=TELayerNormColumnParallelLinear,  # folds input-LN + GQA QKV
@@ -49,9 +53,9 @@ dsa_gqa_layer = ModuleSpec(
                     module=DSAttention,
                     submodules=DSAttentionSubmodules(
                         indexer=ModuleSpec(
-                            module=DSAIndexer,
-                            submodules=DSAIndexerSubmodules(
-                                linear_wq_b=TELinear,
+                            module=DSGQAIndexer,
+                            submodules=DSGQAIndexerSubmodules(
+                                linear_q=TELinear,
                                 linear_wk=TELinear,
                                 k_norm=TENorm,
                                 linear_weights_proj=TELinear,
