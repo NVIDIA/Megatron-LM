@@ -1884,8 +1884,7 @@ def test_cudnn_sparse_backward_uses_batch_major_topk_indices_for_batched_kv(monk
     )
 
     torch.testing.assert_close(
-        seen["topk_indices"][:, 0, :3],
-        torch.tensor([[3, 1, -1], [4, 6, -1]], dtype=torch.int32),
+        seen["topk_indices"][:, 0, :3], torch.tensor([[3, 1, -1], [4, 6, -1]], dtype=torch.int32)
     )
     torch.testing.assert_close(
         seen["topk_indices"][:, 0, 3:], torch.full((2, 125), -1, dtype=torch.int32)
@@ -2313,9 +2312,7 @@ def test_cudnn_sparse_backward_topk_padding_aligns_to_block_size():
     torch.testing.assert_close(padded_topk[..., :3], topk_indices)
     torch.testing.assert_close(padded_attn[..., 3], torch.zeros(1, 2))
     torch.testing.assert_close(padded_index[..., 3], torch.zeros(1, 2))
-    torch.testing.assert_close(
-        padded_topk[..., 3], torch.full((1, 2), -1, dtype=torch.int32)
-    )
+    torch.testing.assert_close(padded_topk[..., 3], torch.full((1, 2), -1, dtype=torch.int32))
 
 
 def test_cudnn_attn_target_pads_small_local_head_count(monkeypatch):
