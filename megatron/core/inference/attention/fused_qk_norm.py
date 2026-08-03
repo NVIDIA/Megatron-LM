@@ -47,6 +47,13 @@ FUSED_QK_NORM_MAX_TOKENS: int = int(os.environ.get("MCORE_FUSED_QK_NORM_MAX_TOKE
 # removing one full-query strided copy per layer per step. Requires the fused norm.
 USE_GROUPED_QK_NORM: bool = os.environ.get("MCORE_GROUPED_QK_NORM", "0") == "1"
 
+# Launch shape. One row per CTA is the obvious choice for a 128-wide row and reaches only
+# ~570 GB/s, because it puts 9,216 single-warp CTAs on the device for a 256-token step.
+# 8 rows x 8 warps measured exactly 2x that (8.22 -> 4.12 us) and was the best point in a
+# rows x warps sweep; env-overridable so the sweep can be repeated on other hardware.
+ROWS_PER_CTA: int = int(os.environ.get("MCORE_QK_NORM_ROWS", "8"))
+NUM_WARPS: int = int(os.environ.get("MCORE_QK_NORM_WARPS", "8"))
+
 
 if HAVE_TRITON:
 
@@ -59,10 +66,9 @@ if HAVE_TRITON:
         wq_ptr,
         wk_ptr,
         n_q_rows,
+        n_rows,
         q_in_rs,
         k_in_rs,
-        q_out_rs,
-        k_out_rs,
         eps,
         q_grp_rs,
         HN: tl.constexpr,
@@ -70,27 +76,37 @@ if HAVE_TRITON:
         Q_GROUPED: tl.constexpr,
         NPG: tl.constexpr,
         HEADS: tl.constexpr,
+        ROWS: tl.constexpr,
     ):
-        """One CTA per row across the concatenated [q_rows; k_rows] space.
+        """``ROWS`` rows per CTA across the concatenated ``[q_rows; k_rows]`` space.
 
-        Programs with ``row < n_q_rows`` normalize a query row with ``wq``;
-        the rest normalize a key row with ``wk``. Both candidate loads are
-        issued (the off-path one clamped to row 0 and masked out of the store),
-        which keeps the kernel branch-free on the hot path for a 128-wide row.
+        Rows below ``n_q_rows`` are query rows normalized with ``wq``; the rest are key
+        rows normalized with ``wk``. A block may straddle that boundary, so both address
+        schemes are computed for every row and selected per row.
 
-        With ``Q_GROUPED`` the query is read straight out of the QKV projection's
-        output instead of from a repacked copy. There, q heads are grouped with the
-        k and v head of their group, so a q row's address needs two strides -- one
-        per group (``q_grp_rs``) and one per head inside it -- and no single row
-        stride exists. See ``fused_qk_rmsnorm_grouped`` for why that matters.
+        With ``Q_GROUPED`` the query is read straight out of the QKV projection's output
+        instead of from a repacked copy. There, q heads are grouped with the k and v head
+        of their group, so a q row's address needs two strides -- one per group
+        (``q_grp_rs``) and one per head inside it -- and no single row stride exists. See
+        :func:`fused_qk_rmsnorm_grouped` for why that matters.
+
+        One row per CTA is the obvious shape for a 128-wide row and it is the wrong one:
+        it puts 9,216 single-warp CTAs on the device for a 256-token step and reaches only
+        ~570 GB/s. Eight rows per CTA at eight warps measured exactly 2x that, and a
+        sweep of the rest of the space found nothing better.
+
+        Output row strides are ``HN``, not parameters: both output tensors are allocated
+        here and are contiguous, and passing that stride at runtime instead costs a third
+        of the kernel (6.15 us against 4.12 us) because the compiler can no longer prove
+        the stores are contiguous and vectorize them.
         """
-        row = tl.program_id(0)
+        rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
         cols = tl.arange(0, HN)
-        is_q = row < n_q_rows
+        live = rows < n_rows
+        is_q = rows < n_q_rows
 
-        q_row = tl.where(is_q, row, 0)
-        k_row = tl.where(is_q, 0, row - n_q_rows)
-
+        q_row = tl.where(is_q, rows, 0)
+        k_row = tl.where(is_q, 0, rows - n_q_rows)
         if Q_GROUPED:
             head = q_row % HEADS
             q_off = (
@@ -98,25 +114,34 @@ if HAVE_TRITON:
             ) * q_grp_rs + (head % NPG) * HN
         else:
             q_off = q_row * q_in_rs
-        xq = tl.load(q_ptr + q_off + cols).to(tl.float32)
-        xk = tl.load(k_ptr + k_row * k_in_rs + cols).to(tl.float32)
-        x = tl.where(is_q, xq, xk)
 
-        var = tl.sum(x * x, axis=0) / HN
-        inv = 1.0 / tl.sqrt(var + eps)
-        xn = x * inv
+        q_mask = (live & is_q)[:, None]
+        k_mask = (live & (rows >= n_q_rows))[:, None]
+
+        xq = tl.load(q_ptr + q_off[:, None] + cols[None, :], mask=q_mask, other=0.0)
+        xk = tl.load(k_ptr + (k_row * k_in_rs)[:, None] + cols[None, :], mask=k_mask, other=0.0)
+        x = tl.where(is_q[:, None], xq.to(tl.float32), xk.to(tl.float32))
+
+        var = tl.sum(x * x, axis=1) / HN
+        xn = x * (1.0 / tl.sqrt(var + eps))[:, None]
 
         wq = tl.load(wq_ptr + cols).to(tl.float32)
         wk = tl.load(wk_ptr + cols).to(tl.float32)
-        w = tl.where(is_q, wq, wk)
+        w = tl.where(is_q[:, None], wq[None, :], wk[None, :])
         if ZERO_CENTERED:
             w = w + 1.0
         y = xn * w
 
-        q_store_mask = is_q & (cols < HN)
-        k_store_mask = (row >= n_q_rows) & (cols < HN)
-        tl.store(qo_ptr + q_row * q_out_rs + cols, y.to(qo_ptr.dtype.element_ty), mask=q_store_mask)
-        tl.store(ko_ptr + k_row * k_out_rs + cols, y.to(ko_ptr.dtype.element_ty), mask=k_store_mask)
+        tl.store(
+            qo_ptr + q_row[:, None] * HN + cols[None, :],
+            y.to(qo_ptr.dtype.element_ty),
+            mask=q_mask,
+        )
+        tl.store(
+            ko_ptr + k_row[:, None] * HN + cols[None, :],
+            y.to(ko_ptr.dtype.element_ty),
+            mask=k_mask,
+        )
 
 
 def fused_qk_rmsnorm(
@@ -154,8 +179,9 @@ def fused_qk_rmsnorm(
 
     n_q_rows = q2.shape[0]
     n_rows = n_q_rows + k2.shape[0]
+    assert qo2.stride(0) == hn and ko2.stride(0) == hn  # the kernel stores at stride HN
 
-    _fused_qk_rmsnorm_kernel[(n_rows,)](
+    _fused_qk_rmsnorm_kernel[(triton.cdiv(n_rows, ROWS_PER_CTA),)](
         q2,
         k2,
         qo2,
@@ -163,10 +189,9 @@ def fused_qk_rmsnorm(
         weight_q,
         weight_k,
         n_q_rows,
+        n_rows,
         q2.stride(0),
         k2.stride(0),
-        qo2.stride(0),
-        ko2.stride(0),
         float(eps),
         0,
         HN=hn,
@@ -174,7 +199,8 @@ def fused_qk_rmsnorm(
         Q_GROUPED=False,
         NPG=1,
         HEADS=1,
-        num_warps=1,
+        ROWS=ROWS_PER_CTA,
+        num_warps=NUM_WARPS,
     )
     return qo, ko
 
@@ -224,8 +250,9 @@ def fused_qk_rmsnorm_grouped(
 
     n_q_rows = sq * b * heads
     n_rows = n_q_rows + k2.shape[0]
+    assert qo2.stride(0) == hn and ko2.stride(0) == hn  # the kernel stores at stride HN
 
-    _fused_qk_rmsnorm_kernel[(n_rows,)](
+    _fused_qk_rmsnorm_kernel[(triton.cdiv(n_rows, ROWS_PER_CTA),)](
         grouped_query,
         k2,
         qo2,
@@ -233,10 +260,9 @@ def fused_qk_rmsnorm_grouped(
         weight_q,
         weight_k,
         n_q_rows,
+        n_rows,
         0,  # unused: grouped q rows have no single stride
         k2.stride(0),
-        qo2.stride(0),
-        ko2.stride(0),
         float(eps),
         grouped_query.stride(2),
         HN=hn,
@@ -244,7 +270,8 @@ def fused_qk_rmsnorm_grouped(
         Q_GROUPED=True,
         NPG=npg,
         HEADS=heads,
-        num_warps=1,
+        ROWS=ROWS_PER_CTA,
+        num_warps=NUM_WARPS,
     )
     return qo, ko
 
