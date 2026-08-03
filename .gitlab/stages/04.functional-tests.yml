@@ -428,6 +428,9 @@ functional:run_nemo:
       allow_failure: true
     - when: never
 
+# Sole root Slack notification for functional MR, nightly, weekly, and release
+# pipelines. Detailed triage and Linear updates reply in the thread recorded by
+# slack_notification.json; individual workload runners must not notify directly.
 functional:x_notify:
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
