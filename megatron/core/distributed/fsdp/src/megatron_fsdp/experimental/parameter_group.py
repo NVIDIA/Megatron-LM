@@ -26,7 +26,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Flat, Partial, Placements, Replicate, changed_mesh_axis
+from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -62,7 +62,6 @@ class FsdpParameterGroup:
     mesh: DeviceMesh
     dtype: torch.dtype
     requires_grad: bool
-    is_first_microbatch: bool
     main_weight: DBuffer
     model_weight: DBuffer
     main_grad: DBuffer | None
@@ -116,7 +115,6 @@ class FsdpParameterGroup:
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
-        self.is_first_microbatch = True
         for parameter, fqns in parameter_to_fqns.items():
             if parameter.dtype != self.dtype:
                 raise ValueError(
@@ -179,11 +177,13 @@ class FsdpParameterGroup:
                     dtype=grad_dtype,
                     device=self.main_weight.device,
                 )
-                self.main_grad.local_buffer.zero_()
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
+            # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
+            # is finalized to main_weight's placements after the last microbatch.
+            self._accumulation_placements = main_grad_placements
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -337,58 +337,60 @@ class FsdpParameterGroup:
     ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
-        main_grad remains in the gradient placements across optimizer steps. The
-        last microbatch produces a separate optimizer gradient when its placements
-        differ from main_grad.
+        For HSDP main_grad rests DP-outer-Partial (Partial where main_weight is
+        Replicate) between microbatches, accumulating each backward through the
+        standard zero_grad contract; the last microbatch reduces the DP-outer axes,
+        finalizing main_grad to main_weight's placements so ``.grad`` is the fully
+        reduced gradient before ``optimizer.step()``. With every axis Flat (plain
+        DP) main_grad already rests finalized.
         """
         assert self.main_grad is not None
 
-        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
-        if reduce_axis is None:
-            assert isinstance(self.main_grad.placements[-1], Partial), (
-                "The last placement must be Partial"
+        # zero_grad(set_to_none=True) clears sharded parameter grads, so this
+        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
+        # leaves sharded grads installed, so this backward accumulates into main_grad.
+        has_sharded_grads = self._has_sharded_grads()
+
+        # A non-accumulation main_grad means the previous step finalized it; this
+        # only happens on the first microbatch. Start with fresh accumulation storage
+        # rather than trying to redistribute a Flat optimizer shard back to Partial.
+        if self.main_grad.placements != self._accumulation_placements:
+            self.main_grad = DBuffer(
+                mesh=self.mesh,
+                placements=self._accumulation_placements,
+                tensor_shapes=self.main_weight.layout.tensor_shapes,
+                dtype=self.main_grad.dtype,
+                device=self.main_weight.device,
             )
-            if self.is_first_microbatch:
-                self.main_grad.local_buffer.copy_(partial_grad.local_buffer)
-            else:
-                self.main_grad.local_buffer.add_(partial_grad.local_buffer)
-        else:
-            can_reduce_into_main_grad = (
-                self.is_first_microbatch and partial_grad.dtype == self.main_grad.dtype
-            )
-            partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-            grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
-            if self._symm_mem_pool is not None:
-                partial_grad.rendezvous(reduce_axis)
-            if can_reduce_into_main_grad:
+            has_sharded_grads = False
+
+        # Without an installed gradient, main_grad can be overwritten directly.
+        if not has_sharded_grads:
+            if partial_grad.dtype == self.main_grad.dtype:
+                # Write directly into main_grad without an intermediate buffer.
                 partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-                if grad_divisor != 1:
-                    self.main_grad.local_buffer.div_(grad_divisor)
             else:
+                # Materialize separately, then copy to convert to main_grad's dtype.
+                # No-shard/ZeRO-1 remains Partial with no communication;
+                # ZeRO-2/3 changes Partial to Flat with reduce-scatter.
                 reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-                if grad_divisor != 1:
-                    reduced_grad.local_buffer.div_(grad_divisor)
-                if self.is_first_microbatch:
-                    self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
-                else:
-                    self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
-
-        optimizer_grad = self.main_grad
-        if is_last_microbatch:
-            optimizer_grad = self.main_grad.redistribute(self.main_weight.placements)
-            if optimizer_grad is not self.main_grad:
-                self.main_grad.local_buffer.zero_()
-
-        # Install the accumulation grad between microbatches and the finalized grad
-        # for optimizer.step() after the last microbatch.
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = optimizer_grad.get_dtensor(index)
-
-        if is_last_microbatch:
-            # Reset for the first microbatch of the next accumulation cycle.
-            self.is_first_microbatch = True
+                self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
         else:
-            self.is_first_microbatch = False
+            # Preserve installed-gradient semantics by accumulating the reduced result.
+            # No-shard/ZeRO-1 remains Partial with no communication;
+            # ZeRO-2/3 changes Partial to Flat with reduce-scatter.
+            reduced_grad = partial_grad.redistribute(self.main_grad.placements)
+            self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+
+        if is_last_microbatch:
+            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
+            # reduce-scatter for HFSDP) before binding the sharded parameter grads.
+            self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
+
+        # Make each sharded parameter's .grad consistent with the final main_grad.
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
     """Resolve a root-module-relative parameter FQN to its direct owner."""
