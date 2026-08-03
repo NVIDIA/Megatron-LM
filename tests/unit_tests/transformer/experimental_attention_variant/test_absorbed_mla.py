@@ -621,8 +621,7 @@ def test_quantized_up_proj_recompute_parity(
     # and by test_functionality.
     threshold = 0.9 if quant_overrides.get("fp4") else 0.99
     cosine_sim = torch.nn.functional.cosine_similarity(
-        recomputed_output.flatten().float().unsqueeze(0),
-        bf16_output.flatten().float().unsqueeze(0),
+        recomputed_output.flatten().float().unsqueeze(0), bf16_output.flatten().float().unsqueeze(0)
     ).item()
     assert (
         cosine_sim > threshold
