@@ -142,26 +142,44 @@ def _build_expert_linear(implementation: str, config: TransformerConfig) -> torc
 
 
 @pytest.mark.parametrize(
-    ("tensor_model_parallel_size", "expert_tensor_parallel_size"), [(2, 1), (1, 2)]
+    (
+        "tensor_model_parallel_size",
+        "expert_tensor_parallel_size",
+        "gtp_weight_remat_size",
+        "expert_gtp_weight_remat_size",
+    ),
+    [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 1, 2)],
 )
 @pytest.mark.parametrize(
     "implementation", ["native", "transformer_engine", "transformer_engine_grouped"]
 )
 def test_expert_grad_sync_uses_expert_data_parallel_group(
-    implementation: str, tensor_model_parallel_size: int, expert_tensor_parallel_size: int
+    implementation: str,
+    tensor_model_parallel_size: int,
+    expert_tensor_parallel_size: int,
+    gtp_weight_remat_size: int,
+    expert_gtp_weight_remat_size: int,
 ):
-    """Expert gradients must not be reduced over ordinary DP when ETP differs from TP."""
+    """Expert gradients must use expert DP when the expert and dense topologies differ."""
+    if expert_gtp_weight_remat_size > 1:
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if not HAVE_GTP:
+            pytest.skip("GTP requires TransformerEngine >= 2.19")
     if Utils.world_size < 4 or Utils.world_size % 4 != 0:
         pytest.skip("Test requires a world size divisible by four")
     if Utils.world_size > 16:
         pytest.skip("Rank-encoded gradients are intended for small unit-test world sizes")
 
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tensor_model_parallel_size,
-        expert_model_parallel_size=1,
-        expert_tensor_parallel_size=expert_tensor_parallel_size,
-    )
     try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+            gtp_remat_size=gtp_weight_remat_size,
+            expert_gtp_remat_size=expert_gtp_weight_remat_size,
+        )
+
         # Per-token loss leaves DDP's pre-collective gradient scaling at one.
         config = TransformerConfig(
             num_layers=1,
@@ -174,6 +192,10 @@ def test_expert_grad_sync_uses_expert_data_parallel_group(
             tensor_model_parallel_size=tensor_model_parallel_size,
             expert_model_parallel_size=1,
             expert_tensor_parallel_size=expert_tensor_parallel_size,
+            tensor_parallel_num_weight_shards=(tensor_model_parallel_size * gtp_weight_remat_size),
+            expert_tensor_parallel_num_weight_shards=(
+                expert_tensor_parallel_size * expert_gtp_weight_remat_size
+            ),
             calculate_per_token_loss=True,
             gradient_accumulation_fusion=False,
             perform_initialization=False,
@@ -194,7 +216,7 @@ def test_expert_grad_sync_uses_expert_data_parallel_group(
         )
 
         expert_dp_group = parallel_state.get_expert_data_parallel_group(
-            partial_expert_data_parallel=True
+            with_gtp_remat=False, partial_expert_data_parallel=True
         )
         ordinary_dp_group = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=True
@@ -222,6 +244,10 @@ def test_expert_grad_sync_uses_expert_data_parallel_group(
         assert len(model.expert_parallel_buffers) == 1
         assert all(param.allreduce is False for param in model.parameters())
     finally:
+        if expert_gtp_weight_remat_size > 1:
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import reset_gtp_state
+
+            reset_gtp_state()
         Utils.destroy_model_parallel()
 
 

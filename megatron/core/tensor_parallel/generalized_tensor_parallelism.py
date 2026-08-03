@@ -507,11 +507,14 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
     gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
-    # Preserve the source weight's TP attributes (dropped when wrapping into GTPShardedParam),
-    # so param_is_not_tensor_parallel_duplicate still classifies it without GTP-specific code.
-    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+    # Preserve duplicate-filtering metadata dropped when wrapping into GTPShardedParam.
+    from megatron.core.tensor_parallel import (
+        copy_gtp_attributes,
+        copy_tensor_model_parallel_attributes,
+    )
 
     copy_tensor_model_parallel_attributes(gtp_shard, param)
+    copy_gtp_attributes(gtp_shard, param)
     return gtp_shard
 
 
@@ -545,10 +548,14 @@ def _gtp_wrap_bf16_shard(module, name, param):
     :func:`_gtp_slice_one_param`, which slices a full weight — this only wraps it, no slicing.
     Returns the new param (also swapped into the module).
     """
-    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+    from megatron.core.tensor_parallel import (
+        copy_gtp_attributes,
+        copy_tensor_model_parallel_attributes,
+    )
 
     gtp_shard = GTPShardedParam(param.data)
     copy_tensor_model_parallel_attributes(gtp_shard, param)
+    copy_gtp_attributes(gtp_shard, param)
     delattr(module, name)
     module._parameters[name] = gtp_shard
     return gtp_shard
