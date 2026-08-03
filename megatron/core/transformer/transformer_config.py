@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from dataclasses import asdict, dataclass, field, fields
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -1207,31 +1207,65 @@ class TransformerConfig(ModelParallelConfig):
 
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture).
-    Automatically enabled by `_validate_moe_per_layer_lists` when any
-    `*_per_layer` list below is set."""
+    Automatically enabled by `_validate_per_layer_config_overrides` when
+    `per_layer_config_overrides` or `mtp_per_layer_config_overrides` is set."""
 
     hetereogenous_dist_checkpoint: bool = False
     """Whether to use heterogenous layers in distributed checkpoint."""
 
-    ffn_hidden_size_per_layer: Optional[List[int]] = None
-    """Per-layer override for `ffn_hidden_size`. Length must equal `num_layers`.
-    Use `-1` on layers that should keep the global value (e.g. non-MLP layers)."""
+    # -----------------------------------------------------------------------------
+    # Sparse per-layer overrides. Each entry is a dict mapping a whitelisted config
+    # field name to its override value; missing keys leave the global value in
+    # place. Shape matches HF configs like Nemotron-H Puzzle's `block_configs` /
+    # `mtp_block_configs`, so bridge mapping is 1:1. See
+    # `_ALLOWED_PER_LAYER_OVERRIDE_KEYS` for the whitelist.
+    # -----------------------------------------------------------------------------
 
-    moe_ffn_hidden_size_per_layer: Optional[List[int]] = None
-    """Per-layer override for `moe_ffn_hidden_size`. Length must equal `num_layers`.
-    Use `-1` on layers that are not MoE."""
+    per_layer_config_overrides: Optional[List[Dict[str, Any]]] = None
+    """Sparse main-block per-layer overrides. Length must equal `num_layers`. Each
+    dict maps a whitelisted field name (see `_ALLOWED_PER_LAYER_OVERRIDE_KEYS`) to
+    its override; unknown keys raise at validation time to prevent silent
+    misconfiguration. `None` or `{}` for a layer means no override."""
 
-    num_moe_experts_per_layer: Optional[List[int]] = None
-    """Per-layer override for `num_moe_experts`. Length must equal `num_layers`.
-    Use `-1` on layers that are not MoE."""
+    mtp_pattern_length: Optional[int] = None
+    """Number of layers in one MTP depth's hybrid pattern (i.e. `len(mtp_pattern)`
+    after parsing `hybrid_layer_pattern`). Set by the CLI/provider after pattern
+    parsing so `_validate_per_layer_config_overrides` can length-check
+    `mtp_per_layer_config_overrides`. Orthogonal to `mtp_num_layers` (the MTP
+    depth count); all depths share the same per-position overrides, but each
+    depth's HybridStack has `mtp_pattern_length` layers regardless of how many
+    depths there are."""
 
-    moe_router_topk_per_layer: Optional[List[int]] = None
-    """Per-layer override for `moe_router_topk`. Length must equal `num_layers`.
-    Use `-1` on layers that are not MoE."""
+    mtp_per_layer_config_overrides: Optional[List[Dict[str, Any]]] = None
+    """Sparse per-position overrides applied inside every MTP depth's HybridStack.
+    Length must equal `mtp_pattern_length`. Same key whitelist as
+    `per_layer_config_overrides`."""
 
-    moe_shared_expert_intermediate_size_per_layer: Optional[List[int]] = None
-    """Per-layer override for `moe_shared_expert_intermediate_size`. Length must equal
-    `num_layers`. Use `-1` on layers that should disable/inherit the global value."""
+    _ALLOWED_PER_LAYER_OVERRIDE_KEYS: ClassVar[frozenset[str]] = frozenset({
+        # MLP / MoE
+        "ffn_hidden_size",
+        "moe_ffn_hidden_size",
+        "num_moe_experts",
+        "moe_router_topk",
+        "moe_shared_expert_intermediate_size",
+        # Mamba mixer (see megatron/core/ssm/mamba_mixer.py)
+        "mamba_state_dim",
+        "mamba_head_dim",
+        "mamba_num_groups",
+        "mamba_num_heads",
+    })
+    """Whitelist of TransformerConfig fields that may appear in per-layer override
+    dicts. Keeping this explicit avoids the `dict[str, Any]` phantom-key smell:
+    a typo raises at validation time instead of silently no-op'ing."""
+
+    _NONE_ALLOWED_OVERRIDE_KEYS: ClassVar[frozenset[str]] = frozenset({
+        # Disables the shared expert branch for this layer.
+        "moe_shared_expert_intermediate_size",
+        # `None` means "auto-compute nheads from d_inner // headdim".
+        "mamba_num_heads",
+    })
+    """Subset of override keys that additionally accept `None` as an explicit value.
+    All other whitelisted keys must be positive ints."""
 
     ####################
     # Quantization
@@ -2975,107 +3009,152 @@ class TransformerConfig(ModelParallelConfig):
                     "Disable MoE capacity/expert padding."
                 )
 
-        self._validate_moe_per_layer_lists()
+        self._validate_per_layer_config_overrides()
 
-    def _validate_moe_per_layer_lists(self) -> None:
-        """Validate per-layer MoE / MLP hidden-size lists and enable heterogeneous specs.
+    def _validate_per_layer_config_overrides(self) -> None:
+        """Validate sparse per-layer override lists and enable heterogeneous specs.
 
-        Each `*_per_layer` list, when set, must have length equal to `num_layers` and
-        contain either `-1` (no override for that layer) or a strictly positive integer.
-        If any list is set, `heterogeneous_block_specs` is flipped to True so downstream
-        block builders route per-layer configs through `get_config_for_layer`.
+        `per_layer_config_overrides` length must equal `num_layers`.
+        `mtp_per_layer_config_overrides` length must equal `mtp_pattern_length`
+        (number of positions in one MTP depth's pattern) — orthogonal to
+        `mtp_num_layers` (the number of MTP depths). All depths share the same
+        per-position overrides. Every key in every override dict must appear in
+        `_ALLOWED_PER_LAYER_OVERRIDE_KEYS`; typos raise instead of silently
+        no-op'ing. If either list is set, `heterogeneous_block_specs` is flipped to
+        True so downstream block builders route per-layer configs through
+        `get_config_for_layer` / `get_config_for_mtp_layer`.
         """
-        per_layer_fields = [
-            "ffn_hidden_size_per_layer",
-            "moe_ffn_hidden_size_per_layer",
-            "num_moe_experts_per_layer",
-            "moe_router_topk_per_layer",
-            "moe_shared_expert_intermediate_size_per_layer",
-        ]
+
+        def _validate_override_entries(
+            field_name: str, entries: List[Optional[Dict[str, Any]]]
+        ) -> None:
+            for i, entry in enumerate(entries):
+                if entry is None:
+                    continue
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"{field_name}[{i}] must be a dict or None, got {type(entry)}."
+                    )
+                unknown = set(entry.keys()) - self._ALLOWED_PER_LAYER_OVERRIDE_KEYS
+                if unknown:
+                    raise ValueError(
+                        f"{field_name}[{i}] has unknown override keys: {sorted(unknown)}. "
+                        f"Allowed: {sorted(self._ALLOWED_PER_LAYER_OVERRIDE_KEYS)}."
+                    )
+                for key, value in entry.items():
+                    none_allowed = key in self._NONE_ALLOWED_OVERRIDE_KEYS
+                    if value is None:
+                        if not none_allowed:
+                            raise ValueError(
+                                f"{field_name}[{i}][{key!r}] does not accept None; "
+                                "must be a positive int."
+                            )
+                    elif not isinstance(value, int) or value <= 0:
+                        suffix = " or None" if none_allowed else ""
+                        raise ValueError(
+                            f"{field_name}[{i}][{key!r}] must be a positive int{suffix}, "
+                            f"got {value!r}."
+                        )
 
         has_per_layer = False
-        for field_name in per_layer_fields:
-            values = getattr(self, field_name)
-            if values is None:
-                continue
+
+        if self.per_layer_config_overrides is not None:
             has_per_layer = True
             # HybridModelProvider defers num_layers derivation until finalize(); only
             # length-check when num_layers is available.
-            if self.num_layers is not None and len(values) != self.num_layers:
+            if (
+                self.num_layers is not None
+                and len(self.per_layer_config_overrides) != self.num_layers
+            ):
                 raise ValueError(
-                    f"{field_name} length ({len(values)}) must match num_layers "
+                    f"per_layer_config_overrides length "
+                    f"({len(self.per_layer_config_overrides)}) must match num_layers "
                     f"({self.num_layers})."
                 )
-            for value in values:
-                if not isinstance(value, int):
-                    raise ValueError(f"All values in {field_name} must be ints, got {type(value)}.")
-                if value != -1 and value <= 0:
-                    raise ValueError(
-                        f"All values in {field_name} must be -1 or > 0, got {value}."
-                    )
+            _validate_override_entries(
+                "per_layer_config_overrides", self.per_layer_config_overrides
+            )
+
+        # MTP per-position lists are validated against `mtp_pattern_length`, which
+        # the CLI/provider populates after parsing `hybrid_layer_pattern`. Callers
+        # that build a HybridModel without going through the CLI parser can leave it
+        # unset; length checks are then deferred to the HybridStack builder.
+        # NOTE: `mtp_pattern_length` (positions per depth) and `mtp_num_layers`
+        # (number of depths) are orthogonal axes — no cross-check between them.
+        if self.mtp_per_layer_config_overrides is not None:
+            has_per_layer = True
+            if (
+                self.mtp_pattern_length is not None
+                and len(self.mtp_per_layer_config_overrides) != self.mtp_pattern_length
+            ):
+                raise ValueError(
+                    f"mtp_per_layer_config_overrides length "
+                    f"({len(self.mtp_per_layer_config_overrides)}) must match "
+                    f"mtp_pattern_length ({self.mtp_pattern_length})."
+                )
+            _validate_override_entries(
+                "mtp_per_layer_config_overrides", self.mtp_per_layer_config_overrides
+            )
 
         if has_per_layer:
             self.heterogeneous_block_specs = True
 
+    def _apply_overrides(
+        self, overrides: Optional[Dict[str, Any]]
+    ) -> "TransformerConfig":
+        """Return a config with `overrides` applied via `dataclasses.replace`.
+
+        Uses `replace` (not `asdict`) so ProcessGroup / ProcessGroupCollection handles
+        carried on subclasses like HybridModelProvider are passed by reference
+        instead of triggering a deepcopy that fails on distributed handles. The
+        returned instance preserves the concrete subclass, and both override lists
+        are nulled out so no code that inspects it can accidentally recurse through
+        `get_config_for_layer` / `get_config_for_mtp_layer`.
+        """
+        if not overrides:
+            return self
+        from dataclasses import replace as _dc_replace
+
+        keys_to_update = dict(overrides)
+        keys_to_update.setdefault("heterogeneous_block_specs", False)
+        keys_to_update.setdefault("per_layer_config_overrides", None)
+        keys_to_update.setdefault("mtp_per_layer_config_overrides", None)
+        return _dc_replace(self, **keys_to_update)
+
     def get_config_for_layer(self, layer_number: int) -> "TransformerConfig":
-        """Return a per-layer transformer config with `*_per_layer` overrides applied.
+        """Return a per-layer transformer config with main-block overrides applied.
 
         `layer_number` is 1-indexed and interpreted against the global layer numbering
         used by hybrid/transformer block builders.
         """
+        if self.per_layer_config_overrides is None:
+            return self
         layer_idx = layer_number - 1
         if layer_idx < 0 or layer_idx >= self.num_layers:
             raise ValueError(
                 f"Invalid layer_number={layer_number}. Must be in [1, {self.num_layers}]."
             )
+        return self._apply_overrides(self.per_layer_config_overrides[layer_idx])
 
-        keys_to_update: dict = {}
+    def get_config_for_mtp_layer(self, layer_number: int) -> "TransformerConfig":
+        """Return a per-position transformer config for an MTP HybridStack layer.
 
-        if self.num_moe_experts_per_layer is not None:
-            value = self.num_moe_experts_per_layer[layer_idx]
-            if value != -1:
-                keys_to_update["num_moe_experts"] = value
-        if self.ffn_hidden_size_per_layer is not None:
-            value = self.ffn_hidden_size_per_layer[layer_idx]
-            if value != -1:
-                keys_to_update["ffn_hidden_size"] = value
-        if self.moe_ffn_hidden_size_per_layer is not None:
-            value = self.moe_ffn_hidden_size_per_layer[layer_idx]
-            if value != -1:
-                keys_to_update["moe_ffn_hidden_size"] = value
-        if self.moe_router_topk_per_layer is not None:
-            value = self.moe_router_topk_per_layer[layer_idx]
-            if value != -1:
-                keys_to_update["moe_router_topk"] = value
-        if self.moe_shared_expert_intermediate_size_per_layer is not None:
-            value = self.moe_shared_expert_intermediate_size_per_layer[layer_idx]
-            keys_to_update["moe_shared_expert_intermediate_size"] = (
-                None if value == -1 else value
-            )
-
-        if not keys_to_update:
+        `layer_number` is 1-indexed against the MTP HybridStack (which restarts at
+        1 per depth with `pp_layer_offset=0`), so `layer_number - 1` is the position
+        within the MTP pattern. All MTP depths share the same per-position
+        overrides — see `mtp_pattern_length` for the axis definition.
+        """
+        if self.mtp_per_layer_config_overrides is None:
             return self
-
-        # Use `dataclasses.replace` (not asdict) so:
-        #  * ProcessGroup / ProcessGroupCollection handles carried on subclasses like
-        #    HybridModelProvider are passed by reference instead of triggering a
-        #    deepcopy that fails on distributed handles.
-        #  * The returned instance preserves the concrete subclass, so downstream
-        #    code that reads Hybrid/MLA-specific fields still finds them.
-        # We also null out the per-layer lists on the returned instance so no code
-        # that inspects it can accidentally recurse through get_config_for_layer.
-        from dataclasses import replace as _dc_replace
-
-        keys_to_update.setdefault("heterogeneous_block_specs", False)
-        for name in (
-            "ffn_hidden_size_per_layer",
-            "moe_ffn_hidden_size_per_layer",
-            "num_moe_experts_per_layer",
-            "moe_router_topk_per_layer",
-            "moe_shared_expert_intermediate_size_per_layer",
+        layer_idx = layer_number - 1
+        if self.mtp_pattern_length is not None and (
+            layer_idx < 0 or layer_idx >= self.mtp_pattern_length
         ):
-            keys_to_update.setdefault(name, None)
-        return _dc_replace(self, **keys_to_update)
+            raise ValueError(
+                f"Invalid mtp layer_number={layer_number}. Must be in "
+                f"[1, {self.mtp_pattern_length}]."
+            )
+        return self._apply_overrides(self.mtp_per_layer_config_overrides[layer_idx])
 
 
 @dataclass

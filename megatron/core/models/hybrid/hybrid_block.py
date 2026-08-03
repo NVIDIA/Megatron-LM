@@ -128,13 +128,18 @@ class HybridStack(MegatronModule):
             # MoE topk / moe_ffn_hidden_size), resolve a layer-specific config; this
             # mirrors how transformer_block.py handles heterogeneous_block_specs.
             #
-            # Skip per-layer resolution for MTP HybridStacks: MTP layer_number restarts
-            # at 1 with pp_layer_offset=0, so indexing into main-block per-layer lists
-            # would return the wrong (main-block) layer's config. MTP layers instead
-            # consume the scalar `moe_ffn_hidden_size` / `moe_router_topk` on the
-            # global config, which the caller should populate with the MTP MoE values.
-            if self.config.heterogeneous_block_specs and not is_mtp_layer:
-                layer_config = self.config.get_config_for_layer(layer_number)
+            # MTP HybridStacks route through the MTP-specific resolver instead of the
+            # main-block one: MTP layer_number restarts at 1 with pp_layer_offset=0,
+            # so indexing into main-block per-layer lists would return the wrong
+            # layer's config. The MTP resolver indexes `mtp_*_per_layer` lists sized
+            # to `mtp_pattern_length` (positions within one MTP depth). All MTP
+            # depths share the same per-position overrides, matching Nemotron-H
+            # Puzzle's `mtp_block_configs`.
+            if self.config.heterogeneous_block_specs:
+                if is_mtp_layer:
+                    layer_config = self.config.get_config_for_mtp_layer(layer_number)
+                else:
+                    layer_config = self.config.get_config_for_layer(layer_number)
             else:
                 layer_config = self.config
             if layer_config.fp8:
