@@ -265,7 +265,7 @@ class DSGQAttention(DSAttention):
     """
 
     def forward(self, query, key, value, attention_mask, x=None, qr=None, **kwargs):
-        """Fill x/qr from stashed hidden states when the base forward omits them."""
+        """Fill x/qr from stashed hidden states and expand GQA K/V to full heads."""
         if x is None:
             x = getattr(self, "_dsa_hidden_states", None)
         if qr is None:
@@ -275,6 +275,19 @@ class DSGQAttention(DSAttention):
                 "DSGQAttention has no hidden states to use as DSA x/qr. Expected "
                 "DSGQASelfAttention to stash them via get_query_key_value_tensors."
             )
+        # Main's reference DSA path (compute_dsa_indexer_loss + unfused_dsa_fn)
+        # requires one KV head per query head (MQA nk==1 or MHA nk==np); it does
+        # not do genuine GQA head-grouping. Expand GQA K/V [s, b, nk, h] ->
+        # [s, b, np, h] by repeating each group's head (contiguous grouping: query
+        # head i attends KV group i // (np // nk)). NB: this materializes MHA-sized
+        # K/V — the memory-efficient GQA path is the (later) Triton kernel.
+        if value is not None:
+            nq = query.size(2)
+            nk = key.size(2)
+            if nk != nq and nk > 0 and nq % nk == 0:
+                rep = nq // nk
+                key = key.repeat_interleave(rep, dim=2)
+                value = value.repeat_interleave(rep, dim=2)
         return super().forward(query, key, value, attention_mask, x, qr, **kwargs)
 
 
