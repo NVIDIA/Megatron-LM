@@ -2454,6 +2454,7 @@ def setup_model_and_optimizer(
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
             )
         else:
             assert (
@@ -3292,9 +3293,14 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        # Sequence-packing schedulers may change the number of microbatches for
-        # this step, so scale by the count returned from train_step.
-        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
+        if args.calculate_per_token_loss:
+            # The tracker already reduces raw loss sums and token counts into a
+            # per-token loss, matching the main loss normalization path.
+            mtp_loss_scale = 1.0
+        else:
+            # Legacy mode accumulates microbatch-normalized losses, so average
+            # by the scheduled microbatch count for this step.
+            mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -3309,7 +3315,11 @@ def training_log(
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
             num_layers=args.num_layers + (args.mtp_num_layers or 0),
-            csa_compress_ratios=args.csa_compress_ratios,
+            num_indexer_layers=(
+                sum(ratio == 4 for ratio in args.csa_compress_ratios)
+                if args.csa_compress_ratios is not None
+                else None
+            ),
             preserve_groups=args.cuda_graph_impl != "none",
         )
 

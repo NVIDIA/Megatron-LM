@@ -2,17 +2,20 @@
 """Deferred weight-gradient (``delay_wgrad_compute``) flush tests for the CSA and DSA
 experimental attention variants.
 
-Under ``delay_wgrad_compute=True`` every TE linear built from the shared config defers
-its weight gradient until an explicit ``backward_dw()`` call.  These tests verify that
+Under ``delay_wgrad_compute=True`` TE linears that execute their forward defer their
+weight gradient until an explicit ``backward_dw()`` call. Absorbed K/V up projections
+are an exception: absorption consumes their weights directly, so they must keep the
+plain autograd path. These tests verify that
 
 * ``DSv4HybridSelfAttention.backward_dw()`` traverses ``core_attention``
   (``CompressedSparseAttention`` -> ``Compressor`` / ``CSAIndexer``) so the six CSA
   compressor/indexer linears of a ratio-4 layer are flushed, and
-* ``MLASelfAttention.backward_dw()`` traverses ``core_attention`` (``DSAttention`` ->
-  ``DSAIndexer``) so the three DSA indexer linears are flushed,
+* ``AbsorbedMLASelfAttention.backward_dw()`` traverses ``core_attention``
+  (``DSAttention`` -> ``DSAIndexer``) so the three DSA indexer linears are flushed,
 
 i.e. after ``loss.backward()`` the deferred weights still have ``.grad is None`` and only
-after ``attn.backward_dw()`` do all of them (nested ones included) receive gradients.
+after ``attn.backward_dw()`` do all of them (nested ones included) receive gradients,
+while absorbed K/V up-projection gradients are already present and remain unchanged.
 """
 
 import operator
@@ -175,7 +178,7 @@ def _build_csa_attention(config, layer_number, pg_collection):
 
 
 def _build_dsa_attention(config, layer_number, pg_collection):
-    """Instantiate an MLASelfAttention with a DSAttention core from config."""
+    """Instantiate an AbsorbedMLASelfAttention with a DSAttention core from config."""
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
     from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
         get_dsa_module_spec_for_backend,
@@ -245,9 +248,7 @@ def _assert_all_grads_none(named_linears, stage):
 
 def _assert_all_grads_present(named_linears, stage):
     for name, linear in named_linears:
-        assert (
-            linear.weight.grad is not None
-        ), f"{stage}: {name}.weight.grad is None — backward_dw() did not flush this linear"
+        assert linear.weight.grad is not None, f"{stage}: {name}.weight.grad is None"
         assert torch.isfinite(linear.weight.grad).all(), f"{stage}: non-finite grad on {name}"
 
 
@@ -357,7 +358,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
 
 
 # ===========================================================================
-# TEST 2: dsa — three DSA indexer linears under MLASelfAttention
+# TEST 2: dsa — three DSA indexer linears under AbsorbedMLASelfAttention
 # ===========================================================================
 
 
@@ -368,7 +369,7 @@ class TestDSv4HybridCSADelayedWgradFlush:
     reason="delay_wgrad_compute requires TE >= 2.3.0 (older TE ignores the flag)",
 )
 class TestDSADelayedWgradFlush:
-    """MLASelfAttention.backward_dw() must flush the DSA indexer linears."""
+    """AbsorbedMLASelfAttention.backward_dw() must flush the DSA indexer linears."""
 
     @pytest.fixture(scope='class', autouse=True)
     def setup_method(self):
@@ -397,14 +398,23 @@ class TestDSADelayedWgradFlush:
             ("core_attention.indexer.linear_wk", indexer.linear_wk),
             ("core_attention.indexer.linear_weights_proj", indexer.linear_weights_proj),
         ]
-        # The MLA-level TE linears also defer (already flushed before the fix).
+        # MLA linears that execute their forward defer and are flushed by backward_dw().
         attention_level_linears = [
             ("linear_q_down_proj", attn.linear_q_down_proj),
             ("linear_q_up_proj", attn.linear_q_up_proj),
             ("linear_kv_down_proj", attn.linear_kv_down_proj),
-            ("linear_kv_up_proj", attn.linear_kv_up_proj),
             ("linear_proj", attn.linear_proj),
         ]
+        # Absorption reads K/V up-projection weights directly instead of executing
+        # the modules' forward methods. They therefore use plain autograd rather
+        # than TE's delayed-wgrad queue.
+        if attn._uses_combined_kv_up_projection:
+            absorbed_kv_up_linears = [("linear_kv_up_proj", attn.linear_kv_up_proj)]
+        else:
+            absorbed_kv_up_linears = [
+                ("linear_k_up_proj", attn.linear_k_up_proj),
+                ("linear_v_up_proj", attn.linear_v_up_proj),
+            ]
 
         hidden = (
             torch.randn(seq_len, batch_size, config.hidden_size, dtype=torch.bfloat16)
@@ -429,10 +439,20 @@ class TestDSADelayedWgradFlush:
         ), "indexer loss backward did not reach the indexer (k_norm has no grad)"
 
         _assert_all_grads_none(dsa_indexer_linears + attention_level_linears, "pre-flush")
+        _assert_all_grads_present(absorbed_kv_up_linears, "pre-flush")
+        absorbed_kv_up_grads = {
+            name: linear.weight.grad.detach().clone() for name, linear in absorbed_kv_up_linears
+        }
 
         attn.backward_dw()
 
         _assert_all_grads_present(dsa_indexer_linears + attention_level_linears, "post-flush")
+        for name, linear in absorbed_kv_up_linears:
+            torch.testing.assert_close(
+                linear.weight.grad,
+                absorbed_kv_up_grads[name],
+                msg=f"backward_dw() changed plain-autograd wgrad for {name}",
+            )
         # The indexer linears receive gradients exclusively through the indexer
         # loss (x/qr are detached in DSAttention.forward); ensure it contributed.
         _assert_any_grad_nonzero(dsa_indexer_linears, "post-flush")
@@ -440,7 +460,7 @@ class TestDSADelayedWgradFlush:
         # Same math, different timing: flushed wgrads must equal eager wgrads.
         _assert_flushed_grads_match_eager(
             attn,
-            dsa_indexer_linears + attention_level_linears,
+            dsa_indexer_linears + attention_level_linears + absorbed_kv_up_linears,
             _make_dsa_config,
             _build_dsa_attention,
             1,

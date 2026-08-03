@@ -34,6 +34,7 @@ from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -142,9 +143,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
+    needs_padding_mask = args.use_varlen_dataset and args.varlen_sbhd_validation
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
+        and not needs_padding_mask
         and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
     ):
         return None, None, None, None, None, None, None
@@ -153,6 +156,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = get_batch_on_this_tp_rank(
         data_iterator,
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        needs_padding_mask=needs_padding_mask,
     )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -186,6 +190,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             None,
         )
 
+    thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
@@ -195,9 +200,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch, cu_seqlens, cu_seqlens_padded, max_seqlen
         )
 
-    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    padding_mask = None
+    # Pad the already-packed THD tensors at the end when requested. A configured
+    # thd_max_packed_sequences also pads cu_seqlens to a fixed capacity in eager or graph mode.
+    # SBHD validation samples carry physical right-padding metadata. CP has
+    # already partitioned it with the other sequence-dimension tensors.
+    padding_mask = batch.pop('padding_mask', None)
     if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
         tokens = batch.get('tokens', None)
         labels = batch.get('labels', None)
@@ -219,7 +226,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
-                pad_by_appending_dummy_seq=config.pad_packed_seq_by_appending_dummy_seq,
+                tail_padding_policy=thd_tail_padding_policy,
+                padding_mask=padding_mask,
             )
         )
         if 'tokens' in batch:
@@ -397,7 +405,12 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or (
+        getattr(args, 'use_varlen_dataset', False)
+        and getattr(args, 'varlen_sbhd_validation', False)
+    ):
+        # Packed THD and SBHD validation both need padding metadata on every
+        # pipeline stage so each MoE layer excludes physical padding.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
         config, ignore_virtual=False, vp_stage=vp_stage
@@ -443,6 +456,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "dynamic_context_parallel": args.dynamic_context_parallel,
+        "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
         "varlen_sbhd_validation": args.varlen_sbhd_validation,
     }

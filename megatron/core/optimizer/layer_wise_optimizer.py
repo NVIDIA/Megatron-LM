@@ -1034,7 +1034,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if len(self.chained_optimizers) == 1:
             wrapped_state_dict = {1: state_dict}
         else:
-            wrapped_state_dict = state_dict
+            wrapped_state_dict = (
+                dict(enumerate(state_dict)) if isinstance(state_dict, list) else state_dict
+            )
         for sd in wrapped_state_dict.values():
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
                 logger.info('[layerwise] converting fp32_from_fp16_params from dict to list')
