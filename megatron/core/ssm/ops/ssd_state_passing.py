@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from megatron.core.ssm.ops.determinism import autotune_configs
+from megatron.core.tuning import autotune_configs
 
 
 @triton.autotune(
