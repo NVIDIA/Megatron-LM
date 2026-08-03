@@ -3048,10 +3048,22 @@ bit-exact candidates:
 | 4 | 4 | 6.15 | 767 | 1.34x |
 | **8** | **8** | **4.12** | **1146** | **2.00x** |
 
-In-tree the same shape measures **6.16 us**, not 4.12 -- a 2 us gap between the harness
-kernel and the shipped one at identical rows/warps that is **still unexplained**. Making
-the output row stride a constexpr was the obvious suspect (the harness had it as one) and
-did not move the number. Open item; there is another ~0.1 ms/step behind it.
+In-tree the same shape measures **6.15 us**, not 4.12 -- a 2 us gap between the harness
+kernel and the shipped one at identical rows and warps that is **still unexplained** after
+three hypotheses, each tested and each measuring 6.15 us unchanged:
+
+| Hypothesis | Why it was plausible | Result |
+|---|---|---|
+| Runtime output row stride blocks store vectorization | the harness hardcoded `HN`, the kernel took a stride argument | rejected, 6.15 us |
+| `where(is_q, rows, 0)` in the store address hides contiguity | the harness addressed stores off the raw row index | rejected, 6.15 us |
+| Two separate load address arrays instead of one shared | the harness built a single `where`-selected offset array | rejected, 6.15 us |
+
+The two kernels are now near-identical in structure and still differ by a third. One
+oddity in the sweep worth chasing next: the times quantize to exactly three values
+(8.21 / 6.15 / 4.12 us) and rows=8 hit 4.12 us at *every* warp count, which is not how a
+bandwidth-bound kernel should behave and hints the difference is a compilation artifact
+rather than a shape effect. Comparing the two PTX/SASS dumps is the obvious next step and
+was not reached. Open item, worth ~0.1 ms/step.
 
 End-to-end, both arms from the same file so the launch shape is the only variable:
 1x1 controls **30,341 / 30,399** against 8x8 **30,482** tok/s, i.e. **+0.35%** on a
