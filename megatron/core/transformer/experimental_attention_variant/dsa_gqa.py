@@ -101,18 +101,26 @@ class DSGQAIndexer(DSAIndexer):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 
+        # rope_type / rotary_* are MLATransformerConfig fields; a plain GQA
+        # TransformerConfig lacks them (the GQA model gets its rope params from
+        # args, not config). Resolve with getattr defaults matching the standard
+        # RoPE setup.
+        self.rope_type = getattr(self.config, "rope_type", None) or "rope"
+        rotary_percent = getattr(self.config, "rotary_percent", 1.0)
+        rotary_base = getattr(self.config, "rotary_base", 10000)
+
         # Position embedding (over the full indexer head dim).
-        if self.config.rope_type == "rope":
+        if self.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
                 self.qk_pos_emb_head_dim,
-                rotary_percent=self.config.rotary_percent,
-                rotary_base=self.config.rotary_base,
+                rotary_percent=rotary_percent,
+                rotary_base=rotary_base,
                 cp_group=self.pg_collection.cp,
             )
-        elif self.config.rope_type == "yarn":
+        elif self.rope_type == "yarn":
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.qk_pos_emb_head_dim,
-                rotary_base=self.config.rotary_base,
+                rotary_base=rotary_base,
                 scaling_factor=self.config.rotary_scaling_factor,
                 original_max_position_embeddings=self.config.original_max_position_embeddings,
                 beta_fast=self.config.beta_fast,
@@ -197,7 +205,7 @@ class DSGQAIndexer(DSAIndexer):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
-        if self.config.rope_type == "rope":
+        if self.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
             mscale = 1.0
         else:
