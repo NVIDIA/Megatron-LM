@@ -525,6 +525,53 @@ class TestAccumulatorVirtualPipeline:
         assert total_real_tokens == (100 + 200) + 50
         assert seqlen_squared_sum == (100**2 + 200**2) + 50**2
 
+    @pytest.mark.parametrize("vp_size", [1, 2, 4, 8])
+    def test_reported_flops_are_invariant_to_virtual_pipeline_size(self, vp_size):
+        """The reported FLOPs must not depend on how the model is chunked.
+
+        This is the invariant the ``vp_stage`` gate exists to protect. The
+        interleaved schedule runs ``forward_step`` once per (micro-batch, model
+        chunk) and every chunk observes the same ``cu_seqlens`` for a given
+        micro-batch, while the closed-form formula already spans all
+        ``args.num_layers``. Chunking the model therefore must not change the
+        answer. Without the gate this fails with exactly ``vp_size``-fold
+        inflation.
+        """
+        args = _make_gpt_args()
+        num_microbatches = 3
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+
+        # ``virtual_pipeline_model_parallel_size == 1`` is normalized to None in
+        # arguments.py, and the non-interleaved schedule never sets a vp_stage.
+        for _ in range(num_microbatches):
+            for chunk in range(vp_size):
+                update_seqlen_stats_from_cu_seqlens(cu, vp_stage=None if vp_size == 1 else chunk)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+
+        # Each micro-batch counted exactly once, whatever vp_size is.
+        assert total_real_tokens == num_microbatches * (100 + 200)
+        assert seqlen_squared_sum == num_microbatches * (100**2 + 200**2)
+
+        flops = num_floating_point_operations(
+            args,
+            num_microbatches,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum,
+            total_real_tokens_in_batch=total_real_tokens,
+        )
+
+        # ... and the user-visible number matches the unchunked reference.
+        _reset_seqlen_accumulator()
+        for _ in range(num_microbatches):
+            update_seqlen_stats_from_cu_seqlens(cu, vp_stage=None)
+        ref_tokens, ref_squared_sum = consume_seqlen_stats_in_iteration()
+        reference_flops = num_floating_point_operations(
+            args,
+            num_microbatches,
+            seqlen_squared_sum_in_batch=ref_squared_sum,
+            total_real_tokens_in_batch=ref_tokens,
+        )
+        assert flops == reference_flops
+
 
 class TestAccumulatorDistributed:
     """SUM all-reduce scoped to the pure data-parallel group (CP excluded).
