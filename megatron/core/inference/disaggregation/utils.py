@@ -60,7 +60,10 @@ def transfer_block_count(peer_meta: Any, src_block_ids: List[int]) -> int:
 def drop_transfer_prefix_blocks(
     peer_meta: Any, src_block_ids: List[int], prefix_count: int
 ) -> Tuple[Any, List[int]]:
-    """Return transfer metadata with a sequence prefix removed."""
+    """Return transfer metadata with a sequence prefix removed.
+
+    Used when the decode engine reuses cached prefix blocks and only pulls the uncached suffix.
+    """
 
     if prefix_count == 0:
         return peer_meta, list(src_block_ids)
