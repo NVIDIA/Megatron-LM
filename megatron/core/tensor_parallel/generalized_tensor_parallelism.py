@@ -31,7 +31,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from packaging.version import Version
@@ -349,15 +349,21 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
-    Drains the eager AG/RS side streams, then waits on each CG runner's replay stream
-    (its tail = captured Phase 2 main_grad.add_). No-op when GTP is inactive.
+    Drains the eager AG/RS side streams, then — outside CUDA-graph capture — waits on each CG
+    runner's replay stream (its tail = captured Phase 2 main_grad.add_). Under whole-step capture
+    there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
+    # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
     for s in _AG_STREAMS.values():
         cur.wait_stream(s)
     for s in _RS_STREAMS.values():
         cur.wait_stream(s)
+    # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
+    # whole-step capture there are no runners, so stop here while capturing.
+    if torch.cuda.is_current_stream_capturing():
+        return
     # Local import: cuda_graphs imports this module, so a module-level import would be circular.
     from megatron.core.transformer.cuda_graphs import get_gtp_runner_streams
 
@@ -501,11 +507,14 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
     gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
-    # Preserve the source weight's TP attributes (dropped when wrapping into GTPShardedParam),
-    # so param_is_not_tensor_parallel_duplicate still classifies it without GTP-specific code.
-    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+    # Preserve duplicate-filtering metadata dropped when wrapping into GTPShardedParam.
+    from megatron.core.tensor_parallel import (
+        copy_gtp_attributes,
+        copy_tensor_model_parallel_attributes,
+    )
 
     copy_tensor_model_parallel_attributes(gtp_shard, param)
+    copy_gtp_attributes(gtp_shard, param)
     return gtp_shard
 
 
@@ -539,10 +548,14 @@ def _gtp_wrap_bf16_shard(module, name, param):
     :func:`_gtp_slice_one_param`, which slices a full weight — this only wraps it, no slicing.
     Returns the new param (also swapped into the module).
     """
-    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+    from megatron.core.tensor_parallel import (
+        copy_gtp_attributes,
+        copy_tensor_model_parallel_attributes,
+    )
 
     gtp_shard = GTPShardedParam(param.data)
     copy_tensor_model_parallel_attributes(gtp_shard, param)
+    copy_gtp_attributes(gtp_shard, param)
     delattr(module, name)
     module._parameters[name] = gtp_shard
     return gtp_shard
@@ -788,6 +801,9 @@ def _init_gtp_runtime_attrs(obj):
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
     obj._grad_accum_hook = None
+    # The weight's AccumulateGrad node (set by register_grad_accum_hook). Retained so the leaf
+    # lands on the capture stream for full-iteration CUDA-graph capture; None until DDP registers.
+    obj._grad_accum_node = None
     # Quantization. For native-FP8 GTP the reclass path overwrites _quantizer with the tensor's
     # own MXFP8 quantizer and points quantized at self; BF16 GTP leaves both unset.
     obj._quantizer = None
@@ -999,6 +1015,33 @@ class GTPShardedParam(torch.nn.Parameter):
             self._buf_parity = p
         return p
 
+    def _gather_buffer_identity(self, dtype) -> tuple:
+        """The part of the cache key that decides which weights share a gather buffer."""
+        return (self._unsharded_shape_padded, dtype, self.expert_idx)
+
+    def _ensure_distinct_buffer_from_prev(self, dtype):
+        """Move self to a second buffer if its chain predecessor would share one.
+
+        One-step-ahead prefetch keeps prev_w and self live at once, so sharing a buffer lets
+        self's gather clobber the weight prev_w's GEMM is still reading. Neighbours normally
+        differ in shape; a CUDA-graph-partitioned chain can leave two same-shaped weights
+        adjacent (embedding + output_layer alone in the UNGRAPHED chain).
+
+        Grouped chains use their own counter (``_GTP_GROUPED_BUF_PARITY_COUNTER``).
+        """
+        prev = self.prev_w
+        if prev is None or _chain_is_grouped(self.chain_id):
+            return
+        if self.is_routed_expert or prev.is_routed_expert:
+            return
+        if prev._cached_dtypes is None:  # never gathered — no buffer to collide with
+            return
+        if prev._gather_buffer_identity(prev._cached_dtypes[0]) != self._gather_buffer_identity(
+            dtype
+        ):
+            return
+        self._buf_parity = 1 - (getattr(prev, "_buf_parity", None) or 0)
+
     def _get_cache_key(self, dtype, fwd: bool, reduce_scatter: bool) -> tuple:
         """Build cache key from output shape + dtype.
 
@@ -1025,6 +1068,10 @@ class GTPShardedParam(torch.nn.Parameter):
             # chain_id keeps fc1/fc2 apart (both can be in flight at once, even if same-shaped);
             # parity alternates consecutive blocks between two buffers.
             key = key + (self.chain_id, self._double_buffer_parity())
+        elif getattr(self, "_buf_parity", None):
+            # Set by _ensure_distinct_buffer_from_prev. Parity 0 keeps the shared buffer, so
+            # only the second weight of an adjacent same-key pair costs an extra allocation.
+            key = key + (self._buf_parity,)
         return key
 
     def _strip_padding(self, tensor):
@@ -1423,6 +1470,9 @@ class GTPShardedParam(torch.nn.Parameter):
             dtypes = [
                 q.dtype if q is not None else w.dtype for q, w in zip(quantizers, self._weights)
             ]
+            # Must run before the reserve below — it decides which buffer the ticket gets.
+            self._ensure_distinct_buffer_from_prev(dtypes[0])
+
             for w, dt in zip(self._weights, dtypes):
                 w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
                 cache.get(w._ag_ticket_fwd)
@@ -1446,16 +1496,22 @@ class GTPShardedParam(torch.nn.Parameter):
         """Pool-allocate a wgrad scratch tensor of unsharded shape for the bwd GEMM."""
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
-    def register_grad_accum_hook(self, grad_accum_node, hook):
+    def register_grad_accum_hook(
+        self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
+    ) -> None:
         """Register a DDP backward hook to call after the wgrad RS finalize.
 
         For GTP params autograd may receive None (async RS), so the normal grad-accumulator
         hook never fires; the integrator (Graphed.backward for captured chains, or the eager
         chain-tail cascade) calls this hook explicitly after RS wait + accumulation, so DDP's
-        register_grad_ready fires at the right time. grad_accum_node is accepted for API
-        compatibility but not retained — only the hook callable.
+        register_grad_ready fires at the right time. We retain grad_accum_node (the weight's
+        AccumulateGrad) here. Keeping a live strong reference across the warmup->capture
+        boundary is what places the node on the capture stream for full-iteration CG; an
+        un-retained node stays stranded on the default stream and trips capture. The node is
+        not added to DDP's grad_accs (that list is for autograd-hooked nodes) and never gets
+        .register_hook'd, because grad-ready is fired manually via _grad_accum_hook.
         """
-        del grad_accum_node
+        self._grad_accum_node = grad_accum_node
         self._grad_accum_hook = hook
 
     @staticmethod
