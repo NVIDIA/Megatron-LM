@@ -2807,10 +2807,13 @@ stride-aware and takes no-copy `[-1, head_dim]` views. So the copy is **upstream
 norm**, between the QKV GEMM and it, and at 2.66 us it is about the size of a full
 round-trip of the QKV tensor (256 tok x 5120 x 2 B, read+write, at ~3 TB/s).
 
-The prime suspect is `SplitAlongDim` in `Attention.get_query_key_value_tensors`
-materializing q/k/v instead of returning views. **The test is one gated line**: take the
-`torch.split` branch instead and see whether the 48 copies/step disappear without a new
-copy appearing later (FA needs only last-dim contiguity, which the split views have).
+The prime suspect was `SplitAlongDim` in `Attention.get_query_key_value_tensors`
+materializing q/k/v instead of returning views. **Tested and eliminated**: taking the
+`torch.split` branch instead (`MCORE_QKV_SPLIT_VIEWS=1`, arm `u1qkvsplit`) gives
+29,307 tok/s against the 29,313 control -- exactly neutral. Either TE's split already
+returns views, or `torch.split` + the `[sq, b, np, hn]` reshape materializes the same
+bytes. The copy's source remains open; what is now known is that it is QKV-sized, sits
+between the QKV GEMM and the norm, and is not the split.
 
 A fourth attempt at naming it with `copy_trace` landed in prefill again -- it reported
 `rmsnorm.py:182 op_forward` doing `.contiguous()` on a strided `(512, 1, 4, 128)` K

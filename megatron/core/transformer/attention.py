@@ -67,6 +67,10 @@ from ..models.common.embeddings.yarn_rotary_pos_embedding import (
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
+# Split QKV with torch.split (views) instead of TE's SplitAlongDim. Under test as the
+# suspected source of one full-QKV-sized copy per decode layer; see COPY-ID-S18.
+_QKV_SPLIT_VIEWS: bool = os.environ.get("MCORE_QKV_SPLIT_VIEWS", "0") == "1"
+
 try:
     from einops import rearrange
 except ImportError:
@@ -1945,7 +1949,7 @@ class SelfAttention(Attention):
                 self.hidden_size_per_attention_head,
             ]
 
-            if SplitAlongDim is not None:
+            if SplitAlongDim is not None and not _QKV_SPLIT_VIEWS:
                 (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
                 (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
@@ -1962,7 +1966,7 @@ class SelfAttention(Attention):
             if not split_qkv:
                 return mixed_qkv, split_arg_list
 
-            if SplitAlongDim is not None:
+            if SplitAlongDim is not None and not _QKV_SPLIT_VIEWS:
                 (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
                 (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
