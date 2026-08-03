@@ -136,6 +136,7 @@ def _build_mixer(cp_group):
         d_model=config.hidden_size,
         layer_number=1,
         pg_collection=pg,
+        name="decoder.layers.0.mixer",
     )
     return mixer.cuda().bfloat16(), config
 

@@ -127,6 +127,7 @@ class GatedDeltaProductMixer(MegatronModule):
         layer_number: The layer number of this Mamba layer.
         pg_collection: The required process groups to use for tensor model parallel and context
             parallel.
+        name: Module instance name passed top-down from its parent module.
     """
 
     def __init__(
@@ -157,6 +158,7 @@ class GatedDeltaProductMixer(MegatronModule):
         ngroups=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
+        name: str | None = None,
     ):
         if not HAVE_MAMBA_SSM:
             raise ImportError(
@@ -220,6 +222,7 @@ class GatedDeltaProductMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            name=(name + f".in_proj") if name is not None else None,
         )
         setattr(self.in_proj.weight, "use_muon", False)
         if self.in_proj.bias is not None:
@@ -337,6 +340,7 @@ class GatedDeltaProductMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            name=(name + f".out_proj") if name is not None else None,
         )
 
         # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
