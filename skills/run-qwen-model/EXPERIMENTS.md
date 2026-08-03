@@ -2800,9 +2800,23 @@ name them with a `TorchDispatchMode` hook produced nothing usable:
 | 47 | `vectorized_elementwise_kernel<8>` (bf16 copy) | `_multimem_reduce_scatter_v` → `_fused_add_rmsnorm` | materializes the MoE output that the next kernel immediately reads |
 | 48 | `elementwise_kernel<128,4>` | QKV GEMM (`nvjet_*`) → `_fused_qk_rmsnorm` | contiguous copy of the strided Q/K slices |
 
-Both are removable without new math: have `_fused_add_rmsnorm` read the collective's
-output buffer directly, and make `_fused_qk_rmsnorm` stride-aware. Worth 0.232 ms of
-device time plus ~96 launches of gap ≈ 0.28 ms/step ≈ 3%, and both kernels are ours.
+The first one turned out to be a dtype symptom, not a fusion target, and is fixed in
+`QWEN-040` (+2.5%). The second is still open, and the guess in the first version of this
+entry -- "make `_fused_qk_rmsnorm` stride-aware" -- was wrong: that kernel is *already*
+stride-aware and takes no-copy `[-1, head_dim]` views. So the copy is **upstream of the
+norm**, between the QKV GEMM and it, and at 2.66 us it is about the size of a full
+round-trip of the QKV tensor (256 tok x 5120 x 2 B, read+write, at ~3 TB/s).
+
+The prime suspect is `SplitAlongDim` in `Attention.get_query_key_value_tensors`
+materializing q/k/v instead of returning views. **The test is one gated line**: take the
+`torch.split` branch instead and see whether the 48 copies/step disappear without a new
+copy appearing later (FA needs only last-dim contiguity, which the split views have).
+
+A fourth attempt at naming it with `copy_trace` landed in prefill again -- it reported
+`rmsnorm.py:182 op_forward` doing `.contiguous()` on a strided `(512, 1, 4, 128)` K
+tensor, which is TE's norm op on a 512-token prefill, not the decode copy. That is a
+real finding for prefill but not the one being chased, and it is the fourth time this
+hook has answered a different question than the one asked.
 
 > **Lesson on the failed hook.** `copy_trace` was armed three ways: on the first layer
 > forward (caught the one-time lazy expert-weight consolidation and reported 32 weight
