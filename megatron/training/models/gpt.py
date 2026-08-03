@@ -185,6 +185,9 @@ class GPTModelConfig(ModelConfig):
     ### settings for default layer spec options ###
     use_arbitrary_attention_mask: bool | None = None
 
+    use_fused_lce: bool = False
+    logits_split_chunks: int = 8
+
     @override
     def __getattr__(self, name: str, /) -> Any:
         # __getattr__ is only called when normal attribute lookup has already failed,
@@ -329,6 +332,8 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             post_process=post_process,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            use_fused_lce=self._model_config.use_fused_lce,
+            logits_split_chunks=self._model_config.logits_split_chunks
         )
 
         return model
