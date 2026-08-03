@@ -1740,6 +1740,12 @@ class CompressedSparseAttention(MegatronModule):
         if is_mtp_layer:
             self.layer_number = self.layer_number + self.config.num_layers
         self.compress_ratio = compress_ratio
+        # Benchmark NVTX tag: layer flavor by compress ratio (W / CSA / HCA).
+        self._nvtx_layer_tag = {
+            0: "attn_window_total",
+            4: "attn_csa_total",
+            128: "attn_hca_total",
+        }.get(compress_ratio, f"attn_csa_r{compress_ratio}_total")
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
@@ -2088,6 +2094,7 @@ class CompressedSparseAttention(MegatronModule):
             output: [sq, b, np * v_head_dim]
         """
         nvtx_range_push("compressed_sparse_attn")
+        nvtx_range_push(self._nvtx_layer_tag)
 
         _orig_cp_group = self.pg_collection.cp
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
@@ -2112,6 +2119,7 @@ class CompressedSparseAttention(MegatronModule):
             else:
                 output = self._forward_thd(query, key, x, qr, packed_seq_params)
             self.pg_collection.cp = _orig_cp_group
+            nvtx_range_pop(self._nvtx_layer_tag)
             nvtx_range_pop("compressed_sparse_attn")
             return output
 
@@ -2157,6 +2165,7 @@ class CompressedSparseAttention(MegatronModule):
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
         self.pg_collection.cp = _orig_cp_group
+        nvtx_range_pop(self._nvtx_layer_tag)
         nvtx_range_pop("compressed_sparse_attn")
         return output
 
@@ -2619,6 +2628,7 @@ class CompressedSparseAttention(MegatronModule):
                     raise RuntimeError(
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
+                nvtx_range_push("indexer_total")
                 # Switch 1: take the load-balanced CP path via config flag. Fall back to the
                 # contiguous path for CP<=1 or short sequences, where the redistribute overhead
                 # outweighs the imbalance savings.
@@ -2671,6 +2681,30 @@ class CompressedSparseAttention(MegatronModule):
 
                 bal_dispatch_mode = None
                 bal_dispatch_handle = None
+                bal_multi_seq = False
+                if use_balance:
+                    # Real (non-empty) segment count for this microbatch: one D2H sync,
+                    # cached on PackedSeqParams and reused by every layer.
+                    bal_multi_seq = getattr(packed_seq_params, "_dsa_cp_multi_seq", None)
+                    if bal_multi_seq is None:
+                        if torch.cuda.is_current_stream_capturing():
+                            # D2H is illegal during graph capture. CUDA graphs require
+                            # static shapes, so the verdict cannot change between the
+                            # eager warmup iterations and the captured ones: reuse the
+                            # last eager decision (kept on the module).
+                            bal_multi_seq = getattr(self, "_dsa_cp_multi_seq_eager", False)
+                        else:
+                            seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+                            nseg_real = int((seg_lens > 0).sum().item())
+                            total_real = int(cu_seqlens[-1].item())
+                            # "multi" here means "NOT a single sequence filling the whole
+                            # pack": the global folding is exactly balanced only in that
+                            # case; a single sequence with a capacity-padding tail is
+                            # unbalanced under folding (tail chunks land in the dead zone)
+                            # and belongs to the zigzag path.
+                            bal_multi_seq = not (nseg_real == 1 and total_real == cp_size * l_local)
+                            self._dsa_cp_multi_seq_eager = bal_multi_seq
+                        packed_seq_params._dsa_cp_multi_seq = bal_multi_seq
                 if use_balance:
                     from megatron.core.transformer.experimental_attention_variant import (
                         cp_balanced_indexer,
@@ -2686,7 +2720,15 @@ class CompressedSparseAttention(MegatronModule):
                         # compressor and compressed-K gather below instead of sitting on the
                         # critical path right before the top-k.
                         bal_dispatch_handle = cp_balanced_indexer.dispatch_chunks_async(
-                            indexer_qr, weights_indexer_cp, cp_group, cp_size, l_local
+                            indexer_qr,
+                            weights_indexer_cp,
+                            cp_group,
+                            cp_size,
+                            l_local,
+                            max_seqlen_q=max_seqlen_q,
+                            config=self.config,
+                            use_fused=self.use_fused_kernels,
+                            multi_seq=bal_multi_seq,
                         )
 
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
@@ -2739,6 +2781,7 @@ class CompressedSparseAttention(MegatronModule):
                             dispatch=bal_dispatch_mode,
                             dispatch_handle=bal_dispatch_handle,
                             layout_cache=bal_layout_cache,
+                            multi_seq=bal_multi_seq,
                         )
                     )
                 else:
@@ -2755,6 +2798,8 @@ class CompressedSparseAttention(MegatronModule):
                         max_seqlen_q=max_seqlen_q,
                         use_fused=self.use_fused_kernels,
                     )
+
+                nvtx_range_pop("indexer_total")
 
             # ---- Step 5: attention compressed KV path -------------------------
             compressed_kv_local, _ = self.compressor._forward_thd(
