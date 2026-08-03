@@ -40,6 +40,13 @@ except ImportError:
 
 ENABLED: bool = os.environ.get("MCORE_FLASHINFER_DECODE", "0") == "1"
 
+# Programmatic Dependent Launch lets this kernel's prologue start while its predecessor
+# drains. 855 of mcore's 934 per-step GPU gaps are sub-microsecond launch overhead
+# (GAP-S18), so it is worth an arm; left as a knob because PDL interacts with graph
+# capture and its benefit is hardware- and neighbour-dependent. None = flashinfer decides.
+_PDL_ENV = os.environ.get("MCORE_FLASHINFER_PDL", "")
+ENABLE_PDL: Optional[bool] = bool(int(_PDL_ENV)) if _PDL_ENV else None
+
 # vLLM sizes this at 128 MiB for the same kernel family.
 _WORKSPACE_BYTES: int = 128 * 1024 * 1024
 
@@ -117,5 +124,6 @@ def decode(
         bmm1_scale=softmax_scale,
         bmm2_scale=1.0,
         kv_layout="NHD",
+        enable_pdl=ENABLE_PDL,
     )
     return out.reshape(num_requests, tokens_per_request, *out.shape[1:])
