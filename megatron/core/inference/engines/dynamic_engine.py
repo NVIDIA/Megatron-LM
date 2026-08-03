@@ -2891,7 +2891,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.context.get_active_request_count() > 0 or self.waiting_request_ids:
                     await self.async_step()
                 else:
-                    await asyncio.sleep(0.02)
+                    # Transfer handles expose polling but no async completion
+                    # callback. Yield briefly without adding the normal 20 ms
+                    # idle-loop delay to decode admission.
+                    await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             pass
 

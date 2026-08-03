@@ -11,14 +11,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
-try:
-    import msgpack
-
-    HAVE_MSGPACK = True
-except ImportError:
-    msgpack = None
-    HAVE_MSGPACK = False
-
 from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotCapacityError
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
@@ -32,7 +24,6 @@ from megatron.core.inference.disaggregation.utils import (
     drop_transfer_prefix_blocks,
     transfer_block_count,
 )
-from megatron.core.inference.headers import Headers
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 if TYPE_CHECKING:
@@ -120,7 +111,15 @@ class InferenceStateHandoffMixin:
         return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
 
     def _reset_pending_kv_imports(self) -> None:
-        """Drain and release pending imports before an engine reset."""
+        """Drain and release pending handoff transfers before an engine reset."""
+
+        unsafe_pushes = []
+        if not hasattr(self, "_pending_kv_pushes"):
+            self._pending_kv_pushes = []
+        for request_id, handles in self._pending_kv_pushes:
+            if not self._wait_for_transfer_handles(*handles):
+                unsafe_pushes.append((request_id, handles))
+        self._pending_kv_pushes = unsafe_pushes
 
         if not hasattr(self, "_deferred_kv_handoffs"):
             self._deferred_kv_handoffs = deque()
@@ -141,9 +140,9 @@ class InferenceStateHandoffMixin:
             else:
                 unsafe.append(pending)
         self._pending_kv_imports = unsafe
-        if unsafe:
+        if unsafe_pushes or unsafe:
             raise RuntimeError(
-                "Cannot reset while KV handoff transfers may still write to cache storage"
+                "Cannot reset while KV handoff transfers may still access cache storage"
             )
         if not hasattr(self, "_handoff_import_owners"):
             self._handoff_import_owners = {}
@@ -835,15 +834,6 @@ class InferenceStateHandoffMixin:
             len(self._pending_kv_imports),
         )
 
-        # Coordinator-native mode: tell the coordinator the read drained so it
-        # releases the prefill's pinned blocks and a flow-control slot. In the
-        # Dynamo mode the client triggers the release instead.
-        if getattr(self, "_disagg_config", None) is not None and self.is_mp_coordinator:
-            assert HAVE_MSGPACK, "the coordinator-native disagg mode requires msgpack"
-            self.socket_for_receiving_requests.send(
-                msgpack.packb([Headers.KV_READ_DONE.value, pending.request_id], use_bin_type=True)
-            )
-
         self._handoff_import_owners[pending.request_id] = list(local_blocks)
         pending.local_blocks = []
         try:
@@ -927,7 +917,9 @@ class InferenceStateHandoffMixin:
             and torch.distributed.get_world_size(mp_group) > 1
         ):
             flags = torch.tensor(
-                [1 if d else 0 for d, _ in local], dtype=torch.int32, device="cuda"
+                [1 if d else 0 for d, _ in local],
+                dtype=torch.int32,
+                device=self.context.memory_buffer.device,
             )
             torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MIN, group=mp_group)
             local = [(bool(f), exc) for f, (_, exc) in zip(flags.tolist(), local)]

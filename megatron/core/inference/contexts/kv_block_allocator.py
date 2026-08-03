@@ -254,7 +254,7 @@ class KVBlockAllocator:
 
         if not releasable:
             return 0
-        self._release_memory_blocks(torch.tensor(releasable, dtype=torch.int32, device='cpu'))
+        self._release_memory_blocks(torch.tensor(releasable, dtype=torch.int64, device='cpu'))
         return len(releasable)
 
     def _release_memory_blocks(self, blocks: Tensor) -> None:

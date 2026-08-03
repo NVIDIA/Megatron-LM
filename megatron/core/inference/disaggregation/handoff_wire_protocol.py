@@ -21,7 +21,11 @@ def make_submit_request_with_kv_message(
 
 
 def parse_submit_request_with_kv_fields(fields: Sequence[Any]) -> Tuple[Any, ...]:
-    """Validate and unpack fields following ``SUBMIT_REQUEST_WITH_KV``."""
+    """Validate and unpack the five fields after the message header.
+
+    The matching builder returns the header followed by these fields; callers
+    pass only the post-header slice to this parser.
+    """
 
     if len(fields) != 5:
         raise ValueError(f"SUBMIT_REQUEST_WITH_KV payload must have 5 fields, got {len(fields)}")

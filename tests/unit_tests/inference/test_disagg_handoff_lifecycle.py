@@ -280,6 +280,52 @@ def test_reset_cancels_capacity_queued_handoffs(handoff_loop):
     assert engine.pending_kv_import_count == 0
 
 
+def test_reset_waits_for_pending_prefill_pushes(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    handle = mock.Mock()
+    engine._pending_kv_pushes = [(7, [handle])]
+
+    engine._reset_pending_kv_imports()
+
+    handle.wait.assert_called_once_with()
+    assert not engine._pending_kv_pushes
+
+
+def test_reset_rejects_an_active_prefill_push(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    handle = mock.Mock()
+    handle.wait.side_effect = TimeoutError
+    engine._pending_kv_pushes = [(7, [handle])]
+
+    with pytest.raises(RuntimeError, match="may still access cache storage"):
+        engine._reset_pending_kv_imports()
+
+    assert engine._pending_kv_pushes == [(7, [handle])]
+
+
+def test_admission_collective_uses_cache_buffer_device(handoff_loop, monkeypatch):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    pending = _pending_import(engine, 4, 10, 104)
+    pending.handle = _PendingHandle()
+    engine._pending_kv_imports.append(pending)
+    engine.pg_collection.mp = object()
+    expected_device = engine.context.memory_buffer.device
+    observed_devices = []
+    torch_tensor = torch.tensor
+
+    def record_device(data, *args, device=None, **kwargs):
+        observed_devices.append(device)
+        return torch_tensor(data, *args, device="cpu", **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", record_device)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+
+    assert engine._admission_flags() == [(False, None)]
+    assert observed_devices == [expected_device]
+
+
 def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     engine = _HandoffHarness(handoff_loop, available=0)
     engine.context.mamba_slot_allocator = None
