@@ -67,12 +67,15 @@ class WeightedMultiTask(
             else:
                 self.weights.append(config.weight / total_weight)
 
-        # Weighted (non-evaluation) environment handling.
+        # Weighted (non-evaluation) environment handling. Zero-weight agents are
+        # excluded outright: multi-env configs carry weight-0 entries so the
+        # launcher boots their servers ("weight 0 = never sampled"), and the
+        # layout's min-one-group bump must not resurrect them into the batch.
         self._rollout_agents = []
         self._rollout_env_ids = []
         self._rollout_weights = []
         for idx, (agent, config) in enumerate(zip(self.agents, agent_configs)):
-            if config.evaluation_only:
+            if config.evaluation_only or config.weight <= 0.0:
                 continue
             self._rollout_agents.append(agent)
             self._rollout_env_ids.append(getattr(agent, "env_id", None) or f"agent_{idx}")
@@ -120,9 +123,10 @@ class WeightedMultiTask(
         return counts
 
     def _distribute_counts(self, total_count: int) -> list[int]:
-        """Split a count across non-evaluation agents by weight (largest remainder).
+        """Split a count across weighted agents by weight (largest remainder).
 
-        Returns a per-agent list summing to total_count, 0 for evaluation-only agents.
+        Returns a per-agent list summing to total_count, 0 for evaluation-only
+        and zero-weight agents.
         """
         if not self._rollout_weights:
             raise ValueError("No non-evaluation agents available for rollout generation")
@@ -130,7 +134,10 @@ class WeightedMultiTask(
         shares = iter(
             self._round_shares([total_count * w for w in self._rollout_weights], total_count)
         )
-        return [0 if config.evaluation_only else next(shares) for config in self.agent_configs]
+        return [
+            0 if (config.evaluation_only or config.weight <= 0.0) else next(shares)
+            for config in self.agent_configs
+        ]
 
     def rollout_group_layout(self, num_groups: int) -> list[int]:
         """Constant per-batch groups for each weighted env, in env order.
