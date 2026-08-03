@@ -621,7 +621,7 @@ class TestMambaPrefixCachingE2E:
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
 
-        assert alloc.total_count == 3, f"expected 3 total blocks, got {alloc.total_count}"
+        assert alloc.pool_size == 3, f"expected 3 total blocks, got {alloc.pool_size}"
         assert ctx.max_requests >= 1
 
         finished = {}
@@ -644,7 +644,7 @@ class TestMambaPrefixCachingE2E:
         assert (
             h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
         )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
+        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.pool_avail == 1
 
         # F: disjoint prefix, forces eviction of E's cached block
         req_F = _run_one(1, prompts[1])
