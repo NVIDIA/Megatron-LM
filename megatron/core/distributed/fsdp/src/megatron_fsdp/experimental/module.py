@@ -194,6 +194,7 @@ class FsdpModule:
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
+        module.register_load_state_dict_pre_hook(self._pre_load_state_dict)
         module.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
         module.register_forward_hook(lambda _module, _args, _output: self.post_forward())
         module.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
@@ -220,6 +221,24 @@ class FsdpModule:
                 self.post_backward()
 
         return grad_hook
+
+    def _pre_load_state_dict(
+        self,
+        _module: nn.Module,
+        _state_dict: dict[str, object],
+        _prefix: str,
+        local_metadata: dict[str, object],
+        _strict: bool,
+        _missing_keys: list[str],
+        _unexpected_keys: list[str],
+        _error_msgs: list[str],
+    ) -> None:
+        """Reject state-dict loads that replace parameters managed by FSDP."""
+        if local_metadata.get("assign_to_params_buffers", False):
+            raise RuntimeError(
+                "load_state_dict(assign=True) is not supported after fully_shard(). "
+                "Load before fully_shard() or use an in-place load path with assign=False."
+            )
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
