@@ -17,18 +17,12 @@ def _top_logprob_entries(top_logprobs):
     if not isinstance(top_logprobs, dict):
         return []
     return [
-        {
-            "token": str(token),
-            "logprob": logprob,
-            "bytes": list(str(token).encode("utf-8")),
-        }
+        {"token": str(token), "logprob": logprob, "bytes": list(str(token).encode("utf-8"))}
         for token, logprob in top_logprobs.items()
     ]
 
 
-def _token_logprobs(
-    tokenizer, token_ids, log_probs, top_log_probs, chat, start_offset
-):
+def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_offset):
     entries = []
     offsets = []
     offset = start_offset
@@ -234,10 +228,7 @@ class StreamingChatParser:
                         deltas.append(
                             {
                                 "tool_calls": [
-                                    {
-                                        "index": index,
-                                        "function": {"arguments": argument_delta},
-                                    }
+                                    {"index": index, "function": {"arguments": argument_delta}}
                                 ]
                             }
                         )
@@ -262,9 +253,7 @@ def _status_name(record):
 def _failure_message(record):
     events = record.get("events") or []
     error_events = [
-        event
-        for event in events
-        if event.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+        event for event in events if event.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
     ]
     if error_events:
         return str(error_events[-1].get("payload", "Unknown error"))
@@ -358,7 +347,8 @@ async def openai_stream(
             else:
                 final_record = item["final"]
                 if _status_name(final_record) == "FAILED":
-                    yield f"data: {json.dumps({'error': {'message': _failure_message(final_record)}})}\n\n"
+                    error_payload = {"error": {"message": _failure_message(final_record)}}
+                    yield f"data: {json.dumps(error_payload)}\n\n"
                     return
                 result = unwrap_serialized_tensors(final_record)
                 state["final"] = result
@@ -408,18 +398,11 @@ async def openai_stream(
                 state["tokens"].extend(new_tokens)
                 state["log_probs"].extend(new_log_probs)
                 state["top_log_probs"].extend(new_top_log_probs)
-                start_offset = state["detokenizer"].text_length + len(
-                    state["echo_prompt"] or ""
-                )
+                start_offset = state["detokenizer"].text_length + len(state["echo_prompt"] or "")
                 delta = state["detokenizer"].update(new_tokens)
                 logprobs = (
                     _token_logprobs(
-                        tokenizer,
-                        new_tokens,
-                        new_log_probs,
-                        new_top_log_probs,
-                        chat,
-                        start_offset,
+                        tokenizer, new_tokens, new_log_probs, new_top_log_probs, chat, start_offset
                     )
                     if return_log_probs
                     else None
@@ -455,11 +438,7 @@ async def openai_stream(
                         ]
                     )
             elif new_tokens:
-                choice = {
-                    "index": index,
-                    "logprobs": logprobs,
-                    "finish_reason": None,
-                }
+                choice = {"index": index, "logprobs": logprobs, "finish_reason": None}
                 choice["delta" if chat else "text"] = {"content": delta} if chat else delta
                 yield sse([choice])
 

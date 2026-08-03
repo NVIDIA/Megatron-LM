@@ -22,7 +22,6 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.open
 from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import Qwen3CoderToolParser
 
 
-
 class _Tokenizer:
     def detokenize(self, tokens):
         return "".join(chr(ord("a") + token - 1) for token in tokens)
@@ -78,11 +77,7 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
                 "prompt_tokens": [9, 9],
                 "generated_tokens": [1, 2, 3],
                 "generated_log_probs": [-0.1, -0.2, -0.3],
-                "generated_top_n_logprobs": [
-                    {"a": -0.01},
-                    {"b": -0.02},
-                    {"c": -0.03},
-                ],
+                "generated_top_n_logprobs": [{"a": -0.01}, {"b": -0.02}, {"c": -0.03}],
                 "num_cached_tokens": 2,
                 "sampling_params": {"num_tokens_to_generate": 3},
             }
@@ -110,10 +105,7 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     assert "generated_text" not in first["choices"][0]
     assert "generated_length" not in first["choices"][0]
     assert first["choices"][0]["logprobs"]["token_logprobs"] == [-0.1, -0.2]
-    assert first["choices"][0]["logprobs"]["top_logprobs"] == [
-        {"a": -0.01},
-        {"b": -0.02},
-    ]
+    assert first["choices"][0]["logprobs"]["top_logprobs"] == [{"a": -0.01}, {"b": -0.02}]
     assert first["choices"][0]["logprobs"]["text_offset"] == [0, 1]
     assert reconciled["choices"][0]["text"] == "c"
     assert reconciled["choices"][0]["logprobs"]["top_logprobs"] == [{"c": -0.03}]
@@ -212,12 +204,7 @@ async def test_openai_stream_surfaces_failed_final_without_success_terminator():
         {
             "final": {
                 "status": "FAILED",
-                "events": [
-                    {
-                        "type": "ERROR_NONTRANSIENT",
-                        "payload": "context length exceeded",
-                    }
-                ],
+                "events": [{"type": "ERROR_NONTRANSIENT", "payload": "context length exceeded"}],
             }
         }
     )
@@ -226,16 +213,11 @@ async def test_openai_stream_surfaces_failed_final_without_success_terminator():
     records = [
         record
         async for record in openai_stream(
-            [stream],
-            _Tokenizer(),
-            [_IncrementalDetokenizer()],
-            chat=True,
+            [stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=True
         )
     ]
 
-    assert records == [
-        'data: {"error": {"message": "context length exceeded"}}\n\n'
-    ]
+    assert records == ['data: {"error": {"message": "context length exceeded"}}\n\n']
 
 
 @pytest.mark.asyncio
@@ -279,17 +261,10 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
     payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
 
     role, content, finished = payloads
-    assert role["choices"][0]["delta"] == {
-        "role": "assistant",
-        "content": "",
-    }
+    assert role["choices"][0]["delta"] == {"role": "assistant", "content": ""}
     assert content["choices"][0]["delta"] == {"content": "a"}
     assert content["choices"][0]["logprobs"]["content"][0]["top_logprobs"] == [
-        {
-            "token": "a",
-            "logprob": -0.01,
-            "bytes": [97],
-        }
+        {"token": "a", "logprob": -0.01, "bytes": [97]}
     ]
     assert finished["choices"][0]["finish_reason"] == "stop"
     assert records[-1] == "data: [DONE]\n\n"
@@ -301,10 +276,7 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
             "type": "function",
             "function": {
                 "name": "get_weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                },
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
             },
         }
     ]
@@ -312,10 +284,7 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     def parse(text):
         return Qwen3CoderToolParser.parse(text, tools=tools)
 
-    parser = StreamingChatParser(
-        parse,
-        marker_prefixes=Qwen3CoderToolParser.streaming_markers,
-    )
+    parser = StreamingChatParser(parse, marker_prefixes=Qwen3CoderToolParser.streaming_markers)
     model_output = (
         "Checking. <tool_call><function=get_weather>"
         "<parameter=city>\nSF\n</parameter></function></tool_call>"
@@ -326,11 +295,7 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     deltas.extend(parser.parse(model_output, finished=True))
 
     assert "".join(delta.get("content", "") for delta in deltas) == "Checking. "
-    tool_deltas = [
-        tool_call
-        for delta in deltas
-        for tool_call in delta.get("tool_calls", [])
-    ]
+    tool_deltas = [tool_call for delta in deltas for tool_call in delta.get("tool_calls", [])]
     name_deltas = [
         tool_call
         for tool_call in tool_deltas
@@ -343,17 +308,16 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     assert name_deltas[0]["function"] == {"name": "get_weather"}
 
     argument_text = "".join(
-        tool_call.get("function", {}).get("arguments", "")
-        for tool_call in tool_deltas
+        tool_call.get("function", {}).get("arguments", "") for tool_call in tool_deltas
     )
     assert json.loads(argument_text) == {"city": "SF"}
     assert all(tool_call["index"] == 0 for tool_call in tool_deltas)
-    assert parser.finish_reason(
-        {
-            "generated_tokens": [1],
-            "sampling_params": {"num_tokens_to_generate": 2},
-        }
-    ) == "tool_calls"
+    assert (
+        parser.finish_reason(
+            {"generated_tokens": [1], "sampling_params": {"num_tokens_to_generate": 2}}
+        )
+        == "tool_calls"
+    )
 
 
 def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
@@ -362,10 +326,7 @@ def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
             "type": "function",
             "function": {
                 "name": "get_weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                },
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
             },
         }
     ]
@@ -381,39 +342,26 @@ def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
                     {
                         "id": "call_previous",
                         "type": "function",
-                        "function": {
-                            "name": "get_weather",
-                            "arguments": '{"city": "SF"}',
-                        },
+                        "function": {"name": "get_weather", "arguments": '{"city": "SF"}'},
                     }
                 ],
             },
-            {
-                "role": "tool",
-                "tool_call_id": "call_previous",
-                "content": "62 F",
-            },
+            {"role": "tool", "tool_call_id": "call_previous", "content": "62 F"},
             {"role": "user", "content": "What about NYC?"},
         ],
     }
 
     sanitized_messages = _sanitize_messages_for_template(request_payload["messages"])
 
-    assert sanitized_messages[1]["tool_calls"][0]["function"]["arguments"] == {
-        "city": "SF"
-    }
+    assert sanitized_messages[1]["tool_calls"][0]["function"]["arguments"] == {"city": "SF"}
     assert sanitized_messages[2] == {
         "role": "tool",
         "tool_call_id": "call_previous",
         "content": "62 F",
     }
-    assert sanitized_messages[3] == {
-        "role": "user",
-        "content": "What about NYC?",
-    }
+    assert sanitized_messages[3] == {"role": "user", "content": "What about NYC?"}
     assert (
-        request_payload["messages"][1]["tool_calls"][0]["function"]["arguments"]
-        == '{"city": "SF"}'
+        request_payload["messages"][1]["tool_calls"][0]["function"]["arguments"] == '{"city": "SF"}'
     )
 
     parser = StreamingChatParser(
@@ -429,32 +377,25 @@ def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
         deltas.extend(parser.parse(model_output[:end]))
     deltas.extend(parser.parse(model_output, finished=True))
 
-    tool_deltas = [
-        tool_call
-        for delta in deltas
-        for tool_call in delta.get("tool_calls", [])
-    ]
-    assert sum(
-        tool_call.get("function", {}).get("name") == "get_weather"
-        for tool_call in tool_deltas
-    ) == 1
-    tool_call_ids = [
-        tool_call["id"] for tool_call in tool_deltas if "id" in tool_call
-    ]
+    tool_deltas = [tool_call for delta in deltas for tool_call in delta.get("tool_calls", [])]
+    assert (
+        sum(tool_call.get("function", {}).get("name") == "get_weather" for tool_call in tool_deltas)
+        == 1
+    )
+    tool_call_ids = [tool_call["id"] for tool_call in tool_deltas if "id" in tool_call]
     assert len(tool_call_ids) == 1
     assert tool_call_ids[0].startswith("call_")
     assert all(tool_call["index"] == 0 for tool_call in tool_deltas)
     argument_text = "".join(
-        tool_call.get("function", {}).get("arguments", "")
-        for tool_call in tool_deltas
+        tool_call.get("function", {}).get("arguments", "") for tool_call in tool_deltas
     )
     assert json.loads(argument_text) == {"city": "NYC"}
-    assert parser.finish_reason(
-        {
-            "generated_tokens": [1],
-            "sampling_params": {"num_tokens_to_generate": 2},
-        }
-    ) == "tool_calls"
+    assert (
+        parser.finish_reason(
+            {"generated_tokens": [1], "sampling_params": {"num_tokens_to_generate": 2}}
+        )
+        == "tool_calls"
+    )
 
 
 def test_huggingface_fast_incremental_detokenizer_preserves_utf8_boundaries():

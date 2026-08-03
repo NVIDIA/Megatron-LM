@@ -632,9 +632,7 @@ try:
                     tuple(
                         marker
                         for parser_name in parsers
-                        for marker in getattr(
-                            PARSER_MAPPING[parser_name], "streaming_markers", ()
-                        )
+                        for marker in getattr(PARSER_MAPPING[parser_name], "streaming_markers", ())
                     )
                     if tools_requested
                     else ()
@@ -653,9 +651,7 @@ try:
                     )
                     return parsed_text, metadata
 
-                is_named_tool_choice = (
-                    isinstance(tool_choice, dict) and "function" in tool_choice
-                )
+                is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
                 chat_parsers = [
                     StreamingChatParser(
                         parse_streaming_text,

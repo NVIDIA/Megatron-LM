@@ -759,17 +759,11 @@ def test_streaming_partials_are_sent():
     request = types.SimpleNamespace(
         generated_tokens=[11, 12, 13],
         generated_log_probs=[-0.1, -0.2, -0.3],
-        generated_top_n_logprobs=[
-            {"eleven": -0.01},
-            {"twelve": -0.02},
-            {"thirteen": -0.03},
-        ],
+        generated_top_n_logprobs=[{"eleven": -0.01}, {"twelve": -0.02}, {"thirteen": -0.03}],
         prompt_log_probs=[-0.4],
         prompt_top_n_logprobs=[{"prompt": -0.04}],
         sampling_params=types.SimpleNamespace(
-            streaming=True,
-            return_log_probs=True,
-            skip_prompt_log_probs=False,
+            streaming=True, return_log_probs=True, skip_prompt_log_probs=False
         ),
     )
     engine.requests = {7: types.SimpleNamespace(record=[request])}
