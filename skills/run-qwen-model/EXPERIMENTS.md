@@ -2731,6 +2731,17 @@ same fp32 reduce-scatter this change shrinks, so the two are one win, not two.
 Left env-gated and **off by default**: it is a numerics change, and enabling it by
 default needs an accuracy run (lm-eval or equivalent), not three greedy-decode probes.
 
+**Mechanism confirmed by launch count, not by time.** A trace captured with the gate on
+shows `bfloat16_copy_kernel` instances falling from 258,564 to 4,572 whole-trace (−98%)
+and the copy bucket falling from 107 to 59 launches/step — exactly 48, one per layer,
+the cast that is now a no-op. Counts are the right evidence here because the two traces'
+*times* are not comparable: the second window's expert GEMM is 27% cheaper (2.436 →
+1.777 ms/step) and its attention launches went 50 → 63, neither of which a
+reduce-scatter dtype can cause. The two 60-step windows simply sit at different average
+sequence lengths, so per-bucket ms/step may only be compared *within* a trace. The
+throughput number in the table above, measured without a profiler attached, is what
+sizes the win.
+
 > **Lesson.** A "removable copy" is usually a symptom. Three sessions treated the
 > per-layer copies as fusion targets worth ~0.06 ms each; the copy was actually pointing
 > at a **buffer dtype** decision upstream worth 2.5%. When a copy shows up next to a

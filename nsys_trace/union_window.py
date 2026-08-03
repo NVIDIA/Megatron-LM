@@ -11,6 +11,13 @@ more for an engine that launches eagerly than for one replaying a whole-step gra
 Read the union as a lower bound on packing quality, and confirm any conclusion
 against unprofiled step time before acting on it.
 
+A second caveat that bit once: the last N steps of two runs are not necessarily the
+same *workload*. Decode cost grows with sequence length, so two windows sitting at
+different average seqlen differ in every bucket at once -- one such pair differed by
+27% on the expert GEMM. Before attributing a per-bucket time change to a code change,
+check that the buckets the change cannot touch held still; if they did not, compare
+launch *counts* (seqlen-invariant) instead.
+
 Usage:
   python union_window.py trace.sqlite '<anchor kernel LIKE pattern>' [steps] [layers]
 """
