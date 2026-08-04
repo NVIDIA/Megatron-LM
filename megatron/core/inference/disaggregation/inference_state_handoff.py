@@ -23,6 +23,7 @@ from megatron.core.inference.disaggregation.utils import (
     drop_transfer_prefix_blocks,
     transfer_block_count,
 )
+from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 if TYPE_CHECKING:
@@ -474,8 +475,6 @@ class InferenceStateHandoffMixin:
         src_block_ids: list,
     ) -> "asyncio.Future[DynamicInferenceRequest]":
         """Start or capacity-queue a KV pull and return its completion future."""
-        from megatron.core.inference.inference_request import compute_block_hashes_batched
-
         allocator = self.context.kv_block_allocator
         if not allocator.enable_prefix_caching:
             raise RuntimeError(
