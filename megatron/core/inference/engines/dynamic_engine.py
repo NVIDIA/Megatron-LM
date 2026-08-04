@@ -353,6 +353,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # Generated token count already streamed for each request.
+        self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
@@ -1138,9 +1140,8 @@ class DynamicInferenceEngine(AbstractEngine):
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
-        # Check that the KV cache has enough blocks for this request's stored tokens:
+        # Check that the shared KV pool has enough blocks for this request's stored tokens:
         # the prompt, all generated tokens but the last, and the final decode step's drafts.
-        # Blocks are granted to a running request only from the active pool.
         max_stored_tokens = len(request.prompt_tokens)
         if request.sampling_params.num_tokens_to_generate > 1:
             max_stored_tokens += (
@@ -1149,7 +1150,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 + self.context.num_speculative_tokens
             )
         request_block_count = math.ceil(max_stored_tokens / self.context.block_size_tokens)
-        if request_block_count > self.context.kv_block_allocator.active_count:
+        usable_blocks = self.context.kv_block_allocator.pool_size - 1
+        if request_block_count > usable_blocks:
             request.status = Status.FAILED
             request.add_event_error_nontransient(BlockOverflowError(request_id))
 
@@ -1279,7 +1281,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
-            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+            blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
             if block_allocator.enable_prefix_caching:
                 blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
                 blocks_ref_count = block_allocator.block_ref_counts.sum().item()
@@ -1351,7 +1353,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             if block_allocator.enable_prefix_caching:
                                 event = request.add_event_generated_token(
                                     token,
-                                    blocks_total=block_allocator.total_count,
+                                    blocks_total=block_allocator.pool_size,
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
                                     blocks_ref_count=blocks_ref_count,
@@ -1361,7 +1363,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             else:
                                 event = request.add_event_generated_token(
                                     token,
-                                    blocks_total=block_allocator.total_count,
+                                    blocks_total=block_allocator.pool_size,
                                     blocks_hashed_total=blocks_allocated,
                                     blocks_hashed_active=blocks_hashed_active,
                                     pre_fwd_active_token_count=pre_fwd_active_token_count,
@@ -1636,6 +1638,26 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
+    def _mamba_batch_invariant_prefill_chunk_length(
+        self, req: DynamicInferenceRequest, capacity: int
+    ) -> int:
+        """Raw prefill length that computes an aligned chunk within ``capacity``.
+
+        Non-final calls must start and end at Mamba chunk boundaries. The final
+        prompt call may be shorter because it seeds the decode replay tail.
+        """
+        remaining = len(req.remaining_prompt_tokens)
+        if capacity >= remaining:
+            return remaining
+
+        chunk_size = self.context.mamba_chunk_size
+        computed_tokens = (capacity // chunk_size) * chunk_size
+        if remaining - computed_tokens == 1:
+            computed_tokens -= chunk_size
+        if computed_tokens <= 0:
+            return 0
+        return computed_tokens
+
     def schedule_waiting_requests(self) -> None:
         """Try to schedule requests from the waiting pool."""
         # Keep track of which requests get scheduled.
@@ -1887,6 +1909,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+            batch_invariant_mamba_prefill = (
+                self.context.batch_invariant_mode and self.context.is_hybrid_model
+            )
 
             # Check for conflicting block hashes.
             if prefix_caching_enabled and not is_continuing_chunked_prefill:
@@ -1939,7 +1964,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     computed_chunk = computed_budget
 
-                prefill_chunk_length = prefix_skip + computed_chunk
+                if batch_invariant_mamba_prefill:
+                    prefill_chunk_length = self._mamba_batch_invariant_prefill_chunk_length(
+                        req, computed_chunk
+                    )
+                    if prefill_chunk_length == 0:
+                        can_schedule = False
+                        break
+                else:
+                    prefill_chunk_length = prefix_skip + computed_chunk
 
                 # Mamba prefix caching: keep chunk boundaries block-aligned.
                 # compute_and_store_offsets() records a recurrent-state snapshot at a
@@ -1975,7 +2008,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # See https://github.com/Dao-AILab/flash-attention/issues/1537
                 # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
                 # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
-                if remaining_len - prefill_chunk_length == 1:
+                if not batch_invariant_mamba_prefill and remaining_len - prefill_chunk_length == 1:
                     if computed_chunk > 1:
                         prefill_chunk_length -= 1
                     else:
@@ -2130,10 +2163,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 "finished_request_count": self.finished_request_count,
                 "evicted_request_count": self.evicted_request_count,
                 "kv_stats": kvcache_util_stats,
-                "total_active_block_count": self.context.kv_block_allocator.active_count,
-                "total_paused_block_count": self.context.kv_block_allocator.paused_count,
-                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
-                "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+                "usable_block_count": self.context.kv_block_allocator.pool_size - 1,
+                "occupied_block_count": self.context.kv_block_allocator.get_total_used(),
+                "allocatable_block_count": self.context.kv_block_allocator.get_allocatable_count(),
+                "active_used_block_count": self.context.kv_block_allocator.get_active_used(),
+                "paused_used_block_count": self.context.kv_block_allocator.get_paused_used(),
+                "paused_block_budget": self.context.kv_block_allocator.paused_limit,
             }
             context_state = {**pre_step_context_state, **post_step_context_state}
         else:
@@ -2142,6 +2177,44 @@ class DynamicInferenceEngine(AbstractEngine):
             context_state = {**pre_step_context_state, "kv_stats": None}
 
         return result, context_state, step_time
+
+    def _try_send_streaming_partials(self) -> None:
+        """Send pending token deltas to the inference coordinator."""
+        partials: list = []
+        emit_lengths: Dict[int, int] = {}
+        for rid, entry in self.requests.items():
+            request = entry.record[-1]
+            if not getattr(request.sampling_params, "streaming", False):
+                continue
+            already = self._partial_emit_lengths.get(rid, 0)
+            total = len(request.generated_tokens)
+            stop_word_ids = getattr(request, "stop_word_ids", None)
+            holdback = 0
+            if stop_word_ids and not getattr(
+                request.sampling_params, "detokenize_stop_sequence", False
+            ):
+                holdback = max(0, max(len(ids) for ids in stop_word_ids) - 1)
+            emit_end = max(already, total - holdback)
+            streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
+            if emit_end - already >= streaming_interval:
+                new_tokens = list(request.generated_tokens[already:emit_end])
+                partial = {"request_id": rid, "new_tokens": new_tokens}
+                if request.sampling_params.return_log_probs:
+                    partial["new_log_probs"] = list(
+                        (request.generated_log_probs or [])[already:emit_end]
+                    )
+                partials.append(partial)
+                emit_lengths[rid] = emit_end
+
+        if not partials:
+            return
+
+        payload = msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
+        nvtx_range_push("coordinator_streaming")
+        self.socket_for_receiving_requests.send(payload)
+        nvtx_range_pop("coordinator_streaming")
+
+        self._partial_emit_lengths.update(emit_lengths)
 
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
@@ -2250,6 +2323,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.socket_for_receiving_requests.send(payload)
                 nvtx_range_pop("coordinator_communication")
 
+            # Stream newly generated tokens for active requests. Finished
+            # requests were already popped from self.requests above, so their
+            # emit lengths are dropped here rather than in the loop.
+            for record in finished_request_records:
+                self._partial_emit_lengths.pop(record.requests[-1].request_id, None)
+            self._try_send_streaming_partials()
+
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
@@ -2331,7 +2411,8 @@ class DynamicInferenceEngine(AbstractEngine):
             output_str = (
                 "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
-                "blocks: a %d/%d, p %d/%d ... "
+                "blocks: occupied %d/%d, allocatable %d, active-used %d, "
+                "paused-used %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
@@ -2356,10 +2437,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["waiting_request_count"],
                     context_state["finished_request_count"],
                     context_state["evicted_request_count"],
-                    context_state["total_active_used_blocks"],
-                    context_state["total_active_block_count"],
-                    context_state["total_paused_used_blocks"],
-                    context_state["total_paused_block_count"],
+                    context_state["occupied_block_count"],
+                    context_state["usable_block_count"],
+                    context_state["allocatable_block_count"],
+                    context_state["active_used_block_count"],
+                    context_state["paused_used_block_count"],
+                    context_state["paused_block_budget"],
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
@@ -2411,7 +2494,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 kv_alloc = self.context.kv_block_allocator
                 output_str += " ... prefix cache util: KV %d/%d blocks cached (%d evictable)" % (
                     len(kv_alloc.kv_hash_to_block_id),
-                    kv_alloc.total_count,
+                    kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )
                 msa = self.context.mamba_slot_allocator
@@ -2575,6 +2658,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.ABORT_REQUEST:
+                request_id = int(data[1])
+                entry = self.requests.get(request_id)
+                if entry is not None:
+                    request = entry.record[-1]
+                    # Force active requests to finish on the next step.
+                    request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
+                    active_ids = self.context.request_ids[: self.context.total_request_count]
+                    matches = torch.where(active_ids == request_id)[0]
+                    if matches.numel() > 0:
+                        assert matches.numel() == 1
+                        idx = int(matches[0].item())
+                        self.context.request_output_lengths[idx] = (
+                            self.context.request_kv_length_offsets[idx]
+                            + self.context.request_query_lengths[idx]
+                        )
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             elif header == Headers.START_CUDA_PROFILER:
