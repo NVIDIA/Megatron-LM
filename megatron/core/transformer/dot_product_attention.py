@@ -268,4 +268,6 @@ class DotProductAttention(MegatronModule):
             sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata['dp_cp_group'],
+            intra_dp_cp_group=metadata.get('intra_dp_cp_group'),
+            intra_expt_dp_group=metadata.get('intra_expt_dp_group'),
         )

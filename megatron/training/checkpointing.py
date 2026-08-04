@@ -2047,6 +2047,7 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     """
     from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
     from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mimo.model import MimoModel
 
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
@@ -2055,6 +2056,15 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         while module is not None:
             if isinstance(module, HybridModel):
                 return True
+            if isinstance(module, MimoModel):
+                if module.language_model is not None:
+                    module = module.language_model
+                    continue
+                # Heterogeneous encoder-only ranks do not instantiate the language
+                # model, but its spec still describes the model being checkpointed.
+                return bool(
+                    module.mimo_config.language_model_spec.params.get('hybrid_layer_pattern')
+                )
             module = getattr(module, 'module', None)
         return False
 
