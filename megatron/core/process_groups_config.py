@@ -133,6 +133,16 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Gloo mirrors of the two groups the distributed optimizer needs for checkpoint I/O.
+    # These have no NCCL equivalent: without them a caller-supplied collection cannot drive
+    # the optimizer at all. May be None when the job was built with
+    # initialize_model_parallel(create_gloo_process_groups=False).
+    # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    intra_dp_cp_gloo: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    intra_expt_dp_gloo: torch.distributed.ProcessGroup = field(init=False)
+
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
@@ -228,6 +238,17 @@ class ProcessGroupCollection:
                 parallel_state.get_expert_data_parallel_group,
                 check_initialized=False,
                 partial_expert_data_parallel=True,
+            ),
+            'intra_dp_cp_gloo': partial(
+                parallel_state.get_data_parallel_group_gloo,
+                with_context_parallel=True,
+                partial_data_parallel=True,
+                check_initialized=False,
+            ),
+            'intra_expt_dp_gloo': partial(
+                parallel_state.get_expert_data_parallel_group_gloo,
+                partial_expert_data_parallel=True,
+                check_initialized=False,
             ),
             'inter_dist_opt': partial(
                 parallel_state.get_inter_distributed_optimizer_instance_group,
@@ -427,14 +448,14 @@ class ProcessGroupCollection:
                 )
             expt_tp_pp_group = pg_collection.tp_ep_pp
 
-            # Gloo groups - not supported when pg_collection is provided
+            # Gloo groups come from the collection. They are optional: a job built with
+            # create_gloo_process_groups=False legitimately has none.
             if use_gloo_process_groups:
-                raise ValueError(
-                    "Gloo process groups are not supported when pg_collection is "
-                    "provided. Please set use_gloo_process_groups to False."
-                )
-            intra_dp_cp_group_gloo = None
-            intra_expt_dp_group_gloo = None
+                intra_dp_cp_group_gloo = getattr(pg_collection, 'intra_dp_cp_gloo', None)
+                intra_expt_dp_group_gloo = getattr(pg_collection, 'intra_expt_dp_gloo', None)
+            else:
+                intra_dp_cp_group_gloo = None
+                intra_expt_dp_group_gloo = None
 
         return {
             'dp_group': dp_group,

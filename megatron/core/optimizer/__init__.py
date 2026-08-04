@@ -685,10 +685,10 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
 
-    if pg_collection is None or not hasattr(pg_collection, 'tp'):
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-    else:
-        tp_group = pg_collection.tp
+    assert pg_collection is not None and hasattr(
+        pg_collection, 'tp'
+    ), "pg_collection with tp must be resolved by get_megatron_optimizer"
+    tp_group = pg_collection.tp
     # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
     setattr(optimizer, 'tp_group', tp_group)
 
@@ -769,8 +769,7 @@ def _get_megatron_emerging_optimizer(
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
-    if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert pg_collection is not None, "pg_collection must be resolved by get_megatron_optimizer"
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
@@ -884,10 +883,10 @@ def _get_megatron_emerging_optimizer(
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
-            if pg_collection is None or not hasattr(pg_collection, 'tp'):
-                tp_group = parallel_state.get_tensor_model_parallel_group()
-            else:
-                tp_group = pg_collection.tp
+            assert pg_collection is not None and hasattr(
+                pg_collection, 'tp'
+            ), "pg_collection with tp must be resolved by get_megatron_optimizer"
+            tp_group = pg_collection.tp
             setattr(optimizer, 'tp_group', tp_group)
             results.append(optimizer)
             continue
@@ -1019,6 +1018,12 @@ def get_megatron_optimizer(
         config_overrides = get_standard_config_overrides(config)
 
     check_config_overrides_consistency(config, config_overrides)
+
+    # Compatibility boundary. get_megatron_optimizer is the edge of megatron/core for optimizer
+    # construction, so the global-state fallback lives here and nowhere deeper: every helper below
+    # receives an explicit collection. See docs/developer/parallel-state-deprecation.md.
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.

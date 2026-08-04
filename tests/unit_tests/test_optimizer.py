@@ -1340,14 +1340,27 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
         )
 
-    # Test 6: Gloo process groups should not be used with custom process groups
+    # Test 6: Gloo process groups are taken from the collection rather than refused.
+    # Previously this raised "Gloo process groups are not supported when pg_collection is
+    # provided", which made explicit process-group passing and gloo groups mutually exclusive --
+    # and the optimizer path is on every training run. A collection that carries no gloo groups
+    # (the create_gloo_process_groups=False case) now yields None instead of failing.
     pg_collection_complete.mp = None  # Explicitly set to None as allowed
     pg_collection_complete.tp_ep_pp = None  # Explicitly set to None as allowed
 
-    with pytest.raises(ValueError, match="Gloo process groups are not supported"):
-        get_megatron_optimizer(
-            config=optimizer_config,
-            model_chunks=model_chunks,
-            use_gloo_process_groups=True,  # Should be False when using custom groups
-            pg_collection=pg_collection_complete,
-        )
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection_complete, model_chunks, use_gloo_process_groups=True
+    )
+    assert groups['intra_dp_cp_group_gloo'] is None
+    assert groups['intra_expt_dp_group_gloo'] is None
+
+    # And when the collection does carry them, they are passed straight through.
+    gloo_dp = torch.distributed.new_group(backend="gloo")
+    gloo_expt_dp = torch.distributed.new_group(backend="gloo")
+    pg_collection_complete.intra_dp_cp_gloo = gloo_dp
+    pg_collection_complete.intra_expt_dp_gloo = gloo_expt_dp
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection_complete, model_chunks, use_gloo_process_groups=True
+    )
+    assert groups['intra_dp_cp_group_gloo'] is gloo_dp
+    assert groups['intra_expt_dp_group_gloo'] is gloo_expt_dp
