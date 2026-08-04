@@ -475,7 +475,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
-            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -3070,7 +3070,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+        matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 
