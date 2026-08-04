@@ -331,6 +331,7 @@ class DSGQAttention(DSAttention):
             DSAIndexerLossLoggingHelper,
         )
         from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
+            _cudnn_available_for_indexer,
             dsa_dense_indexer_loss,
             dsa_min_memory_gqa,
             dsa_min_memory_gqa_forward_only,
@@ -356,6 +357,21 @@ class DSGQAttention(DSAttention):
         kcs = getattr(cfg, "dsa_kernel_key_block_size", None)
         sparse_loss = getattr(cfg, "dsa_indexer_use_sparse_loss", False)
         coeff = getattr(cfg, "dsa_indexer_loss_coeff", 0.0) or 0.0
+
+        # One-time backend report (per layer/process) so the effective backend is
+        # unambiguous — cudnn_indexer_active tells you whether cuDNN actually engaged
+        # (it silently falls back to the PyTorch oracle if `from cudnn import DSA`
+        # fails or index_n_heads is not in {32,64}). NB: config.dsa_kernel_backend is
+        # NOT read by this path; only these env-derived flags matter.
+        if not getattr(self, "_dsa_backend_logged", False):
+            self._dsa_backend_logged = True
+            cudnn_active = _cudnn_available_for_indexer(use_cudnn, self.indexer.index_n_heads)
+            print(
+                f"[DSGQAttention layer{self.layer_number}] min-memory backend: "
+                f"use_triton={use_triton} use_cudnn={use_cudnn} "
+                f"cudnn_indexer_active={cudnn_active}",
+                flush=True,
+            )
 
         if not torch.is_grad_enabled():
             return dsa_min_memory_gqa_forward_only(
