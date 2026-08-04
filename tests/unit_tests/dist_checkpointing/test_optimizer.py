@@ -29,7 +29,7 @@ from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megat
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
@@ -605,6 +605,78 @@ class TestDistributedOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        ("source_offload", "destination_offload"), [(False, True), (True, False)]
+    )
+    @pytest.mark.parametrize(
+        "use_precision_aware_optimizer",
+        [
+            False,
+            pytest.param(
+                True,
+                marks=pytest.mark.skipif(
+                    not is_te_min_version("2.1.0.dev0"),
+                    reason="Precision-aware FusedAdam requires TE 2.1.0.dev0",
+                ),
+            ),
+        ],
+    )
+    def test_chunked_offload_distributed_checkpoint_compatibility(
+        self, tmp_path_dist_ckpt, source_offload, destination_offload, use_precision_aware_optimizer
+    ):
+        """Offloaded and legacy Adam DistOpt checkpoints load in both directions."""
+
+        Utils.initialize_model_parallel(1, 1)
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'chunked_offload_A', sync=True) as ckpt_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / 'chunked_offload_B', sync=True) as ckpt_dir_B,
+        ):
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=1,
+                pp=1,
+                chunked_optimizer_state_offload=source_offload,
+                optimizer_state_offload_chunk_size_mb=1,
+                use_precision_aware_optimizer=use_precision_aware_optimizer,
+            )
+            model_sharded_sd_A = model_A[0].sharded_state_dict()
+            save(optimizer_A.sharded_state_dict(model_sharded_sd_A), ckpt_dir_A)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=1,
+                chunked_optimizer_state_offload=destination_offload,
+                optimizer_state_offload_chunk_size_mb=1,
+                use_precision_aware_optimizer=use_precision_aware_optimizer,
+                initialize_optimizer_state=False,
+            )
+            model_sharded_sd_B = model_B[0].sharded_state_dict()
+            load_template = optimizer_B.sharded_state_dict(model_sharded_sd_B, is_loading=True)
+            optimizer_B.load_state_dict(load(load_template, ckpt_dir_A))
+
+            if destination_offload:
+                dist_optimizer = optimizer_B.chained_optimizers[0]
+                manager = dist_optimizer._optimizer_state_offloader
+                assert manager is not None
+                for param in manager.selected_params:
+                    for value in manager.optimizer.state[param].values():
+                        if isinstance(value, torch.Tensor) and value.numel() == param.numel():
+                            assert value.device.type == 'cpu'
+                    if manager._master_in_optimizer_state:
+                        master = manager.optimizer.state[param].get('master_param')
+                        assert isinstance(master, torch.Tensor)
+                        assert master.device.type == 'cpu'
+                    elif id(param) in manager._explicit_master_param_ids:
+                        assert param.device.type == 'cpu'
+
+            save(optimizer_B.sharded_state_dict(model_sharded_sd_B), ckpt_dir_B)
+
+            checkpoint_A = load_plain_tensors(ckpt_dir_A)
+            checkpoint_B = load_plain_tensors(ckpt_dir_B)
+            diffs = diff(checkpoint_A, checkpoint_B)
+            assert not any(map(bool, diffs)), diffs
 
     @pytest.mark.parametrize("fully_parallel", [False, True])
     @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import load, save
+from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -129,6 +129,74 @@ class TestLayerWiseOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        ("source_offload", "destination_offload"), [(False, True), (True, False)]
+    )
+    def test_chunked_offload_distributed_checkpoint_compatibility(
+        self, tmp_path_dist_ckpt, source_offload, destination_offload
+    ):
+        """Compact Muon checkpoints remain compatible across the offload switch."""
+
+        Utils.initialize_model_parallel(1, 1)
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'layerwise_offload_A', sync=True) as ckpt_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / 'layerwise_offload_B', sync=True) as ckpt_dir_B,
+        ):
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                chunked_optimizer_state_offload=source_offload,
+                optimizer_state_offload_chunk_size_mb=1,
+            )
+            model_sharded_sd_A = model_A[0].sharded_state_dict()
+            save(optimizer_A.sharded_state_dict(model_sharded_sd_A), ckpt_dir_A)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                chunked_optimizer_state_offload=destination_offload,
+                optimizer_state_offload_chunk_size_mb=1,
+                initialize_optimizer_state=False,
+            )
+            model_sharded_sd_B = model_B[0].sharded_state_dict()
+            load_template = optimizer_B.sharded_state_dict(model_sharded_sd_B, is_loading=True)
+            optimizer_B.load_state_dict(load(load_template, ckpt_dir_A))
+
+            if destination_offload:
+
+                def collect_managers(optimizer):
+                    managers = []
+                    manager = getattr(optimizer, '_optimizer_state_offloader', None)
+                    if manager is not None:
+                        managers.append(manager)
+                    for child in getattr(optimizer, 'chained_optimizers', ()):
+                        managers.extend(collect_managers(child))
+                    return managers
+
+                managers = collect_managers(optimizer_B)
+                # Compact Muon state and its sibling DistributedOptimizer state must both
+                # preserve CPU canonical storage after the distributed load.
+                assert len(managers) >= 2
+                for manager in managers:
+                    for param in manager.selected_params:
+                        assert param.device.type == 'cpu'
+                        for key, value in manager.optimizer.state[param].items():
+                            if manager._is_offloadable_state(param, key, value):
+                                assert value.device.type == 'cpu'
+
+            save(optimizer_B.sharded_state_dict(model_sharded_sd_B), ckpt_dir_B)
+            check_equal(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
 
     def test_parameter_sharding(self):
         """Test that parameters are correctly sharded across DP ranks."""
