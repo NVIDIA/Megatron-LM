@@ -2602,6 +2602,9 @@ def setup_model_and_optimizer(
             fp8_recipe=getattr(args, 'fp8_recipe', None),
             fp8=getattr(args, 'fp8', None) is not None,
             calculate_per_token_loss=getattr(args, 'calculate_per_token_loss', False),
+            reduce_scatter_with_fp32_accumulation=getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ),
         )
 
     model = _build_model_wrapper(wrap_with_ddp)
