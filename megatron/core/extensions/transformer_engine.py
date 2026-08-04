@@ -2444,7 +2444,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             if _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR:
                 extra_kwargs["use_grouped_tensor"] = config.moe_use_grouped_tensor
-            elif config.moe_use_grouped_tensor:
+            elif config.moe_use_grouped_tensor and not config.use_transformer_engine_op_fuser:
                 raise RuntimeError(
                     "moe_use_grouped_tensor=True requires a Transformer Engine GroupedLinear "
                     "that exposes the use_grouped_tensor argument."
