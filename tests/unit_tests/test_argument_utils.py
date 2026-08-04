@@ -678,6 +678,29 @@ class TestMegatronNetworkArgumentGeneration:
             assert not hasattr(args, field_name)
 
 
+class TestMegatronMixedPrecisionArguments:
+    """Test language-model logit dtype CLI choices."""
+
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_mixed_precision_args
+
+        return _add_mixed_precision_args(ArgumentParser(exit_on_error=False))
+
+    def test_logit_dtype_defaults_to_bf16(self):
+        args = self._parser().parse_args([])
+        assert args.logit_dtype == 'bf16'
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+    def test_logit_dtype_accepts_supported_choices(self, dtype):
+        args = self._parser().parse_args(["--logit-dtype", dtype])
+        assert args.logit_dtype == dtype
+
+    def test_logit_dtype_rejects_fp16(self):
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            self._parser().parse_args(["--logit-dtype", "fp16"])
+
+
 # ---------------------------------------------------------------------------
 # Tests for pretrain_cfg_container_from_args
 # ---------------------------------------------------------------------------
