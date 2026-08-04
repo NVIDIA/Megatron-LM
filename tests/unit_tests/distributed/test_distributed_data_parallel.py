@@ -1,11 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from packaging import version
 from torch import testing
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.distributed_data_parallel import GTPParamSyncHandle
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -35,6 +38,42 @@ class TestDistributedDataParallel:
     @classmethod
     def teardown_class(cls):
         Utils.destroy_model_parallel()
+
+    def test_gtp_parameter_sync_handle_matches_forward_pre_hook(self):
+        class BucketGroup:
+            def __init__(self):
+                self.calls = []
+                self.param_gather_dispatched = False
+                self.param_gather_handle = None
+
+            def finish_param_sync(self, skip_next_bucket_dispatch=False):
+                self.calls.append(skip_next_bucket_dispatch)
+                self.param_gather_dispatched = True
+
+        bucket_group = BucketGroup()
+        ddp = object.__new__(DistributedDataParallel)
+        ddp.ddp_config = SimpleNamespace(align_param_gather=False)
+        ddp.overlap_param_gather_with_optimizer_step = False
+        ddp.remove_forward_pre_hook_handles = {object(): object()}
+
+        handle = GTPParamSyncHandle(ddp, bucket_group)
+        handle.ensure_ready()
+        assert bucket_group.calls == [False]
+
+        # A completed gather is idempotent when the same bucket is prefetched again.
+        handle.ensure_ready()
+        assert bucket_group.calls == [False]
+
+        ddp.ddp_config.align_param_gather = True
+        bucket_group.param_gather_dispatched = False
+        handle.ensure_ready()
+        assert bucket_group.calls == [False, True]
+
+        # Disabling DDP's forward hooks also disables the GTP readiness handle.
+        ddp.remove_forward_pre_hook_handles = {}
+        bucket_group.param_gather_dispatched = False
+        handle.ensure_ready()
+        assert bucket_group.calls == [False, True]
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
