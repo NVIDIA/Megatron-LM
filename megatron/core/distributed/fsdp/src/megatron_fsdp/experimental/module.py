@@ -37,6 +37,8 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
+    # A context is owned by its FSDP module tree, so runtime backedges to modules
+    # must be weak; otherwise deleting the tree requires cyclic GC.
     _root_module: ReferenceType["FsdpModule"]
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each

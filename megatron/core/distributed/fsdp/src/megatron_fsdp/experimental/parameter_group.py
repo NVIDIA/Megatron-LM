@@ -33,6 +33,8 @@ _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
+    # This parameter-owned backedge must be weak; otherwise it forms a reference
+    # cycle with the parameter group and delays releasing its CUDA storage.
     parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
     if parameter_group_ref is None:
         return None
@@ -53,6 +55,8 @@ class FsdpParameter:
 class FsdpParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
+    # FsdpModule owns its parameter groups, so this backedge must be weak to avoid
+    # a reference cycle that delays releasing CUDA storage until cyclic GC.
     _owning_module: ReferenceType[nn.Module]
     fsdp_parameters: tuple[FsdpParameter, ...]
     mesh: DeviceMesh
@@ -186,6 +190,7 @@ class FsdpParameterGroup:
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
+            # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(

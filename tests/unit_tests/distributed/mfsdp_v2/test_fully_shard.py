@@ -441,6 +441,10 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
+    # Earlier tests may retain process-global CUDA allocations such as the
+    # CuBLAS workspace. Capture them before creating this model, so the test
+    # only detects storage retained by the deleted FSDP model itself.
+    allocated_before = torch.cuda.memory_allocated(device)
     model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
@@ -450,9 +454,7 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     del output, x, model
     torch.cuda.synchronize(device)
 
-    # This forward has no GEMM workspace. Retain at most negligible runtime
-    # bookkeeping, not the deleted model's persistent FSDP buffers.
-    assert torch.cuda.memory_allocated(device) < 1024**2
+    assert torch.cuda.memory_allocated(device) - allocated_before < 1024**2
 
 
 def test_root_forward_returns_to_resting_memory(distributed_setup):
