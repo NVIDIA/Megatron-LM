@@ -356,7 +356,11 @@ class DynamicInferenceEngine(AbstractEngine):
     def _poll_pending_kv_imports(self) -> int:
         return 0
 
-    def _capture_handoff_meta(self, request, block_ids: list) -> None:
+    def _prepare_handoff_metadata_batch(self, requests_and_blocks: list[tuple]) -> dict:
+        """Hook overridden by the KV-handoff engine composition."""
+        return {}
+
+    def _capture_handoff_meta(self, request, block_ids: list, prepared=None) -> None:
         self._raise_kv_handoff_not_enabled("KV handoff completion")
 
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
@@ -1357,8 +1361,18 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
+        request_id_list = request_ids.tolist()
+        handoff_blocks_by_request = finished_handoff_block_ids or {}
+        prepared_handoff_metadata = self._prepare_handoff_metadata_batch(
+            [
+                (self.get_request(request_id), handoff_blocks_by_request.get(request_id, []))
+                for request_id in request_id_list
+                if request_id in finished_request_ids
+            ]
+        )
+
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+            zip(request_id_list, sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
 
             # Ensure tokens is always a list for consistent handling
@@ -1494,9 +1508,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.status = Status.COMPLETED
                     request.add_event_finish()
                     # Keep handoff blocks only when the request needs them.
-                    handoff_blocks = (finished_handoff_block_ids or {}).get(request_id, [])
+                    handoff_blocks = handoff_blocks_by_request.get(request_id, [])
                     if getattr(request.sampling_params, "do_kv_handoff", False):
-                        self._capture_handoff_meta(request, handoff_blocks)
+                        self._capture_handoff_meta(
+                            request, handoff_blocks, prepared_handoff_metadata.get(request_id)
+                        )
                     elif handoff_blocks:
                         self._release_pinned_handoff_blocks(handoff_blocks)
                     finished_entry = self.requests.pop(request_id)

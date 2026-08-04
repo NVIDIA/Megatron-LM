@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict
 
 import torch
@@ -29,6 +30,78 @@ if TYPE_CHECKING:
     from megatron.core.inference.sampling_params import SamplingParams
 
 
+@dataclass(frozen=True)
+class _PreparedHandoffMetadata:
+    """Per-request metadata assembled once for a completed prefill batch."""
+
+    local_blocks: list[int]
+    top_blocks: list[int]
+    kv_meta: Any
+
+
+def _pack_int_records(records: list[tuple[int, list[int]]]) -> list[int]:
+    """Pack variable-length integer records into one flat payload."""
+
+    payload = [len(records)]
+    for request_id, values in records:
+        payload.extend((int(request_id), len(values), *map(int, values)))
+    return payload
+
+
+def _unpack_int_records(payload: list[int]) -> list[tuple[int, list[int]]]:
+    """Inverse of :func:`_pack_int_records` with bounds validation."""
+
+    if not payload:
+        raise RuntimeError("handoff metadata payload is empty")
+    num_records = int(payload[0])
+    offset = 1
+    records = []
+    for _ in range(num_records):
+        if offset + 2 > len(payload):
+            raise RuntimeError("handoff metadata payload has a truncated record header")
+        request_id, count = map(int, payload[offset : offset + 2])
+        offset += 2
+        if count < 0 or offset + count > len(payload):
+            raise RuntimeError("handoff metadata payload has an invalid record length")
+        records.append((request_id, [int(value) for value in payload[offset : offset + count]]))
+        offset += count
+    if offset != len(payload):
+        raise RuntimeError("handoff metadata payload contains trailing values")
+    return records
+
+
+def _all_gather_int_records(
+    records: list[tuple[int, list[int]]], group: Any, device: torch.device
+) -> list[list[tuple[int, list[int]]]]:
+    """All-gather a batch of integer records without Python object serialization."""
+
+    world_size = get_pg_size(group)
+    if world_size == 1 or not torch.distributed.is_initialized():
+        return [records]
+
+    payload = _pack_int_records(records)
+    header = torch.tensor((len(records), len(payload)), dtype=torch.int64, device=device)
+    gathered_header = torch.empty(world_size * 2, dtype=torch.int64, device=device)
+    torch.distributed.all_gather_into_tensor(gathered_header, header, group=group)
+    headers = gathered_header.view(world_size, 2).cpu().tolist()
+
+    record_counts = {int(values[0]) for values in headers}
+    if len(record_counts) != 1:
+        raise RuntimeError(f"Handoff request counts differ across ranks: {sorted(record_counts)}")
+    payload_sizes = [int(values[1]) for values in headers]
+    max_payload_size = max(payload_sizes)
+    local_payload = torch.zeros(max_payload_size, dtype=torch.int64, device=device)
+    local_payload[: len(payload)] = torch.tensor(payload, dtype=torch.int64, device=device)
+    gathered_payload = torch.empty(world_size * max_payload_size, dtype=torch.int64, device=device)
+    torch.distributed.all_gather_into_tensor(gathered_payload, local_payload, group=group)
+    return [
+        _unpack_int_records(rank_payload[:payload_size])
+        for rank_payload, payload_size in zip(
+            gathered_payload.view(world_size, max_payload_size).cpu().tolist(), payload_sizes
+        )
+    ]
+
+
 class InferenceStateHandoffMixin:
     """Optional KV-cache handoff behavior composed into the dynamic engine."""
 
@@ -38,6 +111,7 @@ class InferenceStateHandoffMixin:
         self._pinned_handoff_blocks: Dict[int, list] = {}
         self._kv_transfer_agent = None
         self._kv_peer_metas = None
+        self._pp_kv_peer_metas = None
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
         self._handoff_import_owners: Dict[int, list[int]] = {}
@@ -214,6 +288,15 @@ class InferenceStateHandoffMixin:
             )
             self._kv_peer_metas = gathered
 
+        # Transport descriptors are static. Gather them across pipeline stages
+        # once instead of serializing them with every completed request.
+        self._pp_kv_peer_metas = [self._kv_peer_metas]
+        if torch.distributed.is_initialized() and pp_size > 1:
+            self._pp_kv_peer_metas = [None] * pp_size
+            torch.distributed.all_gather_object(
+                self._pp_kv_peer_metas, self._kv_peer_metas, group=self.pg_collection.pp
+            )
+
     def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
         """Push a pinned hand-off's KV to the decode instance described by
         `decode_metas` (two-sided transports only).
@@ -246,45 +329,102 @@ class InferenceStateHandoffMixin:
         self._pending_kv_pushes = remaining
         return reaped
 
-    def _capture_handoff_meta(self, request: "DynamicInferenceRequest", block_ids: list) -> None:
-        """Attach transfer metadata and retain the request's pinned blocks."""
-        rid = request.request_id
+    def _prepare_handoff_metadata_batch(
+        self, requests_and_blocks: list[tuple["DynamicInferenceRequest", list[int]]]
+    ) -> dict[int, _PreparedHandoffMetadata]:
+        """Assemble metadata for all handoffs completed by one engine step."""
+
+        handoffs = [
+            (request, list(block_ids))
+            for request, block_ids in requests_and_blocks
+            if getattr(request.sampling_params, "do_kv_handoff", False)
+        ]
+        if not handoffs:
+            return {}
         if self._kv_peer_metas is None:
             raise RuntimeError("KV handoff requested before transfer setup")
-        local_kv: Any = self._kv_peer_metas
 
-        # Prefix-cache entries must be immutable. The last prompt block is still
-        # writable when the prompt is not block-aligned, so hand off only complete
-        # prompt blocks and let decode recompute the bounded partial tail.
-        num_complete_blocks = len(request.prompt_tokens) // self.context.block_size_tokens
-        dropped_blocks = block_ids[num_complete_blocks:]
-        block_ids = block_ids[:num_complete_blocks]
-        if dropped_blocks:
-            self._release_pinned_handoff_blocks(dropped_blocks)
+        local_records = []
+        local_blocks_by_request = {}
+        for request, block_ids in handoffs:
+            # Prefix-cache entries must be immutable. The last prompt block is
+            # still writable when the prompt is not block-aligned, so transfer
+            # only complete blocks and recompute the bounded tail on decode.
+            num_complete = len(request.prompt_tokens) // self.context.block_size_tokens
+            complete_blocks = block_ids[:num_complete]
+            dropped_blocks = block_ids[num_complete:]
+            if dropped_blocks:
+                self._release_pinned_handoff_blocks(dropped_blocks)
+            local_blocks_by_request[request.request_id] = complete_blocks
+            local_records.append((request.request_id, complete_blocks))
 
         pp_size = get_pg_size(self.pg_collection.pp)
-        if pp_size > 1 and torch.distributed.is_initialized():
-            local_entry = {"request_id": rid, "kv_meta": local_kv, "block_ids": list(block_ids)}
-            gathered: list = [None] * pp_size
-            torch.distributed.all_gather_object(gathered, local_entry, group=self.pg_collection.pp)
-            request_ids = {entry["request_id"] for entry in gathered}
-            block_counts = {len(entry["block_ids"]) for entry in gathered}
-            if request_ids != {rid} or len(block_counts) != 1:
-                if block_ids:
-                    self._release_pinned_handoff_blocks(block_ids)
-                raise RuntimeError(
-                    "Pipeline ranks produced inconsistent KV handoff metadata "
-                    f"(request_ids={sorted(request_ids)}, block_counts={sorted(block_counts)})"
+        try:
+            if pp_size > 1:
+                gathered_records = _all_gather_int_records(
+                    local_records, self.pg_collection.pp, self.context.memory_buffer.device
                 )
-            kv_meta: Any = {
-                "pp_metas": [
-                    {"tp_metas": e["kv_meta"], "block_ids": e["block_ids"]} for e in gathered
-                ]
-            }
-            top_block_ids: Any = gathered[0]["block_ids"]
-        else:
-            kv_meta = local_kv
-            top_block_ids = block_ids
+            else:
+                gathered_records = [local_records]
+            local_request_ids = [request_id for request_id, _ in local_records]
+            for rank_records in gathered_records:
+                rank_request_ids = [request_id for request_id, _ in rank_records]
+                if rank_request_ids != local_request_ids:
+                    raise RuntimeError(
+                        "Pipeline ranks completed different handoff requests "
+                        f"(local={local_request_ids}, peer={rank_request_ids})"
+                    )
+            for record_index in range(len(local_records)):
+                block_counts = {
+                    len(rank_records[record_index][1]) for rank_records in gathered_records
+                }
+                if len(block_counts) != 1:
+                    raise RuntimeError(
+                        "Pipeline ranks produced different handoff block counts "
+                        f"for request {local_request_ids[record_index]}: {sorted(block_counts)}"
+                    )
+            static_pp_metas = self._pp_kv_peer_metas or [self._kv_peer_metas]
+            if len(static_pp_metas) != pp_size:
+                raise RuntimeError(
+                    f"Expected static metadata for {pp_size} pipeline stages, "
+                    f"got {len(static_pp_metas)}"
+                )
+        except Exception:
+            for block_ids in local_blocks_by_request.values():
+                self._release_pinned_handoff_blocks(block_ids)
+            raise
+
+        prepared = {}
+        for record_index, (request_id, local_blocks) in enumerate(local_records):
+            stage_blocks = [rank_records[record_index][1] for rank_records in gathered_records]
+            if pp_size > 1:
+                kv_meta: Any = {
+                    "pp_metas": [
+                        {"tp_metas": stage_meta, "block_ids": blocks}
+                        for stage_meta, blocks in zip(static_pp_metas, stage_blocks)
+                    ]
+                }
+            else:
+                kv_meta = self._kv_peer_metas
+            prepared[request_id] = _PreparedHandoffMetadata(
+                local_blocks=local_blocks, top_blocks=stage_blocks[0], kv_meta=kv_meta
+            )
+        return prepared
+
+    def _capture_handoff_meta(
+        self,
+        request: "DynamicInferenceRequest",
+        block_ids: list,
+        prepared: _PreparedHandoffMetadata | None = None,
+    ) -> None:
+        """Attach prepared transfer metadata and retain the request's blocks."""
+
+        rid = request.request_id
+        if prepared is None:
+            prepared = self._prepare_handoff_metadata_batch([(request, block_ids)])[rid]
+        block_ids = prepared.local_blocks
+        kv_meta = prepared.kv_meta
+        top_block_ids = prepared.top_blocks
 
         if not block_ids:
             logging.warning(

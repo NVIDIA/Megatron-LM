@@ -265,7 +265,7 @@ def test_peer_poll_failure_fails_this_rank(handoff_loop, monkeypatch):
 
 @pytest.mark.parametrize(
     ("remote_request_id", "remote_blocks", "message"),
-    [(8, [20], "request_ids"), (7, [], "block_counts")],
+    [(8, [20], "different handoff requests"), (7, [], "different handoff block counts")],
 )
 def test_capture_handoff_rejects_inconsistent_pipeline_metadata(
     monkeypatch, remote_request_id, remote_blocks, message
@@ -274,34 +274,103 @@ def test_capture_handoff_rejects_inconsistent_pipeline_metadata(
     engine._initialize_disaggregation_state()
     pp_group = object()
     engine.pg_collection = SimpleNamespace(pp=pp_group)
-    engine.context = SimpleNamespace(block_size_tokens=4)
+    engine.context = SimpleNamespace(block_size_tokens=4, memory_buffer=torch.empty(1))
     engine._kv_peer_metas = {"global_rank": 0}
+    engine._pp_kv_peer_metas = [{"global_rank": 0}, {"global_rank": 1}]
     engine._release_pinned_handoff_blocks = mock.Mock(return_value=1)
     request = SimpleNamespace(
-        request_id=7, prompt_tokens=torch.arange(4), disaggregated_params=None
+        request_id=7,
+        prompt_tokens=torch.arange(4),
+        sampling_params=SamplingParams(do_kv_handoff=True),
+        disaggregated_params=None,
     )
 
-    def gather_inconsistent_metadata(output, local_entry, group):
+    collective_calls = 0
+
+    def gather_inconsistent_metadata(output, local, group):
+        nonlocal collective_calls
         assert group is pp_group
-        output[:] = [
-            local_entry,
-            {
-                "request_id": remote_request_id,
-                "kv_meta": {"global_rank": 1},
-                "block_ids": remote_blocks,
-            },
-        ]
+        collective_calls += 1
+        if collective_calls == 1:
+            remote_payload_size = 3 + len(remote_blocks)
+            output.copy_(torch.tensor([1, local[1], 1, remote_payload_size]))
+        else:
+            remote = torch.zeros_like(local)
+            remote_values = torch.tensor([1, remote_request_id, len(remote_blocks), *remote_blocks])
+            remote[: len(remote_values)] = remote_values
+            output.copy_(torch.cat((local, remote)))
 
     pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
     with (
         mock.patch(pg_size, return_value=2),
         mock.patch("torch.distributed.is_initialized", return_value=True),
-        mock.patch("torch.distributed.all_gather_object", side_effect=gather_inconsistent_metadata),
+        mock.patch(
+            "torch.distributed.all_gather_into_tensor", side_effect=gather_inconsistent_metadata
+        ),
         pytest.raises(RuntimeError, match=message),
     ):
         engine._capture_handoff_meta(request, [10])
 
     engine._release_pinned_handoff_blocks.assert_called_once_with([10])
+
+
+def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch):
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    pp_group = object()
+    engine.pg_collection = SimpleNamespace(pp=pp_group)
+    engine.context = SimpleNamespace(block_size_tokens=4, memory_buffer=torch.empty(1))
+    engine._kv_peer_metas = {"global_rank": 0}
+    engine._pp_kv_peer_metas = [{"global_rank": 0}, {"global_rank": 1}]
+    requests = [
+        SimpleNamespace(
+            request_id=7,
+            prompt_tokens=torch.arange(8),
+            sampling_params=SamplingParams(do_kv_handoff=True),
+            disaggregated_params=None,
+        ),
+        SimpleNamespace(
+            request_id=8,
+            prompt_tokens=torch.arange(12),
+            sampling_params=SamplingParams(do_kv_handoff=True),
+            disaggregated_params=None,
+        ),
+    ]
+    local_blocks = [[10, 11], [12, 13, 14]]
+    remote_payload = torch.tensor([2, 7, 2, 20, 21, 8, 3, 22, 23, 24])
+    collective_calls = 0
+
+    def gather_metadata(output, local, group):
+        nonlocal collective_calls
+        assert group is pp_group
+        collective_calls += 1
+        if collective_calls == 1:
+            output.copy_(torch.cat((local, local)))
+        else:
+            output.copy_(torch.cat((local, remote_payload)))
+
+    pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
+    with (
+        mock.patch(pg_size, return_value=2),
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.all_gather_into_tensor", side_effect=gather_metadata),
+    ):
+        prepared = engine._prepare_handoff_metadata_batch(zip(requests, local_blocks))
+        for request, blocks in zip(requests, local_blocks):
+            engine._capture_handoff_meta(request, blocks, prepared[request.request_id])
+
+    assert collective_calls == 2
+    assert requests[0].disaggregated_params == {
+        "request_id": 7,
+        "block_ids": [10, 11],
+        "kv_meta": {
+            "pp_metas": [
+                {"tp_metas": {"global_rank": 0}, "block_ids": [10, 11]},
+                {"tp_metas": {"global_rank": 1}, "block_ids": [20, 21]},
+            ]
+        },
+    }
+    assert requests[1].disaggregated_params["kv_meta"]["pp_metas"][1]["block_ids"] == [22, 23, 24]
 
 
 @pytest.mark.parametrize(
@@ -317,7 +386,10 @@ def test_capture_handoff_keeps_only_complete_prompt_blocks(
     engine._kv_peer_metas = {"global_rank": 0}
     engine._release_pinned_handoff_blocks = mock.Mock(return_value=len(released_blocks))
     request = SimpleNamespace(
-        request_id=7, prompt_tokens=torch.arange(prompt_tokens), disaggregated_params=None
+        request_id=7,
+        prompt_tokens=torch.arange(prompt_tokens),
+        sampling_params=SamplingParams(do_kv_handoff=True),
+        disaggregated_params=None,
     )
 
     with mock.patch(
