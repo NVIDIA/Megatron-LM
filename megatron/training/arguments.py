@@ -4202,6 +4202,16 @@ def _add_distributed_args(parser):
         'with the standard ring implementation) but performs accumulation locally in FP32.',
     )
     group.add_argument(
+        '--gtp-remat-reduce-scatter-with-fp32-accumulation',
+        action='store_true',
+        default=False,
+        help='Same trade as --ddp-reduce-scatter-with-fp32-accumulation, but for '
+        'the wgrad reduce-scatter GTP weight-remat performs over the gtp_remat axis: send '
+        'low-precision values over the wire via an all-to-all and accumulate locally in FP32. '
+        'Independent of the DDP flag (different collective, different process group). Costs one '
+        'extra unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.',
+    )
+    group.add_argument(
         '--ddp-param-name-patterns-for-fp32-local-accumulation',
         nargs='+',
         default=[],
