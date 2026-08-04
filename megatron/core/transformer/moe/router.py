@@ -6,6 +6,7 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.inference import insitu_timing as _insitu
+from megatron.core.inference.moe import synthetic_routing as _synth
 from megatron.core.inference.moe.fused_router import can_use_fused_router, fused_router
 from megatron.core.inference.moe.router_topk import (
     can_fuse_route_mask,
@@ -33,6 +34,13 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _synth_world() -> int:
+    """EP world size for synthetic routing's rank-block split."""
+    import torch.distributed as dist
+
+    return dist.get_world_size() if dist.is_initialized() else 1
 
 
 class Router(ABC, MegatronModule):
@@ -991,7 +999,14 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
         ):
             with _insitu.site("router_topk"):
-                return fused_softmax_topk(logits, self.topk, mask_padding=can_fuse_route_mask())
+                probs, idx = fused_softmax_topk(
+                    logits, self.topk, mask_padding=can_fuse_route_mask()
+                )
+                if _synth.ENABLED:
+                    probs, idx = _synth.maybe_override(
+                        probs, idx, self.config.num_moe_experts, _synth_world()
+                    )
+                return probs, idx
 
         probs, top_indices = self._compiled_topk_routing(
             logits,

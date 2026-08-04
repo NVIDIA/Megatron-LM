@@ -36,6 +36,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe import expert_histogram as _exphist
 from megatron.core.inference.moe import router_topk as _fused_topk
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -592,6 +593,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Publishing the count lets the router's selection kernel emit the sentinel and
         # retires this launch. The skip below keys off the tag the router leaves on the
         # tensor it actually masked, so it is evidence rather than the gate.
+        if _exphist.ENABLED:
+            # Allocated here rather than in __init__ because this is the first point
+            # with both the device and the global expert count in hand; it is a no-op
+            # after the first call, and capture has not happened yet on that call.
+            _exphist.configure(self.config.num_moe_experts, self.routing_map.device)
+        _exphist.record(self.routing_map)
+
         if self.__class__._real_token_count_tensor is not None and self._rows_unsharded:
             _fused_topk.publish_graph_padding(self.__class__._real_token_count_tensor)
 

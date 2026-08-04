@@ -126,6 +126,10 @@ def _report():
         from megatron.core.inference import insitu_timing
 
         insitu_timing.report(block_ms=g)
+
+        from megatron.core.inference.moe import expert_histogram
+
+        expert_histogram.dump()
     except Exception as e:
         print(f"[STEP_GPU] insitu report failed: {e}", file=sys.stderr, flush=True)
     # Dump here rather than only at exit: the harness SIGTERMs the server, which
