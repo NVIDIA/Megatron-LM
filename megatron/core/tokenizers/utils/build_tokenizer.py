@@ -64,6 +64,7 @@ def build_tokenizer(args, **kwargs):
             kwargs['vocab_size'] = args.vocab_size
         kwargs['num_special_tokens'] = args.tiktoken_num_special_tokens
         kwargs['special_tokens'] = args.special_tokens
+        kwargs['fast_tokenizer'] = args.fast_tokenizer
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
         tokenizer_library = 'huggingface'
         tokenizer_path = args.tokenizer_model
@@ -74,6 +75,7 @@ def build_tokenizer(args, **kwargs):
         kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
+        kwargs['fast_tokenizer'] = args.fast_tokenizer
     elif args.tokenizer_type == 'MultimodalTokenizer':
         tokenizer_library = 'multimodal'
         kwargs['prompt_format'] = args.tokenizer_prompt_format
