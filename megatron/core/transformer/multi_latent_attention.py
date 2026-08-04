@@ -90,6 +90,7 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
         packed_seq_params is not None
         and packed_seq_params.qkv_format == "thd"
         and parallel_attention.config.experimental_attention_variant is None
+        and not parallel_attention.config.mla_native_v_head_dim
         and value is not None
         and query.shape[-1] != orig_v_dim
     )

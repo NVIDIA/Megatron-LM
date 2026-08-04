@@ -438,6 +438,66 @@ class TestParallelMLAAttention:
                 assert output.shape[2] == transformer_config.hidden_size
                 assert bias.shape[0] == transformer_config.hidden_size
 
+    @pytest.mark.parametrize("mla_native_v_head_dim", [False, True])
+    def test_gpu_forward_thd_native_v_head_dim(self, mla_native_v_head_dim):
+        """Test that mla_native_v_head_dim controls the thd V pad without changing the output."""
+        if is_te_min_version("1.10.0"):
+            transformer_config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=64,
+                qk_pos_emb_head_dim=64,
+                mla_native_v_head_dim=mla_native_v_head_dim,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=self.transformer_config.rotary_base,
+                original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
+            )
+            attention = MLASelfAttention(
+                transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            sequence_length = 32
+            micro_batch_size = 1
+
+            attention.cuda().bfloat16()
+
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, transformer_config.hidden_size)
+            )
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            with mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ):
+                packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+                query, _, value, _, _ = attention.get_query_key_value_tensors(
+                    hidden_states, None, None, packed_seq_params, None
+                )
+                assert query.shape[-1] != value.shape[-1]
+
+                prepared, need_v_pad, orig_v_dim, _ = mla_module._prepare_mla_core_attention_value(
+                    attention, query, value, packed_seq_params
+                )
+                assert need_v_pad is not mla_native_v_head_dim
+                assert prepared.shape[-1] == (
+                    orig_v_dim if mla_native_v_head_dim else query.shape[-1]
+                )
+
+                output, bias = attention(hidden_states, None, packed_seq_params=packed_seq_params)
+
+                assert output.shape[0] == sequence_length
+                assert output.shape[1] == micro_batch_size
+                assert output.shape[2] == transformer_config.hidden_size
+                assert bias.shape[0] == transformer_config.hidden_size
+
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
             transformer_config = self.transformer_config
