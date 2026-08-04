@@ -313,7 +313,8 @@ class _GDNBase(MegatronModule):
         """Set variant specifics on the module. Called once from ``__init__``.
 
         Must set:
-        - ``in_proj_dim``
+        - ``in_proj_extra_dim`` (the variant-specific in_proj sections beyond q/k/v/z;
+          the base class derives ``in_proj_dim`` from it)
         - ``in_proj_split_names``
         - ``in_proj_split_sections``
         - ``feat_dim_split``
