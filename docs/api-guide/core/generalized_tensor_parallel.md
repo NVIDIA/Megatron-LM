@@ -283,7 +283,7 @@ GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False
 
 ### 2.4 Tuning knobs
 
-Set via `from megatron.core.tensor_parallel.gtp_api import GTP_CONFIG, update_gtp_config`:
+Set via `from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG, update_gtp_config`:
 
 ```python
 update_gtp_config(
@@ -646,16 +646,9 @@ The two modes differ only in release timing and the storage required to make ear
 5. **Replay fencing.** Before replay writes a slot, the graph runner waits for its `ready_event`. The RS stream publishes that event only after NCCL has stopped reading the slot. Different slots may remain live concurrently; reuse of an occupied slot waits.
 6. **Final gradient fence.** `wait_for_gtp_grad_reduction_on_current_stream()` joins GTP side streams and graph-runner streams before DDP or the optimizer consumes `main_grad`.
 
-*Result and cost.* The ring owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail remains zero, and a non-ring producer is copied into the logical view before reduce-scatter. The bounded memory cost is up to `graph_wgrad_ring_size` full unsharded wgrad buffers for each matching scheduling/shape domain, rather than one buffer per layer. The default ring size of two is sufficient for the intended one-graph overlap: one slot may remain an in-flight RS input while the next graph writes the other, and reuse waits on the older slot's `ready_event`. A larger ring is needed only if a graph scope introduces additional simultaneously live same-key writers; capture rejects unsafe same-slot reuse instead of silently aliasing it.
+*Result and cost.* The ring owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail remains zero, and a non-ring producer is copied into the logical view before reduce-scatter. The bounded memory cost is up to `graph_wgrad_ring_size` full unsharded wgrad buffers for each matching scheduling/shape domain, rather than one buffer per layer. The default ring size of two is sufficient when each graph has one same-key writer: one slot may remain an in-flight RS input while the next graph writes the other, and reuse waits on the older slot's `ready_event`. A larger ring is needed only when one graph contains multiple same-key writers whose reduce-scatter inputs can be live together. Capture rejects unsafe same-slot reuse instead of silently aliasing it.
 
 The feature applies only to **local/partial CUDA graphs** and is enabled by default. `--disable-gtp-local-cg-backward-rs-overlap` selects the conservative schedule for correctness and performance comparisons. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
-
-*Performance.*
-
-| Model / parallel configuration | CUDA-graph scope | Without overlap | With overlap | Gain |
-|---|---|---:|---:|---:|
-| Half NT3 Ultra, L54; 256 GPUs; TP1GTP128EP64EGTP4DP2; MBS1 GBS256; MXFP8 | `mamba attn moe_router` | 989.9 TFLOP/s/GPU (1423.8 ms/iter) | 1023.6 TFLOP/s/GPU (1375.8 ms/iter) | +3.4% |
-| Half NT4 proxy, L76; 256 GPUs; TP2GTP64DP4EP64EGTP4; MBS1, GBS256; MXFP8 with BF16 RS | `mamba attn moe_router` | 995.2 TFLOP/s/GPU (3351.4 ms/iter) | 1063.3 TFLOP/s/GPU (3136.7 ms/iter) | +6.8% |
 
 ## 4. Testing
 

@@ -1486,9 +1486,6 @@ def validate_args(args, defaults={}):
             )
         gtp_weight_remat_size = args.gtp_weight_remat_size
         egtp_weight_remat_size = args.expert_gtp_weight_remat_size
-        from megatron.core.tensor_parallel.gtp_api import update_gtp_config
-
-        update_gtp_config(cross_cg_overlap=args.gtp_local_cg_backward_rs_overlap)
         if get_device_arch_version() >= 10:
             # Setting GTP communication groups for high priority streams for Blackwell and later
             # architectures. Assigning high priority to communication streams ensures that

@@ -429,7 +429,8 @@ class GTPRematConfig:
     # finished. Disable to drain RS before graph completion.
     cross_cg_overlap: bool = True
     # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
-    # Two slots allow graph N+1 compute to overlap graph N's RS.
+    # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
+    # same-key writers may need more slots to keep all in-flight RS inputs distinct.
     graph_wgrad_ring_size: int = 2
 
 
@@ -462,9 +463,10 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    cross_cg_overlap=True,
 ):
     """
-    Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
+    Configure GTP weight-remat before model construction.
     Must be called once BEFORE model construction.
     """
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
@@ -474,6 +476,7 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+        cross_cg_overlap=cross_cg_overlap,
     )
     if fp4:
         update_gtp_config(pad_for_alignment=16)
@@ -1104,9 +1107,11 @@ class GTPShardedParam(torch.nn.Parameter):
     def _get_cache_key(self, dtype, fwd: bool, reduce_scatter: bool) -> tuple:
         """Build a cache key that includes the communication scheduling domain.
 
-        Buffers may be reused only by operations serialized on the same GTP chain and process
-        group. GRAPHED and UNGRAPHED chains use independent streams, as do collectives on different
-        process groups, so sharing across either boundary can race even when shape and dtype match.
+        ``GTPWeightCache.release`` retains a ticket's buffer pointer while returning the storage to
+        its key's pool. Reuse is therefore safe only for operations serialized on the same GTP chain
+        and process group. GRAPHED and UNGRAPHED chains use independent streams, as do collectives
+        on different process groups, so sharing across either boundary can race even when shape and
+        dtype match.
 
         Within one scheduling domain, weights with matching gathered shape and dtype share a
         buffer. Expert weights gathered in parallel use self.expert_idx to remain distinct, while
