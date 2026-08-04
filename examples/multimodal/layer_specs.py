@@ -3,7 +3,6 @@ from functools import partial
 
 import torch
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -15,9 +14,11 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -127,11 +128,23 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
     )
 
 
-def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
+def get_hybrid_layer_spec_te(config=None, padding=False) -> ModuleSpec:
     attn_mask_type = AttnMaskType.causal
     # Padding mask is needed for e.g. Context Parallel.
     if padding:
         attn_mask_type = AttnMaskType.padding_causal
+
+    # MoE expert count / grouped-GEMM come from the language model's
+    # TransformerConfig so this spec matches the checkpoint's architecture.
+    # The moe_layer branch is only used by MoE hybrid checkpoints (e.g.
+    # nemotron6-moe); non-MoE hybrids never traverse it, so a None config is
+    # fine there — assert only when it would actually be consulted.
+    if config is not None:
+        num_experts = config.num_moe_experts
+        moe_grouped_gemm = config.moe_grouped_gemm
+    else:
+        num_experts = None
+        moe_grouped_gemm = None
 
     return ModuleSpec(
         module=HybridStack,
@@ -178,6 +191,19 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
                             linear_fc1=not_none(TELayerNormColumnParallelLinear),
                             linear_fc2=not_none(TERowParallelLinear),
                         ),
+                    ),
+                    mlp_bda=get_bias_dropout_add,
+                ),
+            ),
+            moe_layer=ModuleSpec(
+                module=MoETransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    pre_mlp_layernorm=TENorm,
+                    mlp=get_moe_module_spec(
+                        use_te=True,
+                        num_experts=num_experts,
+                        moe_grouped_gemm=moe_grouped_gemm,
+                        moe_use_legacy_grouped_gemm=False,
                     ),
                     mlp_bda=get_bias_dropout_add,
                 ),

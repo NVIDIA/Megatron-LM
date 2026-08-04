@@ -824,10 +824,26 @@ class TextGenerationController:
         else:
             logits_seq_len = context.padded_active_token_count
 
+        # Check for VLM image data in the context.
+        image_token_mask = context.current_image_token_mask()
+        image_embeddings = context.current_image_embeddings()
+        has_images = (
+            image_token_mask is not None
+            and image_embeddings is not None
+            and (image_token_mask >= 0).any()
+        )
+
+        inference_input = {
+            "tokens": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": None,
+        }
+        if has_images:
+            inference_input["image_token_mask"] = image_token_mask
+            inference_input["image_embeddings"] = image_embeddings
+
         with torch.inference_mode():
-            logits = self.inference_wrapped_model.run_one_forward_step(
-                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
-            )
+            logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
             # logits shape: [1, seq_len, vocab_size]
 
         if not context.config.materialize_only_last_token_logits:

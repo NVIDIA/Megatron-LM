@@ -1,10 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
 import json
 import logging
 import time
 import traceback
+import urllib.request
 import uuid
 import warnings
 
@@ -232,6 +234,75 @@ def _coerce_arguments_mapping(arguments):
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _extract_image_url_bytes(url: str) -> bytes:
+    """Extract raw bytes from an OpenAI-style image_url value.
+
+    Supports base64-encoded data URLs (``data:image/...;base64,<b64>``) and
+    plain ``http(s)://`` URLs.
+    """
+    if url.startswith("data:"):
+        _, b64_data = url.split(",", 1)
+        return base64.b64decode(b64_data)
+    if url.startswith(("http://", "https://")):
+        with urllib.request.urlopen(url) as response:
+            return response.read()
+    raise ValueError(f"Unsupported image_url scheme: {url[:40]!r}")
+
+
+def _extract_images_from_messages(messages):
+    """Pull image_url blocks out of OpenAI-style multimodal messages.
+
+    Walks the message list, extracting bytes from each ``image_url`` block,
+    replacing it with an inline ``<image>`` text marker, and returning both
+    the rewritten messages and the ordered list of image bytes. Messages
+    with plain string ``content`` are passed through unchanged.
+
+    Returns:
+        (messages_with_markers, image_bytes_list)
+    """
+    if not isinstance(messages, list):
+        return messages, []
+
+    rewritten = []
+    image_bytes_list: list[bytes] = []
+
+    for message in messages:
+        if not isinstance(message, dict):
+            rewritten.append(message)
+            continue
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+
+        new_chunks = []
+        found_image = False
+        for chunk in content:
+            if isinstance(chunk, dict) and chunk.get("type") == "image_url":
+                url = chunk.get("image_url", {}).get("url", "")
+                if not url:
+                    continue
+                try:
+                    image_bytes_list.append(_extract_image_url_bytes(url))
+                except Exception as e:
+                    logger.warning(f"Failed to decode image_url: {e}")
+                    continue
+                new_chunks.append({"type": "text", "text": "<image>"})
+                found_image = True
+            else:
+                new_chunks.append(chunk)
+
+        if found_image:
+            msg_copy = dict(message)
+            msg_copy["content"] = new_chunks
+            rewritten.append(msg_copy)
+        else:
+            rewritten.append(message)
+
+    return rewritten, image_bytes_list
 
 
 def _sanitize_messages_for_template(messages):
@@ -468,16 +539,34 @@ try:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
+        # Extract any image_url blocks before template sanitization, which would
+        # otherwise drop them. Replaces each image block with an inline <image>
+        # text marker that the chat template can substitute.
+        messages, image_bytes_list = _extract_images_from_messages(messages)
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 
+        # Inject a server-configured chat template (e.g. pretraining.jinja for
+        # VLM checkpoints) unless the caller supplies its own. Loaded once at
+        # server startup from --chat-template into app.config.
+        server_chat_template = current_app.config.get('chat_template', None)
+        if server_chat_template and 'chat_template' not in chat_template_kwargs:
+            chat_template_kwargs['chat_template'] = server_chat_template
+
+        # Prefer the underlying HF tokenizer for chat-template application when
+        # reachable. The vision tokenizer's apply_chat_template is a stub, and
+        # the text wrapper just forwards anyway; reaching the HF tokenizer lets
+        # us pass tokenize/add_generation_prompt/chat_template directly.
+        hf_tok = getattr(getattr(tokenizer, '_tokenizer', None), 'tokenizer', None)
+        chat_tok = hf_tok if hf_tok is not None else tokenizer
+
         try:
-            if (
-                hasattr(tokenizer, 'apply_chat_template')
-                and getattr(tokenizer, "chat_template", None) is not None
+            if hasattr(chat_tok, 'apply_chat_template') and (
+                getattr(chat_tok, "chat_template", None) is not None
+                or chat_template_kwargs.get('chat_template') is not None
             ):
                 prompt_tokens = _coerce_to_token_id_list(
-                    tokenizer.apply_chat_template(
+                    chat_tok.apply_chat_template(
                         template_messages,
                         tokenize=True,
                         add_generation_prompt=True,
@@ -525,7 +614,7 @@ try:
 
                         # Get the templated tokenization of just the previous generation
                         retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                            tokenizer.apply_chat_template(
+                            chat_tok.apply_chat_template(
                                 messages_to_last_assistant_message,
                                 tokenize=True,
                                 add_generation_prompt=False,
@@ -611,6 +700,11 @@ try:
             return_raw_text = req.get("return_raw_text", False)
             return_prompt_tokens = return_tokenized_data or return_raw_text
 
+            # OpenAI-style "stop" may be a string or list of strings; normalize.
+            stop = req.get("stop", None)
+            if isinstance(stop, str):
+                stop = [stop]
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -618,6 +712,7 @@ try:
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
+                stop_words=stop,
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
@@ -640,7 +735,10 @@ try:
                 return Response(str(error), status=400)
 
             streams = [
-                client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
+                client.add_request_streaming(
+                    prompt_tokens, sampling_params, image_bytes_list=image_bytes_list or None
+                )
+                for _ in range(n)
             ]
             chat_parsers = None
             if parsers:
@@ -692,7 +790,12 @@ try:
             response.timeout = None
             return response
 
-        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        tasks = [
+            client.add_request(
+                prompt_tokens, sampling_params, image_bytes_list=image_bytes_list or None
+            )
+            for _ in range(n)
+        ]
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()

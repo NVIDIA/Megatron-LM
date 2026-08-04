@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
 import logging
 import time
 
@@ -97,6 +98,12 @@ try:
 
             ignore_eos = bool(req.get("ignore_eos", False))
 
+            # Optional VLM input: base64-encoded image bytes, ordered to match
+            # <image> markers in the prompt. Text-only callers omit this field.
+            image_bytes_list = [
+                base64.b64decode(s) for s in (req.get("image_bytes_list") or [])
+            ]
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -143,9 +150,21 @@ try:
                 streaming_interval=sampling_params.streaming_interval,
             )
             if stream_requested:
-                tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request_streaming(
+                        prompt_tokens,
+                        per_req_params,
+                        image_bytes_list=image_bytes_list or None,
+                    )
+                )
             else:
-                tasks.append(client.add_request(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request(
+                        prompt_tokens,
+                        per_req_params,
+                        image_bytes_list=image_bytes_list or None,
+                    )
+                )
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))

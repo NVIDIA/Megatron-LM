@@ -89,7 +89,11 @@ class InferenceClient:
         self.aborted_request_ids: set[int] = set()
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        image_bytes_list: Optional[List[bytes]] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -103,6 +107,9 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
+            image_bytes_list: Optional list of raw image bytes (one entry per
+                image in the prompt). When provided, the engine will preprocess
+                each image and run the vision encoder before adding the request.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
@@ -111,7 +118,13 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        payload = [
+            Headers.SUBMIT_REQUEST.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            image_bytes_list,
+        ]
         return self._submit_request(payload, request_id)
 
     def _make_kv_handoff_request(
@@ -211,7 +224,11 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def add_request_streaming(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        image_bytes_list: Optional[List[bytes]] = None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -238,7 +255,13 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        payload = [
+            Headers.SUBMIT_REQUEST.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            image_bytes_list,
+        ]
         return self._submit_stream(payload, request_id)
 
     def _submit_request(self, payload: list, request_id: int) -> asyncio.Future:
