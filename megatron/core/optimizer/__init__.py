@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import logging
 import warnings
@@ -88,6 +88,37 @@ from .optimizer_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _release_unused_cpu_memory_after_optimizer_init(optimizer: MegatronOptimizer) -> bool:
+    """Release CPU allocator pages after distributed optimizer HP initialization."""
+
+    def iter_optimizers(current_optimizer):
+        if isinstance(current_optimizer, ChainedOptimizer):
+            for child_optimizer in current_optimizer.chained_optimizers:
+                yield from iter_optimizers(child_optimizer)
+        else:
+            yield current_optimizer
+
+    high_precision_init_value_count = sum(
+        getattr(leaf_optimizer, '_high_precision_init_value_count', 0)
+        for leaf_optimizer in iter_optimizers(optimizer)
+    )
+    if high_precision_init_value_count == 0:
+        return False
+
+    cpu_empty_cache = getattr(getattr(torch, 'cpu', None), 'empty_cache', None)
+    if cpu_empty_cache is None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "PyTorch does not provide torch.cpu.empty_cache(); released high-precision "
+            "initialization values may remain cached by the CPU allocator.",
+        )
+        return False
+
+    cpu_empty_cache()
+    return True
 
 
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
@@ -1023,12 +1054,14 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
-        return _get_megatron_emerging_optimizer(
+        optimizer = _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
             config_overrides=config_overrides,
             pg_collection=pg_collection,
         )
+        _release_unused_cpu_memory_after_optimizer_init(optimizer)
+        return optimizer
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
@@ -1115,10 +1148,9 @@ def get_megatron_optimizer(
             optimizers.append(optimizer_part)
             model_chunk_offset += 1
 
-        if len(optimizers) == 1:
-            return optimizers[0]
-
-        return ChainedOptimizer(optimizers)
+        optimizer = optimizers[0] if len(optimizers) == 1 else ChainedOptimizer(optimizers)
+        _release_unused_cpu_memory_after_optimizer_init(optimizer)
+        return optimizer
 
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}
@@ -1205,4 +1237,6 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
-    return ChainedOptimizer(optimizers)
+    optimizer = ChainedOptimizer(optimizers)
+    _release_unused_cpu_memory_after_optimizer_init(optimizer)
+    return optimizer

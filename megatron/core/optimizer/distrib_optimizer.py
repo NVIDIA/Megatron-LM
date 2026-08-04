@@ -352,6 +352,40 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return local_param_group_map, group_ranges
 
+    @staticmethod
+    def _clear_unowned_high_precision_init_values(
+        opt_group_ranges: List,
+        param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
+        config: OptimizerConfig,
+    ) -> Tuple[int, int]:
+        """Clear initialization values after this rank no longer needs them.
+
+        Quantized parameters retain a high-precision CPU initialization value
+        until the distributed optimizer creates its FP32 main-parameter shard.
+        Parameters that have no shard on this rank never enter the shard-copy
+        loop, so their initialization values must be released separately.
+        """
+        if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return 0, 0
+
+        observed = 0
+        cleared = 0
+        for group_range in opt_group_ranges:
+            for model_param in group_range["orig_group"]["params"]:
+                getter = getattr(model_param, 'get_high_precision_init_val', None)
+                if getter is None:
+                    continue
+                high_precision_init_value = getter()
+                if high_precision_init_value is None:
+                    continue
+                observed += 1
+                if model_param not in param_gbuf_map:
+                    model_param.clear_high_precision_init_val()
+                    cleared += 1
+                del high_precision_init_value
+
+        return observed, cleared
+
     @classmethod
     def _build_model_and_main_param_groups(
         cls,
@@ -777,6 +811,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Optimizer ranges.
         self.model_param_group_index_map, self.opt_group_ranges = (
             self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
+        )
+
+        self._high_precision_init_value_count, _ = self._clear_unowned_high_precision_init_values(
+            self.opt_group_ranges, self.model_param_gbuf_map, config
         )
 
         # Allocate main param shards.
