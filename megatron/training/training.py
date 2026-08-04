@@ -1921,6 +1921,13 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
+    if args.moe_token_dispatcher_type == "moonep":
+        # MoonEP holds VMM/NVLink mappings that must be released before the process
+        # group is torn down.
+        from megatron.core.transformer.moe.moonep_manager import destroy_moonep_managers
+
+        destroy_moonep_managers()
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
