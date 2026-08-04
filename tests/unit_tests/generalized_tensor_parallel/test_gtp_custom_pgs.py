@@ -91,19 +91,19 @@ def _pick_permuted_gtp_group(rank, mpu_ranks):
     Returns the group whose membership differs from ``mpu_ranks``, so any module that reads
     the global group instead of the supplied one gathers a different peer's shard.
     """
-    my_group = {}
-    for name, pairs in _PAIRINGS.items():
+    my_groups = {}  # sorted pair -> this rank's group in that pairing
+    for pairs in _PAIRINGS.values():
         for pair in pairs:
             group = dist.new_group(ranks=pair)
             if rank in pair:
-                my_group[name] = (group, pair)
+                my_groups[tuple(sorted(pair))] = group
 
-    permuted = [(g, pair) for g, pair in my_group.values() if sorted(pair) != mpu_ranks]
+    permuted = [g for pair, g in my_groups.items() if list(pair) != mpu_ranks]
     assert len(permuted) == 1, (
-        f"rank {rank}: expected exactly one pairing differing from the MPU group {mpu_ranks}, "
-        f"got {[pair for _, pair in my_group.values()]}"
+        f"rank {rank}: want exactly one pairing differing from the MPU group {mpu_ranks}, "
+        f"got {list(my_groups)}"
     )
-    return permuted[0][0]
+    return permuted[0]
 
 
 def _canonical_full_weights(block, gtp_group):
@@ -221,7 +221,6 @@ def _worker_custom_pgs_match_mpu(rank, world_size, port):
 
     ps.destroy_model_parallel()
     ps.initialize_model_parallel()
-    GTPShardedParam._chain_state = {}
 
     # ---------------- The two topologies must agree ----------------
     torch.testing.assert_close(
@@ -246,8 +245,47 @@ def _worker_custom_pgs_match_mpu(rank, world_size, port):
         )
 
 
+def _worker_partial_pgs_fall_back_to_mpu(rank, world_size, port):
+    """A collection that omits gtp_remat must fall back to the MPU group, not disable GTP.
+
+    ``__getattr__`` returns None for unset fields, so ``hasattr`` lies: a resolver trusting it
+    reads None and silently builds an unsharded block.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=GTP_SIZE
+    )
+    model_parallel_cuda_manual_seed(42)
+
+    partial_pgs = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'pp'])
+    assert 'gtp_remat' not in vars(partial_pgs), "this collection must omit gtp_remat"
+
+    block = _build_block(partial_pgs)
+
+    gtp_group = ps.get_gtp_weight_remat_group()
+    sharded = [(n, p) for n, p in block.named_parameters() if isinstance(p, GTPShardedParam)]
+    assert sharded, "no parameter was sharded: the resolver did not fall back to the MPU group"
+    for name, param in sharded:
+        assert param.gtp_remat_size == gtp_group.size(), (
+            f"{name} was sharded over a size-{param.gtp_remat_size} axis, "
+            f"want {gtp_group.size()} (the MPU gtp_remat group)"
+        )
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel()
+
+
 class TestGTPCustomProcessGroups:
     def test_custom_gtp_pg_collection_matches_mpu(self):
         """A permuted-but-equivalent gtp_remat group must give identical fwd/bwd results."""
         _requires_multi_gpu(WORLD)
         _run_distributed(_worker_custom_pgs_match_mpu, WORLD)
+
+    def test_pg_collection_without_gtp_remat_falls_back_to_mpu(self):
+        """Omitting gtp_remat must fall back to the MPU group, not silently disable sharding."""
+        _requires_multi_gpu(WORLD)
+        _run_distributed(_worker_partial_pgs_fall_back_to_mpu, WORLD)

@@ -704,7 +704,9 @@ def resolve_gtp_remat_group(
         is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
     """
     attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
-    if pg_collection is not None and hasattr(pg_collection, attr):
+    # `vars()`, not hasattr: __getattr__ makes hasattr always True, so the fallback below
+    # would be unreachable.
+    if pg_collection is not None and attr in vars(pg_collection):
         return getattr(pg_collection, attr)
     mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
         required_pgs=['gtp_remat', 'expt_gtp_remat']
