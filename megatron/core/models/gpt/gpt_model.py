@@ -786,6 +786,7 @@ class GPTModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     source_partition_mode=input_partition_mode,
                     target_partition_mode=postprocess_partition_mode,
+                    tp_group=self.pg_collection.tp,
                 )
                 input_to_postprocess_converter.assert_no_dense_attention_inputs(
                     attention_mask=attention_mask,
@@ -796,7 +797,9 @@ class GPTModel(LanguageModule):
                 position_ids = input_to_postprocess_converter.convert(position_ids, seq_dim=-1)
                 labels = input_to_postprocess_converter.convert(labels, seq_dim=-1)
                 loss_mask = input_to_postprocess_converter.convert(loss_mask, seq_dim=-1)
-                padding_mask = input_to_postprocess_converter.convert(padding_mask, seq_dim=-1)
+                padding_mask = input_to_postprocess_converter.convert(
+                    padding_mask, seq_dim=-1, sequence_parallel=self.config.sequence_parallel
+                )
                 rotary_pos_emb = input_to_postprocess_converter.convert_rank_local_rotary(
                     rotary_pos_emb, seq_dim=0
                 )
