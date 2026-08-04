@@ -35,13 +35,20 @@ if TYPE_CHECKING:
 class _PreparedHandoffMetadata:
     """Per-request metadata assembled once for a completed prefill batch."""
 
-    local_blocks: list[int]
-    top_blocks: list[int]
+    local_blocks: list[int]  # Complete blocks owned and pinned by this PP stage.
+    top_level_blocks: list[int]  # Stage-0 blocks carried in the top-level wire field.
     kv_meta: Any
 
 
 def _pack_int_records(records: list[tuple[int, list[int]]]) -> list[int]:
-    """Pack variable-length integer records into one flat payload."""
+    """Encode request records for a tensor-based pipeline-stage gather.
+
+    Each record is encoded as ``[request_id, value_count, *values]``, with the
+    number of records at the front of the payload. For example,
+    ``[(7, [10, 11]), (8, [12])]`` becomes ``[2, 7, 2, 10, 11, 8, 1, 12]``.
+    The flat integer payload lets :func:`_all_gather_int_records` exchange
+    request block IDs without Python object serialization.
+    """
 
     payload = [len(records)]
     for request_id, values in records:
@@ -50,7 +57,13 @@ def _pack_int_records(records: list[tuple[int, list[int]]]) -> list[int]:
 
 
 def _unpack_int_records(payload: list[int]) -> list[tuple[int, list[int]]]:
-    """Inverse of :func:`_pack_int_records` with bounds validation."""
+    """Decode request records gathered from another pipeline stage.
+
+    The first value is the record count, followed by
+    ``[request_id, value_count, *values]`` for each record. For example,
+    ``[1, 7, 2, 10, 11]`` becomes ``[(7, [10, 11])]``. Bounds and trailing-data
+    checks reject malformed peer metadata before it is used for a handoff.
+    """
 
     if not payload:
         raise RuntimeError("handoff metadata payload is empty")
@@ -408,7 +421,7 @@ class InferenceStateHandoffMixin:
             else:
                 kv_meta = self._kv_peer_metas
             prepared[request_id] = _PreparedHandoffMetadata(
-                local_blocks=local_blocks, top_blocks=stage_blocks[0], kv_meta=kv_meta
+                local_blocks=local_blocks, top_level_blocks=stage_blocks[0], kv_meta=kv_meta
             )
         return prepared
 
@@ -425,7 +438,7 @@ class InferenceStateHandoffMixin:
             prepared = self._prepare_handoff_metadata_batch([(request, block_ids)])[rid]
         block_ids = prepared.local_blocks
         kv_meta = prepared.kv_meta
-        top_block_ids = prepared.top_blocks
+        top_level_block_ids = prepared.top_level_blocks
 
         if not block_ids:
             logging.warning(
@@ -443,7 +456,7 @@ class InferenceStateHandoffMixin:
 
         request.disaggregated_params = {
             "request_id": rid,
-            "block_ids": top_block_ids,
+            "block_ids": top_level_block_ids,
             "kv_meta": kv_meta,
         }
         logging.info("DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d", rid, len(block_ids))
