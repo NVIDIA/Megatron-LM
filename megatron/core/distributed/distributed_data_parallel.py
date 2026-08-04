@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import weakref
 from contextlib import contextmanager
 from typing import Optional
 
@@ -17,6 +18,26 @@ from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
+
+
+class GTPParamSyncHandle:
+    """GTP-only readiness handle for one DDP parameter all-gather bucket group."""
+
+    def __init__(self, ddp, bucket_group) -> None:
+        self._ddp = weakref.ref(ddp)
+        self._bucket_group = bucket_group
+
+    def ensure_ready(self) -> None:
+        """Finish this bucket's parameter all-gather when forward hooks are active."""
+        ddp = self._ddp()
+        if ddp is None or is_graph_capturing() or not ddp.remove_forward_pre_hook_handles:
+            return
+        if (
+            self._bucket_group.param_gather_dispatched
+            and self._bucket_group.param_gather_handle is None
+        ):
+            return
+        ddp._finish_param_sync_for_bucket_group(self._bucket_group)
 
 
 class DistributedDataParallel(_BaseDataParallel):
@@ -338,6 +359,19 @@ class DistributedDataParallel(_BaseDataParallel):
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
 
+        if self.ddp_config.overlap_param_gather:
+            # Only GTP parameters need a readiness handle: GTP prefetch may read them before
+            # their owning module's ordinary DDP pre-forward hook runs.
+            gtp_bucket_group_handles: dict[object, GTPParamSyncHandle] = {}
+            for param, bucket_group in self.param_to_bucket_group.items():
+                if not getattr(param, 'is_gtp_weight_remat', False):
+                    continue
+                handle = gtp_bucket_group_handles.get(bucket_group)
+                if handle is None:
+                    handle = GTPParamSyncHandle(self, bucket_group)
+                    gtp_bucket_group_handles[bucket_group] = handle
+                param._gtp_ddp_param_sync_handle = handle
+
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
         # This is a temporary workaround around a TE bug that is fixed with
@@ -455,20 +489,19 @@ class DistributedDataParallel(_BaseDataParallel):
                 if param not in self.param_to_bucket_group:
                     continue
                 assert param.requires_grad
-
-                # If aligning param all-gather across pipeline stages, all-gather is dispatched
-                # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
-                # If overlapping param all-gather with optimizer step, then all-gather has
-                # already been dispatched in optimizer step.
-                skip_next_bucket_dispatch = (
-                    self.ddp_config.align_param_gather
-                    or self.overlap_param_gather_with_optimizer_step
-                )
-                self.param_to_bucket_group[param].finish_param_sync(
-                    skip_next_bucket_dispatch=skip_next_bucket_dispatch
-                )
+                self._finish_param_sync_for_bucket_group(self.param_to_bucket_group[param])
 
         return hook
+
+    def _finish_param_sync_for_bucket_group(self, bucket_group):
+        # If aligning param all-gather across pipeline stages, all-gather is dispatched
+        # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
+        # If overlapping param all-gather with optimizer step, then all-gather has
+        # already been dispatched in optimizer step.
+        skip_next_bucket_dispatch = (
+            self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
+        )
+        bucket_group.finish_param_sync(skip_next_bucket_dispatch=skip_next_bucket_dispatch)
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         """

@@ -70,6 +70,7 @@ if HAVE_GTP:
         get_ag_stream,
         get_rs_stream,
         set_cuda_graph_mempool,
+        track_gtp_capture_comms,
         wait_async_comms,
     )
 else:
@@ -80,6 +81,7 @@ else:
     get_ag_stream = None
     get_rs_stream = None
     set_cuda_graph_mempool = None
+    track_gtp_capture_comms = None
     wait_async_comms = None
 
 try:
@@ -925,6 +927,8 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
+        # DDP parameter buckets read by this graph before their module pre-hooks run.
+        self._gtp_fwd_capture_comms = None
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -1302,8 +1306,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
-                with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                capture_comm_context = (
+                    track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+                )
+                with (
+                    capture_comm_context as capture_comms,
+                    torch.cuda.graph(
+                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    ),
                 ):
 
                     self._sync_against_side_streams(self.fwd_side_streams)
@@ -1321,6 +1331,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.use_stream:
                         self.fwd_completion_event.record()
+
+                if self.gtp_remat:
+                    self._gtp_fwd_capture_comms = capture_comms
 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -1631,6 +1644,9 @@ class _CudaGraphRunner(torch.nn.Module):
         if mismatch_errors:
             error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
             raise AssertionError(error_msg)
+
+        if self._gtp_fwd_capture_comms is not None:
+            self._gtp_fwd_capture_comms.ensure_param_sync_ready()
 
         inp_tensors = self.get_tensors(args, kwargs, check_types=False)
         if self.grad_enabled:

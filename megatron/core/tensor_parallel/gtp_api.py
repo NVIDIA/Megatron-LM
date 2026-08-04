@@ -30,6 +30,7 @@ try:
         wait_for_gtp_grad_reduction_on_current_stream,
         wrap_module_params_gtp,
     )
+    from megatron.core.tensor_parallel.gtp_cuda_graphs import track_gtp_capture_comms
 
     HAVE_GTP = HAVE_TE
 except ImportError:
@@ -53,6 +54,7 @@ __all__ = [
     "is_gtp_param",
     "make_sharded_tensors_for_checkpoint_with_gtp_remat",
     "set_cuda_graph_mempool",
+    "track_gtp_capture_comms",
     "wait_async_comms",
     "wait_for_gtp_grad_reduction_on_current_stream",
     "wrap_module_params_gtp",
