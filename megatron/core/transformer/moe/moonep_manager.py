@@ -16,12 +16,7 @@ if TYPE_CHECKING:
 
 try:
     from moonep import Buffer, MoonEPCommPlan
-    from moonep._C import (
-        get_vmm_granularity,
-        nvl_dist_alloc,
-        nvl_dist_map,
-        nvl_release_mem_handle,
-    )
+    from moonep._C import get_vmm_granularity, nvl_dist_alloc, nvl_dist_map, nvl_release_mem_handle
     from moonep.buffer import _exchange_ipc_fds
     from moonep.grad_reduce import launch_grad_reduce
     from moonep.prefetch import launch_prefetch
@@ -381,10 +376,7 @@ class MoonEPManager:
         experts_to_copy = plan.experts_to_copy[self.rank]
         for projection in layer_buffers.projections():
             launch_prefetch(
-                projection.source_weights,
-                projection.prefetch_slots,
-                experts_to_copy,
-                self.num_sms,
+                projection.source_weights, projection.prefetch_slots, experts_to_copy, self.num_sms
             )
 
     def reset_grad_accumulators(self, layer_buffers: MoonEPLayerBuffers) -> None:
@@ -464,9 +456,7 @@ def expert_weight_shapes(config: TransformerConfig) -> Tuple[Tuple[int, int], Tu
     return (fc1_out, hidden), (hidden, ffn)
 
 
-def _config_signature(
-    config: TransformerConfig, ep_group: torch.distributed.ProcessGroup
-) -> tuple:
+def _config_signature(config: TransformerConfig, ep_group: torch.distributed.ProcessGroup) -> tuple:
     """Signature of the MoonEP settings every layer on a process group must agree on."""
     num_ranks = utils.get_pg_size(ep_group)
     fc1_shape, fc2_shape = expert_weight_shapes(config)

@@ -24,9 +24,9 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
     record_dispatch_token_counts,
 )
+from megatron.core.transformer.moe.moonep_dispatcher import MoEMoonEPTokenDispatcher
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
-from megatron.core.transformer.moe.moonep_dispatcher import MoEMoonEPTokenDispatcher
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,

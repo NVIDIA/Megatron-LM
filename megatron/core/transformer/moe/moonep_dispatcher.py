@@ -195,9 +195,7 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
 
     def token_combine(self, hidden_states: torch.Tensor):
         """K-sum expert outputs back to token-major order."""
-        return _MoonEPCombine.apply(
-            hidden_states, self.manager, self.layer_buffers, self.plan
-        )
+        return _MoonEPCombine.apply(hidden_states, self.manager, self.layer_buffers, self.plan)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
         """Restore the original hidden-state shape."""
