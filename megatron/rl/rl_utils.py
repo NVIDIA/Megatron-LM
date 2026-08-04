@@ -9,7 +9,7 @@ import json
 import logging
 import math
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -58,10 +58,13 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.rl.agent.api import (
+    EnvId,
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutRequest,
     GroupedRollouts,
+    GroupQueuesPerEnv,
+    GroupsPerEnv,
     RewardEvaluationResult,
     Rollout,
     RolloutGroup,
@@ -302,6 +305,13 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Durable rollout bank state (rank-0 only). ``restored_groups`` holds groups
+        # replayed from disk at resume, bucketed per env and drained across steps;
+        # ``fresh_overflow`` buffers over-quota streaming groups for a later step.
+        self.rollout_bank = None
+        self.restored_groups: GroupQueuesPerEnv = {}
+        self.bank_restored = False
+        self.fresh_overflow: GroupQueuesPerEnv = {}
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
         # Per-GPU variants are available via methods that divide by world_size.
         self.world_size = None
@@ -566,13 +576,77 @@ def get_inference_interface(args, loop, model):
 
 _ROLLOUT_GENERATOR = None
 _ROLLOUT_AGENT = None
+_ROLLOUT_BANK = None
 
 
-def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
-    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
+def maybe_get_rollout_bank(args):
+    """Return the durable rollout bank singleton, creating it on first use.
+
+    Rank-0 only (only rank 0 runs the rollout pipeline, so the bank is a single
+    writer with no distributed coordination). Returns None when the feature is
+    disabled or on non-zero ranks.
+    """
+    global _ROLLOUT_BANK
+    if not getattr(args, "rl_durable_rollout_bank", False):
+        logger.debug("Durable rollout bank is disabled; proceeding without it.")
+        return None
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        logger.debug("Durable rollout bank runs on rank 0 only; skipping on this rank.")
+        return None
+    if _ROLLOUT_BANK is None:
+        from megatron.rl.rollout_bank import RolloutBank
+
+        bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
+        get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
+        log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
+    return _ROLLOUT_BANK
+
+
+def get_rollout_bank():
+    """Return the rollout bank singleton, or None if disabled / not yet created."""
+    return _ROLLOUT_BANK
+
+
+def maybe_compact_rollout_bank(iteration):
+    """Compact the bank at a durable-checkpoint boundary (rank-0 no-op otherwise).
+
+    Called from save_checkpoint so the bank's compacted-through T tracks the model
+    checkpoint: groups consumed at marker <= iteration are reclaimed, survivors
+    carry forward.
+    """
+    bank = get_rollout_bank()
+    if bank is not None:
+        bank.checkpoint(iteration)
+
+
+def _get_or_create_rollout_agent(args, parallel_generation_tasks):
+    """Return the cached rollout agent, building it on first use.
+
+    Owns the ``_ROLLOUT_AGENT`` global so the per-env weight target can be computed
+    (in ``get_environment_rollouts``) from the same agent instance that will
+    generate, and so metric logging can read the live rollout pipelines (see
+    ``_collect_rollout_pipeline_metrics``). Wires the durable rollout bank onto the
+    agent so completed groups are written through on assembly.
+    """
+    global _ROLLOUT_AGENT
+    if _ROLLOUT_AGENT is None:
+        _ROLLOUT_AGENT = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
+    _ROLLOUT_AGENT._rollout_bank = get_rollout_bank()
+    return _ROLLOUT_AGENT
+
+
+def get_rollout_generator(
+    args,
+    inference_interface,
+    n_prompts,
+    samples_per_group,
+    num_groups_per_env: GroupsPerEnv | None = None,
+):
+    global _ROLLOUT_GENERATOR
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
-        agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
+        agent = _get_or_create_rollout_agent(args, parallel_generation_tasks)
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
             streaming=streaming,
@@ -587,12 +661,117 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
             submission_granularity=args.rl_submission_granularity,
             consumption_granularity=args.rl_consumption_granularity,
+            num_groups_per_env=num_groups_per_env,
         )
-        # Keep the agent handle so metric logging can read the live rollout
-        # pipelines (see _collect_rollout_pipeline_metrics).
-        _ROLLOUT_AGENT = agent
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
+
+
+async def _empty_rollout_generator():
+    """An async generator that yields nothing (fully-restored collection)."""
+    return
+    yield  # pragma: no cover - makes this a generator
+
+
+def _env_targets(agent, n_prompts: int) -> GroupsPerEnv:
+    """Per-env group target for a full collection of ``n_prompts`` groups.
+
+    Keyed by env_id so it can be matched against restored bank groups. For a
+    ``WeightedMultiTask`` the computation lives on the agent
+    (``env_group_targets``), which reuses its own weight split so the target and
+    the generator's actual split stay identical. Legacy single-env agents fall
+    back to a one-key dict.
+    """
+    if isinstance(agent, WeightedMultiTask):
+        return agent.env_group_targets(n_prompts)
+    # Legacy single-env agent: env_id is the bucket key that must match this
+    # agent's rollout env_id, so require it rather than guessing a positional name.
+    env_id = getattr(agent, "env_id", None)
+    if not env_id:
+        raise ValueError(
+            f"Rollout agent {type(agent).__name__} has no env_id; it is required to "
+            f"weight-balance restored rollout-bank groups. Set env_id on the agent."
+        )
+    return {env_id: n_prompts}
+
+
+def _bucket_restored_groups(
+    groups: GroupedRollouts, known_env_ids: set[EnvId]
+) -> GroupQueuesPerEnv:
+    """Bucket restored bank groups by env_id, asserting env-config stability."""
+    buckets: GroupQueuesPerEnv = {}
+    for g in groups:
+        if not g:
+            continue
+        env = g[0].env_id
+        assert env in known_env_ids, (
+            f"Restored rollout-bank group has env_id {env!r} which is not in the "
+            f"current --langrl-env-config (known: {sorted(known_env_ids)}). Changing "
+            f"the environment set across a crash-resume is unsupported; resume with a "
+            f"matching config or clear the rollout bank."
+        )
+        buckets.setdefault(env, deque()).append(g)
+    return buckets
+
+
+def _plan_restore_injection(
+    target: GroupsPerEnv, restored_by_env: GroupQueuesPerEnv
+) -> tuple[GroupsPerEnv, GroupsPerEnv]:
+    """Cap-and-defer plan for one collection step (pure; no I/O).
+
+    Injects at most ``target[env]`` restored groups per env this step (deferring the
+    surplus to later steps) and returns the per-env residual to generate fresh, so
+    ``inject + fresh == target`` per env — weight-balanced every step.
+
+    Returns ``(inject_by_env, residual_by_env)``, both keyed by every env in
+    ``target``.
+    """
+    inject_by_env: GroupsPerEnv = {}
+    residual_by_env: GroupsPerEnv = {}
+    for env, tgt in target.items():
+        available = len(restored_by_env.get(env, ()))
+        take = min(available, tgt)
+        inject_by_env[env] = take
+        residual_by_env[env] = tgt - take
+    return inject_by_env, residual_by_env
+
+
+def _pull_fresh_inorder(loop, generator, n_fresh: int) -> GroupedRollouts:
+    """Pull ``n_fresh`` fresh groups from the generator in completion order.
+
+    The plain drain: ``anext`` the generator a fixed number of times, with no
+    per-env routing. Correct whenever the generator already yields the right
+    per-env mix -- a one-shot generator built with ``num_groups_per_env``, or a
+    balanced streaming generator in steady state (no restore residual to satisfy).
+    """
+    return [loop.run_until_complete(anext(generator)) for _ in range(n_fresh)]
+
+
+def _pull_fresh_balanced(
+    loop, generator, residual_by_env: GroupsPerEnv, overflow: GroupQueuesPerEnv
+) -> GroupedRollouts:
+    """Balanced counterpart of ``_pull_fresh_inorder``: same ``anext`` drain of the
+    generator, but pulls *until each env's quota is met* (instead of a fixed
+    ``n_fresh`` count), so per-env balance is preserved while draining restored
+    rollout-bank groups.
+    """
+    need = dict(residual_by_env)  # remaining quota per env
+    fresh: GroupedRollouts = []
+    # 1) Satisfy quotas from previously buffered overflow first (guarantees drain).
+    for env, dq in overflow.items():
+        while need.get(env, 0) > 0 and dq:
+            fresh.append(dq.popleft())
+            need[env] -= 1
+    # 2) Pull from the generator until every quota is met, buffering the rest.
+    while sum(need.values()) > 0:
+        group = loop.run_until_complete(anext(generator))
+        env = group[0].env_id if group else ""
+        if need.get(env, 0) > 0:
+            fresh.append(group)
+            need[env] -= 1
+        else:
+            overflow.setdefault(env, deque()).append(group)
+    return fresh
 
 
 def get_environment_rollouts(
@@ -656,11 +835,65 @@ def get_environment_rollouts(
             training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
-            with nvtx_range("rl/inference-setup", time=True):
-                # Asyncronously run inference and rollout collection
-                rollout_generator = get_rollout_generator(
-                    args, inference_interface, n_prompts, samples_per_group
+            runtime_state = get_rl_runtime_state()
+            bank = maybe_get_rollout_bank(args)
+            inject: GroupedRollouts = []
+            residual_per_env = None  # None => default weight-proportional split
+            if bank is not None:
+                bank.set_collection(args.curr_iteration)
+                agent = _get_or_create_rollout_agent(
+                    args, get_rl_parallel_generation_tasks(args)
                 )
+                target = _env_targets(agent, n_prompts)
+                if not runtime_state.bank_restored:
+                    restored_groups: GroupedRollouts = bank.restore(args.iteration)
+                    runtime_state.restored_groups = _bucket_restored_groups(
+                        restored_groups, set(target)
+                    )
+                    runtime_state.bank_restored = True
+                    total_restored_groups = sum(
+                        len(dq) for dq in runtime_state.restored_groups.values()
+                    )
+                    if total_restored_groups:
+                        log_single_rank(
+                            logger,
+                            logging.INFO,
+                            f"RolloutBank restored {total_restored_groups} completed groups from "
+                            f"disk at resume iteration {args.iteration}",
+                        )
+                # Only engage the balanced-injection path while there is banked work to
+                # drain (restored groups, or streaming overflow buffered earlier); the
+                # steady state is byte-for-byte the pre-bank behavior.
+                if any(runtime_state.restored_groups.values()) or any(
+                    runtime_state.fresh_overflow.values()
+                ):
+                    # Plan how many restored groups to inject this step vs. the residual
+                    # to generate fresh (deferring the surplus to later steps).
+                    inject_by_env, residual_per_env = _plan_restore_injection(
+                        target, runtime_state.restored_groups
+                    )
+                    for env, count in inject_by_env.items():
+                        dq = runtime_state.restored_groups.get(env)
+                        for _ in range(count):
+                            inject.append(dq.popleft())
+            n_fresh = n_prompts - len(inject)
+
+            with nvtx_range("rl/inference-setup", time=True):
+                # The streaming generator persists across iterations, so its request
+                # keeps the full trainer batch size (n_prompts) and a balanced split;
+                # per-env residual balancing for restored groups is enforced on the
+                # consumption side (see _pull_fresh_balanced). A one-shot generator is
+                # rebuilt per step, so it takes the per-env residual directly and is
+                # drained below.
+                request_num_groups = n_prompts if args.rl_partial_rollouts else n_fresh
+                gen_override = None if args.rl_partial_rollouts else residual_per_env
+                if request_num_groups == 0:
+                    rollout_generator = _empty_rollout_generator()
+                else:
+                    rollout_generator = get_rollout_generator(
+                        args, inference_interface, request_num_groups, samples_per_group,
+                        num_groups_per_env=gen_override,
+                    )
 
             # NOTE(jbarker): we need to double check this when using PP>1
             rank = torch.distributed.get_rank()
@@ -671,9 +904,18 @@ def get_environment_rollouts(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    rollouts = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
-                    ]
+                    # Streaming with rebalance: quota-route the balanced stream to the
+                    # per-env residual, buffering over-quota groups for a later step.
+                    # Otherwise pull n_fresh groups in completion order.
+                    if args.rl_partial_rollouts and residual_per_env is not None:
+                        fresh = _pull_fresh_balanced(
+                            loop, rollout_generator, residual_per_env,
+                            runtime_state.fresh_overflow,
+                        )
+                    else:
+                        fresh = _pull_fresh_inorder(loop, rollout_generator, n_fresh)
+                    # Restored groups first, then freshly generated ones.
+                    rollouts = list(inject) + fresh
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
@@ -685,6 +927,12 @@ def get_environment_rollouts(
                                 assert False, "Unexpected group left in generator."
                             except StopAsyncIteration:
                                 break
+                    # Record consumption for every group handed to the trainer. On a
+                    # rollback (restart at T < this step) the marker > T rule restores
+                    # these; once the checkpoint advances past this step they are pruned.
+                    if bank is not None:
+                        for group in rollouts:
+                            bank.mark_consumed(group.uid, args.curr_iteration)
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
