@@ -46,6 +46,8 @@ class _MoonEPDispatch(torch.autograd.Function):
     def backward(ctx, grad_hidden_nvsh, grad_route_weights_nvs, _grad_cu_seqlens):
         """Combine token gradients back and reduce duplicated experts' weight gradients."""
         manager = ctx.manager
+        if grad_route_weights_nvs is None:
+            grad_route_weights_nvs = torch.zeros_like(grad_hidden_nvsh[:, 0], dtype=torch.float32)
         grad_hidden_sh, grad_probs_sk, _ = manager.buffer.combine(
             plan=ctx.plan,
             hidden_nvsh=grad_hidden_nvsh.contiguous(),
