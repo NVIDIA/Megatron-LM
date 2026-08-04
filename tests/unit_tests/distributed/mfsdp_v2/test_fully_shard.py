@@ -22,6 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContextPhase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
     collect_linked_kernels,
@@ -222,7 +223,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     assert isinstance(model.fc1.weight, DTensor)
     assert isinstance(model.fc2.weight, DTensor)
-    assert not model.context.is_backward
+    # The final autograd callback leaves the context resting.
+    assert model.context.phase is FsdpContextPhase.RESTING
+
+    # A second forward after backward runs in the forward phase again, so
+    # forward-order prefetch resumes and the following backward still ends
+    # with every module resharded.
+    model(x).sum().backward()
+    assert isinstance(model.fc1.weight, DTensor)
+    assert isinstance(model.fc2.weight, DTensor)
+    assert model.context.phase is FsdpContextPhase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
