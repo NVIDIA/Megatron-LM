@@ -6,6 +6,7 @@ from typing import Optional, Union
 import torch
 
 from megatron.core.inference import insitu_timing as _insitu
+from megatron.core.inference.moe.fused_router import can_use_fused_router, fused_router
 from megatron.core.inference.moe.router_topk import can_use_fused_softmax_topk, fused_softmax_topk
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
@@ -948,6 +949,23 @@ class InferenceTopKRouter(TopKRouter):
         )
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        # The gating GEMM's output is a couple of tiles, so cuBLASLt splits K and pays a
+        # separate reduce pass to finish the sum -- purely because the logits have to reach
+        # memory before the top-k can read them. When the fused router applies, it keeps
+        # the logit tile in registers and does the softmax and selection there, replacing
+        # three launches (GEMM, splitK reduce, softmax+topk) with one.
+        if (
+            self.qb_beta is None
+            and input.ndim == 3
+            and input.shape[1] == 1
+            and input.is_contiguous()  # so the [num_tokens, hidden] view cannot copy
+            and self._fused_router_semantics_ok()
+        ):
+            flat = input.view(-1, input.shape[-1])
+            if can_use_fused_router(flat, self.weight, self.bias, self.topk):
+                with _insitu.site("router_fused"):
+                    return fused_router(flat, self.weight, self.topk, self._router_out_dtype())
+
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
         # QB selects on (logits - qb_beta); at inference qb_beta is fixed, so it's per-token.
@@ -986,6 +1004,33 @@ class InferenceTopKRouter(TopKRouter):
             precomputed_indices=precomputed_indices,
         )
         return probs.squeeze(1), top_indices.squeeze(1)
+
+    def _router_out_dtype(self) -> torch.dtype:
+        """The dtype the reference path's probabilities come out in."""
+        if self.config.moe_router_dtype == 'fp32':
+            return torch.float32
+        if self.config.moe_router_dtype == 'fp64':
+            return torch.float64
+        return self.config.params_dtype
+
+    def _fused_router_semantics_ok(self) -> bool:
+        """Whether this config's routing is the plain pre-softmax top-k the kernel does.
+
+        Anything else -- expert groups, a scaling factor, sigmoid scoring, an expert bias,
+        router replay -- changes the selection or the weights, so it stays on the
+        reference path. Mirrors the guards on the standalone fused top-k.
+        """
+        c = self.config
+        return (
+            c.moe_router_pre_softmax
+            and self.score_function == "softmax"
+            and c.moe_router_num_groups is None
+            and c.moe_router_group_topk is None
+            and c.moe_router_topk_scaling_factor is None
+            and self.expert_bias is None
+            and not self.router_replay
+            and c.moe_router_dtype in (None, 'fp32')
+        )
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Simplified forward pass for inference - returns dense tensors only.

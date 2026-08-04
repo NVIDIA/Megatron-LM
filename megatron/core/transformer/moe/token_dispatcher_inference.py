@@ -583,7 +583,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # shift local rows into the global frame for the comparison. When unset
         # (standalone dispatcher use without a context) all rows are real, so
         # skip the mask.
-        if self.__class__._real_token_count_tensor is not None:
+        if self.__class__._real_token_count_tensor is not None and not (
+            _ablate.ABLATE_ROUTE_MASK and _ablate.hit("route_mask")
+        ):
             mask_routing_padding(
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
             )

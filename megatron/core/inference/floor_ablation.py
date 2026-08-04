@@ -67,6 +67,7 @@ ABLATE_NVLS_COMBINE: bool = os.environ.get("MCORE_ABLATE_NVLS_COMBINE", "0") == 
 ABLATE_EXPERT_GEMM: bool = os.environ.get("MCORE_ABLATE_EXPERT_GEMM", "0") == "1"
 ABLATE_MOE_SUM: bool = os.environ.get("MCORE_ABLATE_MOE_SUM", "0") == "1"
 ABLATE_ATTN_CORE: bool = os.environ.get("MCORE_ABLATE_ATTN_CORE", "0") == "1"
+ABLATE_ROUTE_MASK: bool = os.environ.get("MCORE_ABLATE_ROUTE_MASK", "0") == "1"
 
 ANY_ABLATION: bool = any(
     (
@@ -75,6 +76,7 @@ ANY_ABLATION: bool = any(
         ABLATE_EXPERT_GEMM,
         ABLATE_MOE_SUM,
         ABLATE_ATTN_CORE,
+        ABLATE_ROUTE_MASK,
     )
 )
 
@@ -179,6 +181,7 @@ def announce() -> Optional[str]:
             ("expert_gemm", ABLATE_EXPERT_GEMM),
             ("moe_sum", ABLATE_MOE_SUM),
             ("attn_core", ABLATE_ATTN_CORE),
+            ("route_mask", ABLATE_ROUTE_MASK),
         )
         if flag
     ]

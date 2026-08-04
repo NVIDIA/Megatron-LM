@@ -3058,18 +3058,138 @@ three hypotheses, each tested and each measuring 6.15 us unchanged:
 | `where(is_q, rows, 0)` in the store address hides contiguity | the harness addressed stores off the raw row index | rejected, 6.15 us |
 | Two separate load address arrays instead of one shared | the harness built a single `where`-selected offset array | rejected, 6.15 us |
 
-The two kernels are now near-identical in structure and still differ by a third. One
-oddity in the sweep worth chasing next: the times quantize to exactly three values
-(8.21 / 6.15 / 4.12 us) and rows=8 hit 4.12 us at *every* warp count, which is not how a
-bandwidth-bound kernel should behave and hints the difference is a compilation artifact
-rather than a shape effect. Comparing the two PTX/SASS dumps is the obvious next step and
-was not reached. Open item, worth ~0.1 ms/step.
+**Closed in session 20: there is no gap.** The PTX comparison this pointed to was run
+(`dev/moe_fused/harness_qknorm_ptx.py`) and measured the shipped kernel and the harness
+kernel at **4.12 us each, ratio 1.00x** -- same answer for q and k, 21 registers, no
+spills, `.v2` vectorized loads and stores. The shipped kernel had already reached the
+harness number; the 6.15 us readings were stale, taken before the store-stride fix landed
+and then carried forward as if current. The three hypotheses above were each rejected for
+the right reason: every one of them was measuring a kernel that was already fast.
+
+The lesson is measurement hygiene, not Triton. A number that survives three
+disconfirmations without moving is more likely stale than robust, and re-measuring the
+baseline is cheaper than the next hypothesis. Nothing left to recover -- item closed.
 
 End-to-end, both arms from the same file so the launch shape is the only variable:
 1x1 controls **30,341 / 30,399** against 8x8 **30,482** tok/s, i.e. **+0.35%** on a
 control-to-control spread of 0.19%. Note the microbenchmark predicted 1.17%
 (2.06 us x 48 layers on an 8.44 ms step) and a third of that landed -- a reminder that a
 kernel-level win on a non-critical-path kernel is an upper bound, not a forecast.
+
+### QWEN-045 — fusing the router GEMM: **-2.37%, rejected**
+
+The router chain is four launches per layer: gating GEMM, a cuBLASLt splitK reduce (the
+logits have to reach memory before top-k can read them), fused softmax+topk, and the
+padding mask. `kernel_neighbors.py` attributed 48 of the 82 splitK reduces per step to
+this GEMM, so collapsing all four into one Triton kernel that keeps the logit tile in
+registers looked like the largest single launch-count win available.
+
+The microbenchmark endorsed it. Sweeping BLOCK_M x BLOCK_K x warps at the decode shape,
+keeping only configs whose expert sets matched exactly:
+
+| BLOCK_M | BLOCK_K | warps | us | vs reference |
+|---:|---:|---:|---:|---:|
+| 32 | 128 | 8 | 16.41 | 0.94x |
+| 16 | 128 | 4 | 12.68 | 1.21x |
+| **16** | **256** | **4** | **12.31** | **1.25x** |
+
+Expert sets bit-exact, probabilities within 7.45e-09, and the folded padding mask correct
+(200 real rows, the other 56 getting -1). Against the reference's 15.34 us that is
+0.146 ms/step, ~1.7% of an 8.35 ms step. The winning shape is a *narrow* BLOCK_M with the
+widest K tile -- it maximises CTA count, and the whole-weight read each CTA does is then
+what hides the K loop. Note the in-tree defaults were initially the 0.94x config, which
+would have tested a kernel slower than baseline; they were corrected before the A/B.
+
+End to end it lost, consistently, in both replicate pairs:
+
+| arm | tok/s |
+|---|---:|
+| control | 30,689.4 |
+| fused router | 29,981.5 |
+| control | 30,697.5 |
+| fused router | 29,951.2 |
+
+**-2.37%** on a control-to-control spread of 8 tok/s. The sign is opposite to the
+prediction and the magnitude is larger, so this is not noise and not a tuning problem.
+
+The mechanism worth carrying forward: the four launches it replaced were not serial dead
+time. cuBLASLt's GEMM and its splitK reduce overlap with neighbouring kernels inside the
+CUDA graph, whereas a 16-CTA Triton kernel occupies few SMs *and* forces every CTA to
+stream the full weight matrix, which evicts what its neighbours are reading. Isolated
+device time credits the fused kernel for work it removed from the critical path only in
+a benchmark where nothing else was running.
+
+**Rule this establishes:** an isolated-kernel win does not transfer when the kernel it
+replaces is one that overlaps well. Before fusing across a cuBLAS call, measure the
+*ablation* ceiling (delete the work and run e2e) rather than the replacement's device
+time -- the ablation prices the critical path, the microbenchmark prices the kernel.
+Retained behind `MCORE_FUSED_ROUTER=0`.
+
+### QWEN-046 — the padding mask: **+1.02% available, fusion not yet working**
+
+Applying the rule from QWEN-045 to the cheapest member of the router chain.
+`mask_routing_padding` writes -1 into every topk slot of the CUDA-graph padding rows so
+those tokens route to no expert; it is one launch per layer per step (48/step) over a
+256x8 int64 tensor, which is almost entirely launch overhead. Ablating it outright
+(`MCORE_ABLATE_ROUTE_MASK=1`, correctness-breaking by construction, valid only as a
+ceiling) priced the critical path directly:
+
+| arm | tok/s |
+|---|---:|
+| control | 30,662.5 |
+| mask ablated | 30,965.1 |
+| control | 30,661.0 |
+| mask ablated | 30,983.4 |
+
+**+1.02%** on a control-to-control spread of 1.5 tok/s -- among the tightest replicate
+pairs measured in this project, and a lower bound besides: skipping the mask lets padding
+rows route to real experts, which if anything *adds* expert GEMM work.
+
+The fusion target is the router's `_softmax_topk_kernel`, which is one CTA per token and
+already stores that token's index row, so the sentinel is a scalar compare and a select
+with no extra launch. It was implemented (module-level publish of the context's
+`int32[1]` count, `MASK_PADDING` constexpr in the kernel, and a dispatcher skip keyed off
+a tag the router leaves on the tensor it masked) and it **hung in warmup with the gate
+off**, which localises the fault to the always-on parts rather than to the masking logic.
+Reverting the three files reproduced the baseline to within 1 tok/s (30,661.9 against
+30,662.5 and 30,661.0), so the hang is attributable to those edits alone.
+
+Design, suspects, and a cheapest-first diagnostic ladder are written up in
+`dev/moe_fused/NOTES-route-mask-fusion.md` so the next attempt starts from the hang
+rather than from the design. Leading suspect is the kernel signature change itself: it is
+the only always-on edit that alters generated code, and if `tl.where(False, -1, best_idx)`
+fails to fold, every row gets -1 and the NVLS all-gather-v barrier can deadlock on
+rank-divergent counts. Unmeasured guess, listed first in the ladder.
+
+### Session 20 status
+
+| | tok/s | ms/step | vs vLLM |
+|---|---:|---:|---:|
+| vLLM DP4+EP (`VLLM-BASELINE`) | 33,994.5 | 7.53 | — |
+| **mcore, current best** | **30,662–30,697** | **8.35** | **90.2%** |
+| mcore, with the mask ablated (not shippable) | 30,974 | 8.27 | 91.1% |
+| mcore at session-2 start | 22,398.9 | 11.71 | 65.9% |
+
+Session 20 added **no throughput**: both candidates were rejected, one on measurement
+(-2.37%) and one on a hang. The code is unchanged from session 19; the higher number
+against session 19's recorded 30,482 is node-and-day drift, not a code change, measured
+across five controls in one job (30,689 / 30,697 / 30,662 / 30,661 / 30,662).
+
+What session 20 did produce, all of which outlives it:
+
+- A priced target: **+1.02%** sitting in the padding mask, with the ceiling measured
+  rather than estimated, and the implementation already designed and written up.
+- A rule that would have saved this session's larger experiment (QWEN-045): price the
+  ablation ceiling before fusing across a well-overlapped cuBLAS call.
+- One closed open item (QWEN-044's phantom 2 us) and one retired measurement habit.
+- **14 hours of queue time recovered.** Two jobs sat `PENDING (Priority)` for 14 h and
+  7 h with 315 nodes idle, purely because the sbatch template omitted `--qos`: the
+  default `normal` is priority 100 against a queue head near 350k. Resubmitted under
+  `--qos=interactive` (priority 700, <=4 nodes) and `--qos=short` (priority 200, <=2 h),
+  both started within seconds. Every job template in `skills/` now sets `--qos`, and
+  `skills/run-qwen-model/SKILL.md` carries the diagnostic: if nodes are idle and
+  `squeue -j <id> -o '%Q'` is far below the head of `squeue -p batch -t PD -S -Q`, it is
+  QOS and not contention.
 
 ### Session 19 status
 
