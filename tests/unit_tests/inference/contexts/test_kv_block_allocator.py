@@ -212,8 +212,7 @@ def test_prefix_caching_allocate_and_hash_registration():
     assert small.is_memory_available(5) is False
 
 
-def test_shared_pinned_block_releases_once_per_owner():
-    """Each handoff owner retains and later releases its own block reference."""
+def test_retain_memory_blocks_adds_one_reference_per_owner():
     allocator = KVBlockAllocator(
         _make_context(),
         pool_size=8,
@@ -225,73 +224,14 @@ def test_shared_pinned_block_releases_once_per_owner():
     block_id = int(block[0])
     allocator.register_kv_block_hashes([block_id], [101])
 
-    # Model two requests sharing this block, then finishing in the same step.
-    allocator.block_ref_counts[block] += 1
-    allocator.pin_memory_blocks([block_id])
-    allocator.pin_memory_blocks([block_id])
-    allocator.release_memory_blocks(block)
-    allocator.release_memory_blocks(block)
-
-    assert allocator.block_ref_counts[block_id].item() == 2
-    assert allocator.pinned_blocks == {block_id: 2}
-
-    assert allocator.release_pinned_memory_blocks([block_id]) == 1
-    assert allocator.block_ref_counts[block_id].item() == 1
-    assert allocator.pinned_blocks == {block_id: 1}
-
-    assert allocator.release_pinned_memory_blocks([block_id]) == 1
-    assert allocator.block_ref_counts[block_id].item() == 0
-    assert allocator.pinned_blocks == {}
-    assert 101 not in allocator.kv_hash_to_block_id
-
-
-def test_shared_pinned_block_without_prefix_caching_frees_on_final_release():
-    allocator = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
-    block = allocator.allocate_memory_blocks(1)
-    block_id = int(block[0])
-    initial_available = allocator.pool_avail
-
-    allocator.pin_memory_blocks([block_id])
-    allocator.pin_memory_blocks([block_id])
-
-    assert allocator.release_pinned_memory_blocks([block_id]) == 0
-    assert allocator.pool_avail == initial_available
-    assert allocator.release_pinned_memory_blocks([block_id]) == 1
-    assert allocator.pool_avail == initial_available + 1
-
-
-def test_reset_clears_pinned_block_ownership():
-    allocator = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
-    allocator.pin_memory_blocks([3])
-
-    allocator.reset()
-
-    assert allocator.pinned_blocks == {}
-
-
-def test_unpinned_owner_can_release_a_shared_pinned_block():
-    allocator = KVBlockAllocator(
-        _make_context(),
-        pool_size=8,
-        paused_limit=0,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
-    )
-    block = allocator.allocate_memory_blocks(1)
-    block_id = int(block[0])
-    allocator.register_kv_block_hashes([block_id], [101])
-
-    # One active owner shares the block with an owner that is about to be pinned.
-    allocator.block_ref_counts[block] += 1
-    allocator.pin_memory_blocks([block_id])
+    allocator.retain_memory_blocks([block_id])
+    allocator.retain_memory_blocks([block_id])
     assert allocator.block_ref_counts[block_id].item() == 3
 
-    # Both active owners release normally; only the explicit pin remains.
     allocator.release_memory_blocks(block)
     allocator.release_memory_blocks(block)
     assert allocator.block_ref_counts[block_id].item() == 1
-
-    allocator.release_pinned_memory_blocks([block_id])
+    allocator.release_memory_blocks(block)
     assert allocator.block_ref_counts[block_id].item() == 0
     assert 101 not in allocator.kv_hash_to_block_id
 

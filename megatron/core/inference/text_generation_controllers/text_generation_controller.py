@@ -1962,7 +1962,7 @@ class TextGenerationController:
                 valid = [int(b) for b in blocks.tolist() if b != -1]
                 if valid:
                     finished_handoff_block_ids[req_id] = valid
-                    allocator.pin_memory_blocks(valid)
+                    allocator.retain_memory_blocks(valid)
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.

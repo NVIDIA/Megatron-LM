@@ -319,8 +319,11 @@ class InferenceStateHandoffMixin:
 
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
         """Release this request's ownership of its pinned handoff blocks."""
+        if not block_ids:
+            return 0
         allocator = self.context.kv_block_allocator
-        return allocator.release_pinned_memory_blocks(block_ids)
+        allocator.release_memory_blocks(torch.tensor(block_ids, dtype=torch.int32, device="cpu"))
+        return len(block_ids)
 
     def add_request_with_kv_handoff(
         self,
@@ -379,7 +382,7 @@ class InferenceStateHandoffMixin:
         if not self._handoff_capacity_available(num_blocks_to_import, cached_blocks):
             return False
 
-        self._retain_handoff_blocks(cached_blocks)
+        allocator.retain_memory_blocks(cached_blocks)
         local_blocks_tensor = allocator.allocate_memory_blocks(num_blocks_to_import)
         if local_blocks_tensor is None:
             if cached_blocks:
@@ -462,15 +465,6 @@ class InferenceStateHandoffMixin:
                 break
             cached_blocks.append(int(block_id))
         return cached_blocks
-
-    def _retain_handoff_blocks(self, cached_blocks: list[int]) -> None:
-        """Retain ready prefix blocks while an import enters the scheduler."""
-
-        if cached_blocks:
-            allocator = self.context.kv_block_allocator
-            block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
-            allocator.block_ref_counts[block_tensor] += 1
-            allocator.update_timestamps(block_tensor)
 
     def _handoff_capacity_available(self, num_blocks: int, cached_blocks: list[int]) -> bool:
         """Agree on KV capacity before any model-parallel rank mutates its allocator."""

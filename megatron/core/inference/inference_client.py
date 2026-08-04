@@ -7,10 +7,6 @@ import time
 from typing import List, Optional, Union
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.disaggregation.handoff_wire_protocol import (
-    make_release_kv_message,
-    make_submit_request_with_kv_message,
-)
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
@@ -116,12 +112,27 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
-        assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
-        self.request_submission_times[request_id] = time.perf_counter()
-        return self.completion_futures[request_id]
+        return self._submit_request(payload, request_id)
+
+    def _make_kv_handoff_request(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> tuple[int, list]:
+        """Allocate an ID and build a decode request carrying remote KV metadata."""
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = [
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            kv_meta,
+            list(src_block_ids),
+        ]
+        return request_id, payload
 
     def add_request_with_kv_handoff(
         self,
@@ -144,21 +155,10 @@ class InferenceClient:
         Returns:
             asyncio.Future: A future that resolves to the completed request.
         """
-        request_id = self.next_request_id
-        self.next_request_id += 1
-        payload = make_submit_request_with_kv_message(
-            Headers.SUBMIT_REQUEST_WITH_KV.value,
-            request_id,
-            prompt,
-            sampling_params.serialize(),
-            kv_meta,
-            src_block_ids,
+        request_id, payload = self._make_kv_handoff_request(
+            prompt, sampling_params, kv_meta, src_block_ids
         )
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
-        self.request_submission_times[request_id] = time.perf_counter()
-        return self.completion_futures[request_id]
+        return self._submit_request(payload, request_id)
 
     def add_request_with_kv_handoff_streaming(
         self,
@@ -182,15 +182,8 @@ class InferenceClient:
             AsyncStream[dict]: Per-step partial and final reply frames.
         """
         sampling_params.streaming = True
-        request_id = self.next_request_id
-        self.next_request_id += 1
-        payload = make_submit_request_with_kv_message(
-            Headers.SUBMIT_REQUEST_WITH_KV.value,
-            request_id,
-            prompt,
-            sampling_params.serialize(),
-            kv_meta,
-            src_block_ids,
+        request_id, payload = self._make_kv_handoff_request(
+            prompt, sampling_params, kv_meta, src_block_ids
         )
         return self._submit_stream(payload, request_id)
 
@@ -200,7 +193,7 @@ class InferenceClient:
         Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
         engines without that request_id ignore the message.
         """
-        payload = make_release_kv_message(Headers.RELEASE_KV.value, request_id)
+        payload = [Headers.RELEASE_KV.value, int(request_id)]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def abort_request(self, request_id: int) -> None:
@@ -247,6 +240,15 @@ class InferenceClient:
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
         return self._submit_stream(payload, request_id)
+
+    def _submit_request(self, payload: list, request_id: int) -> asyncio.Future:
+        """Send a prepared request and register its completion future."""
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        assert request_id not in self.completion_futures
+        future = asyncio.get_running_loop().create_future()
+        self.completion_futures[request_id] = future
+        self.request_submission_times[request_id] = time.perf_counter()
+        return future
 
     def _submit_stream(self, payload: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""

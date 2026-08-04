@@ -68,6 +68,10 @@ class _KvAllocator:
         self.block_ref_counts[blocks] -= 1
         self.releases.append(blocks.tolist())
 
+    def retain_memory_blocks(self, block_ids):
+        if block_ids:
+            self.block_ref_counts[torch.tensor(block_ids, dtype=torch.int64)] += 1
+
     def register_kv_block_hashes(self, block_ids, block_hashes, parent_hashes=None):
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
         self.registered_parent_hashes.extend(parent_hashes or [])

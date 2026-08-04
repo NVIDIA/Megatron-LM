@@ -47,7 +47,6 @@ class KVBlockAllocator:
         # configured (setup_kv_transfer flips this on); other engines have no
         # release path for the pins.
         self.enable_handoff_pinning = False
-        self.pinned_blocks: Dict[int, int] = {}
 
         assert (
             0 <= paused_limit <= pool_size - 2
@@ -225,42 +224,6 @@ class KVBlockAllocator:
         if blocks.numel() == 0:
             return
 
-        self._release_memory_blocks(blocks)
-
-    def pin_memory_blocks(self, block_ids: list[int]) -> None:
-        """Retain one reference to each block for a pending KV handoff."""
-        for block_id in block_ids:
-            block_id = int(block_id)
-            self.pinned_blocks[block_id] = self.pinned_blocks.get(block_id, 0) + 1
-        if self.enable_prefix_caching and block_ids:
-            blocks = torch.tensor(block_ids, dtype=torch.int64, device='cpu')
-            self.block_ref_counts[blocks] += 1
-
-    def release_pinned_memory_blocks(self, block_ids: list[int]) -> int:
-        """Release one handoff-owned reference to each block."""
-        releasable = []
-        for block_id in block_ids:
-            block_id = int(block_id)
-            pin_count = self.pinned_blocks.get(block_id, 0)
-            if pin_count == 0:
-                continue
-            final_pin = pin_count == 1
-            if final_pin:
-                del self.pinned_blocks[block_id]
-            else:
-                self.pinned_blocks[block_id] = pin_count - 1
-            # Prefix caching takes one allocator ref per pin, so every release
-            # decrements it. Without refcounts, only the final pin frees storage.
-            if self.enable_prefix_caching or final_pin:
-                releasable.append(block_id)
-
-        if not releasable:
-            return 0
-        self._release_memory_blocks(torch.tensor(releasable, dtype=torch.int64, device='cpu'))
-        return len(releasable)
-
-    def _release_memory_blocks(self, blocks: Tensor) -> None:
-        """Release blocks after pin ownership has been resolved."""
         if self.enable_prefix_caching:
             unique_blocks, release_counts = torch.unique(blocks, return_counts=True)
             remaining_ref_counts = self.block_ref_counts[unique_blocks] - release_counts.to(
@@ -290,6 +253,18 @@ class KVBlockAllocator:
             self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
             self.pool_avail += num_blocks
 
+    def retain_memory_blocks(self, block_ids: list[int]) -> None:
+        """Add one prefix-cache reference to each block.
+
+        Args:
+            block_ids: Blocks retained by a new owner.
+        """
+        assert self.enable_prefix_caching, "retaining KV blocks requires prefix caching"
+        if block_ids:
+            blocks = torch.tensor(block_ids, dtype=torch.int64, device='cpu')
+            self.block_ref_counts[blocks] += 1
+            self.update_timestamps(blocks)
+
     def reset(self) -> None:
         """Reset the allocator to initial state.
 
@@ -310,7 +285,6 @@ class KVBlockAllocator:
         torch.arange(self.pool_size, out=self.block_bag)
 
         self.pool_avail = self.pool_size - 1
-        self.pinned_blocks.clear()
 
         if self.enable_prefix_caching:
             # Reset all block hashes

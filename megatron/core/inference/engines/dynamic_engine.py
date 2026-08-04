@@ -33,9 +33,6 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.disaggregation.handoff_wire_protocol import (
-    parse_submit_request_with_kv_fields,
-)
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -2732,9 +2729,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side KV import.
-                request_id, prompt, sampling_params, kv_meta, src_block_ids = (
-                    parse_submit_request_with_kv_fields(data[1:])
-                )
+                request_id, prompt, sampling_params, kv_meta, src_block_ids = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
                 self.add_request_with_kv_handoff(
