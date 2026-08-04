@@ -90,6 +90,7 @@ MODEL_ARGS=(
   # --- logging / memory ---
   --log-interval 1
   --log-memory-to-tensorboard
+  --log-memory-interval 1
   --log-num-zeros-in-grad
   --timing-log-level 0
   # --- data / tokenizer: EDIT for your cluster (mock data shown) ---

@@ -46,17 +46,9 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
         print_rank_0(f" == params layer {l}: {layer_params}")
 
-    # Optional DSA forward-pass timing (off by default). Set DSA_TIMING=1 to enable.
-    import os
-
-    if os.environ.get("DSA_TIMING", "0") == "1":
-        from megatron.core.transformer.experimental_attention_variant.dsa_timing import (
-            attach_dsa_forward_timing,
-        )
-
-        attach_dsa_forward_timing(
-            model, profile_rank=int(os.environ.get("DSA_TIMING_RANK", "0"))
-        )
+    # NB: DSA forward-pass timing is attached in pretrain_hybrid.forward_step, not
+    # here — the config-container model provider does not reliably route through
+    # this builder, so attaching here would silently no-op.
 
     return model
 

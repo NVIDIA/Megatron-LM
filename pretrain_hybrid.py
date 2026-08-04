@@ -331,6 +331,21 @@ def forward_step(data_iterator, model: HybridModel):
 
     timers('batch-generator').stop()
 
+    # Optional DSA forward-pass timing. Attach once, here (provider-agnostic): the
+    # config-container model provider does not reliably route through the builder
+    # where this used to live. Auto-logs per-DSA-layer + median forward ms.
+    import os as _os
+
+    if _os.environ.get("DSA_TIMING", "0") == "1" and not getattr(
+        model, "_dsa_timing_attached", False
+    ):
+        from megatron.core.transformer.experimental_attention_variant.dsa_timing import (
+            attach_dsa_forward_timing,
+        )
+
+        attach_dsa_forward_timing(model, profile_rank=int(_os.environ.get("DSA_TIMING_RANK", "0")))
+        model._dsa_timing_attached = True
+
     with stimer:
         output_tensor = model(
             tokens,
