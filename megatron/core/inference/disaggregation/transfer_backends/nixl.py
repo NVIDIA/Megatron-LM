@@ -28,11 +28,12 @@ from megatron.core.inference.disaggregation.utils import transfer_peer_records
 logger = logging.getLogger(__name__)
 
 try:
-    from nixl._api import nixl_agent  # type: ignore[import-not-found]
+    from nixl._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
 
     _HAVE_NIXL = True
 except ImportError:
     nixl_agent = None  # type: ignore[assignment]
+    nixl_agent_config = None  # type: ignore[assignment]
     _HAVE_NIXL = False
 
 
@@ -40,6 +41,35 @@ except ImportError:
 # fabric failure, so cap the wait.
 _POLL_INTERVAL_S = 0.0005  # 0.5 ms
 _POLL_TIMEOUT_S = 30.0
+
+
+def _validate_ucx_transport_config(memory_buffer: torch.Tensor) -> None:
+    """Reject an explicit UCX transport configuration that cannot handle CUDA memory."""
+    if not memory_buffer.is_cuda:
+        return
+
+    configured_tls = os.environ.get("UCX_TLS")
+    if not configured_tls:
+        return
+
+    tokens = {
+        token.strip().lower().lstrip("\\")
+        for token in configured_tls.lstrip("^").split(",")
+        if token.strip()
+    }
+    cuda_transports = {"cuda_copy", "cuda_ipc", "gdr_copy"}
+    if configured_tls.startswith("^"):
+        excludes_all_cuda = "cuda" in tokens or cuda_transports.issubset(tokens)
+        if not excludes_all_cuda:
+            return
+    elif "all" in tokens or "cuda" in tokens or tokens & cuda_transports:
+        return
+
+    raise RuntimeError(
+        f"UCX_TLS={configured_tls!r} does not enable a CUDA transport for NIXL GPU "
+        "buffers. Remove the override to let UCX select transports automatically, or "
+        "include a CUDA transport such as cuda_copy or cuda_ipc."
+    )
 
 
 @dataclass
@@ -94,8 +124,21 @@ class NixlPullHandle:
             time.sleep(_POLL_INTERVAL_S)
 
 
+class _NixlAgentContext:
+    """NIXL resources shared by the state buffers on one rank."""
+
+    def __init__(self, agent_name: str):
+        # One-sided reads require the passive peer to make transport progress.
+        # A single shared progress thread avoids contention with model execution
+        # while still progressing KV, convolution-state, and SSM-state transfers.
+        agent_config = nixl_agent_config(enable_prog_thread=True)
+        self.agent_name = agent_name
+        self.agent = nixl_agent(agent_name, agent_config)
+        self.known_peers: Dict[str, Any] = {}
+
+
 class NixlTransferBackend:
-    """Per-rank NIXL agent owning a registration over the paged KV buffer.
+    """Per-buffer registration on a rank's NIXL agent.
 
     Per-block transfers are descriptor ranges over that registration. Peer
     metadata is exchanged by the control plane and registered lazily on first
@@ -123,6 +166,7 @@ class NixlTransferBackend:
         layer_end: Optional[int] = None,
         ssm_layout: Optional[SSMShardLayout] = None,
         ssm_state_kind: Optional[str] = None,
+        _shared_context: Optional[_NixlAgentContext] = None,
     ):
         if not _HAVE_NIXL:
             raise RuntimeError(
@@ -170,21 +214,15 @@ class NixlTransferBackend:
         self._ssm_layout = ssm_layout
         self._ssm_state_kind = ssm_state_kind
 
-        # Configure UCX before agent construction. Avoid TCP for VRAM addresses;
-        # operators may override this by setting UCX_TLS before launch.
-        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,cma,shm,self")
-        # Explicit registration makes the UCX memtype cache unnecessary and
-        # avoids stale VRAM/host classifications.
-        os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
-
-        self._agent = nixl_agent(agent_name)
+        _validate_ucx_transport_config(memory_buffer)
+        if _shared_context is None:
+            _shared_context = _NixlAgentContext(agent_name)
+        self._agent_context = _shared_context
+        self._agent = _shared_context.agent
         self._reg_handle = self._agent.register_memory(memory_buffer)
 
-        # Base64 keeps NIXL metadata safe for msgpack/json control messages.
-        self._agent_metadata = self._agent.get_agent_metadata()
-
         # Peer agent_name -> id returned by add_remote_agent.
-        self._known_peers: Dict[str, Any] = {}
+        self._known_peers = _shared_context.known_peers
 
         logger.info(
             "NixlTransferBackend[%s] registered %d-block buffer "
@@ -200,15 +238,21 @@ class NixlTransferBackend:
             shape,
         )
 
+    def new_registered_buffer(self, **kwargs) -> "NixlTransferBackend":
+        """Register another state buffer on this backend's NIXL agent."""
+
+        return type(self)(_shared_context=self._agent_context, **kwargs)
+
     def export_meta(self) -> Dict[str, Any]:
         """Return JSON/msgpack-safe metadata for shipping to a decode peer.
 
         Layout fields describe the scatter-gather address ranges needed to pull
         source blocks into decode-owned blocks.
         """
+        agent_metadata = self._agent.get_agent_metadata()
         meta = {
-            "agent_name": self.agent_name,
-            "agent_metadata_b64": base64.b64encode(self._agent_metadata).decode("ascii"),
+            "agent_name": self._agent_context.agent_name,
+            "agent_metadata_b64": base64.b64encode(agent_metadata).decode("ascii"),
             "base_addr": self._buf_ptr,
             "outer_stride_bytes": self._outer_stride_bytes,
             "device_id": self._device_id,

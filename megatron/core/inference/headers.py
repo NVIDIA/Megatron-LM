@@ -27,8 +27,12 @@ class Request(IntEnum):
 
     SUBMIT_REQUEST = 20
     ENGINE_REPLY = 21
-    ENGINE_REPLY_PARTIAL = 22
+    ENGINE_REPLY_PARTIAL = 22  # Currently used only by the Dynamo frontend.
     ABORT_REQUEST = 23
+    SUBMIT_REQUEST_WITH_KV = 24  # Decode-side KV import.
+    RELEASE_KV = 25  # Free pinned handoff blocks.
+    KV_READ_DONE = 26  # Decode finished importing a handoff's KV.
+    SEND_KV = 27  # Tell the prefill engine to send a handoff's KV.
 
 
 class Control(IntEnum):
