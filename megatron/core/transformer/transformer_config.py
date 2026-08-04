@@ -3530,8 +3530,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("MoonEP requires moe_grouped_gemm=True (TEGroupedMLP).")
         if self.expert_tensor_parallel_size not in (None, 1):
             raise ValueError("MoonEP currently requires expert_tensor_parallel_size=1.")
-        if not self.gradient_accumulation_fusion:
-            raise ValueError("MoonEP requires gradient_accumulation_fusion=True.")
+        if self.mtp_num_layers not in (None, 0):
+            raise ValueError("MoonEP does not currently support MTP layers.")
         # MoonEP's dispatch/combine and prefetch kernels assert bf16 activations and
         # bf16 expert weights; there is no FP8/FP4 path in the library.
         if self.params_dtype != torch.bfloat16 or self.fp8 or self.fp4:

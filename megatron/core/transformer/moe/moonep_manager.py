@@ -16,7 +16,12 @@ if TYPE_CHECKING:
 
 try:
     from moonep import Buffer, MoonEPCommPlan
-    from moonep._C import nvl_dist_alloc, nvl_dist_map, nvl_release_mem_handle
+    from moonep._C import (
+        get_vmm_granularity,
+        nvl_dist_alloc,
+        nvl_dist_map,
+        nvl_release_mem_handle,
+    )
     from moonep.buffer import _exchange_ipc_fds
     from moonep.grad_reduce import launch_grad_reduce
     from moonep.prefetch import launch_prefetch
@@ -25,6 +30,7 @@ try:
 except ImportError:
     Buffer = None
     MoonEPCommPlan = None
+    get_vmm_granularity = None
     nvl_dist_alloc = None
     nvl_dist_map = None
     nvl_release_mem_handle = None
@@ -266,9 +272,22 @@ class MoonEPManager:
         full._keepalive = keepalive
         return full
 
+    def _check_chunk_alignment(self, name: str, chunk_shape: List[int]) -> None:
+        """MoonEP maps chunks with cuMemMap, so each must be an exact VMM granularity multiple."""
+        granularity = get_vmm_granularity()
+        for dtype, size in ((torch.bfloat16, 2), (torch.float32, 4)):
+            nbytes = chunk_shape[0] * chunk_shape[1] * chunk_shape[2] * size
+            if nbytes % granularity != 0:
+                raise ValueError(
+                    f"MoonEP {name} {dtype} chunk of {nbytes} bytes (shape {chunk_shape}) is not a "
+                    f"multiple of the {granularity}-byte VMM granularity; adjust the expert "
+                    f"count per rank or the expert FFN size."
+                )
+
     def _make_projection(self, name: str, shape: Tuple[int, int]) -> MoonEPProjectionBuffers:
         """Allocate one layer's [E+B] weight and gradient ranges for one projection."""
         chunk_shape = [self.num_prefetch_slots, shape[0], shape[1]]
+        self._check_chunk_alignment(name, chunk_shape)
         pool = self._alloc_shared_chunk(f"{name}_pool", chunk_shape, torch.bfloat16, False)
         reduce = self._alloc_shared_chunk(f"{name}_reduce", chunk_shape, torch.float32, True)
         weight = self._map_expert_range(chunk_shape, torch.bfloat16, pool.fd)

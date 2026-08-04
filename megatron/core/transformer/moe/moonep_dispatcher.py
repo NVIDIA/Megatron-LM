@@ -146,11 +146,16 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         num_tokens = hidden_states.shape[0]
 
-        routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
         self.topk_probs, topk_indices = torch.topk(probs, self.config.moe_router_topk, dim=-1)
         self.topk_indices = topk_indices.to(torch.int32).contiguous()
-        self.tokens_per_expert = routing_map.sum(dim=0).to(torch.int32).contiguous()
+        # Count from the indices actually handed to MoonEP so the planner and the
+        # dispatch agree even when the router emits zero-probability slots.
+        self.router_tokens_per_expert = (
+            torch.bincount(topk_indices.flatten(), minlength=self.num_experts)
+            .to(torch.int32)
+            .contiguous()
+        )
 
         self.manager.stage_master_weights(self.layer_buffers)
         return hidden_states, self.topk_probs
@@ -162,7 +167,7 @@ class MoEMoonEPTokenDispatcher(MoETokenDispatcher):
             hidden_states,
             self.topk_probs.float().contiguous(),
             self.topk_indices,
-            self.tokens_per_expert,
+            self.router_tokens_per_expert,
             self.manager,
             self.layer_buffers,
             plan_holder,

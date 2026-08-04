@@ -477,8 +477,11 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
             if getattr(param, '_moonep_is_replica', False):
-                # TE writes replica wgrad straight into MoonEP's reduce buffer via
-                # gradient-accumulation fusion; drop the autograd placeholder grad.
+                # Replica main_grad is a row of MoonEP's reduce buffer. With
+                # gradient-accumulation fusion TE has already written it; otherwise fold
+                # the autograd grad in here. Replicas intentionally have no DDP bucket.
+                if param.grad is not None and not param.grad_added_to_main_grad:
+                    param.main_grad.add_(param.grad.data)
                 param.grad = None
                 return
 
