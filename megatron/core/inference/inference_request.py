@@ -99,7 +99,6 @@ def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -
     Args:
         prompt_tokens: All prompt token IDs, shape [seq_len].
         block_size: Number of tokens per block.
-
     Returns:
         List of positive integer hash values in [1, 2^63-1], one per complete block.
     """
@@ -388,6 +387,10 @@ class DynamicInferenceRequest(InferenceRequest):
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
+
+    # KV handoff metadata for decode-side NIXL pulls.
+    # Shape: {"request_id", "block_ids", "kv_meta"}.
+    disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -744,6 +747,8 @@ class DynamicInferenceRequestRecord:
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        # Preserve KV handoff metadata when merging request segments.
+        disaggregated_params = self.requests[-1].disaggregated_params
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -770,6 +775,7 @@ class DynamicInferenceRequestRecord:
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
             num_cached_tokens=self.requests[0].num_cached_tokens,
+            disaggregated_params=disaggregated_params,
         )
 
         return request

@@ -337,12 +337,72 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
+        self._initialize_disaggregation_state()
+
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+    def _initialize_disaggregation_state(self) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+
+    def _reset_pending_kv_imports(self) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+
+    @property
+    def pending_kv_import_count(self) -> int:
+        """Number of decode requests awaiting a KV import (none here)."""
+        return 0
+
+    def _poll_pending_kv_imports(self) -> int:
+        return 0
+
+    def _prepare_handoff_metadata_batch(self, requests_and_blocks: list[tuple]) -> dict:
+        """Hook overridden by the KV-handoff engine composition."""
+        return {}
+
+    def _capture_handoff_meta(self, request, block_ids: list, prepared=None) -> None:
+        self._raise_kv_handoff_not_enabled("KV handoff completion")
+
+    def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
+        return 0
+
+    def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("KV transfer setup")
+
+    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("SEND_KV")
+
+    def _poll_pending_kv_pushes(self) -> int:
+        return 0
+
+    @property
+    def pending_kv_push_count(self) -> int:
+        """Number of prefill sends awaiting completion (none here)."""
+        return 0
+
+    def add_request_with_kv_handoff(
+        self, request_id, prompt, sampling_params, kv_meta, src_block_ids
+    ) -> asyncio.Future[DynamicInferenceRequest]:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("SUBMIT_REQUEST_WITH_KV")
+
+    def release_handoff_blocks(self, request_id: int) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("RELEASE_KV")
+
+    @staticmethod
+    def _raise_kv_handoff_not_enabled(operation: str) -> None:
+        raise RuntimeError(
+            f"{operation} requires KV handoff, but it is not enabled. "
+            "Use DisaggDynamicInferenceEngine with KV transfer configured."
+        )
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
+        self._reset_pending_kv_imports()
         self.context.reset()
 
         # Request state.
@@ -352,6 +412,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
+        if hasattr(self, "_pinned_handoff_blocks"):
+            self._pinned_handoff_blocks.clear()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
@@ -1175,6 +1237,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        precomputed_block_hashes: Optional[List[int]] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1224,6 +1287,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
+            precomputed_block_hashes=precomputed_block_hashes or [],
         )
 
         # Add request.
@@ -1243,6 +1307,7 @@ class DynamicInferenceEngine(AbstractEngine):
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1296,8 +1361,18 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
+        request_id_list = request_ids.tolist()
+        handoff_blocks_by_request = finished_handoff_block_ids or {}
+        prepared_handoff_metadata = self._prepare_handoff_metadata_batch(
+            [
+                (self.get_request(request_id), handoff_blocks_by_request.get(request_id, []))
+                for request_id in request_id_list
+                if request_id in finished_request_ids
+            ]
+        )
+
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+            zip(request_id_list, sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
 
             # Ensure tokens is always a list for consistent handling
@@ -1432,6 +1507,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
+                    # Keep handoff blocks only when the request needs them.
+                    handoff_blocks = handoff_blocks_by_request.get(request_id, [])
+                    if getattr(request.sampling_params, "do_kv_handoff", False):
+                        self._capture_handoff_meta(
+                            request, handoff_blocks, prepared_handoff_metadata.get(request_id)
+                        )
+                    elif handoff_blocks:
+                        self._release_pinned_handoff_blocks(handoff_blocks)
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -1945,7 +2028,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
-                    (_, _, _, _, prefix_skip, _) = self.context._compute_prefix_match(
+                    _, _, _, _, prefix_skip, _ = self.context._compute_prefix_match(
                         req, remaining_len
                     )
                     prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
@@ -2025,7 +2108,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # admits the request). For >= 2 computed tokens add_request computes
                 # exactly this chunk, which already fits the budget.
                 if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    (_, _, _, _, _, actual_effective) = self.context._compute_prefix_match(
+                    _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
                         req, prefill_chunk_length
                     )
                     if self.context.active_token_count + actual_effective > self.context.max_tokens:
@@ -2248,6 +2331,7 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
+            finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -2256,7 +2340,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
+            active_request_ids, finished_request_records = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
@@ -2269,6 +2353,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
+                finished_handoff_block_ids=finished_handoff_block_ids,
             )
 
         else:
@@ -2658,6 +2743,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.SUBMIT_REQUEST_WITH_KV:
+                # Decode-side KV import.
+                request_id, prompt, sampling_params, kv_meta, src_block_ids = data[1:]
+                sampling_params = SamplingParams.deserialize(sampling_params)
+                nvtx_range_push("add_request_with_kv_handoff")
+                self.add_request_with_kv_handoff(
+                    request_id, prompt, sampling_params, kv_meta, src_block_ids
+                )
+                nvtx_range_pop("add_request_with_kv_handoff")
+            elif header == Headers.RELEASE_KV:
+                # Coordinator-broadcast release. Unknown request ids are no-ops.
+                self.release_handoff_blocks(int(data[1]))
+            elif header == Headers.SEND_KV:
+                # Push transport: send a pinned hand-off's KV to the decode
+                # instance the coordinator picked.
+                self.push_handoff_kv(int(data[1]), data[2])
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 entry = self.requests.get(request_id)
@@ -2685,6 +2786,9 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
+
+        self._poll_pending_kv_imports()
+        self._poll_pending_kv_pushes()
 
         if new_generation_epoch is not None:
             self._generation_epoch = new_generation_epoch
@@ -2795,10 +2899,20 @@ class DynamicInferenceEngine(AbstractEngine):
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
+                                or self.pending_kv_import_count > 0
+                                or self.pending_kv_push_count > 0
                             )
                         )
                     )
-                await self.async_step()
+                self._poll_pending_kv_imports()
+                self._poll_pending_kv_pushes()
+                if self.context.get_active_request_count() > 0 or self.waiting_request_ids:
+                    await self.async_step()
+                else:
+                    # Transfer handles expose polling but no async completion
+                    # callback. Yield briefly without adding the normal 20 ms
+                    # idle-loop delay to decode admission.
+                    await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             pass
 
@@ -2888,9 +3002,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
-                    local_pending = self.context.get_active_request_count() + len(
+                    local_schedulable = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
+                    local_pending = local_schedulable + self.pending_kv_import_count
                     if self.disable_ep_consensus:
                         # Skip the EP consensus all-reduce; act on local state only.
                         # NOTE: even with no consensus we must still participate in EP
@@ -2902,7 +3017,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             await self._world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
-                        elif local_pending > 0:
+                        elif local_schedulable > 0:
                             await self.async_step()
                         else:
                             self.step_start_event.record()
@@ -2943,7 +3058,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
-                        if local_pending > 0:
+                        if local_schedulable > 0:
                             await self.async_step()
                         else:
                             # Dummy forward to participate in the EP collective.
