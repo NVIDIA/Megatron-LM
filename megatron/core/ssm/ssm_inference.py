@@ -42,7 +42,7 @@ via ``context.mamba_metadata`` and ``context.mamba_slot_allocator``; the mixin
 orchestration is unaware of them.
 
 Note: static-batching ("legacy") inference is intentionally *not* part of this
-interface. Concrete mixers keep any static/eager inference path quarantined so
+interface. Concrete mixers keep any static/eager inference path separate so
 it does not pollute the dynamic decode/prefill hooks defined here.
 """
 

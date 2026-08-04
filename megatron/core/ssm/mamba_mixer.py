@@ -520,7 +520,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         return out, out_bias
 
     # ==================================================================
-    # Static / eager inference (quarantined)
+    # Static / eager inference
     #
     # These methods implement legacy static-batching inference (and the
     # non-memory-efficient training prefill fallback). They are deliberately
