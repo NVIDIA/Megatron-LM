@@ -7,7 +7,11 @@ import torch
 
 from megatron.core.inference import insitu_timing as _insitu
 from megatron.core.inference.moe.fused_router import can_use_fused_router, fused_router
-from megatron.core.inference.moe.router_topk import can_use_fused_softmax_topk, fused_softmax_topk
+from megatron.core.inference.moe.router_topk import (
+    can_fuse_route_mask,
+    can_use_fused_softmax_topk,
+    fused_softmax_topk,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
@@ -987,7 +991,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
         ):
             with _insitu.site("router_topk"):
-                return fused_softmax_topk(logits, self.topk)
+                return fused_softmax_topk(logits, self.topk, mask_padding=can_fuse_route_mask())
 
         probs, top_indices = self._compiled_topk_routing(
             logits,
