@@ -12,15 +12,16 @@ All of these variants share an *identical* request-level control flow for the
 dynamic inference engine:
 
     1. Fetch this layer's (conv_state, ssm_state) slabs from the context.
-    2. Project the packed input.
+    2. Project the packed input (``in_proj``).
     3. Split the packed batch into a decode partition (1 token per request,
        placed first) and a prefill partition (variable length, placed after).
        The kernels cannot mix the two, so they run independently.
-    4. Merge the two partitions back into packed token order.
-    5. Apply the output projection.
+    4. Run the decode and prefill kernels on their respective partitions.
+    5. Merge the two partitions back into packed token order.
+    6. Apply the output projection (``out_proj``).
 
-Only the kernels in steps 2-5 differ between variants. This mixin owns the
-shared control flow (steps 1, 3, 4 and the orchestration) and delegates the
+Only the kernels in step 4 differ between variants. This mixin owns the shared
+control flow (steps 1-3, 5, 6 and the orchestration) and delegates the
 variant-specific work to two hooks, ``ssm_decode`` and ``ssm_prefill``. New
 linear-attention variants should subclass this mixin and implement those two
 hooks rather than re-deriving the decode/prefill bookkeeping.
