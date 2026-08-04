@@ -463,7 +463,6 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
-    cross_cg_overlap=True,
 ):
     """
     Configure GTP weight-remat before model construction.
@@ -476,7 +475,6 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
-        cross_cg_overlap=cross_cg_overlap,
     )
     if fp4:
         update_gtp_config(pad_for_alignment=16)

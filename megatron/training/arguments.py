@@ -2981,10 +2981,6 @@ def _add_distributed_args(parser):
                        dest='overlap_p2p_comm')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
-    group.add_argument('--disable-gtp-local-cg-backward-rs-overlap', action='store_false',
-                       dest='gtp_local_cg_backward_rs_overlap', default=True,
-                       help='Disable GTP backward reduce-scatter overlap across local CUDA graph '
-                            'boundaries. The overlap is enabled by default when GTP is active.')
     group.add_argument('--ddp-num-buckets', type=int, default=None,
                        help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,

@@ -596,9 +596,6 @@ class _CudagraphGlobalRecord:
             GTP_CONFIG.check_param_states = False
             initialize_graph_wgrad_rings()
 
-        gc.collect()
-        torch.cuda.empty_cache()
-
         _set_capture_start()
         if has_te_modules:
             te_set_capture_start()
@@ -862,8 +859,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
         else:
             runner.bwd_graph.replay()
-            for slot in runner._gtp_wgrad_ring_slots:
-                slot.ready_event.record(torch.cuda.current_stream())
 
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
         for param in runner.params_to_backprop:

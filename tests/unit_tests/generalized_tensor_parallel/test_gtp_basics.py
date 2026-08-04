@@ -23,7 +23,6 @@ Test groups
 - TestWaitAsyncCommsFallback - inline-accumulation fallback when _wgrad_rs_handle is None
 - TestGTPDDPBucketAlignment  - GTP/regular DDP bucket ends padded for dist-opt alignment
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
-- TestGTPConfig              - unified pre-model configuration entry point
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
 - TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and fallback equivalence
 
@@ -78,15 +77,6 @@ class _FakeGroup:
 
     def rank(self):
         return self._rank
-
-
-class TestGTPConfig:
-    def test_configure_sets_cross_cg_overlap(self, monkeypatch):
-        monkeypatch.setattr(gtp_module.GTP_CONFIG, "cross_cg_overlap", True)
-
-        gtp_module.configure_gtp_remat_from_recipe(cross_cg_overlap=False)
-
-        assert not gtp_module.GTP_CONFIG.cross_cg_overlap
 
 
 class TestGTPWeightCacheSchedulingDomain:

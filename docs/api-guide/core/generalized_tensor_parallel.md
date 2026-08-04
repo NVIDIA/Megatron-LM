@@ -292,14 +292,13 @@ update_gtp_config(
     async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
     reduce_scatter_with_fp32_accumulation=False,  # wgrad RS: BF16 all-to-all + FP32 sum (§2.5)
-    cross_cg_overlap=True,        # Overlap GTP RS across local CUDA-graph boundaries
     graph_wgrad_ring_size=2,      # Persistent wgrad slots per graph scheduling domain
 )
 ```
 
 `training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
 
-GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enabled by default. Pass `--disable-gtp-local-cg-backward-rs-overlap` to drain reduce-scatter and its gradient finalization before releasing the next local graph. This fallback is useful for correctness comparisons and debugging; it gives up cross-graph communication overlap. The ownership and ordering protocol is described in [§3.5](#cross-graph-backward-reduce-scatter-overlap).
+GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enabled automatically. The ownership and ordering protocol is described in [§3.5](#cross-graph-backward-reduce-scatter-overlap).
 
 > **CUDA-graph warmup under GTP_remat.** When CUDA graphs are enabled, GTP_remat forces a minimum of **2** per-graph warmup steps regardless of `--cuda-graph-warmup-steps` (e.g. a user-set `0` is bumped to `2`): the first warmup builds the weight-prefetch chain and the second exercises the prefetch path before capture.
 
@@ -590,7 +589,7 @@ GTP supports both **full-iteration CUDA graphs** and **local/partial CUDA graphs
 
 *Problem.* A local backward graph may launch GTP all-gathers and wgrad reduce-scatters on side streams. The conservative completion boundary drains both kinds of communication before releasing the next graph. This is correct, but it serializes the current graph's RS tail with otherwise independent compute in the next graph. Releasing the next graph earlier introduces two ownership requirements: each graph must drain only its own communication, and an RS input must remain alive until NCCL has stopped reading it even if another graph has started.
 
-*Without cross-graph overlap.* With `GTP_CONFIG.cross_cg_overlap=False`, the backward graph drains its communication in two stages:
+*Without cross-graph overlap.* The conservative backward schedule drains communication in two stages:
 
 ```text
 Stage 1: graph-owned AG handles -> wait graph-owned AG streams
@@ -611,7 +610,7 @@ main stream                                                             wait com
 
 *Design.* Cross-graph overlap keeps the same two drain stages but moves `bwd_completion_event` between them. Stage 1 establishes that the graph's all-gathers are complete, which is sufficient to release the next graph. Stage 2 remains ordered after the event and drains RS before finalizing `main_grad`. This creates a compute window for the RS tail without changing the collective or gradient math.
 
-*With cross-graph overlap.* With `GTP_CONFIG.cross_cg_overlap=True`, the main stream may launch the next backward graph while the current graph's RS and `main_grad` finalization continue. Fixed-address ring slots and replay-time events protect each RS input for the longer lifetime.
+*With cross-graph overlap.* The main stream may launch the next backward graph while the current graph's RS and `main_grad` finalization continue. Fixed-address ring slots and replay-time events protect each RS input for the longer lifetime.
 
 ```text
 time ------------------------------------------------------------------------------------>
@@ -640,7 +639,7 @@ The two modes differ only in release timing and the storage required to make ear
 *Implementation.* Cross-graph overlap is implemented by the following cooperating mechanisms:
 
 1. **Capture-local communication ownership.** `track_gtp_capture_comms()` creates one `GTPCaptureCommState` per backward capture. `register_capture_comm()` records the exact params, AG streams, and RS streams touched by that graph. Both drain stages pass `capture_comms.params` to `wait_async_comms()`, so a graph drains only communication it owns.
-2. **Two-stage completion protocol.** Stage 1 calls `wait_async_comms(..., skip_rs=True)` and joins graph-owned AG streams. When overlap is enabled, `bwd_completion_event` is recorded here. Stage 2 drains graph-owned RS handles, accumulates reduced wgrads into `main_grad`, and joins the RS streams. When overlap is disabled, the completion event is recorded only after this stage.
+2. **Two-stage completion protocol.** Stage 1 calls `wait_async_comms(..., skip_rs=True)` and joins graph-owned AG streams before recording `bwd_completion_event`. Stage 2 drains graph-owned RS handles, accumulates reduced wgrads into `main_grad`, and joins the RS streams.
 3. **Persistent wgrad-ring allocation.** `initialize_graph_wgrad_rings()` runs after DDP creates `main_grad` and before graph capture. `allocate_graph_wgrad_rings()` allocates fixed-address tensors outside the shared graph pool. Slots are keyed by communication domain, unsharded shape, padded shape, dtype, and expert index. The default ring size is two.
 4. **Actual RS-input ownership.** `_prepare_wgrad_reduce_scatter_inputs()` registers the ring slot selected as the actual NCCL input. If one graph maps multiple parameters to the same slot, capture fails with a request to increase `graph_wgrad_ring_size`.
 5. **Replay fencing.** Before replay writes a slot, the graph runner waits for its `ready_event`. The RS stream publishes that event only after NCCL has stopped reading the slot. Different slots may remain live concurrently; reuse of an occupied slot waits.
@@ -648,7 +647,7 @@ The two modes differ only in release timing and the storage required to make ear
 
 *Result and cost.* The ring owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail remains zero, and a non-ring producer is copied into the logical view before reduce-scatter. The bounded memory cost is up to `graph_wgrad_ring_size` full unsharded wgrad buffers for each matching scheduling/shape domain, rather than one buffer per layer. The default ring size of two is sufficient when each graph has one same-key writer: one slot may remain an in-flight RS input while the next graph writes the other, and reuse waits on the older slot's `ready_event`. A larger ring is needed only when one graph contains multiple same-key writers whose reduce-scatter inputs can be live together. Capture rejects unsafe same-slot reuse instead of silently aliasing it.
 
-The feature applies only to **local/partial CUDA graphs** and is enabled by default. `--disable-gtp-local-cg-backward-rs-overlap` selects the conservative schedule for correctness and performance comparisons. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
+The feature applies only to **local/partial CUDA graphs** and is enabled automatically. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
 
 ## 4. Testing
 

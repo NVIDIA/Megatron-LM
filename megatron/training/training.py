@@ -2106,7 +2106,6 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
-            cross_cg_overlap=getattr(args, 'gtp_local_cg_backward_rs_overlap', True),
         )
 
     model = _build_model_wrapper(wrap_with_ddp)
