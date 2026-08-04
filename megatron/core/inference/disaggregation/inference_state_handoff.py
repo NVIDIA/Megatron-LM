@@ -230,25 +230,24 @@ class InferenceStateHandoffMixin:
     def _capture_handoff_meta(self, request: "DynamicInferenceRequest", block_ids: list) -> None:
         """Attach transfer metadata and retain the request's pinned blocks."""
         rid = request.request_id
-        if not block_ids:
-            logging.warning(
-                "DISAGG_PREFILL_HANDOFF request_id=%d had no snapshot blocks "
-                "(controller missed the slot?); decode peer will receive empty handoff",
-                rid,
-            )
-            return
-
-        self._pinned_handoff_blocks[rid] = list(block_ids)
-
         if self._kv_peer_metas is None:
             raise RuntimeError("KV handoff requested before transfer setup")
         local_kv: Any = self._kv_peer_metas
 
         pp_size = get_pg_size(self.pg_collection.pp)
         if pp_size > 1 and torch.distributed.is_initialized():
-            local_entry = {"kv_meta": local_kv, "block_ids": list(block_ids)}
+            local_entry = {"request_id": rid, "kv_meta": local_kv, "block_ids": list(block_ids)}
             gathered: list = [None] * pp_size
             torch.distributed.all_gather_object(gathered, local_entry, group=self.pg_collection.pp)
+            request_ids = {entry["request_id"] for entry in gathered}
+            block_counts = {len(entry["block_ids"]) for entry in gathered}
+            if request_ids != {rid} or len(block_counts) != 1:
+                if block_ids:
+                    self._release_pinned_handoff_blocks(block_ids)
+                raise RuntimeError(
+                    "Pipeline ranks produced inconsistent KV handoff metadata "
+                    f"(request_ids={sorted(request_ids)}, block_counts={sorted(block_counts)})"
+                )
             kv_meta: Any = {
                 "pp_metas": [
                     {"tp_metas": e["kv_meta"], "block_ids": e["block_ids"]} for e in gathered
@@ -258,6 +257,16 @@ class InferenceStateHandoffMixin:
         else:
             kv_meta = local_kv
             top_block_ids = block_ids
+
+        if not block_ids:
+            logging.warning(
+                "DISAGG_PREFILL_HANDOFF request_id=%d had no snapshot blocks "
+                "(controller missed the slot?); decode peer will receive empty handoff",
+                rid,
+            )
+            return
+
+        self._pinned_handoff_blocks[rid] = list(block_ids)
 
         if isinstance(kv_meta, list):
             kv_meta = {"tp_metas": kv_meta}
@@ -300,8 +309,9 @@ class InferenceStateHandoffMixin:
         allocator = self.context.kv_block_allocator
         if not allocator.enable_prefix_caching:
             raise RuntimeError(
-                "add_request_with_kv_handoff requires --enable-prefix-caching on the "
-                "decode engine; the prefill-skip path uses the prefix-cache match logic."
+                "add_request_with_kv_handoff requires "
+                "--inference-dynamic-batching-prefix-caching on the decode engine; "
+                "the prefill-skip path uses the prefix-cache match logic."
             )
 
         if self._kv_transfer_agent is None:
@@ -508,35 +518,39 @@ class InferenceStateHandoffMixin:
         return safe_to_release
 
     def _admission_flags(self) -> list:
-        """Per-pending (done, exception) pairs, with the done flags agreed
-        across the model-parallel group.
+        """Per-pending (done, failed, exception) tuples agreed across MP ranks.
 
-        Each rank polls its own transfer handles; the done flags are
-        AND-reduced over the MP group so every rank admits the same imports on
-        the same step. Pending order is identical across ranks (the submits
-        arrive via the TP broadcast in order). A poll failure is recorded and
-        re-raised by the caller's quarantine path; it flags as done because
-        the failure is terminal on this rank either way."""
+        Pending order is identical across ranks because submissions arrive via
+        the TP broadcast in order. One SUM reduction establishes that all ranks
+        completed or that any rank failed, keeping admission and failure control
+        flow identical across the model-parallel group.
+        """
         local = []
         for p in self._pending_kv_imports:
             try:
                 done = all(handle.poll() for handle in self._pending_transfer_handles(p))
-                local.append((done, None))
+                local.append((done, False, None))
             except Exception as exc:  # quarantined by the caller
-                local.append((True, exc))
+                local.append((False, True, exc))
         mp_group = getattr(self.pg_collection, "mp", None)
-        if (
-            mp_group is not None
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_world_size(mp_group) > 1
-        ):
+        world_size = (
+            torch.distributed.get_world_size(mp_group)
+            if (mp_group is not None and torch.distributed.is_initialized())
+            else 1
+        )
+        if world_size > 1:
+            # A failure contributes -world_size, so the reduced value stays
+            # negative even when every other rank reports completion.
             flags = torch.tensor(
-                [1 if d else 0 for d, _ in local],
+                [-world_size if failed else int(done) for done, failed, _ in local],
                 dtype=torch.int32,
                 device=self.context.memory_buffer.device,
             )
-            torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.MIN, group=mp_group)
-            local = [(bool(f), exc) for f, (_, exc) in zip(flags.tolist(), local)]
+            torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM, group=mp_group)
+            local = [
+                (value == world_size, value < 0, exc)
+                for value, (_, _, exc) in zip(flags.tolist(), local)
+            ]
         return local
 
     def _poll_pending_kv_imports(self) -> int:
@@ -547,10 +561,12 @@ class InferenceStateHandoffMixin:
         remaining = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            done, poll_exc = admission.popleft()
+            done, failed, poll_exc = admission.popleft()
             try:
-                if poll_exc is not None:
-                    raise poll_exc
+                if failed:
+                    raise poll_exc or RuntimeError(
+                        "KV handoff transfer failed on a model-parallel peer"
+                    )
                 if done:
                     self._finalize_kv_handoff_import(pending)
                     ready += 1

@@ -221,8 +221,69 @@ def test_admission_collective_uses_cache_buffer_device(handoff_loop, monkeypatch
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
 
-    assert engine._admission_flags() == [(False, None)]
+    assert engine._admission_flags() == [(False, False, None)]
     assert observed_devices == [expected_device]
+
+
+def test_peer_poll_failure_fails_this_rank(handoff_loop, monkeypatch):
+    engine = _HandoffHarness(handoff_loop)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    pending.handle = _PendingHandle()
+    engine._pending_kv_imports.append(pending)
+    engine.pg_collection.mp = object()
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def report_peer_failure(flags, op, group):
+        flags.copy_(torch.tensor([-1], dtype=flags.dtype))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", report_peer_failure)
+
+    with pytest.raises(RuntimeError, match="failed on a model-parallel peer"):
+        engine._poll_pending_kv_imports()
+
+    assert isinstance(pending.future.exception(), RuntimeError)
+    assert engine.context.kv_block_allocator.releases == [[block_id]]
+
+
+@pytest.mark.parametrize(
+    ("remote_request_id", "remote_blocks", "message"),
+    [(8, [20], "request_ids"), (7, [], "block_counts")],
+)
+def test_capture_handoff_rejects_inconsistent_pipeline_metadata(
+    monkeypatch, remote_request_id, remote_blocks, message
+):
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    pp_group = object()
+    engine.pg_collection = SimpleNamespace(pp=pp_group)
+    engine._kv_peer_metas = {"global_rank": 0}
+    engine._release_pinned_handoff_blocks = mock.Mock(return_value=1)
+    request = SimpleNamespace(request_id=7, disaggregated_params=None)
+
+    def gather_inconsistent_metadata(output, local_entry, group):
+        assert group is pp_group
+        output[:] = [
+            local_entry,
+            {
+                "request_id": remote_request_id,
+                "kv_meta": {"global_rank": 1},
+                "block_ids": remote_blocks,
+            },
+        ]
+
+    pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
+    with (
+        mock.patch(pg_size, return_value=2),
+        mock.patch("torch.distributed.is_initialized", return_value=True),
+        mock.patch("torch.distributed.all_gather_object", side_effect=gather_inconsistent_metadata),
+        pytest.raises(RuntimeError, match=message),
+    ):
+        engine._capture_handoff_meta(request, [10])
+
+    engine._release_pinned_handoff_blocks.assert_called_once_with([10])
 
 
 def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
