@@ -1967,8 +1967,10 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # Preserve the first-iteration accumulation only for a fresh training run. A resumed
+    # process starts with an empty total_loss_dict, so keeping the first resumed loss would
+    # average it with the next iteration.
+    should_reset = not is_first_iteration or args.iteration > 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
