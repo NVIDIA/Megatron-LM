@@ -274,7 +274,8 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False,
-  weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False)
+  weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
+  reduce_scatter_with_fp32_accumulation=False)
 ```
 
 ### 2.4 Tuning knobs
@@ -287,12 +288,49 @@ update_gtp_config(
     weight_prefetch=True,         # Disable to debug the cold-start path
     async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
+    reduce_scatter_with_fp32_accumulation=False,  # wgrad RS: BF16 all-to-all + FP32 sum (§2.5)
 )
 ```
 
 `training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
 
 > **CUDA-graph warmup under GTP_remat.** When CUDA graphs are enabled, GTP_remat forces a minimum of **2** per-graph warmup steps regardless of `--cuda-graph-warmup-steps` (e.g. a user-set `0` is bumped to `2`): the first warmup builds the weight-prefetch chain and the second exercises the prefetch path before capture.
+
+### 2.5 FP32-accumulation wgrad reduce-scatter (optional)
+
+```bash
+--gtp-remat-reduce-scatter-with-fp32-accumulation      # default: off
+```
+
+**A ring reduce-scatter rounds the partial sum at every one of its `N-1` hops, so BF16 gradient error compounds with the axis size (≈`√N` for gradient-like data, worse when contributions share a sign). This flag replaces it with an all-to-all plus one local FP32 sum, eliminating that accumulation error for the same bytes on the wire.**
+
+| | |
+|---|---|
+| **Use when** | wgrads are BF16 (the default) **and** the gtp_remat axis is ≥ 4 |
+| **Skip when** | `--accumulate-allreduce-grads-in-fp32` is set, which already makes the wire and the accumulation FP32; or the axis is ≤ 2, where it is auto-bypassed |
+| **Gain** | the `N-1` intermediate roundings disappear, leaving only the final downcast — so the error stops growing with the axis, and the benefit grows with it |
+| **Cost** | one unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter, plus a local FP32 sum and downcast at `wait()` time |
+
+Implemented in `megatron/core/distributed/reduce_scatter_with_fp32_accumulation.py`. This is the
+gtp_remat-axis analogue of `--ddp-reduce-scatter-with-fp32-accumulation` and **independent of
+it** — a different collective over a different process group, so enable either, both, or neither.
+
+**Behaviour notes**
+
+- **The mean stays a pre-scale.** Both paths apply `1/gtp_remat` to the wgrad before the
+  collective (§3.2 table); under `calculate_per_token_loss` the axis SUMs and no factor
+  applies either way.
+- **Auto-bypass at axis size ≤ 2.** The gate reads the per-chain group, so each axis decides
+  independently: a `GTP_remat=8 × EGTP_remat=2` run gets FP32 accumulation on the dense weights
+  and the plain reduce-scatter on the experts.
+- **Scratch lifetime.** The buffer comes from GTP's wgrad pool rather than a fresh `empty_like`,
+  and is returned only once the handle is waited — it is the *input* to the deferred FP32 sum.
+- **Batched (grouped / routed-expert) path.** The all-to-alls share one `ncclGroupStart/End` via
+  `_coalescing_manager`, but the manager cannot serve as the handle: it waits only the NCCL work
+  it collects, while each fp32-accum handle still owes a local FP32 sum. The sums are deferred
+  behind it in one composite handle — which is why the all-to-alls are issued with
+  `async_op=True`: for this primitive that flag defers the sum, it does not merely return a
+  handle. (DDP's own flag sidesteps all this by asserting a single bucket.)
 
 ---
 
@@ -342,7 +380,7 @@ The figure visualizes the per-class split from the list above: green = resolves 
 
 Two distinct pools with explicit lifecycle rules:
 
-- **`GTPWeightCache`** (AG/RS output buffers) — ticket-based, keyed on `(shape, dtype, fwd, expert_idx, reduce_scatter)`. Same-shape buffers across layers are shared. Tickets persistent; buffer allocated lazily on first `get()`; addresses stable across iterations for CG replay.
+- **`GTPWeightCache`** (AG/RS output buffers) — ticket-based, keyed on `(shape, dtype, fwd, expert_idx, reduce_scatter)`. Same-shape buffers across layers are shared, **except between chain neighbours** — one-step-ahead keeps `prev_w` and the current weight live at once, so `_ensure_distinct_buffer_from_prev` folds a parity bit into the key when the two would collide, at the cost of one extra buffer for the second of the pair. Normally inert (neighbours are different weight roles, hence different shapes); it fires when CG capture leaves two same-shaped weights adjacent — embedding + output_layer alone in the `UNGRAPHED` chain. Tickets persistent; buffer allocated lazily on first `get()`; addresses stable across iterations for CG replay.
 - **`_wgrad_buf_pool`** (wgrad-GEMM output recycling) — holds the **full, unsharded** wgrad-GEMM output buffer (shape `_unsharded_shape`, dtype `main_grad.dtype` — fp32 when `grad_reduce_in_fp32`, else bf16). The TE backward writes the wgrad into it via `main_grad_func = weight.grad_buffer` (a `DistributedWeight` protocol method backed by `get_wgrad_tensor`; it is a *scratch*, distinct from the sharded `param.main_grad`); the protocol's `finalize_group_grads` (backed by `wgrad_reduce_scatter`) then reduce-scatters it down to the shard and the buffer is returned here. This is a full-weight-shaped fp32/bf16 transient — one of the larger per-weight buffers — and is **precision-independent** (wgrad is always computed in high precision), so it is identical in BF16 vs MXFP8 runs. Buffers are tagged `_from_gtp_wgrad_pool=True` at `_wgrad_pool_get`; `_wgrad_pool_put` no-ops on foreign buffers (fresh allocs from Megatron `layers.py` or aten F.embedding bwd) → caching allocator handles those, so the pool never accumulates untagged buffers.
 
 #### Overlap design summary
@@ -430,6 +468,8 @@ The DP collective only covers the replicate axis; the gtp_remat axis is complete
 | final normalization | net grad = full `(replicate × gtp_remat)` **mean** | grads summed over all axes, then `÷ total_global_tokens` in `finalize_model_grads` |
 
 - **Default (mean) path** decouples gradient scaling from the gtp_remat degree: the DP `1/replicate` mean × the reduce-scatter `1/gtp_remat` mean (sharded weights) — or × the finalize AVG (replicated params) — equals the exact full mean, independent of the gtp_remat axis size.
+- **`--gtp-remat-reduce-scatter-with-fp32-accumulation` swaps the collective, not the scaling**
+  — this table applies unchanged (§2.5).
 - **Per-token-loss path** must SUM over gtp_remat (like the DP axis): `total_global_tokens` already counts the gtp_remat peers' distinct tokens, so the single `÷ total_global_tokens` does all normalization. A `1/gtp_remat` mean here would shrink every gtp_remat gradient by `1/gtp_remat` (grad-norm mismatch + divergence), so the reduce-scatter mean and finalize AVG are both gated on `not calculate_per_token_loss`.
 
 > **`average_in_collective` must be off (the default).** The default-path scaling is a *pre-scale* applied before a SUM collective. `average_in_collective=True` instead uses NCCL AVG over the collective's own (replicate) group, which interacts incorrectly with the gtp_remat completion. Asserted via `ProcessGroupCollection.is_gtp_remat_active` in both `arguments.py` (training) and `DistributedDataParallel.__init__` (direct megatron-core users). (Independently, `calculate_per_token_loss` already forbids `average_in_collective`.)
@@ -527,7 +567,8 @@ Three consequences:
   - the weight cache keys **one buffer per `(shape, dtype, expert_idx)`**, which assumes at most one same-key weight is live;
   - one-block-ahead makes block *N* and block *N+1* weights **live at the same time** — same key, two tensors in flight;
   - fix: a chain-position **parity (0,1,0,1…)** is folded into the cache key, so consecutive blocks alternate between **exactly two** buffers (counter cleared by `reset_gtp_state()`);
-  - without it the prefetch would **overwrite the weight the running GEMM is still reading** — a silent-correctness bug, not a crash.
+  - without it the prefetch would **overwrite the weight the running GEMM is still reading** — a silent-correctness bug, not a crash;
+  - the hazard is not exclusive to grouped chains — *any* chain whose neighbours share a key has it. Grouped chains are same-key throughout, so they take the blanket counter; others take the narrower `_ensure_distinct_buffer_from_prev` check, which allocates only where the collision is real (see *Buffer / memory management*).
 - **Eager only** — the optimization disables itself under CUDA-graph capture:
   - `_classify_param_chain` evaluates `graphed = _FULL_ITERATION or ("moe" in cuda_graph_modules)` **before** the split, and returns the plain `GRAPHED` chain when it is true;
   - so with `--cuda-graph-impl full_iteration` **every** param is `GRAPHED` — expert weights included — and they keep the ordinary one-step-ahead prefetch;
@@ -551,10 +592,12 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`). |
 | `test_moe_egtp.py` | EGTP_remat on MoE routed-expert weights. |
 | `test_gtp_loss_correctness.py` | End-to-end: GTP_remat per-step loss trajectory matches a no-GTP_remat baseline. |
-| `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. |
+| `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. Also the fp32-accumulation reduce-scatter (§2.5): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
 | `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
+
+The fp32-accumulation primitive itself is covered outside this suite, by `tests/unit_tests/distributed/test_reduce_scatter_with_fp32_accumulation.py`, which does not require GTP_remat.
 
 All tests require ≥ 4 GPUs and TransformerEngine >= 2.19; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP_remat change.
