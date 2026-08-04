@@ -1522,17 +1522,59 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
             config=optimizer_config, model_chunks=model_chunks, pg_collection=pg_collection_complete
         )
 
-    # Test 6: Gloo process groups should not be used with custom process groups
+    # Test 6: An explicit collection can omit Gloo groups or supply its own.
     pg_collection_complete.mp = None  # Explicitly set to None as allowed
     pg_collection_complete.tp_ep_pp = None  # Explicitly set to None as allowed
 
-    with pytest.raises(ValueError, match="Gloo process groups are not supported"):
-        get_megatron_optimizer(
-            config=optimizer_config,
-            model_chunks=model_chunks,
-            use_gloo_process_groups=True,  # Should be False when using custom groups
-            pg_collection=pg_collection_complete,
-        )
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection_complete, model_chunks, use_gloo_process_groups=True
+    )
+    assert groups['intra_dp_cp_group_gloo'] is None
+    assert groups['intra_expt_dp_group_gloo'] is None
+
+    # And when the collection does carry them, they are passed straight through.
+    gloo_dp = torch.distributed.new_group(backend="gloo")
+    gloo_expt_dp = torch.distributed.new_group(backend="gloo")
+    pg_collection_complete.intra_dp_cp_gloo = gloo_dp
+    pg_collection_complete.intra_expt_dp_gloo = gloo_expt_dp
+    groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection_complete, model_chunks, use_gloo_process_groups=True
+    )
+    assert groups['intra_dp_cp_group_gloo'] is gloo_dp
+    assert groups['intra_expt_dp_group_gloo'] is gloo_expt_dp
+
+
+@pytest.mark.parametrize('create_gloo', [False, True])
+@pytest.mark.parametrize('use_gloo', [False, True])
+def test_get_megatron_optimizer_with_gloo_collection(mocker, create_gloo, use_gloo):
+    """The optimizer uses caller-owned Gloo groups without resolving the global grid again."""
+    Utils.initialize_model_parallel(create_gloo_process_groups=create_gloo)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert (pg_collection.intra_dp_cp_gloo is not None) == create_gloo
+    assert (pg_collection.intra_expt_dp_gloo is not None) == create_gloo
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        DistributedDataParallelConfig(use_distributed_optimizer=True),
+        torch.nn.Linear(16, 16, bias=False, device='cuda'),
+        pg_collection=pg_collection,
+    )
+    mocker.patch.object(
+        ProcessGroupCollection,
+        'use_mpu_process_groups',
+        side_effect=AssertionError('explicit collection must not read the global grid'),
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(optimizer='adam', lr=0.001, use_distributed_optimizer=True),
+        [model],
+        pg_collection=pg_collection,
+        use_gloo_process_groups=use_gloo,
+    )
+    assert len(optimizer.chained_optimizers) == 1
+    distributed_optimizer = optimizer.chained_optimizers[0]
+    assert isinstance(distributed_optimizer, DistributedOptimizer)
+    assert distributed_optimizer.data_parallel_group_gloo is (
+        pg_collection.intra_dp_cp_gloo if use_gloo else None
+    )
 
 
 def _chain_member(param_groups):
