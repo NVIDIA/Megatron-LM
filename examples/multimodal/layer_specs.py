@@ -1,9 +1,6 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
-from functools import partial
-
 import torch
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -15,9 +12,11 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
+from megatron.core.extensions.transformer_engine import HAVE_TE
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -114,7 +113,7 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=not_none(TERowParallelLinear),
+                    linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -160,7 +159,7 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
                         submodules=SelfAttentionSubmodules(
                             linear_qkv=not_none(TELayerNormColumnParallelLinear),
                             core_attention=not_none(TEDotProductAttention),
-                            linear_proj=not_none(TERowParallelLinear),
+                            linear_proj=TERowParallelLinear,
                         ),
                     ),
                     self_attn_bda=get_bias_dropout_add,
@@ -172,8 +171,8 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
             mlp_layer=ModuleSpec(
                 module=MLPLayer,
                 submodules=TransformerLayerSubmodules(
-                    mlp=partial(
-                        MLP.as_mlp_submodule,
+                    mlp=ModuleSpec(
+                        module=MLP,
                         submodules=MLPSubmodules(
                             linear_fc1=not_none(TELayerNormColumnParallelLinear),
                             linear_fc2=not_none(TERowParallelLinear),
@@ -182,14 +181,27 @@ def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
                     mlp_bda=get_bias_dropout_add,
                 ),
             ),
+            moe_layer=ModuleSpec(
+                module=MoETransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    pre_mlp_layernorm=TENorm,
+                    mlp=get_moe_module_spec(
+                        use_te=True,
+                        num_experts=8,
+                        moe_grouped_gemm=True,
+                        moe_use_legacy_grouped_gemm=False,
+                    ),
+                    mlp_bda=get_bias_dropout_add,
+                ),
+            ),
         ),
     )
 
 
-def get_mlp_module_spec(use_te: bool = True):
+def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
-    return partial(
-        MLP.as_mlp_submodule,
+    return ModuleSpec(
+        module=MLP,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
             linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
@@ -197,9 +209,9 @@ def get_mlp_module_spec(use_te: bool = True):
     )
 
 
-def get_norm_mlp_module_spec_te():
-    return partial(
-        MLP.as_mlp_submodule,
+def get_norm_mlp_module_spec_te() -> ModuleSpec:
+    return ModuleSpec(
+        module=MLP,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TELayerNormColumnParallelLinear),
             linear_fc2=not_none(TERowParallelLinear),

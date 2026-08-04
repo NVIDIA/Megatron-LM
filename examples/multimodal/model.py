@@ -8,16 +8,19 @@ from config import get_language_model_config, get_vision_model_config, get_visio
 from layer_specs import (get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te,
                          get_hybrid_layer_spec_te)
 
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.utils import log_single_rank
 
 
+
 def model_provider(
     pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
-    vp_stage=None, config=None, pg_collection=None
+    **kwargs,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -29,9 +32,6 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable parallel model output.
-        vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
-        config: Optional transformer config. If None, will be created from args.
-        pg_collection: Optional process group collection. If None, will use default.
 
     Returns:
         model: A multimodal model.
@@ -41,28 +41,38 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
 
-    num_image_embeddings = get_num_image_embeddings(
-        args.img_h,
-        args.img_w,
-        args.patch_dim,
-        args.vision_model_type,
-        args.disable_vision_class_token,
-        1,
-        args.pixel_shuffle,
-        args.use_tile_tags,
-        args.max_num_tiles,
-        args.tokenizer_prompt_format
-    )
-    old_seq_length = args.seq_length
-    args.seq_length = args.encoder_seq_length = num_image_embeddings
-    if old_seq_length != args.seq_length:
-        log_single_rank(
-            logging.getLogger(__name__),
-            logging.WARNING,
-            f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
+    if getattr(args, 'dynamic_resolution', False):
+        max_num_image_embeddings = args.seq_length
+        num_image_embeddings = args.seq_length
+        if args.pixel_shuffle:
+            max_num_image_embeddings //= 4
+            num_image_embeddings //= 4
+        if getattr(args, 'conv_merging', False):
+            max_num_image_embeddings //= 4
+            num_image_embeddings //= 4
+    else:
+        num_image_embeddings = get_num_image_embeddings(
+            args.img_h,
+            args.img_w,
+            args.patch_dim,
+            args.vision_model_type,
+            args.disable_vision_class_token,
+            1,
+            args.pixel_shuffle,
+            args.use_tile_tags,
+            args.max_num_tiles,
+            args.tokenizer_prompt_format
         )
+        old_seq_length = args.seq_length
+        args.seq_length = args.encoder_seq_length = num_image_embeddings
+        if old_seq_length != args.seq_length:
+            log_single_rank(
+                logging.getLogger(__name__),
+                logging.WARNING,
+                f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
+            )
 
-    max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
+        max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
 
     assert (
         args.decoder_seq_length is not None
@@ -82,7 +92,13 @@ def model_provider(
     base_config = core_transformer_config_from_args(get_args())
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
-    base_config.calculate_per_token_loss = True
+    # Must be False for VLM without --use-loss-scaling. With True, the loss is a raw
+    # sum (~num_tokens larger) and gradient scaling is deferred to finalize_model_grads.
+    # This causes bf16 activation gradient overflow during backward (before finalize
+    # compensates). The original m-lm-vlm-training avoids this via --use-loss-scaling
+    # which normalizes the loss to O(1) before backward. We don't have that, so False
+    # divides by num_tokens before backward, keeping activation gradients in bf16 range.
+    base_config.calculate_per_token_loss = False
 
     language_config = deepcopy(base_config)
     language_config = get_language_model_config(language_config)
@@ -98,8 +114,17 @@ def model_provider(
     elif use_te:
         # Padding mask needed for SP/CP.
         padding = args.context_parallel_size > 1 and args.sequence_parallel
-        if args.language_model_type.startswith('nemotron5-hybrid'):
+        if args.spec is not None:
+            language_transformer_layer_spec = import_module(args.spec)
+        elif args.language_model_type.startswith(('nemotron5-hybrid', 'nemotron6-moe')):
             language_transformer_layer_spec = get_hybrid_layer_spec_te(padding=padding)
+        elif getattr(args, 'num_experts', None):
+            language_transformer_layer_spec = get_gpt_decoder_block_spec(
+                language_config,
+                use_transformer_engine=use_te,
+                normalization=args.normalization,
+                qk_l2_norm=getattr(args, 'qk_l2_norm', False),
+            )
         else:
             language_transformer_layer_spec = get_layer_spec_te(
                 is_vit=False, padding=padding
@@ -113,8 +138,11 @@ def model_provider(
     vision_config = get_vision_model_config(
         vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
     )
+    # Most ViT checkpoints use bias in linear layers; override --disable-bias-linear.
+    # Pixtral (both sizes) uses no bias — config.py already sets add_bias_linear=False.
+    if vision_model_type not in ("pixtral-vit", "pixtral-vit-large"):
+        vision_config.add_bias_linear = True
     if vision_model_type.startswith("hf://"):
-        assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
     if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
@@ -141,6 +169,13 @@ def model_provider(
     elif vision_model_type == "internvit300M":
         from nvlm.internvit import get_internvit300M_layer_spec
         vision_transformer_layer_spec = get_internvit300M_layer_spec(use_te=use_te)
+    elif vision_model_type in ("pixtral-vit", "pixtral-vit-large", "qwen-vl", "kimi-vit"):
+        if use_te:
+            vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)
+        else:
+            vision_transformer_layer_spec = get_layer_spec(
+                is_vit=True, normalization=vision_config.normalization
+            )
     elif vision_model_type.startswith("hf://"):
         vision_transformer_layer_spec = None
     else:
@@ -202,7 +237,7 @@ def model_provider(
         drop_vision_class_token=args.disable_vision_class_token,
         vision_projection_config=vision_projection_config,
         vision_projection_layer_spec=vision_projection_layer_spec,
-        vision_projection_type="mlp",
+        vision_projection_type=args.vision_projection_type,
         allow_missing_vision_projection_checkpoint=args.allow_missing_vision_projection_checkpoint,
         parallel_output=parallel_output,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
@@ -221,9 +256,18 @@ def model_provider(
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
+        conv_merging=getattr(args, "conv_merging", False),
         tile_tags=tile_tags,
         max_num_tiles=args.max_num_tiles,
         tokenizer_type=args.tokenizer_prompt_format,
+        use_vision_backbone_fp8_arch=getattr(args, "use_vision_backbone_fp8_arch", False),
+        dynamic_resolution=getattr(args, "dynamic_resolution", False),
+        class_token_len=getattr(args, "class_token_len", None),
+        radio_force_eval_mode=getattr(args, "radio_force_eval_mode", False),
+        radio_force_cpe_eval_mode=getattr(args, "radio_force_cpe_eval_mode", False),
+        radio_interpolate_only_cpe=getattr(args, "radio_interpolate_only_cpe", False),
+        radio_cpe_aspect_ratio_select=getattr(args, "radio_cpe_aspect_ratio_select", False),
+        radio_disable_cpe=getattr(args, "radio_disable_cpe", False),
     )
 
     model.freeze(

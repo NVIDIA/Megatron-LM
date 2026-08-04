@@ -137,6 +137,11 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
         return self._tokenizer.pad
 
     @property
+    def bos(self):
+        """Beginning of sentence token ID."""
+        return self._tokenizer.bos
+
+    @property
     def eod(self):
         """End of sentence token ID."""
         return self._tokenizer.eod
