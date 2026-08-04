@@ -36,7 +36,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 )
 
 
-def _worker_gtp_partial_cg_correctness(rank, world_size, port, cross_cg_overlap):
+def _worker_gtp_partial_cg_correctness(rank, world_size, port):
     """Compare eager and local attention CUDA graphs with GTP2 x DP2."""
     del port
 
@@ -228,8 +228,6 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, cross_cg_overlap)
     # this focused GTP/CUDA-graph test.
     initialize_main_grads(partial_cg)
 
-    original_cross_cg_overlap = gtp_module.GTP_CONFIG.cross_cg_overlap
-    gtp_module.GTP_CONFIG.cross_cg_overlap = cross_cg_overlap
     partial_cg_losses = []
     partial_cg_grad_norms = []
     try:
@@ -248,10 +246,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, cross_cg_overlap)
         assert _CudagraphGlobalRecord.cudagraph_created
         runners = [layer.cudagraph_manager.cudagraph_runners[0] for layer in partial_cg]
         assert all(runner.gtp_remat for runner in runners)
-        if cross_cg_overlap:
-            assert any(runner._gtp_wgrad_ring_slots for runner in runners)
-        else:
-            assert all(not runner._gtp_wgrad_ring_slots for runner in runners)
+        assert any(runner._gtp_wgrad_ring_slots for runner in runners)
 
         replay_grad_norms = []
         replay_losses = []
@@ -280,8 +275,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, cross_cg_overlap)
         )
         if gtp_rank == 0:
             print(
-                f"[partial-CG grad norm, cross_cg_overlap={cross_cg_overlap}, "
-                f"DP replica {dp_rank}] eager={eager_grad_norm:.6f} replays={replay_grad_norms}",
+                f"[partial-CG grad norm, DP replica {dp_rank}] "
+                f"eager={eager_grad_norm:.6f} replays={replay_grad_norms}",
                 flush=True,
             )
 
@@ -310,7 +305,6 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, cross_cg_overlap)
         for layer in partial_cg:
             layer.cudagraph_manager.cudagraph_runners.clear()
         gc.collect()
-        gtp_module.GTP_CONFIG.cross_cg_overlap = original_cross_cg_overlap
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
         gtp_module.reset_gtp_state()
@@ -318,8 +312,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, cross_cg_overlap)
     if rank == 0:
         for step, (eager_loss, partial_cg_loss) in enumerate(zip(eager_losses, partial_cg_losses)):
             print(
-                f"Step {step:2d}: eager={eager_loss:.6f}  partial_cg={partial_cg_loss:.6f} "
-                f"cross_cg_overlap={cross_cg_overlap}",
+                f"Step {step:2d}: eager={eager_loss:.6f}  partial_cg={partial_cg_loss:.6f}",
                 flush=True,
             )
     torch.testing.assert_close(
@@ -331,13 +324,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, cross_cg_overlap)
 
 
 class TestGTPPartialCGCorrectness:
-    @pytest.mark.parametrize(
-        "cross_cg_overlap",
-        [False, True],
-        ids=["cross-cg-overlap-disabled", "cross-cg-overlap-enabled"],
-    )
-    def test_gtp_partial_cg_loss_and_grad_norm_match_eager(self, cross_cg_overlap):
+    def test_gtp_partial_cg_loss_and_grad_norm_match_eager(self):
         """Local-CG loss trajectory and global grad norm must match eager execution."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
-        _run_distributed(_worker_gtp_partial_cg_correctness, 4, cross_cg_overlap)
+        _run_distributed(_worker_gtp_partial_cg_correctness, 4)

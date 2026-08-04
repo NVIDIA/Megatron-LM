@@ -277,8 +277,7 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
-  reduce_scatter_with_fp32_accumulation=False,
-  cross_cg_overlap=True, graph_wgrad_ring_size=2)
+  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2)
 ```
 
 ### 2.4 Tuning knobs

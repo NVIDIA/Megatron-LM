@@ -849,13 +849,14 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
-            if runner.gtp_remat and GTP_CONFIG.cross_cg_overlap:
+            if runner.gtp_remat:
                 for slot in runner._gtp_wgrad_ring_slots:
                     runner.stream.wait_event(slot.ready_event)
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
-                for slot in runner._gtp_wgrad_ring_slots:
-                    slot.ready_event.record(runner.stream)
+                if runner.gtp_remat:
+                    for slot in runner._gtp_wgrad_ring_slots:
+                        slot.ready_event.record(runner.stream)
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
         else:
             runner.bwd_graph.replay()
@@ -1482,19 +1483,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True, params=capture_comms.params)
                 self._wait_side_streams(capture_comms.ag_streams)
 
-                if GTP_CONFIG.cross_cg_overlap:
-                    # Release the next runner after AG drain but before RS drain.
-                    self.bwd_completion_event.record()
+                # Release the next runner after AG drain but before RS drain.
+                self.bwd_completion_event.record()
 
                 # Phase 2: in-graph RS drain + finalize.
                 wait_async_comms(
                     GTPChain.GRAPHED.value, finalize_after_drain=True, params=capture_comms.params
                 )
                 self._wait_side_streams(capture_comms.rs_streams)
-
-                if not GTP_CONFIG.cross_cg_overlap:
-                    # Fallback: delay the next graph until RS and main_grad finalization complete.
-                    self.bwd_completion_event.record()
 
             if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.

@@ -369,7 +369,6 @@ def initialize_graph_wgrad_rings() -> None:
     """Allocate persistent wgrad inputs before local CUDA-graph capture."""
     allocate_graph_wgrad_rings(
         _GTP_PARAMS,
-        enabled=GTP_CONFIG.cross_cg_overlap,
         full_iteration=_FULL_ITERATION,
         async_reduction=GTP_CONFIG.async_reduction,
         ring_size=GTP_CONFIG.graph_wgrad_ring_size,
@@ -425,12 +424,10 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
-    # Let a local CUDA graph release its successor before this graph's GTP reduce-scatter has
-    # finished. Disable to drain RS before graph completion.
-    cross_cg_overlap: bool = True
     # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
     # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
+    # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
 
 
@@ -465,7 +462,7 @@ def configure_gtp_remat_from_recipe(
     reduce_scatter_with_fp32_accumulation=False,
 ):
     """
-    Configure GTP weight-remat before model construction.
+    Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
     Must be called once BEFORE model construction.
     """
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
@@ -1573,11 +1570,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         Capture ownership is registered later, when the final RS input is selected.
         """
-        ring_slot = (
-            getattr(self, "_gtp_graph_wgrad_ring_slot", None)
-            if GTP_CONFIG.cross_cg_overlap
-            else None
-        )
+        ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)
         if ring_slot is not None:
             return self._gtp_graph_wgrad_ring_view
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
@@ -1667,8 +1660,6 @@ class GTPShardedParam(torch.nn.Parameter):
 
     def _record_graph_wgrad_ring_slots_ready(self) -> None:
         """Publish that this RS has finished reading its persistent input slots."""
-        if not GTP_CONFIG.cross_cg_overlap:
-            return
         seen = set()
         for weight in self._weights:
             slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
@@ -1834,11 +1825,7 @@ class GTPShardedParam(torch.nn.Parameter):
         """
         prepared = []
         for weight, wgrad in zip(self._weights, wgrads):
-            slot = (
-                getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
-                if GTP_CONFIG.cross_cg_overlap
-                else None
-            )
+            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
             if slot is None:
                 if weight.pad_length > 0:
                     wgrad = torch.nn.functional.pad(wgrad, (0, 0, 0, weight.pad_length))

@@ -115,7 +115,6 @@ _GRAPH_WGRAD_RINGS: dict[tuple, list[GraphWgradRingSlot]] = {}
 def allocate_graph_wgrad_rings(
     params: Iterable,
     *,
-    enabled: bool,
     full_iteration: bool,
     async_reduction: bool,
     ring_size: int,
@@ -127,7 +126,7 @@ def allocate_graph_wgrad_rings(
     Slots are shared across layers only within one communication scheduling domain. A two-slot
     ring retains one graph of overlap without allocating one full unsharded wgrad per layer.
     """
-    if not enabled or full_iteration or not async_reduction or _GRAPH_WGRAD_RINGS:
+    if full_iteration or not async_reduction or _GRAPH_WGRAD_RINGS:
         return
     if ring_size < 1:
         raise ValueError("GTP_CONFIG.graph_wgrad_ring_size must be at least 1")
