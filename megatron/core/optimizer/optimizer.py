@@ -1023,14 +1023,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # copies of float16 params and the native fp32 params, interleaved in the
         # original param-group order. Yield the model-side param for each inner
         # param in that order so the ids line up even when both kinds are present.
+        native_fp32_param_ids = {
+            id(param) for param in chain.from_iterable(self.fp32_from_fp32_groups)
+        }
+
         def model_params_in_optimizer_order():
-            for inner_group, float16_group, fp32_group in zip(
-                self.optimizer.param_groups, self.float16_groups, self.fp32_from_fp32_groups
-            ):
+            for inner_group, float16_group in zip(self.optimizer.param_groups, self.float16_groups):
                 float16_params = iter(float16_group)
-                fp32_param_ids = {id(param) for param in fp32_group}
                 for param in inner_group['params']:
-                    yield param if id(param) in fp32_param_ids else next(float16_params)
+                    yield (param if id(param) in native_fp32_param_ids else next(float16_params))
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, model_params_in_optimizer_order()
@@ -1042,17 +1043,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
         # State ids of the fp32 main copies only, skipping native fp32 params.
         float16_param_ids_per_group = []
-        for state_group, inner_group, fp32_group in zip(
-            state_dict['optimizer']['param_groups'],
-            self.optimizer.param_groups,
-            self.fp32_from_fp32_groups,
+        for state_group, inner_group in zip(
+            state_dict['optimizer']['param_groups'], self.optimizer.param_groups
         ):
-            fp32_param_ids = {id(param) for param in fp32_group}
             float16_param_ids_per_group.append(
                 [
                     param_id
                     for param_id, param in zip(state_group['params'], inner_group['params'])
-                    if id(param) not in fp32_param_ids
+                    if id(param) not in native_fp32_param_ids
                 ]
             )
         state_dict['fp32_from_fp16_params'] = [
