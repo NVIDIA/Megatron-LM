@@ -90,6 +90,7 @@ MODEL_ARGS:
   --moe-router-dtype: fp32
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-aux-loss-coeff: 1e-4
+  --moe-router-padding-for-quantization: true
   --moe-token-dispatcher-type: flex
   --moe-flex-dispatcher-backend: hybridep
   --moe-hybridep-num-sms: 32
@@ -106,12 +107,13 @@ MODEL_ARGS:
   # Mixed precision / quantization args
   --bf16: true
   --grad-reduce-in-bf16: true
-  --te-precision-config-file: /mnt/artifacts/model/nemotron3_super_release_gb200/te_quant.cfg
   --first-last-layers-bf16: true
   --num-layers-at-start-in-bf16: 0
   --num-layers-at-end-in-bf16: 14
-  --fp4-format: e2m1
-  --fp4-recipe: nvfp4
+  --fp8-format: e4m3
+  --fp8-recipe: mxfp8
+  --fp8-param-gather: true
+  --reuse-grad-buf-for-mxfp8-param-ag: true
 
   # Regularization args
   --attention-dropout: 0.0
