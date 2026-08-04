@@ -654,7 +654,8 @@ The feature applies only to **local/partial CUDA graphs** and is enabled by defa
 
 | Model / parallel configuration | CUDA-graph scope | Without overlap | With overlap | Gain |
 |---|---|---:|---:|---:|
-|  |  |  |  |  |
+| Half NT3 Ultra, L54; 256 GPUs; TP1GTP128EP64EGTP4DP2; MBS1 GBS256; MXFP8 | `mamba attn moe_router` | 989.9 TFLOP/s/GPU (1423.8 ms/iter) | 1023.6 TFLOP/s/GPU (1375.8 ms/iter) | +3.4% |
+| Half NT4 proxy, L76; 256 GPUs; TP2GTP64DP4EP64EGTP4; MBS1, GBS256; MXFP8 with BF16 RS | `mamba attn moe_router` | 995.2 TFLOP/s/GPU (3351.4 ms/iter) | 1063.3 TFLOP/s/GPU (3136.7 ms/iter) | +6.8% |
 
 ## 4. Testing
 
