@@ -58,8 +58,6 @@ class MoonEPProjectionBuffers:
     reduce_buffer: torch.Tensor
     num_global_experts: int
     master_parameters: List[torch.nn.Parameter] = field(default_factory=list)
-    master_weights: List[torch.Tensor] = field(default_factory=list)
-    master_main_grads: List[torch.Tensor] = field(default_factory=list)
 
     @property
     def source_weights(self) -> torch.Tensor:
@@ -348,8 +346,6 @@ class MoonEPManager:
             return
         for projection, linear in zip(layer_buffers.projections(), linear_modules):
             projection.master_parameters.clear()
-            projection.master_weights.clear()
-            projection.master_main_grads.clear()
             for index in range(self.num_local_master_experts):
                 param = getattr(linear, f"weight{index}")
                 main_grad = getattr(param, "main_grad", None)
@@ -363,8 +359,6 @@ class MoonEPManager:
                         "--accumulate-allreduce-grads-in-fp32."
                     )
                 projection.master_parameters.append(param)
-                projection.master_weights.append(param.data)
-                projection.master_main_grads.append(main_grad)
         layer_buffers.parameters_bound = True
 
     # ------------------------------------------------------------------
@@ -377,8 +371,10 @@ class MoonEPManager:
             raise RuntimeError("MoonEP master parameters are staged before they were bound.")
         for projection in layer_buffers.projections():
             local_rows = projection.source_weights[self.local_master_slice]
-            for index, weight in enumerate(projection.master_weights):
-                local_rows[index].copy_(weight)
+            # Read param.data live: the distributed optimizer re-points it on every
+            # overlapped parameter all-gather.
+            for index, param in enumerate(projection.master_parameters):
+                local_rows[index].copy_(param.data)
 
     def prefetch(self, layer_buffers: MoonEPLayerBuffers, plan: MoonEPCommPlan) -> None:
         """Copy the duplicated experts' weights from their home ranks into local slots."""
@@ -412,8 +408,8 @@ class MoonEPManager:
                 grid_sync_bar=ctx['grid_sync_bar'],
             )
             local_rows = projection.source_grads[self.local_master_slice]
-            for index, main_grad in enumerate(projection.master_main_grads):
-                main_grad.add_(local_rows[index])
+            for index, param in enumerate(projection.master_parameters):
+                param.main_grad.add_(local_rows[index])
         self.release_master_grads(layer_buffers)
 
     def release_master_grads(self, layer_buffers: MoonEPLayerBuffers) -> None:
