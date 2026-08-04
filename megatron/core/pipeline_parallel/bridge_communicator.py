@@ -14,11 +14,11 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 class CommRole(Enum):
     """Communication role for ranks in bridge communication.
 
-    SENDER: Leader tp-cp rank within each DP replica of source grid.
+    SENDER: Leader tp-cp rank within each data lane of source grid.
             Sends data to destination grid receivers.
-    RECEIVER: Leader tp-cp rank within each DP replica of destination grid.
+    RECEIVER: Leader tp-cp rank within each data lane of destination grid.
               Receives data from source grid senders.
-    MEMBER: Non-leader ranks within DP replicas.
+    MEMBER: Non-leader ranks within data lanes.
             Participate in broadcasts from their local leader.
     """
 
@@ -212,44 +212,48 @@ class BridgeCommunicator:
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
         """Get the leader rank for a given grid and direction.
 
-        We elect leader rank for each dp replica, the first tp-cp rank in the group
+        We elect one leader for each DP x GTP data lane, the first tp-cp rank in the group
         in the last pp stage (for src grid) or first pp stage (for dest grid) is the leader.
         """
         leader_ranks = []
         local_leader_rank = None
-        # grid.gen_rank_enum(["tp", "cp", "pp"]) # vary tp & cp, but same dp
+        # Vary model dimensions while holding data-like dimensions fixed. GTP ranks execute
+        # independent microbatches after rematerializing the same TP weight slice.
+        data_dims = {"dp", "gtp_remat"}
         # returns a list of sublists, each sublist is a group of ranks
-        # that have different tp & cp & pp, same dp
-        per_dp_replica_ranks = grid._gen_rank_enum([x for x in grid.dim_names if x != "dp"])
+        # that have different tp & cp & pp, same dp and gtp_remat
+        per_data_lane_ranks = grid._gen_rank_enum(
+            [dim for dim in grid.dim_names if dim not in data_dims]
+        )
         if is_src:
             # Add rank from last pp stage
             ranks = []
-            for group in per_dp_replica_ranks:
+            for group in per_data_lane_ranks:
                 if self.current_rank in group:
                     assert (
                         local_leader_rank is None
-                    ), "only one local leader rank is allowed per dp replica"
+                    ), "only one local leader rank is allowed per data lane"
                     local_leader_rank = group[-1]
                 ranks.append(group[-1])
             leader_ranks.extend(ranks)
         else:
             # Add rank from first pp stage
             ranks = []
-            for group in per_dp_replica_ranks:
+            for group in per_data_lane_ranks:
                 if self.current_rank in group:
                     assert (
                         local_leader_rank is None
-                    ), "only one local leader rank is allowed per dp replica"
+                    ), "only one local leader rank is allowed per data lane"
                     local_leader_rank = group[0]
                 ranks.append(group[0])
             leader_ranks.extend(ranks)
         return leader_ranks, local_leader_rank
 
     def get_boundary_pp_stage_ranks(self, grid: HyperCommGrid, is_src: bool):
-        """Get TP-CP ranks at boundary PP stage for each DP replica.
+        """Get TP-CP ranks at the boundary PP stage for each data lane.
 
         Returns ranks at the last PP stage (if src) or first PP stage (if dest)
-        for each DP dimension, ordered by DP dimension.
+        with the DP and GTP coordinates held fixed.
         """
 
         # Get tp-cp rank enumeration (each list has same dp and pp, different tp and cp)

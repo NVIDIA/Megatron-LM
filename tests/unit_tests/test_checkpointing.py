@@ -11,6 +11,7 @@ import torch.distributed.checkpoint
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.models.mimo.model import MimoModel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -23,6 +24,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
     get_checkpoint_tracker_filename,
     load_checkpoint,
     maybe_save_dataloader_state,
@@ -73,6 +75,22 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+def test_hybrid_checkpoint_matches_encoder_only_mimo_rank():
+    """An encoder-only MIMO rank identifies its uninstantiated hybrid language model."""
+    model = MimoModel.__new__(MimoModel)
+    torch.nn.Module.__init__(model)
+    model.language_model = None
+    model.mimo_config = SimpleNamespace(
+        language_model_spec=SimpleNamespace(params={'hybrid_layer_pattern': 'M*'})
+    )
+
+    assert _maybe_setup_gpt_to_hybrid_load(
+        SimpleNamespace(hybrid_layer_pattern='M*'),
+        SimpleNamespace(hybrid_layer_pattern='M*'),
+        [model],
+    ) == (None, False)
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):

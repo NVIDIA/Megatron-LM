@@ -992,6 +992,8 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
+    intra_dp_cp_group = kwargs.pop('intra_dp_cp_group', None)
+    intra_expt_dp_group = kwargs.pop('intra_expt_dp_group', None)
 
     prepend_axis_num = len(prepend_offsets)
 
@@ -1051,10 +1053,17 @@ def make_tp_sharded_tensor_for_checkpoint(
             else:
                 # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
                 new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
-            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas).
-            dp_replica_id = parallel_state.get_data_parallel_rank(
-                with_context_parallel=True, with_gtp_remat=False
-            )
+            # Elect the writer over the GTP-remat-excluded replica group. Explicit-grid
+            # callers cannot use MPU globals, and expert weights replicate over expert DP.
+            replica_group = intra_dp_cp_group
+            if not getattr(tensor, 'allreduce', True) and intra_expt_dp_group is not None:
+                replica_group = intra_expt_dp_group
+            if replica_group is not None:
+                dp_replica_id = get_pg_rank(replica_group)
+            else:
+                dp_replica_id = parallel_state.get_data_parallel_rank(
+                    with_context_parallel=True, with_gtp_remat=False
+                )
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):
                 kwargs.setdefault("allow_shape_mismatch", True)

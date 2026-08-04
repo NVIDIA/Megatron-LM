@@ -82,11 +82,12 @@ class ModalitySubmodules(ABC, nn.Module):
         parallel_state global fallback in ensure_metadata_has_dp_cp_group.
         """
         if self.pg_collection is not None:
-            assert (
-                hasattr(self.pg_collection, 'dp_cp') and self.pg_collection.dp_cp is not None
-            ), "pg_collection is missing dp_cp group"
+            dp_cp_group = self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+            assert dp_cp_group is not None, "pg_collection is missing a data-parallel group"
             metadata = dict(metadata) if metadata else {}
-            metadata['dp_cp_group'] = self.pg_collection.dp_cp
+            metadata['dp_cp_group'] = dp_cp_group
+            metadata['intra_dp_cp_group'] = self.pg_collection.dp_cp
+            metadata['intra_expt_dp_group'] = self.pg_collection.expt_dp
 
         sharded_sd = {}
         for name, container in self.named_children():
