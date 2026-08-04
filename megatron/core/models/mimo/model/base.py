@@ -98,6 +98,11 @@ class MimoModel(MegatronModule):
         self._initialize_submodules()
         self._initialize_language_model()
 
+    @property
+    def checkpoint_language_model_type(self) -> type[torch.nn.Module]:
+        """Language-model type used by checkpoint compatibility checks on every MIMO rank."""
+        return self.mimo_config.language_model_spec.module
+
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Build sharded state dict, bypassing parallel_state global fallbacks.
 
@@ -125,11 +130,14 @@ class MimoModel(MegatronModule):
                 pg = getattr(pg_src, 'pg_collection', None)
                 mod_metadata = metadata
                 if pg is not None:
-                    assert (
-                        hasattr(pg, 'dp_cp') and pg.dp_cp is not None
-                    ), f"pg_collection on '{name}' is missing dp_cp group"
+                    dp_cp_group = getattr(pg, 'dp_cp_gtp_remat', None) or pg.dp_cp
+                    assert dp_cp_group is not None, (
+                        f"pg_collection on '{name}' is missing a data-parallel group"
+                    )
                     mod_metadata = dict(metadata) if metadata else {}
-                    mod_metadata['dp_cp_group'] = pg.dp_cp
+                    mod_metadata['dp_cp_group'] = dp_cp_group
+                    mod_metadata['intra_dp_cp_group'] = pg.dp_cp
+                    mod_metadata['intra_expt_dp_group'] = getattr(pg, 'expt_dp', None)
                 # Unwrap wrappers so the sharded keys match the raw load_state_dict keys.
                 inner = module
                 child_prefix = f'{prefix}{name}.'

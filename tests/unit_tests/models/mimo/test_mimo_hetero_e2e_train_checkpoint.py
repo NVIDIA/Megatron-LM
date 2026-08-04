@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""End-to-end: the hetero MIMO 20L mock trains and round-trips a checkpoint.
+"""End-to-end: the hetero MIMO 20L GTP mock trains and round-trips a checkpoint.
 
 This drives the training launcher, which spawns its own 8-rank ``torch.distributed.run``,
 so it must run as a single plain pytest process (not under the multi-rank unit runner).
@@ -30,6 +30,10 @@ def _run_launcher(base, train_iters, extra_args, name):
         **os.environ,
         "TRAIN_ITERS": str(train_iters),
         "TORCHRUN_LOG_DIR": str(base / f"torchrun-{name}"),
+        "LLM_DP": "1",
+        "LLM_EP": "2",
+        "TENSOR_PARALLEL_NUM_WEIGHT_SHARDS": "4",
+        "EXPERT_TENSOR_PARALLEL_NUM_WEIGHT_SHARDS": "2",
     }
     # conftest's autouse set_env fixture disables TE flash/fused attention; the 20L model
     # at seq 8192 needs them (unfused attention OOMs), so let the launcher use TE defaults.
@@ -63,7 +67,7 @@ def _tail(result):
 @pytest.mark.skipif(
     _UNDER_TORCHRUN, reason="launcher spawns its own torchrun; run as a plain process"
 )
-def test_hetero_mimo_20l_trains_and_checkpoint_round_trips():
+def test_hetero_mimo_20l_gtp_trains_and_checkpoint_round_trips():
     # The 128-expert MoE checkpoint is large; save under the repo workspace (a roomy
     # shared filesystem on the cluster) rather than pytest's node-local /tmp tmp_path.
     scratch = Path(tempfile.mkdtemp(prefix="mimo_e2e_", dir=_REPO_ROOT))
