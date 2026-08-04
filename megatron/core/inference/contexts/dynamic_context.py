@@ -3106,15 +3106,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # Track prefix cache hits. num_cached_tokens accumulates across prefill
-        # chunks: each chunk matches a disjoint block range (start advances with
-        # finished_chunk_token_count), so a long cached prefix is discovered
-        # incrementally and must be summed, not overwritten.
-        if num_matched_blocks > 0:
-            self.prefix_cache_hits += 1
-            self.prefix_cache_blocks_matched += num_matched_blocks
-            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
-
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
 
@@ -3142,6 +3133,24 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
+
+        # Track prefix cache hits only after allocation succeeds. num_cached_tokens
+        # accumulates across successful prefill chunks; a failed admission can be
+        # retried and must not count the same cached prefix twice.
+        #
+        # `num_cached_tokens` counts tokens whose prefill was actually SKIPPED, not
+        # tokens matched. The two differ whenever `prefix_skip_tokens` is clamped
+        # below `num_matched_blocks * block_size_tokens` -- most commonly the ">= 2
+        # computed tokens" clamp, which fires on every fully cached repeat, and on
+        # hybrid models the Mamba back-off. Counting matches there overstates the
+        # saving by a whole block: a 2049-token prompt re-sent verbatim matches 8
+        # blocks but recomputes the 8th, so the honest figure is 1792, not 2048.
+        # This value is surfaced to clients as OpenAI's `usage.prompt_tokens_details
+        # .cached_tokens`, which is read as "prompt tokens served from cache".
+        if num_matched_blocks > 0:
+            self.prefix_cache_hits += 1
+            self.prefix_cache_blocks_matched += num_matched_blocks
+            req.num_cached_tokens += prefix_skip_tokens
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -3221,9 +3230,47 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = token_offset_range
+        # Tokens recomputed inside an already-matched block must not write to it.
+        # The block is shared with whatever request cached it, and a hash match
+        # guarantees it already holds the correct KV for exactly these tokens, so
+        # the recomputed values are redundant. Rewriting them anyway would perturb
+        # a concurrent reader's KV by the low bits (the same math under a different
+        # batch shape reduces in a different order), which is a needless source of
+        # run-to-run nondeterminism.
+        #
+        # Only the write mapping is redirected. `request_to_kv_block_ids` still
+        # points at the real block, so attention reads the cached values through
+        # the block table and nothing has to be restored after the chunk --
+        # `token_to_block_idx` is rebuilt from scratch every step.
+        #
+        # This region is non-empty whenever `prefix_skip_tokens` ends up below
+        # `num_matched_blocks * block_size_tokens`: via the ">= 2 computed tokens"
+        # clamp, via the Mamba back-off, or in memory-only hybrid mode where the
+        # skip is 0 but blocks are still shared for dedup.
         self.token_to_block_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
+        if num_matched_blocks > 0:
+            # The matched blocks occupy block indices
+            # [already_allocated_blocks, already_allocated_blocks + num_matched),
+            # i.e. token positions [matched_start_token, matched_end_token). This
+            # chunk's token positions are `effective_kv_offset + i`, so the tokens
+            # to redirect form the contiguous range [lo, hi) below.
+            #
+            # `lo` is only non-zero when `finished_chunk_token_count` is not
+            # block-aligned: `prefix_skip_tokens` is 0 there, so the chunk starts
+            # inside the request's own partial block from the previous chunk, whose
+            # KV nothing else holds and must not be discarded.
+            matched_start_token = already_allocated_blocks * self.block_size_tokens
+            matched_end_token = (
+                already_allocated_blocks + num_matched_blocks
+            ) * self.block_size_tokens
+            lo = max(0, matched_start_token - effective_kv_offset)
+            hi = min(effective_prefill_chunk_length, matched_end_token - effective_kv_offset)
+            if hi > lo:
+                self.token_to_block_idx[
+                    self.active_token_count + lo : self.active_token_count + hi
+                ] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = (token_offset_range % self.block_size_tokens)
