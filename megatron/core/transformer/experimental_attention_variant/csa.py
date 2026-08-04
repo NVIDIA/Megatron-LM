@@ -762,7 +762,6 @@ def _compute_unfused_csa_non_compressed_lse(
         q_flat = query.detach()
         kv_flat = kv_full.detach()
         global_indices = window_indices.to(dtype=torch.int64)
-        output_shape = (1, num_heads, total_q)
     else:
         raise ValueError(
             "non-compressed LSE query must be SBHD [sq, b, h, d] or "
@@ -798,7 +797,7 @@ def _compute_unfused_csa_non_compressed_lse(
 
     if query.ndim == 4:
         return lse_flat.reshape(batch_size, seqlen_q, num_heads).permute(0, 2, 1).contiguous()
-    return lse_flat.transpose(0, 1).unsqueeze(0).reshape(output_shape).contiguous()
+    return lse_flat.transpose(0, 1).unsqueeze(0).contiguous()
 
 
 def _unfused_indexer_sparse_attn_from_topk(
