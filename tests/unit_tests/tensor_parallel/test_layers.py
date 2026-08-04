@@ -2,7 +2,11 @@
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.layers import linear_with_frozen_weight
+from megatron.core.extensions.transformer_engine import te_general_gemm
+from megatron.core.tensor_parallel.layers import (
+    linear_with_frozen_weight,
+    linear_with_grad_accumulation_and_async_allreduce,
+)
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from tests.unit_tests.test_utilities import Utils
 
@@ -68,5 +72,42 @@ def test_LinearWithFrozenWeight_3d_input_matches_torch_linear():
 
     assert torch.allclose(actual, expected)
     assert torch.allclose(input_data.grad, expected_input.grad)
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
+    Utils.initialize_model_parallel(1, 1)
+
+    input_data = torch.randn(4, 3, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    reference_input = input_data.detach().clone().requires_grad_(True)
+    reference_weight = weight.detach().clone().requires_grad_(True)
+
+    output = linear_with_grad_accumulation_and_async_allreduce(
+        input_data,
+        weight,
+        None,
+        False,
+        False,
+        False,
+        tp_group=None,
+        output_dtype=torch.float32,
+    )
+    output.sum().backward()
+
+    reference_output = torch.nn.functional.linear(reference_input, reference_weight)
+    reference_output.sum().backward()
+    fp32_reference_output = torch.nn.functional.linear(input_data.detach().float(), weight.detach().float())
+
+    assert output.dtype == torch.float32
+    assert input_data.grad.dtype == torch.bfloat16
+    assert weight.grad.dtype == torch.bfloat16
+    assert torch.allclose(output, fp32_reference_output, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(input_data.grad, reference_input.grad)
+    assert torch.allclose(weight.grad, reference_weight.grad)
 
     Utils.destroy_model_parallel()
