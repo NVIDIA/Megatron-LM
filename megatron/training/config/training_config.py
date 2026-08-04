@@ -571,6 +571,24 @@ class CheckpointConfig:
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
+    strict_fsdp_dtensor_model_load: Literal[
+        "assume_ok_unexpected",
+        "log_unexpected",
+        "log_all",
+        "raise_unexpected",
+        "raise_all",
+        "return_unexpected",
+        "return_all",
+        "ignore_all",
+    ] = "raise_unexpected"
+    """Determine handling of model weights an FSDP DTensor partial load cannot supply.
+    Check StrictHandling docs for flags meaning. Only applies when strict_fsdp_dtensor_load is
+    False, where the underlying load would otherwise skip such weights silently and leave them
+    at their initialized values. Unlike strict_fsdp_dtensor_load this covers only the model
+    sections, so optimizer and RNG state that is intentionally absent does not trip it. Weights
+    the checkpoint holds but this rank does not need are always fine, as expected under
+    pipeline, tensor and expert parallelism. Ignored when finetune is set."""
+
     dist_ckpt_strictness: Literal[
         "assume_ok_unexpected",
         "log_unexpected",
