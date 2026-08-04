@@ -2396,8 +2396,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
-            if pg_collection is None:
-                pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            assert pg_collection is not None, (
+                "TEGroupedLinear requires an explicit pg_collection; "
+                "see docs/developer/parallel-state-deprecation.md"
+            )
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"
             tp_group = pg_collection.expt_tp
