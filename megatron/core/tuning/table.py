@@ -51,7 +51,7 @@ def _package_versions() -> dict:
     for name in ("mamba-ssm", "transformer-engine", "triton"):
         try:
             out[name] = metadata.version(name)
-        except Exception:
+        except metadata.PackageNotFoundError:
             pass
     return out
 
@@ -112,7 +112,7 @@ def load(arch: str, table_path=()) -> TunedTable:
         if not path.is_file():
             continue
         try:
-            with path.open() as handle:
+            with path.open(encoding="utf-8") as handle:
                 data = json.load(handle)
         except (OSError, ValueError) as exc:
             warnings.warn(f"Ignoring unreadable tuned table {path}: {exc}")
@@ -141,7 +141,7 @@ def merge_records(paths) -> dict:
         lambda: collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
     )
     for path in sorted(paths):
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             for arch, kernels in json.load(handle).items():
                 for kernel, entries in kernels.items():
                     for key, config in entries.items():
@@ -165,7 +165,7 @@ def disagreement_report(paths) -> dict:
     """
     votes: dict = collections.defaultdict(collections.Counter)
     for path in sorted(paths):
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             for arch, kernels in json.load(handle).items():
                 for kernel, entries in kernels.items():
                     for key, config in entries.items():
@@ -184,6 +184,6 @@ def write(arch: str, kernels: dict, path, source: str = "") -> None:
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as handle:
+    with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=1, sort_keys=True)
         handle.write("\n")

@@ -77,7 +77,7 @@ def _dump_records() -> None:
     rank = os.environ.get("RANK", "0")
     path = f"{_policy.record_path}.rank{rank}.json"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as handle:
+    with open(path, "w", encoding="utf-8") as handle:
         json.dump(_tune_records, handle, indent=1, sort_keys=True)
 
 

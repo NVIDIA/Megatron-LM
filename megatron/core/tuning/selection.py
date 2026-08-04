@@ -21,7 +21,9 @@ def arch_tag() -> str:
 
     try:
         major, minor = torch.cuda.get_device_capability()
-    except Exception:
+    except (AssertionError, RuntimeError):
+        # No CUDA device, or the driver is unavailable: the caller only needs a
+        # stable label, and "unknown" simply never matches a recorded table.
         return "unknown"
     return f"sm{major}{minor}"
 

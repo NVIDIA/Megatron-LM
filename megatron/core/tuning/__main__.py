@@ -12,46 +12,55 @@ import sys
 from megatron.core.tuning import table as table_mod
 
 
+def _out(message: str) -> None:
+    """Write one line to stdout (``print`` is a banned builtin in this repo)."""
+    sys.stdout.write(message + "\n")
+
+
+def _err(message: str) -> None:
+    """Write one line to stderr."""
+    sys.stderr.write(message + "\n")
+
+
 def _merge(args) -> int:
+    """Merge per-rank recordings into a single table file."""
     merged = table_mod.merge_records(args.records)
     if not merged:
-        print("no records found", file=sys.stderr)
+        _err("no records found")
         return 1
     if len(merged) > 1 and not args.arch:
-        print(f"records span several architectures {sorted(merged)}; pass --arch", file=sys.stderr)
+        _err(f"records span several architectures {sorted(merged)}; pass --arch")
         return 1
+
     arch = args.arch or next(iter(merged))
     kernels = merged[arch]
     disagreements = table_mod.disagreement_report(args.records)
     table_mod.write(arch, kernels, args.output, source=args.source)
-    print(
-        f"wrote {args.output}: {arch}, {len(kernels)} kernels, "
-        f"{sum(len(v) for v in kernels.values())} entries"
-    )
+
+    entries = sum(len(v) for v in kernels.values())
+    _out(f"wrote {args.output}: {arch}, {len(kernels)} kernels, {entries} entries")
     if disagreements:
-        print(
-            f"{len(disagreements)} entries had ranks disagreeing; the majority vote "
-            "resolved them, and that disagreement is the variance this table removes"
+        _out(
+            f"{len(disagreements)} entries had ranks disagreeing; the majority vote resolved "
+            "them, and that disagreement is the variance this table removes"
         )
     return 0
 
 
 def _report(args) -> int:
+    """Summarize recordings without writing a table."""
     merged = table_mod.merge_records(args.records)
+    if not merged:
+        _err("no records found")
+        return 1
     disagreements = table_mod.disagreement_report(args.records)
     for arch, kernels in sorted(merged.items()):
-        print(f"{arch}: {len(kernels)} kernels, {sum(len(v) for v in kernels.values())} entries")
+        entries = sum(len(v) for v in kernels.values())
+        _out(f"{arch}: {len(kernels)} kernels, {entries} entries")
         for kernel in sorted(kernels):
-            marks = [k for (a, kn, k) in disagreements if a == arch and kn == kernel]
-            note = (
-                f"  <- {len(marks)} entr{'y' if len(marks) == 1 else 'ies'} disagreed"
-                if marks
-                else ""
-            )
-            print(f"   {kernel}: {len(kernels[kernel])} entries{note}")
-    if not merged:
-        print("no records found", file=sys.stderr)
-        return 1
+            disagreed = sum(1 for (a, k, _) in disagreements if a == arch and k == kernel)
+            note = f"  <- {disagreed} disagreed across ranks" if disagreed else ""
+            _out(f"   {kernel}: {len(kernels[kernel])} entries{note}")
     return 0
 
 
