@@ -376,6 +376,11 @@ class DynamicInferenceEngine(AbstractEngine):
     def _poll_pending_kv_pushes(self) -> int:
         return 0
 
+    @property
+    def pending_kv_push_count(self) -> int:
+        """Number of prefill sends awaiting completion (none here)."""
+        return 0
+
     def add_request_with_kv_handoff(
         self, request_id, prompt, sampling_params, kv_meta, src_block_ids
     ) -> asyncio.Future[DynamicInferenceRequest]:
@@ -2884,10 +2889,12 @@ class DynamicInferenceEngine(AbstractEngine):
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
                                 or self.pending_kv_import_count > 0
+                                or self.pending_kv_push_count > 0
                             )
                         )
                     )
                 self._poll_pending_kv_imports()
+                self._poll_pending_kv_pushes()
                 if self.context.get_active_request_count() > 0 or self.waiting_request_ids:
                     await self.async_step()
                 else:

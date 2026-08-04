@@ -249,6 +249,8 @@ class KVBlockAllocator:
                 del self.pinned_blocks[block_id]
             else:
                 self.pinned_blocks[block_id] = pin_count - 1
+            # Prefix caching takes one allocator ref per pin, so every release
+            # decrements it. Without refcounts, only the final pin frees storage.
             if self.enable_prefix_caching or final_pin:
                 releasable.append(block_id)
 

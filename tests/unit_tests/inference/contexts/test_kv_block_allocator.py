@@ -245,6 +245,21 @@ def test_shared_pinned_block_releases_once_per_owner():
     assert 101 not in allocator.kv_hash_to_block_id
 
 
+def test_shared_pinned_block_without_prefix_caching_frees_on_final_release():
+    allocator = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
+    block = allocator.allocate_memory_blocks(1)
+    block_id = int(block[0])
+    initial_available = allocator.pool_avail
+
+    allocator.pin_memory_blocks([block_id])
+    allocator.pin_memory_blocks([block_id])
+
+    assert allocator.release_pinned_memory_blocks([block_id]) == 0
+    assert allocator.pool_avail == initial_available
+    assert allocator.release_pinned_memory_blocks([block_id]) == 1
+    assert allocator.pool_avail == initial_available + 1
+
+
 def test_reset_clears_pinned_block_ownership():
     allocator = KVBlockAllocator(_make_context(), pool_size=8, paused_limit=0)
     allocator.pin_memory_blocks([3])

@@ -13,8 +13,14 @@ import torch
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
-from megatron.core.inference.disaggregation.pending_handoff_imports import PendingKvImport
-from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.disaggregation.pending_handoff_imports import (
+    DeferredKvHandoff,
+    PendingKvImport,
+)
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    compute_block_hashes_batched,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -41,10 +47,15 @@ class _KvAllocator:
 
     def __init__(self):
         self.next_block = 10
+        self.capacity_available = True
         self.releases = []
         self.registered_parent_hashes = []
         self.block_ref_counts = torch.zeros(256, dtype=torch.int32)
         self.kv_hash_to_block_id = {}
+
+    def is_memory_available(self, _count, potential_matched_count=0):
+        assert potential_matched_count >= 0
+        return self.capacity_available
 
     def allocate_memory_blocks(self, count):
         blocks = torch.arange(self.next_block, self.next_block + count, dtype=torch.int32)
@@ -259,9 +270,12 @@ def test_capture_handoff_rejects_inconsistent_pipeline_metadata(
     engine._initialize_disaggregation_state()
     pp_group = object()
     engine.pg_collection = SimpleNamespace(pp=pp_group)
+    engine.context = SimpleNamespace(block_size_tokens=4)
     engine._kv_peer_metas = {"global_rank": 0}
     engine._release_pinned_handoff_blocks = mock.Mock(return_value=1)
-    request = SimpleNamespace(request_id=7, disaggregated_params=None)
+    request = SimpleNamespace(
+        request_id=7, prompt_tokens=torch.arange(4), disaggregated_params=None
+    )
 
     def gather_inconsistent_metadata(output, local_entry, group):
         assert group is pp_group
@@ -286,12 +300,50 @@ def test_capture_handoff_rejects_inconsistent_pipeline_metadata(
     engine._release_pinned_handoff_blocks.assert_called_once_with([10])
 
 
+@pytest.mark.parametrize(
+    ("prompt_tokens", "expected_blocks", "released_blocks"), [(10, [10, 11], [12]), (3, [], [10])]
+)
+def test_capture_handoff_keeps_only_complete_prompt_blocks(
+    prompt_tokens, expected_blocks, released_blocks
+):
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine.pg_collection = SimpleNamespace(pp=None)
+    engine.context = SimpleNamespace(block_size_tokens=4)
+    engine._kv_peer_metas = {"global_rank": 0}
+    engine._release_pinned_handoff_blocks = mock.Mock(return_value=len(released_blocks))
+    request = SimpleNamespace(
+        request_id=7, prompt_tokens=torch.arange(prompt_tokens), disaggregated_params=None
+    )
+
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size", return_value=1
+    ):
+        engine._capture_handoff_meta(request, [10, 11, 12][: len(expected_blocks) + 1])
+
+    assert request.disaggregated_params["block_ids"] == expected_blocks
+    assert engine._pinned_handoff_blocks[7] == expected_blocks
+    engine._release_pinned_handoff_blocks.assert_called_once_with(released_blocks)
+
+
+def test_handoff_metadata_survives_request_serialization():
+    metadata = {"request_id": 7, "block_ids": [10, 11], "kv_meta": {"transport": "nixl"}}
+    request = DynamicInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.arange(8),
+        sampling_params=SamplingParams(num_tokens_to_generate=0),
+        disaggregated_params=metadata,
+    )
+
+    restored = DynamicInferenceRequest.deserialize(request.serialize())
+
+    assert restored.disaggregated_params == metadata
+
+
 def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     prompt = [1] * 12
-    hashes = compute_block_hashes_batched(
-        torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
-    )
+    hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(2)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
     engine.context.kv_block_allocator.kv_hash_to_block_id.update(zip(hashes[:2], cached.tolist()))
@@ -311,12 +363,69 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine.context.kv_block_allocator.registered_parent_hashes == [hashes[1]]
 
 
+def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine.context.kv_block_allocator.capacity_available = False
+
+    future = engine.add_request_with_kv_handoff(
+        8, [1] * 8, SamplingParams(num_tokens_to_generate=2), {"request_id": 8}, [100, 101]
+    )
+
+    assert engine.pending_kv_import_count == 1
+    assert len(engine._deferred_kv_handoffs) == 1
+    assert not engine._pending_kv_imports
+    assert not engine._kv_transfer_agent.calls
+    assert not future.done()
+
+    engine.context.kv_block_allocator.capacity_available = True
+    engine._poll_pending_kv_imports()
+    _drain_loop(handoff_loop)
+
+    assert not engine._deferred_kv_handoffs
+    assert len(engine._pending_kv_imports) == 1
+    assert engine._kv_transfer_agent.calls == [({"request_id": 8}, [100, 101], [10, 11])]
+
+
+def test_handoff_submission_failure_is_agreed_across_model_parallel_ranks(
+    handoff_loop, monkeypatch
+):
+    engine = _HandoffHarness(handoff_loop)
+    engine.pg_collection.mp = object()
+    future = handoff_loop.create_future()
+    handoff = DeferredKvHandoff(
+        request_id=8,
+        prompt=[1] * 8,
+        sampling_params=SamplingParams(num_tokens_to_generate=2),
+        kv_meta={"request_id": 8},
+        src_block_ids=[100, 101],
+        hashes=compute_block_hashes_batched(torch.tensor([1] * 8), 4),
+        num_blocks=2,
+        future=future,
+    )
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def report_peer_start_failure(value, op, group):
+        if value.numel() == 1:
+            value.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", report_peer_start_failure)
+
+    with pytest.raises(RuntimeError, match="submission failed on a model-parallel peer"):
+        engine._try_start_kv_handoff_import(handoff)
+
+    assert isinstance(future.exception(), RuntimeError)
+    # The local receive may still be active, so its destination blocks cannot
+    # return to the allocator until the engine is restarted.
+    assert engine.context.kv_block_allocator.releases == []
+    assert not engine._pending_kv_imports
+
+
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     prompt = [2] * 12
-    hashes = compute_block_hashes_batched(
-        torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
-    )
+    hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
     engine.context.kv_block_allocator.release_memory_blocks(cached)
     engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
@@ -342,9 +451,7 @@ def test_nccl_handoff_does_not_filter_source_push(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._kv_transfer_agent.is_push = True
     prompt = [3] * 8
-    hashes = compute_block_hashes_batched(
-        torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
-    )
+    hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
     engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = 4
 
     engine.add_request_with_kv_handoff(

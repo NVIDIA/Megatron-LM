@@ -12,6 +12,20 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 
 @dataclass(kw_only=True)
+class DeferredKvHandoff:
+    """Decode handoff waiting for local KV-cache capacity."""
+
+    request_id: int
+    prompt: list
+    sampling_params: SamplingParams
+    kv_meta: dict
+    src_block_ids: List[int]
+    hashes: List[int]
+    num_blocks: int
+    future: asyncio.Future
+
+
+@dataclass(kw_only=True)
 class PendingKvImport:
     """Decode request waiting for an asynchronous KV-cache import."""
 

@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
-from megatron.core.inference.disaggregation.pending_handoff_imports import PendingKvImport
+from megatron.core.inference.disaggregation.pending_handoff_imports import (
+    DeferredKvHandoff,
+    PendingKvImport,
+)
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     construct_kv_transfer_backend_class,
 )
@@ -35,6 +38,7 @@ class InferenceStateHandoffMixin:
         self._pinned_handoff_blocks: Dict[int, list] = {}
         self._kv_transfer_agent = None
         self._kv_peer_metas = None
+        self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
         self._handoff_import_owners: Dict[int, list[int]] = {}
         self._pending_kv_pushes: list = []
@@ -43,7 +47,13 @@ class InferenceStateHandoffMixin:
     def pending_kv_import_count(self) -> int:
         """Number of decode requests waiting for capacity or transfer completion."""
 
-        return len(self._pending_kv_imports)
+        return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
+
+    @property
+    def pending_kv_push_count(self) -> int:
+        """Number of prefill sends waiting for transport completion."""
+
+        return len(self._pending_kv_pushes)
 
     def _reset_pending_kv_imports(self) -> None:
         """Drain and release pending handoff transfers before an engine reset."""
@@ -58,6 +68,12 @@ class InferenceStateHandoffMixin:
 
         if not hasattr(self, "_pending_kv_imports"):
             self._pending_kv_imports = deque()
+        if not hasattr(self, "_deferred_kv_handoffs"):
+            self._deferred_kv_handoffs = deque()
+        while self._deferred_kv_handoffs:
+            handoff = self._deferred_kv_handoffs.popleft()
+            if not handoff.future.done():
+                handoff.future.cancel()
         unsafe = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
@@ -117,6 +133,9 @@ class InferenceStateHandoffMixin:
 
     def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
         """Bring up the KV transfer agents for this engine.
+
+        This method must be called collectively by every model-parallel rank in
+        the engine because each rank participates in PP and TP metadata gathers.
 
         Args:
             role: "prefill" or "decode"; used to name the local transfer agent.
@@ -234,6 +253,15 @@ class InferenceStateHandoffMixin:
             raise RuntimeError("KV handoff requested before transfer setup")
         local_kv: Any = self._kv_peer_metas
 
+        # Prefix-cache entries must be immutable. The last prompt block is still
+        # writable when the prompt is not block-aligned, so hand off only complete
+        # prompt blocks and let decode recompute the bounded partial tail.
+        num_complete_blocks = len(request.prompt_tokens) // self.context.block_size_tokens
+        dropped_blocks = block_ids[num_complete_blocks:]
+        block_ids = block_ids[:num_complete_blocks]
+        if dropped_blocks:
+            self._release_pinned_handoff_blocks(dropped_blocks)
+
         pp_size = get_pg_size(self.pg_collection.pp)
         if pp_size > 1 and torch.distributed.is_initialized():
             local_entry = {"request_id": rid, "kv_meta": local_kv, "block_ids": list(block_ids)}
@@ -260,11 +288,10 @@ class InferenceStateHandoffMixin:
 
         if not block_ids:
             logging.warning(
-                "DISAGG_PREFILL_HANDOFF request_id=%d had no snapshot blocks "
-                "(controller missed the slot?); decode peer will receive empty handoff",
+                "DISAGG_PREFILL_HANDOFF request_id=%d has no complete prompt blocks; "
+                "decode will recompute the prompt tail",
                 rid,
             )
-            return
 
         self._pinned_handoff_blocks[rid] = list(block_ids)
 
@@ -303,7 +330,7 @@ class InferenceStateHandoffMixin:
         kv_meta: dict,
         src_block_ids: list,
     ) -> "asyncio.Future[DynamicInferenceRequest]":
-        """Start a KV-cache pull and return the request completion future."""
+        """Start or capacity-queue a KV pull and return its completion future."""
         from megatron.core.inference.inference_request import compute_block_hashes_batched
 
         allocator = self.context.kv_block_allocator
@@ -318,100 +345,114 @@ class InferenceStateHandoffMixin:
             raise RuntimeError("KV handoff received without a transfer backend")
 
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
-        hashes = compute_block_hashes_batched(
-            prompt_tensor, self.context.block_size_tokens, include_partial=True
-        )
+        hashes = compute_block_hashes_batched(prompt_tensor, self.context.block_size_tokens)
         num_blocks = transfer_block_count(kv_meta, src_block_ids)
         future = self._loop.create_future()
-        self._start_kv_handoff_import(
+        handoff = DeferredKvHandoff(
             request_id=request_id,
             prompt=prompt,
             sampling_params=sampling_params,
             kv_meta=kv_meta,
-            src_block_ids=src_block_ids,
+            src_block_ids=list(src_block_ids),
             hashes=hashes,
             num_blocks=num_blocks,
             future=future,
         )
+        if self._deferred_kv_handoffs or not self._try_start_kv_handoff_import(handoff):
+            self._deferred_kv_handoffs.append(handoff)
+            logging.debug(
+                "DISAGG_DECODE_CAPACITY_QUEUE request_id=%d queued=%d",
+                request_id,
+                len(self._deferred_kv_handoffs),
+            )
         return future
 
-    def _start_kv_handoff_import(
-        self,
-        request_id: int,
-        prompt: list,
-        sampling_params: "SamplingParams",
-        kv_meta: dict,
-        src_block_ids: list,
-        hashes: list[int],
-        num_blocks: int,
-        future: asyncio.Future,
-    ) -> None:
-        """Reserve destination blocks and start one KV-cache transfer."""
+    def _try_start_kv_handoff_import(self, handoff: DeferredKvHandoff) -> bool:
+        """Start one capacity-safe import, or return false without mutation."""
 
         allocator = self.context.kv_block_allocator
         cached_blocks = []
         if not getattr(self._kv_transfer_agent, "is_push", False):
-            cached_blocks = self._retain_cached_handoff_prefix(hashes, num_blocks)
+            cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, handoff.num_blocks)
 
-        num_blocks_to_import = num_blocks - len(cached_blocks)
+        num_blocks_to_import = handoff.num_blocks - len(cached_blocks)
+        if not self._handoff_capacity_available(num_blocks_to_import, cached_blocks):
+            return False
+
+        self._retain_handoff_blocks(cached_blocks)
         local_blocks_tensor = allocator.allocate_memory_blocks(num_blocks_to_import)
         if local_blocks_tensor is None:
             if cached_blocks:
                 allocator.release_memory_blocks(
                     torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
                 )
-            raise RuntimeError(
-                f"add_request_with_kv_handoff: OOM allocating {num_blocks_to_import} blocks"
-            )
+            raise RuntimeError("KV allocator capacity changed during handoff admission")
         imported_blocks = [int(block) for block in local_blocks_tensor.tolist()]
         local_blocks = cached_blocks + imported_blocks
         owned_blocks_tensor = torch.tensor(local_blocks, dtype=torch.int32, device="cpu")
 
         handle = None
+        start_error = None
         try:
             transfer_meta, transfer_src_blocks = drop_transfer_prefix_blocks(
-                kv_meta, src_block_ids, len(cached_blocks)
+                handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
             )
 
             handle = self._kv_transfer_agent.begin_pull_blocks(
                 transfer_meta, transfer_src_blocks, imported_blocks
             )
         except Exception as exc:
-            safe_to_release = getattr(exc, "transfer_destinations_safe", True)
-            safe_to_release &= self._wait_for_transfer_handles(handle)
+            start_error = exc
+
+        if not self._all_ranks_started_handoff(start_error is None):
+            # A peer may fail after this rank has posted a two-sided receive.
+            # Waiting here could block forever because its matching send may
+            # never be posted. Keep any potentially active destination blocks
+            # out of the allocator until the engine is restarted.
+            safe_to_release = handle is None and getattr(
+                start_error, "transfer_destinations_safe", True
+            )
             if safe_to_release:
                 allocator.release_memory_blocks(owned_blocks_tensor)
             else:
                 logging.error(
-                    "Quarantining KV blocks after a timed-out handoff submission: %s", local_blocks
+                    "Quarantining KV blocks after a failed handoff submission: %s", local_blocks
                 )
-            raise
+            error = start_error or RuntimeError(
+                "KV handoff submission failed on a model-parallel peer"
+            )
+            if not handoff.future.done():
+                handoff.future.set_exception(error)
+            raise error
 
         pending = PendingKvImport(
-            request_id=request_id,
-            prompt=prompt,
-            sampling_params=sampling_params,
+            request_id=handoff.request_id,
+            prompt=handoff.prompt,
+            sampling_params=handoff.sampling_params,
             local_blocks=local_blocks,
-            hashes=hashes,
-            hashes_to_register=max(0, min(num_blocks, len(hashes)) - len(cached_blocks)),
+            hashes=handoff.hashes,
+            hashes_to_register=max(
+                0, min(handoff.num_blocks, len(handoff.hashes)) - len(cached_blocks)
+            ),
             hash_registration_start=len(cached_blocks),
             handle=handle,
-            future=future,
+            future=handoff.future,
         )
         self._pending_kv_imports.append(pending)
         logging.debug(
             "DISAGG_DECODE_PULL_SUBMIT request_id=%d prompt_tokens=%d "
             "cached_blocks=%d imported_blocks=%d pending_imports=%d",
-            request_id,
-            len(prompt),
+            handoff.request_id,
+            len(handoff.prompt),
             len(cached_blocks),
             len(imported_blocks),
             len(self._pending_kv_imports),
         )
         self._loop.call_soon_threadsafe(self._loop.create_task, self._notify_cond_for_new_request())
+        return True
 
-    def _retain_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
-        """Retain the contiguous handoff prefix already cached on decode."""
+    def _find_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
+        """Find the contiguous handoff prefix already cached on decode."""
 
         allocator = self.context.kv_block_allocator
         cached_blocks = []
@@ -420,12 +461,81 @@ class InferenceStateHandoffMixin:
             if block_id is None:
                 break
             cached_blocks.append(int(block_id))
+        return cached_blocks
+
+    def _retain_handoff_blocks(self, cached_blocks: list[int]) -> None:
+        """Retain ready prefix blocks while an import enters the scheduler."""
 
         if cached_blocks:
+            allocator = self.context.kv_block_allocator
             block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
             allocator.block_ref_counts[block_tensor] += 1
             allocator.update_timestamps(block_tensor)
-        return cached_blocks
+
+    def _handoff_capacity_available(self, num_blocks: int, cached_blocks: list[int]) -> bool:
+        """Agree on KV capacity before any model-parallel rank mutates its allocator."""
+
+        allocator = self.context.kv_block_allocator
+        potential_matched_count = 0
+        if cached_blocks:
+            block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
+            potential_matched_count = int((allocator.block_ref_counts[block_tensor] == 0).sum())
+        local_available = allocator.is_memory_available(
+            num_blocks, potential_matched_count=potential_matched_count
+        )
+
+        mp_group = getattr(self.pg_collection, "mp", None)
+        world_size = (
+            torch.distributed.get_world_size(mp_group)
+            if (mp_group is not None and torch.distributed.is_initialized())
+            else 1
+        )
+        if world_size == 1:
+            return local_available
+
+        agreement = torch.tensor(
+            [num_blocks, -num_blocks, int(local_available)],
+            dtype=torch.int32,
+            device=self.context.memory_buffer.device,
+        )
+        torch.distributed.all_reduce(agreement, op=torch.distributed.ReduceOp.MIN, group=mp_group)
+        min_blocks, neg_max_blocks, all_available = agreement.tolist()
+        if min_blocks != -neg_max_blocks:
+            raise RuntimeError(
+                "Model-parallel ranks computed different KV handoff block counts "
+                f"(min={min_blocks}, max={-neg_max_blocks})"
+            )
+        return bool(all_available)
+
+    def _all_ranks_started_handoff(self, local_started: bool) -> bool:
+        """Agree that every model-parallel rank submitted its local transfer."""
+
+        mp_group = getattr(self.pg_collection, "mp", None)
+        world_size = (
+            torch.distributed.get_world_size(mp_group)
+            if (mp_group is not None and torch.distributed.is_initialized())
+            else 1
+        )
+        if world_size == 1:
+            return local_started
+
+        started = torch.tensor(
+            int(local_started), dtype=torch.int32, device=self.context.memory_buffer.device
+        )
+        torch.distributed.all_reduce(started, op=torch.distributed.ReduceOp.MIN, group=mp_group)
+        return bool(started.item())
+
+    def _drain_deferred_kv_handoffs(self) -> int:
+        """Start queued handoffs in FIFO order while the queue head fits."""
+
+        started = 0
+        while self._deferred_kv_handoffs:
+            handoff = self._deferred_kv_handoffs[0]
+            if not self._try_start_kv_handoff_import(handoff):
+                break
+            self._deferred_kv_handoffs.popleft()
+            started += 1
+        return started
 
     @staticmethod
     def _pending_transfer_handles(pending: PendingKvImport) -> list:
@@ -554,6 +664,7 @@ class InferenceStateHandoffMixin:
         return local
 
     def _poll_pending_kv_imports(self) -> int:
+        self._drain_deferred_kv_handoffs()
         if not self._pending_kv_imports:
             return 0
         admission = deque(self._admission_flags())
