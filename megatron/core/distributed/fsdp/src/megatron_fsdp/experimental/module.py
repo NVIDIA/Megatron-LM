@@ -63,13 +63,9 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
-    @property
-    def root_module(self) -> "FsdpModule":
-        """Return the root module while its FSDP context remains active."""
-        root_module = self._root_module()
-        if root_module is None:
-            raise RuntimeError("FSDP context outlived its root module.")
-        return root_module
+    def is_module_root(self, module: "FsdpModule") -> bool:
+        """Return whether ``module`` is this context's root module."""
+        return self._root_module() is module
 
     def register_post_backward_final_callback(self) -> None:
         """Register this root context's final callback for the current backward.
@@ -199,7 +195,7 @@ class FsdpModule:
 
     def is_root(self) -> bool:
         """Return whether this module is the outermost FsdpModule in its context."""
-        return self.context.root_module is self
+        return self.context.is_module_root(self)
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)

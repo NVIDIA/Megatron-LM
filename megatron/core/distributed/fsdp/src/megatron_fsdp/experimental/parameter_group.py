@@ -34,7 +34,9 @@ _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
     parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
-    return parameter_group_ref() if parameter_group_ref is not None else None
+    if parameter_group_ref is None:
+        return None
+    return parameter_group_ref()
 
 
 @dataclass(frozen=True, eq=False)
@@ -203,22 +205,17 @@ class FsdpParameterGroup:
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
-    @property
-    def owning_module(self) -> nn.Module:
-        """Return this group's module while it remains alive."""
-        owning_module = self._owning_module()
-        if owning_module is None:
-            raise RuntimeError("FSDP parameter group outlived its owning module.")
-        return owning_module
-
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
             return nullcontext()
         return torch.cuda.use_mem_pool(self._symm_mem_pool)
 
     def _set_module_parameter(self, fqns: tuple[str, ...], parameter: nn.Parameter) -> None:
+        owning_module = self._owning_module()
+        if owning_module is None:
+            raise RuntimeError("FSDP parameter group outlived its owning module.")
         for fqn in fqns:
-            module, parameter_name = _get_parameter_owner(self.owning_module, fqn)
+            module, parameter_name = _get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
     def _switch_to_sharded_parameters(self) -> None:

@@ -25,7 +25,7 @@ class IndexedOrder(Generic[T]):
     """Insertion order with weakly held items and successor lookup."""
 
     def __init__(self) -> None:
-        """Create an empty weak indexed order."""
+        """Create an empty indexed order."""
         self._items: list[ref[T]] = []
         self._index_by_item: WeakKeyDictionary[T, int] = WeakKeyDictionary()
 
