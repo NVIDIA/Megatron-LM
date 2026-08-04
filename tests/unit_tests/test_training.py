@@ -3,10 +3,12 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+from megatron.training import training as training_module
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
 from megatron.training.training import build_train_valid_test_data_iterators
@@ -79,6 +81,115 @@ class TestTraining:
                     vocab,
                     mult,
                 )
+
+    def test_first_iteration_loss_and_timer_reset_after_resume(self, monkeypatch):
+        args = create_test_args()
+        vars(args).update(
+            consumed_train_samples=1,
+            data_parallel_size=1,
+            dsa_indexer_loss_coeff=None,
+            log_energy=False,
+            log_memory_interval=None,
+            log_throughput=False,
+            log_timers_to_tensorboard=False,
+            micro_batch_size=1,
+            mtp_num_layers=None,
+            num_experts=None,
+            record_memory_history=False,
+            rl_use_sequence_packing=False,
+            seq_length=1,
+            skipped_train_samples=0,
+            timing_log_level=0,
+            world_size=1,
+        )
+        set_args(args)
+
+        timers = MagicMock()
+        timers('interval-time').elapsed.return_value = 1.0
+        monkeypatch.setattr(training_module, 'get_timers', lambda: timers)
+        monkeypatch.setattr(training_module, 'get_tensorboard_writer', lambda: None)
+        monkeypatch.setattr(training_module, 'get_wandb_writer', lambda: None)
+        monkeypatch.setattr(training_module, 'get_one_logger', lambda: None)
+        monkeypatch.setattr(training_module, 'get_energy_monitor', lambda: None)
+        monkeypatch.setattr(training_module, 'get_num_microbatches', lambda: 1)
+        monkeypatch.setattr(
+            training_module, 'reduce_max_stat_across_model_parallel_group', lambda value: value
+        )
+        monkeypatch.setattr(training_module, 'num_floating_point_operations', lambda *_: 1)
+        log_strings = []
+        monkeypatch.setattr(training_module, 'print_rank_last', log_strings.append)
+        monkeypatch.setattr(training_module.one_logger_utils, 'track_app_tag', lambda *_: None)
+        monkeypatch.setattr(training_module.one_logger_utils, 'track_e2e_metrics', lambda *_: None)
+
+        original_tensor = torch.tensor
+
+        def cpu_tensor(*tensor_args, **tensor_kwargs):
+            tensor_kwargs.pop('device', None)
+            return original_tensor(*tensor_args, **tensor_kwargs)
+
+        monkeypatch.setattr(training_module.torch, 'tensor', cpu_tensor)
+
+        for loaded_iteration, log_interval, expected_loss in (
+            (0, 10, 1.0),
+            (50, 1, 0.0),
+            (50, 10, 0.0),
+        ):
+            args.iteration = loaded_iteration
+            args.log_interval = log_interval
+            total_loss_dict = {}
+            timers.reset_mock()
+            timers('interval-time').elapsed.return_value = 1.0
+
+            training_module.training_log(
+                loss_dict={'lm loss': original_tensor([1.0])},
+                total_loss_dict=total_loss_dict,
+                learning_rate=1e-4,
+                iteration=loaded_iteration + 1,
+                loss_scale=1.0,
+                report_memory_flag=False,
+                skipped_iter=0,
+                grad_norm=None,
+                params_norm=None,
+                num_zeros_in_grad=None,
+                max_attention_logit=None,
+                is_first_iteration=True,
+            )
+
+            assert total_loss_dict['lm loss'].item() == expected_loss
+            assert total_loss_dict['advanced iterations'] == int(loaded_iteration == 0)
+            timers('interval-time').elapsed.assert_called_once_with(barrier=True, reset=False)
+            timers.log.assert_called_once_with([], normalizer=1, reset=False)
+
+        args.iteration = 50
+        args.log_interval = 10
+        total_loss_dict = {}
+        log_strings.clear()
+        timers.reset_mock()
+        timers('interval-time').elapsed.side_effect = [1.0, 10.0]
+
+        for iteration in range(51, 61):
+            training_module.training_log(
+                loss_dict={'lm loss': original_tensor([1.0])},
+                total_loss_dict=total_loss_dict,
+                learning_rate=1e-4,
+                iteration=iteration,
+                loss_scale=1.0,
+                report_memory_flag=False,
+                skipped_iter=0,
+                grad_norm=None,
+                params_norm=None,
+                num_zeros_in_grad=None,
+                max_attention_logit=None,
+                is_first_iteration=iteration == 51,
+            )
+
+        assert 'elapsed time per iteration (ms): 1000.0' in log_strings[-1]
+        assert 'lm loss: 1.000000E+00' in log_strings[-1]
+        assert 'timer iterations' not in log_strings[-1]
+        assert [
+            call.kwargs['reset'] for call in timers('interval-time').elapsed.call_args_list
+        ] == [False, True]
+        assert [call.kwargs['normalizer'] for call in timers.log.call_args_list] == [1, 10]
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
