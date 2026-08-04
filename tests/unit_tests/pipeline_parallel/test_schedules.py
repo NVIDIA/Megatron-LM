@@ -108,6 +108,18 @@ def test_deallocate_output_tensor():
     assert out.nelement() == 6
 
 
+def test_deallocate_output_tensor_view_supports_custom_backward():
+    base = torch.arange(6.0, requires_grad=True)
+    out = base.view(2, 3)
+    assert out._base is base
+
+    schedule.deallocate_output_tensor(out, deallocate_pipeline_outputs=True)
+
+    assert out.numel() == 1
+    schedule.custom_backward(out, torch.ones(2, 3))
+    torch.testing.assert_close(base.grad, torch.ones_like(base))
+
+
 @contextmanager
 def _no_sync():
     yield
