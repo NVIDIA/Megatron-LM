@@ -24,7 +24,11 @@ def _err(message: str) -> None:
 
 def _merge(args) -> int:
     """Merge per-rank recordings into a single table file."""
-    merged = table_mod.merge_records(args.records)
+    try:
+        merged = table_mod.merge_records(args.records)
+    except OSError as exc:
+        _err(f"cannot read recordings: {exc}")
+        return 1
     if not merged:
         _err("no records found")
         return 1
@@ -49,7 +53,11 @@ def _merge(args) -> int:
 
 def _report(args) -> int:
     """Summarize recordings without writing a table."""
-    merged = table_mod.merge_records(args.records)
+    try:
+        merged = table_mod.merge_records(args.records)
+    except OSError as exc:
+        _err(f"cannot read recordings: {exc}")
+        return 1
     if not merged:
         _err("no records found")
         return 1
