@@ -100,6 +100,8 @@ def make_sharded_tensors_for_checkpoint(
     extra_state_suffix: str = '_extra_state',
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    intra_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    intra_expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
 
@@ -122,6 +124,10 @@ def make_sharded_tensors_for_checkpoint(
         dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
             with context parallel. If None, defaults to
             parallel_state.get_data_parallel_group(with_context_parallel=True)
+        intra_dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): GTP-excluded
+            dense replica group used for checkpoint writer election.
+        intra_expt_dp_group (Optional[torch.distributed.ProcessGroup], optional): GTP-excluded
+            expert replica group used for expert checkpoint writer election.
 
     """
 
@@ -152,6 +158,8 @@ def make_sharded_tensors_for_checkpoint(
                 extra_state_suffix=extra_state_suffix,
                 tp_group=tp_group,
                 dp_cp_group=dp_cp_group,
+                intra_dp_cp_group=intra_dp_cp_group,
+                intra_expt_dp_group=intra_expt_dp_group,
             )
 
     sharded_state_dict = {}
@@ -292,6 +300,8 @@ def sharded_state_dict_default(
             sharded_offsets,
             tp_group=tp_group,
             dp_cp_group=metadata['dp_cp_group'],
+            intra_dp_cp_group=metadata.get('intra_dp_cp_group'),
+            intra_expt_dp_group=metadata.get('intra_expt_dp_group'),
         )
     return module_sharded_sd
 

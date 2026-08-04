@@ -128,6 +128,8 @@ class ExtendedRMSNorm(RMSNormGated):
             sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+            intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
         )
 
 
@@ -1430,6 +1432,8 @@ class MambaMixer(MegatronModule):
             sharded_offsets=sharded_offsets,
             tp_group=self.tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+            intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
         )
         # Submodules
         for name, module in self.named_children():
@@ -1481,6 +1485,8 @@ class MambaMixer(MegatronModule):
                 prepend_offsets=sharded_offsets,
                 tp_group=self.tp_group,
                 dp_cp_group=metadata['dp_cp_group'],
+                intra_dp_cp_group=metadata.get('intra_dp_cp_group'),
+                intra_expt_dp_group=metadata.get('intra_expt_dp_group'),
             )
 
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (

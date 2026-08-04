@@ -2055,6 +2055,11 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         while module is not None:
             if isinstance(module, HybridModel):
                 return True
+            language_model_type = getattr(module, 'checkpoint_language_model_type', None)
+            if isinstance(language_model_type, type) and issubclass(
+                language_model_type, HybridModel
+            ):
+                return True
             module = getattr(module, 'module', None)
         return False
 
