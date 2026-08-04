@@ -209,8 +209,6 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
     """Activation recomputation should leave every FSDP module resharded."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
