@@ -26,8 +26,12 @@ and stash capacities. If either capacity overflows, training fails immediately i
 attempting the dynamic rerun; increase the corresponding capacity factor and restart the job.
 
 Transformer Engine warmup and graph capture both replay the previously recorded paged-stash
-schedule, preserving the training layer, microbatch, and virtual-pipeline coordinates. This mode
-requires a Transformer Engine version whose ordered warmup follows the real pipeline schedule.
+layer templates, preserving the training layer, microbatch, and virtual-pipeline coordinates. The
+runtime paged-stash schedule remains unchanged. Graph capture temporarily expands Transformer
+Engine's final `_order` (which may use a larger dynamic-CP slot upper bound) into a capture-only
+schedule and restores the recorded runtime schedule afterward. This mode requires a Transformer
+Engine version whose ordered warmup follows `_order`; it does not use per-callable cursor hooks.
+The stash/reload kernels remain inside their corresponding CUDA graphs.
 Each per-layer graph joins the stash and reload work it launched on the auxiliary stream before
 its capture ends because CUDA stream dependencies cannot cross independent capture boundaries.
 
