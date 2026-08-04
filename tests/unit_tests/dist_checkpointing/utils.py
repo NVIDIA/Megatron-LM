@@ -185,6 +185,11 @@ def setup_model_and_optimizer(
     dist_opt=True,
     optimizer='adam',
     use_param_layout=False,
+    chunked_optimizer_state_offload=False,
+    optimizer_state_offload_chunk_size_mb=0,
+    optimizer_state_offload_fraction=1.0,
+    use_precision_aware_optimizer=False,
+    initialize_optimizer_state=True,
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -226,6 +231,10 @@ def setup_model_and_optimizer(
         use_distributed_optimizer=ddp_use_dist_opt,
         use_layer_wise_distributed_optimizer=use_layer_wise,
         optimizer=optimizer,
+        chunked_optimizer_state_offload=chunked_optimizer_state_offload,
+        optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
+        optimizer_state_offload_fraction=optimizer_state_offload_fraction,
+        use_precision_aware_optimizer=use_precision_aware_optimizer,
     )
 
     if optimizer_type in ('muon', 'dist_muon'):
@@ -250,18 +259,21 @@ def setup_model_and_optimizer(
         if not hasattr(optimizer, 'optimizer'):
             optimizer.init_state_fn(optimizer)
         else:
-            optimizer.init_state_fn(optimizer.optimizer)
+            optimizer.init_state_fn(optimizer.optimizer, optimizer.config)
 
-    if isinstance(optimizer, ChainedOptimizer):
-        _init_states(optimizer)
-    else:
-        for group in optimizer.optimizer.param_groups:
-            for p in group['params']:
-                if len(optimizer.optimizer.state[p]) == 0:
-                    optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if initialize_optimizer_state:
+        if isinstance(optimizer, ChainedOptimizer):
+            _init_states(optimizer)
+        else:
+            for group in optimizer.optimizer.param_groups:
+                for p in group['params']:
+                    if len(optimizer.optimizer.state[p]) == 0:
+                        optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
+                        optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
+    if chunked_optimizer_state_offload:
+        optimizer.offload_optimizer_state_for_forward()
     CachedMetadataFileSystemReader.clear_metadata_cache()
     return unwrap_model(model), optimizer
 

@@ -220,6 +220,7 @@ class TestFP8Param:
         fp8_param_gather: bool = True,
         use_cuda_graph: bool = False,
         eval_transition: bool = False,
+        num_steps: int = 100,
         **kwargs,
     ):
         """Test fp8_param with a small GPT model."""
@@ -331,9 +332,19 @@ class TestFP8Param:
 
         loss_list = []
         eval_loss_list = []
+        delay_master_offload = (
+            not inference
+            and args.chunked_optimizer_state_offload
+            and args.reuse_grad_buf_for_mxfp8_param_ag
+            and args.overlap_param_gather
+        )
 
-        for i in range(100):
+        for i in range(num_steps):
             if not inference:
+                if args.chunked_optimizer_state_offload:
+                    optimizer.offload_optimizer_state_for_forward(
+                        offload_master=not delay_master_offload
+                    )
                 gpt_model[0].zero_grad_buffer()
                 optimizer.zero_grad()
 
@@ -352,7 +363,11 @@ class TestFP8Param:
             # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
             # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
             if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                # Each DistOpt staging entry restores its own offloaded master window.
                 self.copy_main_params_to_param_buffer(gpt_model, optimizer)
+
+            if delay_master_offload:
+                optimizer.offload_optimizer_state_for_forward()
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -380,6 +395,8 @@ class TestFP8Param:
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
 
+            if args.chunked_optimizer_state_offload:
+                optimizer.prefetch_optimizer_state_for_gradient_finalization()
             update_successful, _, _ = optimizer.step()
             assert update_successful
 
@@ -394,6 +411,29 @@ class TestFP8Param:
                         (input_ids, labels, position_ids, attention_mask, loss_mask),
                     )
                 )
+
+        if not inference and args.chunked_optimizer_state_offload:
+            optimizer.offload_optimizer_state_for_forward()
+            managers = [
+                child._optimizer_state_offloader
+                for child in optimizer.chained_optimizers
+                if child._optimizer_state_offloader is not None
+            ]
+            assert managers
+            for manager in managers:
+                for param in manager.selected_params:
+                    for value in manager.optimizer.state[param].values():
+                        if isinstance(value, torch.Tensor) and value.numel() == param.numel():
+                            assert value.device.type == 'cpu'
+            assert any(
+                param.device.type == 'cpu'
+                or (
+                    isinstance(manager.optimizer.state[param].get('master_param'), torch.Tensor)
+                    and manager.optimizer.state[param]['master_param'].device.type == 'cpu'
+                )
+                for manager in managers
+                for param in manager.selected_params
+            )
 
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
             self.cuda_graph_helper.delete_cuda_graphs()
@@ -437,6 +477,61 @@ class TestFP8Param:
         )
         torch.testing.assert_close(loss, loss_ref, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(eval_loss, eval_loss_ref, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("recipe", ["blockwise", "mxfp8"])
+    def test_chunked_optimizer_state_offload(self, recipe):
+        """Adam DistOpt keeps FP8-gather updates equivalent while state/master are offloaded."""
+
+        arch = get_device_arch_version()
+        if recipe == "blockwise" and arch != 9:
+            pytest.skip("blockwise FP8 is Hopper-only")
+        if recipe == "mxfp8" and arch < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+
+        common = dict(overlap_param_gather=True, overlap_grad_reduce=True, num_steps=3)
+        offloaded = self._run_test_helper(
+            1,
+            recipe,
+            fp8_param_gather=True,
+            chunked_optimizer_state_offload=True,
+            optimizer_state_offload_chunk_size_mb=1,
+            optimizer_state_offload_fraction=1.0,
+            ckpt_format='torch_dist',
+            **common,
+        )
+        reference = self._run_test_helper(1, recipe, fp8_param_gather=True, **common)
+        torch.testing.assert_close(offloaded, reference, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_precision_aware_mxfp8_chunked_optimizer_state_offload(self):
+        """Precision-aware FusedAdam masters and moments remain CPU canonical with MXFP8."""
+
+        if get_device_arch_version() < 10:
+            pytest.skip("mxfp8 requires Blackwell architecture or newer")
+
+        common = dict(
+            overlap_param_gather=True,
+            overlap_grad_reduce=True,
+            num_steps=3,
+            use_precision_aware_optimizer=True,
+            exp_avg_dtype='bf16',
+            exp_avg_sq_dtype='bf16',
+        )
+        offloaded = self._run_test_helper(
+            1,
+            "mxfp8",
+            fp8_param_gather=True,
+            chunked_optimizer_state_offload=True,
+            optimizer_state_offload_chunk_size_mb=1,
+            optimizer_state_offload_fraction=1.0,
+            ckpt_format='torch_dist',
+            **common,
+        )
+        reference = self._run_test_helper(1, "mxfp8", fp8_param_gather=True, **common)
+        torch.testing.assert_close(offloaded, reference, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.parametrize("tp_size", [2])

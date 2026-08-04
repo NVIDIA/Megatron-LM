@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,7 +11,7 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -59,6 +60,124 @@ class TinyModel(nn.Module):
         return self.fc1(x)
 
 
+def test_layerwise_step_hook_is_noop_without_chunked_offload():
+    """Disabled offload must not inspect child-only manager attributes or rebuild pipeline state."""
+
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(chunked_optimizer_state_offload=False), chained_optimizers=[object()]
+    )
+
+    assert (
+        LayerWiseDistributedOptimizer._managed_optimizer_state_offload_child_indices(optimizer)
+        == ()
+    )
+    LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
+
+
+def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeypatch):
+    """A zero fraction must bypass Muon schema inspection and offloader construction."""
+
+    class FakeWrappedOptimizer:
+        def __init__(self, optimizer, config, grad_scaler, init_state_fn):
+            self.optimizer = optimizer
+            self.config = config
+            self._optimizer_state_offloader = None
+
+    def fake_shard_params(self, optimizers, full_param_layouts=None, model_chunks=None):
+        self.dp_cp_params_list = []
+        self.expt_dp_params_list = []
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.layer_wise_optimizer.Float16OptimizerWithFloat16Params",
+        FakeWrappedOptimizer,
+    )
+    monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
+    config = SimpleNamespace(
+        bf16=True,
+        chunked_optimizer_state_offload=True,
+        optimizer_state_offload_fraction=0.0,
+        overlap_param_gather=False,
+        use_layer_wise_param_layout=False,
+    )
+
+    optimizer = LayerWiseDistributedOptimizer([object()], config)
+
+    assert optimizer._managed_optimizer_state_offload_child_indices() == ()
+    LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
+
+
+def test_layerwise_param_sync_subset_excludes_distopt_buckets():
+    """Forced pre-forward sync must leave sibling DistributedOptimizer buckets untouched."""
+
+    layerwise_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=True)
+    distopt_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=False)
+    layerwise_group = SimpleNamespace(buckets=[SimpleNamespace(params_list=[layerwise_param])])
+    distopt_group = SimpleNamespace(buckets=[SimpleNamespace(params_list=[distopt_param])])
+    calls = []
+    model_chunk = SimpleNamespace(
+        bucket_groups=[layerwise_group, distopt_group],
+        expert_parallel_bucket_groups=[],
+        _start_bucket_group_param_sync=lambda group, force_sync: calls.append((group, force_sync)),
+    )
+    optimizer = SimpleNamespace(model_chunks=[model_chunk])
+
+    LayerWiseDistributedOptimizer.start_param_sync_for_bucket_group_subset(
+        optimizer, force_sync=True
+    )
+
+    assert calls == [(layerwise_group, True)]
+
+
+def test_outer_chain_only_syncs_children_requiring_master_before_offload():
+    calls = []
+
+    def child(name, requires_sync):
+        return SimpleNamespace(
+            optimizer_state_offload_requires_pre_forward_param_sync=lambda: requires_sync,
+            start_param_sync_for_bucket_group_subset=lambda force_sync: calls.append(
+                (name, force_sync)
+            ),
+        )
+
+    optimizer = SimpleNamespace(
+        chained_optimizers=[child("layerwise", True), child("distopt", False)]
+    )
+    ChainedOptimizer.start_param_sync_for_bucket_group_subset(optimizer, force_sync=True)
+    assert calls == [("layerwise", True)]
+
+
+def test_layerwise_pipelines_child_state_prefetch():
+    """LayerWise overlaps the first managed child, then uses the base chained step hook."""
+
+    events = []
+
+    def child(name, managed):
+        return SimpleNamespace(
+            _optimizer_state_offloader=object() if managed else None,
+            prefetch_optimizer_master_weights_for_step=lambda: events.append(f"master:{name}"),
+            prefetch_optimizer_state_for_step=lambda: events.append(f"state:{name}"),
+            step_with_ready_grads=lambda: events.append(f"step:{name}") or True,
+        )
+
+    children = [child("a", True), child("b", False), child("c", True)]
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.chained_optimizers = children
+    optimizer.config = SimpleNamespace(
+        chunked_optimizer_state_offload=True,
+        optimizer_state_offload_fraction=1.0,
+        overlap_param_gather_with_optimizer_step=False,
+    )
+    optimizer._managed_optimizer_state_offload_indices = (0, 2)
+    optimizer._next_managed_optimizer_state_offload_index = {0: 2}
+
+    optimizer.prefetch_optimizer_state_for_gradient_finalization()
+    assert events == ["master:a", "master:b", "master:c", "state:a"]
+
+    events.clear()
+    assert optimizer._step()
+    assert events == ["state:a", "state:c", "step:a", "step:b", "step:c"]
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
@@ -82,6 +201,9 @@ class TestLayerWiseOptimizer:
         use_layer_wise=True,
         copy_from=None,
         use_param_layout=False,
+        chunked_optimizer_state_offload=False,
+        optimizer_state_offload_chunk_size_mb=0,
+        optimizer_state_offload_fraction=1.0,
     ):
         """Create model, DDP wrapper, and optimizer.
 
@@ -135,6 +257,9 @@ class TestLayerWiseOptimizer:
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
+            chunked_optimizer_state_offload=chunked_optimizer_state_offload,
+            optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
+            optimizer_state_offload_fraction=optimizer_state_offload_fraction,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -298,6 +423,95 @@ class TestLayerWiseOptimizer:
                         raise AssertionError(
                             f"Parameter {name} differs between rank 0 and rank {i}. {str(e)}"
                         ) from None
+
+    def test_compact_muon_chunked_state_and_master_offload(self):
+        """Compact-layout Muon updates whole tensors while state and masters live on CPU."""
+
+        model, optimizer, _ = self.create_model_and_optimizer(
+            use_param_layout=True,
+            chunked_optimizer_state_offload=True,
+            optimizer_state_offload_chunk_size_mb=1,
+        )
+        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
+            use_param_layout=True, copy_from=model
+        )
+
+        managed_children = [
+            child
+            for child in optimizer.chained_optimizers
+            if child._optimizer_state_offloader is not None
+        ]
+        assert managed_children
+        assert (
+            len({id(child._optimizer_state_offloader._d2h_stream) for child in managed_children})
+            == 1
+        )
+        assert (
+            len({id(child._optimizer_state_offloader._h2d_stream) for child in managed_children})
+            == 1
+        )
+
+        optimizer.offload_optimizer_state_for_forward()
+        optimizer.zero_grad()
+
+        for child in managed_children:
+            manager = child._optimizer_state_offloader
+            for param in manager.selected_params:
+                if any(
+                    id(param) == id(master)
+                    for group in child.fp32_from_float16_groups
+                    for master in group
+                ):
+                    assert param.device.type == 'cpu'
+
+        inputs = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        model(inputs).sum().backward()
+        optimizer.prefetch_optimizer_state_for_gradient_finalization()
+        assert optimizer.step()[0]
+
+        reference_model(inputs).sum().backward()
+        assert reference_optimizer.step()[0]
+
+        optimizer.offload_optimizer_state_for_forward()
+        for child in managed_children:
+            manager = child._optimizer_state_offloader
+            for param in manager.selected_params:
+                for value in manager.optimizer.state[param].values():
+                    if isinstance(value, torch.Tensor) and value.numel() == param.numel():
+                        assert value.device.type == 'cpu'
+                if any(
+                    id(param) == id(master)
+                    for group in child.fp32_from_float16_groups
+                    for master in group
+                ):
+                    assert param.device.type == 'cpu'
+
+        for offloaded_param, reference_param in zip(
+            model.parameters(), reference_model.parameters()
+        ):
+            torch.testing.assert_close(offloaded_param, reference_param, rtol=1e-4, atol=1e-5)
+
+    def test_split_layerwise_and_distopt_share_offload_streams(self):
+        """Muon children and sibling Adam DistOpt serialize copies on one stream pair."""
+
+        _, optimizer, _ = self.create_model_and_optimizer(
+            use_param_layout=True,
+            chunked_optimizer_state_offload=True,
+            optimizer_state_offload_chunk_size_mb=1,
+        )
+        managers = []
+
+        def collect(current_optimizer):
+            manager = getattr(current_optimizer, '_optimizer_state_offloader', None)
+            if manager is not None:
+                managers.append(manager)
+            for child in getattr(current_optimizer, 'chained_optimizers', ()):
+                collect(child)
+
+        collect(optimizer)
+        assert len(managers) >= 2
+        assert len({id(manager.transfer_streams[0]) for manager in managers}) == 1
+        assert len({id(manager.transfer_streams[1]) for manager in managers}) == 1
 
     def test_get_grad_norm(self):
         """Test LayerWiseDistributedOptimizer gradient norm computation."""

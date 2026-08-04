@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -368,11 +369,21 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    chunked_optimizer_state_offload: bool = False
+    """Keep selected optimizer tensor states and master weights on CPU between updates."""
+
+    optimizer_state_offload_chunk_size_mb: int = 0
+    """Target GPU staging-window size for optimizer tensor state, in MiB.
+
+    Zero restores all selected tensor state together. Master weights are restored in one full
+    window and are not bounded by this value.
+    """
+
+    optimizer_state_offload_fraction: float = 1.0
+    """Fraction of optimizer parameter bundles whose state and master weights are offloaded."""
+
     offload_optimizer_states: bool = False
-    """
-    If True, offload optimizer states to CPU after each optimizer step and
-    reload them before the next optimizer step.
-    """
+    """Deprecated alias for :attr:`chunked_optimizer_state_offload`."""
 
     ################
     # Miscellaneous
@@ -404,6 +415,62 @@ class OptimizerConfig:
     def __post_init__(self):
         """Check the validity of the config."""
 
+        used_deprecated_optimizer_state_offload = self.offload_optimizer_states
+        if self.offload_optimizer_states:
+            warnings.warn(
+                "offload_optimizer_states is deprecated; use "
+                "chunked_optimizer_state_offload instead. The deprecated option now enables "
+                "the replacement with its legacy-equivalent defaults: chunk size 0 and "
+                "offload fraction 1.0 unless those settings were explicitly changed.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            self.chunked_optimizer_state_offload = True
+            self.offload_optimizer_states = False
+
+        assert (
+            self.optimizer_state_offload_chunk_size_mb >= 0
+        ), "optimizer_state_offload_chunk_size_mb must be non-negative"
+        assert (
+            0.0 <= self.optimizer_state_offload_fraction <= 1.0
+        ), "optimizer_state_offload_fraction must be in [0.0, 1.0]"
+
+        if self.chunked_optimizer_state_offload and self.optimizer_state_offload_fraction > 0.0:
+            if used_deprecated_optimizer_state_offload:
+                assert self.optimizer == 'adam', (
+                    "the deprecated --offload-optimizer-states alias currently supports only "
+                    "Adam; use --chunked-optimizer-state-offload for supported Muon offload"
+                )
+            else:
+                assert self.optimizer in (
+                    'adam',
+                    'muon',
+                ), "chunked optimizer state offload currently supports Adam and Muon"
+
+            assert (
+                not self.optimizer_cpu_offload
+            ), "chunked_optimizer_state_offload and optimizer_cpu_offload are mutually exclusive"
+            assert (
+                not self.optimizer_cuda_graph
+            ), "chunked optimizer state offload does not support optimizer CUDA graphs"
+
+            if self.optimizer == 'muon':
+                assert (
+                    self.use_layer_wise_distributed_optimizer
+                ), "Muon optimizer state offload requires LayerWiseDistributedOptimizer"
+                assert self.bf16, "Muon optimizer state offload currently requires bf16"
+                assert not self.use_layer_wise_param_layout, (
+                    "Muon optimizer state offload requires --use-layer-wise-param-layout to be "
+                    "disabled so the decoupled compact LayerWise DDP layout is used"
+                )
+            else:
+                assert not self.use_layer_wise_distributed_optimizer, (
+                    "Adam optimizer state offload does not support " "LayerWiseDistributedOptimizer"
+                )
+                assert (
+                    self.use_distributed_optimizer
+                ), "Adam optimizer state offload requires use_distributed_optimizer"
+
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
         # different for different training precision settings. FP8 cases require different
@@ -421,8 +488,6 @@ class OptimizerConfig:
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."
