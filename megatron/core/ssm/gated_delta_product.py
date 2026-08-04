@@ -375,7 +375,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             D_has_hdim=self.D_has_hdim,
         )
 
-    def forward(
+    def input_proj_ssm(
         self,
         hidden_states,
         inference_context=None,
@@ -383,7 +383,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params=None,
     ):
-        """Run the gated delta product mixer on hidden states."""
+        """Run GDP's input projection and recurrence, before output projection.
+
+        This matches the split-compute interface used by :class:`MambaMixer`, allowing
+        shortcut-MoE to overlap routed-expert communication with the GDP recurrence.
+        """
+        inference_context = deprecate_inference_params(inference_context, inference_params)
         seq_len, batch_size, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
@@ -394,7 +399,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 assert (
                     self.cp.cp_size == 1
                 ), "Context parallel is not supported for GDP dynamic inference"
-                return self.ssm_dynamic_inference(hidden_states, inference_context)
+                return self.ssm_dynamic_inference(
+                    hidden_states, inference_context, apply_output_proj=False
+                )
             assert (
                 inference_context.is_static_batching()
             ), "GDP inference must be either static or dynamic batching."
@@ -532,9 +539,28 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
 
-        out, out_bias = self.out_proj(y)
+        return y
 
-        return out, out_bias
+    def output_proj(self, y):
+        """Apply GDP's output projection to a recurrence output."""
+        return self.out_proj(y)
+
+    def forward(
+        self,
+        hidden_states,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params=None,
+    ):
+        """Run GDP's recurrence followed by its output projection."""
+        y = self.input_proj_ssm(
+            hidden_states,
+            inference_context=inference_context,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+        )
+        return self.output_proj(y)
 
     # ==================================================================
     # Static / eager inference
@@ -548,7 +574,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
     # ==================================================================
     def _static_decode(
         self, hidden_states: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Single-token static-batching decode step (updates state in place)."""
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
         assert self.cp.cp_size == 1, "Context parallel not supported for GDP inference decode"
@@ -562,8 +588,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             zVKQba.transpose(0, 1), conv_state=conv_state, ssm_state=ssm_state, batch_indices=None
         )
 
-        # (b, 1, d_inner) -> (1, b, d_inner), which is what out_proj expects.
-        return self.out_proj(y.transpose(0, 1))
+        # (b, 1, d_inner) -> (1, b, d_inner), which is what output_proj expects.
+        return y.transpose(0, 1)
 
     # ------------------------------------------------------------------
     # Dynamic-batching inference.
