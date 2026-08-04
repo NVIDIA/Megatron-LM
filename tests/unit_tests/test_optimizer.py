@@ -1113,7 +1113,11 @@ def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_
         ).self_attention.submodules
         assert isinstance(submodules, MLASelfAttentionSubmodules)
         fused_mla = FusedMLASelfAttention(
-            transformer_config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+            transformer_config,
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         model = nn.Module()
