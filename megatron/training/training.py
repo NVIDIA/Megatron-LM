@@ -2871,6 +2871,14 @@ def train_step(
             seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
             seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
             forward_backward_data_iterator = data_iterator
+
+        if getattr(config, "mtp_num_layers", None):
+            # Writer objects only exist on the last rank, so use globally consistent
+            # configuration flags to keep the acceptance collective branch rank-aligned.
+            has_acceptance_consumer = bool(
+                getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
+            )
+            MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=forward_backward_data_iterator,
