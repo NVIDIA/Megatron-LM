@@ -366,6 +366,8 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
     wait_async_comms()
+    # Iteration boundary: catches any chain that grew after the first-backward dump.
+    GTPShardedParam.flush_link_tables()
     cur = torch.cuda.current_stream()
     # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
     for s in _AG_STREAMS.values():
@@ -894,6 +896,9 @@ class GTPShardedParam(torch.nn.Parameter):
     # Recompute-forward prefetch cursor, keyed by chain_id; also cleared by reset_gtp_state().
     _recompute_chain_state: Dict[str, dict] = {}
 
+    # Set on link creation, cleared on log; keeps the backward hot path to one bool test.
+    _link_tables_dirty: bool = False
+
     @classmethod
     def _get_chain_state(cls, chain_id: str) -> dict:
         if chain_id not in cls._chain_state:
@@ -901,7 +906,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 "last_weight": None,
                 "link_node_count": 0,
                 "link_table_buffer": [],
-                "link_table_flushed": False,
+                # Rows already logged (a length, so a chain that grows is re-logged in full).
+                "link_table_logged_len": 0,
             }
         return cls._chain_state[chain_id]
 
@@ -910,6 +916,22 @@ class GTPShardedParam(torch.nn.Parameter):
         if chain_id not in cls._recompute_chain_state:
             cls._recompute_chain_state[chain_id] = {"last_weight": None}
         return cls._recompute_chain_state[chain_id]
+
+    @classmethod
+    def flush_link_tables(cls) -> None:
+        """Log each chain's buffered prefetch-link table; re-log in full if it later grew.
+
+        Call only where every chain is complete. In particular NOT on "this weight is already
+        linked" inside the forward -- MTP re-consumes weights mid-forward, so that fires before
+        the chain is done and truncates the table.
+        """
+        cls._link_tables_dirty = False
+        for chain in cls._chain_state.values():
+            buf = chain["link_table_buffer"]
+            if len(buf) == chain["link_table_logged_len"]:
+                continue
+            chain["link_table_logged_len"] = len(buf)
+            log_single_rank(logger, logging.INFO, "\n".join(buf) + "\n")
 
     @classmethod
     def _buffer_link_table_row(
@@ -950,6 +972,7 @@ class GTPShardedParam(torch.nn.Parameter):
                 return f"{type(q).__name__}/{raw_dt}"
             return str(getattr(param, "dtype", "-"))
 
+        cls._link_tables_dirty = True
         chain["link_node_count"] += 1
         if chain["link_node_count"] == 1:
             chain_id = getattr(curr, "chain_id", GTPChain.UNGRAPHED.value)
@@ -1381,6 +1404,10 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
+        # Chains are complete by the first backward AG. Logging here, not at the iteration
+        # boundary, means the tables still appear when backward goes on to crash.
+        if type(self)._link_tables_dirty:
+            type(self).flush_link_tables()
 
         if GTP_CONFIG.weight_prefetch and self.next_w is not None:
             result = self._get_prefetched_weight(False)
@@ -1506,10 +1533,6 @@ class GTPShardedParam(torch.nn.Parameter):
 
             self.prefetch_initialized = True
             chain["last_weight"] = self
-        elif not chain["link_table_flushed"] and chain["link_table_buffer"]:
-            # Second forward pass: flush the complete table atomically to avoid interleaving
-            chain["link_table_flushed"] = True
-            log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
 
         return result
 
@@ -1559,17 +1582,26 @@ class GTPShardedParam(torch.nn.Parameter):
         param._set_rs_state(GTPWeightState.NONE)
         return dummy_grad
 
-    def _wait_reduce_scatter(self, finalize_grad=False):
-        # Enter rs_stream context so handle.wait() + rs_event.record() land on rs_stream
-        # (mirrors _wait_param_gather). With finalize_grad=True, main_grad.add_ also runs on
-        # rs_stream right after the NCCL RS — starts during AG drain, not after, avoiding
-        # SM-saturation that blocks cross-graph overlap.
+    def _wait_reduce_scatter(self, finalize_grad=False) -> bool:
+        """Wait on this weight's in-flight wgrad reduce-scatter, optionally accumulating it.
+
+        Enters the rs_stream context so handle.wait() + rs_event.record() land on rs_stream
+        (mirrors _wait_param_gather). With finalize_grad=True, main_grad.add_ also runs on
+        rs_stream right after the NCCL RS — starts during AG drain, not after, avoiding
+        SM-saturation that blocks cross-graph overlap.
+
+        Returns:
+            True if an RS was actually pending and waited on -- lets the caller tell "completed"
+            from "never issued" (see wgrad_reduce_scatter).
+        """
+        waited = False
         rs_stream = self._cached_rs_stream
         if rs_stream is None:
             rs_stream = get_rs_stream(self.chain_id, self.group)
             self._cached_rs_stream = rs_stream
         with torch.cuda.stream(rs_stream):
             if self._wgrad_rs_handle is not None:
+                waited = True
                 self._wgrad_rs_handle.wait()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
@@ -1587,6 +1619,7 @@ class GTPShardedParam(torch.nn.Parameter):
                         self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
         self._release_comm_scratch()
+        return waited
 
     def _release_comm_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs")):
         """Release the buffers a finished RS was reading.
@@ -1765,6 +1798,13 @@ class GTPShardedParam(torch.nn.Parameter):
         wgrads = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
+        # Repeated backward (MTP re-uses embedding/output_layer): a second wgrad would reuse this
+        # weight's RS ticket -- the same output buffer -- and overwrite the first result, whose
+        # handle is also dropped. Finalize the pending RS before starting another.
+        if GTP_CONFIG.async_reduction and self._wgrad_rs_handle is not None:
+            self._wait_reduce_scatter(finalize_grad=True)
+            self._already_finalized = False
+
         # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = not _chain_is_graphed(self.chain_id)
@@ -1797,9 +1837,14 @@ class GTPShardedParam(torch.nn.Parameter):
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
         if GTP_CONFIG.async_reduction and self.next_w is not None:
-            self.next_w._wait_reduce_scatter()
+            # Backward follows reverse-chain order only while each weight is consumed once per
+            # forward. MTP breaks that (its re-embed runs late, so the embedding's backward
+            # precedes its successor's), so the successor may have no RS pending.
+            waited = self.next_w._wait_reduce_scatter()
 
-            if getattr(self.next_w, "_already_finalized", False):
+            if not waited:
+                pass  # nothing in flight: successor hasn't run, or was already finalized
+            elif getattr(self.next_w, "_already_finalized", False):
                 self.next_w._already_finalized = False
             else:
                 self.next_w.rs_event.wait()
@@ -2234,6 +2279,7 @@ def reset_gtp_state():
     """
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
+    GTPShardedParam._link_tables_dirty = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
 
 
