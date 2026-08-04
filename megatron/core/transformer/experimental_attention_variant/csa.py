@@ -797,7 +797,9 @@ def _compute_unfused_csa_non_compressed_lse(
 
     if query.ndim == 4:
         return lse_flat.reshape(batch_size, seqlen_q, num_heads).permute(0, 2, 1).contiguous()
-    return lse_flat.transpose(0, 1).unsqueeze(0).contiguous()
+    return (
+        lse_flat.transpose(0, 1).unsqueeze(0).reshape(1, num_heads, lse_flat.shape[0]).contiguous()
+    )
 
 
 def _unfused_indexer_sparse_attn_from_topk(
