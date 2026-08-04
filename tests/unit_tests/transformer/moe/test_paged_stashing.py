@@ -33,34 +33,90 @@ from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp
 pytestmark = pytest.mark.launch_on_gb200
 
 
-def test_te_graph_capture_replays_paged_stash_schedule():
+def _make_schedule_manager(recorded_schedule, vp_size=1):
     manager = PagedStashManager.__new__(PagedStashManager)
     manager.enabled = True
     manager.status = 'captured'
-    manager.vp_size = 1
-    manager._pp_schedule = [1_001_000, 1_002_000, -1_002_000, -1_001_000]
-    manager.current_layer = [99]
-    manager.current_microbatch = [99]
+    manager.vp_size = vp_size
+    manager._pp_schedule = recorded_schedule
+    manager.current_layer = [99] * vp_size
+    manager.current_microbatch = [99] * vp_size
     manager.current_vp_stage = 0
     manager.current_schedule_index = len(manager._pp_schedule)
     manager._te_graph_capture = False
+    return manager
 
-    manager.start_te_graph_capture()
-    manager.prepare_te_graph_capture_forward()
+
+def test_te_graph_capture_uses_capture_order_then_restores_runtime_schedule():
+    runtime_schedule = [
+        1_001_000,
+        1_002_000,
+        1_001_001,
+        1_002_001,
+        -1_002_000,
+        -1_001_000,
+        -1_002_001,
+        -1_001_001,
+    ]
+    manager = _make_schedule_manager(runtime_schedule)
+
+    runtime_state = manager.start_te_graph_capture([1, 1, 1, -1, -1, -1])
+
+    assert manager._pp_schedule != runtime_schedule
+    assert len(manager._pp_schedule) == 12
     assert manager.current_schedule_index == 0
+    manager.prepare_te_graph_capture_forward()
     assert manager.current_layer == [1]
     assert manager.current_microbatch == [0]
 
-    manager.current_schedule_index = 1
+    # TE repeats the complete order for warmup and capture. The first forward naturally
+    # wraps a fully consumed schedule without any per-callable cursor hook.
+    manager.current_schedule_index = len(manager._pp_schedule)
     manager.prepare_te_graph_capture_forward()
-    assert manager.current_layer == [2]
+    assert manager.current_schedule_index == 0
 
-    manager.current_schedule_index = 2
-    with pytest.raises(RuntimeError, match="expected a forward schedule entry"):
-        manager.prepare_te_graph_capture_forward()
-
-    manager.finish_te_graph_capture()
+    manager.finish_te_graph_capture(runtime_state)
     assert not manager._te_graph_capture
+    assert manager._pp_schedule is runtime_schedule
+    assert manager.current_schedule_index == len(runtime_schedule)
+    assert manager.current_layer == [99]
+    assert manager.current_microbatch == [99]
+
+
+def test_paged_stash_schedule_supports_distinct_vp_layer_templates():
+    manager = _make_schedule_manager(
+        [
+            1_001_000,
+            1_002_000,
+            2_001_000,
+            -2_001_000,
+            1_001_001,
+            1_002_001,
+            -1_002_000,
+            -1_001_000,
+            2_001_001,
+            -1_002_001,
+            -1_001_001,
+            -2_001_001,
+        ],
+        vp_size=2,
+    )
+
+    rebuilt = manager._build_te_graph_capture_schedule([1, 2, -2, 1, -1, 2, -1, -2])
+
+    assert rebuilt == manager._pp_schedule
+
+
+def test_paged_stash_schedule_rejects_invalid_recording_or_order():
+    manager = _make_schedule_manager([1_001_000, -1_002_000])
+    with pytest.raises(RuntimeError, match="backward layer order"):
+        manager._build_te_graph_capture_schedule([1, -1])
+
+    manager = _make_schedule_manager([1_001_000, -1_001_000])
+    with pytest.raises(RuntimeError, match="unbalanced forward/backward"):
+        manager._build_te_graph_capture_schedule([1, 1, -1])
+    with pytest.raises(RuntimeError, match="chunk-level integer PP order"):
+        manager._build_te_graph_capture_schedule([1.0, -1.0])
 
 
 def test_te_graph_capture_joins_auxiliary_streams_per_layer(monkeypatch):

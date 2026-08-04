@@ -2848,7 +2848,10 @@ class TECudaGraphHelper:
                 self.config.moe_paged_stash
                 and CudaGraphModule.moe in self.config.cuda_graph_modules
             )
-            with rng_context, paged_stash_te_graph_capture(te_whole_moe_paged_stash):
+            with (
+                rng_context,
+                paged_stash_te_graph_capture(te_whole_moe_paged_stash, order=kwargs['_order']),
+            ):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
