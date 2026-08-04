@@ -397,7 +397,11 @@ class DBuffer:
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
         reduce_op = partial_placement.reduce_op
-        is_symm_mem = symm_mem.is_symm_mem_tensor(self.local_buffer)
+        # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
+        # reductions remain supported on older PyTorch versions that lack it.
+        is_symm_mem = hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
+            self.local_buffer
+        )
         if is_symm_mem:
             self.rendezvous(axis)
             # NCCL symmetric-memory reduce-scatter selects its symmetric kernel

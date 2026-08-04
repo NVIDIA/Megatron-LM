@@ -474,6 +474,26 @@ def test_partial_reduce_scatter_to_flat_average(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 
 
+def test_partial_reduce_scatter_to_flat_average_without_symm_mem_detector(
+    distributed_setup, monkeypatch
+):
+    """Ordinary AVG remains available when PyTorch lacks the symmetric-memory detector."""
+    device, world_size = distributed_setup.device, distributed_setup.world_size
+    mesh = init_device_mesh(device.type, (world_size,))
+    monkeypatch.delattr(symm_mem, "is_symm_mem_tensor")
+    rank_scale = float(distributed_setup.rank + 1)
+    partial_buffer = DBuffer.distribute_tensors(
+        [torch.full((5, 3), rank_scale, dtype=torch.float32, device=device)],
+        mesh,
+        [Partial(reduce_op=dist.ReduceOp.AVG)],
+    )
+
+    replicated_buffer = partial_buffer.reduce_scatter(0, Flat()).allgather(0)
+
+    expected = torch.full((5, 3), (world_size + 1) / 2.0, dtype=torch.float32, device=device)
+    _assert_dbuffer_local_tensors_close(replicated_buffer, [expected])
+
+
 def test_symmetric_memory_partial_reduce_scatter_to_flat_average(distributed_setup):
     """Symmetric-memory reduce-scatter preserves AVG semantics."""
     device, world_size = distributed_setup.device, distributed_setup.world_size

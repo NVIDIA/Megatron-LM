@@ -90,6 +90,8 @@ class FsdpParameterGroup:
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
+        if use_symm_mem and not hasattr(symm_mem, "is_symm_mem_tensor"):
+            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
