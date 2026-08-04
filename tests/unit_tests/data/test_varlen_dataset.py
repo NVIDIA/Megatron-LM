@@ -2,11 +2,10 @@
 
 """Unit tests for :mod:`megatron.training.datasets.varlen_dataset`.
 
-These tests cover the schema-detection and message-normalization helpers and
-the :class:`VarlenLowLevelDataset` loader. The end-to-end SFTDataset packing
-behavior is exercised by the existing SFT test suite; here we focus on the
-varlen-specific contracts (auto-detect schema, normalize to messages,
-ValueError on unsupported shapes).
+These tests cover the schema-detection and message-normalization helpers. The
+end-to-end SFTDataset packing behavior is exercised by the existing SFT test
+suite; here we focus on the varlen-specific contracts (auto-detect schema,
+normalize to messages, ValueError on unsupported shapes).
 """
 
 import pytest
