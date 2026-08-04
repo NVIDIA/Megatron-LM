@@ -256,6 +256,17 @@ stimer = StragglerDetector()
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 
+# Gate for ``update_seqlen_stats_from_cu_seqlens``. Interleaved (virtual)
+# pipelining re-runs the user ``forward_step`` once per virtual model chunk on
+# the SAME micro-batch, and every chunk observes identical ``cu_seqlens``; since
+# the FLOPs formula already spans all ``args.num_layers``, letting each chunk
+# record would multiply the reported FLOPs by the virtual-pipeline size.
+# ``_gate_seqlen_stats_by_vp_stage`` flips this to ``False`` for the duration of
+# a non-primary chunk's forward step and restores it afterwards, so the gate is
+# strictly scoped: outside a wrapped forward step it is always ``True`` and
+# ``update_*`` behaves exactly as an ungated call would.
+_seqlen_stats_recording_enabled: bool = True
+
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
@@ -309,13 +320,16 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
             metric reports useful work only, not work on CP-alignment or
             end-of-sequence padding tokens.
 
-    Call this ONCE per logical micro-batch. Under interleaved (virtual) pipeline
-    parallelism the forward step runs once per virtual model chunk for the same
-    micro-batch and every chunk observes identical ``cu_seqlens``, so callers
-    must record only from the primary chunk (``vp_stage`` ``None`` or ``0``) --
-    the whole-model FLOPs formula already covers all ``args.num_layers``, so
-    recording per chunk would multiply the estimate by the virtual-pipeline
-    size. See the call sites in ``pretrain_gpt.py`` / ``pretrain_hybrid.py``.
+    This records ONCE per logical micro-batch. Callers do not have to arrange
+    that themselves: under interleaved (virtual) pipeline parallelism the
+    forward step runs once per virtual model chunk for the same micro-batch and
+    every chunk observes identical ``cu_seqlens``, and
+    ``_gate_seqlen_stats_by_vp_stage`` -- installed by ``train_step`` and
+    ``evaluate`` around the user ``forward_step`` -- turns this function into a
+    no-op for every chunk but the primary one. The whole-model FLOPs formula
+    already covers all ``args.num_layers``, so recording per chunk would
+    multiply the estimate by the virtual-pipeline size. Outside a wrapped
+    forward step the gate is open, so a direct call always records.
 
     Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
     broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
@@ -325,6 +339,9 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     flag at ``False`` and pay zero collective cost.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active
+    if not _seqlen_stats_recording_enabled:
+        # Non-primary virtual pipeline chunk replaying the same micro-batch.
+        return
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -402,6 +419,58 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     t.zero_()
     _seqlen_stats_active = False
     return total_real_tokens, seqlen_squared_sum
+
+
+def _get_vp_stage_or_none(model):
+    """Return a model chunk's ``vp_stage``, or ``None`` when it has none.
+
+    ``get_attr_wrapped_model`` walks the ``.module`` chain and RAISES when no
+    object in it defines the attribute. ``vp_stage`` is not universal -- e.g.
+    ``MimoModel`` defines none and is only rescued by ``Float16Module``, which
+    exists solely for fp16/bf16 runs -- so an unguarded read would turn an
+    fp32 model without ``vp_stage`` into a hard training failure over a
+    reporting metric. Absent ``vp_stage`` means "not interleaved".
+    """
+    try:
+        return get_attr_wrapped_model(model, "vp_stage")
+    except RuntimeError:
+        return None
+
+
+def _gate_seqlen_stats_by_vp_stage(forward_step_func):
+    """Wrap a user ``forward_step`` so only the primary virtual chunk records stats.
+
+    The interleaved pipeline schedule invokes ``forward_step_func`` once per
+    (micro-batch, virtual model chunk) pair, always with a SINGLE model chunk as
+    the second positional argument, and every chunk sees identical
+    ``cu_seqlens`` for a given micro-batch. Since ``num_floating_point_operations``
+    already accounts for all ``args.num_layers``, an ungated
+    ``update_seqlen_stats_from_cu_seqlens`` inside ``forward_step`` would inflate
+    the reported THD FLOPs by exactly the virtual-pipeline size. Gating here
+    rather than at the ``forward_step`` call sites keeps entry points free of
+    this concern.
+
+    The override is scoped to the wrapped call and restored in a ``finally``,
+    so it cannot leak: a raising forward step (the rerun state machine retries
+    on failures) cannot strand the gate closed, and any ``update_*`` issued
+    outside a wrapped forward step still records unconditionally.
+    """
+    if getattr(forward_step_func, "_gates_seqlen_stats", False):
+        return forward_step_func
+
+    @functools.wraps(forward_step_func)
+    def wrapper(data_iterator, model, *args, **kwargs):
+        global _seqlen_stats_recording_enabled
+        previous = _seqlen_stats_recording_enabled
+        # ``vp_stage`` is None without interleaving and the chunk index with it.
+        _seqlen_stats_recording_enabled = _get_vp_stage_or_none(model) in (None, 0)
+        try:
+            return forward_step_func(data_iterator, model, *args, **kwargs)
+        finally:
+            _seqlen_stats_recording_enabled = previous
+
+    wrapper._gates_seqlen_stats = True
+    return wrapper
 
 
 def num_floating_point_operations(
@@ -2345,6 +2414,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+    # Interleaved pipelining replays each micro-batch on every virtual chunk;
+    # gate the packed-sequence FLOPs stats so only the primary chunk records.
+    forward_step_func = _gate_seqlen_stats_by_vp_stage(forward_step_func)
+
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
                                      (iteration + 1) % args.save_params_interval == 0)
@@ -4173,6 +4246,9 @@ def evaluate(
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+
+    # Same gate as in ``train_step``; covers both schedule hand-offs below.
+    forward_step_func = _gate_seqlen_stats_by_vp_stage(forward_step_func)
 
     timers('evaluate', log_level=0).start(barrier=True)
 
