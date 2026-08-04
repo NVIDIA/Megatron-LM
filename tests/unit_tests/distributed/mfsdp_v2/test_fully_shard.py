@@ -450,7 +450,6 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
 
     x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
     output = model(x)
-    torch.cuda.synchronize(device)
     del output, x, model
     torch.cuda.synchronize(device)
 
