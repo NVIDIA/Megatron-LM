@@ -612,6 +612,19 @@ def finalize_model_grads(
         gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
         egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
 
+    # A missing group would silently skip the gtp_remat-axis reduction below and train on
+    # wrong gradients, so fail loudly whenever the config says the axis is active.
+    for axis, group, axis_size in (
+        ('gtp_remat', gtp_remat_group, config.gtp_weight_remat_size),
+        ('expt_gtp_remat', egtp_remat_group, config.expert_gtp_weight_remat_size),
+    ):
+        if axis_size > 1:
+            found = 'None' if group is None else f'a size-{group.size()} group'
+            assert group is not None and group.size() == axis_size, (
+                f"{axis} is enabled (size={axis_size}) but pg_collection provides {found}. "
+                f"Pass a pg_collection carrying `{axis}` to finalize_model_grads."
+            )
+
     # Fence the current stream against all GTP backward grad work before the DP gradient sync.
     if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:
         from megatron.core.tensor_parallel.gtp_api import (

@@ -33,7 +33,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.layers import (
@@ -1460,15 +1460,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-        else:
-            assert hasattr(
-                pg_collection, "expt_gtp_remat" if is_expert else "gtp_remat"
-            ), "TELayerNormColumnParallelLinear pg_collection must have gtp remat pg"
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1650,15 +1642,7 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-        else:
-            assert hasattr(
-                pg_collection, "expt_gtp_remat" if is_expert else "gtp_remat"
-            ), "TEColumnParallelLinear pg_collection must have gtp remat pg"
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
         super().__init__(
             input_size=input_size,
@@ -1918,15 +1902,7 @@ class TERowParallelLinear(TELinear):
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-        else:
-            assert hasattr(
-                pg_collection, "expt_gtp_remat" if is_expert else "gtp_remat"
-            ), "TERowParallelLinear pg_collection must have gtp remat pg"
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
         super().__init__(
             input_size=input_size,

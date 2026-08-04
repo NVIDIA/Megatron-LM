@@ -22,7 +22,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
     divide,
     get_pg_rank,
@@ -262,7 +262,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.tp_group = get_tensor_model_parallel_group_if_none(self.tp_group)
 
-        (self.vocab_start_index, self.vocab_end_index) = (
+        self.vocab_start_index, self.vocab_end_index = (
             VocabUtility.vocab_range_from_global_vocab_size(
                 self.num_embeddings, get_pg_rank(self.tp_group), get_pg_size(self.tp_group)
             )
@@ -315,15 +315,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
 
         self.gtp_remat_size = 1
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat"]
-            )
-        else:
-            assert hasattr(
-                pg_collection, "gtp_remat"
-            ), "VocabParallelEmbedding pg_collection must have gtp_remat pg"
-        gtp_remat_group = pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
@@ -1028,17 +1020,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.weight = None
 
         self.gtp_remat_size = 1
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-        else:
-            assert hasattr(
-                pg_collection, "expt_gtp_remat" if self.is_expert else "gtp_remat"
-            ), "ColumnParallelLinear pg_collection must have gtp remat pg"
-        gtp_remat_group = (
-            pg_collection.expt_gtp_remat if self.is_expert else pg_collection.gtp_remat
-        )
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, self.is_expert)
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
@@ -1401,17 +1383,7 @@ class RowParallelLinear(torch.nn.Module):
         setattr(self.weight, "allreduce", not use_expert_pgs)
 
         self.gtp_remat_size = 1
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-        else:
-            assert hasattr(
-                pg_collection, "expt_gtp_remat" if self.is_expert else "gtp_remat"
-            ), "RowParallelLinear pg_collection must have gtp remat pg"
-        gtp_remat_group = (
-            pg_collection.expt_gtp_remat if self.is_expert else pg_collection.gtp_remat
-        )
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, self.is_expert)
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
