@@ -23,7 +23,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .indexed_order import WeakIndexedOrder
+from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
 
@@ -41,8 +41,8 @@ class FsdpContext:
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: WeakIndexedOrder["FsdpModule"]
-    backward_order: WeakIndexedOrder["FsdpModule"]
+    forward_order: IndexedOrder["FsdpModule"]
+    backward_order: IndexedOrder["FsdpModule"]
 
     def __init__(self, device: torch.device, root_module: "FsdpModule") -> None:
         """Create rank-local runtime state for a root FSDP subtree.
@@ -53,8 +53,8 @@ class FsdpContext:
         """
         self._root_module = ref(root_module)
         self.is_last_microbatch = True
-        self.forward_order = WeakIndexedOrder()
-        self.backward_order = WeakIndexedOrder()
+        self.forward_order = IndexedOrder()
+        self.backward_order = IndexedOrder()
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
@@ -371,7 +371,7 @@ class FsdpModule:
         return f"MFSDP {name} {phase}"
 
 
-def _collect_backward_order(module: nn.Module, order: WeakIndexedOrder["FsdpModule"]) -> None:
+def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
     """Collect FsdpModules in static backward prefetch order."""
     if isinstance(module, FsdpModule):
         order.append(module)
