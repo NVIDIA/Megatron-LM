@@ -1745,7 +1745,7 @@ class SelfAttention(Attention):
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
         # Only this consistency check needs the DP group, so it is required here rather than in
-        # __init__, which asks use_mpu_process_groups for tp/cp only.
+        # __init__, which requires tp/cp only.
         assert hasattr(
             self.pg_collection, 'dp'
         ), "run_realtime_tests requires a dp process group; pass one via pg_collection.dp"

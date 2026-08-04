@@ -53,10 +53,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context = inference_context
 
-        # Get the inference pg_collection from the config if it exists; otherwise the training
-        # pg_collection might be used during RL
-        if (pg_collection := self.inference_context.config.pg_collection) is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Resolved once at the inference-config boundary; during RL this may be the training
+        # collection rather than an inference-specific one.
+        pg_collection = self.inference_context.config.resolve_pg_collection()
 
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
