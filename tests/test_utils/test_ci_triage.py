@@ -130,8 +130,7 @@ def test_cerno_hard_cutover_contract():
     assert triage.count("cerno-notify") == 2
     assert triage.count('--config "${CERNO_CONFIG}"') == 3
     assert "ARG CERNO_COMMIT=5a5fb5360e67f8f09d189871bbc0d768c09c43fa" in dockerfile
-    assert '"cerno @ git+${CI_SERVER_URL}/dl/nemo/' in dockerfile
-    assert '.git@${CERNO_COMMIT}"' in dockerfile
+    assert '"cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"' in dockerfile
     assert "id=CERNO_TOKEN" in dockerfile
     assert "/run/secrets/CERNO_TOKEN" in dockerfile
     assert "--secret id=CERNO_TOKEN,env=PAT" in build_script

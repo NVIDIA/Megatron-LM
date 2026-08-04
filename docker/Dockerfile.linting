@@ -30,4 +30,4 @@ RUN --mount=type=secret,id=CERNO_TOKEN \
       GIT_CONFIG_KEY_0=http.extraHeader \
       GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'oauth2:%s' "$(cat /run/secrets/CERNO_TOKEN)" | base64 -w0)" \
       uv pip install --no-cache-dir \
-        "cerno @ git+${CI_SERVER_URL}/dl/nemo/nemo-ci-triage.git@${CERNO_COMMIT}"
+        "cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"
