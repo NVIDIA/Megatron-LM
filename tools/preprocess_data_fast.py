@@ -9,6 +9,13 @@ import time
 import multiprocessing
 from multiprocessing import Pool
 
+import orjson
+from itertools import islice
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                             os.path.pardir)))
+
 from megatron.core.datasets import indexed_dataset
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.arguments import _add_tokenizer_args
@@ -26,6 +33,10 @@ def get_args():
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
+    group.add_argument('--batch-size', type=int, required=False, default=1,
+                       help='Batch size')
+    group.add_argument('--log-interval', type=int, required=False, default=10000,
+                       help='Interval to log the progress')
     args = parser.parse_args()
     args.keep_empty = False
 
@@ -36,6 +47,35 @@ def get_args():
     args.vocab_extra_ids = 0
 
     return args
+
+
+def batch_jsonl(path, batch_size, key):
+    with open(path, "rb") as f:  # orjson works on bytes, skip text decode
+        while batch := [orjson.loads(line)[key] for line in islice(f, batch_size)]:
+            yield batch
+
+
+def process_key_batch(args, key, level):
+    tokenizer = build_tokenizer(args)  # each process needs its own tokenizer
+
+    bin_file = "{}_{}_{}.bin".format(args.output_prefix, key, level)
+    idx_file = "{}_{}_{}.idx".format(args.output_prefix, key, level)
+
+    builder = indexed_dataset.IndexedDatasetBuilder(
+        bin_file,
+        dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
+    )
+
+    for iteration, batch in enumerate(batch_jsonl(args.input, args.batch_size, key), start=1):
+        if iteration % args.log_interval == 0:
+            print(f"Preprocessed {iteration * args.batch_size} samples.")
+
+        encoded_docs = tokenizer._tokenizer.tokenizer.tokenizer.encode_batch_list(batch, parallel=True)
+
+        for doc in encoded_docs:
+            builder.add_document(doc, [len(doc)])
+
+    builder.finalize(idx_file)
 
 
 def process_key(args, key, level):
@@ -62,9 +102,11 @@ def main():
     args = get_args()
     level = "document"
 
+    fn = process_key_batch if args.batch_size > 1 else process_key
+
     ctx = multiprocessing.get_context('spawn')
     with ctx.Pool(processes=len(args.json_keys)) as pool:
-        pool.starmap(process_key, [(args, key, level) for key in args.json_keys])
+        pool.starmap(fn, [(args, key, level) for key in args.json_keys])
 
 
 if __name__ == '__main__':
