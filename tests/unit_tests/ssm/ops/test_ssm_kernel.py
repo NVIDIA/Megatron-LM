@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -82,6 +83,7 @@ class TestMambaDynamicInference(unittest.TestCase):
 
         # Create the Mixer instance directly
         self.mixer = MagicMock(spec=MambaMixer)
+        self.mixer.config = SimpleNamespace(batch_invariant_mode=False)
         self.mixer.d_state = self.d_state
         self.mixer.d_conv = self.d_conv
         self.mixer.headdim = self.headdim

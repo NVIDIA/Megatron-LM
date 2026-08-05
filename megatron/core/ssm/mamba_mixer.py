@@ -25,6 +25,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.ops.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.intermediate_extraction import (
     scatter_intermediate_conv,
@@ -60,10 +61,12 @@ from .mamba_context_parallel import MambaContextParallel
 
 try:
     from causal_conv1d import causal_conv1d_fn
+    from causal_conv1d import causal_conv1d_update as causal_conv1d_update_cuda
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
 except ImportError:
     causal_conv1d_fn = None
+    causal_conv1d_update_cuda = None
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
@@ -288,6 +291,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".in_proj") if name is not None else None,
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
@@ -439,6 +443,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".out_proj") if name is not None else None,
         )
 
@@ -488,6 +493,10 @@ class MambaMixer(MegatronModule):
                 return self._dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
+                assert not self.config.batch_invariant_mode, (
+                    "batch_invariant_mode for Mamba inference is only supported with "
+                    "DynamicInferenceContext."
+                )
                 assert not self.config.sequence_parallel
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
@@ -988,12 +997,25 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
+            # Batch-invariant decode replays the partial prefill tail, so keep
+            # the cached SSM state at the last complete chunk boundary.
+            if self.config.batch_invariant_mode:
+                prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+                tail_lens = prefill_lens % self.chunk_size
+                has_boundary = prefill_lens >= self.chunk_size
+                # A partial tail uses the preceding full chunk's state.
+                boundary_chunk_indices = (
+                    last_chunk_indices.to(torch.long) - (tail_lens > 0).to(torch.long)
+                ).clamp(min=0)
+
             # Extraction is enabled when the slot allocator wired buffers in via
             # the caller. When enabled, the chunk scan returns its raw states so
             # our Triton kernels do a fused gather+conditional-scatter directly,
             # skipping the dense intermediate tensor and the padded-slot writes.
             extract_intermediates = (
-                intermediate_chunk_indices is not None and intermediate_ssm_out is not None
+                not self.config.batch_invariant_mode
+                and intermediate_chunk_indices is not None
+                and intermediate_ssm_out is not None
             )
             ssm_varlen_result = mamba_chunk_scan_combined_varlen(
                 x=x,
@@ -1011,16 +1033,16 @@ class MambaMixer(MegatronModule):
                     if self.D_has_hdim
                     else self.cp.get_D()
                 ),
-                z=z if not self.rmsnorm else None,
+                z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
                 dt_bias=self.cp.get_dt_bias().float(),
                 initial_states=initial_ssm_state,
-                return_raw_states=extract_intermediates,
+                return_raw_states=self.config.batch_invariant_mode or extract_intermediates,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 state_dtype=ssm_state.dtype,
             )
 
-            if extract_intermediates:
+            if self.config.batch_invariant_mode or extract_intermediates:
                 ssm_varlen_states, raw_ssm_states = ssm_varlen_result
             else:
                 ssm_varlen_states = ssm_varlen_result
@@ -1029,7 +1051,26 @@ class MambaMixer(MegatronModule):
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+            if self.config.batch_invariant_mode:
+                boundary_mask = has_boundary.view(-1, 1, 1, 1)
+                cache_states = torch.where(
+                    boundary_mask, raw_ssm_states[boundary_chunk_indices], initial_ssm_state
+                )
+            else:
+                cache_states = ssm_varlen_states
+
+            tensor_masked_update(ssm_state, batch_indices, cache_states)
+            if self.config.batch_invariant_mode:
+                self._get_batch_invariant_decoder().seed(
+                    x,
+                    z.squeeze(0),
+                    dt,
+                    B,
+                    C,
+                    cu_seqlens,
+                    batch_indices,
+                    max_requests=ssm_state.shape[0],
+                )
 
             if extract_intermediates:
                 # Fused gather+conditional-scatter for SSM: read row
@@ -1090,7 +1131,7 @@ class MambaMixer(MegatronModule):
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
             z = self.cp.post_conv_ssm(z)
-            y = self.norm(y, z)
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
@@ -1111,6 +1152,12 @@ class MambaMixer(MegatronModule):
                 self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
             self._A_neg_exp_cache_stale = False
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+
+    def _get_batch_invariant_decoder(self) -> MambaBatchInvariantDecode:
+        """Batch-invariant decode adapter, created on first use."""
+        if not hasattr(self, "_batch_invariant_decoder"):
+            self._batch_invariant_decoder = MambaBatchInvariantDecode(self)
+        return self._batch_invariant_decoder
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
@@ -1161,7 +1208,30 @@ class MambaMixer(MegatronModule):
         )
 
         # Conv step
-        if causal_conv1d_update is None:
+        if self.config.batch_invariant_mode:
+            # Match the causal-conv1d arithmetic used by the training forward.
+            assert (
+                causal_conv1d_update_cuda is not None
+            ), "Batch-invariant Mamba decode requires causal-conv1d"
+            assert seq_len == 1, "Batch-invariant Mamba decode supports one token per request"
+            assert (
+                intermediate_conv_state is None
+            ), "Batch-invariant Mamba decode does not support speculative decoding"
+            assert (
+                batch_indices is not None and batch_indices.dtype == torch.int32
+            ), "Batch-invariant Mamba decode requires int32 dynamic-batching indices"
+
+            xBC_dtype = xBC.dtype
+            xBC = causal_conv1d_update_cuda(
+                xBC.to(conv_state.dtype).squeeze(1),
+                conv_state,
+                rearrange(self.conv1d_weight, "d 1 w -> d w").to(conv_state.dtype),
+                self.conv1d_bias.to(conv_state.dtype),
+                self.activation,
+                conv_state_indices=batch_indices,
+            ).unsqueeze(1)
+            xBC = xBC.to(xBC_dtype)
+        elif causal_conv1d_update is None:
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
             xBC_squeeze = xBC.squeeze(1)
@@ -1197,7 +1267,12 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
         # SSM step
-        if selective_state_update is None:
+        if self.config.batch_invariant_mode:
+            assert (
+                batch_indices is not None
+            ), "batch_invariant_mode for Mamba decode requires batch_indices from dynamic batching."
+            y = self._get_batch_invariant_decoder().step(x, z, dt, B, C, batch_indices, ssm_state)
+        elif selective_state_update is None:
             # Fallback uses 1D A; the decode cache is pre-expanded for Triton.
             A = -torch.exp(self.A_log.float())
             # TODO(ksanthanam): Consider deprecating this path
@@ -1286,7 +1361,7 @@ class MambaMixer(MegatronModule):
             y = rearrange(y, "b s h p -> b s (h p)")
 
         if self.rmsnorm:
-            y = self.norm(y, z)
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
