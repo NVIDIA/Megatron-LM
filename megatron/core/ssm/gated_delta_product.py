@@ -99,7 +99,24 @@ class MambaMixerSubmodules:
 
 
 class GatedDeltaProductMixer(MegatronModule):
-    """
+    """Gated Delta Product (GDP) sequence mixer for hybrid models.
+
+    The mixer accepts hidden states with shape ``[sequence, batch, hidden]`` and returns
+    a projected tensor with the same shape plus the optional output-projection bias. It
+    serves as the mixer inside ``MambaLayer``, allowing a hybrid stack to select GDP layers
+    without changing the surrounding layer interface.
+
+    GDP projects each token into an output gate and the ``V``, ``K``, ``Q``, beta, and decay
+    terms used by a sequence of Householder updates. A depthwise causal convolution mixes
+    local context in ``V/K/Q``; the FLA GDP recurrence then updates a matrix-valued state,
+    and gated RMS normalization plus the output projection map the result back to the
+    model hidden size.
+
+    The module shards projections and recurrent parameters across tensor-parallel ranks,
+    redistributes sequence and head dimensions for context parallelism, handles packed
+    THD training sequences, manages static and dynamic inference state, and exposes
+    semantic sharded-state-dict partitions for checkpoint resharding across TP sizes.
+
     Args:
         config: The config of the model.
         submodules: Contains the module specs for the input and output linear layers.
