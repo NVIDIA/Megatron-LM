@@ -11,6 +11,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from types import MethodType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -20,7 +21,11 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ShardedObject,
+    ShardedStateDict,
+)
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -1015,6 +1020,32 @@ else:
     TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
 
 
+def _tenorm_sharded_state_dict(
+    module: torch.nn.Module,
+    prefix: str = '',
+    sharded_offsets: tuple = (),
+    metadata: Optional[dict] = None,
+) -> ShardedStateDict:
+    """Build a TE norm state dict without requiring empty quantization state on load."""
+    state_dict = module.state_dict(prefix='', keep_vars=True)
+    sharded_state_dict = make_sharded_tensors_for_checkpoint(
+        state_dict,
+        prefix,
+        sharded_offsets=sharded_offsets,
+        dp_cp_group=(metadata or {}).get('dp_cp_group'),
+    )
+
+    extra_state = state_dict.get('_extra_state')
+    if extra_state is None or (isinstance(extra_state, torch.Tensor) and extra_state.numel() == 0):
+        sharded_state_dict[f'{prefix}_extra_state'] = LocalNonpersistentObject(extra_state)
+    return sharded_state_dict
+
+
+def _bind_tenorm_sharded_state_dict(module: torch.nn.Module) -> None:
+    """Attach MCore distributed-checkpoint handling to a TE norm instance."""
+    module.sharded_state_dict = MethodType(_tenorm_sharded_state_dict, module)
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
@@ -1070,6 +1101,8 @@ class TENorm:
             zero_centered_gamma=config.layernorm_zero_centered_gamma,
             **_get_extra_te_kwargs(config),
         )
+
+        _bind_tenorm_sharded_state_dict(instance)
 
         return cast(LayerNormInterface, instance)
 

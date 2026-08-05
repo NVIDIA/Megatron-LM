@@ -6,11 +6,13 @@ from dataclasses import fields
 import torch
 import transformer_engine as te
 
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
+    _bind_tenorm_sharded_state_dict,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
@@ -44,6 +46,41 @@ class TestGptLayerCheckpointKeys:
         assert submodules.sharded_state_dict_keys_map == {
             "input_layernorm.": "self_attention.linear_qkv.layer_norm_"
         }
+
+
+class TestTENormCheckpointCompatibility:
+    class _FakeTENorm(torch.nn.Module):
+        def __init__(self, extra_state):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(4))
+            self._test_extra_state = extra_state
+
+        def get_extra_state(self):
+            return self._test_extra_state
+
+        def set_extra_state(self, state):
+            self._test_extra_state = state
+
+    def test_empty_extra_state_is_local_nonpersistent(self):
+        norm = self._FakeTENorm(torch.empty(0, dtype=torch.uint8))
+        _bind_tenorm_sharded_state_dict(norm)
+
+        sharded_state_dict = norm.sharded_state_dict(
+            prefix="norm.", metadata={"dp_cp_group": object()}
+        )
+
+        assert isinstance(sharded_state_dict["norm._extra_state"], LocalNonpersistentObject)
+        assert sharded_state_dict["norm._extra_state"].unwrap().numel() == 0
+
+    def test_nonempty_extra_state_remains_checkpointed(self):
+        norm = self._FakeTENorm(torch.ones(1, dtype=torch.uint8))
+        _bind_tenorm_sharded_state_dict(norm)
+
+        sharded_state_dict = norm.sharded_state_dict(
+            prefix="norm.", metadata={"dp_cp_group": object()}
+        )
+
+        assert isinstance(sharded_state_dict["norm._extra_state"], ShardedObject)
 
 
 class TestSpecCustomization:
