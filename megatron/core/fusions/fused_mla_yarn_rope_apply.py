@@ -571,17 +571,20 @@ def _mla_rope_fwd_kv_split_kernel(
     kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
     mask = kv_off < head_num * stride_kv_nheads
     k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
-    v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
     k = tl.load(KV_ptr + k_in_off, mask=mask)
-    v = tl.load(KV_ptr + v_in_off, mask=mask)
 
     K_ptr = O_KEY + pid_m * stride_k_seq + pid_head * BLOCK_H * stride_k_nheads
     V_ptr = O_VALUE + pid_m * stride_v_seq + pid_head * BLOCK_H * stride_v_nheads
 
     k_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads + tl.arange(0, k_dim)[None, :]
-    v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
     tl.store(K_ptr + k_out_off, k, mask=mask)
-    tl.store(V_ptr + v_out_off, v, mask=mask)
+    # tl.arange requires end > start, so the value path must be pruned at
+    # compile time when v_dim == 0 (v_dim is a constexpr).
+    if v_dim > 0:
+        v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
+        v = tl.load(KV_ptr + v_in_off, mask=mask)
+        v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
+        tl.store(V_ptr + v_out_off, v, mask=mask)
 
     EMB = K_POS_EMB + pid_m * stride_emb_seq
     # x1 = t[..., 0::2], x2 = t[..., 1::2]
@@ -681,16 +684,19 @@ def _mla_rope_bwd_kv_split_kernel(
     dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
     mask = dkv_off < head_num * stride_dkv_nheads
     dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
-    dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
 
     dK_ptr = dK + pid_m * stride_dk_seq + pid_head * BLOCK_H * stride_dk_nheads
     dV_ptr = dV + pid_m * stride_dv_seq + pid_head * BLOCK_H * stride_dv_nheads
     dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, k_dim)[None, :]
-    dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
     dk = tl.load(dK_ptr + dk_in_off, mask=mask)
-    dv = tl.load(dV_ptr + dv_in_off, mask=mask)
     tl.store(dKV_ptr + dk_out_off, dk, mask=mask)
-    tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
+    # tl.arange requires end > start, so the value path must be pruned at
+    # compile time when v_dim == 0 (v_dim is a constexpr).
+    if v_dim > 0:
+        dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
+        dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
+        dv = tl.load(dV_ptr + dv_in_off, mask=mask)
+        tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
 
     if pid_head == 0:
         x_left_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
@@ -821,8 +827,10 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         if cu_seqlens_kv is None:
-            o_key = o_key.view(max_seqlen, -1, nheads, emb_dim + k_dim)
-            o_value = o_value.view(max_seqlen, -1, nheads, v_dim)
+            # Use the explicit batch_size: with v_dim == 0 o_value has zero
+            # elements and view(..., -1, ...) cannot infer the batch dim.
+            o_key = o_key.view(max_seqlen, batch_size, nheads, emb_dim + k_dim)
+            o_value = o_value.view(max_seqlen, batch_size, nheads, v_dim)
         return o_key, o_value
 
     @staticmethod
@@ -843,7 +851,9 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             # sbhd
             max_seqlen, batch_size, nheads, _ = dk.shape
             dk = dk.contiguous().view(-1, nheads, ctx.emb_dim + ctx.k_dim)
-            dv = dv.contiguous().view(-1, nheads, ctx.v_dim)
+            # dk's flattened length is authoritative: with v_dim == 0 dv has
+            # zero elements and view(-1, ...) cannot infer the leading dim.
+            dv = dv.contiguous().view(dk.shape[0], nheads, ctx.v_dim)
             total_seqlen = dk.shape[0]
         else:
             # thd
