@@ -89,8 +89,7 @@ class TestImportModule:
 
     def test_missing_module_raises(self):
         with pytest.raises(
-            ImportError,
-            match="Could not import module 'megatron.core.models.does_not_exist'",
+            ImportError, match="Could not import module 'megatron.core.models.does_not_exist'"
         ):
             import_module(('megatron.core.models.does_not_exist', 'missing_spec'))
 
