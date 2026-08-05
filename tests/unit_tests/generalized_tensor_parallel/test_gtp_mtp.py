@@ -120,7 +120,7 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
 
 
 def _forward_backward(model):
-    """One fwd+bwd on a fixed batch, then drain + finalize any in-flight GTP reduce-scatter."""
+    """One fwd+bwd on a fixed batch, then drain in-flight GTP comms the way production does."""
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import wait_async_comms
 
     for p in model.parameters():
@@ -135,9 +135,12 @@ def _forward_backward(model):
     with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         loss = model(input_ids, position_ids, attention_mask=None, labels=labels).mean()
     loss.backward()
-    # Mirror finalize_model_grads: drain in-flight RS and accumulate anything the chain cascade
-    # left pending, so the comparison never depends on drain timing.
-    wait_async_comms(finalize_after_drain=True)
+    # Match the eager production path: finalize_model_grads reaches
+    # wait_for_gtp_grad_reduction_on_current_stream, which calls wait_async_comms() WITHOUT
+    # finalize_after_drain. So a reduce-scatter still pending here is waited on but never
+    # accumulated, and its gradient is lost. Draining with finalize_after_drain=True would
+    # rescue exactly that case and hide it from the comparison below.
+    wait_async_comms()
     torch.cuda.synchronize()
     return float(loss.item())
 
@@ -324,6 +327,100 @@ def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=Fa
         GTP_CONFIG.pad_for_alignment = saved_pad
 
 
+def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
+    """A weight consumed N times per forward fires DDP grad-ready N times, not once.
+
+    Each consume finalizes the previous reduce-scatter, and every finalize calls the param's
+    grad-ready hook. DDP absorbs that only because bucket completion compares the per-param
+    count against a golden snapshot taken at the end of the first batch -- so the count has to
+    be identical on every later iteration.
+
+    Two requirements keep this separate from the other cases in this file: register_grad_ready
+    asserts overlap_grad_reduce, and the golden gate is first evaluated on batch 2, hence three
+    iterations. A desynchronized count makes finish_grad_sync raise, so completing the loop is
+    itself an assertion.
+    """
+    import collections
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed import param_and_grad_buffer as pgb
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    saved_pad = GTP_CONFIG.pad_for_alignment
+    orig_register = pgb._ParamAndGradBucketGroup.register_grad_ready
+    try:
+        GTP_CONFIG.pad_for_alignment = 0
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=world_size
+        )
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+
+        model = _build_mtp_gpt_model(repeated_layer=repeated_layer, moe=False)
+        classify_gtp_remat_chains([model])
+        name_of = {p: n for n, p in model.named_parameters()}
+
+        counts = collections.Counter()
+
+        def counting_register(self, param, *a, **k):
+            counts[name_of.get(param, "?")] += 1
+            return orig_register(self, param, *a, **k)
+
+        pgb._ParamAndGradBucketGroup.register_grad_ready = counting_register
+
+        ddp = DistributedDataParallel(
+            model.config,
+            DistributedDataParallelConfig(
+                use_distributed_optimizer=False, overlap_grad_reduce=True
+            ),
+            model,
+        )
+
+        gen = torch.Generator(device='cuda').manual_seed(7)
+        input_ids = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
+        position_ids = torch.arange(SEQ, device='cuda').unsqueeze(0).expand(BATCH, SEQ)
+        labels = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
+
+        # 3 iterations: batch 1 records golden, batches 2 and 3 are compared against it.
+        per_iter = []
+        for _ in range(3):
+            counts.clear()
+            ddp.zero_grad_buffer()
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                loss = ddp(input_ids, position_ids, attention_mask=None, labels=labels).mean()
+            loss.backward()
+            ddp.finish_grad_sync()  # raises if a bucket never reached its golden count
+            torch.cuda.synchronize()
+            per_iter.append(dict(counts))
+
+        del model, ddp
+        ps.destroy_model_parallel()
+        GTPShardedParam._chain_state = {}
+        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._link_tables_flushed = False
+    finally:
+        pgb._ParamAndGradBucketGroup.register_grad_ready = orig_register
+        GTP_CONFIG.pad_for_alignment = saved_pad
+
+    if rank != 0:
+        return
+
+    expected = 1 + MTP_NUM_LAYERS  # main head + one per MTP depth
+    for name in ("embedding.word_embeddings.weight", "output_layer.weight"):
+        got = [it.get(name, 0) for it in per_iter]
+        print(f"[ddp-grad-ready] {name:38s} fires per iteration={got}", flush=True)
+        assert got[0] == expected, f"{name}: {got[0]} grad-ready fires, expected {expected}"
+
+    assert per_iter[1] == per_iter[0] and per_iter[2] == per_iter[0], (
+        f"grad-ready counts vary across iterations {per_iter}; DDP's golden gate would never "
+        f"match and the bucket would go unreduced"
+    )
+
+
 class TestGTPMTP:
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
@@ -350,3 +447,14 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
+
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_mtp_shared_weight_ddp_grad_ready_counts(self, repeated_layer):
+        """A re-used weight fires DDP grad-ready once per consume, not once per iteration.
+
+        Guards the DDP side of the repeated-backward finalize: bucket completion is gated on a
+        golden per-param count, so that count must be stable across iterations.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_ddp_grad_ready_counts, 4, repeated_layer)
