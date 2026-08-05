@@ -3,7 +3,7 @@ ENV_VARS:
   NVTE_BWD_LAYERNORM_SM_MARGIN: 16
   TORCHINDUCTOR_WORKER_START: fork
   QUANTIZATION_TYPE_DEBUG: 1
-  # PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  PYTORCH_ALLOC_CONF: garbage_collection_threshold:0.8,roundup_power2_divisions:true,max_non_split_rounding_mb:1024
   NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 64
   USE_MNNVL: 1
   NON_DETERMINSTIC_RESULTS: 1
@@ -129,6 +129,8 @@ MODEL_ARGS:
   --ckpt-fully-parallel-load: true
   --ckpt-assume-constant-structure: true
   --async-save: true
+  --async-strategy: nvrx
+  --async-ckpt-use-cpu-shm: true
   --use-persistent-ckpt-worker: true
   --save-interval: 100
   --save-retain-interval: 2000
