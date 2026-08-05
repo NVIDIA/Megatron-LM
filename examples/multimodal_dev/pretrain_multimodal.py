@@ -142,13 +142,9 @@ def datasets_provider(train_val_test_num_samples):
     return provider_fn(train_val_test_num_samples)
 
 
-if __name__ == "__main__":
-    datasets_provider.is_distributed = True
-
-    args = parse_and_validate_args(
-        extra_args_provider=add_multimodal_args,
-        args_defaults={},
-    )
+def validate_entry_args(args) -> None:
+    """Reject statically-decidable misconfigurations before any model
+    construction (fail in seconds, not after multi-node setup)."""
     # multimodal_dev's model_provider builds the full model on every rank and
     # does not honor pre_process / post_process pipeline-stage flags. PP>1
     # would silently violate Megatron's pipeline-parallel contract.
@@ -159,6 +155,60 @@ if __name__ == "__main__":
             "builds the full model on every rank; pipeline-stage splitting is "
             "not wired through. Run with --pipeline-model-parallel-size 1."
         )
+    # MTP itself IS wired through (models/base.py passes mtp_block_spec to the
+    # language model). The conflict is narrower: this entry sets
+    # scatter_embedding_sequence_parallel=False and scatters later, so under an
+    # EFFECTIVE sequence-parallel layout the decoder embedding keeps its full
+    # [S, B, D] shape while MTP expects the scattered hidden states. Without SP
+    # (or at TP=1, where SP does nothing) the two agree and MTP is supported.
+    if (
+        getattr(args, "mtp_num_layers", 0)
+        and getattr(args, "sequence_parallel", False)
+        and args.tensor_model_parallel_size > 1
+    ):
+        raise ValueError(
+            "MTP is not supported together with sequence parallelism on this entry: "
+            "the deferred embedding scatter (scatter_embedding_sequence_parallel=False) "
+            "leaves the decoder embedding unscattered while MTP consumes scattered "
+            "hidden states. Run with --mtp-num-layers 0, or drop --sequence-parallel."
+        )
+    # The fixed-shape providers size their samples from --total-seq-length
+    # while pack_or_pad_batch caps at --seq-length, so this combination always
+    # aborts at step 1. It is decidable here, before the run costs anything.
+    total_seq_length = getattr(args, "total_seq_length", None)
+    if (
+        getattr(args, "dataset_provider", "mock") != "mock_varlen"
+        and total_seq_length is not None
+        and total_seq_length > args.seq_length
+    ):
+        raise ValueError(
+            f"--total-seq-length {total_seq_length} exceeds --seq-length "
+            f"{args.seq_length}: the fixed-shape providers would emit samples the "
+            "packer refuses to truncate. Lower --total-seq-length or raise "
+            "--seq-length."
+        )
+    # Statically decidable misconfig: the multimodal packed THD path does not
+    # support CUDA graphs (forward_step keeps a runtime guard as defense in
+    # depth); reject the combination at startup instead of at the first step.
+    if getattr(args, "use_packed_sequence", False) and getattr(
+        args, "cuda_graph_impl", "none"
+    ) not in (None, "none"):
+        raise ValueError(
+            "--use-packed-sequence is incompatible with "
+            f"--cuda-graph-impl {args.cuda_graph_impl}: the multimodal packed "
+            "THD path does not support CUDA Graph. Run with "
+            "--cuda-graph-impl none."
+        )
+
+
+if __name__ == "__main__":
+    datasets_provider.is_distributed = True
+
+    args = parse_and_validate_args(
+        extra_args_provider=add_multimodal_args,
+        args_defaults={},
+    )
+    validate_entry_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,
