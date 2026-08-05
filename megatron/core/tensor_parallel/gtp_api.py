@@ -2,16 +2,16 @@
 
 """Generalized Tensor Parallelism (GTP) public API.
 
-Thin re-export of the implementation in
-``megatron.core.tensor_parallel.generalized_tensor_parallelism`` (see that module
-for the design). GTP depends on TransformerEngine: if TE is missing or too old the
-inner module imports cleanly but reports ``HAVE_TE = False``, mirrored here as
-``HAVE_GTP = False``. Consumers gate every GTP code path behind ``if HAVE_GTP:``,
-so no core module uses GTP symbols without TE.
+Thin facade over the core implementation in ``generalized_tensor_parallelism`` and CUDA-graph
+lifecycle support in ``gtp_cuda_graphs``. GTP depends on TransformerEngine: if TE is missing or
+too old the core module imports cleanly but reports ``HAVE_TE = False``, mirrored here as
+``HAVE_GTP = False``. Consumers gate every GTP code path behind ``if HAVE_GTP:``, so no core
+module uses GTP symbols without TE.
 """
 
 try:
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
         HAVE_TE,
         GTPChain,
         GTPEmbeddingWeight,
@@ -23,12 +23,16 @@ try:
         get_rs_stream,
         gtp_native_fp8_load_context,
         gtp_remat_shard_dim0,
+        initialize_graph_wgrad_rings,
         is_gtp_param,
         make_sharded_tensors_for_checkpoint_with_gtp_remat,
-        set_cuda_graph_mempool,
         wait_async_comms,
         wait_for_gtp_grad_reduction_on_current_stream,
         wrap_module_params_gtp,
+    )
+    from megatron.core.tensor_parallel.gtp_cuda_graphs import (
+        set_cuda_graph_mempool,
+        track_gtp_capture_comms,
     )
 
     HAVE_GTP = HAVE_TE
@@ -40,6 +44,7 @@ except ImportError:
 
 __all__ = [
     "HAVE_GTP",
+    "GTP_CONFIG",
     "GTPChain",
     "GTPEmbeddingWeight",
     "attach_gtp_to_presharded_module",
@@ -51,8 +56,10 @@ __all__ = [
     "gtp_native_fp8_load_context",
     "gtp_remat_shard_dim0",
     "is_gtp_param",
+    "initialize_graph_wgrad_rings",
     "make_sharded_tensors_for_checkpoint_with_gtp_remat",
     "set_cuda_graph_mempool",
+    "track_gtp_capture_comms",
     "wait_async_comms",
     "wait_for_gtp_grad_reduction_on_current_stream",
     "wrap_module_params_gtp",
