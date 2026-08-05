@@ -117,7 +117,7 @@ first and incorrectly initialize itself as the root:
 ```python
 # On FsdpModule (module.py)
 def _replace_param_with_raw_if_needed(self) -> None:
-    self._lazy_init_context()
+    self.context.ensure_finalized()
 ```
 
 ### 1.3 Root backward-phase setup — `pre_backward()`
