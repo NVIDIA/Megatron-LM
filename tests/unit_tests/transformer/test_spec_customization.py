@@ -29,6 +29,23 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
+class TestGptLayerCheckpointKeys:
+    def test_dense_local_spec_uses_te_fused_layernorm_keys(self):
+        submodules = get_gpt_layer_local_submodules()
+
+        assert submodules.sharded_state_dict_keys_map == {
+            "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+            "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+        }
+
+    def test_moe_local_spec_keeps_te_standalone_pre_mlp_layernorm_key(self):
+        submodules = get_gpt_layer_local_submodules(num_experts=8)
+
+        assert submodules.sharded_state_dict_keys_map == {
+            "input_layernorm.": "self_attention.linear_qkv.layer_norm_"
+        }
+
+
 class TestSpecCustomization:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
