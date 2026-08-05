@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Tuple, Union
 
+
 @dataclass
 class ModuleSpec:
     """This is a Module Specification dataclass.
