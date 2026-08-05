@@ -1,6 +1,6 @@
 repos:
 - repo: https://github.com/psf/black
-  rev: 'refs/tags/24.4.2:refs/tags/24.4.2'
+  rev: 'refs/tags/26.3.0:refs/tags/26.3.0'
   hooks:
   - id: black
     files: ^megatron/core/.*|^tests/unit_tests/.*

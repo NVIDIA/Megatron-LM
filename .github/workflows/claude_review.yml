@@ -32,7 +32,7 @@ jobs:
           echo "sha=$(gh pr view $PR_NUMBER --repo $REPO --json headRefOid -q .headRefOid)" | tee -a $GITHUB_OUTPUT
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 1
           ref: ${{ steps.get-pr-head-commit.outputs.sha }}
@@ -44,14 +44,17 @@ jobs:
             -f content='eyes'
 
       - name: Run Claude Light Review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           trigger_phrase: "/claude review"
-          show_full_output: true
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read"
-            --model "claude-opus-4-6"
+            --model "${{ vars.CLAUDE_MODEL }}"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
@@ -128,7 +131,7 @@ jobs:
           echo "base_ref=$(echo $PR_DATA | jq -r .baseRefName)" >> $GITHUB_OUTPUT
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 1
           ref: ${{ steps.pr-info.outputs.sha }}
@@ -143,14 +146,17 @@ jobs:
             -f content='eyes'
 
       - name: Run Claude Strict Review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ secrets.NVIDIA_INFERENCE_URL }}
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1"
+          DISABLE_PROMPT_CACHING: "1"
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           trigger_phrase: "/claude strict-review"
-          show_full_output: true
           claude_args: |
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read"
-            --model "claude-opus-4-6"
+            --model "${{ vars.CLAUDE_MODEL }}"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}

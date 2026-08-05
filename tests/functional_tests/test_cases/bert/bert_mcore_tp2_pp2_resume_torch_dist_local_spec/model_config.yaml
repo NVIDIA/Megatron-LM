@@ -46,3 +46,4 @@ MODEL_ARGS:
   --ckpt-format: torch
   --attention-backend: local
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher

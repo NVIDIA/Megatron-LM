@@ -24,9 +24,15 @@ from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Se
 import torch
 import torch.distributed as dist
 from torch.utils.data import get_worker_info
-import zstandard
 
-from megatron.core.msc_utils import MultiStorageClientFeature
+try:
+    import zstandard
+
+    HAVE_ZSTANDARD = True
+except ImportError:
+    HAVE_ZSTANDARD = False
+
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.training import get_args
 from megatron.training.utils import get_blend_and_blend_per_split
 
@@ -92,11 +98,7 @@ def storage_makedirs(path: str, exist_ok: bool = True) -> None:
     """Create a local or MSC directory/prefix."""
     if not path:
         return
-    msc = _msc_if_needed(path)
-    if msc is not None:
-        msc.os.makedirs(path, exist_ok=exist_ok)
-    else:
-        os.makedirs(path, exist_ok=exist_ok)
+    maybe_msc.os.makedirs(path, exist_ok=exist_ok)
 
 
 def storage_move(src: str, dst: str) -> None:
@@ -353,6 +355,11 @@ def iter_logprobs_tar_entries(
 
 def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Decode one zstd-compressed cached-logits payload."""
+    if not HAVE_ZSTANDARD:
+        raise ImportError(
+            "zstandard is required to decode cached-logits payloads. "
+            "Install via `pip install zstandard`."
+        )
     data = zstandard.ZstdDecompressor().decompress(data)
     tensors = torch.load(io.BytesIO(data), weights_only=True)
     indices_list = [

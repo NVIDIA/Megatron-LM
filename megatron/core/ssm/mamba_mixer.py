@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -15,8 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
@@ -26,14 +25,20 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.ops.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.intermediate_extraction import (
+    scatter_intermediate_conv,
+    scatter_intermediate_ssm,
+)
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
+from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
-    cat_with_oom_fallback,
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
@@ -44,16 +49,24 @@ from megatron.core.utils import (
     is_mamba_min_version,
     is_using_quantization_scales,
     log_single_rank,
+    make_tp_sharded_tensor_for_checkpoint,
 )
+
+if HAVE_GTP:
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+else:
+    is_gtp_param = None
 
 from .mamba_context_parallel import MambaContextParallel
 
 try:
     from causal_conv1d import causal_conv1d_fn
+    from causal_conv1d import causal_conv1d_update as causal_conv1d_update_cuda
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
 except ImportError:
     causal_conv1d_fn = None
+    causal_conv1d_update_cuda = None
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
@@ -81,6 +94,12 @@ if not HAVE_MAMBA_SSM:
 
     RMSNormGated = MagicMock()
     HAVE_MAMBA_SSM = False
+
+MAMBA_HAS_STATE_DTYPE = (
+    HAVE_MAMBA_SSM
+    and ("state_dtype" in inspect.signature(mamba_split_conv1d_scan_combined).parameters)
+    and ("state_dtype" in inspect.signature(mamba_chunk_scan_combined).parameters)
+)
 
 try:
     from einops import rearrange, repeat
@@ -208,6 +227,14 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        self.mamba_training_ssm_states_dtype = (
+            config.mamba_training_ssm_states_dtype or config.params_dtype
+        )
+        if config.mamba_training_ssm_states_dtype is not None and not MAMBA_HAS_STATE_DTYPE:
+            raise RuntimeError(
+                "mamba_training_ssm_states_dtype is set, but the installed mamba_ssm does "
+                "not accept the `state_dtype` argument. Upgrade mamba_ssm or unset the option."
+            )
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -264,6 +291,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".in_proj") if name is not None else None,
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
@@ -400,6 +428,7 @@ class MambaMixer(MegatronModule):
             )
             setattr(self.norm.weight, "tensor_model_parallel", True)
             setattr(self.norm.weight, "partition_dim", 0)
+            self.norm.tp_group = self.pg_collection.tp
         # Assume sequence parallelism: input is partitioned along d_inner and
         # output is partitioned along the sequence dimension
         self.out_proj = build_module(
@@ -414,6 +443,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".out_proj") if name is not None else None,
         )
 
@@ -463,6 +493,10 @@ class MambaMixer(MegatronModule):
                 return self._dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
+                assert not self.config.batch_invariant_mode, (
+                    "batch_invariant_mode for Mamba inference is only supported with "
+                    "DynamicInferenceContext."
+                )
                 assert not self.config.sequence_parallel
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
@@ -635,6 +669,7 @@ class MambaMixer(MegatronModule):
         slot_allocator = context.mamba_slot_allocator
         intermediate_chunk_indices = metadata.intermediate_chunk_indices
         intermediate_abs_positions = metadata.intermediate_abs_positions
+        intermediate_real_count = metadata.intermediate_real_count
         intermediate_ssm_out = None
         intermediate_conv_out = None
         if slot_allocator is not None and mamba_layer_idx is not None:
@@ -650,9 +685,9 @@ class MambaMixer(MegatronModule):
             batch_indices=batch_indices,
             intermediate_chunk_indices=intermediate_chunk_indices,
             intermediate_abs_positions=intermediate_abs_positions,
+            intermediate_real_count=intermediate_real_count,
             intermediate_ssm_out=intermediate_ssm_out,
             intermediate_conv_out=intermediate_conv_out,
-            conv_gather_offsets=metadata.conv_gather_offsets,
             cu_chunk_seqlens=metadata.cu_chunk_seqlens,
             last_chunk_indices=metadata.last_chunk_indices,
             seq_idx_for_varlen=metadata.seq_idx_for_varlen,
@@ -723,6 +758,9 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
 
+        state_dtype_kwarg = (
+            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+        )
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -740,6 +778,7 @@ class MambaMixer(MegatronModule):
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
+            **state_dtype_kwarg,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
@@ -760,9 +799,9 @@ class MambaMixer(MegatronModule):
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_chunk_indices: Optional[torch.Tensor] = None,
         intermediate_abs_positions: Optional[torch.Tensor] = None,
+        intermediate_real_count: Optional[torch.Tensor] = None,
         intermediate_ssm_out: Optional[torch.Tensor] = None,
         intermediate_conv_out: Optional[torch.Tensor] = None,
-        conv_gather_offsets: Optional[torch.Tensor] = None,
         cu_chunk_seqlens: Optional[torch.Tensor] = None,
         last_chunk_indices: Optional[torch.Tensor] = None,
         seq_idx_for_varlen: Optional[torch.Tensor] = None,
@@ -787,12 +826,13 @@ class MambaMixer(MegatronModule):
                 intermediate state extraction (fixed size, padded with 0).
             intermediate_abs_positions: Pre-allocated tensor of absolute token
                 positions for conv state extraction (fixed size, padded with d_conv).
+            intermediate_real_count: int32[1] GPU tensor holding the number of
+                meaningful entries in the intermediate buffers this step. Read
+                inside the Triton scatter kernels so padded slots cost nothing.
             intermediate_ssm_out: Output buffer for extracted SSM states
                 [max_intermediate_count, *ssm_shape].
             intermediate_conv_out: Output buffer for extracted conv states
                 [max_intermediate_count, *conv_shape].
-            conv_gather_offsets: Constant tensor [-d_conv, ..., -1] for gathering
-                conv states.
             cu_chunk_seqlens: Precomputed chunk boundaries from MambaMetadata.
             last_chunk_indices: Precomputed last chunk index per sequence.
             seq_idx_for_varlen: Precomputed request ID per chunk.
@@ -957,6 +997,26 @@ class MambaMixer(MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
+            # Batch-invariant decode replays the partial prefill tail, so keep
+            # the cached SSM state at the last complete chunk boundary.
+            if self.config.batch_invariant_mode:
+                prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+                tail_lens = prefill_lens % self.chunk_size
+                has_boundary = prefill_lens >= self.chunk_size
+                # A partial tail uses the preceding full chunk's state.
+                boundary_chunk_indices = (
+                    last_chunk_indices.to(torch.long) - (tail_lens > 0).to(torch.long)
+                ).clamp(min=0)
+
+            # Extraction is enabled when the slot allocator wired buffers in via
+            # the caller. When enabled, the chunk scan returns its raw states so
+            # our Triton kernels do a fused gather+conditional-scatter directly,
+            # skipping the dense intermediate tensor and the padded-slot writes.
+            extract_intermediates = (
+                not self.config.batch_invariant_mode
+                and intermediate_chunk_indices is not None
+                and intermediate_ssm_out is not None
+            )
             ssm_varlen_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
@@ -973,49 +1033,74 @@ class MambaMixer(MegatronModule):
                     if self.D_has_hdim
                     else self.cp.get_D()
                 ),
-                z=z if not self.rmsnorm else None,
+                z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
                 dt_bias=self.cp.get_dt_bias().float(),
                 initial_states=initial_ssm_state,
-                return_intermediate_states=False,
-                intermediate_chunk_indices=intermediate_chunk_indices,
+                return_raw_states=self.config.batch_invariant_mode or extract_intermediates,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 state_dtype=ssm_state.dtype,
             )
 
-            if intermediate_chunk_indices is not None:
-                ssm_varlen_states, intermediate_ssm_states = ssm_varlen_result
+            if self.config.batch_invariant_mode or extract_intermediates:
+                ssm_varlen_states, raw_ssm_states = ssm_varlen_result
             else:
                 ssm_varlen_states = ssm_varlen_result
-                intermediate_ssm_states = None
+                raw_ssm_states = None
 
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+            if self.config.batch_invariant_mode:
+                boundary_mask = has_boundary.view(-1, 1, 1, 1)
+                cache_states = torch.where(
+                    boundary_mask, raw_ssm_states[boundary_chunk_indices], initial_ssm_state
+                )
+            else:
+                cache_states = ssm_varlen_states
 
-            # Write intermediate states to pre-allocated output buffers
-            # All tensor ops, no Python loops, fully CUDA graph compatible.
-            # The destination buffers are sized to the global max_intermediate_count
-            # but we only fill the per-graph-bucket prefix; readers consult
-            # per_request_intermediate_counts to know the real count.
-            if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
-                n = intermediate_ssm_states.shape[0]
-                intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
+            tensor_masked_update(ssm_state, batch_indices, cache_states)
+            if self.config.batch_invariant_mode:
+                self._get_batch_invariant_decoder().seed(
+                    x,
+                    z.squeeze(0),
+                    dt,
+                    B,
+                    C,
+                    cu_seqlens,
+                    batch_indices,
+                    max_requests=ssm_state.shape[0],
+                )
 
-                # Vectorized conv state extraction
-                # conv_gather_offsets: [d_conv] = [-d_conv, ..., -1]
-                gather_positions = (
-                    intermediate_abs_positions.unsqueeze(1).long()
-                    + conv_gather_offsets.unsqueeze(0).long()
-                )  # [n, d_conv]
-                intermediate_conv = xBC_pre_conv[0, gather_positions, :]
-                # [n, d_conv, conv_dim]
-                intermediate_conv_out[:n].copy_(intermediate_conv.transpose(1, 2))
-                # [n, conv_dim, d_conv]
+            if extract_intermediates:
+                # Fused gather+conditional-scatter for SSM: read row
+                # raw_ssm_states[chunk_indices[i]] into intermediate_ssm_out[i],
+                # only for i < real_count.
+                scatter_intermediate_ssm(
+                    raw_ssm_states,
+                    intermediate_chunk_indices,
+                    intermediate_real_count,
+                    intermediate_ssm_out,
+                )
+                # Same pattern for conv: gather a length-d_conv window ending at
+                # abs_positions[i] (clamped into the valid token range) from
+                # xBC_pre_conv and scatter (transposed) into intermediate_conv_out[i],
+                # only for i < real_count.
+                scatter_intermediate_conv(
+                    xBC_pre_conv,
+                    intermediate_abs_positions,
+                    intermediate_real_count,
+                    intermediate_conv_out,
+                    d_conv=intermediate_conv_out.shape[-1],
+                )
         else:
             # Non-dynamic-batching path (static batching)
             initial_ssm_state = None
+            state_dtype_kwarg = (
+                {"state_dtype": self.mamba_training_ssm_states_dtype}
+                if MAMBA_HAS_STATE_DTYPE
+                else {}
+            )
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
@@ -1033,6 +1118,7 @@ class MambaMixer(MegatronModule):
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
                 initial_states=initial_ssm_state,
+                **state_dtype_kwarg,
             )
 
             if ssm_state is not None:
@@ -1045,7 +1131,7 @@ class MambaMixer(MegatronModule):
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
             z = self.cp.post_conv_ssm(z)
-            y = self.norm(y, z)
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
@@ -1066,6 +1152,12 @@ class MambaMixer(MegatronModule):
                 self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
             self._A_neg_exp_cache_stale = False
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+
+    def _get_batch_invariant_decoder(self) -> MambaBatchInvariantDecode:
+        """Batch-invariant decode adapter, created on first use."""
+        if not hasattr(self, "_batch_invariant_decoder"):
+            self._batch_invariant_decoder = MambaBatchInvariantDecode(self)
+        return self._batch_invariant_decoder
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
@@ -1116,7 +1208,30 @@ class MambaMixer(MegatronModule):
         )
 
         # Conv step
-        if causal_conv1d_update is None:
+        if self.config.batch_invariant_mode:
+            # Match the causal-conv1d arithmetic used by the training forward.
+            assert (
+                causal_conv1d_update_cuda is not None
+            ), "Batch-invariant Mamba decode requires causal-conv1d"
+            assert seq_len == 1, "Batch-invariant Mamba decode supports one token per request"
+            assert (
+                intermediate_conv_state is None
+            ), "Batch-invariant Mamba decode does not support speculative decoding"
+            assert (
+                batch_indices is not None and batch_indices.dtype == torch.int32
+            ), "Batch-invariant Mamba decode requires int32 dynamic-batching indices"
+
+            xBC_dtype = xBC.dtype
+            xBC = causal_conv1d_update_cuda(
+                xBC.to(conv_state.dtype).squeeze(1),
+                conv_state,
+                rearrange(self.conv1d_weight, "d 1 w -> d w").to(conv_state.dtype),
+                self.conv1d_bias.to(conv_state.dtype),
+                self.activation,
+                conv_state_indices=batch_indices,
+            ).unsqueeze(1)
+            xBC = xBC.to(xBC_dtype)
+        elif causal_conv1d_update is None:
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
             xBC_squeeze = xBC.squeeze(1)
@@ -1152,7 +1267,12 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
         # SSM step
-        if selective_state_update is None:
+        if self.config.batch_invariant_mode:
+            assert (
+                batch_indices is not None
+            ), "batch_invariant_mode for Mamba decode requires batch_indices from dynamic batching."
+            y = self._get_batch_invariant_decoder().step(x, z, dt, B, C, batch_indices, ssm_state)
+        elif selective_state_update is None:
             # Fallback uses 1D A; the decode cache is pre-expanded for Triton.
             A = -torch.exp(self.A_log.float())
             # TODO(ksanthanam): Consider deprecating this path
@@ -1241,7 +1361,7 @@ class MambaMixer(MegatronModule):
             y = rearrange(y, "b s h p -> b s (h p)")
 
         if self.rmsnorm:
-            y = self.norm(y, z)
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
@@ -1310,6 +1430,8 @@ class MambaMixer(MegatronModule):
                 "conv1d_bias": 0,
             },
             sharded_offsets=sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
         # Submodules
         for name, module in self.named_children():
@@ -1331,6 +1453,38 @@ class MambaMixer(MegatronModule):
             + 2 * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp
         )
+        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|x|B|C|dt] split boundaries
+        # don't line up with GTP slice boundaries, so gather the shards back to TP-local size
+        # (strip the trailing pad rows from the gathered tail) and fall through to the same
+        # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
+        in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
+        if in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight):
+            gtp_remat_group = self.in_proj.weight.group
+            # in_proj.weight was already built at the sharded size by the submodule
+            # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
+            # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
+            # full TP-local size so the [z|x|B|C|dt] split below matches a non-GTP run.
+            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
+            gathered = torch.empty(
+                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
+                dtype=local.dtype,
+                device=local.device,
+            )
+            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
+            if gathered.shape[0] != in_proj_dim:
+                gathered = gathered[:in_proj_dim].contiguous()
+            # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
+            dp_cp_rank = torch.distributed.get_rank(metadata['dp_cp_group'])
+            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
+                gathered,
+                f"{prefix}in_proj.weight",
+                tp_axis=0,
+                replica_id=(0, 0, dp_cp_rank),
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
+
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
             in_proj_dim,
             sharded_state_dict[f"{prefix}in_proj.weight"],
@@ -1348,6 +1502,40 @@ class MambaMixer(MegatronModule):
             ["z", "x", "B", "C", "dt"],
             0,
         )
+
+        # GTP load-side inverse of the save-time all-gather (see
+        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj
+        # note): the checkpoint stores the FULL TP-local in_proj.weight (pad stripped) under the
+        # 5 split keys [z|x|B|C|dt], so the default merge_fn cats them back to ``in_proj_dim``
+        # rows with no padding. To reload into the live GTP param we must mirror init
+        # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
+        # ``gtp_local_size * gtp_remat_size``, then slice by ``gtp_rank``. GTP_remat_size=1 has no
+        # pad/slice.
+        if in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight):
+            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
+            gtp_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
+            gtp_local_size = self.in_proj.weight.data.size(0)
+            original_merge_fn = factory.merge_fn
+
+            @torch.no_grad()
+            def _gtp_slice_after_cat(
+                sub_state_dict,
+                _orig=original_merge_fn,
+                _rank=gtp_local_rank,
+                _size=gtp_local_size,
+                _gtp_remat_size=in_proj_gtp_remat_size,
+            ):
+                full = _orig(sub_state_dict)
+                aligned_total = _size * _gtp_remat_size
+                pad_rows = aligned_total - full.shape[0]
+                if pad_rows > 0:
+                    full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))
+                start = _rank * _size
+                return full[start : start + _size].contiguous()
+
+            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
+                factory, merge_fn=_gtp_slice_after_cat
+            )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
         assert sharded_state_dict[f"{prefix}conv1d_weight"].data.size(0) == conv_dim, (
@@ -1372,66 +1560,6 @@ class MambaMixer(MegatronModule):
             )
 
         return sharded_state_dict
-
-
-def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
-) -> ShardedTensorFactory:
-    """Builds a factory that splits a given ShardedTensor into several independent chunks."""
-    assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
-    orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
-
-    if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
-        raise ValueError(
-            f"Split sections must cover the whole dimension size, "
-            f"got {split_sections=} vs dimensions size "
-            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
-        )
-
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
-    assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
-
-    @torch.no_grad()
-    def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-    ):
-        factory_sh_ten = replace(
-            orig_sh_ten_no_data,
-            key=key,
-            data=t,
-            dtype=t.dtype,
-            replica_id=replica_id,
-            flattened_range=flattened_range,
-        )
-
-        chunk_sh_tens = []
-        split_start = 0
-        for split_size, split_name in zip(split_sections, split_names):
-            split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
-            for sh_ten in split_chunks:
-                sh_ten.key = f"{sh_ten.key}.{split_name}"
-            chunk_sh_tens.extend(split_chunks)
-            split_start += split_size
-
-        assert split_start == orig_sh_ten_no_data.local_shape[split_dim], (
-            split_start,
-            orig_sh_ten_no_data.local_shape[split_dim],
-        )
-        assert sum(sh_ten.data.numel() for sh_ten in chunk_sh_tens) == t.numel(), (
-            chunk_sh_tens,
-            t.shape,
-        )
-        return chunk_sh_tens
-
-    return ShardedTensorFactory(
-        orig_sh_ten.key,
-        orig_sh_ten.data,
-        sh_ten_build_fn,
-        cat_with_oom_fallback,
-        orig_sh_ten.replica_id,
-    )
 
 
 def _check_mamba_sequence_packing_support(

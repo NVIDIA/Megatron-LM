@@ -16,14 +16,13 @@ import transformers
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
-from megatron.training.utils import get_ltor_masks_and_position_ids, print_rank_0
-from utils import get_hf_tokenizer
+from megatron.training.utils import print_rank_0
+from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 from model_provider import model_provider
 from megatron.core.parallel_state import get_context_parallel_group
 
@@ -41,25 +40,6 @@ def add_finetune_args(parser):
 
     add_modelopt_args(parser)
     return parser
-
-def get_eos_id():
-    """Return the eos token id.
-
-    We insert eos_token between two samples during packing. However, if the eos_token is used in message or after turns,
-    we need to replace it with some other special tokens that do not appear in message."""
-    hf_tokenizer = get_hf_tokenizer()
-
-    if hf_tokenizer.eos_token == "<|eot_id|>":
-        return 128001
-    if hf_tokenizer.eos_token == "<|eot|>":
-        return 200001
-    if hf_tokenizer.eos_token == "<|im_end|>":
-        return 151643
-    if hf_tokenizer.eos_token == "<|return|>":
-        return 199999
-
-    return hf_tokenizer.eos_token_id
-
 
 class OfflineDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir: str, num_samples):
@@ -283,7 +263,7 @@ class SFTDataset(torch.utils.data.Dataset):
         # We always add eos between samples for training purpose.
         input_ids = self.tokenizer.apply_chat_template(example)
         current_loss_mask = [1] * len(input_ids)
-        input_ids = input_ids + [get_eos_id()]
+        input_ids = input_ids + [get_eos_token_id(self.tokenizer)]
         current_loss_mask += [0]
 
         assert len(input_ids) == len(current_loss_mask)
@@ -396,7 +376,7 @@ def get_batch(data_iterator):
         datatype = torch.int64
         data_b = tensor_parallel.broadcast_data(keys, data, datatype)
         data_b["loss_mask"] = torch.ones_like(data_b["input_ids"])
-        data_b["loss_mask"][data_b["loss_mask"]==get_eos_id()] = 0
+        data_b["loss_mask"][data_b["loss_mask"] == get_eos_token_id()] = 0
         data_b["loss_mask"] = torch.cat([data_b["loss_mask"], torch.zeros(1,1).to(torch.cuda.current_device())], dim=-1)
 
         keys = ["aux_hidden_states", "hidden_states"]
@@ -404,36 +384,21 @@ def get_batch(data_iterator):
         feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
 
-    # Unpack the data received.
-    tokens_ = data_b["input_ids"]
-    tokens = tokens_[:, 0 : 0 + args.seq_length].contiguous()
-    labels = tokens_[:, 1 : 1 + args.seq_length].contiguous()
-    answer_only_loss_mask = data_b["loss_mask"][:, 1 : 1 + args.seq_length].contiguous()
-
-    # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens, get_eos_id(), get_eos_id(), args.reset_position_ids, args.reset_attention_mask, args.eod_mask_loss, False
+    sample_loss_mask = data_b.get("loss_mask")
+    batch = build_lm_batch(
+        data_b["input_ids"],
+        args.seq_length,
+        sample_loss_mask=sample_loss_mask,
+        eos_token_id=get_eos_token_id(),
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        cp_group=get_context_parallel_group(),
     )
-    loss_mask = loss_mask * answer_only_loss_mask.to(dtype=loss_mask.dtype)
-
-
-    labels = labels.contiguous()
-    loss_mask = loss_mask.contiguous()
-
-    batch = {
-        "tokens": tokens,
-        "labels": labels,
-        "loss_mask": loss_mask,
-        "attention_mask": attention_mask,
-        "position_ids": position_ids,
-    }
 
     if args.export_offline_model:
-        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:args.seq_length]
-        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:args.seq_length]
-
-    # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=get_context_parallel_group())
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[: args.seq_length]
+        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
 
     return batch
 
@@ -492,8 +457,8 @@ if __name__ == "__main__":
     pretrain(
         pretrain_cfg_container_from_args(args),
         train_valid_test_sft_datasets_provider,
-        partial(model_provider, modelopt_gpt_hybrid_builder),
         ModelType.encoder_or_decoder,
         forward_step,
+        partial(model_provider, modelopt_gpt_hybrid_builder),
         non_loss_data_func=non_loss_data_func,
     )
