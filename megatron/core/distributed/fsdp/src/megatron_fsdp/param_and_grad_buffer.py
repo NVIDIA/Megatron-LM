@@ -4611,26 +4611,18 @@ class AllGatherPipeline:
         pipeline_hfsdp_gathers = (
             self.buffer.ddp_config.hfsdp_param_gather_overlap
             and self.buffer.dist_index.use_hybrid_fsdp
-            and self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard"
+            and self.buffer.ddp_config.outer_dp_sharding_strategy == "optim"
         )
         outer_ag_buckets = []
 
-        if pipeline_hfsdp_gathers:
-            if should_prefetch:
-                inner_prefetch_units = 1
-                if self.buffer.ddp_config.fsdp_double_buffer:
-                    inner_prefetch_units = min(1, max(0, 2 - len(double_buf_units)))
-                ag_buckets = self._extend_by_fsdp_units(
-                    ag_buckets, prefetch_order, inner_prefetch_units
-                )
-
-            if outer_fsdp_group_param_gather:
-                outer_ag_buckets = self._extend_by_fsdp_units(
-                    ag_buckets, prefetch_order, 1 if should_prefetch else 0
-                )
-        elif should_prefetch:
+        if should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
                 ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
+            )
+
+        if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
+            outer_ag_buckets = self._extend_by_fsdp_units(
+                ag_buckets, prefetch_order, 1 if should_prefetch else 0
             )
 
         if outer_ag_buckets:
