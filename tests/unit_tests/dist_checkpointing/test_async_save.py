@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -163,3 +164,29 @@ class TestHasNvrxAsyncSupport:
         ):
             with pytest.raises(AssertionError, match="Minimum required nvidia-resiliency-ext"):
                 has_nvrx_async_support()
+
+
+class TestFileSystemWriterAsync:
+    @staticmethod
+    def _write_buckets(tensor):
+        return [(Path("checkpoint"), "storage-key", ([], [(mock.sentinel.item, tensor)]))]
+
+    def test_preload_cpu_tensors_does_not_synchronize_cuda(self):
+        tensor = torch.ones(2)
+
+        with mock.patch.object(torch.cuda, "synchronize") as synchronize:
+            result = FileSystemWriterAsync.preload_tensors(self._write_buckets(tensor))
+
+        synchronize.assert_not_called()
+        assert result[0][2][1][0][1] is tensor
+
+    def test_preload_cuda_tensors_synchronizes_cuda(self):
+        tensor = mock.MagicMock()
+        tensor.is_cuda = True
+        tensor.to.return_value = torch.ones(2)
+
+        with mock.patch.object(torch.cuda, "synchronize") as synchronize:
+            FileSystemWriterAsync.preload_tensors(self._write_buckets(tensor))
+
+        tensor.to.assert_called_once_with("cpu", non_blocking=True)
+        synchronize.assert_called_once_with()
