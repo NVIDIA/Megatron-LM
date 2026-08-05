@@ -24,15 +24,20 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-from ..mixed_precision import MixedPrecisionPolicy
+from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
 from .indexed_order import IndexedOrder
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 
 
 def _is_in_backward() -> bool:
     """Return whether the current thread is executing an autograd GraphTask."""
     return torch._C._current_graph_task_id() != -1
+
+
+def _is_fp8_parameter(parameter: nn.Parameter) -> bool:
+    """Whether ``parameter`` is an MXFP8 primary weight (needs both orientations)."""
+    return is_float8tensor(parameter) and fp8_need_transpose_data(parameter)
 
 
 class FsdpContext:
@@ -190,20 +195,32 @@ class FsdpModule:
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
+
+        for name, parameter in owned_parameters.items():
+            if is_float8tensor(parameter) and not fp8_need_transpose_data(parameter):
+                raise ValueError(
+                    f"MFSDP v2 only supports MXFP8 primary weights; parameter {name!r} is "
+                    f"a {type(parameter).__name__} without transpose data."
+                )
+
         parameter_groups = []
         for group_parameters in _group_parameters(owned_parameters):
             group_dtype = next(iter(group_parameters.values())).dtype
+            is_fp8_group = all(_is_fp8_parameter(p) for p in group_parameters.values())
+            parameter_group_type = Fp8ParameterGroup if is_fp8_group else FsdpParameterGroup
             parameter_groups.append(
-                FsdpParameterGroup(
+                parameter_group_type(
                     owning_module=self,
                     parameters=group_parameters,
                     mesh=mesh,
                     model_weight_placements=_specialize_placements(
-                        model_weight_placements, group_dtype
+                        model_weight_placements, group_dtype, is_fp8_group
                     ),
-                    main_grad_placements=_specialize_placements(main_grad_placements, group_dtype),
+                    main_grad_placements=_specialize_placements(
+                        main_grad_placements, group_dtype, is_fp8_group
+                    ),
                     main_weight_placements=_specialize_placements(
-                        main_weight_placements, group_dtype
+                        main_weight_placements, group_dtype, is_fp8_group
                     ),
                     mixed_precision_policy=mixed_precision_policy,
                     allgather_stream=context.allgather_stream,
@@ -365,13 +382,18 @@ class FsdpModule:
             if next_module is not None:
                 next_module._unshard_parameter_groups()
 
-    def _unshard_parameter_groups(self) -> None:
+    def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
 
         If ``_unshard_event`` is already set, this FsdpModule was already
         unsharded or prefetched and this method is a no-op. Otherwise, this
         method records ``_unshard_event`` after materialization so compute
         can wait without depending on later release work.
+
+        Args:
+            orientation: Payload orientation to gather for MXFP8 groups —
+                ``"rowwise"`` on the forward pass, ``"colwise"`` on the
+                backward pass. Ignored by regular groups.
         """
         if self._unshard_event is not None:
             return
@@ -379,7 +401,7 @@ class FsdpModule:
         allgather_stream = self.context.allgather_stream
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters()
+                group.unshard_parameters(orientation)
             self._unshard_event = allgather_stream.record_event()
 
     def post_forward(self) -> None:
@@ -437,13 +459,13 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self._unshard_parameter_groups()
+        self._unshard_parameter_groups("colwise")
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
         next_module = context.backward_order.next_item(self)
         if next_module is not None:
-            next_module._unshard_parameter_groups()
+            next_module._unshard_parameter_groups("colwise")
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
@@ -544,14 +566,14 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        key = (parameter.dtype, parameter.requires_grad, _is_fp8_parameter(parameter))
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
 def _specialize_placements(
-    placements: tuple[Placement, ...], dtype: torch.dtype
+    placements: tuple[Placement, ...], dtype: torch.dtype, is_fp8_group: bool = False
 ) -> tuple[Placement, ...]:
     """Specialize public placements for one homogeneous parameter group.
 
@@ -559,7 +581,7 @@ def _specialize_placements(
     DBuffer-specific ``Flat`` format. This dtype-homogeneous group boundary is
     where MXFP8 groups will instead select ``BlockAtomic``.
     """
-    if dtype not in (torch.float32, torch.bfloat16, torch.float16):
+    if not is_fp8_group and dtype not in (torch.float32, torch.bfloat16, torch.float16):
         raise NotImplementedError(f"Unsupported dtype: {dtype}.")
     for placement in placements:
         if type(placement) is Shard and placement.dim != 0:
@@ -608,7 +630,7 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, args, kwargs) -> None:
     target = _find_fsdp_target(submodule)
     if target is None:
         return
-    target._unshard_parameter_groups()
+    target._unshard_parameter_groups("rowwise")
     if target._unshard_event is not None:
         target.context.current_stream().wait_event(target._unshard_event)
 
@@ -619,7 +641,7 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, args, kwargs) -> None:
     if not is_recomputing:
         next_module = target.context.forward_order.next_item(target)
         if next_module is not None:
-            next_module._unshard_parameter_groups()
+            next_module._unshard_parameter_groups("rowwise")
 
 
 def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
@@ -651,6 +673,6 @@ def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
         return
     if target.phase is FsdpModule.Phase.RESTING:
         target.phase = FsdpModule.Phase.BACKWARD
-    target._unshard_parameter_groups()
+    target._unshard_parameter_groups("colwise")
     if target._unshard_event is not None:
         target.context.current_stream().wait_event(target._unshard_event)
