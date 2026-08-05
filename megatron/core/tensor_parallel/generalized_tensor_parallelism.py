@@ -246,6 +246,17 @@ def classify_gtp_chains(model) -> None:
         # scatter-add on sharded rows, input has no dgrad) — saves one collective.
         if "embedding" in name:
             param._need_weight_prefetch_bwd = False
+
+        # Reuse the fwd-gathered weight in the bwd dgrad. Safe only when no same-key gather
+        # falls between them: the output layer is last in fwd, first in bwd. A mid-chain param
+        # would also need _need_weight_prefetch_bwd = False. Excluded under native FP8 (fwd is
+        # rowwise-, bwd columnwise-scaled) and for tied weights, which are "embedding..."-named
+        # and gather twice per fwd, so retention would have to key off the second gather.
+        if "output_layer" in name and not getattr(param, "_gtp_native_fp8", False):
+            param._retain_for_bwd = True
+            # Reuse replaces the bwd gather, so stop any successor prefetching it (inert while
+            # the output layer is the chain tail and has none; correct if that ever changes).
+            param._need_weight_prefetch_bwd = False
     if conflicts:
         raise RuntimeError(
             "classify_gtp_chains: the following params were already chain-initialized "
@@ -822,6 +833,9 @@ def _init_gtp_runtime_attrs(obj):
     # (wgrad is a token-indexed scatter-add, input non-differentiable). classify_gtp_chains()
     # sets this False for embedding.word_embeddings.weight.
     obj._need_weight_prefetch_bwd = True
+    # Set for output_layer.weight by classify_gtp_chains; drives the fwd buffer's pin in
+    # GTPWeightCache.reserve and the reuse short-circuit in _all_gather_weight.
+    obj._retain_for_bwd = False
     obj.ag_event = torch.cuda.Event(external=True)
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
@@ -1154,7 +1168,11 @@ class GTPShardedParam(torch.nn.Parameter):
         return tensor[: -self.pad_length]
 
     def _all_gather_weight(self, async_op, fwd, nvtx_label=None):
-        """Quantize (if needed) and all-gather weight. Returns (weight_total, handle)."""
+        """Quantize (if needed) and all-gather weight. Returns (weight_total, handle).
+
+        A _retain_for_bwd weight never reaches here for a bwd gather: its consume is served by
+        _reuse_fwd_weight_for_bwd and its prefetch is suppressed by _need_weight_prefetch_bwd.
+        """
         if nvtx_label is None:
             nvtx_label = (
                 self._debug_name + (".fwd" if fwd else ".bwd") + (".async" if async_op else ".sync")
@@ -1370,6 +1388,20 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
+    def _reuse_fwd_weight_for_bwd(self):
+        """Serve the bwd dgrad from the pinned fwd buffer: no collective, no _ag_ticket_bwd.
+
+        The buffer is pinned, so nothing has overwritten it since the fwd gather, and the
+        issuer's bwd prefetch is suppressed via _need_weight_prefetch_bwd.
+        """
+        nvtx_range_push(f"{self._debug_name}.bwd.reuse_fwd_weight")
+        cache = get_global_GTP_cache()
+        bufs = [cache.get(w._ag_ticket_fwd) for w in self._weights]
+        nvtx_range_pop()
+        bufs = [self._strip_padding(b) for b in bufs]
+        bufs = [b.detach().requires_grad_(w.requires_grad) for b, w in zip(bufs, self._weights)]
+        return bufs if self.is_routed_expert else bufs[0]
+
     def all_gather_and_prefetch_bwd(self, nvtx_label=None):
         """Backward variant: get the current weight (cached if prefetched, else sync gather)
         and async-prefetch prev_w.
@@ -1382,7 +1414,9 @@ class GTPShardedParam(torch.nn.Parameter):
             weight_total
         """
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        if self._retain_for_bwd:
+            result = self._reuse_fwd_weight_for_bwd()
+        elif GTP_CONFIG.weight_prefetch and self.next_w is not None:
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
@@ -1408,7 +1442,9 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.weight_prefetch and self.next_w is not None:
             cache = get_global_GTP_cache()
             for w in self._weights:
-                cache.release(w._ag_ticket_bwd)
+                # _retain_for_bwd weights skip the bwd gather, so their ticket may be None.
+                if w._ag_ticket_bwd is not None:
+                    cache.release(w._ag_ticket_bwd)
 
         return result
 
@@ -1500,7 +1536,10 @@ class GTPShardedParam(torch.nn.Parameter):
             self._ensure_distinct_buffer_from_prev(dtypes[0])
 
             for w, dt in zip(self._weights, dtypes):
-                w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
+                # Reuse the ticket the on-demand consume already reserved: a fresh one would
+                # orphan its buffer, and a pinned buffer never returns to the pool.
+                if w._ag_ticket_fwd is None:
+                    w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
                 cache.get(w._ag_ticket_fwd)
                 cache.release(w._ag_ticket_fwd)
 
@@ -1884,6 +1923,11 @@ class _TicketSlot:
     fwd: bool
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
+    # Held from its fwd gather until the bwd dgrad consumes it, so never pooled again once
+    # bound. Slots created BEFORE the pin may share it -- they gather earlier in fwd and later
+    # in bwd, outside that window. Slots created AFTER it would gather inside the window, and
+    # cannot share it: the pin keeps the buffer out of the pool. Read only by get().
+    pin_for_fwd: bool = False
 
 
 # CUDA-graph memory pool: routes GRAPHED-chain allocations (AG/RS buffers, quantized weight
@@ -1941,6 +1985,9 @@ class GTPWeightCache:
         self._slots: Dict[int, _TicketSlot] = {}
         self._next_ticket: int = 0
         self._total_bytes: int = 0  # running total of allocated bytes
+        # Buffers held across the fwd->bwd boundary. release() refuses to pool these whichever
+        # ticket asks, so nothing created after the pin can adopt one.
+        self._pinned_bufs: List[torch.Tensor] = []
         self.key_to_allocate_func = {}
 
     @staticmethod
@@ -2012,6 +2059,8 @@ class GTPWeightCache:
             reduce_scatter=reduce_scatter,
             fwd=fwd,
             chain_id=getattr(param, "chain_id", GTPChain.UNGRAPHED.value),
+            # Derived here so the two fwd-ticket reserve sites cannot disagree.
+            pin_for_fwd=fwd and getattr(param, "_retain_for_bwd", False),
         )
         return ticket
 
@@ -2033,6 +2082,8 @@ class GTPWeightCache:
                 slot.reduce_scatter,
                 slot.fwd,
             )
+            if slot.pin_for_fwd:
+                self._pinned_bufs.append(slot.buf)
 
         return slot.buf
 
@@ -2045,15 +2096,24 @@ class GTPWeightCache:
         slot = self._slots[ticket]
         if slot.buf is None:
             return
+        # Checked on the BUFFER, not the slot: a slot that adopted this one before it was
+        # pinned would otherwise put it back into circulation.
+        if any(b is slot.buf for b in self._pinned_bufs):
+            return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
         if not any(b is slot.buf for b in self._pool.get(slot.key, [])):
             self._pool[slot.key].append(slot.buf)
 
     def clear(self):
-        """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""
+        """Drop all buffers; tickets remain valid and lazily re-allocate on next get().
+
+        Pinned buffers are dropped too, so this must not run between a pinned slot's fwd gather
+        and the bwd that consumes it -- the next get() would return a never-gathered buffer.
+        """
         for slot in self._slots.values():
             slot.buf = None
+        self._pinned_bufs.clear()
         self._pool.clear()
         self._total_bytes = 0
 
@@ -2225,8 +2285,7 @@ class GTPEmbeddingWeight(torch.autograd.Function):
 
 
 def reset_gtp_state():
-    """Clear the process-global GTP prefetch-chain state (GTPShardedParam._chain_state /
-    ._recompute_chain_state).
+    """Clear the process-global GTP prefetch-chain state and gather-buffer cache.
 
     These class-level dicts survive model teardown, so a GTP model rebuilt in-process would
     inherit stale last_weight pointers / flushed link tables. Call once before the per-chunk
@@ -2235,6 +2294,10 @@ def reset_gtp_state():
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
+    # Buffers outlive the params that allocated them: pooled ones are recycled by the rebuilt
+    # model, but a pinned buffer never is. Safe here -- runs before the first forward, so
+    # nothing is mid-retention.
+    get_global_GTP_cache().clear()
 
 
 # ------------------------------------------------------------------------

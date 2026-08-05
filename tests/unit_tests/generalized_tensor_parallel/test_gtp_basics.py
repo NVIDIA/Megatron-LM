@@ -173,6 +173,113 @@ class TestWrapModuleParams:
 
 
 # ---------------------------------------------------------------------------
+# Output-layer weight is gathered once per step, not twice
+# ---------------------------------------------------------------------------
+
+
+def _worker_output_layer_weight_gathered_once(rank, world_size, port):
+    """The output layer gathers its weight in forward and reuses it in backward.
+
+    Its backward would otherwise re-gather the identical full weight, so the forward
+    result is retained and reused, saving one collective. Two halves are covered here:
+
+    * Which layers opt in. The opt-in is a name match, mirroring the embedding
+      bwd-prefetch opt-out. Ordinary weights must not opt in, and neither must an
+      "embedding..."-named one -- which is how a tied output weight is registered, so
+      tied models simply do not get this optimization.
+    * That the reuse actually happens. No backward gather ticket may be reserved -- that
+      is what distinguishes the reuse from a silent fallback re-gather -- and the input
+      gradient must still match a reference built from an explicit all-gather.
+    * That the forward buffer stays pinned. It may be shared with slots created before
+      the pin, but must never sit in a pool afterwards, including when one of those
+      earlier co-owners releases its own ticket.
+    """
+    torch.manual_seed(0)
+    batch, in_f, out_f = 16, 64, 128  # out_f % (16*world_size)==0 -> no padding
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+            self.decoder_fc1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+            self.output_layer = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+
+    model = _Model()
+    gtp_module.classify_gtp_chains(model)
+
+    out_w = model.output_layer.weight
+    emb_w = model.embedding.weight
+    fc1_w = model.decoder_fc1.weight
+
+    assert out_w._retain_for_bwd is True, "output_layer must reuse its forward weight"
+    assert emb_w._retain_for_bwd is False, "a tied/embedding weight must not reuse"
+    assert fc1_w._retain_for_bwd is False, "ordinary weights must not reuse"
+
+    # Reuse replaces the bwd gather, so the output layer opts out of the bwd prefetch too --
+    # the same flag the embedding uses, for the same reason: no bwd AG is wanted.
+    assert emb_w._need_weight_prefetch_bwd is False, "embedding skips its bwd AG"
+    assert out_w._need_weight_prefetch_bwd is False, "a retained weight skips its bwd AG"
+    assert fc1_w._need_weight_prefetch_bwd is True, "ordinary weights still prefetch in bwd"
+
+    # Reference full weight, reconstructed from the shards.
+    shard = out_w.data.clone()
+    all_shards = [torch.zeros_like(shard) for _ in range(world_size)]
+    dist.all_gather(all_shards, shard, group=gtp_remat_group)
+    full_weight = torch.cat(all_shards, dim=0).float()[:out_f]
+
+    inp = torch.randn(batch, in_f, dtype=dtype, device="cuda")
+    dist.broadcast(inp, src=0)
+    inp_gtp = inp.clone().requires_grad_(True)
+    inp_ref = inp.clone().requires_grad_(True)
+
+    # Run the embedding first so it allocates and publishes a same-shape buffer: the output
+    # layer then adopts it, reproducing the shared-buffer case the pin has to survive.
+    model.embedding(inp.clone(), is_first_microbatch=True)
+    out_gtp = model.output_layer(inp_gtp, is_first_microbatch=True)
+
+    out_ref = (inp_ref.float() @ full_weight.T).to(dtype)
+
+    # wgrad RS path always accumulates into main_grad; allocate before backward.
+    out_w.main_grad = torch.zeros(out_w.shape, dtype=dtype, device="cuda")
+    grad_out = torch.randn_like(out_gtp)
+    dist.broadcast(grad_out, src=0)
+    out_gtp.backward(grad_out)
+    out_ref.backward(grad_out.float())
+
+    # A bwd ticket is only ever reserved by a real bwd gather, so its absence proves the
+    # dgrad took the reuse path rather than silently re-gathering.
+    assert out_w._ag_ticket_bwd is None, "backward must reuse the fwd buffer, not re-gather"
+    assert inp_gtp.grad is not None
+    assert torch.allclose(
+        inp_gtp.grad.float(), inp_ref.grad.float(), atol=1e-5, rtol=1e-5
+    ), f"dX mismatch max_diff={(inp_gtp.grad.float()-inp_ref.grad.float()).abs().max():.4f}"
+
+    # The pinned buffer must be registered and absent from every pool -- and must stay absent
+    # when an earlier co-owner releases its own ticket, which is the case that would otherwise
+    # hand the retained weight to the next same-shape gather.
+    cache = gtp_module.get_global_GTP_cache()
+    pinned = cache.get(out_w._ag_ticket_fwd)
+    assert any(b is pinned for b in cache._pinned_bufs), "fwd buffer must be registered as pinned"
+
+    def _pooled():
+        return any(b is pinned for bufs in cache._pool.values() for b in bufs)
+
+    assert not _pooled(), "pinned buffer must not sit in any pool"
+    for w in (emb_w, fc1_w):
+        if w._ag_ticket_fwd is not None:
+            cache.release(w._ag_ticket_fwd)
+    assert not _pooled(), "a co-owner's release must not return the pinned buffer to a pool"
+
+
+class TestOutputLayerWeightGatheredOnce:
+    def test_backward_reuses_forward_weight_and_gradients_match(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_output_layer_weight_gathered_once, 4)
+
+
+# ---------------------------------------------------------------------------
 # Linear forward/backward numerical correctness
 # ---------------------------------------------------------------------------
 
