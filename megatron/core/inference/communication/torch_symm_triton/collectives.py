@@ -58,7 +58,7 @@ def _ag_phase(
             + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
-        (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+        x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
         st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
@@ -214,7 +214,7 @@ def _multimem_reduce_scatter_kernel(
             multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
-        (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
+        x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
         st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
