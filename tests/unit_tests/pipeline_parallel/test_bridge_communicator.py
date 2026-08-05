@@ -326,6 +326,25 @@ class TestBridgeCommunicator:
         ]
         assert all(rank not in expected for rank in member_ranks)
 
+    def test_destination_cp_topology(self):
+        """Destination CP keeps DP-based routing and reduces only on the leader TP lane."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32)
+
+        assert bridge.dest_tp_leaders == [4]
+        assert bridge.get_boundary_pp_stage_ranks(dest_grid, is_src=False) == [[4, 6, 5, 7]]
+
+        rank = dist.get_rank()
+        expected_broadcast_ranks = [4, 6, 5, 7] if rank >= 4 else []
+        assert bridge.dest_grid_broadcast_ranks == expected_broadcast_ranks
+
+        if rank in (4, 6):
+            assert bridge.dest_cp_reduce_pg is not None
+            assert dist.get_process_group_ranks(bridge.dest_cp_reduce_pg) == [4, 6]
+        else:
+            assert bridge.dest_cp_reduce_pg is None
+
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""
 
@@ -369,6 +388,56 @@ class TestBridgeCommunicator:
                 128,
                 512,
             ), f"Expected gradient shape {(4, 128, 512)}, got {received_gradient.shape}"
+
+    def test_cp_gradient_reconstruction(self):
+        """Complementary destination-CP gradients are summed before fan-in splitting."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32, tensor_ndim=2)
+
+        rows_per_chunk = 2
+        hidden_size = 3
+        chunk_values = (1.0, -2.0, 3.0, -4.0)
+        payload_shape = (4 * rows_per_chunk, hidden_size)
+        expected_source_shape = (rows_per_chunk, hidden_size)
+        source_shape_matches = True
+        source_values_match = True
+
+        if bridge.is_current_rank_in_grid(dest_grid):
+            cp_rank = dist.get_rank(group=dest_grid.get_pg("cp"))
+            owned_chunks = (0, 3) if cp_rank == 0 else (1, 2)
+            local_gradient = torch.zeros(payload_shape, device="cuda", dtype=torch.float32)
+            for chunk_idx in owned_chunks:
+                chunk_start = chunk_idx * rows_per_chunk
+                local_gradient[chunk_start : chunk_start + rows_per_chunk].fill_(
+                    chunk_values[chunk_idx]
+                )
+            bridge.send_backward(local_gradient)
+        else:
+            received_gradient = bridge.recv_backward()
+            source_shape_matches = received_gradient.shape == expected_source_shape
+            source_values_match = source_shape_matches and torch.equal(
+                received_gradient,
+                torch.full(
+                    expected_source_shape,
+                    chunk_values[dist.get_rank()],
+                    device="cuda",
+                    dtype=torch.float32,
+                ),
+            )
+
+        # Synchronize the exact source-side oracle only after every rank has completed its
+        # bridge role, so an assertion failure cannot strand another rank in bridge P2P.
+        source_checks = torch.tensor(
+            [source_shape_matches, source_values_match], device="cuda", dtype=torch.int32
+        )
+        dist.all_reduce(source_checks, op=dist.ReduceOp.MIN)
+        assert (
+            source_checks[0].item() == 1
+        ), f"Every source rank must receive fan-in split shape {expected_source_shape}"
+        assert (
+            source_checks[1].item() == 1
+        ), "Every source rank must receive its exact signed CP-reconstructed gradient chunk"
 
     def test_send_forward_recv_backward_send_backward_recv_forward(self):
         """Test combined send_forward_recv_backward and send_backward_recv_forward operations."""
