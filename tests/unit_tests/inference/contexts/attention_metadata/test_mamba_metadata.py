@@ -31,6 +31,15 @@ class TestMambaMetadata:
         yield metadata
         metadata.reset()
 
+    @pytest.mark.internal
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_decode_indices_dtype(self, dtype):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=16, max_intermediate_count=1, decode_indices_dtype=dtype
+        )
+
+        assert metadata._batch_indices_decode_buffer.dtype == dtype
+
     def _run_update_test(
         self,
         metadata: MambaMetadata,
