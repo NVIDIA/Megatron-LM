@@ -1974,7 +1974,9 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
         seen = []
 
         def mock_set_save_original_input(module):
@@ -1998,7 +2000,9 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
         sharded_sd = fused.sharded_state_dict(prefix="")
         layernorm_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.layer_norm_")]
@@ -2017,7 +2021,9 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
         config = self.transformer_config
         q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
         kv_weight = torch.randn(
