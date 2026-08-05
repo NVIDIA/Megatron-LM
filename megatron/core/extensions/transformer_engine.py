@@ -33,7 +33,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.layers import (
@@ -1334,6 +1334,8 @@ class TELinear(te.pytorch.Linear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+            intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
         )
 
     def backward_dw(self):
@@ -1362,10 +1364,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
+                Falls back to the MPU global process groups when not given.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1457,10 +1462,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1578,6 +1580,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+            intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
         )
 
     @override
@@ -1621,10 +1625,13 @@ class TEColumnParallelLinear(TELinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
+                Falls back to the MPU global process groups when not given.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1639,10 +1646,7 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
         super().__init__(
             input_size=input_size,
@@ -1712,6 +1716,8 @@ class TEColumnParallelLinear(TELinear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+            intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
         )
 
     @override
@@ -1882,10 +1888,13 @@ class TERowParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups used by this layer.
+                Falls back to the MPU global process groups when not given.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1899,10 +1908,7 @@ class TERowParallelLinear(TELinear):
             )
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
 
         super().__init__(
             input_size=input_size,
@@ -1969,6 +1975,8 @@ class TERowParallelLinear(TELinear):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+            intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
         )
 
     @override
@@ -2323,6 +2331,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             sharded_offsets,
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
+            intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+            intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
         )
 
 
@@ -2783,6 +2793,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     new_sharded_offsets,
                     tp_group=self._tp_group,
                     dp_cp_group=metadata["dp_cp_group"],
+                    intra_dp_cp_group=metadata.get("intra_dp_cp_group"),
+                    intra_expt_dp_group=metadata.get("intra_expt_dp_group"),
                 )
                 # Remove expert layers indexing from sharded keys
                 replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)

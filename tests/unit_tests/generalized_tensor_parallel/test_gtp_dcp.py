@@ -55,7 +55,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
 from megatron.core.transformer.transformer_config import TransformerConfig  # noqa: E402
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint  # noqa: E402
-from megatron.core.utils import get_pg_size, make_tp_sharded_tensor_for_checkpoint  # noqa: E402
+from megatron.core.utils import (  # noqa: E402
+    get_pg_rank,
+    get_pg_size,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: E402,F401
     _requires_mxfp8,
     _torchrun_dist_init,
@@ -552,6 +556,10 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
     global_expert_idx = ep_rank * num_gemms  # + gemm_idx (0)
 
     weight = _make_gtp_shard(per_expert_out, in_features, egtp_remat_group)
+    weight.allreduce = False
+    expert_dp_group = (
+        _cached_new_group([0, 2]) if rank in (0, 2) else _cached_new_group([1, 3])
+    )
     assert weight.shape == (
         per_shard_out,
         in_features,
@@ -565,6 +573,8 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
         sharded_offsets=((0, global_expert_idx, num_global_experts),),
         tp_group=_cached_new_group([rank]),  # no TP in this case
         dp_cp_group=_cached_new_group(list(range(world_size))),
+        intra_dp_cp_group=_cached_new_group(list(range(world_size))),
+        intra_expt_dp_group=expert_dp_group,
     )
     st = sharded["weight"]
     assert isinstance(st, ShardedTensor), f"Expected ShardedTensor, got {type(st)}"
@@ -581,6 +591,7 @@ def _worker_helper_offsets_ep_egtp(rank, world_size, port):
     assert (
         st.global_offset[1] == egtp_rank * per_shard_out
     ), f"rank={rank} EGTP_remat axis-1 offset {st.global_offset[1]} != {egtp_rank * per_shard_out}"
+    assert st.replica_id[2] == get_pg_rank(expert_dp_group)
 
 
 def _worker_helper_embedding_offsets(rank, world_size, port):

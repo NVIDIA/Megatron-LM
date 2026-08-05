@@ -11,6 +11,7 @@ import torch.distributed.checkpoint
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
@@ -23,6 +24,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
     get_checkpoint_tracker_filename,
     load_checkpoint,
     maybe_save_dataloader_state,
@@ -73,6 +75,19 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+def test_checkpoint_container_reports_hybrid_language_model_type():
+    """Container ranks without a local language module still report checkpoint compatibility."""
+
+    class HybridLanguageModelContainer(torch.nn.Module):
+        checkpoint_language_model_type = HybridModel
+
+    assert _maybe_setup_gpt_to_hybrid_load(
+        SimpleNamespace(hybrid_layer_pattern='M*'),
+        SimpleNamespace(hybrid_layer_pattern='M*'),
+        [HybridLanguageModelContainer()],
+    ) == (None, False)
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):

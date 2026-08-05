@@ -1,26 +1,78 @@
 #!/bin/bash
 
-# Run an eight-rank heterogeneous mock training loop with Nemotron6-MoE VLM 20L.
+# Run heterogeneous mock training with the Nemotron6-MoE VLM 20L recipe.
 
 set -euo pipefail
+
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 TRAIN_ITERS=${TRAIN_ITERS:-20}
 NUM_MICROBATCHES=${NUM_MICROBATCHES:-4}
 EVAL_INTERVAL=${EVAL_INTERVAL:-1}
 EVAL_ITERS=${EVAL_ITERS:-0}
-MICRO_BATCH_SIZE=1
-LLM_DP=2
-GLOBAL_BATCH_SIZE=$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP))
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+NNODES=${NNODES:-1}
+NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+ENCODER_TP=${ENCODER_TP:-2}
+ENCODER_DP=${ENCODER_DP:-2}
+LLM_OFFSET=${LLM_OFFSET:-$((ENCODER_TP * ENCODER_DP))}
+LLM_TP=${LLM_TP:-2}
+LLM_CP=${LLM_CP:-1}
+LLM_PP=${LLM_PP:-1}
+LLM_DP=${LLM_DP:-2}
+LLM_EP=${LLM_EP:-4}
+LLM_EXPT_TP=${LLM_EXPT_TP:-1}
+TENSOR_PARALLEL_NUM_WEIGHT_SHARDS=${TENSOR_PARALLEL_NUM_WEIGHT_SHARDS:-${LLM_TP}}
+EXPERT_TENSOR_PARALLEL_NUM_WEIGHT_SHARDS=${EXPERT_TENSOR_PARALLEL_NUM_WEIGHT_SHARDS:-${LLM_EXPT_TP}}
+
+if ((TENSOR_PARALLEL_NUM_WEIGHT_SHARDS % LLM_TP != 0)); then
+  echo "TENSOR_PARALLEL_NUM_WEIGHT_SHARDS must be divisible by LLM_TP" >&2
+  exit 2
+fi
+if ((EXPERT_TENSOR_PARALLEL_NUM_WEIGHT_SHARDS % LLM_EXPT_TP != 0)); then
+  echo "EXPERT_TENSOR_PARALLEL_NUM_WEIGHT_SHARDS must be divisible by LLM_EXPT_TP" >&2
+  exit 2
+fi
+
+GTP=$((TENSOR_PARALLEL_NUM_WEIGHT_SHARDS / LLM_TP))
+LLM_SIZE=$((LLM_TP * GTP * LLM_CP * LLM_PP * LLM_DP))
+EXPECTED_WORLD_SIZE=$((ENCODER_TP * ENCODER_DP + LLM_SIZE))
+WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+if ((WORLD_SIZE != EXPECTED_WORLD_SIZE)); then
+  echo "NNODES*NPROC_PER_NODE=${WORLD_SIZE}, but encoder+LLM grids require ${EXPECTED_WORLD_SIZE}" >&2
+  exit 2
+fi
+
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((MICRO_BATCH_SIZE * NUM_MICROBATCHES * LLM_DP * GTP))}
 TORCHRUN_LOG_DIR=${TORCHRUN_LOG_DIR:-"${PWD}/logs/torchrun-$(date +%Y%m%d_%H%M%S)-$$"}
 mkdir -p "${TORCHRUN_LOG_DIR}"
 
 TORCHRUN_ARGS=(
-  --standalone
-  --nproc-per-node 8
+  --nproc-per-node "${NPROC_PER_NODE}"
   --log-dir "${TORCHRUN_LOG_DIR}"
   --redirects 3
-  --tee 3
+  --tee 0:3
 )
+if ((NNODES == 1)); then
+  TORCHRUN_ARGS+=(--standalone)
+else
+  NODE_RANK=${NODE_RANK:-${SLURM_NODEID:-0}}
+  if [[ -z "${MASTER_ADDR:-}" ]]; then
+    if [[ -z "${SLURM_JOB_NODELIST:-}" ]]; then
+      echo "MASTER_ADDR or SLURM_JOB_NODELIST is required for a multi-node run" >&2
+      exit 2
+    fi
+    mapfile -t slurm_nodes < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+    MASTER_ADDR=${slurm_nodes[0]}
+  fi
+  MASTER_PORT=${MASTER_PORT:-$((10000 + ${SLURM_JOB_ID:-0} % 50000))}
+  TORCHRUN_ARGS+=(
+    --nnodes "${NNODES}"
+    --node-rank "${NODE_RANK}"
+    --master-addr "${MASTER_ADDR}"
+    --master-port "${MASTER_PORT}"
+  )
+fi
 
 uv run --extra ssm python -m torch.distributed.run \
   "${TORCHRUN_ARGS[@]}" \
@@ -71,15 +123,17 @@ uv run --extra ssm python -m torch.distributed.run \
   --seq-length 8192 \
   --max-position-embeddings 8192 \
   --bf16 \
-  --encoder-tp 2 \
-  --encoder-dp 2 \
-  --llm-offset 4 \
-  --llm-tp 2 \
-  --llm-cp 1 \
-  --llm-pp 1 \
+  --encoder-tp "${ENCODER_TP}" \
+  --encoder-dp "${ENCODER_DP}" \
+  --llm-offset "${LLM_OFFSET}" \
+  --llm-tp "${LLM_TP}" \
+  --llm-cp "${LLM_CP}" \
+  --llm-pp "${LLM_PP}" \
   --llm-dp "${LLM_DP}" \
-  --llm-ep 4 \
-  --llm-expt-tp 1 \
+  --llm-ep "${LLM_EP}" \
+  --llm-expt-tp "${LLM_EXPT_TP}" \
+  --tensor-parallel-num-weight-shards "${TENSOR_PARALLEL_NUM_WEIGHT_SHARDS}" \
+  --expert-tensor-parallel-num-weight-shards "${EXPERT_TENSOR_PARALLEL_NUM_WEIGHT_SHARDS}" \
   --vocab-size 131072 \
   --micro-batch-size "${MICRO_BATCH_SIZE}" \
   --global-batch-size "${GLOBAL_BATCH_SIZE}" \

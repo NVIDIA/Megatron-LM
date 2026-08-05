@@ -2334,6 +2334,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     tp_group,
     dp_cp_group,
     intra_dp_cp_group=None,
+    intra_expt_dp_group=None,
 ):
     """GTP-aware analogue of make_sharded_tensors_for_checkpoint.
 
@@ -2375,15 +2376,21 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
     gtp_rank = get_pg_rank(gtp_remat_group)
     gtp_remat_size = get_pg_size(gtp_remat_group)
 
-    # Replicate-group rank — the true replicas of a given GTP chunk live here.
-    if intra_dp_cp_group is not None:
-        dp_replica_rank = get_pg_rank(intra_dp_cp_group)
-    else:
+    def replica_rank(tensor):
+        """Rank in the GTP-excluded dense or expert replica group."""
+        replica_group = intra_dp_cp_group
+        if not getattr(tensor, 'allreduce', True) and intra_expt_dp_group is not None:
+            replica_group = intra_expt_dp_group
+        if replica_group is not None:
+            return get_pg_rank(replica_group)
         from megatron.core import parallel_state  # noqa: E402
 
-        dp_replica_rank = parallel_state.get_data_parallel_rank(
+        return parallel_state.get_data_parallel_rank(
             with_context_parallel=True, with_gtp_remat=False
         )
+
+    # Extra-state objects carry no tensor attributes; use the module's GTP weight kind.
+    gtp_template = next(t for t in state_dict.values() if is_gtp_param(t))
 
     sharded_state_dict = {}
     for layer_name, tensor in state_dict.items():
@@ -2394,7 +2401,11 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
             # ShardedObject (extra_state metadata): GTP-REPLICATED across the GTP group. Fold
             # gtp_rank into position 1 of the replica_id (PP, TP-replica-coord, DP) tuple so
             # GTP-peer ranks within the same TP slice get unique replica_ids.
-            replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_replica_rank)
+            replica_id = (
+                0,
+                tp_rank * gtp_remat_size + gtp_rank,
+                replica_rank(gtp_template),
+            )
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
                 tensor, layer_key, sharded_offsets, replica_id=replica_id
             )
@@ -2405,7 +2416,7 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
             # ranks would collide on the same replica_id. Inject gtp_rank into replica_id
             # position 1 (same as the GTP-sharded branch below).
             if layer_name in tensor_parallel_layers_axis_map:
-                replica_id = (0, gtp_rank, dp_replica_rank)
+                replica_id = (0, gtp_rank, replica_rank(tensor))
                 sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
                     tensor,
                     layer_key,
@@ -2414,9 +2425,15 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
                     prepend_offsets=sharded_offsets,
                     tp_group=tp_group,
                     dp_cp_group=dp_cp_group,
+                    intra_dp_cp_group=intra_dp_cp_group,
+                    intra_expt_dp_group=intra_expt_dp_group,
                 )
             else:
-                replica_id = (0, tp_rank * gtp_remat_size + gtp_rank, dp_replica_rank)
+                replica_id = (
+                    0,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    replica_rank(tensor),
+                )
                 sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
                     tensor,
                     layer_key,
@@ -2438,6 +2455,8 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
             prepend_offsets=sharded_offsets,
             tp_group=tp_group,
             dp_cp_group=dp_cp_group,
+            intra_dp_cp_group=intra_dp_cp_group,
+            intra_expt_dp_group=intra_expt_dp_group,
         )
 
     return sharded_state_dict
