@@ -48,8 +48,8 @@ class TestGptLayerCheckpointKeys:
         }
 
 
-class TestTENormCheckpointCompatibility:
-    class _FakeTENorm(torch.nn.Module):
+class TestTECheckpointCompatibility:
+    class _FakeTEModule(torch.nn.Module):
         def __init__(self, extra_state):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.ones(4))
@@ -62,7 +62,7 @@ class TestTENormCheckpointCompatibility:
             self._test_extra_state = state
 
     def test_empty_extra_state_is_local_nonpersistent(self):
-        norm = self._FakeTENorm(torch.empty(0, dtype=torch.uint8))
+        norm = self._FakeTEModule(torch.empty(0, dtype=torch.uint8))
         _bind_tenorm_sharded_state_dict(norm)
 
         sharded_state_dict = norm.sharded_state_dict(
@@ -73,7 +73,7 @@ class TestTENormCheckpointCompatibility:
         assert sharded_state_dict["norm._extra_state"].unwrap().numel() == 0
 
     def test_nonempty_extra_state_remains_checkpointed(self):
-        norm = self._FakeTENorm(torch.ones(1, dtype=torch.uint8))
+        norm = self._FakeTEModule(torch.ones(1, dtype=torch.uint8))
         _bind_tenorm_sharded_state_dict(norm)
 
         sharded_state_dict = norm.sharded_state_dict(
@@ -81,6 +81,22 @@ class TestTENormCheckpointCompatibility:
         )
 
         assert isinstance(sharded_state_dict["norm._extra_state"], ShardedObject)
+
+    def test_attention_empty_extra_state_is_local_nonpersistent(self):
+        class FakeConfig:
+            softmax_type = "learnable"
+
+        attention = self._FakeTEModule(torch.empty(0, dtype=torch.uint8))
+        attention.config = FakeConfig()
+        attention.softmax_offset = torch.nn.Parameter(torch.ones(4))
+        attention._tp_group = None
+
+        sharded_state_dict = TEDotProductAttention.sharded_state_dict(
+            attention, prefix="attention.", metadata={"dp_cp_group": object()}
+        )
+
+        assert "attention.softmax_offset" in sharded_state_dict
+        assert isinstance(sharded_state_dict["attention._extra_state"], LocalNonpersistentObject)
 
 
 class TestSpecCustomization:

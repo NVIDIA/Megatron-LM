@@ -1020,6 +1020,18 @@ else:
     TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
 
 
+def _set_empty_te_extra_state_nonpersistent(
+    state_dict: dict, sharded_state_dict: ShardedStateDict, prefix: str
+) -> None:
+    """Keep empty TE quantization metadata local when loading non-TE checkpoints."""
+    if '_extra_state' not in state_dict:
+        return
+
+    extra_state = state_dict['_extra_state']
+    if extra_state is None or (isinstance(extra_state, torch.Tensor) and extra_state.numel() == 0):
+        sharded_state_dict[f'{prefix}_extra_state'] = LocalNonpersistentObject(extra_state)
+
+
 def _tenorm_sharded_state_dict(
     module: torch.nn.Module,
     prefix: str = '',
@@ -1035,9 +1047,7 @@ def _tenorm_sharded_state_dict(
         dp_cp_group=(metadata or {}).get('dp_cp_group'),
     )
 
-    extra_state = state_dict.get('_extra_state')
-    if extra_state is None or (isinstance(extra_state, torch.Tensor) and extra_state.numel() == 0):
-        sharded_state_dict[f'{prefix}_extra_state'] = LocalNonpersistentObject(extra_state)
+    _set_empty_te_extra_state_nonpersistent(state_dict, sharded_state_dict, prefix)
     return sharded_state_dict
 
 
@@ -2349,7 +2359,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             state_dict = self.state_dict(prefix="", keep_vars=True)
         else:
             state_dict = {}
-        return make_sharded_tensors_for_checkpoint(
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
             {'softmax_offset': 0},
@@ -2357,6 +2367,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_group=self._tp_group,
             dp_cp_group=metadata["dp_cp_group"],
         )
+        _set_empty_te_extra_state_nonpersistent(state_dict, sharded_state_dict, prefix)
+        return sharded_state_dict
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
