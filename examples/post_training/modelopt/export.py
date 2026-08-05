@@ -20,7 +20,7 @@ from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
-from model_provider import model_provider
+from megatron.training.models.model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
