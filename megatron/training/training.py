@@ -3593,7 +3593,7 @@ def train(
     print_datetime('before the start of training step')
 
     print_rank_0(
-        f'params-norm before the start of training: {calc_params_l2_norm(model):.6f}'
+        f'params-norm before the start of training: {calc_params_l2_norm(model)!r}'
     )
 
     # GPU sniff test at start of training.
