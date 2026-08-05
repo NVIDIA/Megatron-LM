@@ -389,6 +389,7 @@ def modelopt_gpt_hybrid_builder(
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "rope_scaling_factor": args.rope_scaling_factor,
             "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
