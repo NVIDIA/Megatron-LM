@@ -3,10 +3,7 @@
 import inspect
 import os
 
-import modelopt
-import modelopt.torch.quantization as mtq
 import torch
-from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
 
 
@@ -32,6 +29,8 @@ def maybe_enable_modelopt(args):
 
 def modelopt_version_higher_than(target_version: str):
     """Check if Model-Optimizer is greater than this version."""
+    import modelopt
+
     info = "rank {:3}/{:3} checking if nvidia-modelopt-{} is higher than {}".format(
         torch.distributed.get_rank(),
         torch.distributed.get_world_size(),
@@ -43,6 +42,8 @@ def modelopt_version_higher_than(target_version: str):
 
 def modelopt_version_at_least(target_version: str):
     """Check if Model-Optimizer is greater or equal than this version."""
+    import modelopt
+
     info = "rank {:3}/{:3} checking if nvidia-modelopt-{} is at least {}".format(
         torch.distributed.get_rank(),
         torch.distributed.get_world_size(),
@@ -116,6 +117,9 @@ def to_empty_if_meta(module: torch.nn.Module, *, device: torch.device, recurse=T
 
 
 def print_distributed_quant_summary(model, msg=""):
+    import modelopt.torch.quantization as mtq
+    from modelopt.torch.quantization.utils import is_quantized
+
     from megatron.core import parallel_state
     from megatron.core.utils import unwrap_model
     from megatron.training import print_rank_0
