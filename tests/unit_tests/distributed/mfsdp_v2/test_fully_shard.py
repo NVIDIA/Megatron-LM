@@ -122,6 +122,99 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
+def _linear(device: torch.device, weight_offset: float) -> nn.Linear:
+    model = nn.Linear(4, 4, bias=False, device=device)
+    with torch.no_grad():
+        weight = torch.arange(16, dtype=torch.float32, device=device).reshape(4, 4)
+        model.weight.copy_(weight + weight_offset)
+    return model
+
+
+def _fully_sharded_linear(
+    device: torch.device, mesh: DeviceMesh, weight_offset: float
+) -> nn.Linear:
+    model = _linear(device, weight_offset)
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    return model
+
+
+def _clone_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().clone() for key, value in module.state_dict().items()}
+
+
+def _full_linear_weight(model: nn.Linear) -> torch.Tensor:
+    weight = model.state_dict()["weight"]
+    assert isinstance(weight, DTensor)
+    return weight.full_tensor().detach().clone()
+
+
+def _assert_assign_true_error(error: RuntimeError) -> None:
+    message = str(error)
+    assert "load_state_dict(assign=True)" in message
+    assert "fully_shard()" in message
+    assert "assign=False" in message
+
+
+@pytest.mark.parametrize("load_from_parent", [False, True], ids=["direct", "parent"])
+def test_post_wrap_assign_true_load_raises(distributed_setup, load_from_parent: bool):
+    if distributed_setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    source_child = _fully_sharded_linear(device, mesh, weight_offset=16.0)
+    target_child = _fully_sharded_linear(device, mesh, weight_offset=0.0)
+    source = nn.Sequential(source_child) if load_from_parent else source_child
+    target = nn.Sequential(target_child) if load_from_parent else target_child
+    checkpoint = _clone_state_dict(source)
+    inputs = torch.eye(4, device=device)
+    weight_before = _full_linear_weight(target_child)
+    expected_output = inputs @ weight_before.T
+
+    with pytest.raises(RuntimeError) as exc_info:
+        target.load_state_dict(checkpoint, assign=True)
+
+    _assert_assign_true_error(exc_info.value)
+    torch.testing.assert_close(_full_linear_weight(target_child), weight_before, rtol=0, atol=0)
+    torch.testing.assert_close(target(inputs), expected_output, rtol=0, atol=0)
+
+
+def test_post_wrap_assign_false_loads_state(distributed_setup):
+    if distributed_setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    source = _fully_sharded_linear(device, mesh, weight_offset=16.0)
+    target = _fully_sharded_linear(device, mesh, weight_offset=0.0)
+    checkpoint = _clone_state_dict(source)
+    inputs = torch.eye(4, device=device)
+    expected_output = source(inputs).detach().clone()
+
+    result = target.load_state_dict(checkpoint, assign=False)
+
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+    torch.testing.assert_close(target(inputs), expected_output, rtol=0, atol=0)
+
+
+def test_pre_wrap_assign_true_loads_state(distributed_setup):
+    if distributed_setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    source = _linear(device, weight_offset=16.0)
+    target = _linear(device, weight_offset=0.0)
+    checkpoint = _clone_state_dict(source)
+    inputs = torch.eye(4, device=device)
+    expected_output = source(inputs).detach().clone()
+
+    result = target.load_state_dict(checkpoint, assign=True)
+    fully_shard(target, mesh=mesh, placements=_flat_placements())
+
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+    torch.testing.assert_close(target(inputs), expected_output, rtol=0, atol=0)
+
+
 def _hsdp_placements() -> Placements:
     """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
     DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
