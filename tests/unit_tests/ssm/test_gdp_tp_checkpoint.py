@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 """Regression tests for GDP tensor-parallel checkpoint resharding."""
 
 from collections import defaultdict
