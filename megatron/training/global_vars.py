@@ -449,7 +449,12 @@ def build_telemetry_resource_attrs(args):
                       ('slurm.array.job_id', 'SLURM_ARRAY_JOB_ID'),
                       ('slurm.array.task_id', 'SLURM_ARRAY_TASK_ID'),
                       ('slurm.array.sluid', 'LENS_SLURM_ARRAY_SLUID'),
-                      ('slurm.restart_count', 'SLURM_RESTART_COUNT')):
+                      ('slurm.restart_count', 'SLURM_RESTART_COUNT'),
+                      # NVRx cycle identity (per-cohort from the ft_launcher agent) -> trainer AND
+                      # async-ckpt spans self-locate to a restart cycle + physical node.
+                      ('nvrx.cycle', 'NVRX_CYCLE'),
+                      ('nvrx.infra_rank', 'NVRX_INFRA_RANK'),
+                      ('nvrx.membership', 'NVRX_MEMBERSHIP')):
         val = os.environ.get(env)
         if val:
             resource_attrs[attr] = val

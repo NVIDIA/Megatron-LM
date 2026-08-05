@@ -460,6 +460,19 @@ if __name__ == "__main__":
     _LAUNCH_SCRIPT_START_TIME = _env_float('LENS_LAUNCH_SCRIPT_START_TIME')
     _LAUNCH_SCRIPT_PRESRUN_TIME = _env_float('LENS_LAUNCH_SCRIPT_PRESRUN_TIME')
 
+    # Under NVRx/ft_launcher the batch script's launch_script_start is captured ONCE, outside the
+    # single srun, and is STALE for every restart -- re-using it backdates a restart's startup all the
+    # way to t0 (a promoted spare then shows a fake ~580s "startup" spanning its standby wait). The
+    # ft_launcher agent hands each worker cohort a FRESH in-srun launch stamp via NVRX_LAUNCH_TIME; use
+    # it as THIS restart's launch anchor so workload.startup measures this relaunch (spawn + import),
+    # not a backdate. presrun is an outside-srun/one-shot concept -> it does not apply to a restart, so
+    # drop it here. The one-time "outside srun -> first nvrx" cold start is captured separately by the
+    # agent (nvrx.cold_start). Non-NVRx runs have no NVRX_LAUNCH_TIME and behave exactly as before.
+    _NVRX_LAUNCH_TIME = _env_float('NVRX_LAUNCH_TIME')
+    if _NVRX_LAUNCH_TIME is not None:
+        _LAUNCH_SCRIPT_START_TIME = _NVRX_LAUNCH_TIME
+        _LAUNCH_SCRIPT_PRESRUN_TIME = None
+
     # SLURM_JOB_START_TIME is set by Slurm itself for the whole job (every
     # process in it, not just the launch script) -- Slurm's own record of when
     # the job was actually granted its allocation and started, which can be
@@ -468,6 +481,14 @@ if __name__ == "__main__":
     # LENS_LAUNCH_SCRIPT_* vars, this needs no cooperation from the launch
     # script -- it's just already there.
     _SLURM_JOB_START_TIME = _env_float('SLURM_JOB_START_TIME')
+    # pre_startup anchors on the 'before the start' stamp. Priority to NVRx: on a RESTART the agent
+    # supplies NVRX_CYCLE_START_TIME (this cycle's pre-rendezvous instant), so pre_startup measures
+    # THIS restart's pre-launch gap (teardown + rejoin) instead of backdating to the one-time
+    # slurm_job_start. On cycle 0 (and non-NVRx) the agent supplies no such stamp, so we keep sbatch's
+    # SLURM_JOB_START_TIME = the real queue/prolog before the launch script.
+    _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
+    if _NVRX_CYCLE_START is not None:
+        _SLURM_JOB_START_TIME = _NVRX_CYCLE_START
 
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(
