@@ -2,15 +2,32 @@
 
 """Regression tests for GDP tensor-parallel checkpoint resharding."""
 
+import inspect
 from collections import defaultdict
 
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.ssm.gated_delta_product import (
+    GatedDeltaProductMixer,
     _get_in_proj_checkpoint_split_layout,
     _split_tensor_factory,
 )
+
+
+def test_constructor_drops_unused_mamba_compatibility_arguments():
+    """GDP dimensions come from TransformerConfig, not ignored constructor overrides."""
+    parameters = inspect.signature(GatedDeltaProductMixer.__init__).parameters
+    removed_parameters = {
+        "expand",
+        "dt_init",
+        "dt_scale",
+        "use_mem_eff_path",
+        "d_state",
+        "headdim",
+        "ngroups",
+    }
+    assert parameters.keys().isdisjoint(removed_parameters)
 
 
 def test_householder_components_reshard_tp2_to_tp1_in_semantic_order():

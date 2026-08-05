@@ -121,12 +121,8 @@ class GatedDeltaProductMixer(MegatronModule):
         config: The config of the model.
         submodules: Contains the module specs for the input and output linear layers.
         d_model: The hidden size of the model.
-        d_state: The state size of the SSM.
         d_conv: The number of channels in the causal convolution.
         conv_init: The initialization range for the causal convolution weights.
-        expand: The expansion factor for the SSM.
-        headdim: The hidden size of each attention head.
-        ngroups: The number of attention heads.
         A_init_range: The initialization range for the attention weights.
         D_has_hdim: Whether the D parameter has the same number of dimensions as the hidden
             state.
@@ -134,13 +130,10 @@ class GatedDeltaProductMixer(MegatronModule):
         norm_before_gate: Whether to apply normalization before the gating mechanism.
         dt_min: The minimum value of the dt parameter.
         dt_max: The maximum value of the dt parameter.
-        dt_init: The initialization value of the dt parameter.
-        dt_scale: The scaling factor for the dt parameter.
         dt_init_floor: The minimum value of the dt parameter after initialization.
         bias: Whether to use bias in the linear layers.
         conv_bias: Whether to use bias in the causal convolution.
         chunk_size: The chunk size for the fused kernel.
-        use_mem_eff_path: Whether to use the memory-efficient path for the Mamba model.
         layer_number: The layer number of this Mamba layer.
         pg_collection: The required process groups to use for tensor model parallel and context
             parallel.
@@ -154,25 +147,18 @@ class GatedDeltaProductMixer(MegatronModule):
         d_model,
         d_conv=4,
         conv_init=None,
-        expand=2,
         A_init_range=(0, 16),
         D_has_hdim=False,
         rmsnorm=True,
         norm_before_gate=False,
         dt_min=0.001,
         dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
         dt_init_floor=1e-4,
         bias=False,
         conv_bias=False,
         # Fused kernel and sharding options
         chunk_size=128,
         layer_number=None,
-        use_mem_eff_path=None,
-        d_state=None,
-        headdim=None,
-        ngroups=None,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
