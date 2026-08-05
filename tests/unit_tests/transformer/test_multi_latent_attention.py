@@ -1510,6 +1510,7 @@ def test_parallel_multi_latent_attention_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return gpt_model
 

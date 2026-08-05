@@ -52,6 +52,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
@@ -165,6 +166,7 @@ class TextGenerationControllerTestBase:
                 hybrid_layer_pattern=hybrid_layer_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
@@ -192,6 +194,7 @@ class TextGenerationControllerTestBase:
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=position_embedding_type,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
 
         model.eval()

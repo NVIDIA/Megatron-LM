@@ -21,6 +21,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     OffloadTensorPool,
     PipelineOffloadManager,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -441,6 +442,7 @@ def _build_gpt_model(
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     ).bfloat16()
     return gpt_model
 
@@ -820,6 +822,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
                 ),
                 vocab_size=vocab_size,
                 max_sequence_length=seq_length,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             .bfloat16()
             .cuda()
@@ -1019,6 +1022,7 @@ def _build_gpt_model_with_cuda_graph(
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     ).bfloat16()
     return gpt_model
 
