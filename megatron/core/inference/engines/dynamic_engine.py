@@ -1374,6 +1374,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
+        # Convert the step's request IDs once, then batch-prepare handoff metadata for
+        # finished requests using the KV blocks retained before context cleanup.
         request_id_list = request_ids.tolist()
         handoff_blocks_by_request = finished_handoff_block_ids or {}
         prepared_handoff_metadata = self._prepare_handoff_metadata_batch(

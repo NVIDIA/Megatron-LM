@@ -664,6 +664,8 @@ class InferenceStateHandoffMixin:
             self._release_handoff_import_owner(pending.request_id)
 
         def _relay_result(src: asyncio.Future) -> None:
+            """Release import ownership and forward decode completion to the handoff future."""
+
             self._release_handoff_import_owner(pending.request_id)
             if pending.future.done():
                 return
