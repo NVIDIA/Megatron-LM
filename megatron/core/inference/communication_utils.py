@@ -149,17 +149,17 @@ def broadcast_tensor(size, dtype, tensor=None, rank=0, data_parallel=False):
     Args:
         data_parallel (bool): Broadcast across a single data parallel model replica.
     """
+    # Single compatibility boundary: the source rank is rank 0 of the model-parallel group, so
+    # both are derived from one lookup. See docs/developer/parallel-state-deprecation.md.
+    group = None
     if data_parallel:
-        rank = parallel_state.get_model_parallel_src_rank()
+        group = parallel_state.get_model_parallel_group()
+        rank = torch.distributed.get_global_rank(group, 0)
 
     if torch.distributed.get_rank() == rank:
         _is_cuda_contiguous(tensor)
     else:
         tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
-
-    group = None
-    if data_parallel:
-        group = parallel_state.get_model_parallel_group()
 
     torch.distributed.broadcast(tensor, rank, group=group)
 
@@ -176,10 +176,9 @@ def broadcast_list(size, dtype, list_values=None, rank=0, data_parallel=False):
     tensor = None
 
     if data_parallel:
-        if parallel_state.get_model_parallel_src_rank() == torch.distributed.get_rank():
-            tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
-
         rank = parallel_state.get_model_parallel_src_rank()
+        if rank == torch.distributed.get_rank():
+            tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
     else:
         if torch.distributed.get_rank() == rank:
             tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
