@@ -82,7 +82,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 EOF
 
 # Install DeepEP
-ARG DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
+ARG DEEPEP_COMMIT=de0dd1185142c727b9c118aeb4cc4702e34deeba
 ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
 ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
