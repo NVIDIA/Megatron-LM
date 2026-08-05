@@ -8,11 +8,14 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
 import torch
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs
 from megatron.lite.runtime.contracts.handle import ModelHandle
+
+pytestmark = pytest.mark.optional
 
 _LITE_ROOT = str(Path(__file__).resolve().parents[3])
 sys.path = [path for path in sys.path if path != _LITE_ROOT]
