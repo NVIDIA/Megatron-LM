@@ -10,6 +10,7 @@ import torch
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -88,6 +89,7 @@ class TestGPTModel:
             max_sequence_length=8,
             position_embedding_type="rope",
             parallel_output=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):

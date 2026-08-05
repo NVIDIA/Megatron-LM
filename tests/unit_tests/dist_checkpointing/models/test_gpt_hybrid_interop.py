@@ -45,6 +45,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args
@@ -349,6 +350,7 @@ def initialize_gpt_model(seed, num_gpt_layers, parallel, moe, glu=False):
         post_process=ps.is_pipeline_last_stage(),
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     with torch.no_grad():
         for param in model.parameters():
@@ -372,6 +374,7 @@ def initialize_hybrid_model(seed, pattern, parallel, moe, glu=False):
         post_process=ps.is_pipeline_last_stage(),
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
 
@@ -546,6 +549,7 @@ def gpt_provider_for_opt(
         post_process=post_process,
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
 
@@ -565,6 +569,7 @@ def hybrid_provider_for_opt(
         post_process=post_process,
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
 

@@ -26,6 +26,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, ChainedOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -451,6 +452,7 @@ def initialize_real_model(
         pre_process=pre_process,
         post_process=post_process,
         vp_stage=vp_stage,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     return this_model

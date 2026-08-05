@@ -27,6 +27,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -77,6 +78,7 @@ class StaticInferenceEngineTestHarness:
             parallel_output=True,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         gpt_model.to(inference_config_params_dtype)
 
