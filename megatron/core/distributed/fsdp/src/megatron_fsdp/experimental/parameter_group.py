@@ -30,7 +30,7 @@ from ..mixed_precision import MixedPrecisionPolicy
 from ..utils import HAVE_TE
 from . import layout_builder
 from .dbuffer import DBuffer
-from .grouped_tensor import get_values, install_storage, is_grouped_tensor
+from .grouped_tensor import GroupedTensor, get_values, install_storage
 from .layout import GlobalLayout
 from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .placement import BlockAtomic, RowAtomic, TensorAtomic
@@ -385,7 +385,7 @@ class FsdpParameterGroup:
                 )
                 copy_parameter_attributes(parameter, materialized_parameter)
                 torch.utils.swap_tensors(parameter, materialized_parameter)
-            elif is_grouped_tensor(parameter):
+            elif isinstance(parameter, GroupedTensor):
                 install_storage(parameter, unsharded_tensor)
                 parameter.grad = None
             else:
