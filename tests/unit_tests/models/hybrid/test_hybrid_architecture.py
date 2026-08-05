@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.inference.config import MambaInferenceStateConfig
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_architecture import (
     HYBRID_LAYER_TYPE,
     HybridLayerSpec,
@@ -19,6 +21,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec,
     hybrid_stack_spec,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -97,6 +100,17 @@ def _layer(layer_type: str, config: TransformerConfig) -> HybridLayerSpec:
 
 def _types(layers) -> list[str]:
     return [layer.layer_type for layer in layers]
+
+
+def _model_shell(architecture, config):
+    """Create enough of a HybridModel to exercise its early inference guards."""
+
+    model = HybridModel.__new__(HybridModel)
+    torch.nn.Module.__init__(model)
+    model.config = config
+    if architecture is not None:
+        model.resolved_hybrid_architecture = architecture
+    return model
 
 
 @pytest.mark.parametrize(
@@ -283,6 +297,215 @@ def test_resolver_preserves_permitted_per_layer_shape_differences():
         (layers[index].config.moe_ffn_hidden_size, layers[index].config.moe_router_topk)
         for index in (6, 7)
     ] == [(112, 3), (144, 4)]
+
+
+@pytest.mark.parametrize(
+    ("layer_type", "field_name", "heterogeneous_value"),
+    [
+        pytest.param("mamba", "mamba_state_dim", 24, id="mamba-cache"),
+        pytest.param("attention", "kv_channels", 16, id="attention-kv-cache"),
+        pytest.param("moe", "moe_router_topk", 3, id="moe-router-buffer"),
+    ],
+)
+def test_dynamic_inference_rejects_heterogeneous_runtime_shapes(
+    layer_type, field_name, heterogeneous_value
+):
+    config = _config(2)
+    first_config = deepcopy(config)
+    second_config = deepcopy(config)
+    setattr(second_config, field_name, heterogeneous_value)
+    architecture = resolve_hybrid_architecture(
+        config=config,
+        hybrid_stack_spec=STACK_SPEC,
+        layer_specs=[_layer(layer_type, first_config), _layer(layer_type, second_config)],
+    )
+    model = _model_shell(architecture, config)
+    inference_context = SimpleNamespace(is_dynamic_batching=lambda: True)
+
+    with (
+        InferenceMode.active(),
+        pytest.raises(
+            NotImplementedError, match="incompatible with dynamic inference's model-global"
+        ),
+    ):
+        model.forward(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=None,
+            inference_context=inference_context,
+            runtime_gather_output=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("layer_type", "field_name", "override_value"),
+    [
+        pytest.param("attention", "kv_channels", 16, id="attention-kv-cache"),
+        pytest.param("moe", "moe_router_topk", 3, id="moe-router-buffer"),
+    ],
+)
+def test_dynamic_inference_rejects_uniform_overrides_incompatible_with_global_buffers(
+    layer_type, field_name, override_value
+):
+    config = _config(2)
+    layer_config = deepcopy(config)
+    setattr(layer_config, field_name, override_value)
+    architecture = resolve_hybrid_architecture(
+        config=config,
+        hybrid_stack_spec=STACK_SPEC,
+        layer_specs=[_layer(layer_type, layer_config), _layer(layer_type, layer_config)],
+    )
+    model = _model_shell(architecture, config)
+    inference_context = SimpleNamespace(is_dynamic_batching=lambda: True)
+
+    with (
+        InferenceMode.active(),
+        pytest.raises(
+            NotImplementedError, match="incompatible with dynamic inference's model-global"
+        ),
+    ):
+        model.forward(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=None,
+            inference_context=inference_context,
+            runtime_gather_output=False,
+        )
+
+
+def test_dynamic_inference_allows_uniform_runtime_shapes_past_heterogeneity_guard():
+    config = _config(2)
+    architecture = resolve_hybrid_architecture(
+        config=config,
+        hybrid_stack_spec=STACK_SPEC,
+        layer_specs=[_layer("mamba", config), _layer("mamba", config)],
+    )
+    model = _model_shell(architecture, config)
+    inference_context = SimpleNamespace(is_dynamic_batching=lambda: True)
+
+    # The next inference invariant proves the heterogeneity guard allowed this
+    # uniform architecture through without needing to construct model layers.
+    with (
+        InferenceMode.active(),
+        pytest.raises(AssertionError, match="Inference must always gather TP logits"),
+    ):
+        model.forward(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=None,
+            inference_context=inference_context,
+            runtime_gather_output=False,
+        )
+
+
+def test_dynamic_inference_rejects_before_reading_layer_state_shapes():
+    config = _config(2)
+    second_config = deepcopy(config)
+    second_config.mamba_state_dim = 24
+    architecture = resolve_hybrid_architecture(
+        config=config,
+        hybrid_stack_spec=STACK_SPEC,
+        layer_specs=[_layer("mamba", config), _layer("mamba", second_config)],
+    )
+
+    class ModelWithUnallocatedState:
+        resolved_hybrid_architecture = architecture
+
+        def __init__(self):
+            self.config = config
+
+        @property
+        def decoder(self):
+            raise AssertionError("Mamba state shapes must not be read before rejection")
+
+    with pytest.raises(
+        NotImplementedError, match="incompatible with dynamic inference's model-global"
+    ):
+        MambaInferenceStateConfig.from_model(ModelWithUnallocatedState())
+
+
+def test_explicit_static_engine_path_skips_dynamic_shape_validation():
+    config = _config(2)
+    second_config = deepcopy(config)
+    second_config.mamba_state_dim = 24
+    architecture = resolve_hybrid_architecture(
+        config=config,
+        hybrid_stack_spec=STACK_SPEC,
+        layer_specs=[_layer("mamba", config), _layer("mamba", second_config)],
+    )
+    decoder = SimpleNamespace(
+        layer_type_list=["mamba", "mamba"],
+        layers=[SimpleNamespace(mixer=SimpleNamespace(chunk_size=64)), SimpleNamespace()],
+        mamba_state_shapes_per_request=lambda: ((8, 4), (8, 16)),
+    )
+    model = SimpleNamespace(
+        resolved_hybrid_architecture=architecture,
+        decoder=decoder,
+        config=SimpleNamespace(params_dtype=torch.bfloat16, batch_invariant_mode=False),
+    )
+
+    inference_config = MambaInferenceStateConfig.from_model(model, validate_dynamic_inference=False)
+
+    assert inference_config is not None
+    assert inference_config.layer_type_list == ["M", "M"]
+
+
+def test_inference_state_normalizes_semantic_layer_types_to_legacy_maps():
+    decoder = SimpleNamespace(
+        layer_type_list=["mamba", "attention"],
+        layers=[SimpleNamespace(mixer=SimpleNamespace(chunk_size=64)), SimpleNamespace()],
+        mamba_state_shapes_per_request=lambda: ((8, 4), (8, 16)),
+    )
+    model = SimpleNamespace(
+        decoder=decoder,
+        config=SimpleNamespace(params_dtype=torch.bfloat16, batch_invariant_mode=False),
+    )
+
+    inference_config = MambaInferenceStateConfig.from_model(model)
+
+    assert inference_config is not None
+    assert inference_config.layer_type_list == ["M", "*"]
+    assert inference_config.mamba_chunk_size == 64
+
+
+def test_legacy_inference_keeps_symbol_list_identity_and_skips_direct_shape_rejection():
+    layer_type_list = ["M", "M"]
+    decoder = SimpleNamespace(
+        layer_type_list=layer_type_list,
+        layers=[SimpleNamespace(mixer=SimpleNamespace(chunk_size=64)), SimpleNamespace()],
+        mamba_state_shapes_per_request=lambda: ((8, 4), (8, 16)),
+    )
+    model = SimpleNamespace(
+        decoder=decoder,
+        config=SimpleNamespace(params_dtype=torch.bfloat16, batch_invariant_mode=False),
+    )
+
+    assert not hasattr(model, "resolved_hybrid_architecture")
+
+    inference_config = MambaInferenceStateConfig.from_model(model)
+
+    assert inference_config is not None
+    assert inference_config.layer_type_list is layer_type_list
+
+
+def test_legacy_forward_does_not_run_direct_heterogeneity_guard():
+    config = _config(2)
+    model = _model_shell(None, config)
+    inference_context = SimpleNamespace(is_dynamic_batching=lambda: True)
+
+    assert not hasattr(model, "resolved_hybrid_architecture")
+
+    with (
+        InferenceMode.active(),
+        pytest.raises(AssertionError, match="Inference must always gather TP logits"),
+    ):
+        model.forward(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=None,
+            inference_context=inference_context,
+            runtime_gather_output=False,
+        )
 
 
 @pytest.mark.parametrize(

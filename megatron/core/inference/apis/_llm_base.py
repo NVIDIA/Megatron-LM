@@ -17,7 +17,7 @@ from typing import Coroutine, List, Optional, Tuple, Union
 
 import torch.distributed as dist
 
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, validate_dynamic_inference_model
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -279,6 +279,7 @@ class _MegatronLLMBase:
             inference_config = InferenceConfig()
 
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
+        validate_dynamic_inference_model(model)
         context = DynamicInferenceContext(model.config, inference_config)
         wrapper = GPTInferenceWrapper(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)

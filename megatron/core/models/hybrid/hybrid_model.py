@@ -641,6 +641,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         in_inference_mode = InferenceMode.is_active()
+        resolved_architecture = getattr(self, "resolved_hybrid_architecture", None)
+
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.is_dynamic_batching()
+            and resolved_architecture is not None
+            and resolved_architecture.source == "direct"
+            and resolved_architecture.has_incompatible_dynamic_inference_shapes(self.config)
+        ):
+            raise NotImplementedError(
+                "Direct HybridModel occurrence configurations are incompatible with dynamic "
+                "inference's model-global cache or runtime buffers (Mamba state/cache "
+                "dimensions, attention KV dimensions, or MoE router top-k values)."
+            )
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"

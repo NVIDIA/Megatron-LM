@@ -366,11 +366,6 @@ remove `--decoder-first-pipeline-num-layers` and
 `--decoder-last-pipeline-num-layers`. Express virtual-pipeline segmentation
 with additional pipe-delimited segments instead.
 
-The declarative `HybridModelBuilder` currently rejects virtual pipeline
-parallelism. Pipe-defined virtual stages are supported by the
-`pretrain_hybrid.py` CLI builder, but custom builder users must avoid VPP or use
-a path that explicitly supports it.
-
 ### Update custom providers and conversion mappings
 
 Custom providers and conversion mappings also need to account for these API and
@@ -398,3 +393,12 @@ Before starting a long run:
   parameter counts by layer.
 - Save and reload one new checkpoint to confirm that the new optimizer and RNG
   state resume correctly.
+
+Direct layer specs are currently training-first. Dynamic inference rejects a
+direct architecture when occurrence configurations are incompatible with its
+model-global cache or runtime buffers, whether the occurrences differ from one
+another or a family-uniform override differs from the base `TransformerConfig`.
+Examples include differing Mamba state dimensions and attention KV dimensions
+or MoE top-k values that differ from the base config. Legacy
+`hybrid_layer_pattern` models retain their existing inference path and do not
+use this direct-spec validator.
