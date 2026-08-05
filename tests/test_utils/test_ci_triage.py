@@ -409,9 +409,7 @@ def test_triage_config_selects_megatron_and_enables_write_actions():
     assert linear_write.write_gates(config) == {
         linear_ci.LINEAR_MODULE: {"open": True, "modify": True, "close": True}
     }
-    assert linear_write.issue_statuses(config) == {
-        linear_ci.LINEAR_MODULE: "Need Triage"
-    }
+    assert linear_write.issue_statuses(config) == {linear_ci.LINEAR_MODULE: "Need Triage"}
 
 
 def test_slack_followup_uses_upstream_detailed_and_execution_summaries():
