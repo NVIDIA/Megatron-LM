@@ -20,6 +20,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -1490,6 +1491,7 @@ def test_parallel_multi_latent_attention_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return gpt_model
 
