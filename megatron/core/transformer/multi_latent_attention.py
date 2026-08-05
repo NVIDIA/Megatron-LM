@@ -88,6 +88,7 @@ else:
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
+        TENorm,
         Linear,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
@@ -97,7 +98,7 @@ else:
         general_gemm,
         QuantizedTensor,
         MXFP8Quantizer,
-    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
@@ -129,6 +130,8 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
         tp_group,  # tensor-parallel process group
         sequence_parallel,  # True if sequence parallelism is active
     ):
+        """Run the fused gemm + rope + mxfp8 quantization"""
+
         tokens = s * b
         x = q_normed.detach().reshape(tokens, -1).contiguous()
 
@@ -153,6 +156,7 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dq):
+        """Backward is unfused and matches the typical backward pass"""
         x_saved, w_q, cos, sin = ctx.saved_tensors
         nh, q_head_dim, qk_head_dim, qk_pos_emb_head_dim, s, b = ctx.dims
         tokens = s * b
@@ -180,28 +184,31 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
         dq2d = dq3.reshape(tokens, nh * q_head_dim).contiguous()
 
         # Dispatch the adjoints on the projection precision (== forward kernel), inferred from w_q:
-        # QuantizedTensor -> fp8 projection (mxfp8in); plain bf16 tensor -> 16-bit projection (bf16in).
+        # QuantizedTensor -> fp8 projection (mxfp8in); plain bf16 tensor
+        #                                -> 16-bit projection (bf16in).
         if isinstance(w_q, QuantizedTensor):
-            # === FP8 projection: fp8 adjoints via TE general_gemm -- identical precision AND kernels
-            #     to the unfused MXFP8 LayerNormLinear backward. x_saved is the columnwise MXFP8
-            #     activation; split_accumulator=True matches the MXFP8 recipe default for grad GEMMs. ===
+            # FP8 projection: fp8 adjoints via TE general_gemm
+            # x_saved is the columnwise MXFP8 activation
+            # split_accumulator=True matches the MXFP8 recipe default for grad GEMMs.
             grad_output_quantizer = MXFP8Quantizer(
                 fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
             )
-            # Pre-swizzle the grad-output scales at cast time (as TE's grad_output_quantizer does), so
-            # general_gemm's in-GEMM swizzle is a no-op (avoids the extra cast_only + standalone
-            # row/col swizzle). Layout only, no effect on numerics.
+            # Pre-swizzle the grad-output scales at cast time, so general_gemm's in-GEMM swizzle
+            # is a no-op (avoids the extra cast_only + standalone row/col swizzle). Layout only,
+            # no effect on numerics.
             grad_output_quantizer.optimize_for_gemm = True
             gy = grad_output_quantizer(dq2d)  # MXFP8: rowwise (dgrad) + columnwise (wgrad)
 
             w_q.update_usage(rowwise_usage=True, columnwise_usage=True)
 
-            # dgrad: grad_input = grad_output @ weight  (A=weight[colwise], B=grad_output[rowwise], NN)
+            # dgrad: grad_input = grad_output @ weight
+            # (A=weight[colwise], B=grad_output[rowwise], NN)
             grad_x = general_gemm(
                 w_q, gy, layout="NN", grad=True, out_dtype=act_dtype, use_split_accumulator=True
             )[0].reshape(s, b, -1)
 
-            # wgrad: grad_weight = grad_output^T @ input  (A=input[colwise], B=grad_output[colwise], NT)
+            # wgrad: grad_weight = grad_output^T @ input
+            # (A=input[colwise], B=grad_output[colwise], NT)
             if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
                 if ctx.fuse_wgrad_accumulation and hasattr(w_q, "main_grad"):
 
@@ -276,7 +283,8 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
         if get_pg_size(ctx.tp_group) > 1 and not ctx.sequence_parallel:
             grad_x = reduce_from_tensor_model_parallel_region(grad_x, group=ctx.tp_group)
 
-        # grads for: q_normed, w_q, cos, sin, then 10 non-tensor args (including tp_group, sequence_parallel)
+        # grads for: q_normed, w_q, cos, sin, then 10 non-tensor args
+        # (including tp_group, sequence_parallel)
         return (
             grad_x,
             ret_grad_w,
@@ -300,6 +308,7 @@ class _QuantizeKVForFusedAttn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, key, value):
+        """Quantize the k anv v tensors"""
         kq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         vq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         k_mx, v_mx = mxfp8_quantize_only([(key.contiguous(), kq), (value.contiguous(), vq)], "sbhd")
@@ -307,6 +316,7 @@ class _QuantizeKVForFusedAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dk, dv):
+        """Attention returns bf16 tensors, so no need to quantize/unquantize in bwd"""
         return dk, dv
 
 
