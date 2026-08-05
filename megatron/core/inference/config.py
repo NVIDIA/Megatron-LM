@@ -169,16 +169,18 @@ class InferenceConfig:
 
     buffer_size_gb: int = 20
     """
-    Buffer size reserved on the GPU for the KV cache.
+    On-GPU portion of the shared KV cache block pool.
     If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
     """
 
     paused_buffer_size_gb: Optional[int] = None
     """
-    Portion of buffer reserved for paused requests. Active requests are paused when there are not
-    enough active blocks available to continue generating a request. The total buffer size
-    (active + paused) depends on `unified_memory_level` (uvm):
+    Memory used to derive the paused-request block retention budget. This does not reserve blocks
+    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    When the pool cannot satisfy new allocations, paused requests retain blocks only within this
+    budget and excess paused requests may be evicted. The total buffer size depends on
+    `unified_memory_level` (uvm):
         - uvm 0: buffer_size_gb (paused buffer is inclusive)
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
