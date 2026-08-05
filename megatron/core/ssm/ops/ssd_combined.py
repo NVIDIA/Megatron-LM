@@ -272,22 +272,21 @@ def mamba_chunk_scan_combined_varlen(
     initial_states=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
-    return_intermediate_states=False,
-    intermediate_chunk_indices=None,
+    return_raw_states=False,
     state_dtype=None,
 ):
-    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell + divisible sequence)
-    or Triton backend.
+    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell) or Triton backend.
 
     CuteDSL is the default backend on Blackwell (SM 10.0+): a faster drop-in
-    covering the production prefill cases (divisible sequence lengths, chunked
-    prefill via ``initial_states``, prefix caching via
-    ``intermediate_chunk_indices``, empty padded sequences). Eligibility is
-    decided up front via :func:`cutedsl_unsupported_reason`; Triton is used on
-    other platforms and for the argument combinations the CuteDSL kernel does
-    not support (non-divisible sequence lengths, gating ``z``, interleaved
-    empty sequences with intermediate emission). See
-    :func:`_mamba_chunk_scan_combined_varlen_triton` for the argument contract.
+    covering the production prefill cases (arbitrary sequence lengths, chunked
+    prefill via ``initial_states``, empty padded sequences, and
+    ``return_raw_states`` for prefix caching). Eligibility is decided up front
+    via :func:`cutedsl_unsupported_reason`; Triton is used on other platforms
+    and for the argument combinations the CuteDSL kernel does not support
+    (gating ``z``, and ``return_raw_states`` on a ragged batch, whose per-
+    sequence chunk grid does not materialise the caller's chunk boundaries).
+    See :func:`_mamba_chunk_scan_combined_varlen_triton` for the argument
+    contract.
     """
     if _cutedsl_ssd_enabled():
         # Kept local: this is the graceful-degradation boundary (the cutlass-
@@ -304,8 +303,7 @@ def mamba_chunk_scan_combined_varlen(
                 cu_chunk_seqlens,
                 last_chunk_indices,
                 z=z,
-                return_intermediate_states=return_intermediate_states,
-                intermediate_chunk_indices=intermediate_chunk_indices,
+                return_raw_states=return_raw_states,
             )
             is None
         )
@@ -327,8 +325,7 @@ def mamba_chunk_scan_combined_varlen(
                 initial_states=initial_states,
                 dt_softplus=dt_softplus,
                 dt_limit=dt_limit,
-                return_intermediate_states=return_intermediate_states,
-                intermediate_chunk_indices=intermediate_chunk_indices,
+                return_raw_states=return_raw_states,
                 state_dtype=state_dtype,
             )
 
@@ -349,7 +346,6 @@ def mamba_chunk_scan_combined_varlen(
         initial_states=initial_states,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
-        return_intermediate_states=return_intermediate_states,
-        intermediate_chunk_indices=intermediate_chunk_indices,
+        return_raw_states=return_raw_states,
         state_dtype=state_dtype,
     )

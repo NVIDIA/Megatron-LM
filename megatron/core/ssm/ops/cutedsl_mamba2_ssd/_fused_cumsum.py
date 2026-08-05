@@ -1,23 +1,4 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Standalone Triton kernel that fuses the dt preprocessing for the CuteDSL SSD
-front-end.
-
-For the two hot (chunk-contiguous) paths — ``aligned`` and ``divisible`` — the
-per-chunk ``delta`` and ``dA_cumsum`` inputs to the CuteDSL kernel are otherwise
-built with a chain of elementwise torch ops (``dt.float()`` + bias add +
-``softplus`` + clamp + a strided cast-copy + a multiply + ``torch.cumsum``).
-Because the whole SSD path is CPU-dispatch bound (~tens of tiny launches), that
-chain of ~6 launches is pure overhead. This kernel collapses it into a single
-launch that reads the raw (token-packed) ``dt`` and writes ``delta`` and
-``dA_cumsum`` (both fp32, matching Triton's fp32 dt) directly into the cached
-workspace buffers, in the ``(B, H, C, L)`` chunk-major layout the CuteDSL
-kernel expects.
-
-The softplus/clamp/cumsum arithmetic mirrors the Triton reference
-``_chunk_cumsum_fwd`` (see :mod:`megatron.core.ssm.ops.ssd_chunk_state`) so the
-result is numerically equivalent.
-"""
-
 import torch
 import triton
 import triton.language as tl
@@ -32,6 +13,10 @@ def _softplus_cumsum_kernel(
     cumsum_ptr,
     H,
     C,
+    n_valid_tokens,
+    ws_token_base_ptr,
+    ws_valid_lo_ptr,
+    ws_valid_hi_ptr,
     stride_dt_token,
     stride_dt_h,
     stride_bias_h,
@@ -43,6 +28,7 @@ def _softplus_cumsum_kernel(
     dt_max,
     HAS_BIAS: tl.constexpr,
     SOFTPLUS: tl.constexpr,
+    RAGGED: tl.constexpr,
     L: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -54,8 +40,25 @@ def _softplus_cumsum_kernel(
     offs = tl.arange(0, L)
     # Chunk-contiguous token packing: aligned uses seqlen0 == C * L, divisible
     # uses B == 1 with C == total_chunks.
-    token = (b * C + c) * L + offs
-    dt = tl.load(dt_ptr + token * stride_dt_token + h * stride_dt_h).to(tl.float32)
+    if RAGGED:
+        # General ragged: each workspace chunk carries its own token base and
+        # real-token window (a chunk shared by two sequences appears once per
+        # owner, each masked to its own tokens).
+        token = tl.load(ws_token_base_ptr + c) + offs
+        lo = tl.load(ws_valid_lo_ptr + c)
+        hi = tl.load(ws_valid_hi_ptr + c)
+        valid = (token >= lo) & (token < hi)
+    else:
+        token = (b * C + c) * L + offs
+        # A tail-ragged batch pads the LAST chunk: those lanes are not real
+        # tokens. Masking the load keeps it in bounds, and forcing delta = 0
+        # below removes them from the scan exactly (zero state contribution,
+        # and cumsum stays flat past the last real token so the chunk's decay
+        # is unchanged).
+        valid = token < n_valid_tokens
+    dt = tl.load(dt_ptr + token * stride_dt_token + h * stride_dt_h, mask=valid, other=0.0).to(
+        tl.float32
+    )
     if HAS_BIAS:
         dt = dt + tl.load(bias_ptr + h * stride_bias_h).to(tl.float32)
     if SOFTPLUS:
@@ -63,6 +66,7 @@ def _softplus_cumsum_kernel(
         # the Triton reference _chunk_cumsum_fwd (identity above to avoid overflow).
         dt = tl.where(dt <= 20.0, tl.math.log(tl.math.exp(dt) + 1.0), dt)
     dt = tl.minimum(tl.maximum(dt, dt_min), dt_max)
+    dt = tl.where(valid, dt, 0.0)
 
     a = tl.load(a_ptr + h * stride_a_h).to(tl.float32)
     dA_cumsum = tl.cumsum(dt * a, axis=0)
@@ -83,6 +87,8 @@ def fused_softplus_cumsum(
     B: int,
     H: int,
     C: int,
+    n_valid_tokens: int | None = None,
+    ragged_chunks: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Fill ``delta_out`` and ``cumsum_out`` from raw ``dt`` in a single launch.
 
@@ -99,6 +105,9 @@ def fused_softplus_cumsum(
         H: Number of heads.
         C: Chunk dim of the output layout (Cmax for aligned, total_chunks for
             divisible).
+        n_valid_tokens: Number of REAL tokens in ``dt``. Lanes at or beyond it
+            (the pad tail of a ragged final chunk) get ``delta = 0``, which
+            removes them from the scan. Defaults to the full ``B * C * L``.
     """
     L = delta_out.shape[-1]
     assert delta_out.shape == cumsum_out.shape, "delta/cumsum must share layout"
@@ -106,6 +115,10 @@ def fused_softplus_cumsum(
     assert delta_out.stride(-1) == 1 and cumsum_out.stride(-1) == 1, "L must be contiguous"
     dt_min, dt_max = dt_limit
     has_bias = dt_bias is not None
+    if n_valid_tokens is None:
+        n_valid_tokens = B * C * L
+    ragged = ragged_chunks is not None
+    base_p, lo_p, hi_p = ragged_chunks if ragged else (dt, dt, dt)
     grid = (B * H * C,)
     # TODO(perf): write a CuTe DSL fused kernel
     _softplus_cumsum_kernel[grid](
@@ -116,6 +129,10 @@ def fused_softplus_cumsum(
         cumsum_out,
         H,
         C,
+        n_valid_tokens,
+        base_p,
+        lo_p,
+        hi_p,
         dt.stride(0),
         dt.stride(1),
         dt_bias.stride(0) if has_bias else 0,
@@ -127,5 +144,6 @@ def fused_softplus_cumsum(
         float(dt_max),
         HAS_BIAS=has_bias,
         SOFTPLUS=dt_softplus,
+        RAGGED=ragged,
         L=L,
     )

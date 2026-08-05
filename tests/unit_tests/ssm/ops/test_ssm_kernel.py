@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import argparse
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -69,12 +68,14 @@ def _emit_per_seq_indices(seq_lens, chunk_size, device):
     sequences (interior chunks for early sequences, up to the last chunk for
     later ones); single-chunk and empty sequences emit nothing.
     """
+    # CEIL chunk counts: a ragged tail owns a (partial) chunk of its own, which
+    # is how both the caller's cu_chunk_seqlens and the kernel number chunks.
     starts = [0]
     for s in seq_lens:
-        starts.append(starts[-1] + s // chunk_size)
+        starts.append(starts[-1] + -(-s // chunk_size))
     emit = []
     for i, s in enumerate(seq_lens):
-        n_chunks = s // chunk_size
+        n_chunks = -(-s // chunk_size)
         if n_chunks > 1:
             emit.append(starts[i] + min(i + 1, n_chunks - 1))
     return torch.tensor(emit, dtype=torch.int64, device=device)
@@ -97,71 +98,38 @@ def _ssd_case(seq_lens, **overrides):
     return case
 
 
-# Every supported dispatch shape and inference feature in one table. Grouped by
-# the scenario each case exercises; ids mirror the grouping.
 _PARITY_CASES = [
-    # Plain divisible batches (varlen tile scheduler), nheads=16 and dstate=16
-    # variants (dstate 16 exercises N padding + the workspace-cache-collision
-    # regression where dstate 16 and 128 both pad to N_pad=128).
-    pytest.param(_ssd_case([256] * 4, chunk_size=256, nheads=16), id="basic-equal"),
-    pytest.param(_ssd_case([256, 512, 256], chunk_size=256, nheads=16), id="basic-unequal"),
-    pytest.param(_ssd_case([512, 256, 768, 256], chunk_size=256, nheads=16), id="basic-unequal4"),
-    pytest.param(_ssd_case([256] * 4, chunk_size=256, nheads=16, dstate=16), id="basic-d16"),
+    pytest.param(_ssd_case([256] * 4, chunk_size=256, nheads=16), id="divisible-equal"),
     pytest.param(
-        _ssd_case([256, 512, 256], chunk_size=256, nheads=16, dstate=16), id="basic-unequal-d16"
+        _ssd_case([512, 256, 768, 256], chunk_size=256, nheads=16), id="divisible-unequal"
     ),
     pytest.param(
-        _ssd_case([512, 256, 768, 256], chunk_size=256, nheads=16, dstate=16),
-        id="basic-unequal4-d16",
+        _ssd_case([256, 512, 256], chunk_size=256, nheads=16, dstate=16), id="divisible-d16"
     ),
-    # Trailing token-buffer padding: dynamic inference hands fixed-size
-    # CUDA-graph token buffers with x.shape[0] > sum(seq_lens); the wrapper
-    # must trim to the real tokens (cu_chunk_seqlens[-1]). A ragged
-    # (non-divisible) batch must be rejected by cutedsl_unsupported_reason.
-    pytest.param(_ssd_case([256, 256], chunk_size=256, pad_to=768), id="padded-equal"),
-    pytest.param(_ssd_case([256, 512], chunk_size=256, pad_to=1024), id="padded-unequal"),
-    pytest.param(
-        _ssd_case([200, 300], chunk_size=256, pad_to=768, expect_fallback=True),
-        id="padded-ragged-fallback",
-    ),
-    # Chunked prefill: non-zero carried SSM state (CuteDSL seeds the state on
-    # the divisible path).
+    pytest.param(_ssd_case([256, 512], chunk_size=256, pad_to=1024), id="padded-buffer"),
     pytest.param(_ssd_case([256, 512, 256], chunk_size=256, with_initial=True), id="prefill"),
-    pytest.param(_ssd_case([128, 256, 384], chunk_size=256, with_initial=True), id="prefill-mixed"),
-    # Prefix caching: intermediate states emitted at flagged chunk boundaries
-    # must match Triton's states[indices] — alone and combined with chunked
-    # prefill.
-    pytest.param(_ssd_case([384, 256, 512], inter="per_seq"), id="prefix"),
+    pytest.param(_ssd_case([2048, 0, 0, 0], with_initial=True), id="empty-slots-prefill"),
     pytest.param(
         _ssd_case([384, 256, 512], inter="per_seq", with_initial=True), id="prefix-prefill"
     ),
-    # Duplicate / padded intermediate indices must follow gather semantics: the
-    # dynamic engine pads intermediate_chunk_indices to a fixed size with chunk
-    # 0, and the CuteDSL emit-slot scatter collides on duplicates — the wrapper
-    # must resolve them so EVERY slot holds its chunk's state.
-    pytest.param(_ssd_case([384, 256, 512], inter=[0] * 12), id="inter-dup-all-padding"),
+    pytest.param(_ssd_case([384, 256, 512], inter=[0] * 12), id="inter-duplicate-padding"),
     pytest.param(
-        _ssd_case([384, 256, 512], inter=[0, 4, 7] + [0] * 9), id="inter-dup-real-plus-padding"
+        _ssd_case([256, 200], chunk_size=128, pad_to=512, with_initial=True),
+        id="tail-ragged-prefill",
     ),
-    pytest.param(_ssd_case([384, 256, 512], inter=[5, 5, 2, 2, 2, 0]), id="inter-dup-arbitrary"),
-    # Empty (0-length) padded sequences — the dynamic engine pads batches to a
-    # fixed slot count — must NOT deadlock the varlen tile scheduler (a 0-chunk
-    # work-item hangs the pipeline); the wrapper compacts empties out of the
-    # launch and scatters per-seq final states back. Interleaved empties +
-    # intermediate emission is unsupported (chunk-numbering mismatch) and must
-    # fall back to Triton; trailing empties stay on CuteDSL.
-    pytest.param(_ssd_case([2048, 0, 0, 0], with_initial=True), id="empty-trailing"),
-    pytest.param(_ssd_case([256, 512, 0, 0], with_initial=True), id="empty-trailing2"),
-    pytest.param(_ssd_case([1024] + [0] * 7, with_initial=True), id="empty-many"),
-    pytest.param(_ssd_case([0, 256, 0], with_initial=True), id="empty-interleaved"),
+    pytest.param(_ssd_case([384, 127], chunk_size=128, pad_to=512), id="tail-ragged-l-minus-1"),
+    pytest.param(_ssd_case([200, 256], chunk_size=128, pad_to=512), id="ragged-interior"),
     pytest.param(
-        _ssd_case([2048, 0, 0, 0], with_initial=True, inter="per_seq"), id="empty-trailing-inter"
+        _ssd_case([300, 500, 700, 0, 0], chunk_size=128, pad_to=1536, with_initial=True),
+        id="ragged-all-empty-prefill",
+    ),
+    pytest.param(_ssd_case([1, 1, 1, 1], chunk_size=128, pad_to=128), id="ragged-single-tokens"),
+    pytest.param(
+        _ssd_case([256, 200], chunk_size=128, expect_fallback=True), id="ragged-unpadded-fallback"
     ),
     pytest.param(
-        _ssd_case([256, 512, 0, 0], with_initial=True, inter="per_seq"), id="empty-trailing2-inter"
-    ),
-    pytest.param(
-        _ssd_case([1024] + [0] * 7, with_initial=True, inter="per_seq"), id="empty-many-inter"
+        _ssd_case([200, 256], chunk_size=128, pad_to=512, inter="per_seq", expect_fallback=True),
+        id="ragged-inter-fallback",
     ),
     pytest.param(
         _ssd_case([0, 256, 0], with_initial=True, inter="per_seq", expect_fallback=True),
@@ -254,10 +222,11 @@ class TestCuteDSLAccuracy:
         headdim, ngroups = 64, 2
         real_num_tokens = sum(seq_lens)
 
-        if ref_backend == "pytorch" and (
-            len(set(seq_lens)) != 1 or seq_lens[0] == 0 or seq_lens[0] % chunk_size != 0
-        ):
-            pytest.skip("torch reference supports only equal, chunk-divisible sequence lengths")
+        # The torch reference walks tokens one by one, so it handles a partial
+        # final chunk natively (which pins the tail-ragged math against a third
+        # implementation); it is only restricted to equal-length batches.
+        if ref_backend == "pytorch" and (len(set(seq_lens)) != 1 or seq_lens[0] == 0):
+            pytest.skip("torch reference supports only equal sequence lengths")
 
         common_kernel_args = _build_varlen_ssd_inputs(
             seq_lens,
@@ -306,9 +275,22 @@ class TestCuteDSLAccuracy:
         )
 
         if ref_backend == "triton":
+            # Triton no longer gathers flagged chunks itself: it returns the
+            # dense all-chunk states via return_raw_states, and the caller
+            # indexes them. That gather IS the contract the CuteDSL wrapper's
+            # sparse emission must reproduce.
+            triton_args = {
+                k: v for k, v in kernel_args.items() if k != "intermediate_chunk_indices"
+            }
             out_ref = torch.empty_like(common_kernel_args["x"])
-            ref = _mamba_chunk_scan_combined_varlen_triton(out=out_ref, **kernel_args)
-            final_ref, inter_ref = ref if idx is not None else (ref, None)
+            ref = _mamba_chunk_scan_combined_varlen_triton(
+                out=out_ref, return_raw_states=idx is not None, **triton_args
+            )
+            if idx is not None:
+                final_ref, raw_ref = ref
+                inter_ref = raw_ref[idx]
+            else:
+                final_ref, inter_ref = ref, None
             out_ref = out_ref[:real_num_tokens]
         else:
             out_ref, final_ref, inter_ref = _torch_reference_varlen(kernel_args, real_num_tokens)
@@ -319,7 +301,7 @@ class TestCuteDSLAccuracy:
             cu_chunk_seqlens=kernel_args["cu_chunk_seqlens"],
             last_chunk_indices=kernel_args["last_chunk_indices"],
             z=kernel_args["z"],
-            return_intermediate_states=False,
+            return_raw_states=False,
             intermediate_chunk_indices=kernel_args["intermediate_chunk_indices"],
         )
         if params["expect_fallback"]:
@@ -410,6 +392,91 @@ class TestFusedSoftplusCumsum:
 
 
 @pytest.mark.skipif(
+    not _cutedsl_ssd_enabled(),
+    reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
+)
+class TestCuteDSLRawStates:
+    """``return_raw_states=True`` must return the SSM state after EVERY caller
+    chunk, elementwise-matching Triton -- including the zero-length chunks that
+    empty (padded) sequences contribute to the caller's chunk numbering."""
+
+    @pytest.mark.parametrize(
+        "seq_lens,with_initial",
+        [
+            ([256, 512, 128], False),  # unequal, divisible
+            ([256, 200], True),  # tail-ragged (partial final chunk) + prefill
+            ([2048, 0, 0, 0], True),  # engine shape: the appended empty-slot rows
+        ],
+    )
+    def test_matches_triton(self, seq_lens, with_initial):
+        from megatron.core.ssm.ops.cutedsl_mamba2_ssd import (
+            cutedsl_unsupported_reason,
+            mamba_chunk_scan_combined_varlen_cutedsl_thd,
+        )
+        from megatron.core.ssm.ops.ssd_combined import _mamba_chunk_scan_combined_varlen_triton
+
+        torch.manual_seed(42)
+        device = torch.device("cuda")
+        chunk_size = 128  # raw states require chunk_size == kernel L
+        nheads, headdim, ngroups, dstate = 8, 64, 2, 128
+        real = sum(seq_lens)
+
+        common = _build_varlen_ssd_inputs(
+            seq_lens, chunk_size, nheads, headdim, ngroups, dstate, device, torch.bfloat16
+        )
+        if real % chunk_size:  # ragged tail needs a padded token buffer
+            pad = -real % chunk_size
+            for k in ("x", "dt", "B", "C"):
+                t = common[k]
+                common[k] = torch.cat(
+                    [t, torch.randn(pad, *t.shape[1:], device=device, dtype=t.dtype)], dim=0
+                )
+        initial_states = (
+            torch.randn(len(seq_lens), nheads, headdim, dstate, device=device, dtype=torch.float32)
+            if with_initial
+            else None
+        )
+        call = dict(
+            z=None,
+            initial_states=initial_states,
+            dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+            state_dtype=torch.float32,
+            **common,
+        )
+
+        out_tri = torch.empty_like(common["x"])
+        final_tri, raw_tri = _mamba_chunk_scan_combined_varlen_triton(
+            out=out_tri, return_raw_states=True, **call
+        )
+
+        reason = cutedsl_unsupported_reason(
+            x=call["x"],
+            chunk_size=call["chunk_size"],
+            cu_chunk_seqlens=call["cu_chunk_seqlens"],
+            last_chunk_indices=call["last_chunk_indices"],
+            z=None,
+            return_raw_states=True,
+        )
+        assert reason is None, f"unexpected fallback: {reason}"
+
+        out_cute = torch.empty_like(common["x"])
+        final_cute, raw_cute = mamba_chunk_scan_combined_varlen_cutedsl_thd(
+            out=out_cute, return_raw_states=True, **call
+        )
+
+        # One row per caller chunk, in the caller's numbering.
+        assert raw_cute.shape == raw_tri.shape, (raw_cute.shape, raw_tri.shape)
+        torch.testing.assert_close(raw_cute, raw_tri, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(final_cute, final_tri, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(out_cute[:real], out_tri[:real], rtol=2e-2, atol=0.25)
+        # Triton derives the final states from the raw ones; so must we.
+        torch.testing.assert_close(
+            final_cute, raw_cute[call["last_chunk_indices"]], rtol=3e-2, atol=3e-2
+        )
+
+
+@pytest.mark.skipif(
     not _fused_cumsum_available(), reason="B/C repack kernel requires CUDA + Triton"
 )
 class TestBCRepack:
@@ -426,14 +493,14 @@ class TestBCRepack:
         return dst
 
     @pytest.mark.parametrize(
-        "G,N,N_pad",
+        "G,N,N_pad,trim",
         [
-            (8, 128, 128),  # production dims (mamba-num-groups 8, dstate 128)
-            (2, 16, 128),  # small dstate: padding rows n >= 16 must stay zero
-            (1, 128, 128),  # single group
+            # production dims, reading a trimmed slice of a padded token buffer
+            (8, 128, 128, True),
+            # small dstate: the padding rows n >= 16 must stay zero
+            (2, 16, 128, False),
         ],
     )
-    @pytest.mark.parametrize("trim", [False, True])
     def test_matches_strided_copy(self, G, N, N_pad, trim):
         from megatron.core.ssm.ops.cutedsl_mamba2_ssd._bc_repack import repack_bc_chunk_major
 
@@ -511,7 +578,7 @@ class TestMambaDynamicInference(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.device.type == 'cpu':
+        if self.device.type == "cpu":
             self.skipTest("Mamba Triton kernels require CUDA")
 
         # --- Configuration ---

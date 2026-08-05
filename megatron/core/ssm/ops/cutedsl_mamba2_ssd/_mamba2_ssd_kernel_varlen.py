@@ -141,7 +141,7 @@ class SSDKernel:
         self.num_tmem_cols_total = 0
 
     def _setup_attributes(self):
-        (tiled_mma_intra1, tiled_mma_intra2, tiled_mma_inter1, tiled_mma_inter2) = (
+        tiled_mma_intra1, tiled_mma_intra2, tiled_mma_inter1, tiled_mma_inter2 = (
             self.make_tiled_mmas(
                 self.io_dtype,
                 self.acc_dtype,
@@ -158,7 +158,7 @@ class SSDKernel:
         )
 
         # Setup stages
-        (self.input_stages, self.output_stages, self.internal_stages, self.intra1_acc_stages) = (
+        self.input_stages, self.output_stages, self.internal_stages, self.intra1_acc_stages = (
             self._compute_stages(self.smem_capacity)
         )
 
@@ -324,11 +324,12 @@ class SSDKernel:
         emit_slot: cute.Tensor,
         seq_chunk_start: cute.Tensor,
         seq_n_chunks: cute.Tensor,
+        seq_x_chunk_start: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
         self._setup_attributes()
-        (tiled_mma_intra1, tiled_mma_intra2, tiled_mma_inter1, tiled_mma_inter2) = (
+        tiled_mma_intra1, tiled_mma_intra2, tiled_mma_inter1, tiled_mma_inter2 = (
             self.make_tiled_mmas(
                 self.io_dtype,
                 self.acc_dtype,
@@ -398,7 +399,7 @@ class SSDKernel:
         cumsum_delta_linear_smem_layout = cute.slice_(
             self.cumsum_delta_linear_smem_layout, (None, 0)
         )
-        (tma_atom_cumsum_delta, tma_tensor_cumsum_delta) = cpasync.make_tiled_tma_atom(
+        tma_atom_cumsum_delta, tma_tensor_cumsum_delta = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
             cumsum_delta,
             cumsum_delta_linear_smem_layout,
@@ -411,7 +412,7 @@ class SSDKernel:
         if cutlass.const_expr(self.d_has_hdim):
             d_cta_v_layout = cute.slice_(cute.make_identity_layout(d.shape), (None, 0))
             d_linear_smem_layout = cute.slice_(self.d_linear_smem_layout, (None, 0))
-            (tma_atom_d, tma_tensor_d) = cpasync.make_tiled_tma_atom(
+            tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileG2SOp(), d, d_linear_smem_layout, d_cta_v_layout
             )
 
@@ -591,6 +592,7 @@ class SSDKernel:
             tile_sched_params,
             seq_chunk_start,
             seq_n_chunks,
+            seq_x_chunk_start,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -643,6 +645,7 @@ class SSDKernel:
         tile_sched_params: Mamba2SSDTileSchedulerParams,
         seq_chunk_start: cute.Tensor,
         seq_n_chunks: cute.Tensor,
+        seq_x_chunk_start: cute.Tensor,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -670,7 +673,7 @@ class SSDKernel:
         C = cute.size(tma_tensor_x, mode=[2])
 
         # Make tiledMma
-        (tiled_mma_intra1, tiled_mma_intra2, tiled_mma_inter1, tiled_mma_inter2) = (
+        tiled_mma_intra1, tiled_mma_intra2, tiled_mma_inter1, tiled_mma_inter2 = (
             self.make_tiled_mmas(
                 self.io_dtype,
                 self.acc_dtype,
@@ -804,7 +807,7 @@ class SSDKernel:
             )
             # ((ATOM_V, REST_V), INPUT_STAGE)
             # ((ATOM_V, REST_V), 1, C, EH, B)
-            (tDeltasCumsumDelta, tDeltagCumsumDelta_pre_slice) = self.tma_partition_with_shape(
+            tDeltasCumsumDelta, tDeltagCumsumDelta_pre_slice = self.tma_partition_with_shape(
                 tma_atom_cumsum_delta,
                 tma_tensor_cumsum_delta,
                 smem_cumsum_delta,
@@ -842,6 +845,12 @@ class SSDKernel:
                 # (B=1) packed tensors. C shadows the static chunk count.
                 C = cute.arch.make_warp_uniform(cutlass.Int32(seq_n_chunks[b_idx]))
                 chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start[b_idx]))
+                # X is read from the caller's token-packed stream, whose chunk
+                # grid is GLOBAL and L-aligned; the dense workspace tensors
+                # (delta/cumsum/B/C) and the Y output use their own, possibly
+                # expanded, per-sequence grid. The two bases coincide unless the
+                # batch is ragged (see _chunk_meta).
+                x_chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_x_chunk_start[b_idx]))
 
                 # Slice global tensor to current tile idx (chunk-major: b=0)
                 # ((ATOM_V, REST_V), C)
@@ -888,7 +897,7 @@ class SSDKernel:
                     # TMA load X
                     cute.copy(
                         tma_atom_x,
-                        tXgX[None, chunk_base + x_producer_state.count],
+                        tXgX[None, x_chunk_base + x_producer_state.count],
                         tXsX[None, x_producer_state.index],
                         tma_bar_ptr=x_pipeline.producer_get_barrier(x_producer_state),
                     )
@@ -1471,10 +1480,10 @@ class SSDKernel:
             # Make copy_atom and partition register/smem tensor for smem load/store of Delta/DeltaA
             # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N, INPUT_STAGE)
             # ((S2R_ATOM_V, S2R_REST_V), S2R_M, S2R_N)
-            (s2r_atom_delta, tBsDelta_s2r, tBrDelta_s2r) = self.smem_load_and_partition_delta_d(
+            s2r_atom_delta, tBsDelta_s2r, tBrDelta_s2r = self.smem_load_and_partition_delta_d(
                 tiled_s2r_b, local_tidx, sDelta, (None, None, None, 0)
             )
-            (s2r_atom_cumsum, tBsDeltaA_s2r, tBrDeltaA_s2r) = self.smem_load_and_partition_delta_d(
+            s2r_atom_cumsum, tBsDeltaA_s2r, tBrDeltaA_s2r = self.smem_load_and_partition_delta_d(
                 tiled_s2r_b, local_tidx, sDeltaA, (None, None, None, 0)
             )
 
@@ -1497,7 +1506,7 @@ class SSDKernel:
             # Make tiledCopy and partition tmem/register tensor for tmem load INTER1_ACC
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INTERNAL_STAGE)
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            (tiled_t2r_inter1, tTR_tP, tTR_rP) = self.pre_inter_tmem_load_and_partition_p(
+            tiled_t2r_inter1, tTR_tP, tTR_rP = self.pre_inter_tmem_load_and_partition_p(
                 local_tidx, tInter1, smem_pt
             )
 
@@ -1828,13 +1837,13 @@ class SSDKernel:
             # Make tiledCopy and partition smem/register tensor for smem memory load delta/delta_cumsum
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, INPUT_STAGE)
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            (s2r_atom_cumsum, tQsDeltaA_Row, tQrDeltaA_Row) = self.smem_load_and_partition_delta_d(
+            s2r_atom_cumsum, tQsDeltaA_Row, tQrDeltaA_Row = self.smem_load_and_partition_delta_d(
                 tiled_t2r_intra1, local_tidx, sDeltaA_Row, (None, None, None, 0)
             )
-            (s2r_atom_cumsum, tQsDeltaA_Col, tQrDeltaA_Col) = self.smem_load_and_partition_delta_d(
+            s2r_atom_cumsum, tQsDeltaA_Col, tQrDeltaA_Col = self.smem_load_and_partition_delta_d(
                 tiled_t2r_intra1, local_tidx, sDeltaA_Col, (None, None, None, 0)
             )
-            (s2r_atom_delta, tQsDelta, tQrDelta) = self.smem_load_and_partition_delta_d(
+            s2r_atom_delta, tQsDelta, tQrDelta = self.smem_load_and_partition_delta_d(
                 tiled_t2r_intra1, local_tidx, sDelta, (None, None, None, 0)
             )
 
@@ -1989,17 +1998,17 @@ class SSDKernel:
             # Make tiled copy and partition tmem/reg tensor w.r.t tensor memory load
             # ((T2R_ATOM_V, T2R_REST_V), REST_M, REST_N, EPI_M, EPI_N, INTERNAL_STAGE)
             # ((T2R_ATOM_V, T2R_REST_V), REST_M, REST_N)
-            (tiled_t2r_intra2, tTR_tIntra, tTR_rIntra) = self.epilog_tmem_load_and_partition_acc(
+            tiled_t2r_intra2, tTR_tIntra, tTR_rIntra = self.epilog_tmem_load_and_partition_acc(
                 local_tidx, tIntra_epi, smem_y
             )
-            (tiled_t2r_inter2, tTR_tInter2, tTR_rInter) = self.epilog_tmem_load_and_partition_acc(
+            tiled_t2r_inter2, tTR_tInter2, tTR_rInter = self.epilog_tmem_load_and_partition_acc(
                 local_tidx, tInter_epi, smem_y
             )
 
             # Make tiled copy and partition smem/reg tensor w.r.t smem load Delta
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N, EPI_M, EPI_N, INPUT_STAGE)
             # ((T2R_ATOM_V, T2R_REST_V), T2R_M, T2R_N)
-            (s2r_atom_delta, tTR_sDeltaA, tTR_rDeltaA) = self.smem_load_and_partition_delta_d(
+            s2r_atom_delta, tTR_sDeltaA, tTR_rDeltaA = self.smem_load_and_partition_delta_d(
                 tiled_t2r_inter2, local_tidx, sDeltaA_epi, (None, None, None, 0, 0, 0)
             )
 

@@ -1,22 +1,4 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Tiled B/C repack (token-major -> dense chunk-major) for the CuteDSL SSD
-front-end.
-
-The divisible path feeds the kernel dense chunk-major ``(1, G, N_pad, TC, L)``
-B/C workspace buffers built from the token-packed ``(T, G, N)`` inputs. Doing
-that with ``B_d[:, :, :N].copy_(B.as_strided(...))`` is an (n, l)-plane
-TRANSPOSE per (group, chunk): torch's generic strided-copy kernel is coalesced
-on only one side and runs at ~1 TB/s (~250 us for B+C at 32K tokens on GB200 —
-comparable to the SSD kernel itself). This kernel stages (BLOCK_L, BLOCK_N)
-tiles through registers/smem (``tl.trans``) so BOTH the token-major loads
-(contiguous along n) and the chunk-major stores (contiguous along l) are
-coalesced, and handles B and C in one launch (grid axis 1).
-
-Rows ``n >= N`` of the ``N_pad``-padded destination are never written: the
-workspace buffers are zero-initialized once and the padding must stay zero,
-exactly like the ``[:, :, :N]`` slice of the copy_ it replaces.
-"""
-
 import torch
 import triton
 import triton.language as tl
@@ -30,11 +12,16 @@ def _bc_repack_kernel(
     c_dst_ptr,
     N,
     TC,
+    n_valid_tokens,
+    ws_token_base_ptr,
+    ws_valid_lo_ptr,
+    ws_valid_hi_ptr,
     stride_src_token,
     stride_src_g,
     stride_dst_g,
     stride_dst_n,
     stride_dst_c,
+    RAGGED: tl.constexpr,
     L: tl.constexpr,
     BLOCK_L: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -58,9 +45,18 @@ def _bc_repack_kernel(
     n_mask = offs_n < N
 
     # Load (BLOCK_L, BLOCK_N): contiguous along n (stride 1) -> coalesced.
-    token = c * L + offs_l
+    # Lanes past the last real token (the pad tail of a ragged final chunk) read
+    # as 0: they contribute nothing anyway (their delta is 0), and writing zeros
+    # keeps the reused workspace free of stale values.
+    if RAGGED:
+        # General ragged: per-workspace-chunk token base + real-token window.
+        token = tl.load(ws_token_base_ptr + c) + offs_l
+        tok_mask = (token >= tl.load(ws_valid_lo_ptr + c)) & (token < tl.load(ws_valid_hi_ptr + c))
+    else:
+        token = c * L + offs_l
+        tok_mask = token < n_valid_tokens
     src_off = token[:, None] * stride_src_token + g * stride_src_g + offs_n[None, :]
-    tile = tl.load(src_ptr + src_off, mask=n_mask[None, :], other=0.0)
+    tile = tl.load(src_ptr + src_off, mask=n_mask[None, :] & tok_mask[:, None], other=0.0)
 
     # Store transposed (BLOCK_N, BLOCK_L): contiguous along l -> coalesced.
     dst_off = g * stride_dst_g + offs_n[:, None] * stride_dst_n + c * stride_dst_c + offs_l[None, :]
@@ -75,6 +71,8 @@ def repack_bc_chunk_major(
     N: int,
     total_chunks: int,
     kernel_chunk_size: int,
+    n_valid_tokens: int | None = None,
+    ragged_chunks: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Repack token-major B and C into the dense chunk-major workspace buffers.
 
@@ -92,6 +90,9 @@ def repack_bc_chunk_major(
         N: Real state dim (``N_pad`` rows beyond it are left untouched).
         total_chunks: ``TC`` (== real tokens / kernel_chunk_size).
         kernel_chunk_size: The kernel chunk size ``L`` (compile-time constant).
+        n_valid_tokens: Number of REAL tokens; rows at or beyond it (the pad
+            tail of a ragged final chunk) are written as zeros instead of being
+            read. Defaults to ``total_chunks * kernel_chunk_size``.
     """
     G = B.shape[1]
     L = kernel_chunk_size
@@ -100,6 +101,10 @@ def repack_bc_chunk_major(
     assert B.stride(1) == C.stride(1) and B.stride(0) == C.stride(0), "B/C layouts must match"
     assert B_dst.stride(1) == C_dst.stride(1), "dst layouts must match"
 
+    if n_valid_tokens is None:
+        n_valid_tokens = total_chunks * L
+    ragged = ragged_chunks is not None
+    base_p, lo_p, hi_p = ragged_chunks if ragged else (B, B, B)
     BLOCK_L = 64 if L % 64 == 0 else L
     BLOCK_N = max(16, triton.next_power_of_2(N))
     grid = (G * total_chunks * (L // BLOCK_L), 2)
@@ -110,11 +115,16 @@ def repack_bc_chunk_major(
         C_dst,
         N,
         total_chunks,
+        n_valid_tokens,
+        base_p,
+        lo_p,
+        hi_p,
         B.stride(0),
         B.stride(1),
         B_dst.stride(1),
         B_dst.stride(2),
         B_dst.stride(3),
+        RAGGED=ragged,
         L=L,
         BLOCK_L=BLOCK_L,
         BLOCK_N=BLOCK_N,
