@@ -1872,7 +1872,7 @@ def _load_base_checkpoint(
                     state_dict_metadata,
                     state_dict,
                     checkpoint_name,
-                    strict=getattr(args, 'strict_fsdp_dtensor_model_load', 'raise_unexpected'),
+                    strict=args.dist_ckpt_strictness,
                 )
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)

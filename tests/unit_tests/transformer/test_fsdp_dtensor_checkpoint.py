@@ -48,6 +48,9 @@ from megatron.core.tensor_parallel.layers import (
 from megatron.core.transformer import fsdp_dtensor_checkpoint
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     MLA_UNFUSED_DOWN_PROJS,
+    _intersect_slice,
+    _shift_slice,
+    _strip_wrapper_prefixes,
     absorbed_input_layernorm_key,
     flatten_state_dict,
     get_expert_index_from_key,
@@ -60,6 +63,60 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     rename_mtp_inner_layer_keys,
     validate_fsdp_dtensor_model_load,
 )
+
+
+# ============================================================================
+# Test the slice/path helpers shared by the SwiGLU, GDN and MLA handlers
+# ============================================================================
+class TestSharedSliceHelpers:
+    """These three are used by every fused-parameter handler, so pin their semantics."""
+
+    def test_intersect_overlapping(self):
+        assert _intersect_slice(slice(0, 10), slice(4, 20)) == slice(4, 10)
+
+    def test_intersect_contained(self):
+        assert _intersect_slice(slice(0, 10), slice(2, 5)) == slice(2, 5)
+
+    @pytest.mark.parametrize(
+        "s1,s2",
+        [
+            (slice(0, 4), slice(4, 8)),  # touching but not overlapping
+            (slice(0, 4), slice(6, 8)),  # disjoint
+            (slice(6, 8), slice(0, 4)),  # disjoint, reversed
+        ],
+    )
+    def test_intersect_without_overlap_is_empty(self, s1, s2):
+        """An FSDP shard that holds none of a section must yield a zero-length slice, not a
+        negative-length one, otherwise the section's reshape silently takes the wrong data."""
+        result = _intersect_slice(s1, s2)
+        assert result.stop - result.start == 0
+        assert list(range(10))[result] == []
+
+    def test_shift_slice(self):
+        assert _shift_slice(slice(6, 10), -4) == slice(2, 6)
+
+    def test_shift_rebases_onto_local_storage(self):
+        """The handlers shift by -fsdp_slice.start to index into this rank's local shard."""
+        fsdp_slice = slice(8, 16)
+        section = _intersect_slice(fsdp_slice, slice(12, 20))
+        assert _shift_slice(section, -fsdp_slice.start) == slice(4, 8)
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("module.decoder.layers.0.weight", "decoder.layers.0.weight"),
+            ("model.module.decoder.layers.0.weight", "decoder.layers.0.weight"),
+            ("module.module.decoder.weight", "decoder.weight"),
+            ("decoder.layers.0.weight", "decoder.layers.0.weight"),
+            ("", ""),
+        ],
+    )
+    def test_strip_wrapper_prefixes(self, path, expected):
+        assert _strip_wrapper_prefixes(path) == expected
+
+    def test_strip_keeps_inner_module_segments(self):
+        """Only leading wrapper segments go; 'module' deeper in the path is a real submodule."""
+        assert _strip_wrapper_prefixes("module.decoder.module.weight") == "decoder.module.weight"
 
 
 # ============================================================================
@@ -1231,12 +1288,33 @@ class TestValidateFsdpDtensorModelLoad:
         assert result == {f"model.{self.MISSING_KEY}"}
         assert self.MISSING_KEY in caplog.text
 
-    @pytest.mark.parametrize(
-        "strict", [StrictHandling.IGNORE_ALL, StrictHandling.ASSUME_OK_UNEXPECTED]
-    )
-    def test_check_disabled_variants(self, strict):
+    def test_ignore_all_disables_the_check(self):
         metadata, load = self._mismatched()
-        assert validate_fsdp_dtensor_model_load(metadata, load, "/ckpt", strict=strict) == set()
+        assert (
+            validate_fsdp_dtensor_model_load(
+                metadata, load, "/ckpt", strict=StrictHandling.IGNORE_ALL
+            )
+            == set()
+        )
+
+    def test_assume_ok_unexpected_raises(self):
+        """ASSUME_OK_UNEXPECTED defers to the underlying strategy, which never raises on a
+        partial DCP load, so for fsdp_dtensor it has to raise here instead. This is the
+        default value of --dist-ckpt-strictness, so the check must be on out of the box."""
+        metadata, load = self._mismatched()
+        with pytest.raises(CheckpointingException):
+            validate_fsdp_dtensor_model_load(
+                metadata, load, "/ckpt", strict=StrictHandling.ASSUME_OK_UNEXPECTED
+            )
+
+    def test_assume_ok_unexpected_quiet_when_complete(self):
+        metadata, load = self._matched()
+        assert (
+            validate_fsdp_dtensor_model_load(
+                metadata, load, "/ckpt", strict=StrictHandling.ASSUME_OK_UNEXPECTED
+            )
+            == set()
+        )
 
     @pytest.mark.parametrize(
         "strict", [StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL]
