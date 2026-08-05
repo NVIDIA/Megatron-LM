@@ -100,8 +100,8 @@ try:
 
             # Optional VLM input: base64-encoded image bytes, ordered to match
             # <image> markers in the prompt. Text-only callers omit this field.
-            image_bytes_list = [
-                base64.b64decode(s) for s in (req.get("image_bytes_list") or [])
+            image_payload = [
+                base64.b64decode(s) for s in (req.get("image_payload") or [])
             ]
 
             sampling_params = SamplingParams(
@@ -154,7 +154,7 @@ try:
                     client.add_request_streaming(
                         prompt_tokens,
                         per_req_params,
-                        image_bytes_list=image_bytes_list or None,
+                        image_payload=image_payload or None,
                     )
                 )
             else:
@@ -162,7 +162,7 @@ try:
                     client.add_request(
                         prompt_tokens,
                         per_req_params,
-                        image_bytes_list=image_bytes_list or None,
+                        image_payload=image_payload or None,
                     )
                 )
 

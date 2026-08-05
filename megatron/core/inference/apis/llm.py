@@ -2,12 +2,15 @@
 
 """Sync high-level inference API for Megatron (``MegatronLLM``)."""
 
-from typing import List, Optional, Union
+from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -39,6 +42,7 @@ class MegatronLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
     ) -> None:
         super().__init__(
             model=model,
@@ -47,18 +51,24 @@ class MegatronLLM(_MegatronLLMBase):
             use_coordinator=use_coordinator,
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
+            inference_wrapper_cls=inference_wrapper_cls,
         )
 
     def generate(
         self,
         prompts: Union[str, List[int], List[str], List[List[int]]],
         sampling_params: Optional[SamplingParams] = None,
+        image_payload=None,
     ) -> List["DynamicInferenceRequest"]:
         """Run inference for one prompt or a batch.
 
         Returns ``list[DynamicInferenceRequest]`` in input order. Single-prompt
         input returns a one-element list -- the always-list shape is the
         deliberate sync-vs-async asymmetry.
+
+        ``image_payload`` is either ``list[bytes]`` (engine preprocesses) or a
+        tensor dict such as ``{"imgs": pixel_values, "imgs_sizes": sizes}``
+        (skip preprocess). Batched prompts take a list of those (or ``None``).
 
         No concurrency guard: sync is single-caller by Python's GIL. If you
         need to call ``generate`` concurrently from multiple threads, callers
@@ -71,13 +81,25 @@ class MegatronLLM(_MegatronLLMBase):
         if sampling_params is None:
             sampling_params = SamplingParams()
 
-        normalized, _is_batch = self._normalize_prompts(prompts)
+        normalized, is_batch = self._normalize_prompts(prompts)
         if not normalized:
             return []
 
+        per_prompt_images = self._normalize_image_payload_list(
+            image_payload,
+            num_prompts=len(normalized),
+            is_batch=is_batch,
+        )
+
         if self._use_coordinator:
             assert self._loop_manager is not None
-            return self._loop_manager.run_sync(self._generate_impl(normalized, sampling_params))
+            return self._loop_manager.run_sync(
+                self._generate_impl(normalized, sampling_params, per_prompt_images)
+            )
+        if any(per_prompt_images):
+            raise ValueError(
+                "image_payload is only supported with use_coordinator=True."
+            )
         # Direct mode: bypass _generate_impl (which would use to_thread,
         # pointless for sync). Call the engine directly and merge.
         records = self._engine.generate(normalized, sampling_params)

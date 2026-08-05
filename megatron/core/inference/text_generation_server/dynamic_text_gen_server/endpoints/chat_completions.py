@@ -260,13 +260,13 @@ def _extract_images_from_messages(messages):
     with plain string ``content`` are passed through unchanged.
 
     Returns:
-        (messages_with_markers, image_bytes_list)
+        (messages_with_markers, image_payload)
     """
     if not isinstance(messages, list):
         return messages, []
 
     rewritten = []
-    image_bytes_list: list[bytes] = []
+    image_payload: list[bytes] = []
 
     for message in messages:
         if not isinstance(message, dict):
@@ -286,7 +286,7 @@ def _extract_images_from_messages(messages):
                 if not url:
                     continue
                 try:
-                    image_bytes_list.append(_extract_image_url_bytes(url))
+                    image_payload.append(_extract_image_url_bytes(url))
                 except Exception as e:
                     logger.warning(f"Failed to decode image_url: {e}")
                     continue
@@ -302,7 +302,7 @@ def _extract_images_from_messages(messages):
         else:
             rewritten.append(message)
 
-    return rewritten, image_bytes_list
+    return rewritten, image_payload
 
 
 def _sanitize_messages_for_template(messages):
@@ -542,7 +542,7 @@ try:
         # Extract any image_url blocks before template sanitization, which would
         # otherwise drop them. Replaces each image block with an inline <image>
         # text marker that the chat template can substitute.
-        messages, image_bytes_list = _extract_images_from_messages(messages)
+        messages, image_payload = _extract_images_from_messages(messages)
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 
@@ -736,7 +736,7 @@ try:
 
             streams = [
                 client.add_request_streaming(
-                    prompt_tokens, sampling_params, image_bytes_list=image_bytes_list or None
+                    prompt_tokens, sampling_params, image_payload=image_payload or None
                 )
                 for _ in range(n)
             ]
@@ -792,7 +792,7 @@ try:
 
         tasks = [
             client.add_request(
-                prompt_tokens, sampling_params, image_bytes_list=image_bytes_list or None
+                prompt_tokens, sampling_params, image_payload=image_payload or None
             )
             for _ in range(n)
         ]

@@ -81,14 +81,13 @@ def handle_submit_request(coordinator, sender_identity, payload):
     # this is a message from a client.
     # route it to a data parallel rank
     # Payload is [SUBMIT_REQUEST, client_request_id, prompt, sampling_params,
-    # image_bytes_list?] — older clients omit the 5th element, so default it
-    # to None.
+    # image_payload]. image_payload is either list[bytes] or a tensor dict.
     fields = payload[1:]
     if len(fields) == 3:
         client_request_id, prompt, sampling_params = fields
-        image_bytes_list = None
+        image_payload = None
     else:
-        client_request_id, prompt, sampling_params, image_bytes_list = fields[:4]
+        client_request_id, prompt, sampling_params, image_payload = fields[:4]
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -107,14 +106,14 @@ def handle_submit_request(coordinator, sender_identity, payload):
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
     engine_payload = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params, image_bytes_list],
+        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params, image_payload],
         use_bin_type=True,
     )
 
     # Skip prefix-aware routing for image-bearing requests: two prompts with
     # identical text tokens but different images would otherwise hash the same
     # and falsely share kv-cache prefixes.
-    if image_bytes_list:
+    if image_payload:
         request_hashes = []
     else:
         request_hashes = coordinator.compute_request_hashes(prompt)

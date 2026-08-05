@@ -19,6 +19,7 @@ if _EXAMPLES_MULTIMODAL not in sys.path:
 import torch  # noqa: E402
 
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
+from megatron.core.inference.config import ImageProcessingConfig  # noqa: E402
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
@@ -125,6 +126,28 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
                 max_img_tokens + args.num_tokens_to_generate + 512,
             )
 
+    inference_config.image_preprocessing_config = ImageProcessingConfig(
+        patch_dim=args.patch_dim,
+        dynamic_resolution=getattr(args, 'dynamic_resolution', False),
+        use_tiling=getattr(args, 'use_tiling', False),
+        pixel_shuffle=getattr(args, 'pixel_shuffle', False),
+        spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
+        dynamic_resolution_min_patches=getattr(
+            args, 'dynamic_resolution_min_patches', 1
+        ),
+        dynamic_resolution_max_patches=getattr(
+            args, 'dynamic_resolution_max_patches', 128
+        ),
+        vision_model_type=getattr(args, 'vision_model_type', 'radio'),
+        pixel_mean=getattr(args, 'pixel_mean', None),
+        pixel_std=getattr(args, 'pixel_std', None),
+        img_h=getattr(args, 'img_h', None),
+        img_w=getattr(args, 'img_w', None),
+        max_num_tiles=getattr(args, 'max_num_tiles', 1),
+        use_thumbnail=getattr(args, 'use_thumbnail', False),
+        num_img_embeddings_per_tile=args.num_img_embeddings_per_tile,
+    )
+
     context = DynamicInferenceContext(model.config, inference_config)
     wrapped_model = VLMInferenceWrapper(model, context)
     controller = TextGenerationController(wrapped_model, tokenizer)
@@ -207,28 +230,36 @@ if __name__ == "__main__":
 
         # Defaults that align this server with the VLM dynamic-batching path.
         # Injected into argv (not as parser defaults) so they appear *before*
-        # any user-provided value; later occurrences win and so explicit user
-        # CLI args override these.
+        # any user-provided value. Value-taking args are overridden by later
+        # explicit CLI occurrences, so the general form of "later wins" holds;
+        # store_true flags have no negating counterpart, so we only inject
+        # those when the user hasn't set a conflicting explicit value.
         _defaults = [
-            "--use-checkpoint-args",
-            "--bf16",
             "--micro-batch-size", "1",
-            "--inference-dynamic-batching",
             "--inference-dynamic-batching-buffer-size-gb", "2.0",
-            # Materialize logits for every prompt position (not just the last)
-            # so prompt log-probs can be computed for lm-eval / MCQ likelihood
-            # scoring.
-            "--return-log-probs",
-            # Avoid running prefill through CUDA graphs: under a graphed prefill,
-            # is_decode_only() returns True and calculate_log_probs short-circuits
-            # to a single logprob per request, breaking logprob-based eval.
-            "--decode-only-cuda-graphs",
             # Placeholders for add_multimodal_extra_args' required args. These
             # are injected as defaults, so _detect_vlm_from_checkpoint will
             # replace them with the checkpoint's real values when loading a VLM.
             "--language-model-type", "placeholder",
             "--tokenizer-prompt-format", "mistral",
         ]
+        # store_true flags: only inject when the user hasn't expressed a
+        # conflicting choice on the CLI.
+        if "fp16" not in user_passed_attrs and "bf16" not in user_passed_attrs:
+            _defaults.append("--bf16")
+        if "use_checkpoint_args" not in user_passed_attrs:
+            _defaults.append("--use-checkpoint-args")
+        if "inference_dynamic_batching" not in user_passed_attrs:
+            _defaults.append("--inference-dynamic-batching")
+        # Materialize logits for every prompt position (not just the last) so
+        # prompt log-probs can be computed for lm-eval / MCQ likelihood scoring.
+        if "return_log_probs" not in user_passed_attrs:
+            _defaults.append("--return-log-probs")
+        # Avoid running prefill through CUDA graphs: under a graphed prefill,
+        # is_decode_only() returns True and calculate_log_probs short-circuits
+        # to a single logprob per request, breaking logprob-based eval.
+        if "decode_only_cuda_graphs" not in user_passed_attrs:
+            _defaults.append("--decode-only-cuda-graphs")
         sys.argv[1:1] = _defaults
 
         parse_and_validate_args(

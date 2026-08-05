@@ -2,12 +2,15 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
-from typing import List, Optional, Union
+from typing import List, Optional, Type, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
+    AbstractModelInferenceWrapper,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -38,6 +41,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
     ) -> None:
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
         # synchronous ``engine.generate()`` from inside the caller's asyncio
@@ -60,12 +64,14 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             use_coordinator=use_coordinator,
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
+            inference_wrapper_cls=inference_wrapper_cls,
         )
 
     async def generate(
         self,
         prompts: Union[str, List[int], List[str], List[List[int]]],
         sampling_params: Optional[SamplingParams] = None,
+        image_payload=None,
     ) -> Union["DynamicInferenceRequest", List["DynamicInferenceRequest"]]:
         """Run inference for one prompt or a batch of prompts.
 
@@ -73,6 +79,9 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         ``DynamicInferenceRequest``; batched input (``list[str]`` or
         ``list[list[int]]``) returns ``list[DynamicInferenceRequest]`` in
         input order.
+
+        ``image_payload`` is either ``list[bytes]`` (engine preprocesses) or a
+        tensor dict such as ``{"imgs": pixel_values, "imgs_sizes": sizes}``.
 
         Raises:
             RuntimeError: if called on a non-primary rank.
@@ -88,9 +97,15 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             # here since single input is wrapped to a one-element list.
             return []
 
+        per_prompt_images = self._normalize_image_payload_list(
+            image_payload,
+            num_prompts=len(normalized),
+            is_batch=is_batch,
+        )
+
         assert self._loop_manager is not None
         results = await self._loop_manager.run_async(
-            self._generate_impl(normalized, sampling_params)
+            self._generate_impl(normalized, sampling_params, per_prompt_images)
         )
         return results if is_batch else results[0]
 

@@ -93,7 +93,7 @@ class InferenceClient:
         prompt: Union[str, List[int]],
         sampling_params: SamplingParams,
         *,
-        image_bytes_list: Optional[List[bytes]] = None,
+        image_payload=None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -107,15 +107,17 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
-            image_bytes_list: Optional list of raw image bytes (one entry per
-                image in the prompt). When provided, the engine will preprocess
-                each image and run the vision encoder before adding the request.
+            image_payload: Optional multimodal input. Either ``list[bytes]``
+                (engine preprocesses) or a dict of tensors such as
+                ``{"imgs": pixel_values, "imgs_sizes": sizes}`` (skip preprocess).
 
         Returns:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
         """
+        from megatron.core.inference.inference_request import serialize_image_payload
+
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [
@@ -123,7 +125,7 @@ class InferenceClient:
             request_id,
             prompt,
             sampling_params.serialize(),
-            image_bytes_list,
+            serialize_image_payload(image_payload),
         ]
         return self._submit_request(payload, request_id)
 
@@ -228,7 +230,7 @@ class InferenceClient:
         prompt: Union[str, List[int]],
         sampling_params: SamplingParams,
         *,
-        image_bytes_list: Optional[List[bytes]] = None,
+        image_payload=None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -248,10 +250,13 @@ class InferenceClient:
             prompt: A string or list of token IDs.
             sampling_params: Sampling parameters. ``streaming`` is set to True
                 in-place.
+            image_payload: Optional multimodal input (``list[bytes]`` or tensor dict).
 
         Returns:
             AsyncStream[dict]: Per-step partial and final reply frames.
         """
+        from megatron.core.inference.inference_request import serialize_image_payload
+
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -260,7 +265,7 @@ class InferenceClient:
             request_id,
             prompt,
             sampling_params.serialize(),
-            image_bytes_list,
+            serialize_image_payload(image_payload),
         ]
         return self._submit_stream(payload, request_id)
 

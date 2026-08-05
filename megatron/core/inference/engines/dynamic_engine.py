@@ -2956,22 +2956,26 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                # Payload is [request_id, prompt, sampling_params, image_bytes_list?].
-                # Older coordinators omit the 5th slot.
+                # Payload is [request_id, prompt, sampling_params, image_payload].
+                # image_payload is either list[bytes] (preprocess here) or a
+                # tensor dict (use directly).
                 fields = data[1:]
                 if len(fields) == 3:
                     request_id, prompt, sampling_params = fields
-                    image_bytes_list = None
+                    image_payload = None
                 else:
-                    request_id, prompt, sampling_params, image_bytes_list = fields[:4]
+                    request_id, prompt, sampling_params, image_payload = fields[:4]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
-                if image_bytes_list:
-                    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
-                        preprocess_image_bytes_list,
-                    )
-                    from megatron.training import get_args
-                    vlm_kwargs = preprocess_image_bytes_list(image_bytes_list, get_args())
+                from megatron.core.inference.inference_request import (
+                    resolve_image_payload_for_engine,
+                )
+
+                vlm_kwargs = resolve_image_payload_for_engine(
+                    image_payload,
+                    image_preprocessing_config=self.context.config.image_preprocessing_config,
+                )
+                if vlm_kwargs:
                     self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
                 else:
                     self.add_request(request_id, prompt, sampling_params)

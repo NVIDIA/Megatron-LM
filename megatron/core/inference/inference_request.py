@@ -7,11 +7,12 @@ import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
+from megatron.core.inference.config import ImageProcessingConfig
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
@@ -46,6 +47,91 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     """
     tensor = torch.tensor(tensor_as_list)
     return tensor
+
+
+def serialize_image_payload(image_payload: Any) -> Optional[Union[List[bytes], Dict[str, Any]]]:
+    """Serialize one request's multimodal payload for the coordinator wire.
+
+    Accepted forms:
+
+    * ``None``: text-only.
+    * ``list[bytes]``: raw images; the engine will preprocess.
+    * ``dict`` with tensor fields (``imgs``, ``imgs_sizes``, optional
+      ``num_tiles`` / ``num_img_embeddings_per_tile``): already-processed
+      pixels (e.g. NeMo-RL ``pixel_values``); the engine skips preprocessing.
+    """
+    if image_payload is None:
+        return None
+    if isinstance(image_payload, list):
+        if image_payload and not isinstance(image_payload[0], (bytes, bytearray)):
+            raise TypeError(
+                "list image_payload must be list[bytes]; "
+                f"got list[{type(image_payload[0]).__name__}]."
+            )
+        return [bytes(item) for item in image_payload]
+    if not isinstance(image_payload, dict):
+        raise TypeError(
+            "image_payload must be None, list[bytes], or dict with tensor fields; "
+            f"got {type(image_payload)}."
+        )
+
+    wire: Dict[str, Any] = {}
+    for key in ("imgs", "imgs_sizes", "num_tiles"):
+        value = image_payload.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"image_payload[{key!r}] must be a Tensor, got {type(value)}.")
+        wire[key] = serialize_tensor(value)
+    if "num_img_embeddings_per_tile" in image_payload:
+        wire["num_img_embeddings_per_tile"] = int(
+            image_payload["num_img_embeddings_per_tile"]
+        )
+    if not wire:
+        return None
+    return wire
+
+
+def resolve_image_payload_for_engine(
+    image_payload: Any,
+    *,
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None,
+) -> Dict[str, Any]:
+    """Turn a wire image payload into ``DynamicInferenceEngine.add_request`` kwargs.
+
+    * ``list[bytes]`` -> preprocess into ``imgs`` / ``imgs_sizes`` using the
+      engine's image preprocessing configuration.
+    * tensor dict -> deserialize and pass through without preprocessing.
+    """
+    if image_payload is None:
+        return {}
+    if isinstance(image_payload, list):
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
+            preprocess_image_bytes_list,
+        )
+
+        if image_preprocessing_config is None:
+            raise RuntimeError(
+                "Raw image payloads require InferenceConfig.image_preprocessing_config."
+            )
+        return preprocess_image_bytes_list(image_payload, image_preprocessing_config)
+    if not isinstance(image_payload, dict):
+        raise TypeError(
+            f"Unsupported image payload type: {type(image_payload)}; "
+            "expected None, list[bytes], or dict."
+        )
+    kwargs: Dict[str, Any] = {}
+    for key in ("imgs", "imgs_sizes", "num_tiles"):
+        if key in image_payload:
+            value = image_payload[key]
+            kwargs[key] = (
+                value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
+            )
+    if "num_img_embeddings_per_tile" in image_payload:
+        kwargs["num_img_embeddings_per_tile"] = int(
+            image_payload["num_img_embeddings_per_tile"]
+        )
+    return kwargs
 
 
 def serialize_ndarray(arr: np.ndarray) -> dict:

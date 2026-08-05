@@ -1,17 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Image preprocessing for VLM inference servers.
+"""Image preprocessing for multimodal inference servers.
 
-Shared between vlm_server.py and the coordinator/engine VLM dispatch in
+Shared between vlm_server.py and the coordinator/engine image dispatch in
 run_dynamic_text_generation_server.py. Lives in core/inference so the engine
 can import it without circular dependencies.
 """
 
 import io
 import math
+from typing import Optional
 
 import torch
 
+from megatron.core.inference.config import ImageProcessingConfig
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
 
 
@@ -25,11 +27,13 @@ def _resolve_pixel_stats(vision_model_type: str):
     spec = _ENCODER_REGISTRY.get(vision_model_type)
     if spec is not None:
         return list(spec.pixel_mean), list(spec.pixel_std)
-    # Fall back to CLIP defaults pulled from the registry rather than a local
-    # copy, so changes to the canonical constants flow through.
+    # Fall back to CLIP defaults pulled from the registry's dataclass field
+    # defaults rather than instantiating (which would need the four required
+    # geometry fields) or copying locally.
     from megatron.core.models.vision.encoder_registry import EncoderSpec
-    default_spec = EncoderSpec()
-    return list(default_spec.pixel_mean), list(default_spec.pixel_std)
+
+    fields = EncoderSpec.__dataclass_fields__
+    return list(fields["pixel_mean"].default), list(fields["pixel_std"].default)
 
 
 def dynamic_res_preprocess(
@@ -56,8 +60,10 @@ def dynamic_res_preprocess(
     """
     orig_width, orig_height = image.size
 
-    closest_patch_height = round(orig_height / res_step + 0.5)
-    closest_patch_width = round(orig_width / res_step + 0.5)
+    # Use math.ceil, not round(x + 0.5) — the latter is banker's rounding and
+    # produces off-by-one, non-monotonic patch counts on exactly-aligned sides.
+    closest_patch_height = math.ceil(orig_height / res_step)
+    closest_patch_width = math.ceil(orig_width / res_step)
     patches = closest_patch_height * closest_patch_width
 
     factor = min(math.sqrt(max_patches / patches), factor_max)
@@ -93,12 +99,17 @@ def dynamic_res_preprocess(
     return resized_img
 
 
-def preprocess_image_bytes(image_bytes: bytes, args, target_hw=None) -> tuple:
-    """Preprocess raw image bytes into tensors for dynamic-resolution VLM inference.
+def preprocess_image_bytes(
+    image_bytes: bytes,
+    config: ImageProcessingConfig,
+    target_hw=None,
+    device: Optional[torch.device] = None,
+) -> tuple:
+    """Preprocess raw image bytes into tensors for dynamic-resolution inference.
 
     Args:
         image_bytes: Raw image file bytes (e.g. JPEG/PNG).
-        args: Megatron args (must have patch_dim and dynamic_resolution_* attrs).
+        config: Image preprocessing configuration.
         target_hw: Optional (H, W) tuple in pixels. If given, resize to exactly
             this size instead of running dynamic_res_preprocess. Used to keep
             all images in a multi-image request at the same patch dimensions.
@@ -113,11 +124,7 @@ def preprocess_image_bytes(image_bytes: bytes, args, target_hw=None) -> tuple:
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    patch_dim = args.patch_dim
-    pixel_shuffle = getattr(args, 'pixel_shuffle', False)
-    spatial_merge_size = getattr(args, 'spatial_merge_size', 1)
-    min_patches = getattr(args, 'dynamic_resolution_min_patches', 1)
-    max_patches = getattr(args, 'dynamic_resolution_max_patches', 128)
+    patch_dim = config.patch_dim
 
     if target_hw is not None:
         target_h, target_w = target_hw
@@ -125,23 +132,20 @@ def preprocess_image_bytes(image_bytes: bytes, args, target_hw=None) -> tuple:
     else:
         img = dynamic_res_preprocess(
             img,
-            min_patches=min_patches,
-            max_patches=max_patches,
+            min_patches=config.dynamic_resolution_min_patches,
+            max_patches=config.dynamic_resolution_max_patches,
             res_step=patch_dim,
-            pixel_shuffle=pixel_shuffle,
-            spatial_merge_size=spatial_merge_size,
+            pixel_shuffle=config.pixel_shuffle,
+            spatial_merge_size=config.spatial_merge_size,
         )
 
-    vision_type = getattr(args, 'vision_model_type', 'radio')
-    pixel_mean = getattr(args, 'pixel_mean', None)
-    pixel_std = getattr(args, 'pixel_std', None)
+    vision_type = config.vision_model_type
+    pixel_mean = config.pixel_mean
+    pixel_std = config.pixel_std
     if pixel_mean is None or pixel_std is None:
         pixel_mean, pixel_std = _resolve_pixel_stats(vision_type)
 
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Normalize(mean=pixel_mean, std=pixel_std),
-    ])
+    transform = T.Compose([T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)])
 
     img_tensor = transform(img)  # [C, H, W]
     C, H, W = img_tensor.shape
@@ -154,19 +158,27 @@ def preprocess_image_bytes(image_bytes: bytes, args, target_hw=None) -> tuple:
     images = patches.unsqueeze(0)
     imgs_sizes = torch.tensor([[H, W]], dtype=torch.int32)
 
-    return images.cuda(), imgs_sizes.cuda()
+    if device is not None:
+        return images.to(device), imgs_sizes.to(device)
+    return images, imgs_sizes
 
 
-def preprocess_image_bytes_list(image_bytes_list, args) -> dict:
-    """Preprocess a list of raw image bytes into engine.add_request VLM kwargs.
+def preprocess_image_bytes_list(
+    image_bytes_list,
+    config: ImageProcessingConfig,
+    device: Optional[torch.device] = None,
+) -> dict:
+    """Preprocess a list of raw image bytes into engine.add_request image kwargs.
 
-    Selects the dynamic-resolution or tiling path based on args.dynamic_resolution
-    and args.use_tiling. Within a single request, dynamic-resolution images are
-    resized to the first image's H/W to keep all images at matching patch counts.
+    Selects the dynamic-resolution or tiling path from the inference config.
+    Each image is preprocessed independently so its aspect ratio is preserved.
 
     Args:
         image_bytes_list: List of raw image bytes (one entry per image).
-        args: Megatron args.
+        config: Image preprocessing configuration.
+        device: Optional target device for the returned tensors. If None,
+            tensors are returned on CPU and the caller is responsible for
+            transfer.
 
     Returns:
         dict suitable for ``**kwargs`` to ``DynamicInferenceEngine.add_request``.
@@ -174,18 +186,15 @@ def preprocess_image_bytes_list(image_bytes_list, args) -> dict:
     if not image_bytes_list:
         return {}
 
-    dynamic_res = (
-        getattr(args, 'dynamic_resolution', False)
-        and not getattr(args, 'use_tiling', False)
-    )
+    dynamic_res = config.dynamic_resolution and not config.use_tiling
 
     if dynamic_res:
+        # Preprocess each image independently so its aspect ratio is preserved.
+        # Downstream (llava_model._preprocess_data / vision encoder pack) handles
+        # per-image cu_seqlens, so ragged patch counts are fine.
         all_imgs, all_sizes = [], []
-        ref_hw = None
         for image_bytes in image_bytes_list:
-            imgs, imgs_sizes = preprocess_image_bytes(image_bytes, args, target_hw=ref_hw)
-            if ref_hw is None:
-                ref_hw = (imgs_sizes[0][0].item(), imgs_sizes[0][1].item())
+            imgs, imgs_sizes = preprocess_image_bytes(image_bytes, config, device=device)
             all_imgs.append(imgs)
             all_sizes.append(imgs_sizes)
         imgs = torch.cat(all_imgs, dim=1) if len(all_imgs) > 1 else all_imgs[0]
@@ -194,7 +203,7 @@ def preprocess_image_bytes_list(image_bytes_list, args) -> dict:
 
     all_imgs, all_num_tiles = [], []
     for image_bytes in image_bytes_list:
-        imgs, num_tiles = preprocess_image_bytes_tiled(image_bytes, args)
+        imgs, num_tiles = preprocess_image_bytes_tiled(image_bytes, config, device=device)
         all_imgs.append(imgs)
         all_num_tiles.append(num_tiles)
     imgs = torch.cat(all_imgs, dim=0) if len(all_imgs) > 1 else all_imgs[0]
@@ -202,12 +211,16 @@ def preprocess_image_bytes_list(image_bytes_list, args) -> dict:
     return {
         "imgs": imgs,
         "num_tiles": num_tiles,
-        "num_img_embeddings_per_tile": getattr(args, 'num_img_embeddings_per_tile', 0),
+        "num_img_embeddings_per_tile": config.num_img_embeddings_per_tile,
     }
 
 
-def preprocess_image_bytes_tiled(image_bytes: bytes, args) -> tuple:
-    """Preprocess raw image bytes into tiled tensors for static-resolution VLM inference.
+def preprocess_image_bytes_tiled(
+    image_bytes: bytes,
+    config: ImageProcessingConfig,
+    device: Optional[torch.device] = None,
+) -> tuple:
+    """Preprocess raw image bytes into tiled tensors for static-resolution inference.
 
     Returns:
         (imgs, num_tiles) where imgs is [num_tiles, C, H, W] and num_tiles is a [1] int tensor.
@@ -221,14 +234,20 @@ def preprocess_image_bytes_tiled(image_bytes: bytes, args) -> tuple:
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    transform = ImageTransform(input_size=args.img_h, vision_model_type=args.vision_model_type)
+    if config.img_h is None or config.img_w is None:
+        raise ValueError("Tiled image preprocessing requires img_h and img_w.")
+    transform = ImageTransform(input_size=config.img_h, vision_model_type=config.vision_model_type)
     imgs_list = transform(
-        img, args.img_h, args.img_w,
-        use_tiling=args.use_tiling,
-        max_num_tiles=args.max_num_tiles,
-        use_thumbnail=args.use_thumbnail,
+        img,
+        config.img_h,
+        config.img_w,
+        use_tiling=config.use_tiling,
+        max_num_tiles=config.max_num_tiles,
+        use_thumbnail=config.use_thumbnail,
     )
 
     imgs = torch.stack(imgs_list)
     num_tiles = torch.tensor([len(imgs_list)], dtype=torch.int)
-    return imgs.cuda(), num_tiles.cuda()
+    if device is not None:
+        return imgs.to(device), num_tiles.to(device)
+    return imgs, num_tiles

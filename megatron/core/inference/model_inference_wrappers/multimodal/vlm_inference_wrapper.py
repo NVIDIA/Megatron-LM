@@ -158,12 +158,12 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes. Upstream LLaVAModel sets neither
-        # _dynamic_resolution nor _patch_dim / _class_token_len; without those,
+        # _dynamic_resolution nor patch_dim / _class_token_len; without those,
         # falling through to the static path would silently miscount tokens.
         if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
             raise NotImplementedError(
                 "Dynamic-resolution image expansion requires LLaVAModel "
-                "attributes (_dynamic_resolution, _patch_dim, _class_token_len) "
+                "attributes (_dynamic_resolution, patch_dim, _class_token_len) "
                 "not yet available upstream. Use num_tiles (static resolution) "
                 "or wait for the companion LLaVAModel changes."
             )
@@ -171,7 +171,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # Compute per-image embedding counts
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
             # Dynamic resolution: compute per-image embedding count from imgs_sizes
-            patch_dim = module._patch_dim
+            patch_dim = module.patch_dim
             do_pixel_shuffle = module._pixel_shuffle
 
             per_image_embeddings = []
@@ -296,7 +296,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
             raise NotImplementedError(
                 "Dynamic-resolution vision-encoder forward requires "
-                "LLaVAModel._dynamic_resolution/_patch_dim, not yet available "
+                "LLaVAModel._dynamic_resolution/patch_dim, not yet available "
                 "upstream. Use num_tiles (static resolution) or wait for the "
                 "companion LLaVAModel changes."
             )
@@ -304,7 +304,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # Build vision_packed_seq_params for dynamic resolution
         vision_packed_seq_params = None
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
-            patch_dim = module._patch_dim
+            patch_dim = module.patch_dim
             seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
             cu_seqlens = torch.cat(
                 [
@@ -323,18 +323,20 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         old_add_decoder = module.add_decoder
         module.add_decoder = False
-        output = self.model(
-            images,
-            [],
-            position_ids=None,
-            attention_mask=None,
-            inference_context=self.inference_context,
-            num_image_tiles=num_image_tiles,
-            runtime_gather_output=True,
-            imgs_sizes=imgs_sizes,
-            vision_packed_seq_params=vision_packed_seq_params,
-        )
-        module.add_decoder = old_add_decoder
+        try:
+            output = self.model(
+                images,
+                [],
+                position_ids=None,
+                attention_mask=None,
+                inference_context=self.inference_context,
+                num_image_tiles=num_image_tiles,
+                runtime_gather_output=True,
+                imgs_sizes=imgs_sizes,
+                vision_packed_seq_params=vision_packed_seq_params,
+            )
+        finally:
+            module.add_decoder = old_add_decoder
 
         if isinstance(output, tuple):
             image_embeddings, _ = output
@@ -416,16 +418,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         else:
             final_embedding = None
 
-        # This engine plumbing ships without the LLaVAModel.forward_lm_only
-        # entry point. Any VLM caller upstream hits this guard rather than a
-        # confusing AttributeError. Text-only requests never reach here (the
-        # dispatch in _forward gates on image_token_mask).
+        # Fall through to a clear error rather than an AttributeError if the
+        # wrapped model doesn't implement forward_lm_only. LLaVAModel does
+        # (added in this PR); other model classes need their own implementation
+        # to be usable on the dynamic decode path.
         if not hasattr(module, "forward_lm_only"):
             raise NotImplementedError(
-                "Dynamic VLM forward requires LLaVAModel.forward_lm_only, "
-                "which is not yet available upstream. This PR ships engine "
-                "and wire plumbing; the LLaVAModel companion change lands "
-                "in a follow-up PR."
+                "Decode-phase forward for this model requires "
+                "`forward_lm_only`, which is implemented on LLaVAModel but not "
+                "on this model class. Implement `forward_lm_only` on the "
+                "wrapped model to enable dynamic-batching decode."
             )
 
         output = module.forward_lm_only(
@@ -522,17 +524,17 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             num_tokens = tokens.size(1)
             recv_buffer_seq_len = num_tokens
 
-            if self._recv_only_vision_embeds:
-                pass  # TODO: recv image_embeddings when encoder is on separate stage
-
-            if self._encoder_only:
-                pass  # TODO: send image_embeddings down pipeline
-            else:
-                output = super().run_one_forward_step(
-                    inference_input, recv_buffer_seq_len=recv_buffer_seq_len
+            if self._recv_only_vision_embeds or self._encoder_only:
+                raise NotImplementedError(
+                    "Dynamic VLM inference does not yet support split "
+                    "encoder/decoder pipeline stages "
+                    "(_recv_only_vision_embeds / _encoder_only). PP is not "
+                    "supported."
                 )
-            logits = output
-            return logits
+            output = super().run_one_forward_step(
+                inference_input, recv_buffer_seq_len=recv_buffer_seq_len
+            )
+            return output
 
         # Pure text path: no VLM keys, use base GPT forward
         if "images" not in inference_input:
