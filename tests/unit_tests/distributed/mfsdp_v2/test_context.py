@@ -109,6 +109,21 @@ def test_two_child_subtrees_then_parent_collapse_to_one_context(distributed_setu
     assert model.layers[1].context is model.context
 
 
+def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
+    """Fine-grained parent references must not become registered child modules."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+    module_names = tuple(name for name, _ in model.named_modules())
+    layer_keys = tuple(model.layers._modules)
+
+    fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    assert tuple(name for name, _ in model.named_modules()) == module_names
+    assert tuple(model.layers._modules) == layer_keys
+
+
 def test_sibling_roots_without_parent_keep_separate_contexts(distributed_setup):
     """Independent FSDP roots should not share runtime scheduling state."""
     device = distributed_setup.device
@@ -145,3 +160,32 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     context = model.context
     assert list(context.forward_order) == [model, model.left, model.left.inner, model.right]
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
+
+
+def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_setup, monkeypatch):
+    """Manual 1F1B release should include nested units without reducing twice."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    fully_shard(model.inner, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
+    fully_shard(model, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
+    model._lazy_init_context()
+
+    calls = []
+    for name, module in (("root", model), ("inner", model.inner)):
+        monkeypatch.setattr(
+            module, "reshard_parameters", lambda name=name: calls.append((name, "reshard"))
+        )
+        monkeypatch.setattr(module, "reduce_grad", lambda name=name: calls.append((name, "reduce")))
+
+    model.post_backward_release_module()
+    model.post_backward_release_module()
+
+    assert calls == [
+        ("inner", "reshard"),
+        ("inner", "reduce"),
+        ("root", "reshard"),
+        ("root", "reduce"),
+    ]

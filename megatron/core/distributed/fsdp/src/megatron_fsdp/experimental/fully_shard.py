@@ -32,6 +32,9 @@ def fully_shard(
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     use_symm_mem: bool = False,
+    fine_grained: bool = False,
+    skip_backward_callback: bool = False,
+    grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -46,6 +49,26 @@ def fully_shard(
             and parameter-dtype main gradients.
         use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
             PyTorch's NCCL symmetric-memory pool.
+        fine_grained: Register pre-forward and pre-backward hooks on every sub-module
+            so the 1F1B EP overlap schedule can call sub-modules directly.
+        skip_backward_callback: Skip per-param post_accumulate_grad_hook. Required
+            when ``delay_wgrad_compute=True`` so gradient reduction waits for
+            ``backward_dw()`` to complete.
+        grad_divisor: Additional divisor applied to the reduced gradient, on top of the
+            averaging the mesh already performs. Defaults to 1, which is correct whenever
+            each mesh rank contributes exactly one term to the gradient.
+
+            Expert parallelism is the motivating case. A rank's experts process tokens
+            routed to them from every rank in the expert-parallel group, and the backward
+            pass routes those tokens' gradients back, so a rank's expert gradient already
+            sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
+            the expert-data-parallel mesh alone therefore divides by too little, and
+            ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no divisor.
+
+        Parameters that are TE MXFP8 primary weights (detected via
+        ``is_float8tensor`` + ``fp8_need_transpose_data``) are grouped into
+        ``Fp8ParameterGroup`` automatically; no flag is needed.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -62,6 +85,9 @@ def fully_shard(
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
             use_symm_mem=use_symm_mem,
+            fine_grained=fine_grained,
+            skip_backward_callback=skip_backward_callback,
+            grad_divisor=grad_divisor,
         )
     except Exception:
         module.__class__ = original_cls

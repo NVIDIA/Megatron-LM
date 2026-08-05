@@ -11,6 +11,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.profiler import ProfilerActivity, profile
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
@@ -42,6 +43,15 @@ class TinyModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the tiny model."""
         return self.fc2(self.relu(self.fc1(x)))
+
+
+class CheckpointedTinyModel(TinyModel):
+    """Tiny model that activation-checkpoints each shardable module."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run each linear layer through reentrant activation checkpointing."""
+        x = checkpoint(self.fc1, x, use_reentrant=True)
+        return checkpoint(self.fc2, self.relu(x), use_reentrant=True)
 
 
 class NestedModel(nn.Module):
@@ -201,6 +211,27 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
         torch.stack(baseline_losses),
         msg="Sharded losses did not match baseline losses.",
     )
+
+
+def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup):
+    """Activation recomputation should leave every FSDP module resharded."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = CheckpointedTinyModel().to(device)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    x = torch.randn(2, 8, device=device, requires_grad=True)
+    model(x).sum().backward()
+
+    assert isinstance(model.fc1.weight, DTensor)
+    assert isinstance(model.fc2.weight, DTensor)
+    assert not model.context.is_backward
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
