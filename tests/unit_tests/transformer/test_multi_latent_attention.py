@@ -1977,6 +1977,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         seen = []
 
@@ -2001,6 +2002,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         sharded_sd = fused.sharded_state_dict(prefix="")
@@ -2020,6 +2022,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         config = self.transformer_config
         q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
