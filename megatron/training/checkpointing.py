@@ -42,7 +42,6 @@ from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.post_training.utils import print_distributed_quant_summary
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -65,6 +64,15 @@ try:
     HAVE_MEGATRON_FSDP = True
 except ImportError:
     HAVE_MEGATRON_FSDP = False
+
+
+# [ModelOpt]: Import
+try:
+    from megatron.post_training.utils import print_distributed_quant_summary
+
+    has_nvidia_modelopt = True
+except Exception:
+    has_nvidia_modelopt = False
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -848,7 +856,8 @@ def save_checkpoint(
                 verify_integrity=args.verify_integrity,
             )
             # [ModelOpt]: save sharded modelopt_state
-            save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
+            if has_nvidia_modelopt:
+                save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
         elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ['torch_dcp', 'fsdp_dtensor']:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -902,10 +911,11 @@ def save_checkpoint(
                 )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
-            if ckpt_type == CheckpointType.LOCAL:
-                print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
-            else:
-                save_modelopt_state(model, state_dict)
+            if has_nvidia_modelopt:
+                if ckpt_type == CheckpointType.LOCAL:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                else:
+                    save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
             logger.debug(
@@ -2796,7 +2806,8 @@ def load_checkpoint(
                     )
                 log_printed = True
 
-    print_distributed_quant_summary(model, msg='After loading checkpoint')
+    if has_nvidia_modelopt:
+        print_distributed_quant_summary(model, msg='After loading checkpoint')
 
     return iteration, num_floating_point_operations_so_far
 
