@@ -49,6 +49,19 @@ class FrozenFirstLayerModel(nn.Module):
         return torch.relu(self.layers[1](x + self.bias))
 
 
+class TiedLM(nn.Module):
+    """Tiny language model with shared input and output embedding weights."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
+        self.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(self.embed_tokens(token_ids)).float().sum()
+
+
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
@@ -174,5 +187,30 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
         ("push", "<root>", "backward"),
         ("push", "layers.1", "backward"),
         ("pop", "layers.1", "backward"),
+        ("pop", "<root>", "backward"),
+    ]
+
+
+def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setup, monkeypatch):
+    """Tied parameters should complete balanced backward ranges across training cycles."""
+    events: list[NvtxEvent] = []
+    _setup_nvtx_recording(monkeypatch, events)
+    model = TiedLM()
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    token_ids = torch.arange(8, device=distributed_setup.device).reshape(2, 4)
+    for _ in range(2):
+        model.zero_grad(set_to_none=True)
+        model(token_ids).backward()
+
+    assert [(event.kind, event.name, event.phase) for event in events] == [
+        ("push", "<root>", "forward"),
+        ("pop", "<root>", "forward"),
+        ("push", "<root>", "backward"),
+        ("pop", "<root>", "backward"),
+        ("push", "<root>", "forward"),
+        ("pop", "<root>", "forward"),
+        ("push", "<root>", "backward"),
         ("pop", "<root>", "backward"),
     ]
