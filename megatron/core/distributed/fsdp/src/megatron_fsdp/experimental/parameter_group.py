@@ -25,7 +25,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .grouped_tensor import get_values, install_storage, is_grouped_tensor
+from .grouped_tensor import GroupedTensor, get_values, install_storage
 from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -187,7 +187,7 @@ class FsdpParameterGroup:
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
-            elif is_grouped_tensor(parameter):
+            elif isinstance(parameter, GroupedTensor):
                 # A grouped parameter's kernels read its separate backing buffer, so assigning
                 # .data would leave them reading the original allocation -- silently freezing
                 # the parameter, since FSDP would then own storage nothing ever consumes.

@@ -31,22 +31,13 @@ from torch import nn
 from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 
 
-def is_grouped_tensor(tensor: torch.Tensor) -> bool:
-    """Whether ``tensor`` is a TE GroupedTensor, or a parameter wrapping one."""
-    if isinstance(tensor, GroupedTensor):
-        return True
-    # PyTorch may wrap a tensor subclass in a plain nn.Parameter whose .data is the subclass.
-    data = getattr(tensor, "data", None)
-    return data is not tensor and isinstance(data, GroupedTensor)
-
-
 def get_values(tensor: torch.Tensor) -> torch.Tensor:
     """Return a plain, logically shaped view of ``tensor``'s values.
 
     For an ordinary tensor this is the tensor itself. For a grouped tensor it is its
     ``rowwise_data`` reshaped to the logical shape.
     """
-    if not is_grouped_tensor(tensor):
+    if not isinstance(tensor, GroupedTensor):
         return tensor
     return tensor.rowwise_data.view(tensor.shape)
 
