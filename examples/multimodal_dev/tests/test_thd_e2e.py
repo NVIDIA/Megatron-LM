@@ -505,6 +505,49 @@ class TestSegmentPacking:
         with pytest.raises(ValueError, match="no segment representation"):
             pack_or_pad_batch([sample], use_packed_sequence=False, seq_length=8, device="cuda")
 
+    def test_packed_document_dataset_roundtrip(self):
+        from examples.multimodal_dev.data.mock_varlen.qwen35_vl import PackedDocumentQwen35VLDataset
+
+        dataset = PackedDocumentQwen35VLDataset(
+            num_samples=4,
+            seq_length=64,
+            seed=1234,
+            vocab_size=100,
+            image_token_id=97,
+            video_token_id=98,
+            vision_start_token_id=96,
+            resolved_profile={
+                "components": [
+                    {
+                        "name": "mix",
+                        "weight": 1,
+                        "length": {"min": 6, "max": 48, "mean": 14, "sigma": 0.8},
+                        "images_per_document": {"counts": [0, 1, 2], "weights": [1, 2, 1]},
+                    }
+                ],
+                "image_sizes": {"resolutions": [[8, 8], [8, 16]]},
+            },
+            patch_size=2,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+        )
+        # One window per call: the packed_document contract is mbs == 1.
+        sample = {key: value.to("cuda") for key, value in dataset[0].items()}
+        segments = sample["seq_lens"].numel()
+        packed = pack_or_pad_batch([sample], use_packed_sequence=True, device="cuda")
+
+        psp = packed["packed_seq_params"]
+        assert len(psp.cu_seqlens_q) == 1 + segments
+        # divisible_by == 1: no physical padding, total == logical.
+        assert psp.total_tokens == int(sample["seq_lens"].sum().item())
+        expected_images = sample["image_grid_thw"].shape[0]
+        assert packed["image_grid_thw"].shape[0] == expected_images
+        assert int((packed["input_ids"] == 96).sum().item()) == expected_images
+        # Full-sequence labels survive the REAL packer end to end.
+        assert torch.equal(packed["loss_mask"].view(-1), sample["loss_mask"])
+        assert torch.equal(packed["labels"].view(-1), sample["labels"])
+
+
 class TestPackOrPadBatchPackedAlignment:
     """Core packed-padding flags also apply to the multimodal local packer."""
 

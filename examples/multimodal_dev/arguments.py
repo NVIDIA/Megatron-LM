@@ -25,7 +25,32 @@ def add_multimodal_args(parser):
         "--dataset-provider",
         type=str,
         default="mock",
-        help="Dataset provider: mock",
+        help=(
+            "Dataset provider: mock, mock_varlen, or cord_v2. Every provider "
+            "emits the multimodal sample contract; a pure-text corpus is "
+            "mock_varlen with a complete explicit profile whose every "
+            'component has images_per_document {"counts":[0],"weights":[1]} '
+            "(image_sizes still has to carry one valid resolution bucket, "
+            "which nothing then draws from)."
+        ),
+    )
+    group.add_argument(
+        "--multimodal-varlen-mock-dataset-config-json",
+        type=str,
+        default=None,
+        help=(
+            "Config for --dataset-provider mock_varlen (inline JSON or a "
+            "JSON-file path). OPTIONAL: omitted, the context-scaled default "
+            "for the final --seq-length applies (domain [4096, 131072]). An "
+            "explicit JSON must be a COMPLETE four-key profile (components / "
+            "image_sizes / plan_pool_windows / plan_seed); partial or unknown-key "
+            "configs are rejected, with the resolved default embedded in the "
+            "error to copy and edit. "
+            "Requires --pad-packed-seq-alignment max and "
+            "--max-seqlen-per-dp-cp-rank. Distinct from the core "
+            "--varlen-mock-dataset-config-json flag. Schema and provenance: "
+            "the packed_document README section."
+        ),
     )
     group.add_argument(
         "--image-token-id",
@@ -43,7 +68,11 @@ def add_multimodal_args(parser):
         "--total-seq-length",
         type=int,
         default=1024,
-        help="Total sequence length for mock data",
+        help=(
+            "Total sequence length for the fixed-shape providers (mock, "
+            "cord_v2); ignored by mock_varlen (--seq-length is the sole "
+            "capacity authority there)."
+        ),
     )
     group.add_argument(
         "--image-seq-length",
@@ -122,7 +151,10 @@ def add_multimodal_args(parser):
         help=(
             "Fail fast when any single image exceeds this many raw patches "
             "(verified on the TP source before staging, then propagated to the "
-            "TP group). Unset by default."
+            "TP group). For --dataset-provider mock_varlen the default is "
+            "derived from the bucket table (the largest drawable bucket's "
+            "raw-patch count, ignoring weight-0 buckets — an exact invariant "
+            "of the data); unset otherwise."
         ),
     )
     group.add_argument(
