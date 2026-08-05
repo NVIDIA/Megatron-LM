@@ -80,7 +80,7 @@ def test_child_then_parent_share_one_context(distributed_setup):
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = NestedModel().to(device)
+    model = NestedModel()
 
     with fully_shard_context(device=device) as context:
         fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
@@ -218,3 +218,19 @@ def test_fully_shard_context_rejects_nesting(distributed_setup):
 
     assert model[0].context is outer_context
     assert model[1].context is outer_context
+
+
+def test_fully_shard_rejects_child_from_another_context(distributed_setup):
+    """A parent cannot join a context different from an FSDP child context."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel()
+
+    with fully_shard_context(device=device) as first_context:
+        fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
+
+    with fully_shard_context(device=device):
+        with pytest.raises(ValueError, match="another fully_shard_context"):
+            fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    assert model.inner.context is first_context

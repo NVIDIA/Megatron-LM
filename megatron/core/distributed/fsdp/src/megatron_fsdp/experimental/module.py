@@ -69,26 +69,22 @@ class FsdpContext:
         if self._is_finalized:
             raise RuntimeError("FSDP context is already finalized.")
 
-        visited: set[FsdpModule] = set()
-        root_modules: list[FsdpModule] = []
-        for module in reversed(self._registered_modules):
-            if module in visited:
-                continue
-            root_modules.append(module)
-            _collect_fsdp_modules_under(cast(nn.Module, module), visited)
-        root_modules.reverse()
-        for root_module in root_modules:
-            root_module._is_root = True
+        children: set[FsdpModule] = set()
+        for module in self._registered_modules:
+            _collect_fsdp_children(cast(nn.Module, module), children)
+        # FsdpModules that are not descendants of any other FsdpModule.
+        roots = [module for module in self._registered_modules if module not in children]
 
-        for root_module in root_modules:
-            for name, module in cast(nn.Module, root_module).named_modules():
+        for root in roots:
+            root._is_root = True
+            for name, module in cast(nn.Module, root).named_modules():
                 if not isinstance(module, FsdpModule):
                     continue
                 module._name = name
                 self.forward_order.append(module)
 
-        for root_module in reversed(root_modules):
-            _collect_backward_order(cast(nn.Module, root_module), self.backward_order)
+        for root in reversed(roots):
+            _collect_backward_order(cast(nn.Module, root), self.backward_order)
 
         self._is_finalized = True
 
@@ -357,17 +353,6 @@ class FsdpModule:
         return f"MFSDP {name} {phase}"
 
 
-def _collect_fsdp_modules_under(module: nn.Module, modules: set["FsdpModule"]) -> None:
-    """Collect FSDP modules reachable from ``module``."""
-    if isinstance(module, FsdpModule):
-        if module in modules:
-            return
-        modules.add(module)
-
-    for child in module.children():
-        _collect_fsdp_modules_under(child, modules)
-
-
 def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
     """Collect one root's static backward prefetch order."""
     if isinstance(module, FsdpModule):
@@ -375,6 +360,15 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, order)
+
+
+def _collect_fsdp_children(module: nn.Module, children: set["FsdpModule"]) -> None:
+    """Collect the nearest FSDP descendants of ``module``."""
+    for child in module.children():
+        if isinstance(child, FsdpModule):
+            children.add(child)
+        else:
+            _collect_fsdp_children(child, children)
 
 
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:

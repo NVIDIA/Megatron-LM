@@ -86,6 +86,12 @@ def fully_shard(
     context = _FSDP_CONTEXT.get()
     if context is None:
         raise RuntimeError("fully_shard must run inside fully_shard_context.")
+    for submodule in module.modules():
+        if isinstance(submodule, FsdpModule) and submodule.context is not context:
+            raise ValueError(
+                "Cannot fully_shard a module containing an FSDP child from another "
+                "fully_shard_context."
+            )
 
     placements = _normalize_placements(mesh, placements)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
