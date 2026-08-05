@@ -64,6 +64,15 @@ except:
 
 if HAVE_TE:
     import transformer_engine_torch as tex
+    from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
+    from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+        mxfp8_quantize_only,
+        mxfp8_transpose_swizzle,
+    )
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
@@ -73,14 +82,6 @@ if HAVE_TE:
         split_te_layernorm_column_parallel_linear,
     )
     from megatron.core.post_training.modelopt.layers import Linear
-    from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
-    from transformer_engine.pytorch.attention.dot_product_attention.utils import (
-        mxfp8_quantize_only,
-        mxfp8_transpose_swizzle,
-    )
-    from transformer_engine.pytorch.cpp_extensions import general_gemm
-    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 else:
     (
         tex,
