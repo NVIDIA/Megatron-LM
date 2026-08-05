@@ -233,6 +233,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             Callable[[Any, MegatronModule], MegatronModule] | None
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
+        use_layer_wise_distributed_optimizer: bool = False,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -246,6 +247,8 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             data_parallel_random_init: Whether to use data parallel random initialization
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
+            use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
+                parameters for the layer-wise distributed optimizer.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,
