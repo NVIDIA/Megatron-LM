@@ -12,6 +12,9 @@ from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+    save_state_dict_async_finalize,
+)
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
@@ -190,3 +193,37 @@ class TestFileSystemWriterAsync:
 
         tensor.to.assert_called_once_with("cpu", non_blocking=True)
         synchronize.assert_called_once_with()
+
+
+class TestSaveStateDictAsyncFinalize:
+    @pytest.mark.parametrize("collective_device", ["cpu", "cuda"])
+    def test_failure_status_uses_process_group_device(self, collective_device):
+        storage_writer = mock.Mock()
+        storage_writer.retrieve_write_results.return_value = [mock.sentinel.local_result]
+        all_results = [mock.sentinel.all_results]
+        dist_wrapper = mock.Mock(is_coordinator=True, coordinator_rank=0, group=mock.sentinel.group)
+        dist_wrapper.gather_object.return_value = all_results
+        failures_occurred = mock.MagicMock()
+        failures_occurred.__bool__.return_value = False
+
+        with (
+            mock.patch(
+                "megatron.core.dist_checkpointing.strategies.state_dict_saver._get_failure_dict",
+                return_value={},
+            ),
+            mock.patch(
+                "megatron.core.dist_checkpointing.strategies.state_dict_saver._get_object_coll_device",
+                return_value=collective_device,
+            ) as get_collective_device,
+            mock.patch.object(torch, "tensor", return_value=failures_occurred) as tensor,
+            mock.patch.object(torch.distributed, "get_rank", return_value=0),
+            mock.patch.object(torch.distributed, "broadcast") as broadcast,
+        ):
+            save_state_dict_async_finalize(storage_writer, mock.sentinel.metadata, dist_wrapper)
+
+        storage_writer.finish.assert_called_once_with(mock.sentinel.metadata, all_results)
+        get_collective_device.assert_called_once_with(dist_wrapper.group)
+        tensor.assert_called_once_with([0], dtype=torch.int, device=collective_device)
+        broadcast.assert_called_once_with(
+            failures_occurred, src=dist_wrapper.coordinator_rank, group=dist_wrapper.group
+        )

@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" State dict saver for PyT Distributed format allowing asynchronous save. """
+"""State dict saver for PyT Distributed format allowing asynchronous save."""
 
 from logging import getLogger
 from time import time
@@ -13,6 +13,7 @@ from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
 from torch.distributed.checkpoint.utils import _DistWrapper, _get_failure_dict
+from torch.distributed.distributed_c10d import _get_object_coll_device
 
 if TYPE_CHECKING:
     from .filesystem_async import FileSystemWriterAsync
@@ -249,7 +250,9 @@ def save_state_dict_async_finalize(
     # Broadcast failure status to all ranks to raise exceptions everywhere if needed.
     # The failure details are only raised on the coordinator.
     failures_occurred = torch.tensor(
-        [int(len(node_failures) > 0)], dtype=torch.int, device=torch.cuda.current_device()
+        [int(len(node_failures) > 0)],
+        dtype=torch.int,
+        device=_get_object_coll_device(dist_wrapper.group),
     )
     torch.distributed.broadcast(
         failures_occurred, src=dist_wrapper.coordinator_rank, group=dist_wrapper.group
