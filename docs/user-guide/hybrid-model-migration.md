@@ -19,8 +19,17 @@ format.
 
 A standard `GPTModel` decoder layer contains both a self-attention sublayer and
 an MLP or MoE sublayer under one layer index. `HybridModel` instead builds an
-ordered stack in which every position represents one layer family. The order is
-described by `--hybrid-layer-pattern`:
+ordered stack in which every position represents one layer family. New
+programmatic model providers should describe that order with direct layer
+specifications, as shown below. The `--hybrid-layer-pattern` syntax remains
+available for CLI workflows and checkpoint migration:
+
+Legacy patterns retain their existing runtime contract: the same string parser
+and PP/VPP selector are used, layer classes receive the shared model config,
+public layer-type lists remain symbol-valued, and legacy MTP, metrics,
+checkpoint keys, and dynamic-inference behavior are unchanged. Direct specs
+use a separate adapter so new per-occurrence behavior does not leak into that
+path.
 
 | Symbol | Layer family |
 |--------|--------------|
@@ -67,6 +76,87 @@ These capabilities do not imply an automatic throughput or quality improvement.
 An architecture-preserving `*-` or `*E` migration should be validated for
 numerical equivalence, and a pattern that adds another layer family should be
 treated as a new architecture and benchmarked independently.
+
+### Prefer direct layer specifications for new providers
+
+`HybridModelConfig.layer_specs` is the preferred API for Python model
+providers. Each `HybridLayerSpec` pairs an existing layer `ModuleSpec` with the
+`TransformerConfig` used for that occurrence. This permits, for example,
+different Mamba state dimensions or different MoE expert widths and top-k
+values at individual positions without introducing another layer class.
+
+The pattern is recursive: nested Python lists and list multiplication are
+expanded in order, and aliases can be reused. `PipelineSplit()` remains a
+structural marker rather than a layer. The following abbreviated example uses
+the layer modules from the standard Hybrid stack:
+
+```python
+from copy import deepcopy
+
+from megatron.core.models.hybrid.hybrid_architecture import HybridLayerSpec, PipelineSplit
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.training.models.hybrid import HybridModelConfig
+
+modules = hybrid_stack_spec.submodules
+# base_config has num_layers=10, pipeline_model_parallel_size=2, and
+# virtual_pipeline_model_parallel_size=2.
+
+mamba_config = deepcopy(base_config)
+mamba_config.mamba_state_dim = 128
+
+moe_4_config = deepcopy(base_config)
+moe_4_config.moe_ffn_hidden_size = 1280
+moe_4_config.moe_router_topk = 4
+
+moe_8_config = deepcopy(base_config)
+moe_8_config.moe_ffn_hidden_size = 2688
+moe_8_config.moe_router_topk = 8
+
+M = HybridLayerSpec(module_spec=modules.mamba_layer, config=mamba_config)
+A = HybridLayerSpec(module_spec=modules.attention_layer, config=deepcopy(base_config))
+E4 = HybridLayerSpec(module_spec=modules.moe_layer, config=moe_4_config)
+E8 = HybridLayerSpec(module_spec=modules.moe_layer, config=moe_8_config)
+
+# Four chunks for PP=2 and VPP=2. Nested lists are flattened in order.
+layers = [
+    [M, E4] * 2,
+    PipelineSplit(),
+    [M, A, E4],
+    PipelineSplit(),
+    [],
+    PipelineSplit(),
+    [[M, E8], A],
+]
+
+model_config = HybridModelConfig(
+    transformer=base_config,
+    vocab_size=vocab_size,
+    layer_specs=layers,
+    # One prediction depth; base_config.mtp_num_layers controls repetition.
+    mtp_layer_specs=[A, E8],
+)
+```
+
+The number of non-marker leaves in `layer_specs` must equal `num_layers`.
+Configure exactly one architecture source: `layer_specs` for the direct API or
+`hybrid_layer_pattern` for the legacy string API. Direct MTP layers belong in
+the separate `mtp_layer_specs` field; do not put `PipelineSplit()` in that
+field. `mtp_layer_specs` describes one prediction depth and
+`mtp_num_layers` controls how many depths are built on the final logical
+pipeline stage. That final stage must also contain at least one decoder layer;
+standalone or separately split direct MTP placement is not supported.
+
+The Python architecture definition is required when resuming a direct-spec
+model. Distributed checkpoints preserve global layer keys and can be resharded
+under another compatible PP/VPP split, but they do not serialize the
+`ModuleSpec` tree or an architecture manifest.
+
+For complete architecture-only definitions, see
+[`nemotron_3_5_nano_30b_a3b.py`](../../examples/nemotron3/nemotron_3_5_nano_30b_a3b.py),
+which deliberately reuses one config per layer family because Nano is not
+heterogeneous, and
+[`nemotron_labs_3_puzzle_75b_a9b.py`](../../examples/nemotron3/nemotron_labs_3_puzzle_75b_a9b.py),
+which preserves Puzzle's occurrence-specific MoE widths and top-k values.
 
 ## 2. How to Convert a Checkpoint
 
@@ -352,24 +442,40 @@ the intervening MLP or MoE positions.
 
 ### Configure pipeline parallelism
 
-For pipeline parallelism, add `|` separators without changing the ordered layer
-symbols. For example, the converted pattern `*-*-*-*-` can be trained with two
-pipeline segments as `*-*-|*-*-`. The number of pipe-delimited segments must be
-divisible by `--pipeline-model-parallel-size`.
+For direct `layer_specs`, insert `PipelineSplit()` between logical model
+chunks. Chunks use VPP-major, PP-minor order:
 
-The pattern replaces conventional pipeline layout controls. Remove
-`--num-layers-per-virtual-pipeline-stage`,
-`--num-virtual-stages-per-pipeline-rank`, `--pipeline-model-parallel-layout`,
-`--account-for-embedding-in-pipeline-split`, and
-`--account-for-loss-in-pipeline-split`. When the pattern contains `|`, also
-remove `--decoder-first-pipeline-num-layers` and
-`--decoder-last-pipeline-num-layers`. Express virtual-pipeline segmentation
-with additional pipe-delimited segments instead.
+```text
+chunk index = vp_stage * pipeline_model_parallel_size + pp_rank
+```
 
-The declarative `HybridModelBuilder` currently rejects virtual pipeline
-parallelism. Pipe-defined virtual stages are supported by the
-`pretrain_hybrid.py` CLI builder, but custom builder users must avoid VPP or use
-a path that explicitly supports it.
+For example, four chunks with PP=2 and VPP=2 map to `(vp=0, pp=0)`,
+`(vp=0, pp=1)`, `(vp=1, pp=0)`, and `(vp=1, pp=1)`, in that order. The number
+of chunks must be divisible by the PP size. Their quotient determines VPP; an
+explicit `virtual_pipeline_model_parallel_size` must agree. Empty chunks are
+allowed, and direct PP configurations with more than one rank require explicit
+splits.
+
+Split-defined layouts are mutually exclusive with
+`pipeline_model_parallel_layout`, first- or last-stage layer-count overrides,
+embedding/loss pipeline accounting, and the conventional per-virtual-stage
+controls. The ordinary decoder input embedding is built only for
+`(vp=0, pp=0)`, and the output and loss are built only for the final logical
+chunk. When MTP is enabled, the existing MTP implementation also keeps its
+synchronized embedding replica on that final chunk. `HybridModelBuilder`
+supports both PP and VPP for this direct path.
+
+For the legacy string API, add `|` separators without changing the ordered
+layer symbols. For example, the converted pattern `*-*-*-*-` can be trained
+with two pipeline segments as `*-*-|*-*-`. The number of pipe-delimited
+segments must be divisible by `--pipeline-model-parallel-size`, and the same
+VPP-major ordering applies.
+
+Legacy validation and ownership rules are intentionally unchanged. In
+particular, existing CLI recipes should keep following the combinations that
+their current `--hybrid-layer-pattern` workflow accepts. When a legacy pattern
+contains `|`, first- and last-stage layer-count overrides remain invalid;
+express those segment sizes with additional pipe-delimited symbols instead.
 
 ### Update custom providers and conversion mappings
 
@@ -378,13 +484,15 @@ state-dict differences:
 
 - Build or register `HybridModel` instead of `GPTModel`.
 - Supply a `hybrid_stack_spec` instead of a GPT transformer-layer spec.
-- Set programmatic `num_layers` to the number of layer symbols in the main
-  pattern; unlike the CLI path, a custom provider might not derive it.
+- Prefer `layer_specs` with per-occurrence configs for new programmatic
+  providers; use `hybrid_layer_pattern` only for legacy compatibility.
+- Set programmatic `num_layers` to the number of direct layer leaves or main
+  pattern symbols; unlike the CLI path, a custom provider might not derive it.
 - Map attention and MLP/MoE parameters to their separate Hybrid layer indices.
 - Use `decoder.final_norm` in HybridModel mappings instead of
   `decoder.final_layernorm`.
 - Expand per-layer settings such as attention-window schedules to the full
-  HybridModel pattern.
+  HybridModel layer order.
 
 ### Validate before scaling up
 
