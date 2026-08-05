@@ -24,7 +24,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
 
 **Scope of this document**: a high-level summary of GTP_remat — design intent, public CLI surface, and Megatron-LM ↔ TransformerEngine integration touchpoints.
 
-**Source**: core implementation in `megatron/core/tensor_parallel/generalized_tensor_parallelism.py`, public surface re-exported from `megatron/core/tensor_parallel/gtp_api.py`. Low-precision tensor primitives (FP8 / MXFP8 / NVFP4) stay in TransformerEngine and are imported by the implementation module.
+**Source**: core sharding and collective implementation in `megatron/core/tensor_parallel/generalized_tensor_parallelism.py`, CUDA-graph lifecycle support in `megatron/core/tensor_parallel/gtp_cuda_graphs.py`, and the public surface re-exported from `megatron/core/tensor_parallel/gtp_api.py`. Low-precision tensor primitives (FP8 / MXFP8 / NVFP4) stay in TransformerEngine and are imported by the implementation module.
 
 **Outline:**
 
@@ -58,6 +58,8 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [3.3 Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp)
     - [3.4 Prefetch-chain construction and its design assumptions](#34-prefetch-chain-construction-and-its-design-assumptions)
       - [Grouped-expert chains (one-block-ahead)](#grouped-expert-chains-one-block-ahead)
+    - [3.5 CUDA graph integration](#35-cuda-graph-integration)
+      - [Cross-graph backward reduce-scatter overlap](#cross-graph-backward-reduce-scatter-overlap)
   - [4. Testing](#4-testing)
 
 ---
@@ -84,11 +86,11 @@ CG compatibility is designed-in from day one, not retrofitted. The entire sync /
 - **Chains never cross-link across the capture axis** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`, plus the eager-only grouped-expert chains of §3.4). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
 - **`torch.cuda.Event(external=True)`** for `ag_event` / `rs_event` — the events survive CG capture boundaries and can be waited on from replay-time streams.
 - **Idempotent ticket cache**: `GTPWeightCache.get(ticket)` keeps `slot.buf` set even after `release()`, so replays read the same buffer address as capture. `clear()` drops buffers while keeping tickets valid → supports CG re-capture with lazy re-allocation.
-- **Allocate-in-pool at creation** (`set_cuda_graph_mempool` + `_graphed_alloc`): GRAPHED-chain AG/RS buffers and quantized weight storage are allocated **directly into the CG memory pool** at first creation (during warmup, before capture), so no CUDA allocations happen inside the captured graph — and no post-hoc reallocation/clone is needed. UNGRAPHED buffers stay in regular allocator memory.
+- **Allocate-in-pool at creation** (`set_cuda_graph_mempool` + `cuda_graph_pool_allocation`): GRAPHED-chain AG/RS buffers and quantized weight storage are allocated **directly into the CG memory pool** at first creation (during warmup, before capture), so no CUDA allocations happen inside the captured graph and no post-hoc reallocation/clone is needed. UNGRAPHED buffers stay in regular allocator memory.
 - **Lazy, one-shot chain linking**: `prefetch_initialized` is flipped during the first fwd (warmup), so the chain-construction Python side-effects never execute inside a captured graph. The link table is buffered and flushed atomically at the second forward.
 - **DDP hook manual triggering**: `register_grad_accum_hook` stores the DDP hook on the param; `_CudagraphReplayNode.backward` calls it manually after replay (since `AccumulateGrad` hooks are silenced by replay). This is also how the `assert self.grad_reduce_handle is not None` failure from partial-CG + overlap-grad-reduce is resolved.
 - **Warmup is side-effect-free on `main_grad`**: GTP_remat accumulates wgrad into `main_grad` *inside* the backward (the fusion path returns wgrads as graph outputs instead). Graph capture only *records* ops; it never runs them. But `create_fwd_graph` runs an **eager** warmup fwd+bwd before capturing. That warmup backward executes GTP_remat's `main_grad.add_`. Its deferred cascade adds into a cross-graph `next_w` (another module) from a **stale RS ticket** — the prior backward's wgrad. And `create_cudagraphs()` runs *after* `finalize_model_grads`. So this overwrites the finalized (reduced + per-token-scaled) grads and spikes the step's grad norm. **Fix**: `create_fwd_graph` snapshots the grads its warmup touches — own params + cross-graph `next_w` — via `_backup_grads_before_capture`, then restores them after capture. The bwd graph has no warmup, so it needs none. Bounded to one module's grads.
-- **Drains at CG / eager boundary**: `_drain_gtp_side_streams()` before eager MoE expert compute. Inside bwd capture, two-phase drain: Phase 1 joins the within-graph cascade and records `bwd_completion_event` (next runner unblocks); Phase 2 calls `wait_async_comms(GRAPHED)` to drain the chain-tail handle and re-joins side streams (queued after the event so it doesn't delay the next runner).
+- **Graph-owned two-stage backward drain**: Stage 1 drains only the all-gathers issued by the current graph and records `bwd_completion_event`, allowing the next backward graph to start. Stage 2 drains that graph's reduce-scatters, accumulates the result into `main_grad`, and releases its persistent wgrad-ring slots. See [§3.5](#cross-graph-backward-reduce-scatter-overlap).
 - **Side-stream registration**: the `(GRAPHED, gtp_remat_group)` ag/rs streams are materialized at runner init (`_register_gtp_side_streams`) so they are captured before the first forward.
 
 ### 1.3 Low-precision gather (native FP8 / NVFP4 param)
@@ -275,7 +277,7 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
-  reduce_scatter_with_fp32_accumulation=False)
+  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2)
 ```
 
 ### 2.4 Tuning knobs
@@ -289,10 +291,13 @@ update_gtp_config(
     async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
     reduce_scatter_with_fp32_accumulation=False,  # wgrad RS: BF16 all-to-all + FP32 sum (§2.5)
+    graph_wgrad_ring_size=2,      # Persistent wgrad slots per graph scheduling domain
 )
 ```
 
 `training.py` auto-tunes `pad_for_alignment` based on the quantization recipe (`--fp4`, `--fp8-recipe=mxfp8`, etc.) before model construction. The other knobs are usually left at defaults.
+
+GTP backward reduce-scatter overlap across local CUDA-graph boundaries is enabled automatically. The ownership and ordering protocol is described in [§3.5](#cross-graph-backward-reduce-scatter-overlap).
 
 > **CUDA-graph warmup under GTP_remat.** When CUDA graphs are enabled, GTP_remat forces a minimum of **2** per-graph warmup steps regardless of `--cuda-graph-warmup-steps` (e.g. a user-set `0` is bumped to `2`): the first warmup builds the weight-prefetch chain and the second exercises the prefetch path before capture.
 
@@ -575,6 +580,74 @@ Three consequences:
   - why it must: `cuda_graphs.py` drains with `wait_async_comms(GTPChain.GRAPHED.value)`, matching the id **literally**, so a weight in `GTP_remat_grouped_fc1_ungraphed` would never be joined at the graph boundary — a **correctness** hazard, not just a lost overlap;
   - lifting it would mean draining by chain-id *prefix* (`_chain_is_grouped`) or registering the grouped streams before capture — neither is done today.
 
+### 3.5 CUDA graph integration
+
+GTP supports both **full-iteration CUDA graphs** and **local/partial CUDA graphs**. The common integration keeps graph and eager chains separate, builds lazy prefetch links during warmup, materializes side streams before capture, and preserves stable addresses for captured communication buffers. Full-iteration capture has no boundary between individual layer graphs. Local capture divides the model into independently replayed graph runners, so communication at a runner boundary requires an explicit completion protocol. The features below describe CUDA-graph-specific GTP optimizations and the ownership rules required to make them safe.
+
+#### Cross-graph backward reduce-scatter overlap
+
+*Problem.* A local backward graph may launch GTP all-gathers and wgrad reduce-scatters on side streams. The conservative completion boundary drains both kinds of communication before releasing the next graph. This is correct, but it serializes the current graph's RS tail with otherwise independent compute in the next graph. Releasing the next graph earlier introduces two ownership requirements: each graph must drain only its own communication, and an RS input must remain alive until NCCL has stopped reading it even if another graph has started.
+
+*Without cross-graph overlap.* The conservative backward schedule drains communication in two stages:
+
+```text
+Stage 1: graph-owned AG handles -> wait graph-owned AG streams
+Stage 2: graph-owned RS handles -> finalize main_grad -> wait graph-owned RS streams
+```
+
+`bwd_completion_event` is recorded after Stage 2. The next graph therefore starts after the current graph's AG, RS, and `main_grad` finalization have completed. Because the RS input lifetime cannot extend into the next graph, no persistent cross-graph wgrad ring is required.
+
+```text
+time -------------------------------------------------------------------------------->
+
+runner i       wgrad GEMM -> launch RS_i -> Stage 1: drain AG -> Stage 2: wait RS_i
+RS stream                    +---------------- RS_i -----------------> add main_grad_i
+runner i stream                                                        -> completion_i
+main stream                                                             wait completion_i
+                                                                         -> runner i-1
+```
+
+*Design.* Cross-graph overlap keeps the same two drain stages but moves `bwd_completion_event` between them. Stage 1 establishes that the graph's all-gathers are complete, which is sufficient to release the next graph. Stage 2 remains ordered after the event and drains RS before finalizing `main_grad`. This creates a compute window for the RS tail without changing the collective or gradient math.
+
+*With cross-graph overlap.* The main stream may launch the next backward graph while the current graph's RS and `main_grad` finalization continue. Fixed-address ring slots and replay-time events protect each RS input for the longer lifetime.
+
+```text
+time ------------------------------------------------------------------------------------>
+
+runner i       wait ready[S0] -> wgrad_i writes S0 -> Stage 1 -> completion_i
+RS stream                                      +------ RS_i(S0) ------> ready[S0] -> add_i
+main stream                                                     +-> launch runner i-1
+runner i-1                                                         wait ready[S1]
+                                                                   wgrad_i-1 writes S1
+RS stream                                                          +--- RS_i-1(S1) ---> ready[S1]
+main stream                                                                        +-> runner i-2
+runner i-2                                                                            wait ready[S0]
+
+                  S0 and S1 are allocated before capture, outside the shared graph pool.
+```
+
+The two modes differ only in release timing and the storage required to make early release safe:
+
+| Property | Without cross-graph overlap | With cross-graph overlap |
+|---|---|---|
+| `bwd_completion_event` | After Stage 2 | Between Stage 1 and Stage 2 |
+| RS overlap with the next graph | No | Yes |
+| Persistent wgrad ring | Not required | Required |
+| Additional persistent memory | None for the ring | Bounded by `graph_wgrad_ring_size` |
+
+*Implementation.* Cross-graph overlap is implemented by the following cooperating mechanisms:
+
+1. **Capture-local communication ownership.** `track_gtp_capture_comms()` creates one `GTPCaptureCommState` per backward capture. `register_capture_comm()` records the exact params, AG streams, and RS streams touched by that graph. Both drain stages pass `capture_comms.params` to `wait_async_comms()`, so a graph drains only communication it owns.
+2. **Two-stage completion protocol.** Stage 1 calls `wait_async_comms(..., skip_rs=True)` and joins graph-owned AG streams before recording `bwd_completion_event`. Stage 2 drains graph-owned RS handles, accumulates reduced wgrads into `main_grad`, and joins the RS streams.
+3. **Persistent wgrad-ring allocation.** `initialize_graph_wgrad_rings()` runs after DDP creates `main_grad` and before graph capture. `allocate_graph_wgrad_rings()` allocates fixed-address tensors outside the shared graph pool. Slots are keyed by communication domain, unsharded shape, padded shape, dtype, and expert index. The default ring size is two.
+4. **Actual RS-input ownership.** `_prepare_wgrad_reduce_scatter_inputs()` registers the ring slot selected as the actual NCCL input. If one graph maps multiple parameters to the same slot, capture fails with a request to increase `graph_wgrad_ring_size`.
+5. **Replay fencing.** Before replay writes a slot, the graph runner waits for its `ready_event`. The RS stream publishes that event only after NCCL has stopped reading the slot. Different slots may remain live concurrently; reuse of an occupied slot waits.
+6. **Final gradient fence.** `wait_for_gtp_grad_reduction_on_current_stream()` joins GTP side streams and graph-runner streams before DDP or the optimizer consumes `main_grad`.
+
+*Result and cost.* The ring owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail remains zero, and a non-ring producer is copied into the logical view before reduce-scatter. The bounded memory cost is up to `graph_wgrad_ring_size` full unsharded wgrad buffers for each matching scheduling/shape domain, rather than one buffer per layer. The default ring size of two is sufficient when each graph has one same-key writer: one slot may remain an in-flight RS input while the next graph writes the other, and reuse waits on the older slot's `ready_event`. A larger ring is needed only when one graph contains multiple same-key writers whose reduce-scatter inputs can be live together. Capture rejects unsafe same-slot reuse instead of silently aliasing it.
+
+The feature applies only to **local/partial CUDA graphs** and is enabled automatically. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
+
 ## 4. Testing
 
 **Whenever you add or change a GTP_remat/EGTP_remat feature, run the GTP_remat unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
@@ -586,7 +659,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 
 | Test file | What it guards |
 |-----------|----------------|
-| `test_gtp_basics.py` | Core GTP_remat shard/gather + DDP bucket alignment. |
+| `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, and DDP bucket alignment. |
 | `test_attention_gtp.py` | GTP_remat on attention linears, loss parity vs no-GTP_remat. |
 | `test_mamba_gtp.py` | GTP_remat on Mamba projection weights. |
 | `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`). |
@@ -594,6 +667,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_loss_correctness.py` | End-to-end: GTP_remat per-step loss trajectory matches a no-GTP_remat baseline. |
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. Also the fp32-accumulation reduce-scatter (§2.5): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
+| `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-slot ring reuse across independently replayed graphs (§3.5). |
 | `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
