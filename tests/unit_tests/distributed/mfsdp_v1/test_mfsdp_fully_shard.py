@@ -110,6 +110,55 @@ def test_all_gather_pipeline_prefetch_units(order, start_buckets, expected_bucke
     assert actual == expected_buckets
 
 
+def test_hfsdp_pipeline_preserves_inner_prefetch_size_policy():
+    """HFSDP overlap extends DP-Outer beyond the byte-budgeted DP-Inner frontier."""
+    param = object()
+    pipeline = AllGatherPipeline.__new__(AllGatherPipeline)
+    pipeline.buffer = SimpleNamespace(
+        param_to_param_group={param: 0},
+        parameter_groups=[
+            SimpleNamespace(fsdp_unit_id=unit_id, transpose_weight_buffer=None)
+            for unit_id in range(2)
+        ],
+        ddp_config=SimpleNamespace(
+            fsdp_double_buffer=False,
+            hfsdp_param_gather_overlap=True,
+            outer_dp_sharding_strategy="optim",
+        ),
+        dist_index=SimpleNamespace(use_hybrid_fsdp=True),
+    )
+    pipeline.bucket_can_be_released = {(0, False): False, (1, False): False}
+    pipeline.bucket_status = {
+        (0, False): BucketStatus.READY_TO_USE,
+        (1, False): BucketStatus.READY_TO_USE,
+    }
+    calls = []
+
+    def extend_by_size(bucket_ids, order, suggested_size, double_buffer_units):
+        calls.append(("inner", bucket_ids, order, suggested_size, double_buffer_units))
+        return [0, 1]
+
+    def extend_by_units(bucket_ids, order, num_units):
+        calls.append(("outer", bucket_ids, order, num_units))
+        return [0, 1, 2]
+
+    pipeline._extend_by_prefetch_size = extend_by_size
+    pipeline._extend_by_fsdp_units = extend_by_units
+    pipeline._launch_outer_prefetches = lambda bucket_ids, bwd: calls.append(
+        ("launch_outer", bucket_ids, bwd)
+    )
+
+    pipeline.all_gather_params(
+        [param], prefetch=True, suggested_AG_prefetch_size=123, outer_fsdp_group_param_gather=True
+    )
+
+    assert calls == [
+        ("inner", [0], PrefetchOrder.FORWARD_PASS_ORDER, 123, set()),
+        ("outer", [0, 1], PrefetchOrder.FORWARD_PASS_ORDER, 1),
+        ("launch_outer", [0, 1, 2], False),
+    ]
+
+
 def destroy_device_mesh(device_mesh):
 
     # Teardown device mesh.
@@ -333,7 +382,7 @@ class TestMegatronFsdpFullyShard:
         reason="Requires DTensor and DeviceMesh support in PyTorch 2.4.0 or later.",
     )
     def test_hfsdp_param_gather_overlap(self):
-        """HFSDP stages DP-Outer two units ahead and DP-Inner one unit ahead."""
+        """HFSDP stages DP-Outer beyond the size-budgeted DP-Inner frontier."""
         if Utils.world_size != 8:
             pytest.skip("Requires 8 GPUs for a 2x4 HFSDP mesh.")
 
@@ -353,6 +402,9 @@ class TestMegatronFsdpFullyShard:
         )
         optimizer = fully_shard_optimizer(Adam(fsdp_model.parameters(), lr=0.01))
 
+        # Keep DP-Inner at the current unit and verify that DP-Outer stages one
+        # additional unit beyond that byte-budgeted frontier.
+        fsdp_model.suggested_AG_prefetch_size = 0
         fsdp_model.synchronize_param_gather()
         fsdp_model.start_param_sync()
         pipeline = fsdp_model.all_gather_pipeline
@@ -368,8 +420,8 @@ class TestMegatronFsdpFullyShard:
             for bucket_id, _ in pipeline.outer_bucket_ready_events
             if parameter_groups[bucket_id].fsdp_unit_id is not None
         }
-        assert len(inner_units) == 2
-        assert len(outer_units) == 3
+        assert len(inner_units) == 1
+        assert len(outer_units) == 2
 
         inputs = torch.randn(1, 3, DIM_SIZE, DIM_SIZE, device="cuda")
         loss = fsdp_model(inputs).square().mean()
