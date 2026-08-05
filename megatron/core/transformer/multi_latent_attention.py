@@ -125,11 +125,12 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
         qk_pos_emb_head_dim,
         s,
         b,
-        tp_group,          # tensor-parallel process group
+        tp_group,  # tensor-parallel process group
         sequence_parallel,  # True if sequence parallelism is active
     ):
         tokens = s * b
         x = q_normed.detach().reshape(tokens, -1).contiguous()
+
         # Reshape [s, 1, 1, rope_dim] -> [s*b, rope_dim] bf16 as required by the KF kernel.
         def _flat(t):
             t = t.reshape(s, -1)
@@ -202,13 +203,19 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
             # wgrad: grad_weight = grad_output^T @ input  (A=input[colwise], B=grad_output[colwise], NT)
             if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
                 if ctx.fuse_wgrad_accumulation and hasattr(w_q, "main_grad"):
+
                     def _wgrad(x_, gy_):
                         # Accumulate the fp8 wgrad directly into fp32 main_grad (out=main_grad,
                         # accumulate=True), exactly as TE's fused-wgrad path does.
                         general_gemm(
-                            x_, gy_, layout="NT", grad=True,
-                            out=w_q.main_grad, out_dtype=w_q.main_grad.dtype,
-                            accumulate=True, use_split_accumulator=True,
+                            x_,
+                            gy_,
+                            layout="NT",
+                            grad=True,
+                            out=w_q.main_grad,
+                            out_dtype=w_q.main_grad.dtype,
+                            accumulate=True,
+                            use_split_accumulator=True,
                         )
                         return w_q.main_grad, None
 
@@ -220,15 +227,26 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
                     ctx.wgrad_store.put(
                         [x_saved, gy],
                         lambda x_, gy_: (
-                            general_gemm(x_, gy_, layout="NT", grad=True,
-                                         out_dtype=act_dtype, use_split_accumulator=True)[0],
+                            general_gemm(
+                                x_,
+                                gy_,
+                                layout="NT",
+                                grad=True,
+                                out_dtype=act_dtype,
+                                use_split_accumulator=True,
+                            )[0],
                             None,
                         ),
                     )
                     ret_grad_w = None
             else:
                 ret_grad_w = general_gemm(
-                    x_saved, gy, layout="NT", grad=True, out_dtype=act_dtype, use_split_accumulator=True
+                    x_saved,
+                    gy,
+                    layout="NT",
+                    grad=True,
+                    out_dtype=act_dtype,
+                    use_split_accumulator=True,
                 )[0]
         else:
             # === 16-bit projection: bf16 adjoints, matching the unfused bf16 up-proj backward.
@@ -237,6 +255,7 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
 
             if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
                 if ctx.fuse_wgrad_accumulation and hasattr(w_q, "main_grad"):
+
                     def _wgrad(dq2d_, x_):
                         w_q.main_grad.add_(
                             (dq2d_.t() @ x_).to(w_q.main_grad.dtype).reshape(w_q.main_grad.shape)
@@ -257,7 +276,22 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
             grad_x = reduce_from_tensor_model_parallel_region(grad_x, group=ctx.tp_group)
 
         # grads for: q_normed, w_q, cos, sin, then 10 non-tensor args (including tp_group, sequence_parallel)
-        return grad_x, ret_grad_w, None, None, None, None, None, None, None, None, None, None, None, None
+        return (
+            grad_x,
+            ret_grad_w,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class _QuantizeKVForFusedAttn(torch.autograd.Function):
@@ -267,9 +301,7 @@ class _QuantizeKVForFusedAttn(torch.autograd.Function):
     def forward(ctx, key, value):
         kq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         vq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
-        k_mx, v_mx = mxfp8_quantize_only(
-            [(key.contiguous(), kq), (value.contiguous(), vq)], "sbhd"
-        )
+        k_mx, v_mx = mxfp8_quantize_only([(key.contiguous(), kq), (value.contiguous(), vq)], "sbhd")
         return k_mx, v_mx
 
     @staticmethod
@@ -640,7 +672,8 @@ class MultiLatentAttention(Attention):
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
                 needs_output_trim = need_v_pad
             forced = [
-                t for t in [query, key, value]
+                t
+                for t in [query, key, value]
                 if t is not None and not isinstance(t, QuantizedTensor)
             ]
             core_attn_out = core_attn_manager.group_offload(
@@ -1088,9 +1121,7 @@ class MLASelfAttention(MultiLatentAttention):
                 # With sequence parallelism q_normed is sequence-split; gather to full sequence
                 # before the fused kernel.
                 if self.config.sequence_parallel and get_pg_size(self.tp_group) > 1:
-                    q_normed = gather_from_sequence_parallel_region(
-                        q_normed, group=self.tp_group
-                    )
+                    q_normed = gather_from_sequence_parallel_region(q_normed, group=self.tp_group)
                 s = q_normed.shape[0]
 
                 query = _FusedMLAQUpProjFunction.apply(
