@@ -130,8 +130,15 @@ class MoEModelTestContainer:
             gated_linear_unit=kwargs.get("gated_linear_unit", False),
             activation_func=kwargs.get("activation_func", F.gelu),
             moe_router_force_biased=kwargs.get("moe_router_force_biased", None),
-            moe_paged_stash_buffer_size_factor_cuda=0.5,
-            moe_paged_stash_buffer_size_factor_cpu=1.5,
+            # Shrinking the CUDA factor and zeroing the CPU one (no host-spill fallback) is how
+            # a test forces a paged-stash overflow: the pool is provisioned once at the
+            # capture->captured transition, so a small factor overflows on the first real step.
+            moe_paged_stash_buffer_size_factor_cuda=kwargs.get(
+                "moe_paged_stash_buffer_size_factor_cuda", 0.5
+            ),
+            moe_paged_stash_buffer_size_factor_cpu=kwargs.get(
+                "moe_paged_stash_buffer_size_factor_cpu", 1.5
+            ),
         )
         self.moe_layers = [self._create_moe_layer(layer_number=i) for i in range(num_layers)]
         self.moe_layer = self.moe_layers[0]
@@ -583,17 +590,7 @@ class TestNcclEpPagedStashing:
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     def test_over_budget_recovery(self, zero_copy):
-        """Replay an over-budget step at a budget grown to the peak the dropped step needed.
-
-        Drives the same sequence PagedStashRunner.prepare_for_rerun does. The runner itself is
-        not reachable from a unit test (it walks model_chunk.decoder.layers and is built in
-        training.py), but its orchestration is not the risky part -- the teardown, re-bootstrap
-        and symm-buffer reallocation are, and those are exercised here.
-
-        zero_copy=True is the case that matters: growing reallocates the symm buffers at the new
-        capacity, and the replay has to come back with zero-copy still on. With zero_copy=False
-        that reallocation never happens, so only this parametrization covers it.
-        """
+        """Degrade an over-budget step to a dropless replay, then restore the grown static budget."""
         if not is_nccl_ep_available():
             pytest.skip("NCCL EP is not available")
         if zero_copy and not is_nccl_ep_zero_copy_available():
@@ -646,59 +643,66 @@ class TestNcclEpPagedStashing:
         out_dropped = run()
         over_1 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
         req_1 = [l.token_dispatcher.check_required_capacity().item() for l in container.moe_layers]
-        # No assertions until every collective below is done -- one that fires on a subset of
-        # ranks strands the rest in ep_finalize or the all_reduce, and pytest's deferred
-        # FAILURES section is destroyed by the resulting watchdog kill, hiding the cause.
-        # MAX across ranks, as PagedStashRunner.check_moe_overflow does. ncclEpCreateGroup
-        # asserts every rank passes an identical max_recv_tokens_per_rank, so growing to a
-        # per-rank local peak makes the re-bootstrap diverge and hang.
+
         required_t = torch.tensor([max(req_1)], dtype=torch.int64, device="cuda")
         torch.distributed.all_reduce(required_t, op=torch.distributed.ReduceOp.MAX)
         required = int(required_t.item())
         budget_before = container.moe_layers[0].token_dispatcher._comm_manager._recv_capacity
 
-        # 2. prepare_for_rerun: grow the budget to the observed peak, release the EP context,
-        #    replay. The mode never changes -- the replay is still static and still zero-copy,
-        #    and the grown budget carries forward, so there is no restore step.
+        # 2. prepare_for_rerun: clear the capacity factor (-> eager, which has no budget to
+        #    exceed), record the peak to grow to, release the EP context, replay dropless.
         for layer in container.moe_layers:
             layer.token_dispatcher.reset_over_budget()
+            layer.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
             layer.token_dispatcher.grow_ep_recv_capacity(required)
+            layer.token_dispatcher.invalidate_ep_bootstrap()
         nccl_ep_release_context()
 
         out_replay = run()
         eager_2 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
         zc_2 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
-        caps_2 = [l.token_dispatcher._comm_manager._recv_capacity for l in container.moe_layers]
-        over_2 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
-        replay_nan = bool(torch.isnan(out_replay).any())
+
+        dropped_finite = bool(torch.isfinite(out_dropped).all())
+        replay_finite = bool(torch.isfinite(out_replay).all())
         # atol=0 so the comparison is purely relative: these activations are ~1e-15, and
         # allclose's default atol=1e-8 would call any result "close", including a completely
-        # wrong one. NaN compares not-close, so a dropped step that corrupts to NaN is caught
-        # by the same check without depending on it staying NaN.
+        # wrong one.
         dropped_differs = not torch.allclose(out_dropped, out_replay, rtol=1e-2, atol=0)
+
+        # 3. Success branch: restore the capacity factor -> static returns at the grown budget.
+        for layer in container.moe_layers:
+            layer.token_dispatcher.reset_over_budget()
+            layer.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = (
+                container.config.moe_expert_rank_capacity_factor
+            )
+            layer.token_dispatcher.invalidate_ep_bootstrap()
         nccl_ep_release_context()
 
-        # Assertions only past this point: every collective is behind us, so a failure on a
-        # subset of ranks can no longer strand the others in ep_finalize or an all_reduce.
-        # required is the MAX across ranks, so this is a group-wide statement that somebody
-        # overflowed -- unlike any(over_1), which is only true on the ranks that did.
+        out_restored = run()
+        eager_3 = [l.token_dispatcher._comm_manager.eager for l in container.moe_layers]
+        zc_3 = [l.token_dispatcher._comm_manager.zero_copy for l in container.moe_layers]
+        caps_3 = [l.token_dispatcher._comm_manager._recv_capacity for l in container.moe_layers]
+        over_3 = [l.token_dispatcher.check_over_budget().item() for l in container.moe_layers]
+        nccl_ep_release_context()
+
         assert required > budget_before, (
             f"nothing exceeded budget {budget_before} at capacity factor "
             f"{container.config.moe_expert_rank_capacity_factor}; not exercising overflow"
         )
+        assert all(eager_2), f"replay did not degrade to eager: {eager_2}"
+        assert not any(zc_2), f"replay must drop zero-copy while eager: {zc_2}"
+        assert replay_finite, "eager replay produced non-finite values"
+        assert (
+            dropped_finite
+        ), "the dropped step produced non-finite values; dropped tokens must contribute 0"
+        assert not any(eager_3), f"restore did not return to static: {eager_3}"
         assert all(
-            c >= required > budget_before for c in caps_2
-        ), f"budget did not grow: {budget_before} -> {caps_2}, observed peak {required}"
-        # Growing must not change the mode: staying static is what keeps the replay capturable,
-        # and zero-copy must survive the symm buffers being re-rendezvoused at the new capacity.
-        # The zero_copy check is vacuous when False, load-bearing when True.
-        assert not any(eager_2), f"replay must stay static, not degrade to eager: {eager_2}"
+            z == zero_copy for z in zc_3
+        ), f"restore did not return zero_copy to {zero_copy}: {zc_3}"
         assert all(
-            z == zero_copy for z in zc_2
-        ), f"replay did not keep zero_copy={zero_copy}: {zc_2}"
-        # The point of growing to the observed peak: the replay drops nothing.
-        assert not any(over_2), f"still over budget after growing to {required}: {over_2}"
-        assert not replay_nan, "replay produced NaNs"
+            c >= required > budget_before for c in caps_3
+        ), f"budget did not grow: {budget_before} -> {caps_3}, observed peak {required}"
+        assert not any(over_3), f"still over budget after growing to {required}: {over_3}"
         # Only ranks that actually dropped can differ: overflow is per-rank, so a rank whose
         # experts stayed under budget legitimately reproduces the same output.
         if any(over_1):
@@ -706,6 +710,8 @@ class TestNcclEpPagedStashing:
                 "this rank was over budget, so the dropped step must differ from the dropless "
                 "replay"
             )
+        # The correctness check: two different execution modes must agree
+        torch.testing.assert_close(out_restored, out_replay, rtol=1e-2, atol=0)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     # NCCL EP static-shape paged stashing aborts in dev CI with a pybind11 GIL dec_ref failure.

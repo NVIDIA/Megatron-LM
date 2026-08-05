@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     fused_dispatch,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    is_nccl_ep_bootstrapped,
     nccl_ep_combine,
     nccl_ep_dispatch,
     nccl_ep_finalize,
@@ -1533,13 +1534,10 @@ class _NCCLEPManager(_DispatchManager):
         # Per-expert packing alignment for the receive buffer (grouped-GEMM tile)
         self.alignment = get_align_size_for_quantization(config)
         self.moe_expert_rank_capacity_factor = config.moe_expert_rank_capacity_factor
-        # An unset capacity factor selects eager mode: TE sizes the receive buffer per step from
-        # the actual received-token count instead of a fixed budget.
         self.eager = self.moe_expert_rank_capacity_factor is None
         self.zero_copy = config.moe_ncclep_zero_copy
         self._zc_quant = self.zero_copy and bool(config.fp8 or config.fp4)
         # Grown by grow_recv_capacity() after an overflow, to the peak the dropped step needed.
-        # Monotonic, and it stays for every later step: the mode never changes, only the budget.
         self._recv_capacity_override = None
         if not self.eager:
             # Accumulated device-side per dispatch, so the happy path never syncs.
@@ -1612,13 +1610,22 @@ class _NCCLEPManager(_DispatchManager):
         self.num_local_tokens = num_tokens
 
     def _ensure_bootstrap(self):
-        """Bootstrap NCCL EP and size the receive buffer on first use."""
-        if self._bootstrapped:
+        """
+        Bootstrap NCCL EP and size the receive buffer on first use or after paged stash rerun
+        """
+        # A released context always needs a rebuild, and every mode change is paired with one.
+        if self._bootstrapped and is_nccl_ep_bootstrapped():
             return
+        # PagedStashRunner will set factor to None during rerun to enable eager mode
+        self.eager = self.moe_expert_rank_capacity_factor is None
+        # TODO: support eager mode with zero_copy
+        self.zero_copy = self.config.moe_ncclep_zero_copy and not self.eager
+        self._zc_quant = self.zero_copy and bool(self.config.fp8 or self.config.fp4)
         # NCCL EP's HT backend requires max_dispatch_tokens_per_rank to be a multiple of the HT
         # chunk size (64); ncclEpCreateGroup otherwise fails with "invalid usage".
         # (nccl_ep device/hybridep_adapter.cu).
         _HT_TOKENS_PER_CHUNK = 64
+        # TODO: support THD/Dynamic CP when different ranks might have different number of tokens
         self._max_tokens_per_rank = (
             (self.num_local_tokens + _HT_TOKENS_PER_CHUNK - 1)
             // _HT_TOKENS_PER_CHUNK
@@ -1729,22 +1736,12 @@ class _NCCLEPManager(_DispatchManager):
         return recv_tokens
 
     def grow_recv_capacity(self, new_capacity: int) -> None:
-        """Grow the receive budget to ``new_capacity`` and drop this manager's bootstrap.
+        """Raise the static receive budget to ``new_capacity``, the peak a dropped step needed.
 
-        Recovery from a token drop replays the step at a budget grown to the peak the dropped
-        step needed, rather than degrading to a dropless mode. ``new_capacity`` is the pre-drop
-        requirement TE reported, so the replay is dropless as long as it routes the same way,
-        and one EP rebuild serves both the replay and every later step. Staying static also
-        keeps the replay CUDA-graph capturable and keeps zero-copy, neither of which eager
-        supports.
-
-        Only drops this manager's bootstrap -- the caller must also call
-        ``nccl_ep_release_context()`` once, and the next dispatch then re-bootstraps in the
-        un-captured warmup iteration that ``reset_cuda_graph`` guarantees. That is what makes
-        growing safe: the symm buffers are reallocated at the new capacity outside CUDA-graph
-        capture.
+        Applied on the success path after a dropless replay, so the restored static budget covers
+        the routing that overflowed instead of dropping again on the next step. Monotonic.
         """
-        if self.eager:
+        if self.config.moe_expert_rank_capacity_factor is None:
             return
         # Overflow means total_recv_tokens > _recv_capacity >= the current override, so the
         # peak that triggered it is always strictly larger. Anything else is stale accounting.
@@ -1792,9 +1789,9 @@ class _NCCLEPManager(_DispatchManager):
 def nccl_ep_release_context() -> None:
     """Release the process-wide NCCL EP context and the shared zero-copy symm buffers.
 
-    Collective, and process-wide rather than per-layer: call it once after every manager has
-    grown via ``grow_recv_capacity()``. ``_ensure_bootstrap`` rebuilds both lazily, so the
-    symm-buffer rendezvous lands outside CUDA-graph capture.
+    Collective, and process-wide rather than per-layer: call it once per rerun transition.
+    ``_ensure_bootstrap`` rebuilds both lazily, so the symm-buffer rendezvous lands outside
+    CUDA-graph capture.
     """
     _NCCLEPManager._zc_fwd_token_buf = None
     _NCCLEPManager._zc_bwd_token_buf = None
@@ -2066,6 +2063,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         replayed without dropping. No-op unless the backend supports it."""
         if hasattr(self._comm_manager, 'grow_recv_capacity'):
             self._comm_manager.grow_recv_capacity(new_capacity)
+
+    def invalidate_ep_bootstrap(self) -> None:
+        """Force the backend to re-bootstrap on its next dispatch. Call after changing the mode:
+        every manager must re-derive it, not just the one that happens to dispatch first."""
+        if hasattr(self._comm_manager, '_bootstrapped'):
+            self._comm_manager._bootstrapped = False
 
     def reset_over_budget(self):
         """Reset the accumulated over-budget flag on the communication manager."""
