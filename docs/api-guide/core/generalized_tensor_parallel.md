@@ -524,7 +524,7 @@ The prefetch chains (§3.1) are **not configured — they are observed at runtim
 
 2. **Linking (lazily, on the first forward).** The doubly-linked list (`prev_w` / `next_w`) is built the **first time each weight is materialized** inside `all_gather_and_prefetch`: a class-level per-chain cursor (`GTPShardedParam._chain_state[chain_id]["last_weight"]`) records the previously-seen weight, and the current weight links itself after it. The chain therefore **encodes the forward execution order of the first step** and replays it every step after to predict the next weight to prefetch. The recompute chain (`_recompute_next`) self-populates the same way, from the weights re-gathered while `in_fp8_activation_recompute_phase()` is true.
 
-Weights that must **not** join a chain (embedding, output_layer — they all-gather synchronously and run outside the CUDA-graph boundary) are excluded by setting `weight.prefetch_initialized = True` (and `_need_weight_prefetch = False`) at construction, which skips registration entirely.
+A weight can be kept **out** of a chain by setting `weight.prefetch_initialized = True` (and `_need_weight_prefetch = False`) before its first materialization, which skips registration entirely. Nothing does this today: `embedding` and `output_layer` are ordinary `UNGRAPHED` chain members (they are the head and the tail — see the link table GTP logs on the first backward), and only run outside the CUDA-graph boundary. The hook remains available as the fallback for any weight that cannot satisfy the assumptions below.
 
 **Why this needs careful consideration.** Because `_chain_state` is a *class attribute* and `prev_w`/`next_w` are strong references between `GTPShardedParam` instances, the chain **holds the weights alive for the life of the process** and **assumes the first step's behavior is representative of every step**. Neither is free:
 
@@ -534,7 +534,7 @@ Weights that must **not** join a chain (embedding, output_layer — they all-gat
 | **Deterministic, fixed forward order** — the observed order is replayed every step | Data-dependent control flow: conditional layers, early exit, MoE routing that skips experts, reordered visitation | Predicted `next_w` is wrong → stale-buffer read or missed prefetch |
 | **Single, non-reentrant pass** — one global `last_weight` cursor + per-weight in-flight handles | Two models in one process, an extra autograd graph, unexpected microbatch interleaving | Corrupted cursor / async handles |
 | **Fixed, single membership** — `chain_id` and graphed-vs-eager decided once | A weight whose CG scope or dense/expert context changes between steps | Unrepresentable in one linear slot |
-| **No parameter sharing/tying** — a linear list gives each weight one slot | A tied/shared param used in two positions (e.g. tied I/O embeddings) | One identity cannot occupy two chain positions; must be excluded |
+| **One consume per weight per step** — a linear list gives each weight one slot, and backward is assumed to walk it in exact reverse | A weight used at two points in one forward (MTP's shared embedding / output_layer, tied I/O embeddings) | Backward reaches the weight out of chain order, and its reduce-scatters overlap. Supported since §3.5 — anything else in this shape must be checked against it |
 | **Build-once, run-forever lifetime** — strong refs never released | Building/tearing down GTP models in-process (successive UTs, model re-init, multi-model drivers) | Leaks all GTP params/buffers; a new model's chain can cross-link onto a previous model's stale params |
 
 **Mitigations.**
@@ -575,6 +575,33 @@ Three consequences:
   - why it must: `cuda_graphs.py` drains with `wait_async_comms(GTPChain.GRAPHED.value)`, matching the id **literally**, so a weight in `GTP_remat_grouped_fc1_ungraphed` would never be joined at the graph boundary — a **correctness** hazard, not just a lost overlap;
   - lifting it would mean draining by chain-id *prefix* (`_chain_is_grouped`) or registering the grouped streams before capture — neither is done today.
 
+### 3.5 GTP_remat + Multi-Token Prediction (MTP)
+
+MTP is the first feature to break the *one consume per weight per step* assumption in §3.4, and it breaks it in two independent ways:
+
+- **Shared weights.** Each MTP layer re-embeds its shifted input with the main model's `embedding`, and every prediction head (main + one per MTP depth) runs the main model's `output_layer`. Those two weights are consumed **1 + `mtp_num_layers`** times per forward instead of once.
+- **A replayed layer.** With `--mtp-use-repeated-layer` a *single* MTP layer object is built and applied `mtp_num_layers` times (`MultiTokenPredictionBlock.forward` indexes `self.layers[0]` every iteration), so its weights — including grouped experts — are consumed once per depth.
+
+The chain itself is unaffected: linking happens on a weight's **first** materialization, so a re-consumed weight is skipped rather than relinked, and the chain still encodes one clean forward order. In an L6 + 2-depth run it reads `embedding → decoder.0..5 → mtp.0.eh_proj → mtp.0 attn/shared-experts → mtp.1 … → output_layer`, with MTP's routed experts on the grouped `fc1`/`fc2` chains.
+
+What breaks is everything downstream that assumed *one backward per weight, in reverse chain order*.
+
+| Failure | Cause | Fix |
+|---|---|---|
+| `KeyError: None` in `wgrad_reduce_scatter` | Backward reaches a shared weight before its chain successor has reduce-scattered, so the deferred finalize read an unreserved ticket. | Finalize only when an RS was really pending. |
+| **Dropped gradient on `output_layer`, silently** | Its per-head reduce-scatters share one ticket and one handle, so only the last one survives. | Finalize a pending RS before starting the next for that weight. |
+| Truncated link table in the logs | The old flush trigger fired on a weight's second consume, which MTP hits mid-forward. | Flush from `flush_link_tables()` at the first backward AG. |
+
+The first and third are loud; the second is not, which is why it is guarded numerically rather than by a smoke test — see `test_gtp_mtp.py` in §4.
+
+**Configuration notes.**
+
+- MTP layers are appended to `--hybrid-layer-pattern` after a `/` separator, **one segment per depth**, all segments identical: `MEM*EM/*E/*E` is a 6-layer decoder plus 2 MTP depths. `MEM*EM/*E*E` is *one* depth whose MTP layer is 4 layers deep — a different model.
+- The pattern is authoritative: `mtp_num_layers` is **silently overridden** to the number of `/`-separated segments (`arguments.py`, "conflicts with MTP depth count"). Check the arg dump rather than assuming the flag took.
+- `--mtp-use-repeated-layer` is generated from the `TransformerConfig` dataclass, so it does not appear as a literal string in `arguments.py`.
+
+> **Status.** The failure modes above are fixed and covered by unit tests at world=4. A55B-scale convergence with MTP is **still under investigation** — a GTP16 × EGTP2 MXFP8 run diverges from its no-MTP baseline from ~iter 900 with parameter-norm growth of +52% vs +7%. That run has no *MTP-without-GTP* control, so the divergence is **not yet attributed** to GTP_remat. Do not treat GTP_remat + MTP as production-validated.
+
 ## 4. Testing
 
 **Whenever you add or change a GTP_remat/EGTP_remat feature, run the GTP_remat unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
@@ -597,6 +624,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
+| `test_gtp_mtp.py` | GTP_remat + MTP shared weights (§3.5), 8 cases over `mtp_use_repeated_layer` × dense/MoE. Runs fwd+bwd end to end, and compares the async reduce-scatter path against the sync path on an identical model/sharding/batch — a dropped or overwritten wgrad RS raises nothing, so only the numeric check catches it. |
 
 The fp32-accumulation primitive itself is covered outside this suite, by `tests/unit_tests/distributed/test_reduce_scatter_with_fp32_accumulation.py`, which does not require GTP_remat.
 

@@ -366,7 +366,8 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
     wait_async_comms()
-    # Iteration boundary: catches any chain that grew after the first-backward dump.
+    # End of iteration. The first-backward dump already logged the chains; this only catches
+    # one that gained links afterwards, which virtual pipelining can do by interleaving chunks.
     GTPShardedParam.flush_link_tables()
     cur = torch.cuda.current_stream()
     # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
@@ -896,7 +897,8 @@ class GTPShardedParam(torch.nn.Parameter):
     # Recompute-forward prefetch cursor, keyed by chain_id; also cleared by reset_gtp_state().
     _recompute_chain_state: Dict[str, dict] = {}
 
-    # Set on link creation, cleared on log; keeps the backward hot path to one bool test.
+    # True while some chain holds links that have not been logged yet. Backward tests this on
+    # every all-gather, so it stays a plain bool instead of a scan over _chain_state.
     _link_tables_dirty: bool = False
 
     @classmethod
@@ -906,7 +908,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 "last_weight": None,
                 "link_node_count": 0,
                 "link_table_buffer": [],
-                # Rows already logged (a length, so a chain that grows is re-logged in full).
+                # How many buffered rows have been logged so far. A count rather than a
+                # done-flag, so a chain that gains links later is noticed and logged again.
                 "link_table_logged_len": 0,
             }
         return cls._chain_state[chain_id]
@@ -919,11 +922,15 @@ class GTPShardedParam(torch.nn.Parameter):
 
     @classmethod
     def flush_link_tables(cls) -> None:
-        """Log each chain's buffered prefetch-link table; re-log in full if it later grew.
+        """Log the prefetch-link table of every chain that has rows not yet logged.
 
-        Call only where every chain is complete. In particular NOT on "this weight is already
-        linked" inside the forward -- MTP re-consumes weights mid-forward, so that fires before
-        the chain is done and truncates the table.
+        _buffer_link_table_row buffers a row per link; emitting them together here keeps a
+        table from being interleaved with other log lines. A chain that gains links after it
+        was logged is logged again in full, rather than as a fragment.
+
+        Only call this where the chains are known to be complete. "This weight is already
+        linked" is not such a point: MTP consumes the same weight several times per forward,
+        so that condition is first met mid-forward, while later links are still being created.
         """
         cls._link_tables_dirty = False
         for chain in cls._chain_state.values():
@@ -1404,8 +1411,9 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
-        # Chains are complete by the first backward AG. Logging here, not at the iteration
-        # boundary, means the tables still appear when backward goes on to crash.
+        # Links are only created during forward, so every chain is complete by the first
+        # backward all-gather. Logging here rather than at the end of the iteration means the
+        # tables are still emitted if backward then fails, which is when they are most useful.
         if type(self)._link_tables_dirty:
             type(self).flush_link_tables()
 
@@ -1591,8 +1599,9 @@ class GTPShardedParam(torch.nn.Parameter):
         SM-saturation that blocks cross-graph overlap.
 
         Returns:
-            True if an RS was actually pending and waited on -- lets the caller tell "completed"
-            from "never issued" (see wgrad_reduce_scatter).
+            True if this weight had a reduce-scatter in flight and it was waited on, False if
+            there was nothing to wait for. wgrad_reduce_scatter needs to tell those apart
+            before it reads the result buffer.
         """
         waited = False
         rs_stream = self._cached_rs_stream
@@ -1798,11 +1807,13 @@ class GTPShardedParam(torch.nn.Parameter):
         wgrads = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
-        # Repeated backward (MTP re-uses embedding/output_layer): a second wgrad would reuse this
-        # weight's RS ticket -- the same output buffer -- and overwrite the first result, whose
-        # handle is also dropped. Finalize the pending RS before starting another.
+        # MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
+        # more than one backward. The previous reduce-scatter may still be running: starting
+        # another would reuse this weight's ticket, i.e. the same output buffer, and overwrite
+        # the one handle we track -- discarding that gradient with no error. Finish it first.
         if GTP_CONFIG.async_reduction and self._wgrad_rs_handle is not None:
             self._wait_reduce_scatter(finalize_grad=True)
+            # Accounted for here, so the cascade below must not skip the next one.
             self._already_finalized = False
 
         # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
@@ -1837,13 +1848,14 @@ class GTPShardedParam(torch.nn.Parameter):
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
         if GTP_CONFIG.async_reduction and self.next_w is not None:
-            # Backward follows reverse-chain order only while each weight is consumed once per
-            # forward. MTP breaks that (its re-embed runs late, so the embedding's backward
-            # precedes its successor's), so the successor may have no RS pending.
+            # Backward normally walks the chain in reverse, so next_w has already started its
+            # reduce-scatter by now. That only holds while each weight is used once per forward.
+            # MTP's second embedding lookup sits late in the forward, so the embedding's backward
+            # runs before decoder layer 0 has reduce-scattered anything -- check first.
             waited = self.next_w._wait_reduce_scatter()
 
             if not waited:
-                pass  # nothing in flight: successor hasn't run, or was already finalized
+                pass  # next_w has not reduce-scattered yet, or something already finalized it
             elif getattr(self.next_w, "_already_finalized", False):
                 self.next_w._already_finalized = False
             else:
