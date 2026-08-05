@@ -8,7 +8,7 @@
 import copy
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -21,6 +21,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid.hybrid_architecture import HybridLayerSpec
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -91,6 +92,9 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         name: str | None = None,
+        layer_specs: Optional[Sequence[HybridLayerSpec]] = None,
+        moe_metric_layer_offset: int | None = None,
+        moe_metric_num_layers: int | None = None,
     ) -> None:
         """
         Args:
@@ -111,18 +115,75 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        assert layer_type_list is not None, (
-            "layer_type_list must be provided. It should be pre-computed from "
-            "--hybrid-layer-pattern by HybridModel."
-        )
-        self.layer_type_list = layer_type_list
+        if layer_specs is None:
+            assert layer_type_list is not None, (
+                "layer_type_list must be provided. It should be pre-computed from "
+                "--hybrid-layer-pattern by HybridModel."
+            )
+            self.layer_type_list = layer_type_list
+            if getattr(self.config, "mla_down_proj_fusion", False):
+                submodules = self._fuse_mla_down_proj(submodules)
+            self.layers = self._build_legacy_layers(
+                submodules=submodules,
+                layer_type_list=layer_type_list,
+                pp_layer_offset=pp_layer_offset,
+                pg_collection=pg_collection,
+                is_mtp_layer=is_mtp_layer,
+                name=name,
+            )
+        else:
+            if layer_type_list is not None:
+                raise ValueError("Specify layer_specs or layer_type_list, not both.")
+            layer_specs = list(layer_specs)
+            if getattr(self.config, "mla_down_proj_fusion", False):
+                layer_specs = [
+                    (
+                        HybridLayerSpec(self._fuse_mla_layer_spec(spec.module_spec), spec.config)
+                        if spec.layer_type == "mla"
+                        else spec
+                    )
+                    for spec in layer_specs
+                ]
+            self.layer_specs = layer_specs
+            self.layer_type_list = [layer.layer_type for layer in layer_specs]
+            self.layers = self._build_direct_layers(
+                layer_specs=layer_specs,
+                pp_layer_offset=pp_layer_offset,
+                pg_collection=pg_collection,
+                is_mtp_layer=is_mtp_layer,
+                name=name,
+                moe_metric_layer_offset=moe_metric_layer_offset,
+                moe_metric_num_layers=moe_metric_num_layers,
+            )
 
-        if getattr(self.config, "mla_down_proj_fusion", False):
-            submodules = self._fuse_mla_down_proj(submodules)
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
-        # Build layers from the pre-selected segment
-        self.layers = nn.ModuleList()
-        for i, layer_type in enumerate(self.layer_type_list):
+        # Required for activation recomputation
+        self.num_layers_per_pipeline_rank = len(self.layers)
+
+        if self.post_process and self.post_layer_norm:
+            # Final layer norm before output.
+            self.final_norm = TENorm(
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+            )
+
+    def _build_legacy_layers(
+        self,
+        *,
+        submodules: HybridStackSubmodules,
+        layer_type_list: list[str],
+        pp_layer_offset: int,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        name: str | None,
+    ) -> nn.ModuleList:
+        """Build the legacy symbol API with its historical per-family kwargs."""
+
+        layers = nn.ModuleList()
+        for i, layer_type in enumerate(layer_type_list):
             layer_number = i + 1 + pp_layer_offset
             if self.config.fp8:
                 quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
@@ -196,33 +257,89 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
-                        # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
-            self.layers.append(layer)
+            layers.append(layer)
+        return layers
 
-        if self.config.cuda_graph_impl == "local":
-            annotate_first_last_layer(self.layers)
+    def _build_direct_layers(
+        self,
+        *,
+        layer_specs: Sequence[HybridLayerSpec],
+        pp_layer_offset: int,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        name: str | None,
+        moe_metric_layer_offset: int | None,
+        moe_metric_num_layers: int | None,
+    ) -> nn.ModuleList:
+        """Build occurrence-specific existing layer specs."""
 
-        # Required for activation recomputation
-        self.num_layers_per_pipeline_rank = len(self.layers)
+        layers = nn.ModuleList()
+        for i, layer_spec in enumerate(layer_specs):
+            layer_type = layer_spec.layer_type
+            layer_config = layer_spec.config
+            layer_number = i + 1 + pp_layer_offset
+            if layer_config.fp8:
+                quant_init_context = get_fp8_context(
+                    layer_config, i + pp_layer_offset, is_init=True
+                )
+            elif layer_config.fp4:
+                quant_init_context = get_fp4_context(
+                    layer_config, i + pp_layer_offset, is_init=True
+                )
+            else:
+                quant_init_context = nullcontext()
+            with quant_init_context:
+                build_kwargs = {
+                    "config": layer_config,
+                    "layer_number": layer_number,
+                    "pg_collection": pg_collection,
+                    "name": (name + f".layers.{i}") if name is not None else None,
+                }
+                if layer_type == "mamba":
+                    build_kwargs["pp_layer_offset"] = pp_layer_offset
+                else:
+                    build_kwargs["add_layer_offset"] = False
+                    if layer_type != "mlp":
+                        build_kwargs["is_mtp_layer"] = is_mtp_layer
+                    if layer_type in {"attention", "dsa", "mla"}:
+                        build_kwargs["pp_layer_offset"] = pp_layer_offset
+                layer = build_module(layer_spec.module_spec, **build_kwargs)
 
-        if self.post_process and self.post_layer_norm:
-            # Final layer norm before output.
-            self.final_norm = TENorm(
-                config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
-            )
+            if layer_type == "moe" and moe_metric_layer_offset is not None:
+                metric_layer_number = moe_metric_layer_offset + i + 1
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "set_metric_layer_number"):
+                    layer.mlp.set_metric_layer_number(metric_layer_number, moe_metric_num_layers)
+            layers.append(layer)
+        return layers
+
+    def set_moe_metric_layer_offset(self, layer_offset: int, num_layers: int | None = None) -> None:
+        """Retarget MoE metric slots without changing model/checkpoint layer numbers."""
+
+        layer_specs = getattr(self, "layer_specs", None)
+        if layer_specs is None:
+            return
+        for index, (layer_spec, layer) in enumerate(zip(layer_specs, self.layers)):
+            if layer_spec.layer_type != "moe":
+                continue
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "set_metric_layer_number"):
+                layer.mlp.set_metric_layer_number(layer_offset + index + 1, num_layers)
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
         # being modified underneath them.
         submodules = copy.deepcopy(submodules)
-        mla_spec = submodules.mla_layer
+        submodules.mla_layer = self._fuse_mla_layer_spec(submodules.mla_layer)
+        return submodules
+
+    def _fuse_mla_layer_spec(self, mla_spec: ModuleSpec) -> ModuleSpec:
+        """Return a private MLA spec with fused down projections enabled."""
+
+        mla_spec = copy.deepcopy(mla_spec)
         # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
         mla_spec.submodules.input_layernorm = IdentityOp
         mla_spec.submodules.self_attention.module = FusedMLASelfAttention
@@ -236,7 +353,7 @@ class HybridStack(MegatronModule):
             "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
             "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
         }
-        return submodules
+        return mla_spec
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -254,7 +371,7 @@ class HybridStack(MegatronModule):
         if this block contains Mamba layers (this may not be the case with PP > 1).
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
-            if layer_type == LayerSymbols.MAMBA:
+            if layer_type in {LayerSymbols.MAMBA, "mamba"}:
                 return layer.mamba_state_shapes_per_request()
         return None
 
@@ -359,18 +476,29 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
-                for layer in self.layers:
+                layer_specs = getattr(self, "layer_specs", None)
+                for index, layer in enumerate(self.layers):
+                    layer_spec = layer_specs[index] if layer_specs is not None else None
+                    layer_config = layer_spec.config if layer_spec is not None else self.config
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
-                        self.config, layer.layer_number - 1
+                        layer_config, layer.layer_number - 1
                     )
+                    layer_rotary_pos_emb = rotary_pos_emb
+                    if isinstance(rotary_pos_emb, dict):
+                        assert layer_spec is not None
+                        layer_rotary_pos_emb = (
+                            rotary_pos_emb.get(layer_spec.config.kv_channels)
+                            if layer_spec.layer_type == "attention"
+                            else None
+                        )
                     with inner_quant_context:
                         if isinstance(layer, TransformerLayer):
                             hidden_states, _ = layer(
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
                                 inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
+                                rotary_pos_emb=layer_rotary_pos_emb,
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,

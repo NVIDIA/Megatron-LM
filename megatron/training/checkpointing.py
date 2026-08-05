@@ -3,6 +3,7 @@
 """Input/output checkpointing."""
 
 import contextlib
+import copy
 import inspect
 import multiprocessing
 import os
@@ -39,7 +40,10 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
+from megatron.core.post_training.modelopt.checkpointing import (
+    save_modelopt_state,
+    save_sharded_modelopt_state,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 from megatron.post_training.utils import print_distributed_quant_summary
@@ -1348,7 +1352,16 @@ def generate_state_dict(
 
     # Arguments, iteration, and model.
     state_dict = {}
-    state_dict['args'] = args
+    resolved_architecture = getattr(args, 'resolved_hybrid_architecture', None)
+    if getattr(resolved_architecture, "source", None) == "direct":
+        checkpoint_args = copy.copy(args)
+        # This runtime-only summary contains live ModuleSpec/config objects. Direct
+        # architecture recipes must be supplied by Python again on resume.
+        del checkpoint_args.resolved_hybrid_architecture
+        state_dict['args'] = checkpoint_args
+    else:
+        # Preserve the historical args object identity for legacy and non-hybrid checkpoints.
+        state_dict['args'] = args
     state_dict['checkpoint_version'] = 3.0
     if iteration is not None:
         state_dict['iteration'] = iteration

@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -13,6 +14,11 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.hybrid_architecture import (
+    HybridLayerPattern,
+    ResolvedHybridArchitecture,
+    resolve_hybrid_architecture,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -33,6 +39,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
+    get_pg_rank,
+    get_pg_size,
     is_using_quantization_scales,
     log_single_rank,
 )
@@ -41,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 
 def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
+    """Return paired process groups used by legacy per-stage logging."""
+
     tp_group = getattr(pg_collection, 'tp', None)
     dp_cp_group = getattr(pg_collection, 'dp_cp', None)
     if (tp_group is None) != (dp_cp_group is None):
@@ -61,6 +71,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
+        layer_specs (HybridLayerPattern, optional): Preferred direct decoder architecture.
+            Existing layer ``ModuleSpec`` objects are paired with per-occurrence configs, and
+            ``PipelineSplit`` nodes define PP/VPP chunks.
+        mtp_layer_specs (HybridLayerPattern, optional): Direct template for one MTP prediction
+            depth. ``config.mtp_num_layers`` controls repetition.
+        resolved_hybrid_architecture (ResolvedHybridArchitecture, optional): Internal global
+            architecture supplied by ``HybridModelBuilder`` after validation.
         hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
             pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
@@ -78,10 +95,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_override_pattern (str, optional): Deprecated. Use hybrid_layer_pattern instead.
             If set and hybrid_layer_pattern is None, the value is copied to hybrid_layer_pattern
             with a deprecation warning.
-        pre_process (bool, optional): Include embedding layer
-            (used with pipeline parallelism). Defaults to True.
+        pre_process (bool, optional): Include embedding layer (used with pipeline parallelism).
+            Legacy patterns retain the historical True default. Direct architectures constrain
+            ownership to the first logical PP/VPP chunk.
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
-            Defaults to True.
+            Legacy patterns retain the historical True default. Direct architectures constrain
+            ownership to the final logical PP/VPP chunk.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
         parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
@@ -123,11 +142,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        layer_specs: HybridLayerPattern | None = None,
+        mtp_layer_specs: HybridLayerPattern | None = None,
+        resolved_hybrid_architecture: ResolvedHybridArchitecture | None = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
+        has_direct_architecture = (
+            layer_specs is not None
+            or mtp_layer_specs is not None
+            or (
+                resolved_hybrid_architecture is not None
+                and resolved_hybrid_architecture.source == "direct"
+            )
+        )
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            config_logger_args = dict(locals())
+            config_logger_args.pop("layer_specs", None)
+            config_logger_args.pop("mtp_layer_specs", None)
+            config_logger_args.pop("resolved_hybrid_architecture", None)
+            config_logger_args.pop("has_direct_architecture", None)
+            log_config_to_disk(config, config_logger_args, prefix=type(self).__name__)
 
         if self.config.use_mup and not getattr(HybridModel, "mup_warning_printed", False):
             log_single_rank(
@@ -141,16 +176,24 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
-        self.pre_process = pre_process
-        self.post_process = post_process
+        self.vp_stage = vp_stage
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
-        self.vp_stage = vp_stage
         self.disable_param_offloading = True
 
         # Backward compatibility for deprecated hybrid parameters
+        if has_direct_architecture and hybrid_override_pattern is not None:
+            raise ValueError("hybrid_override_pattern cannot be combined with direct layer_specs.")
+        if has_direct_architecture and (
+            (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0)
+            or (hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0)
+        ):
+            raise ValueError(
+                "hybrid_attention_ratio and hybrid_mlp_ratio cannot be combined with "
+                "direct layer_specs."
+            )
         if hybrid_override_pattern is not None:
             if self.hybrid_layer_pattern is None:
                 log_single_rank(
@@ -189,43 +232,94 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config.num_layers, attn_ratio, mlp_ratio
                 )
 
-        # Parse unified pattern to extract main and MTP components, and
-        # determine the pipeline segment for this model instance.
+        if resolved_hybrid_architecture is None and (
+            layer_specs is not None or mtp_layer_specs is not None
+        ):
+            resolved_hybrid_architecture = resolve_hybrid_architecture(
+                config=self.config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                layer_specs=layer_specs,
+                mtp_layer_specs=mtp_layer_specs,
+                hybrid_layer_pattern=self.hybrid_layer_pattern,
+            )
+        elif layer_specs is not None or mtp_layer_specs is not None:
+            raise ValueError(
+                "resolved_hybrid_architecture cannot be combined with unresolved direct specs."
+            )
+
+        is_direct_architecture = (
+            resolved_hybrid_architecture is not None
+            and resolved_hybrid_architecture.source == "direct"
+        )
+
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
 
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
-        self.mtp_pattern = parsed.mtp_pattern
-        self.mtp_num_depths = parsed.mtp_num_depths
 
-        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
-
-        layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-            **logging_pg_kwargs,
-        )
-
-        # Determine if MTP is needed (based on pattern parsing)
-        self.mtp_process = (
-            self.mtp_pattern is not None
-            and self.mtp_num_depths > 0
-            # The following forces MTP to be on the final pipeline stage. It might be more optimal
-            # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
-            # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
-            # stage separate from loss) to be supported in the hybrid model.
-            and mtp_on_this_rank(
-                layout=self.config.pipeline_model_parallel_layout,
-                mtp_num_layers=self.config.mtp_num_layers,
-                ignore_virtual=False,
-                vp_stage=self.vp_stage,
+        if not is_direct_architecture:
+            # Preserve the legacy selector, shared config, symbol API, and constructor defaults.
+            self.pre_process = pre_process
+            self.post_process = post_process
+            logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+            layer_type_list, layer_offset = select_pipeline_segment(
+                parsed.main_pattern or '',
+                self.pg_collection.pp,
+                vp_stage,
+                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+                **logging_pg_kwargs,
             )
-        )
+            local_layer_specs = None
+            self.mtp_pattern = parsed.mtp_pattern
+            self.mtp_num_depths = parsed.mtp_num_depths
+            self.mtp_process = (
+                self.mtp_pattern is not None
+                and self.mtp_num_depths > 0
+                and mtp_on_this_rank(
+                    layout=self.config.pipeline_model_parallel_layout,
+                    mtp_num_layers=self.config.mtp_num_layers,
+                    ignore_virtual=False,
+                    vp_stage=self.vp_stage,
+                )
+            )
+        else:
+            # Every physical/virtual chunk intentionally keeps the same global summary.
+            self.resolved_hybrid_architecture = resolved_hybrid_architecture
+            self.vp_size = self.config.virtual_pipeline_model_parallel_size
+            # Raw direct callers resolve split nodes here rather than in the builder, so derive
+            # ownership only after resolution has inferred VPP.
+            pp_size = self.config.pipeline_model_parallel_size
+            pp_rank = get_pg_rank(self.pg_collection.pp)
+            if torch.distributed.is_initialized():
+                actual_pp_size = get_pg_size(self.pg_collection.pp)
+                if actual_pp_size != pp_size:
+                    raise ValueError(
+                        "TransformerConfig.pipeline_model_parallel_size must match the supplied "
+                        f"PP process group; got {pp_size} != {actual_pp_size}."
+                    )
+            vp_rank = 0 if vp_stage is None else vp_stage
+            owns_pre_process = pp_rank == 0 and vp_rank == 0
+            owns_post_process = pp_rank == pp_size - 1 and (
+                self.vp_size is None or vp_rank == self.vp_size - 1
+            )
+            self.pre_process = owns_pre_process if pre_process is not False else False
+            self.post_process = owns_post_process if post_process is not False else False
+            local_layer_specs, layer_offset = resolved_hybrid_architecture.select_segment(
+                pp_rank=pp_rank, pp_size=pp_size, vp_stage=vp_stage
+            )
+            layer_type_list = None
+            segment_index = vp_rank * pp_size + pp_rank
+            is_final_segment = segment_index == len(resolved_hybrid_architecture.segments) - 1
+            self.mtp_pattern = None
+            self.mtp_num_depths = resolved_hybrid_architecture.mtp_num_layers
+            self.mtp_process = bool(
+                resolved_hybrid_architecture.mtp_layers
+                and self.mtp_num_depths > 0
+                and is_final_segment
+            )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -242,47 +336,117 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 pg_collection=self.pg_collection,
             )
 
-        # MLA (also used by DeepSeek Sparse Attention) uses its own decoupled RoPE, therefore we do
-        # not build standard RoPE here when using MLA.
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            self.rotary_pos_emb = RotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
-            )
-        elif self.position_embedding_type == 'yarn':
-            self.rotary_pos_emb = YarnRotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
-                original_max_position_embeddings=getattr(
-                    self.config, "yarn_original_max_position_embeddings"
-                ),
-                beta_fast=getattr(self.config, "yarn_beta_fast"),
-                beta_slow=getattr(self.config, "yarn_beta_slow"),
-                mscale=getattr(self.config, "yarn_mscale"),
-                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
-                correction_range_round_to_int=getattr(
-                    self.config, "yarn_correction_range_round_to_int"
-                ),
-                use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=self.pg_collection.cp,
-            )
+        if not is_direct_architecture:
+            # Preserve the legacy model-global RoPE/Yarn construction exactly.
+            if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+                self.rotary_pos_emb = RotaryEmbedding(
+                    kv_channels=self.config.kv_channels,
+                    rotary_percent=rotary_percent,
+                    seq_len_interpolation_factor=seq_len_interpolation_factor,
+                    rotary_base=rotary_base,
+                    use_cpu_initialization=self.config.use_cpu_initialization,
+                    cp_group=self.pg_collection.cp,
+                )
+            elif self.position_embedding_type == 'yarn':
+                self.rotary_pos_emb = YarnRotaryEmbedding(
+                    kv_channels=self.config.kv_channels,
+                    rotary_percent=rotary_percent,
+                    seq_len_interpolation_factor=seq_len_interpolation_factor,
+                    rotary_base=rotary_base,
+                    scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                    original_max_position_embeddings=getattr(
+                        self.config, "yarn_original_max_position_embeddings"
+                    ),
+                    beta_fast=getattr(self.config, "yarn_beta_fast"),
+                    beta_slow=getattr(self.config, "yarn_beta_slow"),
+                    mscale=getattr(self.config, "yarn_mscale"),
+                    mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                    correction_range_round_to_int=getattr(
+                        self.config, "yarn_correction_range_round_to_int"
+                    ),
+                    use_cpu_initialization=self.config.use_cpu_initialization,
+                    cp_group=self.pg_collection.cp,
+                )
+        else:
+            # Standard attention occurrences may use different KV widths. Keep one RoPE
+            # module/input per width; MLA and DSA continue to own their decoupled RoPE.
+            rotary_layers = list(local_layer_specs)
+            if self.mtp_process:
+                rotary_layers.extend(resolved_hybrid_architecture.mtp_layers)
+            rotary_configs = {
+                layer.config.kv_channels: layer.config
+                for layer in rotary_layers
+                if layer.layer_type == "attention"
+            }
+            if not rotary_configs:
+                rotary_configs = {self.config.kv_channels: self.config}
+            self._rotary_configs_by_kv = rotary_configs
+
+            def build_rotary_embedding(rotary_config: TransformerConfig):
+                if self.position_embedding_type == 'rope':
+                    return RotaryEmbedding(
+                        kv_channels=rotary_config.kv_channels,
+                        rotary_percent=rotary_percent,
+                        seq_len_interpolation_factor=seq_len_interpolation_factor,
+                        rotary_base=rotary_base,
+                        use_cpu_initialization=rotary_config.use_cpu_initialization,
+                        cp_group=self.pg_collection.cp,
+                    )
+                return YarnRotaryEmbedding(
+                    kv_channels=rotary_config.kv_channels,
+                    rotary_percent=rotary_percent,
+                    seq_len_interpolation_factor=seq_len_interpolation_factor,
+                    rotary_base=rotary_base,
+                    scaling_factor=getattr(rotary_config, "yarn_rotary_scaling_factor"),
+                    original_max_position_embeddings=getattr(
+                        rotary_config, "yarn_original_max_position_embeddings"
+                    ),
+                    beta_fast=getattr(rotary_config, "yarn_beta_fast"),
+                    beta_slow=getattr(rotary_config, "yarn_beta_slow"),
+                    mscale=getattr(rotary_config, "yarn_mscale"),
+                    mscale_all_dim=getattr(rotary_config, "yarn_mscale_all_dim"),
+                    correction_range_round_to_int=getattr(
+                        rotary_config, "yarn_correction_range_round_to_int"
+                    ),
+                    use_cpu_initialization=rotary_config.use_cpu_initialization,
+                    cp_group=self.pg_collection.cp,
+                )
+
+            if (
+                self.position_embedding_type in {'rope', 'yarn'}
+                and not self.config.multi_latent_attention
+            ):
+                if len(rotary_configs) == 1:
+                    self.rotary_pos_emb = build_rotary_embedding(
+                        next(iter(rotary_configs.values()))
+                    )
+                else:
+                    self.rotary_pos_emb_by_kv = torch.nn.ModuleDict(
+                        {
+                            str(kv_channels): build_rotary_embedding(rotary_config)
+                            for kv_channels, rotary_config in rotary_configs.items()
+                        }
+                    )
+
+        decoder_architecture_kwargs = (
+            {"layer_type_list": layer_type_list}
+            if not is_direct_architecture
+            else {
+                "layer_specs": local_layer_specs,
+                "moe_metric_layer_offset": layer_offset,
+                "moe_metric_num_layers": resolved_hybrid_architecture.metric_num_layers,
+            }
+        )
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
             pre_process=self.pre_process,
-            layer_type_list=layer_type_list,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
             name="decoder",
+            **decoder_architecture_kwargs,
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -294,20 +458,28 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
 
+            mtp_architecture_kwargs = (
+                {"mtp_layer_pattern": self.mtp_pattern}
+                if not is_direct_architecture
+                else {
+                    "mtp_layer_specs": resolved_hybrid_architecture.mtp_layers,
+                    "moe_metric_num_layers": resolved_hybrid_architecture.metric_num_layers,
+                }
+            )
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
                 spec=mtp_block_spec,
                 pg_collection=self.pg_collection,
                 vp_stage=self.vp_stage,
-                mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
+                **mtp_architecture_kwargs,
             )
             self._setup_mtp_cuda_graphs()
 
         # Output
-        if post_process or self.mtp_process:
+        if self.post_process or self.mtp_process:
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -414,6 +586,58 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
             self.cudagraph_manager = CudaGraphManager(config)
 
+    def _get_rotary_pos_emb(
+        self,
+        inference_context: Optional[BaseInferenceContext],
+        decoder_input: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tensor | dict[int, Tensor] | None:
+        """Build compatible RoPE inputs for the local attention configurations."""
+
+        resolved_architecture = getattr(self, "resolved_hybrid_architecture", None)
+        if resolved_architecture is None or resolved_architecture.source != "direct":
+            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                return self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            if self.position_embedding_type == 'yarn':
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+                return rotary_pos_emb
+            return None
+
+        if (
+            self.position_embedding_type not in {'rope', 'yarn'}
+            or self.config.multi_latent_attention
+        ):
+            return None
+
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+
+        def rotary_input(rotary_module, rotary_config):
+            rotary_seq_len = rotary_module.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, rotary_config, packed_seq_params
+            )
+            value = rotary_module(rotary_seq_len, packed_seq=packed_seq)
+            if self.position_embedding_type == 'yarn':
+                value, _ = value
+            return value
+
+        if hasattr(self, 'rotary_pos_emb_by_kv'):
+            return {
+                int(kv_channels): rotary_input(
+                    rotary_module, self._rotary_configs_by_kv[int(kv_channels)]
+                )
+                for kv_channels, rotary_module in self.rotary_pos_emb_by_kv.items()
+            }
+
+        rotary_config = next(iter(self._rotary_configs_by_kv.values()))
+        return rotary_input(self.rotary_pos_emb, rotary_config)
+
     def forward(
         self,
         input_ids: Tensor,
@@ -447,6 +671,21 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         in_inference_mode = InferenceMode.is_active()
+        resolved_architecture = getattr(self, "resolved_hybrid_architecture", None)
+
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.is_dynamic_batching()
+            and resolved_architecture is not None
+            and resolved_architecture.source == "direct"
+            and resolved_architecture.has_incompatible_dynamic_inference_shapes(self.config)
+        ):
+            raise NotImplementedError(
+                "Direct HybridModel occurrence configurations are incompatible with dynamic "
+                "inference's model-global cache or runtime buffers (Mamba state/cache "
+                "dimensions, attention KV dimensions, or MoE router top-k values)."
+            )
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -478,24 +717,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
-        rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
-        elif self.position_embedding_type == 'yarn':
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
-            rotary_pos_emb, _ = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-            )
+        rotary_pos_emb = self._get_rotary_pos_emb(
+            inference_context, decoder_input, packed_seq_params
+        )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection

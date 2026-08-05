@@ -146,6 +146,12 @@ from megatron.training.checkpointing import (
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.hybrid_metrics import (
+    get_hybrid_layer_type,
+    get_hybrid_moe_metric_metadata,
+    get_resolved_hybrid_architecture,
+    iter_resolved_hybrid_layers,
+)
 from megatron.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
@@ -471,16 +477,21 @@ def num_floating_point_operations(
             + 2 * seqlen_squared_sum * hidden_size * p
         )
 
-    def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
-                          head_dim=64, num_groups=1, num_heads=128):
+    def mamba_layer_flops(
+        total_tokens,
+        hidden_size,
+        state_dim=16,
+        head_dim=64,
+        num_groups=1,
+        num_heads=128,
+        d_in=None,
+    ):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
         # but small percent of overall layer flops
-        d_in = 2 * hidden_size
-        if num_heads:
-            nheads = num_heads
-        else:
-            nheads = d_in // head_dim
+        if d_in is None:
+            d_in = 2 * hidden_size
+        nheads = num_heads if num_heads else d_in // head_dim
         return (
             (
                 2
@@ -544,6 +555,127 @@ def num_floating_point_operations(
                                                   gdn_num_qk_heads, gdn_num_v_heads,
                                                   gdn_conv_kernel_dim) +
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
+        )
+        return flops_fwd * 3
+
+    def resolved_hybrid_flops(architecture):
+        """Calculate hybrid FLOPs from every resolved layer occurrence."""
+
+        flops_fwd = 0
+        mtp_num_layers = architecture.mtp_num_layers
+        for layer in iter_resolved_hybrid_layers(architecture):
+            config = layer.config
+            layer_type = get_hybrid_layer_type(layer)
+            hidden_size = config.hidden_size
+
+            if layer_type == "attention":
+                num_heads = config.num_attention_heads
+                num_query_groups = config.num_query_groups or num_heads
+                flops_fwd += attn_layer_flops(
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                    hidden_size,
+                    num_heads,
+                    gqa=num_query_groups != num_heads,
+                    gqa_groups=num_query_groups,
+                    kv_channels=config.kv_channels,
+                )
+            elif layer_type in {"mla", "dsa"}:
+                if config.q_lora_rank is None:
+                    q_term = (
+                        config.hidden_size
+                        * config.num_attention_heads
+                        * (config.qk_head_dim + config.qk_pos_emb_head_dim)
+                    )
+                else:
+                    q_term = config.q_lora_rank * (
+                        config.hidden_size
+                        + config.num_attention_heads
+                        * (config.qk_head_dim + config.qk_pos_emb_head_dim)
+                        + 1
+                    )
+                projection_term = (
+                    q_term
+                    + config.kv_lora_rank
+                    * (
+                        config.hidden_size
+                        + config.num_attention_heads
+                        * (config.qk_head_dim + config.v_head_dim)
+                        + 1
+                    )
+                    + config.hidden_size * config.qk_pos_emb_head_dim
+                    + config.num_attention_heads * config.v_head_dim * config.hidden_size
+                )
+                core_term = config.num_attention_heads * (
+                    config.qk_head_dim + config.qk_pos_emb_head_dim + config.v_head_dim
+                )
+                flops_fwd += (
+                    2 * total_real_tokens_in_batch * projection_term
+                    + seqlen_squared_sum_in_batch * core_term
+                )
+            elif layer_type == "mamba":
+                flops_fwd += mamba_layer_flops(
+                    total_real_tokens_in_batch,
+                    hidden_size,
+                    state_dim=config.mamba_state_dim,
+                    head_dim=config.mamba_head_dim,
+                    num_groups=config.mamba_num_groups,
+                    num_heads=config.mamba_num_heads,
+                    d_in=(
+                        config.mamba_num_heads * config.mamba_head_dim
+                        if config.mamba_num_heads
+                        else 2 * hidden_size
+                    ),
+                )
+            elif layer_type == "mlp":
+                flops_fwd += mlp_layer_flops(
+                    total_real_tokens_in_batch,
+                    hidden_size,
+                    expansion=config.ffn_hidden_size / hidden_size,
+                    swiglu=config.gated_linear_unit,
+                )
+            elif layer_type == "moe":
+                flops_fwd += moe_layer_flops(
+                    total_real_tokens_in_batch,
+                    hidden_size,
+                    moe_ffn_hidden_size=config.moe_ffn_hidden_size or config.ffn_hidden_size,
+                    shared_expert_ffn_hidden_size=(config.moe_shared_expert_intermediate_size or 0),
+                    num_experts_routed_to=config.moe_router_topk,
+                    moe_latent_size=config.moe_latent_size,
+                    swiglu=config.gated_linear_unit,
+                )
+            elif layer_type == "gdn":
+                flops_fwd += gdn_layer_flops(
+                    total_real_tokens_in_batch,
+                    hidden_size,
+                    qk_head_dim=config.linear_key_head_dim or 128,
+                    v_head_dim=config.linear_value_head_dim or 128,
+                    num_qk_heads=config.linear_num_key_heads or 16,
+                    num_v_heads=config.linear_num_value_heads or 32,
+                    conv_kernel_dim=config.linear_conv_kernel_dim or 4,
+                )
+            else:
+                raise ValueError(
+                    f"FLOPs calculation is not implemented for resolved hybrid "
+                    f"layer type {layer_type!r}."
+                )
+
+        # Each MTP depth adds two norms, a final norm, and the eh projection.
+        # Layer work above already includes every repeated MTP template layer.
+        flops_fwd += (
+            2
+            * total_real_tokens_in_batch
+            * mtp_num_layers
+            * (3 * args.hidden_size + 2 * args.hidden_size * args.hidden_size)
+        )
+
+        # The main decoder and every MTP depth use an output head.
+        flops_fwd += (
+            2
+            * total_real_tokens_in_batch
+            * args.hidden_size
+            * args.padded_vocab_size
+            * (1 + mtp_num_layers)
         )
         return flops_fwd * 3
 
@@ -848,6 +980,10 @@ def num_floating_point_operations(
 
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
+        resolved_architecture = get_resolved_hybrid_architecture(args)
+        if resolved_architecture is not None:
+            return resolved_hybrid_flops(resolved_architecture)
+
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
@@ -1084,6 +1220,45 @@ def pretrain(
     # to enable monitoring of the initialization process
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
+
+    # Model-defined split nodes may infer VPP after command-line validation.
+    # Give builders a chance to synchronize that topology before MPU state is
+    # initialized and before schedules/data iterators consult the runtime args.
+    runtime_args = get_args()
+    model_config = getattr(cfg_container, "model", None)
+    prepared_direct_architecture = False
+    if model_config is not None:
+        builder_cls = model_config.get_builder_cls()
+        prepare_for_distributed_init = getattr(
+            builder_cls, "prepare_config_for_distributed_init", None
+        )
+        if prepare_for_distributed_init is not None:
+            prepared_direct_architecture = bool(
+                prepare_for_distributed_init(model_config, runtime_args)
+            )
+
+    # Synchronize config objects that were materialized after CLI validation but
+    # before a direct architecture could infer VPP.
+    if (
+        prepared_direct_architecture
+        and getattr(runtime_args, "virtual_pipeline_model_parallel_size", None) is not None
+        and getattr(cfg_container, "ddp", None) is not None
+    ):
+        cfg_container.ddp.align_param_gather = runtime_args.align_param_gather
+    if (
+        getattr(runtime_args, "overlap_param_gather_with_optimizer_step", False)
+        and getattr(runtime_args, "virtual_pipeline_model_parallel_size", None) is None
+    ):
+        raise AssertionError(
+            "--overlap-param-gather-with-optimizer-step only supported with "
+            "interleaved pipeline parallelism"
+        )
+    for deferred_attr in (
+        "_overlap_p2p_comm_before_direct_vpp",
+        "_align_param_gather_before_direct_vpp",
+    ):
+        if hasattr(runtime_args, deferred_attr):
+            delattr(runtime_args, deferred_attr)
 
     # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
     skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
@@ -2110,6 +2285,23 @@ def setup_model_and_optimizer(
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
+    # Resolved hybrid architectures are model-construction artifacts rather
+    # than command-line arguments. Make the shared global summary available to
+    # training metrics after all physical/virtual chunks have been built.
+    if hasattr(args, "resolved_hybrid_architecture"):
+        delattr(args, "resolved_hybrid_architecture")
+    model_chunks = unwrapped_model if isinstance(unwrapped_model, list) else [unwrapped_model]
+    for model_chunk in model_chunks:
+        resolved_hybrid_architecture = getattr(
+            model_chunk, "resolved_hybrid_architecture", None
+        )
+        if (
+            resolved_hybrid_architecture is not None
+            and resolved_hybrid_architecture.source == "direct"
+        ):
+            args.resolved_hybrid_architecture = resolved_hybrid_architecture
+            break
+
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
@@ -2792,7 +2984,18 @@ def training_log(
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     # Log MoE metrics.
     moe_log_string = ""
-    if args.num_experts is not None:
+    resolved_architecture = get_resolved_hybrid_architecture(args)
+    resolved_moe_metadata = (
+        get_hybrid_moe_metric_metadata(resolved_architecture)
+        if resolved_architecture is not None
+        else None
+    )
+    has_moe_layers = (
+        resolved_moe_metadata.num_moe_layers > 0
+        if resolved_moe_metadata is not None
+        else args.num_experts is not None
+    )
+    if has_moe_layers:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
@@ -2804,7 +3007,13 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
-        if is_hybrid_model(args):
+        if resolved_architecture is not None:
+            assert resolved_moe_metadata is not None
+            moe_metadata = resolved_moe_metadata
+            layers = moe_metadata.num_layers
+            moe_layer_freq = moe_metadata.moe_layer_freq
+            mtp_num_layers = moe_metadata.mtp_num_layers
+        elif is_hybrid_model(args):
             from operator import itemgetter
 
             from megatron.core.ssm.mamba_hybrid_layer_allocation import (
@@ -2812,8 +3021,12 @@ def training_log(
                 get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+            moe_layer_freq = args.moe_layer_freq
+            mtp_num_layers = args.mtp_num_layers
         else:
             layers = args.num_layers
+            moe_layer_freq = args.moe_layer_freq
+            mtp_num_layers = args.mtp_num_layers
 
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
@@ -2824,14 +3037,19 @@ def training_log(
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
-            moe_layer_freq=args.moe_layer_freq,
-            mtp_num_layers=args.mtp_num_layers,
+            moe_layer_freq=moe_layer_freq,
+            mtp_num_layers=mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
-    if args.mtp_num_layers is not None:
+    has_mtp_metrics = (
+        resolved_architecture.mtp_num_layers > 0
+        if resolved_architecture is not None
+        else args.mtp_num_layers is not None
+    )
+    if has_mtp_metrics:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
