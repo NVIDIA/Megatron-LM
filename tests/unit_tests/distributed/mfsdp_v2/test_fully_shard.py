@@ -22,7 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpContextPhase
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModulePhase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
     collect_linked_kernels,
@@ -206,7 +206,13 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
 
 @pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "non_reentrant"])
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
-    """Activation recomputation should leave every FSDP module resharded."""
+    """Activation recomputation should leave every FSDP module resharded.
+
+    Backward completes ``fc2`` before recomputing ``fc1``. Without suppressing
+    forward prefetch during recomputation, ``fc1`` unshards ``fc2`` again after
+    its backward hook has run, leaving ``fc2.weight`` as an unsharded Parameter
+    instead of a sharded DTensor at the end of backward.
+    """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -219,16 +225,20 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
     x = torch.randn(2, 8, device=device, requires_grad=True)
     model(x).sum().backward()
 
-    # The final autograd callback leaves the context resting.
-    assert model.context.phase is FsdpContextPhase.RESTING
-
-    # A second forward after backward runs in the forward phase again, so
-    # forward-order prefetch resumes and the following backward still ends
-    # with every module resharded.
-    model(x).sum().backward()
     assert isinstance(model.fc1.weight, DTensor)
     assert isinstance(model.fc2.weight, DTensor)
-    assert model.context.phase is FsdpContextPhase.RESTING
+
+    # Module-local backward state is cleared after its matching backward.
+    assert model._phase is FsdpModulePhase.RESTING
+    assert model.fc1._phase is FsdpModulePhase.RESTING
+    assert model.fc2._phase is FsdpModulePhase.RESTING
+
+    # A second forward after backward runs in the forward phase again, so
+    # forward-order prefetch resumes and the module phases return to resting.
+    model(x).sum().backward()
+    assert model._phase is FsdpModulePhase.RESTING
+    assert model.fc1._phase is FsdpModulePhase.RESTING
+    assert model.fc2._phase is FsdpModulePhase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
