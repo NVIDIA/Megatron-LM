@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -44,7 +45,9 @@ class TestGPTInferenceWrapper:
             parallel_output=True,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
-        ).cuda()
+        
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
 
         inference_context = StaticInferenceContext(self.batch_size, self.sequence_length)
 

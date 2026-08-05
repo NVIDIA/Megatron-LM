@@ -20,6 +20,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
@@ -127,7 +128,9 @@ class TestMTPCudaGraphInference:
             pre_process=True,
             post_process=True,
             mtp_block_spec=mtp_block_spec,
-        ).cuda()
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                ).cuda()
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
         model.eval()
@@ -885,7 +888,9 @@ class TestMTPCudaGraphExpertParallel:
             pre_process=True,
             post_process=True,
             mtp_block_spec=mtp_block_spec,
-        ).cuda()
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                ).cuda()
         for param in model.parameters():
             param.data = param.data.to(config.params_dtype)
         model.eval()
@@ -1207,7 +1212,9 @@ class TestMTPBlockScopeCudaGraph:
                 pre_process=True,
                 post_process=True,
                 position_embedding_type='rope',
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         elif model_type == 'hybrid':
             hybrid_stack_spec = _build_hybrid_stack_spec()
             model = HybridModel(
@@ -1220,7 +1227,9 @@ class TestMTPBlockScopeCudaGraph:
                 post_process=True,
                 hybrid_layer_pattern="****/*",
                 position_embedding_type='rope',
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         else:
             raise ValueError(f"Unknown model_type: {model_type!r}")
         for param in model.parameters():

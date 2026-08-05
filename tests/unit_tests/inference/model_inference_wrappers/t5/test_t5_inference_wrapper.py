@@ -7,6 +7,7 @@ from unittest import mock
 import numpy as np
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
@@ -75,7 +76,9 @@ class TestT5InferenceWrapper:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
-        ).cuda()
+        
+                       pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                   ).cuda()
 
         inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
 

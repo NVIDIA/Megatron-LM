@@ -6,6 +6,7 @@ import sys
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -110,7 +111,9 @@ class TestPartialCudaGraphedA2AOverlap:
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
             mtp_block_spec=mtp_block_spec,
-        )
+        
+                   pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+               )
 
     def create_test_args(
         self, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs

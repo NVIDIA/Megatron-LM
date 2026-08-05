@@ -5,6 +5,7 @@ import os
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state as ps
 from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_local_spec,
@@ -49,7 +50,9 @@ def initialize_bert_model(
         pre_process=pre_process,
         post_process=post_process,
         num_tokentypes=0,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     with torch.no_grad():
         for p in model.parameters():

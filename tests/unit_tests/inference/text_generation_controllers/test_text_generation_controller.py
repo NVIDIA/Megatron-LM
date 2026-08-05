@@ -15,6 +15,7 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     AsyncScheduleMode,
@@ -130,7 +131,9 @@ class TextGenerationControllerTestBase:
                 hybrid_layer_pattern=hybrid_layer_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
             layer_spec = get_gpt_layer_local_spec()
@@ -150,7 +153,9 @@ class TextGenerationControllerTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
 
         model.eval()
         if dtype == torch.bfloat16:

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -56,7 +57,9 @@ def _build_tiny_moe_gpt(
         vocab_size=16,
         max_sequence_length=8,
         position_embedding_type="rope",
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
     if not add_bias_linear:
         assert any(".shared_experts." in name for name, _ in model.named_parameters())
     return model.cuda()

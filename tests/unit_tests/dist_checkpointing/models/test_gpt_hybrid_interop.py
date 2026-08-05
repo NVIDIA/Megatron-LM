@@ -19,6 +19,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
@@ -349,7 +350,9 @@ def initialize_gpt_model(seed, num_gpt_layers, parallel, moe, glu=False):
         post_process=ps.is_pipeline_last_stage(),
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
     with torch.no_grad():
         for param in model.parameters():
             param.random_()
@@ -372,7 +375,9 @@ def initialize_hybrid_model(seed, pattern, parallel, moe, glu=False):
         post_process=ps.is_pipeline_last_stage(),
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
-    )
+    
+               pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+           )
 
 
 def _snapshot_fresh_layers(hybrid_model, layer_maps):
@@ -546,7 +551,9 @@ def gpt_provider_for_opt(
         post_process=post_process,
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
-    )
+    
+               pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+           )
 
 
 def hybrid_provider_for_opt(
@@ -565,7 +572,9 @@ def hybrid_provider_for_opt(
         post_process=post_process,
         position_embedding_type='rope',
         share_embeddings_and_output_weights=True,
-    )
+    
+               pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+           )
 
 
 def _inner_optimizers(optimizer):

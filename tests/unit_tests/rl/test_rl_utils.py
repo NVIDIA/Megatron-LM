@@ -396,7 +396,7 @@ class TestRLUtils:
         """Test that getting logprobs at least does not crash."""
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
 
-        model = MockModel()
+        model = MockModel(pg_collection=ProcessGroupCollection.use_mpu_process_groups())
         tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
         logprobs = rl_utils.get_logprobs(
             model, tokens, position_ids=None, sequence_packing=use_sequence_packing
@@ -519,7 +519,7 @@ class TestRLUtils:
             grpo_group_size=group_size,
         )
 
-        model = MockModel()
+        model = MockModel(pg_collection=ProcessGroupCollection.use_mpu_process_groups())
         tokenizer = MockTokenizer()
 
         # A single-turn rollout whose only turn is short and lacks eod must be rejected:
@@ -600,7 +600,7 @@ class TestRLUtils:
         the microbatch calculator is sized by ceil(ratio * total turns), not the full batch."""
         world_size, dp, tp, pp = initialize_model_parallel
         tokenizer = MockTokenizer()
-        model = MockModel()
+        model = MockModel(pg_collection=ProcessGroupCollection.use_mpu_process_groups())
 
         # ratio = global_batch_size/(prompts*group) = 2*dp/(dp*4) = 0.5.
         # 4*dp single-turn turns (already a multiple of 2*dp); ceil(0.5 * 4*dp) = 2*dp;
@@ -809,7 +809,9 @@ class TestRLUtils:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
             max_sequence_length=32,
-        ).cuda()
+        
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
 
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
@@ -868,7 +870,9 @@ class TestRLUtils:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
             max_sequence_length=32,
-        ).cuda()
+        
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
 
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=True,
@@ -997,7 +1001,9 @@ class TestRLUtils:
             max_sequence_length=4192,
             pre_process=is_pp_first_stage(pp_group),
             post_process=is_pp_last_stage(pp_group),
-        ).cuda()
+        
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         sequence_length = gpt_model.max_sequence_length
 
         gpt_model = Float16Module(gpt_model.config, gpt_model)
@@ -1064,7 +1070,9 @@ class TestRLUtils:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
             max_sequence_length=32,
-        ).cuda()
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                ).cuda()
 
         # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs
         wrapped_model = Float16Module(transformer_config, model)

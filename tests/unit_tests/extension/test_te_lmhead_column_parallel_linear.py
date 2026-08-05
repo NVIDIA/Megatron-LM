@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE, TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
@@ -114,7 +115,9 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
         assert isinstance(model.output_layer, tensor_parallel.ColumnParallelLinear)
         assert not isinstance(model.output_layer, TELMHeadColumnParallelLinear)
 
@@ -140,5 +143,7 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=128,
             max_sequence_length=8,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
         assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)

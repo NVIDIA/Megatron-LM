@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import mpu
 from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
     CachedMetadataFileSystemReader,
@@ -73,7 +74,9 @@ def initialize_gpt_model(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=i,
-        )
+        
+                         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                     )
         this_model.model_type = ModelType.encoder_or_decoder
         model.append(this_model)
 

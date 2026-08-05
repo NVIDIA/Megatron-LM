@@ -1,6 +1,7 @@
 import torch
 from pytest_mock import mocker
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
     DEFAULT_CONVERSION_DICT,
@@ -46,7 +47,9 @@ class TestTRTLLMDistributedGPUConverter:
             transformer_layer_spec=get_gpt_layer_local_spec(),
             vocab_size=_VOCAB_SIZE,
             max_sequence_length=_SEQUENCE_LENGTH,
-        )
+        
+                             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                         )
 
     def teardown_method(self, method):
         """

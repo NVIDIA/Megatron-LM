@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.distributed
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import mpu, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -104,6 +105,8 @@ def initialize_gpt_model(
                 vp_stage=i,
                 mtp_block_spec=mtp_block_spec,
                 share_embeddings_and_output_weights=False,
+            
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             .bfloat16()
             .cuda()

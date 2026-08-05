@@ -6,6 +6,7 @@ import pytest
 import torch
 from packaging.version import Version
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -95,7 +96,9 @@ class TestModelOptGPTModel:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
-        )
+        
+                                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                             )
         # Ensure that a GPTModel can be built with the modelopt spec.
         self.modelopt_model = GPTModel(
             config=transformer_config,
@@ -104,7 +107,9 @@ class TestModelOptGPTModel:
             ),
             vocab_size=100,
             max_sequence_length=4,
-        )
+        
+                                  pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                              )
 
     def test_sharded_state_dict_restore(self, tmp_path_dist_ckpt):
         """Save with the default TE spec and restore using the ModelOpt spec."""
@@ -159,7 +164,9 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
             transformer_layer_spec=default_spec,
             vocab_size=100,
             max_sequence_length=8,
-        )
+        
+                                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                             )
         modelopt_spec = get_gpt_modelopt_spec(transformer_config, remap_te_layernorm=True)
         # Ensure that a GPTModel can be built with the modelopt spec.
         self.modelopt_model = GPTModel(
@@ -167,7 +174,9 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
             transformer_layer_spec=modelopt_spec,
             vocab_size=100,
             max_sequence_length=8,
-        )
+        
+                                  pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                              )
 
 
 class TestModelOptLlama4MoE(TestModelOptGPTModel):
@@ -201,7 +210,9 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             transformer_layer_spec=default_spec,
             vocab_size=100,
             max_sequence_length=8,
-        )
+        
+                                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                             )
         modelopt_spec = get_gpt_modelopt_spec(
             transformer_config, remap_te_layernorm=True, qk_l2_norm=True
         )
@@ -211,7 +222,9 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             transformer_layer_spec=modelopt_spec,
             vocab_size=100,
             max_sequence_length=8,
-        )
+        
+                                  pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                              )
 
 
 class TestModelOptHybridModel(TestModelOptGPTModel):
@@ -230,7 +243,9 @@ class TestModelOptHybridModel(TestModelOptGPTModel):
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
-        )
+        
+                                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                             )
 
         # A Hybrid HybridModel using ModelOpt spec (local + TENorm).
         self.modelopt_model = HybridModel(
@@ -239,7 +254,9 @@ class TestModelOptHybridModel(TestModelOptGPTModel):
             vocab_size=100,
             max_sequence_length=4,
             hybrid_layer_pattern="M*-",
-        )
+        
+                                  pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                              )
 
 
 def test_get_gpt_modelopt_spec_interface():

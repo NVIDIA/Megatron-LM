@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Tuple, Iterator
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core import dist_checkpointing
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -74,7 +75,9 @@ def model_provider() -> GPTModel:
         transformer_layer_spec=get_gpt_layer_local_spec(),
         vocab_size=100,
         max_sequence_length=_SEQUENCE_LENGTH,
-    )
+    
+                              pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                          )
 
     return gpt_model
 

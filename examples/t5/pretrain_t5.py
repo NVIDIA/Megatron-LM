@@ -9,6 +9,7 @@ from typing import Union
 import torch
 
 import megatron
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import mpu, tensor_parallel
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
@@ -132,7 +133,9 @@ def model_provider(
         relative_attention_max_distance=args.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     return model
 

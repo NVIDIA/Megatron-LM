@@ -38,6 +38,7 @@ import types
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     AsyncScheduleMode,
@@ -141,7 +142,9 @@ class TestMambaPrefixCachingE2E:
             hybrid_layer_pattern="M*-",
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
-        ).cuda()
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                ).cuda()
         for param in model.parameters():
             param.data = param.data.to(transformer_config.params_dtype)
         model.eval()

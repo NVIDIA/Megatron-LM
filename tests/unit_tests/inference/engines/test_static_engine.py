@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
@@ -77,7 +78,9 @@ class StaticInferenceEngineTestHarness:
             parallel_output=True,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
-        ).cuda()
+        
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         gpt_model.to(inference_config_params_dtype)
 
         inference_context = StaticInferenceContext(

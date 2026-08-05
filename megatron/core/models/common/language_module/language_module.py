@@ -47,8 +47,12 @@ class LanguageModule(MegatronModule):
     ) -> None:
         super().__init__(config=config)
         self._set_attention_backend()
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert pg_collection is not None, (
+            "LanguageModule requires an explicit pg_collection. The global parallel grid is not a "
+            "safe default: a model built on independent grids (vision encoder + LLM, GTP, MIMO) "
+            "would silently get the wrong one. "
+            "See docs/developer/parallel-state-deprecation.md"
+        )
         self.pg_collection = pg_collection
         self.cp_group = pg_collection.cp
         self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)

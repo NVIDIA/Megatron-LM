@@ -54,7 +54,9 @@ class TestGPTModel:
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
-            )
+            
+                                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                             )
         self.mock_log_single_rank = mock_log_single_rank
 
     def teardown_method(self, method):
@@ -300,7 +302,9 @@ class TestGPTWithFusedOps:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(use_te_op_fuser=True),
             vocab_size=100,
             max_sequence_length=4,
-        )
+        
+                             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                         )
 
     def teardown_method(self, method) -> None:
         Utils.destroy_model_parallel()
@@ -362,7 +366,9 @@ def test_gpt_with_te_activation_func(num_experts, gated_linear_unit):
         ),
         vocab_size=128,
         max_sequence_length=128,
-    )
+    
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
     # test
     sequence_length = gpt_model.max_sequence_length
@@ -501,7 +507,9 @@ class TestGPTWithDynamicInference:
             vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
             parallel_output=True,
-        )
+        
+                             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                         )
         self.gpt_model = Float16Module(self.gpt_model.config, self.gpt_model)
 
     def teardown_method(self, method):

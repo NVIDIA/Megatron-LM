@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch.optim import Adam
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
@@ -329,7 +330,9 @@ def initialize_real_model(
         pre_process=pre_process,
         post_process=post_process,
         vp_stage=vp_stage,
-    )
+    
+                     pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                 )
 
     return this_model
 

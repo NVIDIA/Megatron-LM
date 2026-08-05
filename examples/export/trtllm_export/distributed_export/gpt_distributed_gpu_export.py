@@ -1,5 +1,6 @@
 import os
 import torch
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core import dist_checkpointing
 from megatron.core.export.model_type import ModelType
@@ -42,7 +43,9 @@ def model_provider():
         transformer_layer_spec=get_gpt_layer_local_spec(), 
         vocab_size=_VOCAB_SIZE, 
         max_sequence_length=_SEQUENCE_LENGTH,
-    )
+    
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
     return gpt_model
 
