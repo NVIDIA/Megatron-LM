@@ -230,7 +230,14 @@ def convert_cp_partition_mode(
         )
 
         moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
-        gathered = gather_from_sequence_parallel_region(moved, group=tp_group)
+        # This gather is only used to run a duplicated CP layout permutation before
+        # scattering back to SP shards. Its backward must split, not reduce-scatter;
+        # otherwise every TP rank contributes the same full-sequence gradient.
+        gathered = gather_from_sequence_parallel_region(
+            moved,
+            tensor_parallel_output_grad=False,
+            group=tp_group,
+        )
         converted = _convert_cp_partition_mode_full_sequence(
             gathered,
             cp_group,

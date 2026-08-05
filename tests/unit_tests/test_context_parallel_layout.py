@@ -103,6 +103,13 @@ def _make_sequence_tensor(total_seq_len, seq_dim, device):
     )
 
 
+def _get_sequence_parallel_shard(tensor, seq_dim, tp_group):
+    tp_size = tp_group.size()
+    tp_rank = tp_group.rank()
+    assert tensor.size(seq_dim) % tp_size == 0
+    return tensor.chunk(tp_size, dim=seq_dim)[tp_rank].contiguous()
+
+
 def test_context_parallel_layout_chunk_indices():
     assert get_context_parallel_layout_chunk_indices(4, 2, "zigzag").tolist() == [2, 5]
     assert get_context_parallel_layout_chunk_indices(4, 2, "contiguous").tolist() == [4, 5]
@@ -279,47 +286,72 @@ def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+    ("source_layout", "target_layout", "seq_dim", "sequence_parallel"),
+    [
+        pytest.param("zigzag", "contiguous", 0, False, id="zigzag-contiguous-seq0"),
+        pytest.param("zigzag", "contiguous", 1, False, id="zigzag-contiguous-seq1"),
+        pytest.param("contiguous", "zigzag", 0, False, id="contiguous-zigzag-seq0"),
+        pytest.param("contiguous", "zigzag", 1, False, id="contiguous-zigzag-seq1"),
+        pytest.param("zigzag", "contiguous", 0, True, id="sequence-parallel"),
+    ],
 )
-@pytest.mark.parametrize("seq_dim", [0, 1])
 def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
-    source_layout, target_layout, seq_dim
+    source_layout, target_layout, seq_dim, sequence_parallel
 ):
-    if not torch.cuda.is_available() or Utils.world_size < 2:
-        pytest.skip("SBHD CP partition-mode conversion backward needs at least two CUDA ranks.")
+    min_world_size = 4 if sequence_parallel else 2
+    if not torch.cuda.is_available() or Utils.world_size < min_world_size:
+        pytest.skip(
+            f"SBHD CP partition-mode conversion backward needs at least {min_world_size} "
+            "CUDA ranks."
+        )
 
     cp_size = 2
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    tp_size = 2 if sequence_parallel else 1
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+    )
     try:
         cp_group = parallel_state.get_context_parallel_group()
+        tp_group = parallel_state.get_tensor_model_parallel_group() if sequence_parallel else None
         full_tensor = _make_sequence_tensor(
             total_seq_len=32,
             seq_dim=seq_dim,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
         full_upstream_grad = full_tensor.mul(0.125).add(1.0)
-        source_shard = (
-            get_pos_emb_on_this_cp_rank(
-                full_tensor, seq_dim, cp_group, cp_partition_mode=source_layout
-            )
-            .detach()
-            .requires_grad_(True)
+        source_shard = get_pos_emb_on_this_cp_rank(
+            full_tensor, seq_dim, cp_group, cp_partition_mode=source_layout
         )
+        if sequence_parallel:
+            source_shard = _get_sequence_parallel_shard(source_shard, seq_dim, tp_group)
+        source_shard = source_shard.detach().requires_grad_(True)
 
+        convert_kwargs = (
+            {"sequence_parallel": True, "tp_group": tp_group} if sequence_parallel else {}
+        )
         converted = context_parallel_layout.convert_cp_partition_mode(
             source_shard,
             cp_group,
             source_partition_mode=source_layout,
             target_partition_mode=target_layout,
             seq_dim=seq_dim,
+            **convert_kwargs,
         )
         target_upstream_grad = get_pos_emb_on_this_cp_rank(
             full_upstream_grad, seq_dim, cp_group, cp_partition_mode=target_layout
         )
+        if sequence_parallel:
+            target_upstream_grad = _get_sequence_parallel_shard(
+                target_upstream_grad, seq_dim, tp_group
+            )
         converted.mul(target_upstream_grad).sum().backward()
         expected_source_grad = get_pos_emb_on_this_cp_rank(
             full_upstream_grad, seq_dim, cp_group, cp_partition_mode=source_layout
         )
+        if sequence_parallel:
+            expected_source_grad = _get_sequence_parallel_shard(
+                expected_source_grad, seq_dim, tp_group
+            )
 
         torch.testing.assert_close(source_shard.grad, expected_source_grad, atol=0.0, rtol=0.0)
     finally:
