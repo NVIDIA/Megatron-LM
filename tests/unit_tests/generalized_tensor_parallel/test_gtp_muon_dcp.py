@@ -125,7 +125,6 @@ class TestGTPMuonDCP:
         if int(os.environ.get('WORLD_SIZE', '1')) != 4:
             pytest.skip("Requires world_size 4 (gtp2 x dp2)")
 
-        os.environ['MEGATRON_GTP_FORCE_ENABLE'] = '1'
         from megatron.core import parallel_state as ps
         from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
         from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -237,7 +236,6 @@ class TestGTPMuonDCP:
             pytest.skip("Requires world_size 4 (gtp2 x dp2)")
         _requires_mxfp8()
 
-        os.environ['MEGATRON_GTP_FORCE_ENABLE'] = '1'
         from megatron.core import parallel_state as ps
         from megatron.core.fp8_utils import is_float8tensor
         from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
