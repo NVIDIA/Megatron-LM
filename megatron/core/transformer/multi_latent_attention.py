@@ -1113,14 +1113,6 @@ class MLASelfAttention(MultiLatentAttention):
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
                 q, _ = self.linear_q_up_proj(q_compressed)
-                import os as _os
-                if _os.environ.get("NVTE_FUSED_MLA_DEBUG", "0") == "1" and not getattr(self, '_unfused_dbg_done', False):
-                    self._unfused_dbg_done = True
-                    import torch.distributed as _dist
-                    if _dist.is_initialized() and _dist.get_rank() == 0:
-                        lin = self.linear_q_up_proj
-                        wq = lin._get_weight_quantizers()[0] if hasattr(lin, '_get_weight_quantizers') else None
-                        print(f"[UNFUSED_DBG] fp8={lin.fp8} weight_dtype={lin.weight.dtype} weight_type={type(lin.weight).__name__} weight_quantizer={type(wq).__name__ if wq else None}", flush=True)
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
             else:
