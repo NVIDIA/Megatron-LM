@@ -172,6 +172,7 @@ class MLP(MegatronModule):
         ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
@@ -224,6 +225,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            pg_collection=pg_collection,
             stride=fc1_stride,
             name=(name + ".linear_fc1") if name is not None else None,
         )
@@ -246,6 +248,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
+            pg_collection=pg_collection,
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
@@ -404,6 +407,7 @@ class MLP(MegatronModule):
             config=config,
             submodules=submodules,
             tp_group=pg_collection.tp,
+            pg_collection=pg_collection,
             is_expert=is_expert,
             input_size=input_size,
             ffn_hidden_size=ffn_hidden_size,

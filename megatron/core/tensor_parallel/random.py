@@ -451,6 +451,8 @@ def model_parallel_cuda_manual_seed(
     tp_rank: Optional[int] = None,
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
+    gtp_remat_rank: Optional[int] = None,
+    egtp_remat_rank: Optional[int] = None,
     force_reset_rng: bool = False,
 ):
     """Initialize model parallel cuda seed.
@@ -476,6 +478,10 @@ def model_parallel_cuda_manual_seed(
         ep_rank = get_expert_model_parallel_rank()
     if etp_rank is None:
         etp_rank = get_expert_tensor_parallel_rank()
+    if gtp_remat_rank is None:
+        gtp_remat_rank = get_gtp_weight_remat_rank()
+    if egtp_remat_rank is None:
+        egtp_remat_rank = get_expert_gtp_weight_remat_rank()
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + tp_rank
@@ -500,11 +506,9 @@ def model_parallel_cuda_manual_seed(
     # must draw DIFFERENT values (everything above is identical across peers by design). The 65536
     # stride keeps these disjoint from the tp/ep/etp seeds. Added only when the axis is active, so
     # non-GTP runs keep a byte-identical tracker set (and checkpoint rng payload).
-    gtp_remat_rank = get_gtp_weight_remat_rank()
     if get_gtp_weight_remat_world_size() > 1:
         gtp_remat_seed = tensor_model_parallel_seed + 65536 * (1 + gtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_GTP_REMAT_RNG_TRACKER_NAME, gtp_remat_seed)
-    egtp_remat_rank = get_expert_gtp_weight_remat_rank()
     if get_expert_gtp_weight_remat_world_size() > 1:
         egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)

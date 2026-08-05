@@ -452,7 +452,10 @@ _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
 def _allreduce_replicated_grads_over_gtp_remat_group(
-    model: List[torch.nn.Module], calculate_per_token_loss: bool = False
+    model: List[torch.nn.Module],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    egtp_remat_group: Optional[torch.distributed.ProcessGroup],
+    calculate_per_token_loss: bool = False,
 ):
     """Complete the gtp_remat / egtp_remat axis reduction for replicated parameters.
 
@@ -470,12 +473,6 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
 
     No-op when GTP_remat is inactive (group size <= 1).
     """
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=["gtp_remat", "expt_gtp_remat"]
-    )
-    gtp_remat_group = pg_collection.gtp_remat
-    egtp_remat_group = pg_collection.expt_gtp_remat
-
     dense_active = gtp_remat_group is not None and gtp_remat_group.size() > 1
     expert_active = egtp_remat_group is not None and egtp_remat_group.size() > 1
     if not dense_active and not expert_active:
@@ -564,12 +561,29 @@ def finalize_model_grads(
         # Full DP x CP x gtp_remat group: num_tokens (the per-token-loss divisor below) counts the
         # gtp_remat peers' distinct tokens. Falls back to replicate dp_cp when gtp is inactive.
         dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
+        gtp_remat_group = getattr(pg_collection, 'gtp_remat', None)
+        egtp_remat_group = getattr(pg_collection, 'expt_gtp_remat', None)
     else:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        gtp_remat_group = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+        egtp_remat_group = parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False)
+
+    # A missing group would silently skip the gtp_remat-axis reduction below and train on
+    # wrong gradients, so fail loudly whenever the config says the axis is active.
+    for axis, group, axis_size in (
+        ('gtp_remat', gtp_remat_group, config.gtp_weight_remat_size),
+        ('expt_gtp_remat', egtp_remat_group, config.expert_gtp_weight_remat_size),
+    ):
+        if axis_size > 1:
+            found = 'None' if group is None else f'a size-{group.size()} group'
+            assert group is not None and group.size() == axis_size, (
+                f"{axis} is enabled (size={axis_size}) but pg_collection provides {found}. "
+                f"Pass a pg_collection carrying `{axis}` to finalize_model_grads."
+            )
 
     # Fence the current stream against all GTP backward grad work before the DP gradient sync.
     if config.gtp_weight_remat_size > 1 or config.expert_gtp_weight_remat_size > 1:
@@ -606,7 +620,10 @@ def finalize_model_grads(
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
     _allreduce_replicated_grads_over_gtp_remat_group(
-        model, calculate_per_token_loss=config.calculate_per_token_loss
+        model,
+        gtp_remat_group,
+        egtp_remat_group,
+        calculate_per_token_loss=config.calculate_per_token_loss,
     )
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
