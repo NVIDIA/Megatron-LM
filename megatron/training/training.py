@@ -1112,7 +1112,6 @@ def pretrain(
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
-
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
@@ -3398,6 +3397,7 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     """
+    print(config)
     args = get_args()
     timers = get_timers()
     fault_injector_kwargs = {}
