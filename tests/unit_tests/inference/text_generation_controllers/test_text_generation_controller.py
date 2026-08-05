@@ -1715,10 +1715,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.request_kv_block_counts[active_slice] = 1
         context.token_to_input_ids[active_slice] = torch.tensor([80, 81])
 
-        # Leave room in paused storage but no capacity to keep both requests active.
-        context.kv_block_allocator.active_count = context.kv_block_allocator.get_active_used()
-        context.kv_block_allocator.paused_count = 2
-        context.kv_block_allocator.total_avail = 0
+        # Retain one paused request, but exhaust shared-pool capacity with real allocations.
+        alloc = context.kv_block_allocator
+        alloc.paused_limit = 1
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
 
         sampled_tokens = torch.tensor([90, 91], dtype=torch.int64)
         controller._async_sched_logits = AsyncScheduleLogitsState(
@@ -1762,6 +1765,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         controller._run_async_sched_forward.assert_called_once_with(
             forward_input_ids, forward_position_ids
         )
+        alloc.release_memory_blocks(filler_blocks)
 
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)
@@ -2694,7 +2698,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Initialize allocator and states
-        ctx.kv_block_allocator.total_avail = 100
+        ctx.kv_block_allocator.pool_avail = 100
         ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device=context_device)
         ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device=context_device)
 
@@ -2746,7 +2750,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Assert released block is cleared
         assert ctx.request_to_kv_block_ids[1, 3].item() == -1
-        assert ctx.kv_block_allocator.total_avail == 101  # 1 block released
+        assert ctx.kv_block_allocator.pool_avail == 101  # 1 block released
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
@@ -2950,7 +2954,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.kv_block_allocator.block_ref_counts[20] = 2
         ctx.kv_block_allocator.block_ref_counts[10] = 1
 
-        initial_avail = ctx.kv_block_allocator.total_avail
+        initial_avail = ctx.kv_block_allocator.pool_avail
 
         # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -2996,7 +3000,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
-        ctx.kv_block_allocator.total_avail = 50
+        ctx.kv_block_allocator.pool_avail = 50
 
         self.text_generation_controller._init_mtp_sampling_tensors()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
@@ -3010,7 +3014,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert ctx.request_kv_block_counts[0].item() == 3
         assert ctx.request_last_kv_block_id[0].item() == 30
         assert ctx.request_to_kv_block_ids[0, 3].item() == -1
-        assert ctx.kv_block_allocator.total_avail == 51  # exactly 1 block released
+        assert ctx.kv_block_allocator.pool_avail == 51  # exactly 1 block released
 
         # Prefix blocks remain in request_to_kv_block_ids.
         assert ctx.request_to_kv_block_ids[0, 0].item() == 10
