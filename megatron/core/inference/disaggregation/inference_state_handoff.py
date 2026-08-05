@@ -36,84 +36,7 @@ class _PreparedHandoffMetadata:
     """Per-request metadata assembled once for a completed prefill batch."""
 
     local_blocks: list[int]  # Complete blocks owned and pinned by this PP stage.
-    top_level_blocks: list[int]  # Stage-0 blocks carried in the top-level wire field.
     kv_meta: Any
-
-
-def _pack_int_records(records: list[tuple[int, list[int]]]) -> list[int]:
-    """Encode request records for a tensor-based pipeline-stage gather.
-
-    Each record is encoded as ``[request_id, value_count, *values]``, with the
-    number of records at the front of the payload. For example,
-    ``[(7, [10, 11]), (8, [12])]`` becomes ``[2, 7, 2, 10, 11, 8, 1, 12]``.
-    The flat integer payload lets :func:`_all_gather_int_records` exchange
-    request block IDs without Python object serialization.
-    """
-
-    payload = [len(records)]
-    for request_id, values in records:
-        payload.extend((int(request_id), len(values), *map(int, values)))
-    return payload
-
-
-def _unpack_int_records(payload: list[int]) -> list[tuple[int, list[int]]]:
-    """Decode request records gathered from another pipeline stage.
-
-    The first value is the record count, followed by
-    ``[request_id, value_count, *values]`` for each record. For example,
-    ``[1, 7, 2, 10, 11]`` becomes ``[(7, [10, 11])]``. Bounds and trailing-data
-    checks reject malformed peer metadata before it is used for a handoff.
-    """
-
-    if not payload:
-        raise RuntimeError("handoff metadata payload is empty")
-    num_records = int(payload[0])
-    offset = 1
-    records = []
-    for _ in range(num_records):
-        if offset + 2 > len(payload):
-            raise RuntimeError("handoff metadata payload has a truncated record header")
-        request_id, count = map(int, payload[offset : offset + 2])
-        offset += 2
-        if count < 0 or offset + count > len(payload):
-            raise RuntimeError("handoff metadata payload has an invalid record length")
-        records.append((request_id, [int(value) for value in payload[offset : offset + count]]))
-        offset += count
-    if offset != len(payload):
-        raise RuntimeError("handoff metadata payload contains trailing values")
-    return records
-
-
-def _all_gather_int_records(
-    records: list[tuple[int, list[int]]], group: Any, device: torch.device
-) -> list[list[tuple[int, list[int]]]]:
-    """All-gather a batch of integer records without Python object serialization."""
-
-    world_size = get_pg_size(group)
-    if world_size == 1 or not torch.distributed.is_initialized():
-        return [records]
-
-    payload = _pack_int_records(records)
-    header = torch.tensor((len(records), len(payload)), dtype=torch.int64, device=device)
-    gathered_header = torch.empty(world_size * 2, dtype=torch.int64, device=device)
-    torch.distributed.all_gather_into_tensor(gathered_header, header, group=group)
-    headers = gathered_header.view(world_size, 2).cpu().tolist()
-
-    record_counts = {int(values[0]) for values in headers}
-    if len(record_counts) != 1:
-        raise RuntimeError(f"Handoff request counts differ across ranks: {sorted(record_counts)}")
-    payload_sizes = [int(values[1]) for values in headers]
-    max_payload_size = max(payload_sizes)
-    local_payload = torch.zeros(max_payload_size, dtype=torch.int64, device=device)
-    local_payload[: len(payload)] = torch.tensor(payload, dtype=torch.int64, device=device)
-    gathered_payload = torch.empty(world_size * max_payload_size, dtype=torch.int64, device=device)
-    torch.distributed.all_gather_into_tensor(gathered_payload, local_payload, group=group)
-    return [
-        _unpack_int_records(rank_payload[:payload_size])
-        for rank_payload, payload_size in zip(
-            gathered_payload.view(world_size, max_payload_size).cpu().tolist(), payload_sizes
-        )
-    ]
 
 
 class InferenceStateHandoffMixin:
@@ -358,8 +281,15 @@ class InferenceStateHandoffMixin:
         if self._kv_peer_metas is None:
             raise RuntimeError("KV handoff requested before transfer setup")
 
-        local_records = []
-        local_blocks_by_request = {}
+        pp_size = get_pg_size(self.pg_collection.pp)
+        static_pp_metas = self._pp_kv_peer_metas or [self._kv_peer_metas]
+        if len(static_pp_metas) != pp_size:
+            raise RuntimeError(
+                f"Expected static metadata for {pp_size} pipeline stages, "
+                f"got {len(static_pp_metas)}"
+            )
+
+        prepared = {}
         for request, block_ids in handoffs:
             # Prefix-cache entries must be immutable. The last prompt block is
             # still writable when the prompt is not block-aligned, so transfer
@@ -369,59 +299,24 @@ class InferenceStateHandoffMixin:
             dropped_blocks = block_ids[num_complete:]
             if dropped_blocks:
                 self._release_pinned_handoff_blocks(dropped_blocks)
-            local_blocks_by_request[request.request_id] = complete_blocks
-            local_records.append((request.request_id, complete_blocks))
 
-        pp_size = get_pg_size(self.pg_collection.pp)
-        try:
             if pp_size > 1:
-                gathered_records = _all_gather_int_records(
-                    local_records, self.pg_collection.pp, self.context.memory_buffer.device
-                )
-            else:
-                gathered_records = [local_records]
-            local_request_ids = [request_id for request_id, _ in local_records]
-            for rank_records in gathered_records:
-                rank_request_ids = [request_id for request_id, _ in rank_records]
-                if rank_request_ids != local_request_ids:
-                    raise RuntimeError(
-                        "Pipeline ranks completed different handoff requests "
-                        f"(local={local_request_ids}, peer={rank_request_ids})"
-                    )
-            for record_index in range(len(local_records)):
-                block_counts = {
-                    len(rank_records[record_index][1]) for rank_records in gathered_records
-                }
-                if len(block_counts) != 1:
-                    raise RuntimeError(
-                        "Pipeline ranks produced different handoff block counts "
-                        f"for request {local_request_ids[record_index]}: {sorted(block_counts)}"
-                    )
-            static_pp_metas = self._pp_kv_peer_metas or [self._kv_peer_metas]
-            if len(static_pp_metas) != pp_size:
-                raise RuntimeError(
-                    f"Expected static metadata for {pp_size} pipeline stages, "
-                    f"got {len(static_pp_metas)}"
-                )
-        except Exception:
-            for block_ids in local_blocks_by_request.values():
-                self._release_pinned_handoff_blocks(block_ids)
-            raise
-
-        prepared = {}
-        for record_index, (request_id, local_blocks) in enumerate(local_records):
-            stage_blocks = [rank_records[record_index][1] for rank_records in gathered_records]
-            if pp_size > 1:
+                # Dynamic batching is mirrored across model-parallel ranks: they
+                # receive the same request stream, use a synchronized KV pool size,
+                # and perform allocations, cache registration, and releases in the
+                # same order. Physical block IDs are therefore identical on every
+                # pipeline stage, just as they are across the TP ranks described by
+                # each stage's static metadata.
                 kv_meta: Any = {
                     "pp_metas": [
-                        {"tp_metas": stage_meta, "block_ids": blocks}
-                        for stage_meta, blocks in zip(static_pp_metas, stage_blocks)
+                        {"tp_metas": stage_meta, "block_ids": complete_blocks}
+                        for stage_meta in static_pp_metas
                     ]
                 }
             else:
                 kv_meta = self._kv_peer_metas
-            prepared[request_id] = _PreparedHandoffMetadata(
-                local_blocks=local_blocks, top_level_blocks=stage_blocks[0], kv_meta=kv_meta
+            prepared[request.request_id] = _PreparedHandoffMetadata(
+                local_blocks=complete_blocks, kv_meta=kv_meta
             )
         return prepared
 
@@ -438,7 +333,6 @@ class InferenceStateHandoffMixin:
             prepared = self._prepare_handoff_metadata_batch([(request, block_ids)])[rid]
         block_ids = prepared.local_blocks
         kv_meta = prepared.kv_meta
-        top_level_block_ids = prepared.top_level_blocks
 
         if not block_ids:
             logging.warning(
@@ -456,7 +350,7 @@ class InferenceStateHandoffMixin:
 
         request.disaggregated_params = {
             "request_id": rid,
-            "block_ids": top_level_block_ids,
+            "block_ids": block_ids,
             "kv_meta": kv_meta,
         }
         logging.info("DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d", rid, len(block_ids))
